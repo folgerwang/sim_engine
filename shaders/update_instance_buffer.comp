@@ -1,0 +1,54 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tile_common.glsl.h"
+
+layout(push_constant) uniform TileUniformBufferObject {
+  InstanceBufferUpdateParams params;
+};
+
+layout(std430, set = 0, binding = GAME_OBJECTS_BUFFER_INDEX) readonly buffer GameObjectsBuffer {
+  GameObjectInfo items[];
+};
+
+layout(std430, set = 0, binding = INSTANCE_BUFFER_INDEX) buffer InstanceBuffer {
+  InstanceDataInfo insts[];
+};
+
+struct UnpackedGameObjectInfo {
+    vec3        position;
+    float       scale;
+    vec3        up_vector;
+    vec3        facing_dir;
+};
+
+vec3 unpackNormalizedVector(uint packed_vector, uint sign) {
+    vec3 result;
+    result.xy = unpackHalf2x16(packed_vector);
+    result.z = sqrt(max(1.0f - dot(result.xy, result.xy), 0.0f)) * (sign > 0 ? -1.0f : 1.0f);
+    return result;
+}
+
+UnpackedGameObjectInfo unpackGameObjectInfo(GameObjectInfo info) {
+    UnpackedGameObjectInfo ugo_info;
+    ugo_info.position = info.position;
+    ugo_info.up_vector = unpackNormalizedVector(info.packed_up_vector, info.packed_moving_dir_z_signs & 0x00010000);
+    ugo_info.facing_dir = unpackNormalizedVector(info.packed_facing_dir, info.packed_moving_dir_z_signs & 0x00020000);
+    ugo_info.scale = unpackHalf2x16(info.packed_mass_scale).y;
+
+    return ugo_info;
+}
+
+layout(local_size_x = 64, local_size_y = 1) in;
+void main()
+{
+  // get index in global work group i.e x,y position
+  uint inst_idx = gl_GlobalInvocationID.x;
+  if (inst_idx < params.num_instances) {
+    UnpackedGameObjectInfo info = unpackGameObjectInfo(items[inst_idx]);
+    insts[inst_idx].mat_rot_0 = vec4(cross(info.up_vector, info.facing_dir) * info.scale, 0.0f);
+    insts[inst_idx].mat_rot_1 = vec4(info.up_vector * info.scale, 0.0f);
+    insts[inst_idx].mat_rot_2 = vec4(info.facing_dir * info.scale, 0.0f);
+    insts[inst_idx].mat_pos_scale = vec4(info.position, 1.0f);
+  }
+}

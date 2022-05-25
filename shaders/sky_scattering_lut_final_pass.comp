@@ -1,0 +1,13 @@
+#version 460
+#include "global_definition.glsl.h"
+
+layout (set = 0, binding = DST_SCATTERING_LUT_INDEX, rg32f) uniform image2D dst_lut;
+layout (set = 0, binding = SRC_SCATTERING_LUT_SUM_INDEX, rg32f) uniform readonly image2D src_sum_lut;
+
+layout (local_size_x = 1, local_size_y = kAtmosphereScatteringLutGroupSize, local_size_z = 1) in;
+void main() {
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+	vec2 intensity = imageLoad(dst_lut, pixel_coords).xy;
+	intensity += imageLoad(src_sum_lut, ivec2(gl_WorkGroupID.xy)).xy;
+	imageStore(dst_lut, pixel_coords, vec4(log2(intensity), 0, 0));
+}

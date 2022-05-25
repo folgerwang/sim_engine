@@ -1,0 +1,29 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tile_common.glsl.h"
+#include "weather_common.glsl.h"
+
+layout(push_constant) uniform AirflowUniformBufferObject {
+  AirflowUpdateParams params;
+};
+
+layout(set = 0, binding = DST_TEMP_TEX_INDEX, r16f) uniform writeonly image3D dst_temp;
+layout(set = 0, binding = DST_MOISTURE_TEX_INDEX, r16f) uniform writeonly image3D dst_moisture;
+layout(set = 0, binding = DST_PRESSURE_TEX_INDEX, r16f) uniform writeonly image3D dst_pressure;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main()
+{
+	// skip 2 lines on border.
+	ivec3 pixel_coords = ivec3(gl_GlobalInvocationID.xyz);
+	vec3 uvw = (pixel_coords + 0.5f) * params.inv_size;
+	vec3 position_ws;
+	position_ws.xy = uvw.xy * params.world_range.xy + params.world_min.xy;
+	position_ws.z = getSampleToHeight(uvw.z);
+
+	float temperature = getReferenceDegree(params.controls.sea_level_temperature, position_ws.z);
+	imageStore(dst_temp, pixel_coords, vec4(temperature));
+	imageStore(dst_moisture, pixel_coords, vec4(0));
+	imageStore(dst_pressure, pixel_coords, vec4(0));
+}

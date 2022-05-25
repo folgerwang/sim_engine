@@ -1,0 +1,67 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tile_common.glsl.h"
+
+layout(push_constant) uniform TileUniformBufferObject {
+  TileCreateParams tile_params;
+};
+
+layout(set = 0, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D heightmap_tex;
+layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX, r16f) uniform writeonly image2D rock_layer;
+layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX, rg16) uniform writeonly image2D soil_water_layer;
+layout(set = 0, binding = ORTHER_INFO_LAYER_BUFFER_INDEX, rgba8) uniform writeonly image2D orther_info_layer;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+void main()
+{
+  // get index in global work group i.e x,y position
+  ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+  if (all(lessThan(pixel_coords, uvec2(tile_params.width_pixel_count)))) {
+    float inv_segment_count = 1.0f / tile_params.width_pixel_count;
+    vec2 tile_step = tile_params.world_range * inv_segment_count;
+
+#if 0
+    vec2 map_coords = tile_params.world_min + (pixel_coords + 0.25f) * tile_step;
+    vec2 map_coords1 = map_coords + 0.5f * tile_step;
+
+    vec2 height_info = terrainMap(map_coords);
+    imageStore(rock_layer, pixel_coords * 2, vec4(height_info.x));
+    height_info = terrainMap(vec2(map_coords1.x, map_coords.y));
+    imageStore(rock_layer, pixel_coords * 2 + ivec2(1, 0), vec4(height_info.x));
+    height_info = terrainMap(vec2(map_coords.x, map_coords1.y));
+    imageStore(rock_layer, pixel_coords * 2 + ivec2(0, 1), vec4(height_info.x));
+    height_info = terrainMap(map_coords1);
+    imageStore(rock_layer, pixel_coords * 2 + ivec2(1, 1), vec4(height_info.x));
+#else
+    ivec2 scoord_0 = pixel_coords * 2;
+    ivec2 scoord_1 = pixel_coords * 2 + ivec2(1, 0);
+    ivec2 scoord_2 = pixel_coords * 2 + ivec2(0, 1);
+    ivec2 scoord_3 = pixel_coords * 2 + ivec2(1, 1);
+
+    float height_info = texture(heightmap_tex, (scoord_0 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_0, vec4(height_info));
+    height_info = texture(heightmap_tex, (scoord_1 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_1, vec4(height_info));
+    height_info = texture(heightmap_tex, (scoord_2 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_2, vec4(height_info));
+    height_info = texture(heightmap_tex, (scoord_3 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_3, vec4(height_info));
+#endif
+
+    const float kWaterInitLevel = 1.0f;
+    const float kSoilInitLevel = 5.0f;
+
+    imageStore(
+        soil_water_layer,
+        pixel_coords,
+        vec4(
+            kSoilInitLevel / SOIL_WATER_LAYER_MAX_THICKNESS,
+            kWaterInitLevel / SOIL_WATER_LAYER_MAX_THICKNESS,
+            0, 0));
+
+    if (((pixel_coords.x | pixel_coords.y) & 0x01) == 0) {
+        imageStore(orther_info_layer, pixel_coords / 2, vec4(0.5f / SNOW_LAYER_MAX_THICKNESS));
+    }
+  }
+}

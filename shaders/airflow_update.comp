@@ -1,0 +1,341 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "weather_common.glsl.h"
+#include "tile_common.glsl.h"
+#include "noise.glsl.h"
+
+#define MAX_UINT_VALUE    0xffffffff
+#define INVALIDATE_VALUE  0xffffffff
+#define MIN_UINT_VALUE    0x00000000
+
+layout(push_constant) uniform AirflowUniformBufferObject {
+  AirflowUpdateParams params;
+};
+
+layout(set = 0, binding = DST_TEMP_TEX_INDEX, r16f) uniform writeonly image3D dst_temperature;
+layout(set = 0, binding = DST_MOISTURE_TEX_INDEX, r16f) uniform writeonly image3D dst_moisture;
+layout(set = 0, binding = SRC_TEMP_TEX_INDEX) uniform sampler3D src_temperature;
+layout(set = 0, binding = SRC_MOISTURE_TEX_INDEX) uniform sampler3D src_moisture;
+layout(set = 0, binding = DST_AIRFLOW_TEX_INDEX, rgba8) uniform image3D dst_airflow;
+layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
+layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
+
+shared vec2 s_ground_info[12][12];
+shared vec3 s_ground_weather_info[12][12];
+shared uvec2 s_flow_grid[18][10][10];
+
+vec2 getPackedLayers(vec2 uv) {
+    float rock_height = texture(rock_layer, clamp(uv, 0.0f, 1.0f)).x;
+    vec2 soil_water_thickness = 
+        texture(soil_water_layer, clamp(uv, 0.0f, 1.0f)).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+
+    float soil_layer_height = rock_height + soil_water_thickness.x;
+    float water_layer_height = soil_layer_height + soil_water_thickness.y;
+    
+    vec2 layer_height = vec2(soil_layer_height, water_layer_height);
+
+    return layer_height;
+}
+
+vec3 getGlobalAirflowVector(vec2 noise) {
+    float angle = params.global_flow_angle + (noise.x - 0.5f) * 0.5f;
+    return vec3(cos(angle), sin(angle), 0.0f) * params.global_flow_scale * (1.0f + noise.y * 0.5f);
+}
+
+vec3 getUpdatedWeatherInfo(ivec2 src_coords, vec2 ground_info) {
+
+    vec2 noise_value = hash23(vec3(src_coords, params.current_time));
+    float sample_idx = getHeightToSample(ground_info.y) * params.size.z + (noise_value.x - 0.5f);
+
+    float water_depth = ground_info.y - ground_info.x;
+    float water_level = clamp((water_depth - 0.01f) * 10.0f, 0.0f, 1.0f);
+    float temp_adjust = mix(params.controls.soil_temp_adj, params.controls.water_temp_adj, water_level);
+    float moist_adjust = mix(params.controls.soil_moist_adj, params.controls.water_moist_adj, water_level);
+
+    temp_adjust *= mix(noise_value.y, 1.0f, 0.5f);
+    moist_adjust *= mix(noise_value.y, 1.0f, 0.5f);
+
+    return vec3(sample_idx, temp_adjust, moist_adjust);
+}
+
+void getMinNeighborPressure(vec3 uvw, ivec3 slc, ivec3 pixel_coords, ivec3 offset, uint node_tag, float air_pressure, inout uint min_space) {
+    uvw += offset * params.inv_size;
+    slc += offset;
+    pixel_coords += offset;
+
+    // load current pressure and temperature.
+    float cur_temp = texture(src_temperature, uvw).x;
+    float cur_moist = texture(src_moisture, uvw).x;
+    vec3 weather_info = s_ground_weather_info[slc.y][slc.x];
+    int sample_idx = int(weather_info.x);
+
+    float current_vapor_pressure = cur_moist * params.moist_to_pressure_ratio;
+    // if tile is above ground, calculate vapor pressure.
+    if (pixel_coords.z >= sample_idx) {
+        // tile is touching ground.
+        if (pixel_coords.z == sample_idx) {
+            // vapor pressure adding pressure from adding moisture.
+            current_vapor_pressure += weather_info.z * params.moist_to_pressure_ratio;
+            cur_temp += weather_info.y;
+        }
+
+        float current_pressure = current_vapor_pressure + air_pressure;
+        uint u_pressure_space = (floatBitsToUint(current_pressure) & 0xfffffff8) | node_tag;
+
+        min_space = min(min_space, u_pressure_space);
+    }
+}
+
+uvec2 packTempDiff(uint u_min_pressure, vec3 uvw, ivec3 slc, ivec3 pixel_coords, vec2 noise_value) {
+    vec3 center_weather_info = s_ground_weather_info[slc.y][slc.x];
+    int center_sample_idx = int(center_weather_info.x);
+
+    uvec2 packed_temp_moist_diff = uvec2(packHalf2x16(vec2(0, 0)), 0);
+    if (pixel_coords.z >= center_sample_idx && u_min_pressure != MAX_UINT_VALUE) {
+        float center_temp = texture(src_temperature, uvw).x;
+        float center_moist = texture(src_moisture, uvw).x;
+        if (pixel_coords.z == center_sample_idx) {
+            center_temp += center_weather_info.y;
+            center_moist += center_weather_info.z;
+        }
+        float center_vapor_pressure = center_moist * params.moist_to_pressure_ratio;
+
+        uint min_tag = u_min_pressure & 0x07;
+        ivec3 min_offset = ivec3(min_tag == kNodeLeft ? -1 : (min_tag == kNodeRight ? 1 : 0),
+                                 min_tag == kNodeBack ? -1 : (min_tag == kNodeFront ? 1 : 0),
+                                 min_tag == kNodeBelow ? -1 : (min_tag == kNodeAbove ? 1 : 0));
+
+        vec3 min_uvw = uvw + vec3(min_offset) * params.inv_size;
+        ivec3 min_slc = slc + min_offset;
+        ivec3 min_pixel_coords = pixel_coords + min_offset;
+
+        vec3 min_weather_info = s_ground_weather_info[min_slc.y][min_slc.x];
+        int min_sample_idx = int(min_weather_info.x);
+        float min_temp = texture(src_temperature, min_uvw).x;
+        float min_moist = texture(src_moisture, min_uvw).x;
+        if (min_pixel_coords.z == min_sample_idx) {
+            min_temp += min_weather_info.y * (noise_value.x * 0.5f + 0.5f);
+            min_moist += min_weather_info.z * (noise_value.y * 0.5f + 0.5f);
+        }
+        float min_vapor_pressure = min_moist * params.moist_to_pressure_ratio;
+
+        float neighbor_pressure_space = uintBitsToFloat(u_min_pressure & 0xfffffff8);
+
+        vec4 hash_values = hash44(vec4(vec3(pixel_coords), params.current_time));
+        vec2 noise_values = hash_values.xy * 2.0f - 1.0f;
+
+        float center_height = getSampleToHeight(uvw.z);
+        float center_air_pressure = getAirPressure(params.controls.sea_level_temperature, center_height);
+        float min_air_pressure = getAirPressure(params.controls.sea_level_temperature, getSampleToHeight(min_uvw.z));
+
+        //float frozen_rate = (center_temp - 12.0f + noise_values.y * 2.0f) / 12.0f * 0.5f + 0.5f;
+        //float frozen_transfer_rate = pow(clamp(frozen_rate, 0.0f, 1.0f), params.controls.frozen_pow_curve);
+    	float temperature = getReferenceDegree(params.controls.sea_level_temperature, center_height);
+        float frozen_transfer_rate = 1.0f - exp(-getBuckSaturatedVaporPressure(temperature) * params.controls.frozen_pow_curve);
+
+        if (center_vapor_pressure > min_vapor_pressure) {
+            float transfer_ratio = params.controls.transfer_ratio * (1.0f + hash_values.x * params.controls.transfer_noise_weight);
+            transfer_ratio *= frozen_transfer_rate;
+            
+            float temp_diff_adj = (center_temp - min_temp) * transfer_ratio;
+            float moist_diff_adj = (center_moist - min_moist) * transfer_ratio;
+            float pressure_diff_adj = (center_vapor_pressure + center_air_pressure - (min_vapor_pressure + min_air_pressure)) * transfer_ratio;
+            packed_temp_moist_diff.x = packHalf2x16(vec2(temp_diff_adj, moist_diff_adj));
+            packed_temp_moist_diff.y = (floatBitsToUint(pressure_diff_adj) & 0xfffffff8) | min_tag;
+        }
+    }
+
+    return packed_temp_moist_diff;
+}
+
+void createTempMoistureFlowBuffer(int pixel_index, ivec3 block_coords) {
+    int iz = pixel_index / (10 * 10);
+    int ixy = pixel_index % (10 * 10);
+
+    ivec3 dlc = ivec3(ixy % 10, ixy / 10, iz);
+    ivec3 slc = dlc + 1;
+
+    ivec3 pixel_coords = clamp(dlc + block_coords - 1,
+                               ivec3(0),
+                               params.size - 1);
+
+    vec4 noise_values = hash44(vec4(vec3(pixel_coords), params.current_time));
+    vec3 uvw = ((pixel_coords + 0.5f) + getGlobalAirflowVector(noise_values.xy)) * params.inv_size;
+
+    float center_air_pressure = getAirPressure(params.controls.sea_level_temperature, getSampleToHeight(uvw.z));
+    float below_air_pressure = getAirPressure(params.controls.sea_level_temperature, getSampleToHeight(uvw.z - params.inv_size.z));
+    float above_air_pressure = getAirPressure(params.controls.sea_level_temperature, getSampleToHeight(uvw.z + params.inv_size.z));
+
+    uint min_pressure = MAX_UINT_VALUE;
+    getMinNeighborPressure(uvw, slc, pixel_coords, ivec3(-1, 0, 0), kNodeLeft, center_air_pressure, min_pressure);
+    getMinNeighborPressure(uvw, slc, pixel_coords, ivec3(1, 0, 0), kNodeRight, center_air_pressure, min_pressure);
+    getMinNeighborPressure(uvw, slc, pixel_coords, ivec3(0, -1, 0), kNodeBack, center_air_pressure, min_pressure);
+    getMinNeighborPressure(uvw, slc, pixel_coords, ivec3(0, 1, 0), kNodeFront, center_air_pressure, min_pressure);
+    getMinNeighborPressure(uvw, slc, pixel_coords, ivec3(0, 0, -1), kNodeBelow, below_air_pressure, min_pressure);
+    getMinNeighborPressure(uvw, slc, pixel_coords, ivec3(0, 0, 1), kNodeAbove, above_air_pressure, min_pressure);
+
+    s_flow_grid[dlc.z][dlc.y][dlc.x] =
+        packTempDiff(min_pressure, uvw, slc, pixel_coords, noise_values.zw);
+}
+
+vec3 gatherTempMoistSamples(ivec3 dlc, out vec3 airflow_dir, float above_ratio, float below_ratio) {
+    ivec3 slc = dlc + 1;
+    uvec2 center = s_flow_grid[slc.z][slc.y][slc.x];
+
+    uvec2 left  = s_flow_grid[slc.z][slc.y][slc.x-1];
+    uvec2 right = s_flow_grid[slc.z][slc.y][slc.x+1];
+    uvec2 back  = s_flow_grid[slc.z][slc.y-1][slc.x];
+    uvec2 front = s_flow_grid[slc.z][slc.y+1][slc.x];
+    uvec2 below = s_flow_grid[slc.z-1][slc.y][slc.x];
+    uvec2 above = s_flow_grid[slc.z+1][slc.y][slc.x];
+
+    vec2 temp_moist_adj = vec2(0);
+    float pressure_adj = 0.0f;
+    vec3 airflow_vec = vec3(0);
+    if ((left.y & 0x07) == kNodeRight) {
+        vec2 tm = unpackHalf2x16(left.x);
+        float p = uintBitsToFloat(left.y & 0xfffffff8);
+        temp_moist_adj += tm;
+        pressure_adj += p;
+        airflow_vec += vec3(p, 0, 0);
+    }
+    if ((right.y & 0x07) == kNodeLeft) {
+        vec2 tm = unpackHalf2x16(right.x);
+        float p = uintBitsToFloat(right.y & 0xfffffff8);
+        temp_moist_adj += tm;
+        pressure_adj += p;
+        airflow_vec += vec3(-p, 0, 0);
+    }
+    if ((back.y & 0x07) == kNodeFront) {
+        vec2 tm = unpackHalf2x16(back.x);
+        float p = uintBitsToFloat(back.y & 0xfffffff8);
+        temp_moist_adj += tm;
+        pressure_adj += p;
+        airflow_vec += vec3(0, 0, p);
+    }
+    if ((front.y & 0x07) == kNodeBack) {
+        vec2 tm = unpackHalf2x16(front.x);
+        float p = uintBitsToFloat(front.y & 0xfffffff8);
+        temp_moist_adj += tm;
+        pressure_adj += p;
+        airflow_vec += vec3(0, 0, -p);
+    }
+    if ((below.y & 0x07) == kNodeAbove) {
+        vec2 tm = unpackHalf2x16(below.x) * below_ratio;
+        float p = uintBitsToFloat(below.y & 0xfffffff8) * below_ratio;
+        temp_moist_adj += tm;
+        pressure_adj += p;
+        airflow_vec += vec3(0, p, 0);
+    }
+    if ((above.y & 0x07) == kNodeBelow) {
+        vec2 tm = unpackHalf2x16(above.x) * above_ratio;
+        float p = uintBitsToFloat(above.y & 0xfffffff8) * above_ratio;
+        temp_moist_adj += tm;
+        pressure_adj += p;
+        airflow_vec += vec3(0, -p, 0);
+    }
+
+    uint flow_tag = center.y & 0x07;
+    vec2 tm = unpackHalf2x16(center.x);
+    float p = uintBitsToFloat(center.y & 0xfffffff8);
+    temp_moist_adj -= tm;
+    pressure_adj -= p;
+
+    airflow_vec += vec3(flow_tag == kNodeLeft  ? -p : (flow_tag == kNodeRight ? p : 0),
+                        flow_tag == kNodeBelow ? -p : (flow_tag == kNodeAbove ? p : 0),
+                        flow_tag == kNodeBack  ? -p : (flow_tag == kNodeFront ? p : 0));
+
+    airflow_dir = airflow_vec;
+    return vec3(temp_moist_adj, pressure_adj);
+}
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 16) in;
+void main()
+{
+    ivec3 pixel_coords = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 local_coords = ivec3(gl_LocalInvocationID.xyz);
+    ivec3 block_coords = ivec3(gl_WorkGroupID.xyz) * ivec3(8, 8, 16);
+    int pixel_index = int(gl_LocalInvocationIndex);
+
+    if (pixel_index < 12 * 12) {
+        ivec2 slc = ivec2(pixel_index % 12, pixel_index / 12);
+        ivec2 src_coords = clamp(slc + block_coords.xy - 2,
+                                 ivec2(0),
+                                 params.size.xy - 1);
+        vec2 noise_values = hash23(vec3(src_coords, params.current_time));
+        vec2 uv = (src_coords + noise_values) * params.inv_size.xy;
+        s_ground_info[slc.y][slc.x] =
+            getPackedLayers((uv - 0.5f) * (kCloudMapSize / kWorldMapSize) + 0.5f);
+
+        s_ground_weather_info[slc.y][slc.x] =
+            getUpdatedWeatherInfo(src_coords, s_ground_info[slc.y][slc.x]);
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    if (pixel_index < (18 * 10 * 10 / 2)) {
+        for (int i = 0; i < 2; i++) {
+            createTempMoistureFlowBuffer(pixel_index * 2 + i, block_coords);
+        }
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    vec3 airflow_dir;
+    float uvw_w = (pixel_coords.z + 0.5) * params.inv_size.z;
+    float sample_delta_h = getSampleToDeltaHeight(uvw_w);
+    float above_sample_delta_h = getSampleToDeltaHeight(uvw_w + params.inv_size.z);
+    float below_sample_delta_h = getSampleToDeltaHeight(uvw_w - params.inv_size.z);
+    vec3 temp_moist_pressure_adj = gatherTempMoistSamples(local_coords,
+                                          airflow_dir,
+                                          above_sample_delta_h / sample_delta_h,
+                                          below_sample_delta_h / sample_delta_h);
+
+    float sample_h = getSampleToHeight(uvw_w);
+    float target_stable_temp = getReferenceDegree(params.controls.sea_level_temperature, sample_h);
+
+    ivec3 slc = local_coords + 2;
+
+    vec4 noise_values = hash44(vec4(vec3(pixel_coords), params.current_time));
+    vec3 uvw = ((pixel_coords + 0.5f) + getGlobalAirflowVector(noise_values.xy)) * params.inv_size;
+
+    float random_angle = noise_values.z * 2.0f * 3.1415926f;
+
+    float scale = pixel_coords.z * params.inv_size.z * 0.0625f;
+    vec2 uv_offset = params.inv_size.xy * scale * vec2(cos(random_angle), sin(random_angle));
+    uvw.xy += uv_offset;
+
+    vec3 center_weather_info = s_ground_weather_info[slc.y][slc.x];
+    int center_sample_idx = int(center_weather_info.x);
+
+    float source_temp = texture(src_temperature, uvw).x;
+    float source_moist = texture(src_moisture, uvw).x;
+    float cur_temp = source_temp;
+    float cur_moist = source_moist;
+    if (pixel_coords.z == center_sample_idx) {
+        cur_temp += center_weather_info.y;
+        cur_moist += center_weather_info.z;
+    }
+
+    cur_temp += temp_moist_pressure_adj.x;
+    cur_moist += temp_moist_pressure_adj.y;
+
+    cur_temp = mix(cur_temp, source_temp, 0.01f);
+    cur_moist = mix(cur_moist, source_moist, 0.01f);
+
+    imageStore(dst_temperature,
+               pixel_coords,
+               vec4(cur_temp));
+    imageStore(dst_moisture,
+               pixel_coords,
+               vec4(cur_moist));
+
+    vec4 src_airflow = imageLoad(dst_airflow, pixel_coords);
+    vec3 src_airflow_dir = src_airflow.xyz * 2.0f - 1.0f;
+    airflow_dir = mix(airflow_dir, src_airflow_dir * getPackedVectorLength(src_airflow.w), params.controls.mix_rate);
+    float new_airflow_str = getNormalizedVectorLength(airflow_dir);
+    imageStore(dst_airflow, pixel_coords, vec4(normalize(airflow_dir) * 0.5f + 0.5f, new_airflow_str));
+}

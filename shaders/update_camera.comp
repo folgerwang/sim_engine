@@ -1,0 +1,215 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tile_common.glsl.h"
+
+layout(push_constant) uniform CameraUniformBufferObject {
+    GameCameraParams params;
+};
+
+layout(std430, set = 0, binding = CAMERA_OBJECT_BUFFER_INDEX) buffer CameraInfoBuffer {
+	GameCameraInfo camera_info;
+};
+
+layout(std430, set = 0, binding = GAME_OBJECTS_BUFFER_INDEX) readonly buffer GameObjectsBuffer {
+    GameObjectInfo items[];
+};
+
+layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
+layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
+
+const float kGravityConst = -9.8f;
+
+struct UnpackedGameObjectInfo {
+    vec3        position;
+    float       scale;
+    vec3        up_vector;
+    vec3        facing_dir;
+    vec3        moving_dir;
+    float       mass;
+    float       awareness_radius;
+    float       awareness_coneangle;
+    uint        status;
+};
+
+vec3 unpackNormalizedVector(uint packed_vector, uint sign) {
+    vec3 result;
+    result.xy = unpackHalf2x16(packed_vector);
+    result.z = sqrt(max(1.0f - dot(result.xy, result.xy), 0.0f)) * (sign > 0 ? -1.0f : 1.0f);
+    return result;
+}
+
+UnpackedGameObjectInfo unpackGameObjectInfo(GameObjectInfo info) {
+    UnpackedGameObjectInfo ugo_info;
+    ugo_info.position = info.position;
+    ugo_info.up_vector = unpackNormalizedVector(info.packed_up_vector, info.packed_moving_dir_z_signs & 0x00010000);
+    ugo_info.facing_dir = unpackNormalizedVector(info.packed_facing_dir, info.packed_moving_dir_z_signs & 0x00020000);
+    ugo_info.moving_dir.xy = unpackHalf2x16(info.packed_moving_dir_xy);
+    ugo_info.moving_dir.z = unpackHalf2x16(info.packed_moving_dir_z_signs).x;
+    vec2 mass_scale = unpackHalf2x16(info.packed_mass_scale);
+    ugo_info.mass = mass_scale.x;
+    ugo_info.scale = mass_scale.y;
+    vec2 radius_angle = unpackHalf2x16(info.packed_radius_angle);
+    ugo_info.awareness_radius = radius_angle.x;
+    ugo_info.awareness_coneangle = radius_angle.y;
+    ugo_info.status = info.status;
+
+    return ugo_info;
+}
+
+float getMovingOnHeight(float v0, float delta_t) {
+    return (v0 + 0.5f * kGravityConst * delta_t) * delta_t;
+}
+
+float getDeltaTByDistance(float v0, float h) {
+    float B = v0 / kGravityConst;
+    float C = -2.0f * h / kGravityConst;
+
+    return -B + sqrt(max(B * B - C, 0.0f));
+}
+
+mat4 lookAt(vec3 eye, vec3 center, vec3 up)
+{
+    vec3 f = normalize(center - eye);
+    vec3 s = normalize(cross(f, up));
+    vec3 u = cross(s, f);
+
+	mat4 result;
+    result[0] = vec4(s.x, u.x, -f.x, 0.0f);
+    result[1] = vec4(s.y, u.y, -f.y, 0.0f);
+    result[2] = vec4(s.z, u.z, -f.z, 0.0f);
+    result[3] = vec4(-dot(s, eye), -dot(u, eye), dot(f, eye), 1.0f);
+	return result;
+}
+
+mat4 perspective(float fovy, float aspect, float z_near, float z_far)
+{
+	float tan_half_fovy = tan(fovy / 2.0f);
+
+	mat4 result;
+	result[0] = vec4(1.0f / (aspect * tan_half_fovy), 0.0f, 0.0f, 0.0f);
+	result[1] = vec4(0.0f, 1.0f / tan_half_fovy, 0.0f, 0.0f);
+	result[2] = vec4(0.0f, 0.0f, -(z_far + z_near) / (z_far - z_near), -1.0f);
+	result[3] = vec4(0.0f, 0.0f, -(2.0f * z_far * z_near) / (z_far - z_near), 0.0f);
+	return result;
+}
+
+layout(local_size_x = 1, local_size_y = 1) in;
+void main()
+{
+    if (camera_info.status == 0 || params.frame_count == 0) {
+        camera_info.position = params.init_camera_pos;
+        camera_info.mouse_pos = params.mouse_pos;
+        camera_info.yaw = params.yaw;
+        camera_info.pitch = params.pitch;
+        camera_info.camera_follow_dist = params.camera_follow_dist;
+        camera_info.status |= 0x00000001;
+    }
+    vec2 mouse_offset = params.mouse_pos - camera_info.mouse_pos;
+    mouse_offset *= params.sensitivity;
+        
+    if (params.camera_rot_update != 0) {
+        camera_info.yaw += mouse_offset.x;
+        camera_info.pitch = clamp(camera_info.pitch + mouse_offset.y, -89.0f, 89.0f);
+    }
+
+    vec3 direction;
+    direction.x = cos(radians(-camera_info.yaw)) * cos(radians(camera_info.pitch));
+    direction.y = sin(radians(camera_info.pitch));
+    direction.z = sin(radians(-camera_info.yaw)) * cos(radians(camera_info.pitch));
+    camera_info.facing_dir = normalize(direction);
+    camera_info.up_vector = abs(camera_info.facing_dir.y) < 0.99f ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    vec3 camera_right = normalize(cross(camera_info.facing_dir, camera_info.up_vector));
+
+    vec3 eye_pos, target_pos, up_dir;
+    if (params.num_game_objs > 0 && params.game_obj_idx >= 0 && params.game_obj_idx < kNumGltfInstance) {
+        UnpackedGameObjectInfo game_obj_info = unpackGameObjectInfo(items[params.game_obj_idx]);
+
+        vec2 world_map_uv = (game_obj_info.position.xz - params.world_min) * params.inv_world_range;
+        float rock_layer_height = texture(rock_layer, world_map_uv).x;
+        vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+        float ground_floor_height = rock_layer_height + soil_water_thickness.x + soil_water_thickness.y;
+
+        vec3 contact_normal = terrainNormal(game_obj_info.position.xz, 0.00025f, 2000.0f);
+
+        {
+#if 0
+            float moving_on_height = getMovingOnHeight(info.moving_dir.y, params.delta_t);
+            float ground_height = ground_floor_height;
+            float height_to_fall = ground_height - info.position.y;
+            float delta_t = params.delta_t;
+            vec2 world_map_uv = (info.position.xz - params.world_min) * params.inv_world_range;
+            if (height_to_fall > moving_on_height) {
+                float fall_delta_t = getDeltaTByDistance(info.moving_dir.y, height_to_fall);
+                info.moving_dir.y += kGravityConst * fall_delta_t;
+                info.position.xz += info.moving_dir.xz * fall_delta_t;
+                info.position.y = ground_height;
+
+                vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+                //touch water.
+                if (soil_water_thickness.y > 0.005f) {
+                    info.position.xz += texture(water_flow, world_map_uv).xy * params.water_flow_strength;
+                }
+                else {
+                    // bouncing.
+                    float delta_t = max(params.delta_t - fall_delta_t, 0.0f);
+                    float moving_len = length(info.moving_dir);
+                    info.moving_dir = reflect(normalize(info.moving_dir), contact_normal) * moving_len * 0.3f;
+                    moving_on_height = getMovingOnHeight(info.moving_dir.y, delta_t);
+                }
+            }
+
+            if (delta_t > 0) {
+                float uvw_z = log2(max((info.position.y - kAirflowLowHeight), 0.0f) + 1.0f) /
+                        log2(kAirflowMaxHeight - kAirflowLowHeight + 1.0f);
+
+                vec4 airflow_info = texture(air_flow, vec3(world_map_uv, uvw_z));
+                vec3 airflow_vec = (airflow_info.xyz * 2.0f - 1.0f) * getPackedVectorLength(airflow_info.w);
+                info.position += vec3(0, moving_on_height, 0);
+                info.position.xz += info.moving_dir.xz * delta_t;
+                if (params.enble_airflow != 0) {
+                    info.position += airflow_vec * delta_t * params.air_flow_strength;
+                }
+
+                info.moving_dir.y += kGravityConst * delta_t;
+            }
+#endif
+        }
+
+        camera_info.camera_follow_dist = max(camera_info.camera_follow_dist - params.mouse_wheel_offset * 0.1f, 0.1f);
+
+        eye_pos = game_obj_info.position - camera_info.facing_dir * camera_info.camera_follow_dist;
+        target_pos = game_obj_info.position;
+        up_dir = camera_info.up_vector;
+    }
+    else {
+        if (params.key == GLFW_KEY_W)
+            camera_info.position += params.camera_speed * camera_info.facing_dir;
+        if (params.key == GLFW_KEY_S)
+            camera_info.position -= params.camera_speed * camera_info.facing_dir;
+        if (params.key == GLFW_KEY_A)
+            camera_info.position -= params.camera_speed * camera_right;
+        if (params.key == GLFW_KEY_D)
+            camera_info.position += params.camera_speed * camera_right;
+
+        eye_pos = camera_info.position;
+        target_pos = eye_pos + camera_info.facing_dir;
+        up_dir = camera_info.up_vector;
+    }
+
+    camera_info.position = eye_pos;
+
+    camera_info.view = lookAt(eye_pos, target_pos, up_dir);
+    camera_info.proj = perspective(params.fov, params.aspect, params.z_near, params.z_far);
+    camera_info.proj[1].y *= -1.0f;
+    camera_info.view_proj = camera_info.proj * camera_info.view;
+    camera_info.inv_view_proj = inverse(camera_info.view_proj);
+    mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
+    camera_info.inv_view_proj_relative = inverse(camera_info.proj * view_relative);
+    camera_info.depth_params = vec4(
+        camera_info.proj[2].z,
+        camera_info.proj[3].z,
+        1.0f / camera_info.proj[0].x,
+        1.0f / camera_info.proj[1].y);
+    camera_info.mouse_pos = params.mouse_pos;
+}

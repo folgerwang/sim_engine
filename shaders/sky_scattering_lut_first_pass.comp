@@ -1,0 +1,56 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+const uint kScatteringLutGroupSampleCount = kAtmosphereScatteringLutGroupSize;
+#include "sky_scattering_lut_common.glsl.h"
+
+layout(push_constant) uniform SkyScatteringUniformBufferObject {
+    SkyScatteringParams params;
+};
+
+layout (set = 0, binding = DST_SCATTERING_LUT_INDEX, rg32f) uniform image2D dst_lut;
+
+layout(local_size_x = 1, local_size_y = kScatteringLutGroupSampleCount, local_size_z = 1) in;
+void main()
+{
+	const uint kNumSamples = 32;
+
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+	uint pixel_index = gl_LocalInvocationIndex;
+
+	float x = (pixel_coords.x + 0.5f) / float(kAtmosphereScatteringLutWidth);
+	float step_y = 1.0f / float(kAtmosphereScatteringLutHeight);
+	float y = pixel_coords.y * step_y;
+
+	float height_from_center = x * kAtmosphereRadius;
+	float sqr_height_from_center = height_from_center * height_from_center;
+	float whole_line_length = 2.0f * sqrt(1.0f - x * x) * kAtmosphereRadius;
+
+	float start_line_length = y * whole_line_length;
+	float sample_line_length = step_y * whole_line_length;
+
+	float step_size = sample_line_length / kNumSamples;
+
+	float accumulate_rlh = 0;
+	float accumulate_mie = 0;
+
+	for (int i = 0; i < kNumSamples; i++) {
+		float sample_length = start_line_length + (i + 0.5f) *step_size;
+		float dist_to_middle = sample_length - whole_line_length * 0.5f;
+		float dist_to_center = sqrt(dist_to_middle * dist_to_middle * sqr_height_from_center);
+
+		float thickness = max(dist_to_center * kPlanetRadius, 0.0f);
+
+		// Accumulate the optical depth.
+		accumulate_rlh += exp(-thickness * params.inv_rayleigh_scale_height) * step_size;
+		accumulate_mie += exp(-thickness * params.inv_mie_scale_height) * step_size;
+	}
+
+	sum_intensity[pixel_index] = vec2(accumulate_rlh, accumulate_mie);
+	memoryBarrierShared();
+	barrier();
+
+	generateIncrementSumArray(pixel_index);
+	imageStore(dst_lut, pixel_coords, vec4(sum_intensity[pixel_index], 0, 0));
+}

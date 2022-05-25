@@ -1,0 +1,73 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+#define BLUR_RADIUS				3
+#define SHARED_BUFFER_SIZE		(64 + BLUR_RADIUS * 2)
+
+layout(push_constant) uniform BlurImageUniformBufferObject {
+    BlurImageParams params;
+};
+
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+	GameCameraInfo camera_info;
+};
+
+layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
+layout(set = 0, binding = DST_TEX_INDEX, r11f_g11f_b10f) uniform image2D dst_img;
+layout(set = 0, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D depth_img;
+
+shared vec4 s_src_color[SHARED_BUFFER_SIZE];
+shared float s_src_depth[SHARED_BUFFER_SIZE];
+layout(local_size_x = 1, local_size_y = 64) in;
+void main()
+{
+	// get index in global work group i.e x,y position
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 local_coords = ivec2(gl_LocalInvocationID.xy);
+	ivec2 block_coords = ivec2(gl_WorkGroupID.x, gl_WorkGroupID.y * 64);
+	uint pixel_index = gl_LocalInvocationIndex;
+
+	if (pixel_index < SHARED_BUFFER_SIZE / 2) {
+		ivec2 slc = ivec2(0, local_coords.y * 2);
+		ivec2 sgc = clamp(slc + block_coords + ivec2(0, -BLUR_RADIUS),
+                             ivec2(0),
+                             ivec2(params.size - 1));
+		vec2 uv0 = (sgc + 0.5) * params.inv_size;
+		vec2 uv1 = vec2(uv0.x, uv0.y + params.inv_size.y);
+	    s_src_color[slc.y] = texture(src_img, uv0);
+		s_src_depth[slc.y] = camera_info.proj[3].z / (texture(depth_img, uv0).x + camera_info.proj[2].z);
+		s_src_color[slc.y+1] = texture(src_img, uv1);
+		s_src_depth[slc.y+1] = camera_info.proj[3].z / (texture(depth_img, uv1).x + camera_info.proj[2].z);
+	}
+
+	barrier();
+    memoryBarrierShared();
+
+	if (pixel_coords.y < params.size.y) {
+		uint center_idx = local_coords.y+BLUR_RADIUS;
+		vec4 sum_color = s_src_color[center_idx];
+		float center_depth = s_src_depth[center_idx];
+		float sum_weight = 1.0f;
+
+		float slope_dir = (s_src_depth[center_idx+1] -
+						   s_src_depth[center_idx-1]) * 0.5f;
+
+		for (int i = 1; i <= BLUR_RADIUS; i++) {
+			uint idx_0 = center_idx+i;
+			uint idx_1 = center_idx-i;
+			float weight = (1.0f / i) * 0.6f + 0.4f;
+			float weight_0 = exp2(-abs(s_src_depth[idx_0] - (slope_dir * i + center_depth)) / i) * weight;
+			float weight_1 = exp2(-abs(s_src_depth[idx_1] - (center_depth - slope_dir * i)) / i) * weight;
+			sum_color += s_src_color[idx_1] * weight_1 + s_src_color[idx_0] * weight_0;
+			sum_weight += weight_1 + weight_0;
+		}
+		vec4 fog_color = sum_color / sum_weight;
+  
+		vec4 src_color = imageLoad(dst_img, pixel_coords);
+		vec3 dst_color = src_color.xyz * fog_color.w + fog_color.xyz;
+
+		// output to a specific pixel in the image.
+		imageStore(dst_img, pixel_coords, vec4(dst_color, src_color.w));
+	}
+}

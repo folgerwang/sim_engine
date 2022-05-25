@@ -1,0 +1,67 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tile_common.glsl.h"
+
+layout(push_constant) uniform TileUniformBufferObject {
+  TileUpdateParams tile_params;
+};
+
+layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
+layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX, rg16) uniform readonly image2D soil_water_layer;
+layout(set = 0, binding = DST_WATER_NORMAL_BUFFER_INDEX, rg8_snorm) uniform image2D dst_water_normal;
+
+shared float s_water_height[18][18];
+
+float getWaterHeight(ivec2 src_coords) {
+    vec2 uv = (src_coords + 0.5f) * tile_params.inv_width_pixel_count;
+    float rock_height = texture(rock_layer, uv).x;
+    vec2 soil_water_thickness = imageLoad(soil_water_layer, src_coords).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+    
+    return rock_height + soil_water_thickness.x + soil_water_thickness.y;
+}
+
+layout(local_size_x = 16, local_size_y = 16) in;
+void main()
+{
+  // get index in global work group i.e x,y position
+  int buffer_size = int(tile_params.width_pixel_count);
+  // skip 2 lines on border.
+  ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 local_coords = ivec2(gl_LocalInvocationID.xy);
+  ivec2 block_coords = ivec2(gl_WorkGroupID.xy) * 16;
+  uint pixel_index = gl_LocalInvocationIndex;
+
+  if (pixel_index < 9 * 18) {
+    ivec2 src_local_coords = ivec2((pixel_index % 9) * 2, pixel_index / 9);
+    ivec2 src_coords = clamp(src_local_coords + block_coords - 1,
+                             0,
+                             buffer_size - 1);
+    s_water_height[src_local_coords.y][src_local_coords.x] = getWaterHeight(src_coords);
+
+    src_coords = clamp(src_local_coords + ivec2(1, 0) + block_coords - 1,
+                       0,
+                       buffer_size - 1);
+    s_water_height[src_local_coords.y][src_local_coords.x + 1] = getWaterHeight(src_coords);
+  }
+
+  barrier();
+  memoryBarrierShared();
+
+  if (all(lessThan(pixel_coords, uvec2(tile_params.width_pixel_count)))) {
+    ivec2 src_local_coords = local_coords + 1;
+    float delta_x = s_water_height[src_local_coords.y][src_local_coords.x + 1] -
+                    s_water_height[src_local_coords.y][src_local_coords.x - 1];
+    float delta_z = s_water_height[src_local_coords.y + 1][src_local_coords.x] -
+                    s_water_height[src_local_coords.y - 1][src_local_coords.x];
+
+    vec3 water_normal = normalize(vec3(-delta_x, 2.0f * tile_params.range_per_pixel.x, -delta_z));
+
+    vec3 current_normal;
+    current_normal.xz = imageLoad(dst_water_normal, pixel_coords).xy;
+    current_normal.y = sqrt(1.0f - dot(current_normal.xz, current_normal.xz));
+
+    vec2 final_normal_xz = normalize(mix(water_normal, current_normal, 0.85)).xz;
+    imageStore(dst_water_normal, pixel_coords, vec4(final_normal_xz, 0, 0));
+  }
+}

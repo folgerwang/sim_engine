@@ -1,0 +1,170 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tile_common.glsl.h"
+#include "weather_common.glsl.h"
+
+layout(push_constant) uniform TileUniformBufferObject {
+  GameObjectsUpdateParams params;
+};
+
+layout(std430, set = 0, binding = GAME_OBJECTS_BUFFER_INDEX) buffer GameObjectsBuffer {
+  GameObjectInfo items[];
+};
+
+layout(std430, set = 0, binding = CAMERA_OBJECT_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+	GameCameraInfo camera_info;
+};
+
+layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
+layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
+layout(set = 0, binding = WATER_FLOW_BUFFER_INDEX) uniform sampler2D water_flow;
+layout(set = 0, binding = SRC_AIRFLOW_INDEX) uniform sampler3D air_flow;
+
+const float kGravityConst = -9.8f;
+
+struct UnpackedGameObjectInfo {
+    vec3        position;
+    float       scale;
+    vec3        up_vector;
+    vec3        facing_dir;
+    vec3        moving_dir;
+    float       mass;
+    float       awareness_radius;
+    float       awareness_coneangle;
+    uint        status;
+};
+
+vec3 unpackNormalizedVector(uint packed_vector, uint sign) {
+    vec3 result;
+    result.xy = unpackHalf2x16(packed_vector);
+    result.z = sqrt(max(1.0f - dot(result.xy, result.xy), 0.0f)) * (sign > 0 ? -1.0f : 1.0f);
+    return result;
+}
+
+UnpackedGameObjectInfo unpackGameObjectInfo(GameObjectInfo info) {
+    UnpackedGameObjectInfo ugo_info;
+    ugo_info.position = info.position;
+    ugo_info.up_vector = unpackNormalizedVector(info.packed_up_vector, info.packed_moving_dir_z_signs & 0x00010000);
+    ugo_info.facing_dir = unpackNormalizedVector(info.packed_facing_dir, info.packed_moving_dir_z_signs & 0x00020000);
+    ugo_info.moving_dir.xy = unpackHalf2x16(info.packed_moving_dir_xy);
+    ugo_info.moving_dir.z = unpackHalf2x16(info.packed_moving_dir_z_signs).x;
+    vec2 mass_scale = unpackHalf2x16(info.packed_mass_scale);
+    ugo_info.mass = mass_scale.x;
+    ugo_info.scale = mass_scale.y;
+    vec2 radius_angle = unpackHalf2x16(info.packed_radius_angle);
+    ugo_info.awareness_radius = radius_angle.x;
+    ugo_info.awareness_coneangle = radius_angle.y;
+    ugo_info.status = info.status;
+
+    return ugo_info;
+}
+
+GameObjectInfo packGameObjectInfo(UnpackedGameObjectInfo info) {
+    GameObjectInfo go_info;
+    go_info.packed_mass_scale = packHalf2x16(vec2(info.mass, info.scale));
+    go_info.packed_radius_angle = packHalf2x16(vec2(info.awareness_radius, info.awareness_coneangle));
+    go_info.position = info.position;
+    go_info.packed_up_vector = packHalf2x16(info.up_vector.xy);
+    go_info.packed_facing_dir = packHalf2x16(info.facing_dir.xy);
+    go_info.packed_moving_dir_xy = packHalf2x16(info.moving_dir.xy);
+    go_info.packed_moving_dir_z_signs = packHalf2x16(vec2(info.moving_dir.z, 0));
+    go_info.packed_moving_dir_z_signs |= (info.up_vector.z < 0.0f ? 0x00010000 : 0x00);
+    go_info.packed_moving_dir_z_signs |= (info.facing_dir.z < 0.0f ? 0x00020000 : 0x00);
+    go_info.status = info.status;
+
+    return go_info;
+}
+
+float getMovingOnHeight(float v0, float delta_t) {
+    return (v0 + 0.5f * kGravityConst * delta_t) * delta_t;
+}
+
+float getDeltaTByDistance(float v0, float h) {
+    float B = v0 / kGravityConst;
+    float C = -2.0f * h / kGravityConst;
+
+    return -B + sqrt(max(B * B - C, 0.0f));
+}
+
+layout(local_size_x = 64, local_size_y = 1) in;
+void main()
+{
+  // get index in global work group i.e x,y position
+  uint obj_idx = gl_GlobalInvocationID.x;
+  if (obj_idx < params.num_objects) {
+    float nx = hash1(obj_idx);
+    float ny = hash1(obj_idx + 0.3);
+    float nz = hash1(obj_idx + 0.6);
+
+    UnpackedGameObjectInfo info = unpackGameObjectInfo(items[obj_idx]);
+    vec2 world_map_uv = (info.position.xz - params.world_min) * params.inv_world_range;
+    float rock_layer_height = texture(rock_layer, world_map_uv).x;
+    vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+    float ground_floor_height = rock_layer_height + soil_water_thickness.x + soil_water_thickness.y;
+
+    vec3 contact_normal = terrainNormal(info.position.xz, 0.00025f, 2000.0f);
+
+    if (info.status == 0 || params.frame_count == 0) {
+#if kNumGltfInstance == 1
+        info.position = camera_info.position;
+#else
+        info.position = camera_info.position +
+                        vec3((nx * 2.0f - 1.0f) * 400.0f,
+                             200.0f,
+                             (nz * 2.0f - 1.0f) * 400.0f);
+#endif
+        info.moving_dir = vec3(0, 0, 0);
+        info.mass = 0.1f;
+        info.awareness_radius = 20.0f;
+        info.awareness_coneangle = 30.0f;
+        info.up_vector = vec3(0, 1, 0);
+        info.facing_dir = vec3(0, 0, 1);
+        info.scale = 1.0f;
+        info.status |= 0x00000001;
+    }
+    else {
+        float moving_on_height = getMovingOnHeight(info.moving_dir.y, params.delta_t);
+        float ground_height = ground_floor_height;
+        float height_to_fall = ground_height - info.position.y;
+        float delta_t = params.delta_t;
+        vec2 world_map_uv = (info.position.xz - params.world_min) * params.inv_world_range;
+        if (height_to_fall > moving_on_height) {
+            float fall_delta_t = getDeltaTByDistance(info.moving_dir.y, height_to_fall);
+            info.moving_dir.y += kGravityConst * fall_delta_t;
+            info.position.xz += info.moving_dir.xz * fall_delta_t;
+            info.position.y = ground_height;
+
+            vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+            //touch water.
+            if (soil_water_thickness.y > 0.005f) {
+                info.position.xz += texture(water_flow, world_map_uv).xy * params.water_flow_strength;
+            }
+            else {
+                // bouncing.
+                float delta_t = max(params.delta_t - fall_delta_t, 0.0f);
+                float moving_len = length(info.moving_dir);
+                info.moving_dir = reflect(normalize(info.moving_dir), contact_normal) * moving_len * 0.3f;
+                moving_on_height = getMovingOnHeight(info.moving_dir.y, delta_t);
+            }
+        }
+
+        if (delta_t > 0) {
+            float uvw_z = log2(max((info.position.y - kAirflowLowHeight), 0.0f) + 1.0f) /
+                    log2(kAirflowMaxHeight - kAirflowLowHeight + 1.0f);
+
+            vec4 airflow_info = texture(air_flow, vec3(world_map_uv, uvw_z));
+            vec3 airflow_vec = (airflow_info.xyz * 2.0f - 1.0f) * getPackedVectorLength(airflow_info.w);
+            info.position += vec3(0, moving_on_height, 0);
+            info.position.xz += info.moving_dir.xz * delta_t;
+            if (params.enble_airflow != 0) {
+                info.position += airflow_vec * delta_t * params.air_flow_strength;
+            }
+
+            info.moving_dir.y += kGravityConst * delta_t;
+        }
+    }
+
+    items[obj_idx] = packGameObjectInfo(info);
+  }
+}

@@ -1,0 +1,34 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "noise.glsl.h"
+#include "inoise.glsl.h"
+
+// reference : https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-26-implementing-improved-perlin-noise
+
+layout(push_constant) uniform PerlinNoiseUniformBufferObject {
+  NoiseInitParams params;
+};
+
+layout(set = 0, binding = DST_PERLIN_NOISE_TEX_INDEX, rgba8) uniform writeonly image3D dst_perlin_noise;
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+void main()
+{
+	// skip 2 lines on border.
+	ivec3 pixel_coords = ivec3(gl_GlobalInvocationID.xyz);
+	vec4 noise_value = hash43(vec3(pixel_coords));
+	vec3 pixel_position = vec3(pixel_coords);
+	vec3 uvw = (pixel_position + 0.5f) * params.inv_vol_size;
+
+	float fbm_mod_val = 8.0f;
+	float fbm_perlin_noise = fbm(uvw * fbm_mod_val, fbm_mod_val);
+	float worley_mod_val = 12.0f;
+	float worley_noise_weight = 0.7f;
+	float r = fbm_perlin_noise * (1.0f - getWorleyNoise(uvw, worley_mod_val) * worley_noise_weight);
+	float g = 1.0f - getWorleyNoise(fract(uvw * 2.0f), worley_mod_val) * worley_noise_weight;
+	float b = 1.0f - getWorleyNoise(fract(uvw * 4.0f), worley_mod_val) * worley_noise_weight;
+	float a = 1.0f - getWorleyNoise(fract(uvw * 8.0f), worley_mod_val) * worley_noise_weight;
+
+	imageStore(dst_perlin_noise, pixel_coords, vec4(r, g, b, a));
+}

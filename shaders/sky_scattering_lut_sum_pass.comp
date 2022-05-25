@@ -1,0 +1,29 @@
+#version 460
+#include "global_definition.glsl.h"
+
+const uint kAtmosphereScatteringLutGroupCount =
+	kAtmosphereScatteringLutHeight / kAtmosphereScatteringLutGroupSize;
+const uint kScatteringLutGroupSampleCount = kAtmosphereScatteringLutGroupCount;
+#include "sky_scattering_lut_common.glsl.h"
+
+layout (set = 0, binding = DST_SCATTERING_LUT_SUM_INDEX, rg32f) uniform image2D dst_sum_lut;
+layout (set = 0, binding = SRC_SCATTERING_LUT_INDEX, rg32f) uniform image2D src_lut;
+
+layout (local_size_x = 1, local_size_y = kScatteringLutGroupSampleCount, local_size_z = 1) in;
+void main() {
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 load_src_coords =
+		ivec2(pixel_coords.x,
+			  pixel_coords.y * kAtmosphereScatteringLutGroupSize - 1);
+	uint pixel_index = gl_LocalInvocationIndex;
+	sum_intensity[pixel_index] =
+		pixel_coords.y == 0 ?
+		vec2(0) :
+		imageLoad(src_lut, load_src_coords).xy;
+	
+	memoryBarrierShared();
+	barrier();
+
+	generateIncrementSumArray(pixel_index);
+	imageStore(dst_sum_lut, pixel_coords, vec4(sum_intensity[pixel_index], 0, 0));
+}

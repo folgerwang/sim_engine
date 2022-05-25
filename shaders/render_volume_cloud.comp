@@ -1,0 +1,105 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+#define RENDER_SUNLIGHT_SCATTERING  1
+const int iSteps = 16;
+const int jSteps = 8;
+
+#include "global_definition.glsl.h"
+#include "noise.glsl.h"
+#include "inoise.glsl.h"
+#include "weather_common.glsl.h"
+#include "sunlight_scattering.glsl.h"
+
+layout(push_constant) uniform VolumeMoistUniformBufferObject {
+    VolumeMoistrueParams params;
+};
+
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+	GameCameraInfo camera_info;
+};
+
+layout(set = 0, binding = SRC_MOISTURE_TEX_INDEX) uniform sampler3D src_moisture;
+layout(set = 0, binding = SRC_TEMP_TEX_INDEX) uniform sampler3D src_temperature;
+layout(set = 0, binding = SRC_CLOUD_LIGHTING_TEX_INDEX) uniform sampler3D src_cloud_shadow;
+layout(set = 0, binding = DETAIL_NOISE_TEXTURE_INDEX) uniform sampler3D src_detail_noise_tex;
+layout(set = 0, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampler3D src_rough_noise_tex;
+layout(set = 0, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D src_depth;
+layout(set = 0, binding = DST_FOG_CLOUD_INDEX, rgba16f) uniform writeonly image2D dst_fog_cloud;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+void main()
+{
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    vec2 in_uv = (pixel_coords + 0.5) * params.inv_screen_size;
+    vec2 ss_xy = in_uv * 2.0f - 1.0f;
+    vec4 position_ss = vec4(ss_xy, -1.0f * camera_info.proj[2][2] + camera_info.proj[3][2], 1.0f);
+    vec3 view_dir = normalize((camera_info.inv_view_proj_relative * position_ss).xyz);
+    float view_vec_length = length(view_dir);
+
+    float depth_z = texture(src_depth, in_uv).r;
+    float dist_scale = length(vec3(ss_xy * camera_info.depth_params.zw, 1.0f));
+    float bg_view_dist = camera_info.proj[3].z / (depth_z + camera_info.proj[2].z) * dist_scale;
+
+    float t = rsi_n(camera_info.position.xyz, view_dir, kAirflowMaxHeight);
+
+    float cast_dist = 10000.0f;
+    if (t > 0.0f) {
+        cast_dist = t;
+    }
+
+    t = rsi_n(camera_info.position.xyz, view_dir, kAirflowLowHeight);
+
+    if (t > 0.0f && t < cast_dist) {
+        cast_dist = t;
+    }
+
+    cast_dist = min(cast_dist, bg_view_dist);
+    const float normal_scale = 1434.0f;
+    view_dir = ivec3(view_dir * normal_scale) / normal_scale;
+        
+    vec2 noise = hash23((fract(view_dir) + 0.5f) * normal_scale);
+/*    vec3 noise_dir = hash33(view_dir * 1434.0f) * 2.0f - 1.0f;
+    view_dir = normalize(view_dir + noise_dir * 0.000173f);*/
+
+    const uint num_samples = 32;
+    const float inv_num_samples = 1.0f / num_samples;
+
+    const float cast_dist_per_sample = cast_dist * inv_num_samples;
+
+    float cos_theta = dot(view_dir, normalize(params.sun_pos));
+    float phase = henyeyGreensteinPhaseFunc(params.g, cos_theta);
+
+    vec3 fg_color = vec3(0);
+    float final_alpha = 1.0f;
+    float last_dist = cast_dist_per_sample * (num_samples + noise.x);
+    for (int i = 0; i < num_samples; i++) {
+        float cur_dist = cast_dist_per_sample * (num_samples - i + noise.x);
+        float thickness = max(last_dist - cur_dist, 0.0f);
+
+        vec3 sample_pos = camera_info.position.xyz + cur_dist * view_dir;
+        vec3 uvw = worldPositionToUvw(sample_pos);
+
+        float cur_moisture = texture(src_moisture, uvw).x;
+        vec3 noise_uvw = vec3(sample_pos.x, sample_pos.y + params.time * params.noise_speed_scale, sample_pos.z);
+        vec4 perlin_noise_value_0 = texture(src_detail_noise_tex, noise_uvw * params.noise_scale.x);
+        vec4 perlin_noise_value_1 = texture(src_rough_noise_tex, noise_uvw * params.noise_scale.y);
+        float noise_value = dot(max(perlin_noise_value_0 - params.noise_thresold, 0.0f) / (1.0f - params.noise_thresold), params.noise_weight_0);
+        noise_value += dot(max(perlin_noise_value_1 - params.noise_thresold, 0.0f) / (1.0f - params.noise_thresold), params.noise_weight_1);
+        noise_value -= 0.55f;
+        float cur_temp = texture(src_temperature, uvw).x;
+        float saturate_vapor_moisture = getBuckSaturatedVaporPressure(cur_temp) * params.pressure_to_moist_ratio;
+        float extinct = thickness * max(cur_moisture - saturate_vapor_moisture, 0.0f) * params.view_ext_factor * max(noise_value, 0.0f);
+        float cloud_shadow = texture(src_cloud_shadow, uvw).x;
+
+        vec3 cloud_lighting = (vec3(params.phase_intensity) * phase + vec3(params.ambient_intensity)) * cloud_shadow;
+
+        float cur_alpha = exp2(-pow(extinct, params.view_ext_exponent));
+        fg_color = mix(cloud_lighting, fg_color, cur_alpha);
+        final_alpha *= cur_alpha;
+
+        last_dist = cur_dist;
+    }
+
+    imageStore(dst_fog_cloud, pixel_coords, vec4(fg_color, final_alpha));
+}

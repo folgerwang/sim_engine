@@ -1,0 +1,28 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "weather_common.glsl.h"
+#include "noise.glsl.h"
+#include "functions.glsl.h"
+#include "brdf.glsl.h"
+#include "punctual.glsl.h"
+#include "ibl.glsl.h"
+
+layout(push_constant) uniform CloudLightingUniformBufferObject {
+  CloudShadowParams params;
+};
+
+layout(set = 0, binding = SRC_MOISTURE_TEX_INDEX) uniform sampler3D src_moisture;
+layout(set = 0, binding = DST_CLOUD_SHADOW_TEX_INDEX, r16f) uniform writeonly image3D dst_cloud_shadow;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main()
+{
+    ivec3 pixel_coords = ivec3(gl_GlobalInvocationID.xyz);
+    vec3 uvw = (pixel_coords + 0.5f) * params.inv_size;
+
+    float layer_height = getSampleToDeltaHeight(uvw.z);
+    float light_pass = exp(-layer_height * texture(src_moisture, uvw).x * params.light_ext_factor);
+
+    imageStore(dst_cloud_shadow, pixel_coords, vec4(light_pass));
+}

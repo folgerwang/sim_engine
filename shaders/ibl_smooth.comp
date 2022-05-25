@@ -1,0 +1,36 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+layout(push_constant) uniform IblUniformBufferObject {
+    IblComputeParams ibl_params;
+};
+
+layout(rgba32f, set = 0, binding = SRC_TEX_INDEX) uniform imageCube src_img;
+layout(rgba32f, set = 0, binding = DST_TEX_INDEX) uniform imageCube dst_img;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+void main()
+{
+  // get index in global work group i.e x,y position
+  ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+
+  // base pixel colour for image
+  vec4 pixel = vec4(0);
+  const int sample_count = 1;
+  int num_samples = 0;
+  for (int y = -sample_count; y <= sample_count; y++) {
+	for(int x = -sample_count; x <= sample_count; x++) {
+		ivec2 cur_coord = pixel_coords + ivec2(x, y);
+		if (cur_coord.x >= 0 && cur_coord.y >= 0 && cur_coord.x < ibl_params.size.x && cur_coord.y < ibl_params.size.y) {
+			pixel += imageLoad(src_img, ivec3(pixel_coords + ivec2(x, y), gl_GlobalInvocationID.z));
+			num_samples ++;
+		}
+	}
+  }
+
+  pixel /= num_samples;
+  
+  // output to a specific pixel in the image
+  imageStore(dst_img, ivec3(pixel_coords, gl_GlobalInvocationID.z), pixel);
+}
