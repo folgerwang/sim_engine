@@ -374,7 +374,7 @@ std::string  initCompileGlobalShaders(
     s_compiler_path = compiler_path;
 
     std::string error_strings;
-    const auto shader_compiler_str = s_compiler_path + "\\glslc.exe";
+    const auto shader_compiler_str = s_compiler_path + "\\glslc.exe ";
 
     std::fstream fs;
     fs.open(s_src_shader_path + "\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
