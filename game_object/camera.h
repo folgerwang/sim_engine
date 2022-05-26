@@ -1,7 +1,7 @@
 #pragma once
 #include <unordered_map>
 #include "renderer/renderer.h"
-#include "global_definition.glsl.h"
+#include "shaders/global_definition.glsl.h"
 
 namespace engine {
 namespace game_object {

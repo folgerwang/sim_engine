@@ -283,7 +283,7 @@ static void analyzeCommandLine(
 
 std::string compileGlobalShaders() {
     std::string error_strings;
-    const std::string input_path = "src\\engine\\shaders";
+    const std::string input_path = "src\\sim_engine\\shaders";
     const std::string output_path = "lib\\shaders";
     auto input_folder_exist = std::filesystem::exists(input_path);
     auto output_folder_exist = std::filesystem::exists(output_path);
@@ -293,7 +293,7 @@ std::string compileGlobalShaders() {
         }
         if (output_folder_exist) {
             std::fstream fs;
-            fs.open("src\\shaders\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
+            fs.open("src\\sim_engine\\shaders\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
 
             std::string buffer;
             if (fs.is_open()) {
@@ -317,7 +317,7 @@ std::string compileGlobalShaders() {
                 stat(output_name.c_str(), &output_attrib);
 
                 if (true/*input_attrib.st_mtime > output_attrib.st_mtime*/) {
-                    auto cmd_str = "src\\third_party\\vulkan_lib\\glslc.exe " + input_name + " " + params_str + " " + output_name;
+                    auto cmd_str = "src\\sim_engine\\third_parties\\vulkan_lib\\glslc.exe " + input_name + " " + params_str + " " + output_name;
 
                     auto result = exec((cmd_str + " 2>&1").c_str());
 
@@ -366,12 +366,12 @@ void analyzeAndSplitFilePath(const std::string& path_name) {
 
 std::string  initCompileGlobalShaders() {
     std::string error_strings;
-    const auto input_path = "src\\shaders";
+    const auto input_path = "src\\sim_engine\\shaders";
     const auto output_path = "lib\\shaders";
-    const auto shader_compiler_str = "src\\third_party\\vulkan_lib\\glslc.exe ";
+    const auto shader_compiler_str = "src\\sim_engine\\third_parties\\vulkan_lib\\glslc.exe ";
 
     std::fstream fs;
-    fs.open("src\\shaders\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
+    fs.open("src\\sim_engine\\shaders\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
 
     std::string buffer;
     if (fs.is_open()) {
