@@ -19,6 +19,9 @@
 
 namespace engine {
 namespace helper {
+static std::string s_src_shader_path;
+static std::string s_output_path;
+static std::string s_compiler_path;
 
 std::vector<uint64_t> readFile(const std::string& file_name, uint64_t& file_size) {
     std::ifstream file(file_name, std::ios::ate | std::ios::binary);
@@ -283,17 +286,15 @@ static void analyzeCommandLine(
 
 std::string compileGlobalShaders() {
     std::string error_strings;
-    const std::string input_path = "src\\sim_engine\\shaders";
-    const std::string output_path = "lib\\shaders";
-    auto input_folder_exist = std::filesystem::exists(input_path);
-    auto output_folder_exist = std::filesystem::exists(output_path);
+    auto input_folder_exist = std::filesystem::exists(s_src_shader_path);
+    auto output_folder_exist = std::filesystem::exists(s_output_path);
     if (input_folder_exist) {
         if (!output_folder_exist) {
-            output_folder_exist = std::filesystem::create_directory(output_path);
+            output_folder_exist = std::filesystem::create_directory(s_output_path);
         }
         if (output_folder_exist) {
             std::fstream fs;
-            fs.open("src\\sim_engine\\shaders\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
+            fs.open(s_src_shader_path + "\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
 
             std::string buffer;
             if (fs.is_open()) {
@@ -309,15 +310,15 @@ std::string compileGlobalShaders() {
             for (std::string line; std::getline(buf_str, line); ) {
                 std::string input_name, output_name, params_str;
                 analyzeCommandLine(line, input_name, output_name, params_str);
-                input_name = input_path + input_name;
-                output_name = output_path + output_name;
+                input_name = s_src_shader_path + input_name;
+                output_name = s_output_path + output_name;
 
                 struct stat input_attrib, output_attrib;
                 stat(input_name.c_str(), &input_attrib);
                 stat(output_name.c_str(), &output_attrib);
 
                 if (true/*input_attrib.st_mtime > output_attrib.st_mtime*/) {
-                    auto cmd_str = "src\\sim_engine\\third_parties\\vulkan_lib\\glslc.exe " + input_name + " " + params_str + " " + output_name;
+                    auto cmd_str = s_compiler_path + "\\glslc.exe " + input_name + " " + params_str + " " + output_name;
 
                     auto result = exec((cmd_str + " 2>&1").c_str());
 
@@ -364,14 +365,19 @@ void analyzeAndSplitFilePath(const std::string& path_name) {
     }
 }
 
-std::string  initCompileGlobalShaders() {
+std::string  initCompileGlobalShaders(
+    const std::string& src_shader_path,
+    const std::string& output_path,
+    const std::string& compiler_path) {
+    s_src_shader_path = src_shader_path;
+    s_output_path = output_path;
+    s_compiler_path = compiler_path;
+
     std::string error_strings;
-    const auto input_path = "src\\sim_engine\\shaders";
-    const auto output_path = "lib\\shaders";
-    const auto shader_compiler_str = "src\\sim_engine\\third_parties\\vulkan_lib\\glslc.exe ";
+    const auto shader_compiler_str = s_compiler_path + "\\glslc.exe";
 
     std::fstream fs;
-    fs.open("src\\sim_engine\\shaders\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
+    fs.open(s_src_shader_path + "\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
 
     std::string buffer;
     if (fs.is_open()) {
@@ -387,8 +393,8 @@ std::string  initCompileGlobalShaders() {
     for (std::string line; std::getline(buf_str, line); ) {
         std::string input_name, output_name, params_str;
         analyzeCommandLine(line, input_name, output_name, params_str);
-        input_name = input_path + input_name;
-        output_name = output_path + output_name;
+        input_name = s_src_shader_path + input_name;
+        output_name = s_output_path + output_name;
 
         struct stat input_attrib, output_attrib;
         stat(input_name.c_str(), &input_attrib);
