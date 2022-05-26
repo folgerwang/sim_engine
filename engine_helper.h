@@ -56,7 +56,10 @@ std::pair<std::string, int> exec(const char* cmd);
 
 std::string compileGlobalShaders();
 
-std::string initCompileGlobalShaders();
+std::string initCompileGlobalShaders(
+    const std::string& src_shader_path,
+    const std::string& output_path,
+    const std::string& compiler_path);
 
 } // namespace helper
 } // namespace engine
