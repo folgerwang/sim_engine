@@ -31,7 +31,8 @@ public:
         const glm::uvec2& display_size);
 
     void draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list);
+        const renderer::DescriptorSetList& desc_set_list,
+        uint32_t draw_idx = -1);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

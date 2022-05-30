@@ -52,7 +52,8 @@ void main() {
 
     vec3 light = -camera_info.facing_dir;
 
-    vec3 diffuse = max(dot(light, normalize(n)), 0.0) * texture(diffuse_tex, uv).rgb;
+    float ambient = 0.2f;
+    vec3 diffuse = (max(dot(light, normalize(n)), 0.0) + ambient) * texture(diffuse_tex, uv).rgb;
 
     outColor = vec4(diffuse, 1.0f);
 }

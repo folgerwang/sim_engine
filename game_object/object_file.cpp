@@ -480,7 +480,8 @@ void ObjectMesh::loadObjectFile(
 
 void ObjectMesh::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const renderer::DescriptorSetList& desc_set_list) {
+    const renderer::DescriptorSetList& desc_set_list,
+    uint32_t draw_idx/* = -1 */ ) {
 
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, object_pipeline_);
 
@@ -507,7 +508,12 @@ void ObjectMesh::draw(
         &model_params,
         sizeof(model_params));
 
-    for (auto& patch : patches_) {
+    for (auto i_patch = 0; i_patch < patches_.size(); i_patch++) {
+        auto& patch = patches_[i_patch];
+        if (draw_idx != (uint32_t)-1 && draw_idx != i_patch) {
+            continue;
+        }
+
         std::vector<std::shared_ptr<renderer::Buffer>> buffers;
         std::vector<uint64_t> offsets;
         if (patch->getPositionBuffer()) {
