@@ -21,33 +21,28 @@ void main()
     float inv_segment_count = 1.0f / tile_params.width_pixel_count;
     vec2 tile_step = tile_params.world_range * inv_segment_count;
 
-#if 0
     vec2 map_coords = tile_params.world_min + (pixel_coords + 0.25f) * tile_step;
     vec2 map_coords1 = map_coords + 0.5f * tile_step;
 
-    vec2 height_info = terrainMap(map_coords);
-    imageStore(rock_layer, pixel_coords * 2, vec4(height_info.x));
-    height_info = terrainMap(vec2(map_coords1.x, map_coords.y));
-    imageStore(rock_layer, pixel_coords * 2 + ivec2(1, 0), vec4(height_info.x));
-    height_info = terrainMap(vec2(map_coords.x, map_coords1.y));
-    imageStore(rock_layer, pixel_coords * 2 + ivec2(0, 1), vec4(height_info.x));
-    height_info = terrainMap(map_coords1);
-    imageStore(rock_layer, pixel_coords * 2 + ivec2(1, 1), vec4(height_info.x));
-#else
+    vec2 height_noise_00 = terrainMap(map_coords, 0.00025f, 2000.0f);
+    vec2 height_noise_01 = terrainMap(vec2(map_coords1.x, map_coords.y), 0.00025f, 2000.0f);
+    vec2 height_noise_10 = terrainMap(vec2(map_coords.x, map_coords1.y), 0.00025f, 2000.0f);
+    vec2 height_noise_11 = terrainMap(map_coords1, 0.00025f, 2000.0f);
+
     ivec2 scoord_0 = pixel_coords * 2;
     ivec2 scoord_1 = pixel_coords * 2 + ivec2(1, 0);
     ivec2 scoord_2 = pixel_coords * 2 + ivec2(0, 1);
     ivec2 scoord_3 = pixel_coords * 2 + ivec2(1, 1);
 
-    float height_info = texture(heightmap_tex, (scoord_0 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
-    imageStore(rock_layer, scoord_0, vec4(height_info));
-    height_info = texture(heightmap_tex, (scoord_1 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
-    imageStore(rock_layer, scoord_1, vec4(height_info));
-    height_info = texture(heightmap_tex, (scoord_2 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
-    imageStore(rock_layer, scoord_2, vec4(height_info));
-    height_info = texture(heightmap_tex, (scoord_3 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
-    imageStore(rock_layer, scoord_3, vec4(height_info));
-#endif
+    float height_noise_scale = 0.2f;
+    float heightmap_00 = texture(heightmap_tex, (scoord_0 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_0, vec4(heightmap_00 + height_noise_00.x * height_noise_scale));
+    float heightmap_10 = texture(heightmap_tex, (scoord_1 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_1, vec4(heightmap_10 + height_noise_10.x * height_noise_scale));
+    float heightmap_01 = texture(heightmap_tex, (scoord_2 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_2, vec4(heightmap_01 + height_noise_01.x * height_noise_scale));
+    float heightmap_11 = texture(heightmap_tex, (scoord_3 + 0.5f) * inv_segment_count * 0.5f).x * 2000.0f;
+    imageStore(rock_layer, scoord_3, vec4(heightmap_11 + height_noise_11.x * height_noise_scale));
 
     const float kWaterInitLevel = 1.0f;
     const float kSoilInitLevel = 5.0f;
