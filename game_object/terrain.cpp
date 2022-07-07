@@ -22,6 +22,8 @@
 #include "terrain.h"
 #include "shaders/global_definition.glsl.h"
 
+//#define USE_MESH_SHADER
+
 #if 0
 float tree_line = 0.0f;
 float tree_col = 0.0f;
@@ -1784,6 +1786,33 @@ static renderer::ShaderModuleList getTileShaderModules(
     return shader_modules;
 }
 
+static renderer::ShaderModuleList getTileMeshShaderModules(
+    std::shared_ptr<renderer::Device> device,
+    const std::string& ms_name,
+    const std::string& ps_name,
+    const std::string& ts_name = "") {
+    renderer::ShaderModuleList shader_modules(2);
+    shader_modules[0] =
+        renderer::helper::loadShaderModule(
+            device,
+            ms_name,
+            renderer::ShaderStageFlagBits::MESH_BIT_NV);
+    shader_modules[1] =
+        renderer::helper::loadShaderModule(
+            device,
+            ps_name,
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+    if (ts_name.size() > 0) {
+        shader_modules.push_back(
+            renderer::helper::loadShaderModule(
+                device,
+                ts_name,
+                renderer::ShaderStageFlagBits::TASK_BIT_NV));
+    }
+    return shader_modules;
+}
+
+
 static std::shared_ptr<renderer::DescriptorSetLayout> createTileCreateDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings(4);
@@ -1977,8 +2006,13 @@ static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const glm::uvec2& display_size) {
 
+#ifdef    USE_MESH_SHADER
+    auto shader_modules =
+        getTileMeshShaderModules(device, "grass_mesh.spv", "grass_frag.spv");
+#else
     auto shader_modules =
         getTileShaderModules(device, "grass_vert.spv", "grass_frag.spv", "grass_geom.spv");
+#endif
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = false;
@@ -2860,9 +2894,13 @@ void TileObject::drawGrass(
         tile_pipeline_layout_,
         new_desc_sets);
 
+#ifdef    USE_MESH_SHADER
+    cmd_buf->drawMeshTasks(1);
+#else
     cmd_buf->drawIndexedIndirect(
         grass_indirect_draw_cmd_,
         0);
+#endif
 }
 
 void TileObject::generateAllDescriptorSets(

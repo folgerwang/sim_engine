@@ -22,6 +22,9 @@ PFN_vkBuildAccelerationStructuresKHR vkBuildAccelerationStructuresKHR;
 PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR;
 PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR;
 PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
+PFN_vkCmdDrawMeshTasksNV vkCmdDrawMeshTasksNV;
+PFN_vkCmdDrawMeshTasksIndirectNV vkCmdDrawMeshTasksIndirectNV;
+PFN_vkCmdDrawMeshTasksIndirectCountNV vkCmdDrawMeshTasksIndirectCountNV;
 
 namespace helper {
 
@@ -41,7 +44,8 @@ const std::vector<const char*> device_extensions = {
     VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
     VK_KHR_SPIRV_1_4_EXTENSION_NAME,
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
-    VK_KHR_DEVICE_GROUP_EXTENSION_NAME
+    VK_KHR_DEVICE_GROUP_EXTENSION_NAME,
+    VK_NV_MESH_SHADER_EXTENSION_NAME
 };
 
 #ifdef NDEBUG
@@ -1982,6 +1986,9 @@ void initRayTracingProperties(
     vkCmdTraceRaysKHR = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(vkGetDeviceProcAddr(vk_device, "vkCmdTraceRaysKHR"));
     vkGetRayTracingShaderGroupHandlesKHR = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(vkGetDeviceProcAddr(vk_device, "vkGetRayTracingShaderGroupHandlesKHR"));
     vkCreateRayTracingPipelinesKHR = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(vkGetDeviceProcAddr(vk_device, "vkCreateRayTracingPipelinesKHR"));
+    vkCmdDrawMeshTasksNV = reinterpret_cast<PFN_vkCmdDrawMeshTasksNV>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksNV"));
+    vkCmdDrawMeshTasksIndirectNV = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectNV>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectNV"));
+    vkCmdDrawMeshTasksIndirectCountNV = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectCountNV>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectCountNV"));
 
     // Get ray tracing pipeline properties, which will be used later on in the sample
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR  ray_tracing_pipeline_properties{};

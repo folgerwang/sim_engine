@@ -18,6 +18,9 @@ extern PFN_vkBuildAccelerationStructuresKHR vkBuildAccelerationStructuresKHR;
 extern PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR;
 extern PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR;
 extern PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
+extern PFN_vkCmdDrawMeshTasksNV vkCmdDrawMeshTasksNV;
+extern PFN_vkCmdDrawMeshTasksIndirectNV vkCmdDrawMeshTasksIndirectNV;
+extern PFN_vkCmdDrawMeshTasksIndirectCountNV vkCmdDrawMeshTasksIndirectCountNV;
 
 namespace helper {
 

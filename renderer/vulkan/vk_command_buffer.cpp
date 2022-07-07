@@ -241,6 +241,18 @@ void VulkanCommandBuffer::drawIndirect(
     vkCmdDrawIndirect(cmd_buf_, vk_indirect_buffer->get(), buffer_offset, draw_count, stride);
 }
 
+void VulkanCommandBuffer::drawMeshTasks(uint32_t task_count /*= 0*/, uint32_t first_task/* = 0 */ ) {
+    vkCmdDrawMeshTasksNV(cmd_buf_, task_count, first_task);
+}
+
+void VulkanCommandBuffer::drawMeshTasksIndirect() {
+
+}
+
+void VulkanCommandBuffer::drawMeshTasksIndirectCount() {
+
+}
+
 void VulkanCommandBuffer::dispatch(uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z/* = 1*/) {
     vkCmdDispatch(cmd_buf_, group_count_x, group_count_y, group_count_z);
 }

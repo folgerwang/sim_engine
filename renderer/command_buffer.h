@@ -75,6 +75,11 @@ public:
         uint32_t buffer_offset = 0,
         uint32_t draw_count = 1,
         uint32_t stride = sizeof(DrawIndirectCommand)) = 0;
+    virtual void drawMeshTasks(
+        uint32_t task_count = 0,
+        uint32_t first_task = 0) = 0;
+    virtual void drawMeshTasksIndirect() = 0;
+    virtual void drawMeshTasksIndirectCount() = 0;
     virtual void dispatch(
         uint32_t group_count_x, 
         uint32_t group_count_y, 
