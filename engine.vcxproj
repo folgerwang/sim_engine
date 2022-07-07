@@ -105,6 +105,7 @@
     <None Include="shaders\grass.comp" />
     <None Include="shaders\grass.frag" />
     <None Include="shaders\grass.geom" />
+    <None Include="shaders\grass.mesh" />
     <None Include="shaders\grass.vert" />
     <None Include="shaders\ibl_smooth.comp" />
     <None Include="shaders\lungs.frag" />

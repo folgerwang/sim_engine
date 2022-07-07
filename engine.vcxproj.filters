@@ -409,5 +409,8 @@
     <None Include="shaders\ray_tracing\raytracing_shadow\rt_closesthit.rchit">
       <Filter>Resource Files\ray_tracing\raytracing_shadow</Filter>
     </None>
+    <None Include="shaders\grass.mesh">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

@@ -2,7 +2,7 @@
 #include "global_definition.glsl.h"
 
 layout (points) in;
-layout (triangle_strip, max_vertices = 5) out;
+layout (triangle_strip, max_vertices = 14) out;
 
 layout(location = 0) in VsPsData {
     vec4 position_ws;
@@ -40,5 +40,31 @@ void main() {
     gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(0.0, 1.0, 0.0), 1.0);
     EmitVertex();
   
+    EndPrimitive();
+
+    angle = in_data[0].position_ws.w * 2.0f * 3.1415926 + 3.1415926 / 2.0f;
+    sincos_xy = vec2(sin(angle), cos(angle));
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(sincos_xy.x * root_size, 0.0, sincos_xy.y * root_size), 1.0);
+    EmitVertex();
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(-sincos_xy.x * root_size, 0.0, -sincos_xy.y * root_size), 1.0);
+    EmitVertex();
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(sincos_xy.x * leaf_size, 0.5, sincos_xy.y * leaf_size), 1.0);
+    EmitVertex();
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(-sincos_xy.x * leaf_size, 0.5, -sincos_xy.y * leaf_size), 1.0);
+    EmitVertex();
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(sincos_xy.x * leaf_1_size, 0.8, sincos_xy.y * leaf_1_size), 1.0);
+    EmitVertex();
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(-sincos_xy.x * leaf_1_size, 0.8, -sincos_xy.y * leaf_1_size), 1.0);
+    EmitVertex();
+
+    gl_Position = camera_info.view_proj * vec4(in_data[0].position_ws.xyz + vec3(0.0, 1.0, 0.0), 1.0);
+    EmitVertex();
+
     EndPrimitive();
 }  
