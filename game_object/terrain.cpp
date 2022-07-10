@@ -1885,10 +1885,14 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescript
         SRC_DEPTH_TEX_INDEX);
     bindings[2] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ROCK_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV) |
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
     bindings[3] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SOIL_WATER_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV) |
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
     bindings[4] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ORTHER_INFO_LAYER_BUFFER_INDEX,
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
@@ -2849,11 +2853,17 @@ void TileObject::draw(
 void TileObject::drawGrass(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
-    const glm::uvec2 display_size,
+    const glm::vec2& camera_pos,
+    const glm::uvec2& display_size,
     int dbuf_idx,
     float delta_t,
     float cur_time) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
+
+    auto ratio = glm::clamp((getMinDistToCamera(camera_pos) - 256.0f) / 1024.0f, 0.0f, 1.0f);
+    auto min_num_grass = static_cast<float>(TileConst::kMinNumGrass);
+    auto max_num_grass = static_cast<float>(TileConst::kMaxNumGrass);
+    auto num_grass = max_num_grass * (1.0f - ratio) + min_num_grass * ratio;
 
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, tile_grass_pipeline_);
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
@@ -2881,6 +2891,7 @@ void TileObject::drawGrass(
     tile_params.tile_index = block_idx_;
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV) |
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
         tile_pipeline_layout_,
         &tile_params,
@@ -2895,7 +2906,7 @@ void TileObject::drawGrass(
         new_desc_sets);
 
 #ifdef    USE_MESH_SHADER
-    cmd_buf->drawMeshTasks(1);
+    cmd_buf->drawMeshTasks((num_grass + 31) / 32);
 #else
     cmd_buf->drawIndexedIndirect(
         grass_indirect_draw_cmd_,
@@ -2918,7 +2929,8 @@ void TileObject::generateAllDescriptorSets(
 void TileObject::drawAllVisibleTiles(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
-    const glm::uvec2 display_size,
+    const glm::vec2& camera_pos,
+    const glm::uvec2& display_size,
     int dbuf_idx,
     float delta_t,
     float cur_time,
@@ -2939,6 +2951,7 @@ void TileObject::drawAllVisibleTiles(
             tile->drawGrass(
                 cmd_buf,
                 desc_set_list,
+                camera_pos,
                 display_size,
                 dbuf_idx,
                 delta_t,

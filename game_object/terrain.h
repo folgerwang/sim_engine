@@ -171,7 +171,8 @@ public:
     static void drawAllVisibleTiles(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
-        const glm::uvec2 display_size,
+        const glm::vec2& camera_pos,
+        const glm::uvec2& display_size,
         int dbuf_idx,
         float delta_t,
         float cur_time,
@@ -206,7 +207,8 @@ public:
     void drawGrass(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
-        const glm::uvec2 display_size,
+        const glm::vec2& camera_pos,
+        const glm::uvec2& display_size,
         int dbuf_idx,
         float delta_t,
         float cur_time);
