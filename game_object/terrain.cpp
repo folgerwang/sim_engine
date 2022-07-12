@@ -2906,7 +2906,7 @@ void TileObject::drawGrass(
         new_desc_sets);
 
 #ifdef    USE_MESH_SHADER
-    cmd_buf->drawMeshTasks((static_cast<uint32_t>(num_grass * 2) + 31) / 32);
+    cmd_buf->drawMeshTasks((static_cast<uint32_t>(num_grass * 2) + 15) / 16);
 #else
     cmd_buf->drawIndexedIndirect(
         grass_indirect_draw_cmd_,
