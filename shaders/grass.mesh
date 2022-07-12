@@ -5,7 +5,7 @@
 #include "noise.glsl.h"
 
 out gl_MeshPerVertexNV {
-    vec4 gl_Position;
+    vec4  gl_Position;
 } gl_MeshVerticesNV[];
 
 layout(push_constant) uniform TileUniformBufferObject {
@@ -19,11 +19,16 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
 
+layout(location = 0) out VsPsData {
+    vec2 tex_coord;
+} out_data[];
+
 layout(local_size_x = 32) in;
-layout(triangles, max_vertices=4, max_primitives=2) out;
+layout(triangles, max_vertices=256, max_primitives=256) out;
 void main()
 {
     uint grass_idx = gl_GlobalInvocationID.x;
+    uint local_idx = gl_LocalInvocationID.x;
     vec4 hash_values = clamp(hash43(vec3(tile_params.min, grass_idx)), 0.0f, 1.0f);
 
     // tile world position.
@@ -38,21 +43,60 @@ void main()
 
     vec3 grass_root_pos = vec3(pos_xz_ws.x, ground_height, pos_xz_ws.y);
 
-    vec3 v0 = grass_root_pos + vec3(-1.0, 0.0, -1.0);
-    vec3 v1 = grass_root_pos + vec3(1.0, 0.0, -1.0);
-    vec3 v2 = grass_root_pos + vec3(-1.0, 0.0, 1.0);
-    vec3 v3 = grass_root_pos + vec3(1.0, 0.0, 1.0);
+    float angle = hash_values.w * 2.0f * 3.1415926;
+    vec2 sincos_xy = vec2(sin(angle), cos(angle));
 
-    gl_MeshVerticesNV[0].gl_Position = camera_info.view_proj * vec4(v0, 1.0); // Upper Left
-    gl_MeshVerticesNV[1].gl_Position = camera_info.view_proj * vec4(v1, 1.0); // Upper Right
-    gl_MeshVerticesNV[2].gl_Position = camera_info.view_proj * vec4(v2, 1.0); // Bottom Left
-    gl_MeshVerticesNV[3].gl_Position = camera_info.view_proj * vec4(v3, 1.0); // Bottom Right
-    gl_PrimitiveIndicesNV[0] = 0;
-    gl_PrimitiveIndicesNV[1] = 1;
-    gl_PrimitiveIndicesNV[2] = 2;
-    gl_PrimitiveIndicesNV[3] = 2;
-    gl_PrimitiveIndicesNV[4] = 1;
-    gl_PrimitiveIndicesNV[5] = 3;
-    gl_PrimitiveCountNV += 2;
+    const float root_size = 0.05;
+    const float leaf_size = 0.08;
+    const float leaf_1_size = 0.03;
+
+    gl_MeshVerticesNV[local_idx * 7 + 0].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(sincos_xy.x * root_size, 0.0, sincos_xy.y * root_size), 1.0);
+    out_data[local_idx * 7 + 0].tex_coord = vec2(1, 1);
+
+    gl_MeshVerticesNV[local_idx * 7 + 1].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(-sincos_xy.x * root_size, 0.0, -sincos_xy.y * root_size), 1.0);
+    out_data[local_idx * 7 + 1].tex_coord = vec2(1, 1);
+
+    gl_MeshVerticesNV[local_idx * 7 + 2].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(sincos_xy.x * leaf_size, 0.5, sincos_xy.y * leaf_size), 1.0);
+    out_data[local_idx * 7 + 2].tex_coord = vec2(1, 1);
+
+    gl_MeshVerticesNV[local_idx * 7 + 3].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(-sincos_xy.x * leaf_size, 0.5, -sincos_xy.y * leaf_size), 1.0);
+    out_data[local_idx * 7 + 3].tex_coord = vec2(1, 1);
+
+    gl_MeshVerticesNV[local_idx * 7 + 4].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(sincos_xy.x * leaf_1_size, 0.8, sincos_xy.y * leaf_1_size), 1.0);
+    out_data[local_idx * 7 + 4].tex_coord = vec2(1, 1);
+
+    gl_MeshVerticesNV[local_idx * 7 + 5].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(-sincos_xy.x * leaf_1_size, 0.8, -sincos_xy.y * leaf_1_size), 1.0);
+    out_data[local_idx * 7 + 5].tex_coord = vec2(1, 1);
+
+    gl_MeshVerticesNV[local_idx * 7 + 6].gl_Position =
+        camera_info.view_proj * vec4(grass_root_pos + vec3(0.0, 1.0, 0.0), 1.0);
+    out_data[local_idx * 7 + 6].tex_coord = vec2(1, 1);
+
+    gl_PrimitiveIndicesNV[local_idx * 15 + 0] = local_idx * 7 + 0;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 1] = local_idx * 7 + 1;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 2] = local_idx * 7 + 2;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 3] = local_idx * 7 + 1;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 4] = local_idx * 7 + 2;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 5] = local_idx * 7 + 3;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 6] = local_idx * 7 + 2;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 7] = local_idx * 7 + 3;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 8] = local_idx * 7 + 4;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 9] = local_idx * 7 + 3;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 10] = local_idx * 7 + 4;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 11] = local_idx * 7 + 5;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 12] = local_idx * 7 + 4;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 13] = local_idx * 7 + 5;
+    gl_PrimitiveIndicesNV[local_idx * 15 + 14] = local_idx * 7 + 6;
+
+
+    if (local_idx == 0) {
+        gl_PrimitiveCountNV = 32 * 5;
+    }
 }
     

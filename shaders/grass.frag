@@ -7,6 +7,10 @@
 
 layout(location = 0) out vec4 outColor;
 
+layout(location = 0) in VsPsData {
+    vec2 tex_coord;
+} in_data;
+
 void main() {
-    outColor = vec4(0, 1, 0, 1.0);
+    outColor = vec4(in_data.tex_coord, 0, 1.0);
 }

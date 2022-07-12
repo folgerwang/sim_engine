@@ -22,7 +22,7 @@
 #include "terrain.h"
 #include "shaders/global_definition.glsl.h"
 
-//#define USE_MESH_SHADER
+#define USE_MESH_SHADER
 
 #if 0
 float tree_line = 0.0f;
@@ -2906,7 +2906,7 @@ void TileObject::drawGrass(
         new_desc_sets);
 
 #ifdef    USE_MESH_SHADER
-    cmd_buf->drawMeshTasks((num_grass + 31) / 32);
+    cmd_buf->drawMeshTasks((static_cast<uint32_t>(num_grass * 2) + 31) / 32);
 #else
     cmd_buf->drawIndexedIndirect(
         grass_indirect_draw_cmd_,
