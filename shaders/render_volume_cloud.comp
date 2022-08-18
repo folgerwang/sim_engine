@@ -62,7 +62,7 @@ void main()
 /*    vec3 noise_dir = hash33(view_dir * 1434.0f) * 2.0f - 1.0f;
     view_dir = normalize(view_dir + noise_dir * 0.000173f);*/
 
-    const uint num_samples = 32;
+    const uint num_samples = 24;
     const float inv_num_samples = 1.0f / num_samples;
 
     const float cast_dist_per_sample = cast_dist * inv_num_samples;

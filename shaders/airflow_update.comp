@@ -9,6 +9,20 @@
 #define INVALIDATE_VALUE  0xffffffff
 #define MIN_UINT_VALUE    0x00000000
 
+#define PATCH_SIZE_X         8
+#define PATCH_SIZE_Y         8
+#define PATCH_SIZE_Z         16
+#define PATCH_SIZE           (PATCH_SIZE_X * PATCH_SIZE_Y * PATCH_SIZE_Z)
+#define INFO_BUFFER_SIZE_X   (PATCH_SIZE_X + 4)
+#define INFO_BUFFER_SIZE_Y   (PATCH_SIZE_Y + 4)
+#define INFO_BUFFER_SIZE     (INFO_BUFFER_SIZE_X * INFO_BUFFER_SIZE_Y)
+#define FLOW_BUFFER_SIZE_X   (PATCH_SIZE_X + 2)
+#define FLOW_BUFFER_SIZE_Y   (PATCH_SIZE_Y + 2)
+#define FLOW_BUFFER_SIZE_Z   (PATCH_SIZE_Z + 2)
+#define FLOW_BUFFER_SIZE_XY  (FLOW_BUFFER_SIZE_X * FLOW_BUFFER_SIZE_Y)
+#define FLOW_BUFFER_SIZE     (FLOW_BUFFER_SIZE_XY * FLOW_BUFFER_SIZE_Z)
+#define PATCH_LOOP_COUNT     ((FLOW_BUFFER_SIZE + PATCH_SIZE - 1) / PATCH_SIZE)
+
 layout(push_constant) uniform AirflowUniformBufferObject {
   AirflowUpdateParams params;
 };
@@ -21,9 +35,9 @@ layout(set = 0, binding = DST_AIRFLOW_TEX_INDEX, rgba8) uniform image3D dst_airf
 layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
 
-shared vec2 s_ground_info[12][12];
-shared vec3 s_ground_weather_info[12][12];
-shared uvec2 s_flow_grid[18][10][10];
+shared vec2 s_ground_info[INFO_BUFFER_SIZE_Y][INFO_BUFFER_SIZE_X];
+shared vec3 s_ground_weather_info[INFO_BUFFER_SIZE_Y][INFO_BUFFER_SIZE_X];
+shared uvec2 s_flow_grid[FLOW_BUFFER_SIZE_Z][FLOW_BUFFER_SIZE_Y][FLOW_BUFFER_SIZE_X];
 
 vec2 getPackedLayers(vec2 uv) {
     float rock_height = texture(rock_layer, clamp(uv, 0.0f, 1.0f)).x;
@@ -156,10 +170,10 @@ uvec2 packTempDiff(uint u_min_pressure, vec3 uvw, ivec3 slc, ivec3 pixel_coords,
 }
 
 void createTempMoistureFlowBuffer(int pixel_index, ivec3 block_coords) {
-    int iz = pixel_index / (10 * 10);
-    int ixy = pixel_index % (10 * 10);
+    int iz = pixel_index / FLOW_BUFFER_SIZE_XY;
+    int ixy = pixel_index % FLOW_BUFFER_SIZE_XY;
 
-    ivec3 dlc = ivec3(ixy % 10, ixy / 10, iz);
+    ivec3 dlc = ivec3(ixy % FLOW_BUFFER_SIZE_X, ixy / FLOW_BUFFER_SIZE_Y, iz);
     ivec3 slc = dlc + 1;
 
     ivec3 pixel_coords = clamp(dlc + block_coords - 1,
@@ -243,16 +257,16 @@ vec2 gatherTempMoistSamples(ivec3 dlc, out vec3 airflow_dir, float above_ratio, 
     return temp_moist_adj;
 }
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 16) in;
+layout(local_size_x = PATCH_SIZE_X, local_size_y = PATCH_SIZE_Y, local_size_z = PATCH_SIZE_Z) in;
 void main()
 {
     ivec3 pixel_coords = ivec3(gl_GlobalInvocationID.xyz);
     ivec3 local_coords = ivec3(gl_LocalInvocationID.xyz);
-    ivec3 block_coords = ivec3(gl_WorkGroupID.xyz) * ivec3(8, 8, 16);
+    ivec3 block_coords = ivec3(gl_WorkGroupID.xyz) * ivec3(PATCH_SIZE_X, PATCH_SIZE_Y, PATCH_SIZE_Z);
     int pixel_index = int(gl_LocalInvocationIndex);
 
-    if (pixel_index < 12 * 12) {
-        ivec2 slc = ivec2(pixel_index % 12, pixel_index / 12);
+    if (pixel_index < INFO_BUFFER_SIZE) {
+        ivec2 slc = ivec2(pixel_index % INFO_BUFFER_SIZE_X, pixel_index / INFO_BUFFER_SIZE_Y);
         ivec2 src_coords = clamp(slc + block_coords.xy - 2,
                                  ivec2(0),
                                  params.size.xy - 1);
@@ -268,9 +282,10 @@ void main()
     barrier();
     memoryBarrierShared();
 
-    if (pixel_index < (18 * 10 * 10 / 2)) {
-        for (int i = 0; i < 2; i++) {
-            createTempMoistureFlowBuffer(pixel_index * 2 + i, block_coords);
+    for (int i = 0; i < PATCH_LOOP_COUNT; i++) {
+        int local_idx = PATCH_SIZE * i + pixel_index;
+        if (local_idx < FLOW_BUFFER_SIZE) {
+            createTempMoistureFlowBuffer(local_idx, block_coords);
         }
     }
 
