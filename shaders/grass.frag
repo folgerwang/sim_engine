@@ -12,5 +12,6 @@ layout(location = 0) in VsPsData {
 } in_data;
 
 void main() {
-    outColor = vec4(in_data.tex_coord, 0, 1.0);
+    float a = pow(max((abs(in_data.tex_coord.x - 0.5) - 0.003), 0.0), 0.05);
+    outColor = vec4(vec3(a * 0.1 + 0.9) * vec3(0.5, 1.0, 0.45), 1.0);
 }

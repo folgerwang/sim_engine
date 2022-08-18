@@ -24,7 +24,7 @@ layout(location = 0) out VsPsData {
 } out_data[];
 
 layout(local_size_x = 16) in;
-layout(triangles, max_vertices=256, max_primitives=256) out;
+layout(triangles, max_vertices=256, max_primitives=512) out;
 void main()
 {
     uint grass_idx = gl_GlobalInvocationID.x;
@@ -43,41 +43,42 @@ void main()
 
     vec3 grass_root_pos = vec3(pos_xz_ws.x, ground_height, pos_xz_ws.y);
 
-    float angle = hash_values.w * 2.0f * 3.1415926 + tile_params.time;
-    vec2 sincos_xy = vec2(sin(angle), cos(angle));
+    float root_angle = hash_values.w * 2.0 * 3.1415926;
+    float top_angle = root_angle + (hash_values.z * 2.0 - 1.0) * 3.1415926 * 0.5;
 
     vec2 vert_info[] = {
-        vec2(0.022, 0.0f),
-        vec2(0.025, 0.3f),
-        vec2(0.03, 0.4f),
-        vec2(0.032, 0.5f),
-        vec2(0.03, 0.6f),
-        vec2(0.025, 0.7f),
-        vec2(0.01, 0.9f),
+        vec2(0.034, 0.0f),
+        vec2(0.05, 0.3f),
+        vec2(0.06, 0.4f),
+        vec2(0.064, 0.5f),
+        vec2(0.06, 0.6f),
+        vec2(0.05, 0.7f),
+        vec2(0.02, 0.9f),
+        vec2(0.002, 1.0f)
     };
 
-    for (int i_vert = 0; i_vert < 7; i_vert++) {
-        uint v_idx = local_idx * 15 + i_vert * 2;
+    for (int i_vert = 0; i_vert < 8; i_vert++) {
+        float angle = mix(root_angle, top_angle, vert_info[i_vert].y);
+        vec2 sincos_xy = vec2(sin(angle), cos(angle));
+        vec3 vert_ofs_0 = vec3(sincos_xy.x, 1.0f, sincos_xy.y) * vert_info[i_vert].xyx;
+        vec3 vert_ofs_1 = vec3(-sincos_xy.x, 1.0f, -sincos_xy.y) * vert_info[i_vert].xyx;
+        uint v_idx = local_idx * 16 + i_vert * 2;
         gl_MeshVerticesNV[v_idx].gl_Position =
-            camera_info.view_proj * vec4(grass_root_pos + vec3(sincos_xy.x * vert_info[i_vert].x, vert_info[i_vert].y, sincos_xy.y * vert_info[i_vert].x), 1.0);
-        out_data[v_idx].tex_coord = vec2(1, 1);
+            camera_info.view_proj * vec4(grass_root_pos + vert_ofs_0, 1.0);
+        out_data[v_idx].tex_coord = vec2(0.5 + vert_info[i_vert].x, vert_info[i_vert].y);
         gl_MeshVerticesNV[v_idx+1].gl_Position =
-            camera_info.view_proj * vec4(grass_root_pos + vec3(-sincos_xy.x * vert_info[i_vert].x, vert_info[i_vert].y, -sincos_xy.y * vert_info[i_vert].x), 1.0);
-        out_data[v_idx+1].tex_coord = vec2(1, 1);
+            camera_info.view_proj * vec4(grass_root_pos + vert_ofs_1, 1.0);
+        out_data[v_idx+1].tex_coord = vec2(0.5 - vert_info[i_vert].x, vert_info[i_vert].y);
     }
 
-    gl_MeshVerticesNV[local_idx * 15 + 14].gl_Position =
-        camera_info.view_proj * vec4(grass_root_pos + vec3(0, 1, 0), 1.0);
-    out_data[local_idx * 15 + 14].tex_coord = vec2(1, 1);
-
-    for (int i_poly = 0; i_poly < 13; i_poly++) {
-        gl_PrimitiveIndicesNV[local_idx * 39 + i_poly * 3 + 0] = local_idx * 15 + i_poly;
-        gl_PrimitiveIndicesNV[local_idx * 39 + i_poly * 3 + 1] = local_idx * 15 + i_poly + 1;
-        gl_PrimitiveIndicesNV[local_idx * 39 + i_poly * 3 + 2] = local_idx * 15 + i_poly + 2;
+    for (int i_poly = 0; i_poly < 14; i_poly++) {
+        gl_PrimitiveIndicesNV[local_idx * 42 + i_poly * 3 + 0] = local_idx * 16 + i_poly;
+        gl_PrimitiveIndicesNV[local_idx * 42 + i_poly * 3 + 1] = local_idx * 16 + i_poly + 1;
+        gl_PrimitiveIndicesNV[local_idx * 42 + i_poly * 3 + 2] = local_idx * 16 + i_poly + 2;
     }
 
     if (local_idx == 0) {
-        gl_PrimitiveCountNV = 16 * 13;
+        gl_PrimitiveCountNV = 16 * 14;
     }
 }
     

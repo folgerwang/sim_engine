@@ -23,7 +23,7 @@ class Menu {
     float view_ext_exponent_ = 1.0f;
     float cloud_ambient_intensity_ = 1.0f;
     float cloud_phase_intensity_ = 0.5f;
-    float cloud_moist_to_pressure_ratio_ = 0.1f;
+    float cloud_moist_to_pressure_ratio_ = 0.05f;
     float global_flow_dir_ = 85.0f;
     float global_flow_speed_ = 0.5f;
     float cloud_noise_thresold_ = 0.3f;
