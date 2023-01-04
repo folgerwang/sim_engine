@@ -17,7 +17,7 @@ shared uvec2 s_terrain_layers[20][20];
 shared uint s_adjust_layers[18][18];
 
 uvec2 getPackedLayers(ivec2 src_coords) {
-    vec2 uv = src_coords * tile_params.inv_width_pixel_count;
+    vec2 uv = (src_coords + 0.5f) * tile_params.inv_width_pixel_count;
     float rock_height = texture(rock_layer, uv).x;
     vec2 soil_water_thickness = imageLoad(soil_water_layer, src_coords).xy;
     
