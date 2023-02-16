@@ -5,11 +5,11 @@
 const int iSteps = 16;
 const int jSteps = 8;
 
-#include "global_definition.glsl.h"
-#include "noise.glsl.h"
-#include "inoise.glsl.h"
+#include "..\global_definition.glsl.h"
+#include "..\noise.glsl.h"
+#include "..\inoise.glsl.h"
 #include "weather_common.glsl.h"
-#include "sunlight_scattering.glsl.h"
+#include "..\sunlight_scattering.glsl.h"
 
 layout(push_constant) uniform VolumeMoistUniformBufferObject {
     VolumeMoistrueParams params;

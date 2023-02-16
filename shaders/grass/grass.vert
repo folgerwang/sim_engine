@@ -1,8 +1,8 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
-#include "global_definition.glsl.h"
-#include "tile_common.glsl.h"
-#include "noise.glsl.h"
+#include "..\global_definition.glsl.h"
+#include "..\terrain\tile_common.glsl.h"
+#include "..\noise.glsl.h"
 
 layout(location = VINPUT_POSITION) in vec3 in_position;
 

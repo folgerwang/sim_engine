@@ -2012,10 +2012,10 @@ static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
 
 #ifdef    USE_MESH_SHADER
     auto shader_modules =
-        getTileMeshShaderModules(device, "grass_mesh.spv", "grass_frag.spv");
+        getTileMeshShaderModules(device, "grass/grass_mesh.spv", "grass/grass_frag.spv");
 #else
     auto shader_modules =
-        getTileShaderModules(device, "grass_vert.spv", "grass_frag.spv", "grass_geom.spv");
+        getTileShaderModules(device, "grass/grass_vert.spv", "grass/grass_frag.spv", "grass/grass_geom.spv");
 #endif
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
@@ -2219,7 +2219,7 @@ void TileObject::createStaticMembers(
             renderer::helper::createComputePipeline(
                 device,
                 tile_creator_pipeline_layout_,
-                "tile_creator_comp.spv");
+                "terrain/tile_creator_comp.spv");
     }
 
     if (tile_update_pipeline_layout_ == nullptr) {
@@ -2236,7 +2236,7 @@ void TileObject::createStaticMembers(
             renderer::helper::createComputePipeline(
                 device,
                 tile_update_pipeline_layout_,
-                "tile_update_comp.spv");
+                "terrain/tile_update_comp.spv");
     }
 
     if (tile_flow_update_pipeline_layout_ == nullptr) {
@@ -2253,7 +2253,7 @@ void TileObject::createStaticMembers(
             renderer::helper::createComputePipeline(
                 device,
                 tile_flow_update_pipeline_layout_,
-                "tile_flow_update_comp.spv");
+                "terrain/tile_flow_update_comp.spv");
     }
 
     auto desc_set_layouts = global_desc_set_layouts;
@@ -2275,8 +2275,8 @@ void TileObject::createStaticMembers(
                 tile_pipeline_layout_,
                 graphic_pipeline_info,
                 display_size,
-                "tile_soil_vert.spv",
-                "tile_frag.spv");
+                "terrain/tile_soil_vert.spv",
+                "terrain/tile_frag.spv");
     }
 
     if (tile_water_pipeline_ == nullptr) {
@@ -2288,8 +2288,8 @@ void TileObject::createStaticMembers(
                 tile_pipeline_layout_,
                 graphic_pipeline_info,
                 display_size,
-                "tile_water_vert.spv",
-                "tile_water_frag.spv");
+                "terrain/tile_water_vert.spv",
+                "terrain/tile_water_frag.spv");
     }
 
     if (tile_grass_pipeline_ == nullptr) {
@@ -2781,7 +2781,7 @@ void TileObject::updateTileFlowBuffers(
     tile_params.width_pixel_count = dispatch_count;
     tile_params.inv_width_pixel_count = 1.0f / dispatch_count;
     tile_params.range_per_pixel = tile_params.world_range * tile_params.inv_width_pixel_count;
-    tile_params.flow_speed_factor = glm::vec2(2.0f);
+    tile_params.flow_speed_factor = glm::vec2(1.0f);
     tile_params.current_time = current_time;
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),

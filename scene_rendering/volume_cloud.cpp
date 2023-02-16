@@ -476,7 +476,7 @@ void VolumeCloud::recreate(
         renderer::helper::createComputePipeline(
             device,
             render_cloud_fog_pipeline_layout_,
-            "render_volume_cloud_comp.spv");
+            "weather/render_volume_cloud_comp.spv");
 }
 
 void VolumeCloud::renderVolumeCloud(

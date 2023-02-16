@@ -58,6 +58,15 @@
     <Filter Include="Resource Files\ray_tracing\raytracing_shadow">
       <UniqueIdentifier>{738b2b92-d3c0-427f-8c01-1c6d36fa5a1b}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Resource Files\terrain">
+      <UniqueIdentifier>{3ade918e-f99d-49db-aead-1f568f387fd5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resource Files\grass">
+      <UniqueIdentifier>{e88b729e-973e-4552-8c24-a216ab2b30cf}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resource Files\weather">
+      <UniqueIdentifier>{01f5ba18-90a7-43e8-9abf-7a117cbd4fa7}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="engine_helper.cpp">
@@ -257,17 +266,14 @@
     <ClInclude Include="shaders\sunlight_scattering.glsl.h">
       <Filter>Resource Files</Filter>
     </ClInclude>
-    <ClInclude Include="shaders\tile_common.glsl.h">
-      <Filter>Resource Files</Filter>
+    <ClInclude Include="shaders\terrain\tile_common.glsl.h">
+      <Filter>Resource Files\terrain</Filter>
     </ClInclude>
-    <ClInclude Include="shaders\weather_common.glsl.h">
-      <Filter>Resource Files</Filter>
+    <ClInclude Include="shaders\weather\weather_common.glsl.h">
+      <Filter>Resource Files\weather</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <None Include="shaders\airflow_update.comp">
-      <Filter>Resource Files</Filter>
-    </None>
     <None Include="shaders\base.frag">
       <Filter>Resource Files</Filter>
     </None>
@@ -278,12 +284,6 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\blur_image_y_merge.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\cloud_shadow_init.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\cloud_shadow_merge.comp">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\cube_ibl.frag">
@@ -301,18 +301,6 @@
     <None Include="shaders\full_screen.vert">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="shaders\grass.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\grass.frag">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\grass.geom">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\grass.vert">
-      <Filter>Resource Files</Filter>
-    </None>
     <None Include="shaders\ibl_smooth.comp">
       <Filter>Resource Files</Filter>
     </None>
@@ -323,9 +311,6 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\perlin_noise_init.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\render_volume_cloud.comp">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\shaders-compile.cfg">
@@ -344,27 +329,6 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\skybox.vert">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\temperature_init.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\tile.frag">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\tile.vert">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\tile_creator.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\tile_flow_update.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\tile_update.comp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="shaders\tile_water.frag">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\update_camera.comp">
@@ -409,8 +373,53 @@
     <None Include="shaders\ray_tracing\raytracing_shadow\rt_closesthit.rchit">
       <Filter>Resource Files\ray_tracing\raytracing_shadow</Filter>
     </None>
-    <None Include="shaders\grass.mesh">
-      <Filter>Resource Files</Filter>
+    <None Include="shaders\terrain\tile_creator.comp">
+      <Filter>Resource Files\terrain</Filter>
+    </None>
+    <None Include="shaders\terrain\tile_flow_update.comp">
+      <Filter>Resource Files\terrain</Filter>
+    </None>
+    <None Include="shaders\terrain\tile_update.comp">
+      <Filter>Resource Files\terrain</Filter>
+    </None>
+    <None Include="shaders\terrain\tile_water.frag">
+      <Filter>Resource Files\terrain</Filter>
+    </None>
+    <None Include="shaders\terrain\tile.frag">
+      <Filter>Resource Files\terrain</Filter>
+    </None>
+    <None Include="shaders\terrain\tile.vert">
+      <Filter>Resource Files\terrain</Filter>
+    </None>
+    <None Include="shaders\grass\grass.frag">
+      <Filter>Resource Files\grass</Filter>
+    </None>
+    <None Include="shaders\grass\grass.geom">
+      <Filter>Resource Files\grass</Filter>
+    </None>
+    <None Include="shaders\grass\grass.mesh">
+      <Filter>Resource Files\grass</Filter>
+    </None>
+    <None Include="shaders\grass\grass.vert">
+      <Filter>Resource Files\grass</Filter>
+    </None>
+    <None Include="shaders\grass\grass.comp">
+      <Filter>Resource Files\grass</Filter>
+    </None>
+    <None Include="shaders\weather\airflow_update.comp">
+      <Filter>Resource Files\weather</Filter>
+    </None>
+    <None Include="shaders\weather\cloud_shadow_init.comp">
+      <Filter>Resource Files\weather</Filter>
+    </None>
+    <None Include="shaders\weather\cloud_shadow_merge.comp">
+      <Filter>Resource Files\weather</Filter>
+    </None>
+    <None Include="shaders\weather\render_volume_cloud.comp">
+      <Filter>Resource Files\weather</Filter>
+    </None>
+    <None Include="shaders\weather\temperature_init.comp">
+      <Filter>Resource Files\weather</Filter>
     </None>
   </ItemGroup>
 </Project>

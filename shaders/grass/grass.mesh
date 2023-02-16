@@ -1,8 +1,8 @@
 #version 460
 #extension GL_NV_mesh_shader : enable
-#include "global_definition.glsl.h"
-#include "tile_common.glsl.h"
-#include "noise.glsl.h"
+#include "..\global_definition.glsl.h"
+#include "..\terrain\tile_common.glsl.h"
+#include "..\noise.glsl.h"
 
 out gl_MeshPerVertexNV {
     vec4  gl_Position;

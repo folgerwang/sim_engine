@@ -1,5 +1,5 @@
 #version 450 core
-#include "global_definition.glsl.h"
+#include "..\global_definition.glsl.h"
 
 layout (points) in;
 layout (triangle_strip, max_vertices = 14) out;

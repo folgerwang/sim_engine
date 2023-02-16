@@ -4,7 +4,7 @@
 #include "engine_helper.h"
 #include "game_object/terrain.h"
 #include "weather_system.h"
-#include "shaders/weather_common.glsl.h"
+#include "shaders/weather/weather_common.glsl.h"
 
 namespace {
 namespace er = engine::renderer;
@@ -511,7 +511,7 @@ void WeatherSystem::recreate(
     temperature_init_pipeline_ = erh::createComputePipeline(
         device,
         temperature_init_pipeline_layout_,
-        "temperature_init_comp.spv");
+        "weather/temperature_init_comp.spv");
 
     airflow_pipeline_layout_ =
         erh::createComputePipelineLayout(
@@ -522,7 +522,7 @@ void WeatherSystem::recreate(
     airflow_pipeline_ = erh::createComputePipeline(
         device,
         airflow_pipeline_layout_,
-        "airflow_update_comp.spv");
+        "weather/airflow_update_comp.spv");
 
     cloud_shadow_pipeline_layout_ =
         erh::createComputePipelineLayout(
@@ -533,7 +533,7 @@ void WeatherSystem::recreate(
     cloud_shadow_init_pipeline_ = erh::createComputePipeline(
         device,
         cloud_shadow_pipeline_layout_,
-        "cloud_shadow_init_comp.spv");
+        "weather/cloud_shadow_init_comp.spv");
 
     cloud_shadow_merge_pipeline_layout_ =
         erh::createComputePipelineLayout(
@@ -544,7 +544,7 @@ void WeatherSystem::recreate(
     cloud_shadow_merge_pipeline_ = erh::createComputePipeline(
         device,
         cloud_shadow_merge_pipeline_layout_,
-        "cloud_shadow_merge_comp.spv");
+        "weather/cloud_shadow_merge_comp.spv");
 }
 
 // update air flow buffer.
@@ -702,7 +702,7 @@ void WeatherSystem::updateCloudShadow(
 
     // merge two layers to one combined layer.
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, cloud_shadow_merge_pipeline_);
-    for (uint32_t i_layer = 0; i_layer < kAirflowBufferCount-1; i_layer++) {
+    for (uint32_t i_layer = 0; i_layer < kAirflowBufferBitCount-1; i_layer++) {
         erh::transitMapTextureToStoreImage(
             cmd_buf,
             { cloud_shadow_volume_.image });

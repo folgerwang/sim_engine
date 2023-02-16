@@ -156,8 +156,8 @@
 #define DEBUG_DRAW_MOISTURE                     2
 
 #define kAirflowBufferWidth                     256
-#define kAirflowBufferCount                     6
-#define kAirflowBufferHeight                    (1 << kAirflowBufferCount)
+#define kAirflowBufferBitCount                  6
+#define kAirflowBufferHeight                    (1 << kAirflowBufferBitCount)
 
 #define kAtmosphereScatteringLutGroupSize       64
 #define kAtmosphereScatteringLutWidth           512

@@ -6,7 +6,7 @@
 #include "punctual.glsl.h"
 
 #include "ibl.glsl.h"
-#include "tile_common.glsl.h"
+#include "terrain\tile_common.glsl.h"
 
 layout(push_constant) uniform DebugDrawUniformBufferObject {
     DebugDrawParams params;
