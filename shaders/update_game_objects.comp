@@ -12,6 +12,10 @@ layout(std430, set = 0, binding = GAME_OBJECTS_BUFFER_INDEX) buffer GameObjectsB
   GameObjectInfo items[];
 };
 
+layout(std430, set = 0, binding = INSTANCE_BUFFER_INDEX) buffer InstanceBuffer {
+  InstanceDataInfo insts[];
+};
+
 layout(std430, set = 0, binding = CAMERA_OBJECT_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	GameCameraInfo camera_info;
 };
@@ -105,66 +109,73 @@ void main()
 
     vec3 contact_normal = terrainNormal(info.position.xz, 0.00025f, 2000.0f);
 
-    if (info.status == 0 || params.frame_count == 0) {
+    if (info.status != 0xffffffff) {
+        if (info.status == 0 || params.frame_count == 0) {
 #if kNumGltfInstance == 1
-        info.position = camera_info.position;
+            info.position = camera_info.position;
 #else
-        info.position = camera_info.position +
-                        vec3((nx * 2.0f - 1.0f) * 400.0f,
-                             200.0f,
-                             (nz * 2.0f - 1.0f) * 400.0f);
+            info.position = camera_info.position +
+                            vec3((nx * 2.0f - 1.0f) * 400.0f,
+                                 200.0f,
+                                 (nz * 2.0f - 1.0f) * 400.0f);
 #endif
-        info.moving_dir = vec3(0, 0, 0);
-        info.mass = 0.1f;
-        info.awareness_radius = 20.0f;
-        info.awareness_coneangle = 30.0f;
-        info.up_vector = vec3(0, 1, 0);
-        info.facing_dir = vec3(0, 0, 1);
-        info.scale = 1.0f;
-        info.status |= 0x00000001;
-    }
-    else {
-        float moving_on_height = getMovingOnHeight(info.moving_dir.y, params.delta_t);
-        float ground_height = ground_floor_height;
-        float height_to_fall = ground_height - info.position.y;
-        float delta_t = params.delta_t;
-        vec2 world_map_uv = (info.position.xz - params.world_min) * params.inv_world_range;
-        if (height_to_fall > moving_on_height) {
-            float fall_delta_t = getDeltaTByDistance(info.moving_dir.y, height_to_fall);
-            info.moving_dir.y += kGravityConst * fall_delta_t;
-            info.position.xz += info.moving_dir.xz * fall_delta_t;
-            info.position.y = ground_height;
+            info.moving_dir = vec3(0, 0, 0);
+            info.mass = 0.1f;
+            info.awareness_radius = 20.0f;
+            info.awareness_coneangle = 30.0f;
+            info.up_vector = vec3(0, 1, 0);
+            info.facing_dir = vec3(0, 0, 1);
+            info.scale = 1.0f;
+            info.status |= 0x00000001;
+        }
+        else {
+            float moving_on_height = getMovingOnHeight(info.moving_dir.y, params.delta_t);
+            float ground_height = ground_floor_height;
+            float height_to_fall = ground_height - info.position.y;
+            float delta_t = params.delta_t;
+            vec2 world_map_uv = (info.position.xz - params.world_min) * params.inv_world_range;
+            if (height_to_fall > moving_on_height) {
+                float fall_delta_t = getDeltaTByDistance(info.moving_dir.y, height_to_fall);
+                info.moving_dir.y += kGravityConst * fall_delta_t;
+                info.position.xz += info.moving_dir.xz * fall_delta_t;
+                info.position.y = ground_height;
 
-            vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
-            //touch water.
-            if (soil_water_thickness.y > 0.005f) {
-                info.position.xz += texture(water_flow, world_map_uv).xy * params.water_flow_strength;
+                vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+                //touch water.
+                if (soil_water_thickness.y > 0.005f) {
+                    info.position.xz += texture(water_flow, world_map_uv).xy * params.water_flow_strength;
+                }
+                else {
+                    // bouncing.
+                    float delta_t = max(params.delta_t - fall_delta_t, 0.0f);
+                    float moving_len = length(info.moving_dir);
+                    info.moving_dir = reflect(normalize(info.moving_dir), contact_normal) * moving_len * 0.3f;
+                    moving_on_height = getMovingOnHeight(info.moving_dir.y, delta_t);
+                }
             }
-            else {
-                // bouncing.
-                float delta_t = max(params.delta_t - fall_delta_t, 0.0f);
-                float moving_len = length(info.moving_dir);
-                info.moving_dir = reflect(normalize(info.moving_dir), contact_normal) * moving_len * 0.3f;
-                moving_on_height = getMovingOnHeight(info.moving_dir.y, delta_t);
+
+            if (delta_t > 0) {
+                float uvw_z = log2(max((info.position.y - kAirflowLowHeight), 0.0f) + 1.0f) /
+                        log2(kAirflowMaxHeight - kAirflowLowHeight + 1.0f);
+
+                vec4 airflow_info = texture(air_flow, vec3(world_map_uv, uvw_z));
+                vec3 airflow_vec = (airflow_info.xyz * 2.0f - 1.0f) * getPackedVectorLength(airflow_info.w);
+                info.position += vec3(0, moving_on_height, 0);
+                info.position.xz += info.moving_dir.xz * delta_t;
+                if (params.enble_airflow != 0) {
+                    info.position += airflow_vec * delta_t * params.air_flow_strength;
+                }
+
+                info.moving_dir.y += kGravityConst * delta_t;
             }
         }
 
-        if (delta_t > 0) {
-            float uvw_z = log2(max((info.position.y - kAirflowLowHeight), 0.0f) + 1.0f) /
-                    log2(kAirflowMaxHeight - kAirflowLowHeight + 1.0f);
+        items[obj_idx] = packGameObjectInfo(info);
 
-            vec4 airflow_info = texture(air_flow, vec3(world_map_uv, uvw_z));
-            vec3 airflow_vec = (airflow_info.xyz * 2.0f - 1.0f) * getPackedVectorLength(airflow_info.w);
-            info.position += vec3(0, moving_on_height, 0);
-            info.position.xz += info.moving_dir.xz * delta_t;
-            if (params.enble_airflow != 0) {
-                info.position += airflow_vec * delta_t * params.air_flow_strength;
-            }
-
-            info.moving_dir.y += kGravityConst * delta_t;
-        }
+        insts[obj_idx].mat_rot_0 = vec4(cross(info.up_vector, info.facing_dir) * info.scale, 0.0f);
+        insts[obj_idx].mat_rot_1 = vec4(info.up_vector * info.scale, 0.0f);
+        insts[obj_idx].mat_rot_2 = vec4(info.facing_dir * info.scale, 0.0f);
+        insts[obj_idx].mat_pos_scale = vec4(info.position, 1.0f);
     }
-
-    items[obj_idx] = packGameObjectInfo(info);
   }
 }

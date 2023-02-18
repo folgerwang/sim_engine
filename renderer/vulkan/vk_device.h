@@ -32,6 +32,7 @@ public:
     const std::shared_ptr<PhysicalDevice>& getPhysicalDevice() { return physical_device_; }
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool() final;
     virtual void createBuffer(
+        const std::string& debug_tag,
         const uint64_t& buffer_size,
         const BufferUsageFlags& usage,
         const MemoryPropertyFlags& properties,
@@ -100,7 +101,11 @@ public:
         const MemoryAllocateFlags& allocate_flags) final;
     virtual MemoryRequirements getBufferMemoryRequirements(std::shared_ptr<Buffer> buffer) final;
     virtual MemoryRequirements getImageMemoryRequirements(std::shared_ptr<Image> image) final;
-    virtual std::shared_ptr<Buffer> createBuffer(uint64_t buf_size, BufferUsageFlags usage, bool sharing = false) final;
+    virtual std::shared_ptr<Buffer> createBuffer(
+        const std::string& debug_tag,
+        uint64_t buf_size,
+        BufferUsageFlags usage,
+        bool sharing = false) final;
     virtual std::shared_ptr<Image> createImage(
         ImageType image_type,
         glm::uvec3 image_size,

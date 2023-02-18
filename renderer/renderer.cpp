@@ -270,6 +270,7 @@ void Helper::createBuffer(
     bool need_stage_buffer = has_src_data && (memory_property == SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
     device->createBuffer(
+        __FILE__ + __LINE__,
         buffer_size,
         (need_stage_buffer ? SET_FLAG_BIT(BufferUsage, TRANSFER_DST_BIT) : 0) | usage,
         memory_property,
@@ -282,6 +283,7 @@ void Helper::createBuffer(
             std::shared_ptr<Buffer> staging_buffer;
             std::shared_ptr<DeviceMemory> staging_buffer_memory;
             device->createBuffer(
+                __FILE__ + __LINE__,
                 buffer_size,
                 SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
                 SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -313,6 +315,7 @@ void Helper::updateBufferWithSrcData(
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
     device->createBuffer(
+        __FILE__ + __LINE__,
         buffer_size,
         SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -363,6 +366,7 @@ void Helper::create2DTextureImage(
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
     device->createBuffer(
+        __FILE__ + __LINE__,
         image_size,
         SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -445,6 +449,7 @@ void Helper::dumpTextureImage(
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
     device->createBuffer(
+        __FILE__ + __LINE__,
         buffer_size,
         SET_FLAG_BIT(BufferUsage, TRANSFER_DST_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -537,6 +542,7 @@ void Helper::createCubemapTexture(
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
     if (data) {
         device->createBuffer(
+            __FILE__ + __LINE__,
             image_size,
             SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
             SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |

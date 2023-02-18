@@ -163,8 +163,7 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::DescriptorSetLayout>& gltf_indirect_draw_desc_set_layout,
-        const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout,
-        const std::shared_ptr<renderer::BufferInfo>& game_objects_buffer);
+        const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout);
 
     void destroy();
 };
@@ -174,11 +173,8 @@ class GltfObject {
         kMaxNumObjects = 10240
     };
     const renderer::DeviceInfo& device_info_;
-    std::shared_ptr<GltfData> object_;
-    glm::mat4                   location_;
-
-    // static members.
-    static uint32_t max_alloc_game_objects_in_buffer;
+    std::shared_ptr<GltfData>   object_;
+    uint32_t                    num_instances_ = 0;
 
     static std::shared_ptr<renderer::DescriptorSetLayout> material_desc_set_layout_;
     static std::shared_ptr<renderer::DescriptorSetLayout> skin_desc_set_layout_;
@@ -188,15 +184,9 @@ class GltfObject {
     static std::shared_ptr<renderer::DescriptorSetLayout> gltf_indirect_draw_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> gltf_indirect_draw_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline> gltf_indirect_draw_pipeline_;
-    static std::shared_ptr<renderer::DescriptorSet> update_game_objects_buffer_desc_set_[2];
-    static std::shared_ptr<renderer::DescriptorSetLayout> update_game_objects_desc_set_layout_;
-    static std::shared_ptr<renderer::PipelineLayout> update_game_objects_pipeline_layout_;
-    static std::shared_ptr<renderer::Pipeline> update_game_objects_pipeline_;
     static std::shared_ptr<renderer::DescriptorSetLayout> update_instance_buffer_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> update_instance_buffer_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline> update_instance_buffer_pipeline_;
-    static std::shared_ptr<renderer::BufferInfo> game_objects_buffer_;
-
 
 public:
     GltfObject() = delete;
@@ -209,93 +199,60 @@ public:
         const renderer::TextureInfo& thin_film_lut_tex,
         const std::string& file_name,
         const glm::uvec2& display_size,
-        glm::mat4 location = glm::mat4(1.0f));
+        const uint32_t& num_instances);
 
     void updateInstanceBuffer(
-        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const uint32_t& num_instances);
 
     void updateIndirectDrawBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 
     void updateBuffers(
-        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const uint32_t& num_instances);
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list);
+        const renderer::DescriptorSetList& desc_set_list,
+        const std::shared_ptr<renderer::DescriptorSet>& game_objects_desc_set);
 
     void update(const renderer::DeviceInfo& device_info, const float& time);
 
     void destroy() {
-        if (object_) {
+        // object_ data has been cached, no need to be destroyed here.
+/*        if (object_) {
             object_->destroy();
-        }
+        }*/
     }
-
-    static void createGameObjectUpdateDescSet(
-        const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-        const std::shared_ptr<renderer::Sampler>& texture_sampler,
-        const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
-        const renderer::TextureInfo& rock_layer,
-        const renderer::TextureInfo& soil_water_layer_0,
-        const renderer::TextureInfo& soil_water_layer_1,
-        const renderer::TextureInfo& water_flow,
-        const std::shared_ptr<renderer::ImageView>& airflow_tex);
-
-    static void initGameObjectBuffer(
-        const std::shared_ptr<renderer::Device>& device);
 
     static void initStaticMembers(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const std::shared_ptr<renderer::Sampler>& texture_sampler,
-        const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
-        const renderer::TextureInfo& rock_layer,
-        const renderer::TextureInfo& soil_water_layer_0,
-        const renderer::TextureInfo& soil_water_layer_1,
-        const renderer::TextureInfo& water_flow,
-        const std::shared_ptr<renderer::ImageView>& airflow_tex);
+        const std::shared_ptr<renderer::DescriptorSetLayout>& game_object_desc_set_layout,
+        const std::shared_ptr<renderer::Sampler>& texture_sampler);
 
     static void createStaticMembers(
         const std::shared_ptr<renderer::Device>& device,
-        const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
+        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+        const std::shared_ptr<renderer::DescriptorSetLayout>& game_object_desc_set_layout);
 
     static void recreateStaticMembers(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+        const std::shared_ptr<renderer::DescriptorSetLayout>& game_object_desc_set_layout,
         const glm::uvec2& display_size);
 
     static void generateDescriptorSet(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
-        const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
-        const renderer::TextureInfo& thin_film_lut_tex,
-        const renderer::TextureInfo& rock_layer,
-        const renderer::TextureInfo& soil_water_layer_0,
-        const renderer::TextureInfo& soil_water_layer_1,
-        const renderer::TextureInfo& water_flow,
-        const std::shared_ptr<renderer::ImageView>& airflow_tex);
+        const renderer::TextureInfo& thin_film_lut_tex);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
-
-    static void updateGameObjectsBuffer(
-        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const glm::vec2& world_min,
-        const glm::vec2& world_range,
-        const glm::vec3& camera_pos,
-        float air_flow_strength,
-        float water_flow_strength,
-        int update_frame_count,
-        int soil_water,
-        float delta_t,
-        bool enble_airflow);
-
-    static std::shared_ptr<renderer::BufferInfo> getGameObjectsBuffer();
 
     static std::shared_ptr<GltfData> loadGltfModel(
         const renderer::DeviceInfo& device_info,

@@ -2129,7 +2129,7 @@ TileObject::TileObject(
     assert(tile_res_desc_set_layout_);
 }
 
-void TileObject::destory() {
+void TileObject::destroy() {
     index_buffer_.destroy(device_info_.device);
     grass_vertex_buffer_.destroy(device_info_.device);
     grass_index_buffer_.destroy(device_info_.device);
@@ -2465,7 +2465,7 @@ void TileObject::recreateStaticMembers(
         display_size);
 }
 
-void TileObject::destoryStaticMembers(
+void TileObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(tile_creator_desc_set_layout_);
     device->destroyDescriptorSetLayout(tile_update_desc_set_layout_);
@@ -2566,6 +2566,7 @@ void TileObject::createGrassBuffers() {
         indirect_draw_cmd_buffer.data());
 
     device_info_.device->createBuffer(
+        __FILE__ + __LINE__,
         static_cast<uint32_t>(TileConst::kMaxNumGrass) * sizeof(glsl::GrassInstanceDataInfo),
         SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
@@ -3061,7 +3062,7 @@ void TileObject::updateAllTiles(
     }
 }
 
-void TileObject::destoryAllTiles() {
+void TileObject::destroyAllTiles() {
     tile_meshes_.clear();
     visible_tiles_.clear();
 }

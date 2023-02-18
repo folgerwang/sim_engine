@@ -150,6 +150,7 @@ static void setupMeshState(
             }
 
             device->createBuffer(
+                __FILE__ + __LINE__,
                 sizeof(glsl::PbrMaterialParams),
                 SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
                 SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -922,7 +923,8 @@ static std::shared_ptr<renderer::PipelineLayout> createGltfPipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::DescriptorSetLayout>& material_desc_set_layout,
-    const std::shared_ptr<renderer::DescriptorSetLayout>& skin_desc_set_layout) {
+    const std::shared_ptr<renderer::DescriptorSetLayout>& skin_desc_set_layout,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& game_objects_set_layout) {
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, VERTEX_BIT);
     push_const_range.offset = 0;
@@ -931,6 +933,7 @@ static std::shared_ptr<renderer::PipelineLayout> createGltfPipelineLayout(
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
     desc_set_layouts.push_back(material_desc_set_layout);
     desc_set_layouts.push_back(skin_desc_set_layout);
+    desc_set_layouts.push_back(game_objects_set_layout);
 
     return device->createPipelineLayout(desc_set_layouts, { push_const_range });
 }
@@ -991,26 +994,16 @@ static std::shared_ptr<renderer::Pipeline> createGltfPipeline(
     renderer::VertexInputBindingDescription desc;
     desc.binding = VINPUT_INSTANCE_BINDING_POINT;
     desc.input_rate = renderer::VertexInputRate::INSTANCE;
-    desc.stride = sizeof(glsl::InstanceDataInfo);
+    desc.stride = sizeof(uint32_t);
     binding_descs.push_back(desc);
 
     renderer::VertexInputAttributeDescription attr;
     attr.binding = VINPUT_INSTANCE_BINDING_POINT;
     attr.buffer_offset = 0;
-    attr.format = renderer::Format::R32G32B32_SFLOAT;
+    attr.format = renderer::Format::R32_UINT;
     attr.buffer_view = 0;
-    attr.location = IINPUT_MAT_ROT_0;
-    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_0);
-    attribute_descs.push_back(attr);
-    attr.location = IINPUT_MAT_ROT_1;
-    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_1);
-    attribute_descs.push_back(attr);
-    attr.location = IINPUT_MAT_ROT_2;
-    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
-    attribute_descs.push_back(attr);
-    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
-    attr.location = IINPUT_MAT_POS_SCALE;
-    attr.offset = offsetof(glsl::InstanceDataInfo, mat_pos_scale);
+    attr.location = IINPUT_INSTANCE_INDEX;
+    attr.offset = 0;
     attribute_descs.push_back(attr);
 
     auto gltf_pipeline = device->createPipeline(
@@ -1045,18 +1038,9 @@ renderer::WriteDescriptorList addGltfIndirectDrawBuffers(
 
 renderer::WriteDescriptorList addUpdateInstanceBuffers(
     const std::shared_ptr<renderer::DescriptorSet>& description_set,
-    const renderer::BufferInfo& game_objects_buffer,
     const renderer::BufferInfo& instance_buffer) {
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(2);
-
-    renderer::Helper::addOneBuffer(
-        descriptor_writes,
-        description_set,
-        engine::renderer::DescriptorType::STORAGE_BUFFER,
-        GAME_OBJECTS_BUFFER_INDEX,
-        game_objects_buffer.buffer,
-        game_objects_buffer.buffer->getSize());
+    descriptor_writes.reserve(1);
 
     renderer::Helper::addOneBuffer(
         descriptor_writes,
@@ -1065,73 +1049,6 @@ renderer::WriteDescriptorList addUpdateInstanceBuffers(
         INSTANCE_BUFFER_INDEX,
         instance_buffer.buffer,
         instance_buffer.buffer->getSize());
-
-    return descriptor_writes;
-}
-
-renderer::WriteDescriptorList addGameObjectsInfoBuffer(
-    const std::shared_ptr<renderer::DescriptorSet>& description_set,
-    const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const renderer::BufferInfo& game_object_buffer,
-    const renderer::BufferInfo& game_camera_buffer,
-    const renderer::TextureInfo& rock_layer,
-    const renderer::TextureInfo& soil_water_layer,
-    const renderer::TextureInfo& water_flow,
-    const std::shared_ptr<renderer::ImageView>& airflow_tex) {
-    renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(6);
-
-    renderer::Helper::addOneBuffer(
-        descriptor_writes,
-        description_set,
-        engine::renderer::DescriptorType::STORAGE_BUFFER,
-        GAME_OBJECTS_BUFFER_INDEX,
-        game_object_buffer.buffer,
-        game_object_buffer.buffer->getSize());
-
-    renderer::Helper::addOneBuffer(
-        descriptor_writes,
-        description_set,
-        engine::renderer::DescriptorType::STORAGE_BUFFER,
-        CAMERA_OBJECT_BUFFER_INDEX,
-        game_camera_buffer.buffer,
-        game_camera_buffer.buffer->getSize());
-
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        ROCK_LAYER_BUFFER_INDEX,
-        texture_sampler,
-        rock_layer.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        SOIL_WATER_LAYER_BUFFER_INDEX,
-        texture_sampler,
-        soil_water_layer.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        WATER_FLOW_BUFFER_INDEX,
-        texture_sampler,
-        water_flow.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        SRC_AIRFLOW_INDEX,
-        texture_sampler,
-        airflow_tex,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     return descriptor_writes;
 }
@@ -1147,41 +1064,10 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createGltfIndirectDrawDesc
     return device->createDescriptorSetLayout(bindings);
 }
 
-static std::shared_ptr<renderer::DescriptorSetLayout> createUpdateGameObjectsDescriptorSetLayout(
-    const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(6);
-    bindings[0] = renderer::helper::getBufferDescriptionSetLayoutBinding(
-        GAME_OBJECTS_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        renderer::DescriptorType::STORAGE_BUFFER);
-    bindings[1] = renderer::helper::getBufferDescriptionSetLayoutBinding(
-        CAMERA_OBJECT_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        renderer::DescriptorType::STORAGE_BUFFER);
-    bindings[2] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-        ROCK_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
-    bindings[3] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-        SOIL_WATER_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
-    bindings[4] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-        WATER_FLOW_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
-    bindings[5] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-        SRC_AIRFLOW_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
-
-    return device->createDescriptorSetLayout(bindings);
-}
-
 static std::shared_ptr<renderer::DescriptorSetLayout> createInstanceBufferDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(2);
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(1);
     bindings[0] = renderer::helper::getBufferDescriptionSetLayoutBinding(
-        GAME_OBJECTS_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        renderer::DescriptorType::STORAGE_BUFFER);
-    bindings[1] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         INSTANCE_BUFFER_INDEX,
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         renderer::DescriptorType::STORAGE_BUFFER);
@@ -1196,17 +1082,6 @@ static std::shared_ptr<renderer::PipelineLayout> createGltfIndirectDrawPipelineL
     push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(uint32_t);
-
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
-}
-
-static std::shared_ptr<renderer::PipelineLayout> createGameObjectsPipelineLayout(
-    const std::shared_ptr<renderer::Device>& device,
-    const renderer::DescriptorSetLayoutList& desc_set_layouts) {
-    renderer::PushConstantRange push_const_range{};
-    push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
-    push_const_range.offset = 0;
-    push_const_range.size = sizeof(glsl::GameObjectsUpdateParams);
 
     return device->createPipelineLayout(desc_set_layouts, { push_const_range });
 }
@@ -1227,8 +1102,6 @@ static std::shared_ptr<renderer::PipelineLayout> createInstanceBufferPipelineLay
 namespace game_object {
 
 // static member definition.
-uint32_t GltfObject::max_alloc_game_objects_in_buffer = kNumGltfInstance;
-
 std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::material_desc_set_layout_;
 std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::skin_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> GltfObject::gltf_pipeline_layout_;
@@ -1237,14 +1110,9 @@ std::unordered_map<std::string, std::shared_ptr<GltfData>> GltfObject::object_li
 std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::gltf_indirect_draw_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> GltfObject::gltf_indirect_draw_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline> GltfObject::gltf_indirect_draw_pipeline_;
-std::shared_ptr<renderer::DescriptorSet> GltfObject::update_game_objects_buffer_desc_set_[2];
-std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::update_game_objects_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> GltfObject::update_game_objects_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> GltfObject::update_game_objects_pipeline_;
 std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::update_instance_buffer_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> GltfObject::update_instance_buffer_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline> GltfObject::update_instance_buffer_pipeline_;
-std::shared_ptr<renderer::BufferInfo> GltfObject::game_objects_buffer_;
 
 void PrimitiveInfo::generateHash() {
     hash_ = std::hash<uint32_t>{}(tag_.data);
@@ -1427,9 +1295,9 @@ GltfObject::GltfObject(
     const renderer::TextureInfo& thin_film_lut_tex,
     const std::string& file_name,
     const glm::uvec2& display_size,
-    glm::mat4 location/* = glm::mat4(1.0f)*/)
+    const uint32_t& num_instances)
     : device_info_(device_info),
-    location_(location){
+    num_instances_(num_instances){
 
     auto result = object_list_.find(file_name);
     if (result == object_list_.end()) {
@@ -1459,7 +1327,8 @@ GltfObject::GltfObject(
         }
 
         device_info.device->createBuffer(
-            kNumGltfInstance * sizeof(glsl::InstanceDataInfo),
+            __FILE__ + __LINE__,
+            std::max(num_instances_, 1u) * sizeof(uint32_t),
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
@@ -1471,8 +1340,7 @@ GltfObject::GltfObject(
             device_info.device,
             descriptor_pool,
             gltf_indirect_draw_desc_set_layout_,
-            update_instance_buffer_desc_set_layout_,
-            game_objects_buffer_);
+            update_instance_buffer_desc_set_layout_);
 
         object_list_[file_name] = object_;
     }
@@ -1485,8 +1353,7 @@ void GltfData::generateSharedDescriptorSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::DescriptorSetLayout>& gltf_indirect_draw_desc_set_layout,
-    const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout,
-    const std::shared_ptr<renderer::BufferInfo>& game_objects_buffer) {
+    const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout) {
 
     // create indirect draw buffer set.
     indirect_draw_cmd_buffer_desc_set_ = device->createDescriptorSets(
@@ -1503,73 +1370,18 @@ void GltfData::generateSharedDescriptorSet(
         descriptor_pool, update_instance_buffer_desc_set_layout, 1)[0];
 
     // create a global ibl texture descriptor set.
-    assert(game_objects_buffer);
     buffer_descs = addUpdateInstanceBuffers(
         update_instance_buffer_desc_set_,
-        *game_objects_buffer,
         instance_buffer_);
     device->updateDescriptorSets(buffer_descs);
-}
-
-void GltfObject::createGameObjectUpdateDescSet(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
-    const renderer::TextureInfo& rock_layer,
-    const renderer::TextureInfo& soil_water_layer_0,
-    const renderer::TextureInfo& soil_water_layer_1,
-    const renderer::TextureInfo& water_flow,
-    const std::shared_ptr<renderer::ImageView>& airflow_tex) {
-    // create a global ibl texture descriptor set.
-    for (int soil_water = 0; soil_water < 2; soil_water++) {
-        // game objects buffer update set.
-        update_game_objects_buffer_desc_set_[soil_water] =
-            device->createDescriptorSets(
-                descriptor_pool, update_game_objects_desc_set_layout_, 1)[0];
-
-        assert(game_objects_buffer_);
-        auto write_descs = addGameObjectsInfoBuffer(
-            update_game_objects_buffer_desc_set_[soil_water],
-            texture_sampler,
-            *game_objects_buffer_,
-            *game_camera_buffer,
-            rock_layer,
-            soil_water == 0 ? soil_water_layer_0 : soil_water_layer_1,
-            water_flow,
-            airflow_tex);
-
-        device->updateDescriptorSets(write_descs);
-    }
-}
-
-void GltfObject::initGameObjectBuffer(
-    const std::shared_ptr<renderer::Device>& device) {
-    if (!game_objects_buffer_) {
-        game_objects_buffer_ = std::make_shared<renderer::BufferInfo>();
-        device->createBuffer(
-            kMaxNumObjects * sizeof(glsl::GameObjectInfo),
-            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-            0,
-            game_objects_buffer_->buffer,
-            game_objects_buffer_->memory);
-    }
 }
 
 void GltfObject::initStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
-    const renderer::TextureInfo& rock_layer,
-    const renderer::TextureInfo& soil_water_layer_0,
-    const renderer::TextureInfo& soil_water_layer_1,
-    const renderer::TextureInfo& water_flow,
-    const std::shared_ptr<renderer::ImageView>& airflow_tex) {
-
-    assert(game_objects_buffer_);
+    const std::shared_ptr<renderer::DescriptorSetLayout>& game_object_desc_set_layout,
+    const std::shared_ptr<renderer::Sampler>& texture_sampler) {
 
     if (material_desc_set_layout_ == nullptr) {
         material_desc_set_layout_ =
@@ -1586,33 +1398,18 @@ void GltfObject::initStaticMembers(
             createGltfIndirectDrawDescriptorSetLayout(device);
     }
 
-    if (update_game_objects_desc_set_layout_ == nullptr) {
-        update_game_objects_desc_set_layout_ =
-            createUpdateGameObjectsDescriptorSetLayout(device);
-    }
-
     if (update_instance_buffer_desc_set_layout_ == nullptr) {
         update_instance_buffer_desc_set_layout_ =
             createInstanceBufferDescriptorSetLayout(device);
     }
 
-    createStaticMembers(device, global_desc_set_layouts);
-
-    createGameObjectUpdateDescSet(
-        device,
-        descriptor_pool,
-        texture_sampler,
-        game_camera_buffer,
-        rock_layer,
-        soil_water_layer_0,
-        soil_water_layer_1,
-        water_flow,
-        airflow_tex);
+    createStaticMembers(device, global_desc_set_layouts, game_object_desc_set_layout);
 }
 
 void GltfObject::createStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
-    const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
+    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& game_object_desc_set_layout) {
 
     {
         if (gltf_pipeline_layout_) {
@@ -1628,7 +1425,8 @@ void GltfObject::createStaticMembers(
                     device,
                     global_desc_set_layouts,
                     material_desc_set_layout_,
-                    skin_desc_set_layout_);
+                    skin_desc_set_layout_,
+                    game_object_desc_set_layout);
         }
     }
 
@@ -1659,36 +1457,6 @@ void GltfObject::createStaticMembers(
                     device,
                     gltf_indirect_draw_pipeline_layout_,
                     "update_gltf_indirect_draw_comp.spv");
-        }
-    }
-
-    {
-        if (update_game_objects_pipeline_layout_) {
-            device->destroyPipelineLayout(update_game_objects_pipeline_layout_);
-            update_game_objects_pipeline_layout_ = nullptr;
-        }
-
-        if (update_game_objects_pipeline_layout_ == nullptr) {
-            update_game_objects_pipeline_layout_ =
-                createGameObjectsPipelineLayout(
-                    device,
-                    { update_game_objects_desc_set_layout_ });
-        }
-    }
-
-    {
-        if (update_game_objects_pipeline_) {
-            device->destroyPipeline(update_game_objects_pipeline_);
-            update_game_objects_pipeline_ = nullptr;
-        }
-
-        if (update_game_objects_pipeline_ == nullptr) {
-            assert(update_game_objects_pipeline_layout_);
-            update_game_objects_pipeline_ =
-                renderer::helper::createComputePipeline(
-                    device,
-                    update_game_objects_pipeline_layout_,
-                    "update_game_objects_comp.spv");
         }
     }
 
@@ -1728,9 +1496,10 @@ void GltfObject::recreateStaticMembers(
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& game_object_desc_set_layout,
     const glm::uvec2& display_size) {
 
-    createStaticMembers(device, global_desc_set_layouts);
+    createStaticMembers(device, global_desc_set_layouts, game_object_desc_set_layout);
 
     for (auto& pipeline : gltf_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
@@ -1758,13 +1527,7 @@ void GltfObject::generateDescriptorSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
-    const renderer::TextureInfo& thin_film_lut_tex,
-    const renderer::TextureInfo& rock_layer,
-    const renderer::TextureInfo& soil_water_layer_0,
-    const renderer::TextureInfo& soil_water_layer_1,
-    const renderer::TextureInfo& water_flow,
-    const std::shared_ptr<renderer::ImageView>& airflow_tex) {
+    const renderer::TextureInfo& thin_film_lut_tex) {
 
     for (auto& object : object_list_) {
         updateDescriptorSets(
@@ -1780,25 +1543,12 @@ void GltfObject::generateDescriptorSet(
             device,
             descriptor_pool,
             gltf_indirect_draw_desc_set_layout_,
-            update_instance_buffer_desc_set_layout_,
-            game_objects_buffer_);
+            update_instance_buffer_desc_set_layout_);
     }
-
-    createGameObjectUpdateDescSet(
-        device,
-        descriptor_pool,
-        texture_sampler,
-        game_camera_buffer,
-        rock_layer,
-        soil_water_layer_0,
-        soil_water_layer_1,
-        water_flow,
-        airflow_tex);
 }
 
-void GltfObject::destoryStaticMembers(
+void GltfObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
-    game_objects_buffer_->destroy(device);
     device->destroyDescriptorSetLayout(material_desc_set_layout_);
     device->destroyDescriptorSetLayout(skin_desc_set_layout_);
     device->destroyPipelineLayout(gltf_pipeline_layout_);
@@ -1810,59 +1560,14 @@ void GltfObject::destoryStaticMembers(
     device->destroyDescriptorSetLayout(gltf_indirect_draw_desc_set_layout_);
     device->destroyPipelineLayout(gltf_indirect_draw_pipeline_layout_);
     device->destroyPipeline(gltf_indirect_draw_pipeline_);
-    device->destroyDescriptorSetLayout(update_game_objects_desc_set_layout_);
-    device->destroyPipelineLayout(update_game_objects_pipeline_layout_);
-    device->destroyPipeline(update_game_objects_pipeline_);
     device->destroyDescriptorSetLayout(update_instance_buffer_desc_set_layout_);
     device->destroyPipelineLayout(update_instance_buffer_pipeline_layout_);
     device->destroyPipeline(update_instance_buffer_pipeline_);
 }
 
-void GltfObject::updateGameObjectsBuffer(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const glm::vec2& world_min,
-    const glm::vec2& world_range,
-    const glm::vec3& camera_pos,
-    float air_flow_strength,
-    float water_flow_strength,
-    int update_frame_count,
-    int soil_water,
-    float delta_t,
-    bool enble_airflow) {
-
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, update_game_objects_pipeline_);
-
-    glsl::GameObjectsUpdateParams params;
-    params.num_objects = max_alloc_game_objects_in_buffer;
-    params.delta_t = delta_t;
-    params.frame_count = update_frame_count;
-    params.world_min = world_min;
-    params.inv_world_range = 1.0f / world_range;
-    params.enble_airflow = enble_airflow ? 1 : 0;
-    params.air_flow_strength = air_flow_strength;
-    params.water_flow_strength = water_flow_strength;
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        update_game_objects_pipeline_layout_,
-        &params,
-        sizeof(params));
-
-    cmd_buf->bindDescriptorSets(
-        renderer::PipelineBindPoint::COMPUTE,
-        update_game_objects_pipeline_layout_,
-        { update_game_objects_buffer_desc_set_[soil_water] });
-
-    cmd_buf->dispatch((max_alloc_game_objects_in_buffer + 63) / 64, 1);
-
-    cmd_buf->addBufferBarrier(
-        game_objects_buffer_->buffer,
-        { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
-        { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
-        game_objects_buffer_->buffer->getSize());
-}
-
 void GltfObject::updateInstanceBuffer(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const uint32_t& num_instances) {
 
     cmd_buf->addBufferBarrier(
         object_->instance_buffer_.buffer,
@@ -1873,7 +1578,7 @@ void GltfObject::updateInstanceBuffer(
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, update_instance_buffer_pipeline_);
 
     glsl::InstanceBufferUpdateParams params;
-    params.num_instances = kNumGltfInstance;
+    params.num_instances = num_instances;
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         update_instance_buffer_pipeline_layout_,
@@ -1926,19 +1631,27 @@ void GltfObject::updateIndirectDrawBuffer(
 }
 
 void GltfObject::updateBuffers(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
-    updateInstanceBuffer(cmd_buf);
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const uint32_t& num_instances) {
+    updateInstanceBuffer(cmd_buf, num_instances);
     updateIndirectDrawBuffer(cmd_buf);
 }
 
 void GltfObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const renderer::DescriptorSetList& desc_set_list) {
+    const renderer::DescriptorSetList& desc_set_list,
+    const std::shared_ptr<renderer::DescriptorSet>& game_objects_desc_set) {
 
     const auto& primitive = object_->meshes_[0].primitives_[0];
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
         gltf_pipeline_list_[primitive.getHash()]);
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::GRAPHICS,
+        gltf_pipeline_layout_,
+        { game_objects_desc_set },
+        OBJECT_SHARED_PARAMS_SET);
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);
@@ -1963,10 +1676,6 @@ void GltfObject::update(
     if (object_) {
         object_->update(device_info, 0, time);
     }
-}
-
-std::shared_ptr<renderer::BufferInfo> GltfObject::getGameObjectsBuffer() {
-    return game_objects_buffer_;
 }
 
 std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(

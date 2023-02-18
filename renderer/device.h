@@ -8,6 +8,7 @@ class Device {
 public:
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool() = 0;
     virtual void createBuffer(
+        const std::string& debug_tag,
         const uint64_t& buffer_size,
         const BufferUsageFlags& usage,
         const MemoryPropertyFlags& properties,
@@ -76,7 +77,11 @@ public:
         const MemoryAllocateFlags& allocate_flags) = 0;
     virtual MemoryRequirements getBufferMemoryRequirements(std::shared_ptr<Buffer> buffer) = 0;
     virtual MemoryRequirements getImageMemoryRequirements(std::shared_ptr<Image> image) = 0;
-    virtual std::shared_ptr<Buffer> createBuffer(uint64_t buf_size, BufferUsageFlags usage, bool sharing = false) = 0;
+    virtual std::shared_ptr<Buffer> createBuffer(
+        const std::string& debug_tag,
+        uint64_t buf_size,
+        BufferUsageFlags usage,
+        bool sharing = false) = 0;
     virtual std::shared_ptr<Image> createImage(
         ImageType image_type,
         glm::uvec3 image_size,

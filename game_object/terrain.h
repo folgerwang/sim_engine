@@ -73,7 +73,7 @@ public:
         const uint32_t& block_idx);
 
     ~TileObject() {
-        destory();
+        destroy();
     }
 
     inline size_t getHash() { return hash_; }
@@ -82,7 +82,7 @@ public:
         neighbors_ = neighbors;
     }
 
-    void destory();
+    void destroy();
 
     static const renderer::TextureInfo& getRockLayer();
     static const renderer::TextureInfo& getSoilWaterLayer(int idx);
@@ -127,7 +127,7 @@ public:
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const glm::uvec2& display_size);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
     static void updateStaticDescriptorSet(
@@ -185,7 +185,7 @@ public:
         const float& tile_size,
         const glm::vec2& camera_pos);
 
-    static void destoryAllTiles();
+    static void destroyAllTiles();
 
     bool validTileBySize(
         const glm::ivec2& min_tile_idx,

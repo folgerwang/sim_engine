@@ -145,6 +145,7 @@ void GameCamera::initGameCameraBuffer(
     if (!game_camera_buffer_) {
         game_camera_buffer_ = std::make_shared<renderer::BufferInfo>();
         device->createBuffer(
+            __FILE__ + __LINE__,
             sizeof(glsl::GameCameraInfo),
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
             SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -241,7 +242,7 @@ void GameCamera::generateDescriptorSet(
         game_objects_buffer);
 }
 
-void GameCamera::destoryStaticMembers(
+void GameCamera::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     game_camera_buffer_->destroy(device);
     device->destroyDescriptorSetLayout(update_game_camera_desc_set_layout_);

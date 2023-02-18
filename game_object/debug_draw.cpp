@@ -245,7 +245,7 @@ void DebugDrawObject::recreateStaticMembers(
         display_size);
 }
 
-void DebugDrawObject::destoryStaticMembers(
+void DebugDrawObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(debug_draw_desc_set_layout_);
     device->destroyPipelineLayout(debug_draw_pipeline_layout_);

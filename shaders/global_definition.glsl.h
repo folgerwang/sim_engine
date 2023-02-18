@@ -8,8 +8,6 @@
 
 #define PI      3.1415926535897f
 
-//#define MATERIAL_UNLIT
-
 #define VINPUT_VERTEX_BINDING_POINT         30
 #define VINPUT_INSTANCE_BINDING_POINT       31
 
@@ -29,15 +27,18 @@
 #define IINPUT_MAT_ROT_1            12
 #define IINPUT_MAT_ROT_2            13
 #define IINPUT_MAT_POS_SCALE        14
+#define IINPUT_INSTANCE_INDEX       15
 
 #define PBR_GLOBAL_PARAMS_SET       0
 #define VIEW_PARAMS_SET             1
 #define PBR_MATERIAL_PARAMS_SET     2
 #define TILE_PARAMS_SET             2
 #define MODEL_PARAMS_SET            3
+#define OBJECT_SHARED_PARAMS_SET    4
 
 // MODEL_PARAMS_SET.
 #define JOINT_CONSTANT_INDEX        0
+#define OBJECT_INSTANCE_BUFFER_INDEX    1
 // VIEW_PARAMS_SET
 #define VIEW_CAMERA_BUFFER_INDEX    6
 
@@ -501,21 +502,6 @@ struct GrassInstanceDataInfo {
     vec4            mat_pos_scale;
 };
 
-// could be updated from frame to frame.
-struct GameObjectInfo {
-    vec3            position;                 // 32-bits float position.
-    uint            packed_up_vector;         // 2 half x, y for up vector.
-
-    uint            packed_facing_dir;        // 2 half x, y for facing vector.
-    uint            packed_moving_dir_xy;     // 2 half x, y for moving vector.
-    uint            packed_moving_dir_z_signs;// 2 half z and signs.
-    uint            status;                   // 32 bits for status, todo.
-
-    uint            packed_mass_scale;        // 2 half mass and scale.
-    uint            packed_radius_angle;      // 2 half awareness radius and angle.
-    uint            pad[2];
-};
-
 struct GameCameraParams {
     vec2            world_min;
     vec2            inv_world_range;
@@ -558,6 +544,21 @@ struct GameCameraInfo {
     vec2            mouse_pos;
     float           camera_follow_dist;
     float           pad;
+};
+
+// could be updated from frame to frame.
+struct GameObjectInfo {
+    vec3            position;                 // 32-bits float position.
+    uint            packed_up_vector;         // 2 half x, y for up vector.
+
+    uint            packed_facing_dir;        // 2 half x, y for facing vector.
+    uint            packed_moving_dir_xy;     // 2 half x, y for moving vector.
+    uint            packed_moving_dir_z_signs;// 2 half z and signs.
+    uint            status;                   // 32 bits for status, todo.
+
+    uint            packed_mass_scale;        // 2 half mass and scale.
+    uint            packed_radius_angle;      // 2 half awareness radius and angle.
+    uint            pad[2];
 };
 
 struct VertexBufferInfo {

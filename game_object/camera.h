@@ -60,7 +60,7 @@ public:
         const renderer::TextureInfo& soil_water_layer_1,
         const renderer::BufferInfo& game_objects_buffer);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
     static void updateGameCameraBuffer(

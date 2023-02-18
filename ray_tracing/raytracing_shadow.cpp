@@ -188,6 +188,7 @@ void RayTracingShadowTest::initBottomLevelDataInfo(
         as_build_size_info);
 
     device_info.device->createBuffer(
+        __FILE__ + __LINE__,
         as_build_size_info.as_size,
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -201,6 +202,7 @@ void RayTracingShadowTest::initBottomLevelDataInfo(
         renderer::AccelerationStructureType::BOTTOM_LEVEL_KHR);
 
     device_info.device->createBuffer(
+        __FILE__ + __LINE__,
         as_build_size_info.build_scratch_size,
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -308,6 +310,7 @@ void RayTracingShadowTest::initTopLevelDataInfo(
         as_build_size_info);
 
     device_info.device->createBuffer(
+        __FILE__ + __LINE__,
         as_build_size_info.as_size,
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -321,6 +324,7 @@ void RayTracingShadowTest::initTopLevelDataInfo(
         renderer::AccelerationStructureType::TOP_LEVEL_KHR);
 
     device_info.device->createBuffer(
+        __FILE__ + __LINE__,
         as_build_size_info.build_scratch_size,
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -494,6 +498,7 @@ void RayTracingShadowTest::createRtResources(
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
 
     device_info.device->createBuffer(
+        __FILE__ + __LINE__,
         sizeof(UniformData),
         SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |

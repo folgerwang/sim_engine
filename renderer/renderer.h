@@ -206,12 +206,13 @@ public:
 };
 
 class VulkanBuffer : public Buffer {
+    std::string      debug_tag_;
     uint32_t         size_;
     VkBuffer         buffer_;
     uint64_t         device_address_ = 0;
 public:
-    VulkanBuffer(const VkBuffer& buffer, uint32_t size) :
-        buffer_(buffer), size_(size) {}
+    VulkanBuffer(const std::string& debug_tag, const VkBuffer& buffer, uint32_t size) :
+        debug_tag_(debug_tag), buffer_(buffer), size_(size) {}
     VkBuffer get() { return buffer_; }
     void set_device_address(uint64_t device_address) { device_address_ = device_address; }
     virtual uint32_t getSize() final {

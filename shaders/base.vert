@@ -10,6 +10,10 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 	GameCameraInfo camera_info;
 };
 
+layout(std430, set = OBJECT_SHARED_PARAMS_SET, binding = OBJECT_INSTANCE_BUFFER_INDEX) readonly buffer ObjectInstanceInfoBuffer {
+	InstanceDataInfo instance_info[];
+};
+
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
 layout(std430, set = MODEL_PARAMS_SET, binding = JOINT_CONSTANT_INDEX) readonly buffer JointMatrices {
 	mat4 joint_matrices[];
@@ -51,10 +55,7 @@ layout(location = VINPUT_JOINTS_1) in uvec4 in_joints_1;
 layout(location = VINPUT_WEIGHTS_1) in vec4 in_weights_1;
 #endif
 
-layout(location = IINPUT_MAT_ROT_0) in vec3 in_loc_rot_mat_0;
-layout(location = IINPUT_MAT_ROT_1) in vec3 in_loc_rot_mat_1;
-layout(location = IINPUT_MAT_ROT_2) in vec3 in_loc_rot_mat_2;
-layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
+layout(location = IINPUT_INSTANCE_INDEX) in uint32 in_instance_index;
 
 layout(location = 0) out VsPsData {
     vec3 vertex_position;
@@ -131,13 +132,13 @@ void main() {
     vec3 position_ls = (matrix_ls * vec4(in_position, 1.0f)).xyz;
 
     mat3 local_world_rot_mat =
-        mat3x3(in_loc_rot_mat_0,
-               in_loc_rot_mat_1,
-               in_loc_rot_mat_2);
+        mat3x3(instance_info[in_instance_index].mat_rot_0.xyz,
+               instance_info[in_instance_index].mat_rot_1.xyz,
+               instance_info[in_instance_index].mat_rot_2.xyz);
     vec3 position_ws =
         local_world_rot_mat *
         position_ls +
-        in_loc_pos_scale.xyz;
+        instance_info[in_instance_index].mat_pos_scale.xyz;
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
     out_data.vertex_tex_coord = vec4(0);

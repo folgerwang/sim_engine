@@ -32,6 +32,7 @@ VulkanDevice::~VulkanDevice()
 }
 
 std::shared_ptr<Buffer> VulkanDevice::createBuffer(
+    const std::string& debug_tag,
     uint64_t buf_size,
     BufferUsageFlags usage,
     bool sharing/* = false*/) {
@@ -46,20 +47,21 @@ std::shared_ptr<Buffer> VulkanDevice::createBuffer(
         throw std::runtime_error("failed to create buffer!");
     }
 
-    auto result = std::make_shared<VulkanBuffer>(buffer, static_cast<uint32_t>(buf_size));
+    auto result = std::make_shared<VulkanBuffer>(debug_tag, buffer, static_cast<uint32_t>(buf_size));
     buffer_list_.push_back(result);
 
     return result;
 }
 
 void VulkanDevice::createBuffer(
+    const std::string& debug_tag,
     const uint64_t& buffer_size,
     const BufferUsageFlags& usage,
     const MemoryPropertyFlags& properties,
     const MemoryAllocateFlags& allocate_flags,
     std::shared_ptr<Buffer>& buffer,
     std::shared_ptr<DeviceMemory>& buffer_memory) {
-    buffer = createBuffer(buffer_size, usage);
+    buffer = createBuffer(debug_tag, buffer_size, usage);
     auto mem_requirements = getBufferMemoryRequirements(buffer);
     buffer_memory = allocateMemory(mem_requirements.size,
         mem_requirements.memory_type_bits,

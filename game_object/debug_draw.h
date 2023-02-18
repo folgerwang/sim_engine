@@ -24,10 +24,10 @@ public:
         const glm::vec2& max);
 
     ~DebugDrawObject() {
-        destory();
+        destroy();
     }
 
-    void destory();
+    void destroy();
 
     static void initStaticMembers(
         const renderer::DeviceInfo& device_info,
@@ -50,7 +50,7 @@ public:
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const glm::uvec2& display_size);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
     static void updateStaticDescriptorSet(
