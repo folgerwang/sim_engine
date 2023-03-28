@@ -55,7 +55,7 @@ layout(location = VINPUT_JOINTS_1) in uvec4 in_joints_1;
 layout(location = VINPUT_WEIGHTS_1) in vec4 in_weights_1;
 #endif
 
-layout(location = IINPUT_INSTANCE_INDEX) in uint32 in_instance_index;
+layout(location = IINPUT_INSTANCE_INDEX) in uint in_instance_index;
 
 layout(location = 0) out VsPsData {
     vec3 vertex_position;

@@ -1,5 +1,6 @@
 #pragma once
 #include "renderer_structs.h"
+#include <string>
 
 namespace engine {
 namespace renderer {
