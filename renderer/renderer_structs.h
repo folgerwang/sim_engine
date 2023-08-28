@@ -3,6 +3,7 @@
 #include <vector>
 #include <optional>
 #include <functional>
+#include <string>
 
 #define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
