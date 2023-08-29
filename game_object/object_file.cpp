@@ -78,25 +78,6 @@ static void createUnifiedMesh(
     }
 }
 
-static std::shared_ptr<renderer::BufferInfo> createUnifiedMesh(
-    const renderer::DeviceInfo& device_info,
-    const renderer::BufferUsageFlags& usage,
-    const uint64_t& size,
-    const void* data) {
-    auto v_buffer = std::make_shared<renderer::BufferInfo>();
-    renderer::Helper::createBuffer(
-        device_info,
-        usage,
-        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-        0,
-        v_buffer->buffer,
-        v_buffer->memory,
-        size,
-        data);
-
-    return v_buffer;
-}
-
 static std::shared_ptr<game_object::Patch> createPatch(
     const renderer::DeviceInfo& device_info,
     std::vector<glm::vec3> new_vertices,
@@ -111,7 +92,7 @@ static std::shared_ptr<game_object::Patch> createPatch(
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs;
     assert(new_vertices.size() > 0);
     patch->setPositionBuffer(
-        createUnifiedMesh(
+        createUnifiedMeshBuffer(
             device_info,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             new_vertices.size() * sizeof(new_vertices[0]),
@@ -132,7 +113,7 @@ static std::shared_ptr<game_object::Patch> createPatch(
 
     if (new_normals.size() > 0) {
         patch->setNormalBuffer(
-            createUnifiedMesh(
+            createUnifiedMeshBuffer(
                 device_info,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
                 new_normals.size() * sizeof(new_normals[0]),
@@ -153,7 +134,7 @@ static std::shared_ptr<game_object::Patch> createPatch(
 
     if (new_uvs.size() > 0) {
         patch->setUvBuffer(
-            createUnifiedMesh(
+            createUnifiedMeshBuffer(
                 device_info,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
                 new_uvs.size() * sizeof(new_uvs[0]),
@@ -177,7 +158,7 @@ static std::shared_ptr<game_object::Patch> createPatch(
 
     assert(new_faces.size() > 0);
     patch->setIndexBuffer(
-        createUnifiedMesh(
+        createUnifiedMeshBuffer(
             device_info,
             SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
             new_faces.size() * sizeof(new_faces[0]),

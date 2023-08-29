@@ -138,6 +138,9 @@
     <ClCompile Include="ray_tracing\raytracing_shadow.cpp">
       <Filter>Source Files\engine\ray_tracing</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\plane.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -271,6 +274,9 @@
     </ClInclude>
     <ClInclude Include="shaders\weather\weather_common.glsl.h">
       <Filter>Resource Files\weather</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\plane.h">
+      <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

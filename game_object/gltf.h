@@ -46,7 +46,7 @@ public:
     glm::vec3               bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
     std::shared_ptr<renderer::AccelerationStructureGeometry>  as_geometry;
 
-    renderer::IndexInputBindingDescription  index_desc_;
+    renderer::IndexInputBindingDescription  index_desc_ = { 0 };
     std::vector<renderer::VertexInputBindingDescription> binding_descs_;
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs_;
 
@@ -125,7 +125,7 @@ struct SceneInfo {
 
 struct GltfData {
     const std::shared_ptr<renderer::Device>& device_;
-    int32_t                     default_scene_;
+    int32_t                     default_scene_ = 0;
     std::vector<SceneInfo>      scenes_;
     std::vector<NodeInfo>       nodes_;
     std::vector<MeshInfo>       meshes_;

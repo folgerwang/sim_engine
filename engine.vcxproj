@@ -26,6 +26,7 @@
     <ClCompile Include="game_object\gltf.cpp" />
     <ClCompile Include="game_object\object_file.cpp" />
     <ClCompile Include="game_object\patch.cpp" />
+    <ClCompile Include="game_object\plane.cpp" />
     <ClCompile Include="game_object\shape_base.cpp" />
     <ClCompile Include="game_object\sphere.cpp" />
     <ClCompile Include="game_object\terrain.cpp" />
@@ -51,6 +52,7 @@
     <ClInclude Include="game_object\gltf.h" />
     <ClInclude Include="game_object\object_file.h" />
     <ClInclude Include="game_object\patch.h" />
+    <ClInclude Include="game_object\plane.h" />
     <ClInclude Include="game_object\shape_base.h" />
     <ClInclude Include="game_object\sphere.h" />
     <ClInclude Include="game_object\terrain.h" />
@@ -151,26 +153,26 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>

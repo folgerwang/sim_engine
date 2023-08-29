@@ -2,6 +2,14 @@
 #include "renderer/renderer.h"
 
 namespace engine {
+namespace {
+std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
+    const renderer::DeviceInfo& device_info,
+    const renderer::BufferUsageFlags& usage,
+    const uint64_t& size,
+    const void* data);
+}
+
 namespace game_object {
 
 class ShapeBase {
