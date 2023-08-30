@@ -30,8 +30,8 @@ static void createUnifiedQuad(
     new_uvs[2] = glm::vec2(1.0f, 1.0f);
     new_uvs[3] = glm::vec2(0.0f, 1.0f);
 
-    new_faces[0] = glm::uvec3(0, 1, 2);
-    new_faces[1] = glm::uvec3(0, 2, 3);
+    new_faces[0] = glm::uvec3(0, 2, 1);
+    new_faces[1] = glm::uvec3(0, 3, 2);
 }
 
 static std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(

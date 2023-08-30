@@ -27,6 +27,7 @@
     <ClCompile Include="game_object\object_file.cpp" />
     <ClCompile Include="game_object\patch.cpp" />
     <ClCompile Include="game_object\plane.cpp" />
+    <ClCompile Include="game_object\prt.cpp" />
     <ClCompile Include="game_object\shape_base.cpp" />
     <ClCompile Include="game_object\sphere.cpp" />
     <ClCompile Include="game_object\terrain.cpp" />
@@ -53,6 +54,7 @@
     <ClInclude Include="game_object\object_file.h" />
     <ClInclude Include="game_object\patch.h" />
     <ClInclude Include="game_object\plane.h" />
+    <ClInclude Include="game_object\prt.h" />
     <ClInclude Include="game_object\shape_base.h" />
     <ClInclude Include="game_object\sphere.h" />
     <ClInclude Include="game_object\terrain.h" />
@@ -96,6 +98,7 @@
     <None Include="shaders\base.vert" />
     <None Include="shaders\blur_image_x.comp" />
     <None Include="shaders\blur_image_y_merge.comp" />
+    <None Include="shaders\conemap_gen.comp" />
     <None Include="shaders\cube_ibl.frag" />
     <None Include="shaders\cube_skybox.frag" />
     <None Include="shaders\debug_draw.frag" />
@@ -110,6 +113,9 @@
     <None Include="shaders\lungs.frag" />
     <None Include="shaders\lungs.vert" />
     <None Include="shaders\perlin_noise_init.comp" />
+    <None Include="shaders\prt_gen.comp" />
+    <None Include="shaders\prt_test.frag" />
+    <None Include="shaders\prt_test.vert" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable1.rcall" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable2.rcall" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable3.rcall" />
