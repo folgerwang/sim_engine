@@ -5,7 +5,7 @@
 namespace engine {
 namespace game_object {
 
-class Prt {
+class PrtTest {
     std::shared_ptr<renderer::DescriptorSet>  prt_desc_set_;
     std::shared_ptr<renderer::DescriptorSetLayout> prt_desc_set_layout_;
     std::shared_ptr<renderer::PipelineLayout> prt_pipeline_layout_;
@@ -13,7 +13,7 @@ class Prt {
     std::shared_ptr<renderer::TextureInfo> cone_map_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_tex_;
 public:
-    Prt(
+    PrtTest(
         const renderer::DeviceInfo& device_info,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,

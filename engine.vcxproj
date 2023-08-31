@@ -27,7 +27,7 @@
     <ClCompile Include="game_object\object_file.cpp" />
     <ClCompile Include="game_object\patch.cpp" />
     <ClCompile Include="game_object\plane.cpp" />
-    <ClCompile Include="game_object\prt.cpp" />
+    <ClCompile Include="game_object\prt_test.cpp" />
     <ClCompile Include="game_object\shape_base.cpp" />
     <ClCompile Include="game_object\sphere.cpp" />
     <ClCompile Include="game_object\terrain.cpp" />
@@ -38,8 +38,10 @@
     <ClCompile Include="renderer\vulkan\vk_command_buffer.cpp" />
     <ClCompile Include="renderer\vulkan\vk_device.cpp" />
     <ClCompile Include="renderer\vulkan\vk_renderer_helper.cpp" />
+    <ClCompile Include="scene_rendering\cone_map.cpp" />
     <ClCompile Include="scene_rendering\ibl_creator.cpp" />
     <ClCompile Include="scene_rendering\menu.cpp" />
+    <ClCompile Include="scene_rendering\prt.cpp" />
     <ClCompile Include="scene_rendering\skydome.cpp" />
     <ClCompile Include="scene_rendering\volume_cloud.cpp" />
     <ClCompile Include="scene_rendering\volume_noise.cpp" />
@@ -54,7 +56,7 @@
     <ClInclude Include="game_object\object_file.h" />
     <ClInclude Include="game_object\patch.h" />
     <ClInclude Include="game_object\plane.h" />
-    <ClInclude Include="game_object\prt.h" />
+    <ClInclude Include="game_object\prt_test.h" />
     <ClInclude Include="game_object\shape_base.h" />
     <ClInclude Include="game_object\sphere.h" />
     <ClInclude Include="game_object\terrain.h" />
@@ -72,8 +74,10 @@
     <ClInclude Include="renderer\vulkan\vk_device.h" />
     <ClInclude Include="renderer\vulkan\vk_physical_device.h" />
     <ClInclude Include="renderer\vulkan\vk_renderer_helper.h" />
+    <ClInclude Include="scene_rendering\cone_map.h" />
     <ClInclude Include="scene_rendering\ibl_creator.h" />
     <ClInclude Include="scene_rendering\menu.h" />
+    <ClInclude Include="scene_rendering\prt.h" />
     <ClInclude Include="scene_rendering\skydome.h" />
     <ClInclude Include="scene_rendering\volume_cloud.h" />
     <ClInclude Include="scene_rendering\volume_noise.h" />

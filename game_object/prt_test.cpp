@@ -1,4 +1,4 @@
-#include "prt.h"
+#include "prt_test.h"
 #include "engine_helper.h"
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -94,7 +94,7 @@ static std::shared_ptr<renderer::PipelineLayout> createPipelineLayout(
 
 namespace game_object {
 
-Prt::Prt(
+PrtTest::PrtTest(
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -177,7 +177,7 @@ Prt::Prt(
 
 }
 
-void Prt::draw(
+void PrtTest::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
     std::shared_ptr<Plane> unit_plane) {
@@ -212,7 +212,7 @@ void Prt::draw(
     }
 }
 
-void Prt::destroy(const std::shared_ptr<renderer::Device>& device) {
+void PrtTest::destroy(const std::shared_ptr<renderer::Device>& device) {
     if (cone_map_tex_) {
         cone_map_tex_->destroy(device);
     }

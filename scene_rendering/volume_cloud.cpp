@@ -16,7 +16,7 @@ er::WriteDescriptorList addBlurImageTextures(
     const std::shared_ptr<er::ImageView>& dst_image,
     const std::shared_ptr<er::ImageView>& depth_image) {
     er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(2);
+    descriptor_writes.reserve(3);
 
     // envmap texture.
     er::Helper::addOneTexture(

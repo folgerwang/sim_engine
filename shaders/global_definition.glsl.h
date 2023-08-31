@@ -418,6 +418,16 @@ struct CloudParams {
     float           pad;
 };
 
+struct ConemapParams {
+    uvec2           size;
+    vec2            inv_size;
+};
+
+struct PrtParams {
+    uvec2           size;
+    vec2            inv_size;
+};
+
 struct GameObjectsUpdateParams {
     vec2            world_min;
     vec2            inv_world_range;

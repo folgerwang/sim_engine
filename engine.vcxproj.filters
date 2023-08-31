@@ -141,8 +141,14 @@
     <ClCompile Include="game_object\plane.cpp">
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
-    <ClCompile Include="game_object\prt.cpp">
+    <ClCompile Include="game_object\prt_test.cpp">
       <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
+    <ClCompile Include="scene_rendering\cone_map.cpp">
+      <Filter>Source Files\engine\scene_rendering</Filter>
+    </ClCompile>
+    <ClCompile Include="scene_rendering\prt.cpp">
+      <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -281,8 +287,14 @@
     <ClInclude Include="game_object\plane.h">
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
-    <ClInclude Include="game_object\prt.h">
+    <ClInclude Include="game_object\prt_test.h">
       <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="scene_rendering\cone_map.h">
+      <Filter>Header Files\engine\scene_rendering</Filter>
+    </ClInclude>
+    <ClInclude Include="scene_rendering\prt.h">
+      <Filter>Header Files\engine\scene_rendering</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
