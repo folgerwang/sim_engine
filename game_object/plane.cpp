@@ -7,11 +7,13 @@ namespace {
 static void createUnifiedQuad(
     std::vector<glm::vec3>& new_vertices,
     std::vector<glm::vec3>& new_normals,
+    std::vector<glm::vec3>& new_tangents,
     std::vector<glm::vec2>& new_uvs,
     std::vector<glm::uvec3>& new_faces) {
 
     new_vertices.resize(4);
     new_normals.resize(4);
+    new_tangents.resize(4);
     new_uvs.resize(4);
     new_faces.resize(2);
 
@@ -24,6 +26,11 @@ static void createUnifiedQuad(
     new_normals[1] = glm::vec3(0.0f, 1.0f, 0.0f);
     new_normals[2] = glm::vec3(0.0f, 1.0f, 0.0f);
     new_normals[3] = glm::vec3(0.0f, 1.0f, 0.0f);
+
+    new_tangents[0] = glm::vec3(1.0f, 0.0f, 0.0f);
+    new_tangents[1] = glm::vec3(1.0f, 0.0f, 0.0f);
+    new_tangents[2] = glm::vec3(1.0f, 0.0f, 0.0f);
+    new_tangents[3] = glm::vec3(1.0f, 0.0f, 0.0f);
 
     new_uvs[0] = glm::vec2(0.0f, 0.0f);
     new_uvs[1] = glm::vec2(1.0f, 0.0f);
@@ -61,10 +68,11 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
 {
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;
+    std::vector<glm::vec3> tangents;
     std::vector<glm::vec2> uvs;
     std::vector<glm::uvec3> faces;
 
-    createUnifiedQuad(vertices, normals, uvs, faces);
+    createUnifiedQuad(vertices, normals, tangents, uvs, faces);
 
     renderer::VertexInputBindingDescription binding_desc;
     renderer::VertexInputAttributeDescription attribute_desc;
@@ -101,6 +109,23 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
 
     attribute_desc.binding = binding_idx;
     attribute_desc.location = VINPUT_NORMAL;
+    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
+    attribute_desc.offset = 0;
+    attribute_descs.push_back(attribute_desc);
+    binding_idx++;
+
+    setTangentBuffer(createUnifiedMeshBuffer(
+        device_info,
+        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+        tangents.size() * sizeof(tangents[0]),
+        tangents.data()));
+    binding_desc.binding = binding_idx;
+    binding_desc.stride = sizeof(tangents[0]);
+    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
+    binding_descs.push_back(binding_desc);
+
+    attribute_desc.binding = binding_idx;
+    attribute_desc.location = VINPUT_TANGENT;
     attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
     attribute_desc.offset = 0;
     attribute_descs.push_back(attribute_desc);
@@ -143,6 +168,11 @@ void Plane::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
 
     if (getNormalBuffer()) {
         buffers.push_back(getNormalBuffer()->buffer);
+        offsets.push_back(0);
+    }
+
+    if (getTangentBuffer()) {
+        buffers.push_back(getTangentBuffer()->buffer);
         offsets.push_back(0);
     }
 

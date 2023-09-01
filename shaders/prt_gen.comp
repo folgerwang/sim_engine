@@ -2,67 +2,237 @@
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
 
-#define BLUR_RADIUS				3
-#define SHARED_BUFFER_SIZE		(64 + BLUR_RADIUS * 2)
+float getKValue(int l, int m)
+{
+    const float s_factorial_serials[9] =
+        {1.0f, 1.0f, 2.0f, 6.0f, 24.0f, 120.0f, 720.0f, 5040.0f, 40320.0f};
+    float factor = sqrt((2 * l + 1) / (4.0f * PI));
+    return sqrt(factor * s_factorial_serials[l - abs(m)] / s_factorial_serials[l + abs(m)]);
+}
 
-layout(push_constant) uniform BlurImageUniformBufferObject {
-    BlurImageParams params;
-};
+void fillPVauleTablle(inout float p_value[15], float x) {
+    float x2 = x * x;
+    float x2_s7 = 7.0f * x2;
+    float x2_1 = 1.0f - x2;
+    float x2_1sqrt = sqrt(x2_1);
+    float x2_1_2_3rd = x2_1sqrt * x2_1;
+    float inv_x2_1_2_3rd = 1.0f / x2_1_2_3rd;
+    float x2_1sqr = x2_1 * x2_1;
 
-layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+    // l = 0, m = 0
+    p_value[0] = 1.0f;
+    // l = 1, m = 0
+    p_value[1] = x;
+    // l = 1, m = 1
+    p_value[2] = -x2_1sqrt;
+    float a00 = x * x2_1sqrt;
+    // l = 2, m = 0
+    p_value[3] = 0.5f * (3.0f * x2 - 1.0f);
+    // l = 2, m = 1
+    p_value[4] = -3.0f * a00; 
+    // l = 2, m = 2
+    p_value[5] = 3.0f * x2_1;
+    float a01 = (-5.0f * x2 + 1.0f) * x2_1sqrt;
+    // l = 3, m = 0
+    p_value[6] = 0.5f * x * (5.0f * x2 - 3.0f);
+    // l = 3, m = 1
+    p_value[7] = 1.5f * a01;
+    // l = 3, m = 2
+    p_value[8] = 15.0f * x * x2_1;
+    // l = 3, m = 3
+    p_value[9] = -15.0f * x2_1_2_3rd;
+    float a02 = (-x2_s7 + 3.0f) * a00;
+    // l = 4, m = 0
+    p_value[10] = 0.625f * ((x2_s7 - 6.0f) * x2 + 3.0f);
+    // l = 4, m = 1
+    p_value[11] = 2.5f * a02;
+    // l = 4, m = 2
+    p_value[12] = 7.5f * (x2_s7 - 1.0f) * x2_1;
+    // l = 4, m = 3
+    p_value[13] = -105.0f * x * x2_1_2_3rd;
+    // l = 4, m = 4
+    p_value[14] = 105.0f * x2_1sqr;
+}
+
+void fillYVauleTablle(inout float y_value[25], float theta, float phi) {
+    const float sqrt2 = sqrt(2.0f);
+
+    float cos_theta = cos(theta);
+    float sin_phi = sin(phi);
+    float cos_phi = cos(phi);
+    float sin_2phi = sin(2.0f * phi);
+    float cos_2phi = cos(2.0f * phi);
+    float sin_3phi = sin(3.0f * phi);
+    float cos_3phi = cos(3.0f * phi);
+    float sin_4phi = sin(4.0f * phi);
+    float cos_4phi = cos(4.0f * phi);
+
+    float p_value[15];
+    fillPVauleTablle(p_value, cos_theta);
+
+    float a11 = sqrt2 * getKValue(1, 1) * p_value[2];
+    float a22 = sqrt2 * getKValue(2, 2) * p_value[5];
+    float a21 = sqrt2 * getKValue(2, 1) * p_value[4];
+    float a33 = sqrt2 * getKValue(3, 3) * p_value[9];
+    float a32 = sqrt2 * getKValue(3, 2) * p_value[8];
+    float a31 = sqrt2 * getKValue(3, 1) * p_value[7];
+    float a44 = sqrt2 * getKValue(4, 4) * p_value[14];
+    float a43 = sqrt2 * getKValue(4, 3) * p_value[13];
+    float a42 = sqrt2 * getKValue(4, 2) * p_value[12];
+    float a41 = sqrt2 * getKValue(4, 1) * p_value[11];
+
+    // l = 0, m = 0
+    y_value[0] = getKValue(0, 0) * p_value[0];
+    // l = 1, m = -1
+    y_value[1] = sin_phi * a11;
+    // l = 1, m = 0
+    y_value[2] = getKValue(1, 0) * p_value[1];
+    // l = 1, m = 1
+    y_value[3] = cos_phi * a11;
+    // l = 2, m = -2
+    y_value[4] = sin_2phi * a22;
+    // l = 2, m = -1
+    y_value[5] = sin_phi * a21;
+    // l = 2, m = 0
+    y_value[6] = getKValue(2, 0) * p_value[3];
+    // l = 2, m = 1
+    y_value[7] = cos_phi * a21;
+    // l = 2, m = 2
+    y_value[8] = cos_2phi * a22;
+    // l = 3, m = -3
+    y_value[9] = sin_3phi * a33;
+    // l = 3, m = -2
+    y_value[10] = sin_2phi * a32;
+    // l = 3, m = -1
+    y_value[11] = sin_phi * a31;
+    // l = 3, m = 0
+    y_value[12] = getKValue(3, 0) * p_value[6];
+    // l = 3, m = 1
+    y_value[13] = cos_phi * a31;
+    // l = 3, m = 2
+    y_value[14] = cos_2phi * a32;
+    // l = 3, m = 3
+    y_value[15] = cos_3phi * a33;
+    // l = 4, m = -4
+    y_value[16] = sin_4phi * a44;
+    // l = 4, m = -3
+    y_value[17] = sin_3phi * a43;
+    // l = 4, m = -2
+    y_value[18] = sin_2phi * a42;
+    // l = 4, m = -1
+    y_value[19] = sin_phi * a41;
+    // l = 4, m = 0
+    y_value[20] = getKValue(4, 0) * p_value[10];
+    // l = 4, m = 1
+    y_value[21] = cos_phi * a41;
+    // l = 4, m = 2
+    y_value[22] = cos_2phi * a42;
+    // l = 4, m = 3
+    y_value[23] = cos_3phi * a43;
+    // l = 4, m = 4
+    y_value[24] = cos_4phi * a44;
+}
+
+// ray is normalized vector. org is origin of ray within [-1, 1] range.
+float getIntersection(vec2 org, vec2 ray)
+{
+    vec2 ray_offset = (vec2(1.0f) - sign(abs(ray))) * 1e-20;
+    vec2 adj_ray = ray + ray_offset;
+    vec2 inv_ray = 1.0f / adj_ray;
+    vec2 factor_a = abs(inv_ray);
+    vec2 factor_b = -org * inv_ray;
+    vec2 factor = factor_a + factor_b;
+    return min(factor.x, factor.y);
+}
+
+float getIntersection(vec3 org, vec3 ray)
+{
+    vec3 ray_offset = (vec3(1.0f) - sign(abs(ray))) * 1e-20;
+    vec3 adj_ray = ray + ray_offset;
+    vec3 inv_ray = 1.0f / ray;
+    vec3 factor_a = abs(inv_ray);
+    vec3 factor_b = -org * inv_ray;
+    vec3 factor = factor_a + factor_b;
+    return min(min(factor.x, factor.y), factor.z);
+}
+
+layout(push_constant) uniform PrtUniformBufferObject {
+    PrtParams params;
 };
 
 layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
-layout(set = 0, binding = DST_TEX_INDEX, rgba16f) uniform image2D dst_img;
-layout(set = 0, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D depth_img;
+//layout(set = 0, binding = DST_TEX_INDEX, rgba32ui) uniform uimage2D dst_img;
+layout(set = 0, binding = DST_TEX_INDEX_0, rgba8) uniform image2D dst_img_0;
+layout(set = 0, binding = DST_TEX_INDEX_1, rgba8) uniform image2D dst_img_1;
+layout(set = 0, binding = DST_TEX_INDEX_2, rgba8) uniform image2D dst_img_2;
+layout(set = 0, binding = DST_TEX_INDEX_3, rgba8) uniform image2D dst_img_3;
+layout(set = 0, binding = DST_TEX_INDEX_4, rgba8) uniform image2D dst_img_4;
+layout(set = 0, binding = DST_TEX_INDEX_5, rgba8) uniform image2D dst_img_5;
 
-shared vec4 s_src_color[SHARED_BUFFER_SIZE];
-shared float s_src_depth[SHARED_BUFFER_SIZE];
-layout(local_size_x = 64, local_size_y = 1) in;
+float sampleVisi(vec2 sample_uv, float cur_depth, float theta, float phi) {
+    vec2 sample_ray = vec2(cos(phi), sin(phi));
+    float t = getIntersection(sample_uv * 2.0f - 1.0f, sample_ray) * 0.5f;
+    uint sample_count = uint(t * min(params.size.x, params.size.y));
+    float step = t / sample_count;
+    float visi = 1.0f;
+    float t1 = step * 0.5f;
+    float max_tan_angle = 0.0f;
+    for (uint i = 0; i < sample_count; i++) {
+        vec2 sample_pos = sample_uv + sample_ray * t1;
+        float sample_depth = texture(src_img, sample_pos).w;
+        max_tan_angle = max(max(sample_depth - cur_depth, 0.0f) / t1, max_tan_angle);
+        t1 += step;
+    }
+
+    if (max_tan_angle > 0 && tan(theta) < max_tan_angle) {
+        visi = 0.0f;
+    }
+
+    return visi;
+}
+
+layout(local_size_x = 8, local_size_y = 8) in;
 void main()
 {
 	// get index in global work group i.e x,y position
 	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
-	ivec2 local_coords = ivec2(gl_LocalInvocationID.xy);
-	ivec2 block_coords = ivec2(gl_WorkGroupID.x * 64, gl_WorkGroupID.y);
-	uint pixel_index = gl_LocalInvocationIndex;
 
-	if (pixel_index < SHARED_BUFFER_SIZE / 2) {
-		ivec2 slc = ivec2(local_coords.x * 2, 0);
-		ivec2 sgc = clamp(slc + block_coords + ivec2(-BLUR_RADIUS, 0),
-                             ivec2(0),
-                             ivec2(params.size - 1));
-		vec2 uv0 = (sgc + 0.5) * params.inv_size;
-		vec2 uv1 = vec2(uv0.x + params.inv_size.x, uv0.y);
-	    s_src_color[slc.x] = texture(src_img, uv0);
-		s_src_depth[slc.x] = camera_info.proj[3].z / (texture(depth_img, uv0).x + camera_info.proj[2].z);
-		s_src_color[slc.x+1] = texture(src_img, uv1);
-		s_src_depth[slc.x+1] = camera_info.proj[3].z / (texture(depth_img, uv1).x + camera_info.proj[2].z);
-	}
+    const int numSamples = 200; // Just an example number; in practice, you'd probably need more.
+    const float step_angle = PI / numSamples;
+    float sum_visi[25];
+    for (int s = 0; s < 25; s++) {
+        sum_visi[s] = 0.0f;
+    }
 
-	barrier();
-    memoryBarrierShared();
+    vec2 sample_uv = vec2(pixel_coords + 0.5) * params.inv_size;
+    float c_depth = texture(src_img, sample_uv).w;
 
-	uint center_idx = local_coords.x+BLUR_RADIUS;
-	vec4 sum_color = s_src_color[center_idx];
-	float center_depth = s_src_depth[center_idx];
-	float sum_weight = 1.0f;
+    for (int i = 0; i < numSamples; i++) {
+        for (int j = 0; j < numSamples; j++) {
+            float theta = (i + 0.5f) * step_angle;  // From 0 to pi
+            float phi = (j + 0.5f) * step_angle * 2.0f;  // From 0 to 2*pi
 
-	float slope_dir = (s_src_depth[center_idx+1] -
-					   s_src_depth[center_idx-1]) * 0.5f;
+            float y_value[25];
+            fillYVauleTablle(y_value, theta, phi);
 
-	for (int i = 1; i <= BLUR_RADIUS; i++) {
-		uint idx_0 = center_idx+i;
-		uint idx_1 = center_idx-i;
-		float weight = (1.0f / i) * 0.6f + 0.4f;
-		float weight_0 = exp2(-abs(s_src_depth[idx_0] - (slope_dir * i + center_depth)) / i) * weight;
-		float weight_1 = exp2(-abs(s_src_depth[idx_1] - (center_depth - slope_dir * i)) / i) * weight;
-		sum_color += s_src_color[idx_1] * weight_1 + s_src_color[idx_0] * weight_0;
-		sum_weight += weight_1 + weight_0;
-	}
-	sum_color /= sum_weight;
-  
+            float sample_visi = sampleVisi(sample_uv, c_depth, theta, phi);
+            for (int s = 0; s < 25; s++) {
+                sum_visi[s] += y_value[s] * sample_visi;
+            }
+        }
+    }
+
+    float inv_count = 1.0f / (numSamples * numSamples);
+    for (int s = 0; s < 25; s++) {
+        sum_visi[s] = sum_visi[s] * inv_count;
+    }
+
 	// output to a specific pixel in the image.
-	imageStore(dst_img, pixel_coords, sum_color);
+	//imageStore(dst_img, pixel_coords, uvec4(sum_visi[0] * 256.0f));
+    imageStore(dst_img_0, pixel_coords, vec4(sum_visi[0], sum_visi[1], sum_visi[2], sum_visi[3]));
+    imageStore(dst_img_1, pixel_coords, vec4(sum_visi[4], sum_visi[5], sum_visi[6], sum_visi[7]));
+    imageStore(dst_img_2, pixel_coords, vec4(sum_visi[8], sum_visi[9], sum_visi[10], sum_visi[11]));
+    imageStore(dst_img_3, pixel_coords, vec4(sum_visi[12], sum_visi[13], sum_visi[14], sum_visi[15]));
+    imageStore(dst_img_4, pixel_coords, vec4(sum_visi[16], sum_visi[17], sum_visi[18], sum_visi[19]));
+    imageStore(dst_img_5, pixel_coords, vec4(sum_visi[20], sum_visi[21], sum_visi[22], sum_visi[23]));
 }

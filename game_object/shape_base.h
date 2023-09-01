@@ -16,6 +16,7 @@ class ShapeBase {
     std::shared_ptr<renderer::BufferInfo> position_buffer_;
     std::shared_ptr<renderer::BufferInfo> uv_buffer_;
     std::shared_ptr<renderer::BufferInfo> normal_buffer_;
+    std::shared_ptr<renderer::BufferInfo> tangent_buffer_;
     std::shared_ptr<renderer::BufferInfo> index_buffer_;
     std::vector<renderer::VertexInputBindingDescription> binding_descs_;
     std::vector<renderer::VertexInputAttributeDescription> attrib_descs_;
@@ -33,6 +34,10 @@ public:
 
     void setNormalBuffer(const std::shared_ptr<renderer::BufferInfo>& buffer) {
         normal_buffer_ = buffer;
+    }
+
+    void setTangentBuffer(const std::shared_ptr<renderer::BufferInfo>& buffer) {
+        tangent_buffer_ = buffer;
     }
 
     void setBindingDescs(const std::vector<renderer::VertexInputBindingDescription>& binding_descs) {
@@ -57,6 +62,10 @@ public:
 
     const std::shared_ptr<renderer::BufferInfo>& getNormalBuffer() {
         return normal_buffer_;
+    }
+
+    const std::shared_ptr<renderer::BufferInfo>& getTangentBuffer() {
+        return tangent_buffer_;
     }
 
     const std::vector<renderer::VertexInputBindingDescription>& getBindingDescs() {

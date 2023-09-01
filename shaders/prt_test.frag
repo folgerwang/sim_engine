@@ -5,6 +5,10 @@
 #include "brdf.glsl.h"
 #include "punctual.glsl.h"
 
+layout(push_constant) uniform ModelUniformBufferObject {
+    ModelParams model_params;
+};
+
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	GameCameraInfo camera_info;
 };
@@ -13,15 +17,108 @@ layout(location = 0) in VsPsData {
     vec3 vertex_position;
     vec2 vertex_tex_coord;
     vec3 vertex_normal;
+    vec3 vertex_tangent;
 } in_data;
 
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BASE_TEX_INDEX) uniform sampler2D prt_base_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BUMP_TEX_INDEX) uniform sampler2D prt_bump_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_CONEMAP_TEX_INDEX) uniform sampler2D prt_conemap_tex;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_PRT_TEX_INDEX) uniform sampler2D prt_prt_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_0) uniform sampler2D prt_tex_0;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_1) uniform sampler2D prt_tex_1;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_2) uniform sampler2D prt_tex_2;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_3) uniform sampler2D prt_tex_3;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_4) uniform sampler2D prt_tex_4;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_5) uniform sampler2D prt_tex_5;
+
+const int s_cone_steps = 15;
+const int s_binary_steps = 8;
+const float s_depth_scale = 20.0f / 255.0f;
+
+vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
+{
+    vec3 v = iv / iv.z;
+    vec3 p0 = ip;
+
+    float scale_x = 1.0f;
+    if (v.x > 0.0f && p0.x + v.x > 1.0f)
+    {
+        scale_x = (1.0f - p0.x) / v.x;
+    }
+
+    if (v.x < 0.0f && p0.x + v.x < 0.0f)
+    {
+        scale_x = p0.x / (-v.x);
+    }
+
+    vec3 clamped_v = v * scale_x;
+
+    float scale_y = 1.0f;
+    if (clamped_v.y > 0.0f && p0.y + clamped_v.y > 1.0f)
+    {
+        scale_y = (1.0f - p0.y) / clamped_v.y;
+
+    }
+
+    if (clamped_v.y < 0.0f && p0.y + clamped_v.y < 0.0f)
+    {
+        scale_y = p0.y / (-clamped_v.y);
+    }
+
+    clamped_v = clamped_v * scale_y;
+
+    float dist = length(vec2(v));
+
+    vec4 relief_map_info = texture(prt_conemap_tex, vec2(p0));
+    float height = clamp(relief_map_info.z - p0.z, 0.0f, 1.0f);
+
+    const float half_pi = PI / 2.0f;
+    float tan_cone_angle = tan(relief_map_info.y * half_pi);
+    float start_z = !use_conserve_conemap ? 0.0f : min(height / (dist * tan_cone_angle + 1.0f), clamped_v.z);
+    float cast_z = start_z;
+
+    vec3 p = p0;
+    for (int i = 0; i < s_cone_steps; i++)
+    {
+        p = p0 + v * cast_z;
+        vec4 relief_map_info = texture(prt_conemap_tex, vec2(p));
+
+        //The use of the saturate() function when calculating the distance to move guarantees that we stop on the first visited texel for which the viewing ray is under the relief surface.
+        float height = clamp(relief_map_info.z - p.z, 0.0f, 1.0f);
+
+        float tan_cone_angle = tan(relief_map_info.x * half_pi);
+        cast_z = min(cast_z + height / (dist * tan_cone_angle + 1.0f), clamped_v.z);
+    }
+
+    float step_z = (cast_z - start_z) * 0.5f;
+    float current_z = start_z + step_z;
+
+    for (int i = 0; i < s_binary_steps; i++)
+    {
+        p = p0 + v * current_z;
+        vec4 relief_map_info = texture(prt_conemap_tex, vec2(p));
+        step_z *= 0.5f;
+        if (p.z < relief_map_info.z)
+            current_z += step_z;
+        else
+            current_z -= step_z;
+    }
+
+    return p;
+}
 
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    outColor = vec4(texture(prt_bump_tex, in_data.vertex_tex_coord).aaa, 1);
+    vec3 binormal = cross(in_data.vertex_normal, in_data.vertex_tangent);
+    mat3 world2local = mat3(in_data.vertex_tangent, binormal, in_data.vertex_normal);
+
+    //Run the relaxed cone stepping to find the new relief UV
+    vec3 v = in_data.vertex_position - camera_info.position.xyz;
+    v = world2local * v;
+    v.z = abs(v.z);
+    v.xy *= s_depth_scale;
+
+    vec3 intersect_pos = relaxedConeStepping(v, vec3(in_data.vertex_tex_coord, 0.0), false);
+
+    outColor = vec4(texture(prt_base_tex, vec2(intersect_pos)).xyz, 1);
 }

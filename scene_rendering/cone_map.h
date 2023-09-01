@@ -19,7 +19,9 @@ public:
         const renderer::TextureInfo& bump_tex,
         const renderer::TextureInfo& conemap_tex);
 
-    void update();
+    void update(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::TextureInfo& conemap_tex);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

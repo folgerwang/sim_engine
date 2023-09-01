@@ -35,6 +35,9 @@ void ShapeBase::destroy(const std::shared_ptr<renderer::Device>& device) {
     if (normal_buffer_) {
         normal_buffer_->destroy(device);
     }
+    if (tangent_buffer_) {
+        tangent_buffer_->destroy(device);
+    }
     if (index_buffer_) {
         index_buffer_->destroy(device);
     }

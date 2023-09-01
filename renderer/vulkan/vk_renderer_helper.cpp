@@ -2212,11 +2212,14 @@ void createTextureImage(
         usage,
         tiling,
         renderer::ImageLayout::UNDEFINED);
-    auto mem_requirements = device->getImageMemoryRequirements(image);
-    image_memory = device->allocateMemory(mem_requirements.size,
-        mem_requirements.memory_type_bits,
-        toVkMemoryPropertyFlags(properties),
-        0);
+    auto mem_requirements =
+        device->getImageMemoryRequirements(image);
+    image_memory =
+        device->allocateMemory(
+            mem_requirements.size,
+            mem_requirements.memory_type_bits,
+            toVkMemoryPropertyFlags(properties),
+            0);
     device->bindImageMemory(image, image_memory);
 }
 

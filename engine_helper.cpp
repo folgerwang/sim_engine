@@ -89,6 +89,8 @@ void createTextureImage(
         texture.image,
         texture.memory);
 
+    texture.size = { tex_width, tex_height, 1.0f };
+
     stbi_image_free(void_pixels);
 
     texture.view = device_info.device->createImageView(

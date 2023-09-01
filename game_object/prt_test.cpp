@@ -9,12 +9,17 @@ namespace {
 static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(4);
+    bindings.reserve(9);
 
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BASE_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BUMP_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_CONEMAP_TEX_INDEX));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_PRT_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_1));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_2));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_3));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_4));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_5));
 
     return device->createDescriptorSetLayout(bindings);
 }
@@ -25,10 +30,15 @@ static renderer::WriteDescriptorList addPrtTextures(
     const renderer::TextureInfo& base_tex,
     const renderer::TextureInfo& bump_tex,
     const renderer::TextureInfo& conemap_tex,
-    const renderer::TextureInfo& prt_tex) {
+    const renderer::TextureInfo& prt_tex,
+    const renderer::TextureInfo& prt_tex_1,
+    const renderer::TextureInfo& prt_tex_2,
+    const renderer::TextureInfo& prt_tex_3,
+    const renderer::TextureInfo& prt_tex_4,
+    const renderer::TextureInfo& prt_tex_5) {
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(4);
+    descriptor_writes.reserve(9);
 
     // diffuse.
     renderer::Helper::addOneTexture(
@@ -50,7 +60,7 @@ static renderer::WriteDescriptorList addPrtTextures(
         bump_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    // specular.
+    // conemap.
     renderer::Helper::addOneTexture(
         descriptor_writes,
         desc_set,
@@ -60,14 +70,64 @@ static renderer::WriteDescriptorList addPrtTextures(
         conemap_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    // specular.
+    // prt.
     renderer::Helper::addOneTexture(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_PRT_TEX_INDEX,
+        PRT_TEX_INDEX_0,
         texture_sampler,
         prt_tex.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // prt.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        PRT_TEX_INDEX_1,
+        texture_sampler,
+        prt_tex_1.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // prt.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        PRT_TEX_INDEX_2,
+        texture_sampler,
+        prt_tex_2.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // prt.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        PRT_TEX_INDEX_3,
+        texture_sampler,
+        prt_tex_3.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // prt.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        PRT_TEX_INDEX_4,
+        texture_sampler,
+        prt_tex_4.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // prt.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        PRT_TEX_INDEX_5,
+        texture_sampler,
+        prt_tex_5.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     return descriptor_writes;
@@ -112,7 +172,7 @@ PrtTest::PrtTest(
     renderer::Helper::create2DTextureImage(
         device_info,
         renderer::Format::R8G8B8A8_UNORM,
-        glm::uvec2(128, 128),
+        glm::uvec2(prt_bump_tex.size),
         *cone_map_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -121,11 +181,23 @@ PrtTest::PrtTest(
     renderer::Helper::create2DTextureImage(
         device_info,
         renderer::Format::R32G32B32A32_UINT,
-        glm::uvec2(128, 128),
+        glm::uvec2(prt_bump_tex.size),
         *prt_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    for (int i = 0; i < 6; i++) {
+        prt_texes_[i] = std::make_shared<renderer::TextureInfo>();
+        renderer::Helper::create2DTextureImage(
+            device_info,
+            renderer::Format::R8G8B8A8_UNORM,
+            glm::uvec2(prt_bump_tex.size),
+            *prt_texes_[i],
+            SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
+            SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
 
     prt_desc_set_layout_ = createPrtDescriptorSetLayout(
         device_info.device);
@@ -140,7 +212,12 @@ PrtTest::PrtTest(
         prt_base_tex,
         prt_bump_tex,
         *cone_map_tex_,
-        *prt_tex_);
+        *prt_texes_[0],
+        *prt_texes_[1],
+        *prt_texes_[2],
+        *prt_texes_[3],
+        *prt_texes_[4],
+        *prt_texes_[5]);
 
     device_info.device->updateDescriptorSets(material_descs);
 
@@ -219,6 +296,12 @@ void PrtTest::destroy(const std::shared_ptr<renderer::Device>& device) {
 
     if (prt_tex_) {
         prt_tex_->destroy(device);
+    }
+
+    for (int i = 0; i < 6; i++) {
+        if (prt_texes_[i]) {
+            prt_texes_[i]->destroy(device);
+        }
     }
 
     device->destroyDescriptorSetLayout(prt_desc_set_layout_);

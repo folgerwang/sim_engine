@@ -102,11 +102,47 @@ ConeMap::ConeMap(
 
 }
 
-void ConeMap::update() {
+void ConeMap::update(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::TextureInfo& conemap_tex) {
+
+    renderer::helper::transitMapTextureToStoreImage(
+        cmd_buf,
+        { conemap_tex.image });
+
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        conemap_pipeline_);
+    glsl::ConemapParams params = {};
+    params.size = glm::uvec2(conemap_tex.size);
+    params.inv_size = glm::vec2(1.0f / conemap_tex.size.x, 1.0f / conemap_tex.size.y);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        conemap_pipeline_layout_,
+        &params,
+        sizeof(params));
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::COMPUTE,
+        conemap_pipeline_layout_,
+        { conemap_tex_desc_set_ });
+
+    cmd_buf->dispatch(
+        (conemap_tex.size.x + 7) / 8,
+        (conemap_tex.size.y + 7) / 8,
+        1);
+
+    renderer::helper::transitMapTextureFromStoreImage(
+        cmd_buf,
+        { conemap_tex.image });
 }
 
 void ConeMap::destroy(
     const std::shared_ptr<renderer::Device>& device) {
+    device->destroyDescriptorSetLayout(conemap_desc_set_layout_);
+    device->destroyPipelineLayout(conemap_pipeline_layout_);
+    device->destroyPipeline(conemap_pipeline_);
 }
 
 }//namespace scene_rendering

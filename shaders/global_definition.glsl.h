@@ -63,7 +63,12 @@
 #define PRT_BASE_TEX_INDEX          BASE_COLOR_TEX_INDEX
 #define PRT_BUMP_TEX_INDEX          (PRT_BASE_TEX_INDEX + 1)
 #define PRT_CONEMAP_TEX_INDEX       (PRT_BASE_TEX_INDEX + 2)
-#define PRT_PRT_TEX_INDEX           (PRT_BASE_TEX_INDEX + 3)
+#define PRT_TEX_INDEX_0             (PRT_BASE_TEX_INDEX + 3)
+#define PRT_TEX_INDEX_1             (PRT_BASE_TEX_INDEX + 4)
+#define PRT_TEX_INDEX_2             (PRT_BASE_TEX_INDEX + 5)
+#define PRT_TEX_INDEX_3             (PRT_BASE_TEX_INDEX + 6)
+#define PRT_TEX_INDEX_4             (PRT_BASE_TEX_INDEX + 7)
+#define PRT_TEX_INDEX_5             (PRT_BASE_TEX_INDEX + 8)
 
 // TILE_TEXTURE_PARAMS_SET
 #define TILE_BASE_PARAMS_INDEX              6
@@ -115,6 +120,12 @@
 #define ENVMAP_TEX_INDEX                    0
 #define SRC_TEX_INDEX                       0
 #define DST_TEX_INDEX                       1
+#define DST_TEX_INDEX_0                     1
+#define DST_TEX_INDEX_1                     2
+#define DST_TEX_INDEX_2                     3
+#define DST_TEX_INDEX_3                     4
+#define DST_TEX_INDEX_4                     5
+#define DST_TEX_INDEX_5                     6
 
 #define VERTEX_BUFFER_INDEX                 0
 #define INDEX_BUFFER_INDEX                  1

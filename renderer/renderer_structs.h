@@ -312,6 +312,7 @@ struct DeviceInfo {
 
 struct TextureInfo {
     bool                               linear = true;
+    glm::uvec3                         size = glm::uvec3(0);
     std::shared_ptr<Image>             image;
     std::shared_ptr<DeviceMemory>      memory;
     std::shared_ptr<ImageView>         view;

@@ -428,6 +428,8 @@ void Helper::create2DTextureImage(
         format,
         ImageLayout::UNDEFINED,
         image_layout);
+
+    texture_2d.size = glm::uvec3(size, 1);
 }
 
 void Helper::dumpTextureImage(
@@ -627,6 +629,8 @@ void Helper::createCubemapTexture(
             h = std::max(h >> 1, 1u);
         }
     }
+
+    texture.size = glm::uvec3(width, height, 1);
 
     if (data) {
         device->destroyBuffer(staging_buffer);
