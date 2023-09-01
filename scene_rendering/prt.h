@@ -22,7 +22,8 @@ namespace engine {
                 const renderer::TextureInfo& prt_tex_2,
                 const renderer::TextureInfo& prt_tex_3,
                 const renderer::TextureInfo& prt_tex_4,
-                const renderer::TextureInfo& prt_tex_5);
+                const renderer::TextureInfo& prt_tex_5,
+                const renderer::TextureInfo& prt_tex_6);
 
             void update(
                 const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
@@ -31,7 +32,8 @@ namespace engine {
                 const renderer::TextureInfo& prt_tex_2,
                 const renderer::TextureInfo& prt_tex_3,
                 const renderer::TextureInfo& prt_tex_4,
-                const renderer::TextureInfo& prt_tex_5);
+                const renderer::TextureInfo& prt_tex_5,
+                const renderer::TextureInfo& prt_tex_6);
 
             void destroy(const std::shared_ptr<renderer::Device>& device);
         };

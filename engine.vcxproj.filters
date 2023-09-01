@@ -296,6 +296,9 @@
     <ClInclude Include="scene_rendering\prt.h">
       <Filter>Header Files\engine\scene_rendering</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\prt_core.glsl.h">
+      <Filter>Resource Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\base.frag">

@@ -69,6 +69,7 @@
 #define PRT_TEX_INDEX_3             (PRT_BASE_TEX_INDEX + 6)
 #define PRT_TEX_INDEX_4             (PRT_BASE_TEX_INDEX + 7)
 #define PRT_TEX_INDEX_5             (PRT_BASE_TEX_INDEX + 8)
+#define PRT_TEX_INDEX_6             (PRT_BASE_TEX_INDEX + 9)
 
 // TILE_TEXTURE_PARAMS_SET
 #define TILE_BASE_PARAMS_INDEX              6
@@ -126,6 +127,7 @@
 #define DST_TEX_INDEX_3                     4
 #define DST_TEX_INDEX_4                     5
 #define DST_TEX_INDEX_5                     6
+#define DST_TEX_INDEX_6                     7
 
 #define VERTEX_BUFFER_INDEX                 0
 #define INDEX_BUFFER_INDEX                  1

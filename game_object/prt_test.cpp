@@ -9,7 +9,7 @@ namespace {
 static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(9);
+    bindings.reserve(10);
 
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BASE_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BUMP_TEX_INDEX));
@@ -20,6 +20,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayo
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_3));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_4));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_5));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_6));
 
     return device->createDescriptorSetLayout(bindings);
 }
@@ -35,7 +36,8 @@ static renderer::WriteDescriptorList addPrtTextures(
     const renderer::TextureInfo& prt_tex_2,
     const renderer::TextureInfo& prt_tex_3,
     const renderer::TextureInfo& prt_tex_4,
-    const renderer::TextureInfo& prt_tex_5) {
+    const renderer::TextureInfo& prt_tex_5,
+    const renderer::TextureInfo& prt_tex_6) {
 
     renderer::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(9);
@@ -130,6 +132,16 @@ static renderer::WriteDescriptorList addPrtTextures(
         prt_tex_5.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
+    // prt.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        PRT_TEX_INDEX_6,
+        texture_sampler,
+        prt_tex_6.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
     return descriptor_writes;
 }
 
@@ -191,13 +203,23 @@ PrtTest::PrtTest(
         prt_texes_[i] = std::make_shared<renderer::TextureInfo>();
         renderer::Helper::create2DTextureImage(
             device_info,
-            renderer::Format::R8G8B8A8_UNORM,
+            renderer::Format::R32G32B32A32_SFLOAT,
             glm::uvec2(prt_bump_tex.size),
             *prt_texes_[i],
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
+
+    prt_texes_[6] = std::make_shared<renderer::TextureInfo>();
+    renderer::Helper::create2DTextureImage(
+        device_info,
+        renderer::Format::R32_SFLOAT,
+        glm::uvec2(prt_bump_tex.size),
+        *prt_texes_[6],
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
+        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     prt_desc_set_layout_ = createPrtDescriptorSetLayout(
         device_info.device);
@@ -217,7 +239,8 @@ PrtTest::PrtTest(
         *prt_texes_[2],
         *prt_texes_[3],
         *prt_texes_[4],
-        *prt_texes_[5]);
+        *prt_texes_[5],
+        *prt_texes_[6]);
 
     device_info.device->updateDescriptorSets(material_descs);
 
@@ -298,7 +321,7 @@ void PrtTest::destroy(const std::shared_ptr<renderer::Device>& device) {
         prt_tex_->destroy(device);
     }
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         if (prt_texes_[i]) {
             prt_texes_[i]->destroy(device);
         }

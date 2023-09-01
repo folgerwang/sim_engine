@@ -15,10 +15,11 @@ namespace {
         const std::shared_ptr<er::ImageView>& dst_image_2,
         const std::shared_ptr<er::ImageView>& dst_image_3,
         const std::shared_ptr<er::ImageView>& dst_image_4,
-        const std::shared_ptr<er::ImageView>& dst_image_5) {
+        const std::shared_ptr<er::ImageView>& dst_image_5,
+        const std::shared_ptr<er::ImageView>& dst_image_6) {
         er::WriteDescriptorList descriptor_writes;
 //        descriptor_writes.reserve(2);
-        descriptor_writes.reserve(7);
+        descriptor_writes.reserve(8);
 
         // envmap texture.
         er::Helper::addOneTexture(
@@ -85,6 +86,15 @@ namespace {
             dst_image_5,
             er::ImageLayout::GENERAL);
 
+        er::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            er::DescriptorType::STORAGE_IMAGE,
+            DST_TEX_INDEX_6,
+            nullptr,
+            dst_image_6,
+            er::ImageLayout::GENERAL);
+
         return descriptor_writes;
     }
 
@@ -117,7 +127,8 @@ Prt::Prt(
     const renderer::TextureInfo& prt_tex_2,
     const renderer::TextureInfo& prt_tex_3,
     const renderer::TextureInfo& prt_tex_4,
-    const renderer::TextureInfo& prt_tex_5) {
+    const renderer::TextureInfo& prt_tex_5,
+    const renderer::TextureInfo& prt_tex_6) {
 
     const auto& device = device_info.device;
 
@@ -150,6 +161,10 @@ Prt::Prt(
               renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
                 DST_TEX_INDEX_5,
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_IMAGE),
+              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                DST_TEX_INDEX_6,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                 er::DescriptorType::STORAGE_IMAGE) });
 
     prt_tex_desc_set_ =
@@ -168,7 +183,8 @@ Prt::Prt(
         prt_tex_2.view,
         prt_tex_3.view,
         prt_tex_4.view,
-        prt_tex_5.view);
+        prt_tex_5.view,
+        prt_tex_6.view);
     device->updateDescriptorSets(prt_texture_descs);
 
     prt_pipeline_layout_ =
@@ -191,7 +207,8 @@ void Prt::update(
     const renderer::TextureInfo& prt_tex_2, 
     const renderer::TextureInfo& prt_tex_3, 
     const renderer::TextureInfo& prt_tex_4, 
-    const renderer::TextureInfo& prt_tex_5) {
+    const renderer::TextureInfo& prt_tex_5,
+    const renderer::TextureInfo& prt_tex_6) {
     renderer::helper::transitMapTextureToStoreImage(
         cmd_buf,
         { prt_tex.image,
@@ -199,7 +216,8 @@ void Prt::update(
           prt_tex_2.image,
           prt_tex_3.image,
           prt_tex_4.image,
-          prt_tex_5.image});
+          prt_tex_5.image,
+          prt_tex_6.image });
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
@@ -231,7 +249,8 @@ void Prt::update(
           prt_tex_2.image,
           prt_tex_3.image,
           prt_tex_4.image,
-          prt_tex_5.image });
+          prt_tex_5.image,
+          prt_tex_6.image });
 }
 
 void Prt::destroy(

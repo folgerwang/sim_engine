@@ -12,7 +12,7 @@ class PrtTest {
     std::shared_ptr<renderer::Pipeline> prt_pipeline_;
     std::shared_ptr<renderer::TextureInfo> cone_map_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_tex_;
-    std::shared_ptr<renderer::TextureInfo> prt_texes_[6];
+    std::shared_ptr<renderer::TextureInfo> prt_texes_[7];
 public:
     PrtTest(
         const renderer::DeviceInfo& device_info,
