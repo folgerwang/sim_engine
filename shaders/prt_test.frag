@@ -6,8 +6,8 @@
 #include "punctual.glsl.h"
 #include "prt_core.glsl.h"
 
-layout(push_constant) uniform ModelUniformBufferObject {
-    ModelParams model_params;
+layout(push_constant) uniform PrtLightUniformBufferObject {
+    PrtLightParams params;
 };
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
@@ -34,7 +34,6 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_6) uniform sampler
 
 const int s_cone_steps = 15;
 const int s_binary_steps = 8;
-const float s_depth_scale = 20.0f / 255.0f;
 
 vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
 {
@@ -114,14 +113,11 @@ void main() {
     vec3 binormal = cross(in_data.vertex_normal, in_data.vertex_tangent);
     mat3 world2local = mat3(in_data.vertex_tangent, binormal, in_data.vertex_normal);
 
-    //Run the relaxed cone stepping to find the new relief UV
+    // Run the relaxed cone stepping to find the new relief UV
     vec3 v = in_data.vertex_position - camera_info.position.xyz;
     v = world2local * v;
     v.z = abs(v.z);
-    v.xy *= s_depth_scale;
-
-    float y_value[25];
-    fillYVauleTablle(y_value, PI / 4.0f, PI / 4.0f);
+    v.xy *= params.height_scale;
 
     vec3 intersect_pos = relaxedConeStepping(v, vec3(in_data.vertex_tex_coord, 0.0), false);
 
@@ -134,14 +130,14 @@ void main() {
     float prt_6 = texture(prt_tex_6, vec2(intersect_pos)).x;
 
     float sum_visi = 0;
-    sum_visi += dot(prt_0, vec4(y_value[0], y_value[1], y_value[2], y_value[3]));
-    sum_visi += dot(prt_1, vec4(y_value[4], y_value[5], y_value[6], y_value[7]));
-    sum_visi += dot(prt_2, vec4(y_value[8], y_value[9], y_value[10], y_value[11]));
-    sum_visi += dot(prt_3, vec4(y_value[12], y_value[13], y_value[14], y_value[15]));
-    sum_visi += dot(prt_4, vec4(y_value[16], y_value[17], y_value[18], y_value[19]));
-    sum_visi += dot(prt_5, vec4(y_value[20], y_value[21], y_value[22], y_value[23]));
-    sum_visi += prt_6 * y_value[24];
+    sum_visi += dot(prt_0, vec4(params.coeffs[0], params.coeffs[1], params.coeffs[2], params.coeffs[3]));
+    sum_visi += dot(prt_1, vec4(params.coeffs[4], params.coeffs[5], params.coeffs[6], params.coeffs[7]));
+    sum_visi += dot(prt_2, vec4(params.coeffs[8], params.coeffs[9], params.coeffs[10], params.coeffs[11]));
+    sum_visi += dot(prt_3, vec4(params.coeffs[12], params.coeffs[13], params.coeffs[14], params.coeffs[15]));
+    sum_visi += dot(prt_4, vec4(params.coeffs[16], params.coeffs[17], params.coeffs[18], params.coeffs[19]));
+    sum_visi += dot(prt_5, vec4(params.coeffs[20], params.coeffs[21], params.coeffs[22], params.coeffs[23]));
+    sum_visi += prt_6 * params.coeffs[24];
 
     vec4 base_color = vec4(texture(prt_base_tex, vec2(intersect_pos)).xyz, 1);
-    outColor = vec4(base_color.xyz * sum_visi, 1.0f);
+    outColor = vec4(base_color.xyz * sum_visi * sqrt(4.0f * PI), 1.0f);
 }

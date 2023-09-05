@@ -28,7 +28,7 @@ float sampleVisi(vec2 sample_uv, float cur_depth, float theta, float phi) {
     for (uint i = 0; i < sample_count; i++) {
         vec2 sample_pos = sample_uv + sample_ray * t1;
         float sample_depth = texture(src_img, sample_pos).w;
-        max_tan_angle = max(max(sample_depth - cur_depth, 0.0f) / t1, max_tan_angle);
+        max_tan_angle = max(max(cur_depth - sample_depth, 0.0f) / t1, max_tan_angle);
         t1 += step;
     }
 

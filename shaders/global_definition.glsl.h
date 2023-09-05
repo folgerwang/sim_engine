@@ -6,7 +6,7 @@
 #endif
 //#define USE_PUNCTUAL                1
 
-#define PI      3.1415926535897f
+#define PI                  3.1415926535897f
 
 //#define MATERIAL_UNLIT
 
@@ -257,6 +257,12 @@ struct ViewParams {
 
 struct ModelParams {
     mat4 model_mat;
+};
+
+struct PrtLightParams {
+    mat4 model_mat;
+    float coeffs[25];
+    float height_scale;
 };
 
 struct IblParams {

@@ -39,7 +39,7 @@ void fillPVauleTablle(inout float p_value[15], float x) {
     p_value[9] = -15.0f * x2_1_2_3rd;
     float a02 = (-x2_s7 + 3.0f) * a00;
     // l = 4, m = 0
-    p_value[10] = 0.625f * ((x2_s7 - 6.0f) * x2 + 3.0f);
+    p_value[10] = 0.125f * ((35.0f * x2 - 30.0f) * x2 + 3.0f);
     // l = 4, m = 1
     p_value[11] = 2.5f * a02;
     // l = 4, m = 2
@@ -145,7 +145,7 @@ float getIntersection(vec3 org, vec3 ray)
 {
     vec3 ray_offset = (vec3(1.0f) - sign(abs(ray))) * 1e-20;
     vec3 adj_ray = ray + ray_offset;
-    vec3 inv_ray = 1.0f / ray;
+    vec3 inv_ray = 1.0f / adj_ray;
     vec3 factor_a = abs(inv_ray);
     vec3 factor_b = -org * inv_ray;
     vec3 factor = factor_a + factor_b;

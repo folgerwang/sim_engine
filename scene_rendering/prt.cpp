@@ -222,7 +222,7 @@ void Prt::update(
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
         prt_pipeline_);
-    glsl::ConemapParams params = {};
+    glsl::PrtParams params = {};
     params.size = glm::uvec2(prt_tex.size);
     params.inv_size = glm::vec2(1.0f / prt_tex.size.x, 1.0f / prt_tex.size.y);
 
