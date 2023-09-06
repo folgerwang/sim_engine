@@ -12,27 +12,28 @@ class PrtTest {
     std::shared_ptr<renderer::Pipeline> prt_pipeline_;
     std::shared_ptr<renderer::TextureInfo> cone_map_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_tex_;
-    std::vector<std::shared_ptr<renderer::TextureInfo>> prt_texes_;
 public:
     PrtTest(
         const renderer::DeviceInfo& device_info,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-        const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const glm::uvec2& display_size,
-        std::shared_ptr<Plane> unit_plane,
-        const engine::renderer::TextureInfo& prt_base_tex,
-        const engine::renderer::TextureInfo& prt_bump_tex);
+        const glm::uvec2& buffer_size,
+        std::shared_ptr<Plane> unit_plane);
     void draw(
+        const std::shared_ptr<renderer::Device>& device,
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
-        std::shared_ptr<Plane> unit_plane);
+        const std::shared_ptr<renderer::Sampler>& texture_sampler,
+        std::shared_ptr<Plane> unit_plane,
+        const renderer::TextureInfo& prt_base_tex,
+        const renderer::TextureInfo& prt_bump_tex,
+        const std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_texes);
 
     inline std::shared_ptr<renderer::TextureInfo> getConemapTex() const { return cone_map_tex_; }
     inline std::shared_ptr<renderer::TextureInfo> getPrtTex() const { return prt_tex_; }
-    inline std::vector<std::shared_ptr<renderer::TextureInfo>> getPrtTexes() const { return prt_texes_; }
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

@@ -146,13 +146,8 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayo
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BASE_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BUMP_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_CONEMAP_TEX_INDEX));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_1));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_2));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_3));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_4));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_5));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_6));
+    for (int i = 0; i < 7; ++i)
+        bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0 + i));
 
     return device->createDescriptorSetLayout(bindings);
 }
@@ -163,13 +158,7 @@ static renderer::WriteDescriptorList addPrtTextures(
     const renderer::TextureInfo& base_tex,
     const renderer::TextureInfo& bump_tex,
     const renderer::TextureInfo& conemap_tex,
-    const renderer::TextureInfo& prt_tex,
-    const renderer::TextureInfo& prt_tex_1,
-    const renderer::TextureInfo& prt_tex_2,
-    const renderer::TextureInfo& prt_tex_3,
-    const renderer::TextureInfo& prt_tex_4,
-    const renderer::TextureInfo& prt_tex_5,
-    const renderer::TextureInfo& prt_tex_6) {
+    const std::array<std::shared_ptr<renderer::TextureInfo>, 7>& prt_texes) {
 
     renderer::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(10);
@@ -205,74 +194,16 @@ static renderer::WriteDescriptorList addPrtTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_0,
-        texture_sampler,
-        prt_tex.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_1,
-        texture_sampler,
-        prt_tex_1.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_2,
-        texture_sampler,
-        prt_tex_2.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_3,
-        texture_sampler,
-        prt_tex_3.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_4,
-        texture_sampler,
-        prt_tex_4.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_5,
-        texture_sampler,
-        prt_tex_5.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    // prt.
-    renderer::Helper::addOneTexture(
-        descriptor_writes,
-        desc_set,
-        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_TEX_INDEX_6,
-        texture_sampler,
-        prt_tex_6.view,
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    for (int i = 0; i < prt_texes.size(); ++i) {
+        renderer::Helper::addOneTexture(
+            descriptor_writes,
+            desc_set,
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            PRT_TEX_INDEX_0 + i,
+            texture_sampler,
+            prt_texes[i]->view,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
 
     return descriptor_writes;
 }
@@ -302,14 +233,12 @@ namespace game_object {
 PrtTest::PrtTest(
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const glm::uvec2& display_size,
-    std::shared_ptr<Plane> unit_plane,
-    const renderer::TextureInfo& prt_base_tex,
-    const renderer::TextureInfo& prt_bump_tex) {
+    const glm::uvec2& buffer_size,
+    std::shared_ptr<Plane> unit_plane) {
 
     cone_map_tex_ = std::make_shared<renderer::TextureInfo>();
     prt_tex_ = std::make_shared<renderer::TextureInfo>();
@@ -317,7 +246,7 @@ PrtTest::PrtTest(
     renderer::Helper::create2DTextureImage(
         device_info,
         renderer::Format::R8G8B8A8_UNORM,
-        glm::uvec2(prt_bump_tex.size),
+        buffer_size,
         *cone_map_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -326,31 +255,8 @@ PrtTest::PrtTest(
     renderer::Helper::create2DTextureImage(
         device_info,
         renderer::Format::R32G32B32A32_UINT,
-        glm::uvec2(prt_bump_tex.size),
+        buffer_size,
         *prt_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    prt_texes_.resize(7);
-    for (int i = 0; i < 6; i++) {
-        prt_texes_[i] = std::make_shared<renderer::TextureInfo>();
-        renderer::Helper::create2DTextureImage(
-            device_info,
-            renderer::Format::R32G32B32A32_SFLOAT,
-            glm::uvec2(prt_bump_tex.size),
-            *prt_texes_[i],
-            SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-            SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    prt_texes_[6] = std::make_shared<renderer::TextureInfo>();
-    renderer::Helper::create2DTextureImage(
-        device_info,
-        renderer::Format::R32_SFLOAT,
-        glm::uvec2(prt_bump_tex.size),
-        *prt_texes_[6],
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -360,23 +266,6 @@ PrtTest::PrtTest(
 
     prt_desc_set_ = device_info.device->createDescriptorSets(
         descriptor_pool, prt_desc_set_layout_, 1)[0];
-
-    // create a global ibl texture descriptor set.
-    auto material_descs = addPrtTextures(
-        prt_desc_set_,
-        texture_sampler,
-        prt_base_tex,
-        prt_bump_tex,
-        *cone_map_tex_,
-        *prt_texes_[0],
-        *prt_texes_[1],
-        *prt_texes_[2],
-        *prt_texes_[3],
-        *prt_texes_[4],
-        *prt_texes_[5],
-        *prt_texes_[6]);
-
-    device_info.device->updateDescriptorSets(material_descs);
 
     prt_pipeline_layout_ = createPipelineLayout(
         device_info.device,
@@ -411,9 +300,14 @@ PrtTest::PrtTest(
 }
 
 void PrtTest::draw(
+    const std::shared_ptr<renderer::Device>& device,
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
-    std::shared_ptr<Plane> unit_plane) {
+    const std::shared_ptr<renderer::Sampler>& texture_sampler,
+    std::shared_ptr<Plane> unit_plane,
+    const renderer::TextureInfo& prt_base_tex,
+    const renderer::TextureInfo& prt_bump_tex,
+    const std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_texes) {
 
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
 
@@ -448,6 +342,17 @@ void PrtTest::draw(
 
     params.height_scale = s_height_scale;
 
+    // create a global ibl texture descriptor set.
+    auto material_descs = addPrtTextures(
+        prt_desc_set_,
+        texture_sampler,
+        prt_base_tex,
+        prt_bump_tex,
+        *cone_map_tex_,
+        prt_texes);
+
+    device->updateDescriptorSets(material_descs);
+
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
@@ -460,19 +365,14 @@ void PrtTest::draw(
     }
 }
 
-void PrtTest::destroy(const std::shared_ptr<renderer::Device>& device) {
+void PrtTest::destroy(
+    const std::shared_ptr<renderer::Device>& device) {
     if (cone_map_tex_) {
         cone_map_tex_->destroy(device);
     }
 
     if (prt_tex_) {
         prt_tex_->destroy(device);
-    }
-
-    for (int i = 0; i < 7; i++) {
-        if (prt_texes_[i]) {
-            prt_texes_[i]->destroy(device);
-        }
     }
 
     device->destroyDescriptorSetLayout(prt_desc_set_layout_);

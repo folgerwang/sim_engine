@@ -1,0 +1,89 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+layout(set = 0, binding = SRC_TEX_INDEX_0, rgba32f) uniform image2D src_img_0;
+layout(set = 0, binding = SRC_TEX_INDEX_1, rgba32f) uniform image2D src_img_1;
+layout(set = 0, binding = SRC_TEX_INDEX_2, rgba32f) uniform image2D src_img_2;
+layout(set = 0, binding = SRC_TEX_INDEX_3, rgba32f) uniform image2D src_img_3;
+layout(set = 0, binding = SRC_TEX_INDEX_4, rgba32f) uniform image2D src_img_4;
+layout(set = 0, binding = SRC_TEX_INDEX_5, rgba32f) uniform image2D src_img_5;
+layout(set = 0, binding = SRC_TEX_INDEX_6, r32f) uniform image2D src_img_6;
+layout(set = 0, binding = DST_TEX_INDEX_0, rgba32f) uniform image2D dst_img_0;
+layout(set = 0, binding = DST_TEX_INDEX_1, rgba32f) uniform image2D dst_img_1;
+layout(set = 0, binding = DST_TEX_INDEX_2, rgba32f) uniform image2D dst_img_2;
+layout(set = 0, binding = DST_TEX_INDEX_3, rgba32f) uniform image2D dst_img_3;
+layout(set = 0, binding = DST_TEX_INDEX_4, rgba32f) uniform image2D dst_img_4;
+layout(set = 0, binding = DST_TEX_INDEX_5, rgba32f) uniform image2D dst_img_5;
+layout(set = 0, binding = DST_TEX_INDEX_6, r32f) uniform image2D dst_img_6;
+
+shared vec4 s_shared_min[6][64];
+shared vec4 s_shared_max[6][64];
+
+shared float s_shared_min6[64];
+shared float s_shared_max6[64];
+
+layout(local_size_x = 8, local_size_y = 8) in;
+void main()
+{
+	// get index in global work group i.e x,y position
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    uint local_id = gl_LocalInvocationIndex;
+
+    vec4 value4 = imageLoad(src_img_0, pixel_coords);
+    s_shared_min[0][local_id] = value4;
+    s_shared_max[0][local_id] = value4;
+    value4 = imageLoad(src_img_1, pixel_coords);
+    s_shared_min[1][local_id] = value4;
+    s_shared_max[1][local_id] = value4;
+    value4 = imageLoad(src_img_2, pixel_coords);
+    s_shared_min[2][local_id] = value4;
+    s_shared_max[2][local_id] = value4;
+    value4 = imageLoad(src_img_3, pixel_coords);
+    s_shared_min[3][local_id] = value4;
+    s_shared_max[3][local_id] = value4;
+    value4 = imageLoad(src_img_4, pixel_coords);
+    s_shared_min[4][local_id] = value4;
+    s_shared_max[4][local_id] = value4;
+    value4 = imageLoad(src_img_5, pixel_coords);
+    s_shared_min[5][local_id] = value4;
+    s_shared_max[5][local_id] = value4;
+    float value = imageLoad(src_img_6, pixel_coords).x;
+    s_shared_min6[local_id] = value;
+    s_shared_max6[local_id] = value;
+    barrier();
+
+    // Reduce in shared memory
+    for (uint stride = 1; stride < gl_WorkGroupSize.x * gl_WorkGroupSize.y; stride *= 2) {
+        if (local_id % (2 * stride) == 0 && local_id + stride < gl_WorkGroupSize.x * gl_WorkGroupSize.y) {
+            for (uint i = 0; i < 6; ++i) {
+				s_shared_min[i][local_id] = min(s_shared_min[i][local_id], s_shared_min[i][local_id + stride]);
+				s_shared_max[i][local_id] = max(s_shared_max[i][local_id], s_shared_max[i][local_id + stride]);
+			}
+            s_shared_min6[local_id] = min(s_shared_min6[local_id], s_shared_min6[local_id + stride]);
+            s_shared_max6[local_id] = max(s_shared_max6[local_id], s_shared_max6[local_id + stride]);
+        }
+        barrier();
+    }
+
+    ivec2 min_pixel_coords = ivec2(gl_WorkGroupID.x * 2, gl_WorkGroupID.y);
+    ivec2 max_pixel_coords = ivec2(gl_WorkGroupID.x * 2 + 1, gl_WorkGroupID.y);
+
+    if (local_id == 0) {
+        imageStore(dst_img_0, min_pixel_coords, s_shared_min[0][0]);
+        imageStore(dst_img_1, min_pixel_coords, s_shared_min[1][0]);
+        imageStore(dst_img_2, min_pixel_coords, s_shared_min[2][0]);
+        imageStore(dst_img_3, min_pixel_coords, s_shared_min[3][0]);
+        imageStore(dst_img_4, min_pixel_coords, s_shared_min[4][0]);
+        imageStore(dst_img_5, min_pixel_coords, s_shared_min[5][0]);
+        imageStore(dst_img_6, min_pixel_coords, vec4(s_shared_min6[0]));
+
+        imageStore(dst_img_0, max_pixel_coords, s_shared_max[0][0]);
+        imageStore(dst_img_1, max_pixel_coords, s_shared_max[1][0]);
+        imageStore(dst_img_2, max_pixel_coords, s_shared_max[2][0]);
+        imageStore(dst_img_3, max_pixel_coords, s_shared_max[3][0]);
+        imageStore(dst_img_4, max_pixel_coords, s_shared_max[4][0]);
+        imageStore(dst_img_5, max_pixel_coords, s_shared_max[5][0]);
+        imageStore(dst_img_6, max_pixel_coords, vec4(s_shared_max6[0]));
+    }
+}

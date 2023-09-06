@@ -119,6 +119,9 @@
     <None Include="shaders\lungs.vert" />
     <None Include="shaders\perlin_noise_init.comp" />
     <None Include="shaders\prt_gen.comp" />
+    <None Include="shaders\prt_minmax_ds_f.comp" />
+    <None Include="shaders\prt_minmax_ds_s.comp" />
+    <None Include="shaders\prt_minmax_ds.comp" />
     <None Include="shaders\prt_test.frag" />
     <None Include="shaders\prt_test.vert" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable1.rcall" />

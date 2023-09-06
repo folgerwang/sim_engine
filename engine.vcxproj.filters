@@ -460,5 +460,14 @@
     <None Include="shaders\prt_test.vert">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\prt_minmax_ds_s.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\prt_minmax_ds.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\prt_minmax_ds_f.comp">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>
