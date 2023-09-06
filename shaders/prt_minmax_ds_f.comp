@@ -2,6 +2,10 @@
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
 
+layout(push_constant) uniform PrtUniformBufferObject {
+    PrtParams params;
+};
+
 layout(set = 0, binding = SRC_TEX_INDEX_0, rgba32f) uniform image2D src_img_0;
 layout(set = 0, binding = SRC_TEX_INDEX_1, rgba32f) uniform image2D src_img_1;
 layout(set = 0, binding = SRC_TEX_INDEX_2, rgba32f) uniform image2D src_img_2;
@@ -9,13 +13,10 @@ layout(set = 0, binding = SRC_TEX_INDEX_3, rgba32f) uniform image2D src_img_3;
 layout(set = 0, binding = SRC_TEX_INDEX_4, rgba32f) uniform image2D src_img_4;
 layout(set = 0, binding = SRC_TEX_INDEX_5, rgba32f) uniform image2D src_img_5;
 layout(set = 0, binding = SRC_TEX_INDEX_6, r32f) uniform image2D src_img_6;
-layout(set = 0, binding = DST_TEX_INDEX_0, rgba32f) uniform image2D dst_img_0;
-layout(set = 0, binding = DST_TEX_INDEX_1, rgba32f) uniform image2D dst_img_1;
-layout(set = 0, binding = DST_TEX_INDEX_2, rgba32f) uniform image2D dst_img_2;
-layout(set = 0, binding = DST_TEX_INDEX_3, rgba32f) uniform image2D dst_img_3;
-layout(set = 0, binding = DST_TEX_INDEX_4, rgba32f) uniform image2D dst_img_4;
-layout(set = 0, binding = DST_TEX_INDEX_5, rgba32f) uniform image2D dst_img_5;
-layout(set = 0, binding = DST_TEX_INDEX_6, r32f) uniform image2D dst_img_6;
+
+layout(std430, set = 0, binding = DST_BUFFER_INDEX) buffer PrtMinmaxBuffer {
+	PrtMinmaxInfo info;
+};
 
 shared vec4 s_shared_min[6][64];
 shared vec4 s_shared_max[6][64];
@@ -26,9 +27,10 @@ shared float s_shared_max6[64];
 layout(local_size_x = 8, local_size_y = 8) in;
 void main()
 {
+    ivec2 pixel_coords = min(ivec2(gl_GlobalInvocationID.xy), ivec2(params.size) -1);
 	// get index in global work group i.e x,y position
-    ivec2 min_src_pixel_coords = ivec2(gl_GlobalInvocationID.x * 2, gl_GlobalInvocationID.y);
-    ivec2 max_src_pixel_coords = ivec2(gl_GlobalInvocationID.x * 2 + 1, gl_GlobalInvocationID.y);
+    ivec2 min_src_pixel_coords = ivec2(pixel_coords.x * 2, pixel_coords.y);
+    ivec2 max_src_pixel_coords = ivec2(pixel_coords.x * 2 + 1, pixel_coords.y);
     uint local_id = gl_LocalInvocationIndex;
 
     s_shared_min[0][local_id] = imageLoad(src_img_0, min_src_pixel_coords);
@@ -63,21 +65,14 @@ void main()
     ivec2 min_pixel_coords = ivec2(gl_WorkGroupID.x * 2, gl_WorkGroupID.y);
     ivec2 max_pixel_coords = ivec2(gl_WorkGroupID.x * 2 + 1, gl_WorkGroupID.y);
 
-    if (local_id == 0) {
-        imageStore(dst_img_0, min_pixel_coords, s_shared_min[0][0]);
-        imageStore(dst_img_1, min_pixel_coords, s_shared_min[1][0]);
-        imageStore(dst_img_2, min_pixel_coords, s_shared_min[2][0]);
-        imageStore(dst_img_3, min_pixel_coords, s_shared_min[3][0]);
-        imageStore(dst_img_4, min_pixel_coords, s_shared_min[4][0]);
-        imageStore(dst_img_5, min_pixel_coords, s_shared_min[5][0]);
-        imageStore(dst_img_6, min_pixel_coords, vec4(s_shared_min6[0]));
-
-        imageStore(dst_img_0, max_pixel_coords, s_shared_max[0][0]);
-        imageStore(dst_img_1, max_pixel_coords, s_shared_max[1][0]);
-        imageStore(dst_img_2, max_pixel_coords, s_shared_max[2][0]);
-        imageStore(dst_img_3, max_pixel_coords, s_shared_max[3][0]);
-        imageStore(dst_img_4, max_pixel_coords, s_shared_max[4][0]);
-        imageStore(dst_img_5, max_pixel_coords, s_shared_max[5][0]);
-        imageStore(dst_img_6, max_pixel_coords, vec4(s_shared_max6[0]));
+    if (local_id < 25) {
+        if (local_id < 24) {
+            vec2 minmax = vec2(s_shared_min[local_id/4][0][local_id%4], s_shared_max[local_id/4][0][local_id%4]);
+            info.prt_minmax[local_id] = minmax;
+        }
+        else {
+            vec2 minmax = vec2(s_shared_min6[0], s_shared_max6[0]);
+            info.prt_minmax[local_id] = minmax;
+        }
     }
 }

@@ -120,7 +120,6 @@
 #define PANORAMA_TEX_INDEX                  0
 #define ENVMAP_TEX_INDEX                    0
 #define SRC_TEX_INDEX                       0
-#define DST_TEX_INDEX                       1
 #define SRC_TEX_INDEX_0                     1
 #define SRC_TEX_INDEX_1                     2
 #define SRC_TEX_INDEX_2                     3
@@ -128,6 +127,8 @@
 #define SRC_TEX_INDEX_4                     5
 #define SRC_TEX_INDEX_5                     6
 #define SRC_TEX_INDEX_6                     7
+#define DST_TEX_INDEX                       8
+#define DST_BUFFER_INDEX                    8
 #define DST_TEX_INDEX_0                     8
 #define DST_TEX_INDEX_1                     9
 #define DST_TEX_INDEX_2                     10
@@ -540,6 +541,10 @@ struct GrassInstanceDataInfo {
     vec4            mat_rot_1;
     vec4            mat_rot_2;
     vec4            mat_pos_scale;
+};
+
+struct PrtMinmaxInfo {
+    vec2            prt_minmax[25];
 };
 
 // could be updated from frame to frame.

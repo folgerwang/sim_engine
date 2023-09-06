@@ -70,6 +70,36 @@ namespace {
         return descriptor_writes;
     }
 
+    er::WriteDescriptorList addDsFinalPrtTextures(
+        const std::shared_ptr<er::DescriptorSet>& description_set,
+        const std::shared_ptr<er::Sampler>& texture_sampler,
+        const std::array<std::shared_ptr<er::TextureInfo>, 7>& src_prt_texes,
+        const std::shared_ptr<er::BufferInfo>& dst_prt_minmax_buffer) {
+        er::WriteDescriptorList descriptor_writes;
+        descriptor_writes.reserve(8);
+
+        for (int i = 0; i < src_prt_texes.size(); ++i) {
+            er::Helper::addOneTexture(
+                descriptor_writes,
+                description_set,
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                SRC_TEX_INDEX_0 + i,
+                texture_sampler,
+                src_prt_texes[i]->view,
+                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+
+        er::Helper::addOneBuffer(
+            descriptor_writes,
+            description_set,
+            er::DescriptorType::STORAGE_BUFFER,
+            DST_BUFFER_INDEX,
+            dst_prt_minmax_buffer->buffer,
+            dst_prt_minmax_buffer->buffer->getSize());
+
+        return descriptor_writes;
+    }
+
     std::shared_ptr<er::PipelineLayout>
         createPrtPipelineLayout(
             const std::shared_ptr<er::Device>& device,
@@ -298,10 +328,40 @@ Prt::Prt(
             prt_ds_pipeline_layout_,
             "prt_minmax_ds_comp.spv");
 
+    prt_minmax_buffer_ = std::make_shared<renderer::BufferInfo>();
+    device->createBuffer(
+        sizeof(glsl::PrtMinmaxInfo),
+        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+        SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
+        0,
+        prt_minmax_buffer_->buffer,
+        prt_minmax_buffer_->memory);
+
+    // create a global ibl texture descriptor set layout.
+    std::vector<renderer::DescriptorSetLayoutBinding> ds_f_bindings;
+    ds_f_bindings.reserve(8);
+    for (int i = 0; i < prt_texes_.size(); ++i) {
+        ds_f_bindings.push_back(
+            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                SRC_TEX_INDEX_0 + i,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER));
+    }
+
+    ds_f_bindings.push_back(
+        renderer::helper::getBufferDescriptionSetLayoutBinding(
+            DST_BUFFER_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_BUFFER));
+
+    prt_ds_f_desc_set_layout_ =
+        device->createDescriptorSetLayout(ds_f_bindings);
+
     prt_ds_f_pipeline_layout_ =
         createPrtPipelineLayout(
             device,
-            prt_ds_desc_set_layout_);
+            prt_ds_f_desc_set_layout_);
 
     prt_ds_f_pipeline_ =
         renderer::helper::createComputePipeline(
@@ -394,6 +454,39 @@ void Prt::update(
 
     src_size.x = (src_size.x + 7) / 8;
     src_size.y = (src_size.y + 7) / 8;
+
+    {
+        // create a global ibl texture descriptor set.
+        auto prt_texture_descs = addDsFinalPrtTextures(
+            prt_ds_f_tex_desc_set_,
+            texture_sampler,
+            prt_ds2_texes_,
+            prt_minmax_buffer_);
+        device->updateDescriptorSets(prt_texture_descs);
+
+        cmd_buf->bindPipeline(
+            renderer::PipelineBindPoint::COMPUTE,
+            prt_ds_f_pipeline_);
+        glsl::PrtParams params = {};
+        params.size = src_size;
+        params.inv_size = glm::vec2(1.0f / src_size.x, 1.0f / src_size.y);
+
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            prt_ds_f_pipeline_layout_,
+            &params,
+            sizeof(params));
+
+        cmd_buf->bindDescriptorSets(
+            renderer::PipelineBindPoint::COMPUTE,
+            prt_ds_f_pipeline_layout_,
+            { prt_ds_f_tex_desc_set_ });
+
+        cmd_buf->dispatch(
+            1,
+            1,
+            1);
+    }
 }
 
 void Prt::destroy(
@@ -416,6 +509,7 @@ void Prt::destroy(
     device->destroyPipeline(prt_pipeline_);
 
     device->destroyDescriptorSetLayout(prt_ds_desc_set_layout_);
+    device->destroyDescriptorSetLayout(prt_ds_f_desc_set_layout_);
     device->destroyPipelineLayout(prt_ds_s_pipeline_layout_);
     device->destroyPipeline(prt_ds_s_pipeline_);
     device->destroyPipelineLayout(prt_ds_pipeline_layout_);
