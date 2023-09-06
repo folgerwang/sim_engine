@@ -12,7 +12,7 @@ class PrtTest {
     std::shared_ptr<renderer::Pipeline> prt_pipeline_;
     std::shared_ptr<renderer::TextureInfo> cone_map_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_tex_;
-    std::shared_ptr<renderer::TextureInfo> prt_texes_[7];
+    std::vector<std::shared_ptr<renderer::TextureInfo>> prt_texes_;
 public:
     PrtTest(
         const renderer::DeviceInfo& device_info,
@@ -32,7 +32,7 @@ public:
 
     inline std::shared_ptr<renderer::TextureInfo> getConemapTex() const { return cone_map_tex_; }
     inline std::shared_ptr<renderer::TextureInfo> getPrtTex() const { return prt_tex_; }
-    inline std::shared_ptr<renderer::TextureInfo> getPrtTex(int index) const { return prt_texes_[index]; }
+    inline std::vector<std::shared_ptr<renderer::TextureInfo>> getPrtTexes() const { return prt_texes_; }
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

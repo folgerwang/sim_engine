@@ -10,18 +10,11 @@ namespace {
         const std::shared_ptr<er::DescriptorSet>& description_set,
         const std::shared_ptr<er::Sampler>& texture_sampler,
         const std::shared_ptr<er::ImageView>& src_image,
-        const std::shared_ptr<er::ImageView>& dst_image,
-        const std::shared_ptr<er::ImageView>& dst_image_1,
-        const std::shared_ptr<er::ImageView>& dst_image_2,
-        const std::shared_ptr<er::ImageView>& dst_image_3,
-        const std::shared_ptr<er::ImageView>& dst_image_4,
-        const std::shared_ptr<er::ImageView>& dst_image_5,
-        const std::shared_ptr<er::ImageView>& dst_image_6) {
+        const std::vector<std::shared_ptr<er::TextureInfo>>& prt_texes) {
         er::WriteDescriptorList descriptor_writes;
 //        descriptor_writes.reserve(2);
         descriptor_writes.reserve(8);
 
-        // envmap texture.
         er::Helper::addOneTexture(
             descriptor_writes,
             description_set,
@@ -31,69 +24,16 @@ namespace {
             src_image,
             er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-        // envmap texture.
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_0,
-            nullptr,
-            dst_image,
-            er::ImageLayout::GENERAL);
-
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_1,
-            nullptr,
-            dst_image_1,
-            er::ImageLayout::GENERAL);
-
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_2,
-            nullptr,
-            dst_image_2,
-            er::ImageLayout::GENERAL);
-
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_3,
-            nullptr,
-            dst_image_3,
-            er::ImageLayout::GENERAL);
-
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_4,
-            nullptr,
-            dst_image_4,
-            er::ImageLayout::GENERAL);
-
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_5,
-            nullptr,
-            dst_image_5,
-            er::ImageLayout::GENERAL);
-
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_6,
-            nullptr,
-            dst_image_6,
-            er::ImageLayout::GENERAL);
+        for (int i = 0; i < prt_texes.size(); ++i) {
+            er::Helper::addOneTexture(
+                descriptor_writes,
+                description_set,
+                er::DescriptorType::STORAGE_IMAGE,
+                DST_TEX_INDEX_0 + i,
+                nullptr,
+                prt_texes[i]->view,
+                er::ImageLayout::GENERAL);
+        }
 
         return descriptor_writes;
     }
@@ -122,50 +62,28 @@ Prt::Prt(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& bump_tex,
-    const renderer::TextureInfo& prt_tex,
-    const renderer::TextureInfo& prt_tex_1,
-    const renderer::TextureInfo& prt_tex_2,
-    const renderer::TextureInfo& prt_tex_3,
-    const renderer::TextureInfo& prt_tex_4,
-    const renderer::TextureInfo& prt_tex_5,
-    const renderer::TextureInfo& prt_tex_6) {
+    const std::vector<std::shared_ptr<renderer::TextureInfo>> prt_texes) {
 
     const auto& device = device_info.device;
 
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings;
+    bindings.reserve(8);
+    bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            SRC_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER));
+
+    for (int i = 0; i < prt_texes.size(); ++i) {
+        bindings.push_back(
+            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                DST_TEX_INDEX_0 + i,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_IMAGE));
+    }
+
     prt_desc_set_layout_ =
-        device->createDescriptorSetLayout(
-            { renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                SRC_TEX_INDEX,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_0,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_1,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_2,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_3,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_4,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_5,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE),
-              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_6,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE) });
+        device->createDescriptorSetLayout(bindings);
 
     prt_tex_desc_set_ =
         device->createDescriptorSets(
@@ -178,13 +96,7 @@ Prt::Prt(
         texture_sampler,
         bump_tex.view,
         /*prt_tex.view*/
-        prt_tex.view,
-        prt_tex_1.view,
-        prt_tex_2.view,
-        prt_tex_3.view,
-        prt_tex_4.view,
-        prt_tex_5.view,
-        prt_tex_6.view);
+        prt_texes);
     device->updateDescriptorSets(prt_texture_descs);
 
     prt_pipeline_layout_ =
@@ -202,29 +114,22 @@ Prt::Prt(
 
 void Prt::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const renderer::TextureInfo& prt_tex,
-    const renderer::TextureInfo& prt_tex_1, 
-    const renderer::TextureInfo& prt_tex_2, 
-    const renderer::TextureInfo& prt_tex_3, 
-    const renderer::TextureInfo& prt_tex_4, 
-    const renderer::TextureInfo& prt_tex_5,
-    const renderer::TextureInfo& prt_tex_6) {
-    renderer::helper::transitMapTextureToStoreImage(
-        cmd_buf,
-        { prt_tex.image,
-          prt_tex_1.image,
-          prt_tex_2.image,
-          prt_tex_3.image,
-          prt_tex_4.image,
-          prt_tex_5.image,
-          prt_tex_6.image });
+    const std::vector<std::shared_ptr<renderer::TextureInfo>> prt_texes) {
+
+    std::vector<std::shared_ptr<renderer::Image>> images;
+    images.reserve(prt_texes.size());
+    for (const auto& tex : prt_texes) {
+        images.push_back(tex->image);
+    }
+
+    renderer::helper::transitMapTextureToStoreImage(cmd_buf, images);
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
         prt_pipeline_);
     glsl::PrtParams params = {};
-    params.size = glm::uvec2(prt_tex.size);
-    params.inv_size = glm::vec2(1.0f / prt_tex.size.x, 1.0f / prt_tex.size.y);
+    params.size = glm::uvec2(prt_texes[0]->size);
+    params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -238,19 +143,11 @@ void Prt::update(
         { prt_tex_desc_set_ });
 
     cmd_buf->dispatch(
-        (prt_tex.size.x + 7) / 8,
-        (prt_tex.size.y + 7) / 8,
+        (params.size.x + 7) / 8,
+        (params.size.y + 7) / 8,
         1);
 
-    renderer::helper::transitMapTextureFromStoreImage(
-        cmd_buf,
-        { prt_tex.image,
-          prt_tex_1.image,
-          prt_tex_2.image,
-          prt_tex_3.image,
-          prt_tex_4.image,
-          prt_tex_5.image,
-          prt_tex_6.image });
+    renderer::helper::transitMapTextureFromStoreImage(cmd_buf, images);
 }
 
 void Prt::destroy(

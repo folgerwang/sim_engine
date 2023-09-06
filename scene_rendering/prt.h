@@ -17,23 +17,11 @@ namespace engine {
                 const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
                 const std::shared_ptr<renderer::Sampler>& texture_sampler,
                 const renderer::TextureInfo& bump_tex,
-                const renderer::TextureInfo& prt_tex,
-                const renderer::TextureInfo& prt_tex_1,
-                const renderer::TextureInfo& prt_tex_2,
-                const renderer::TextureInfo& prt_tex_3,
-                const renderer::TextureInfo& prt_tex_4,
-                const renderer::TextureInfo& prt_tex_5,
-                const renderer::TextureInfo& prt_tex_6);
+                const std::vector<std::shared_ptr<renderer::TextureInfo>> prt_texes);
 
             void update(
                 const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-                const renderer::TextureInfo& prt_tex,
-                const renderer::TextureInfo& prt_tex_1,
-                const renderer::TextureInfo& prt_tex_2,
-                const renderer::TextureInfo& prt_tex_3,
-                const renderer::TextureInfo& prt_tex_4,
-                const renderer::TextureInfo& prt_tex_5,
-                const renderer::TextureInfo& prt_tex_6);
+                const std::vector<std::shared_ptr<renderer::TextureInfo>> prt_texes);
 
             void destroy(const std::shared_ptr<renderer::Device>& device);
         };

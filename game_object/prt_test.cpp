@@ -332,6 +332,7 @@ PrtTest::PrtTest(
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
+    prt_texes_.resize(7);
     for (int i = 0; i < 6; i++) {
         prt_texes_[i] = std::make_shared<renderer::TextureInfo>();
         renderer::Helper::create2DTextureImage(
