@@ -146,8 +146,14 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayo
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BASE_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BUMP_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_CONEMAP_TEX_INDEX));
-    for (int i = 0; i < 7; ++i)
-        bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0 + i));
+/*    for (int i = 0; i < 7; ++i)
+        bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0 + i));*/
+    bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            PRT_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            renderer::DescriptorType::STORAGE_IMAGE));
+    bindings.push_back(renderer::helper::getBufferDescriptionSetLayoutBinding(PRT_BUFFER_INDEX));
 
     return device->createDescriptorSetLayout(bindings);
 }
@@ -158,7 +164,8 @@ static renderer::WriteDescriptorList addPrtTextures(
     const renderer::TextureInfo& base_tex,
     const renderer::TextureInfo& bump_tex,
     const renderer::TextureInfo& conemap_tex,
-    const std::array<std::shared_ptr<renderer::TextureInfo>, 7>& prt_texes) {
+    const std::shared_ptr<renderer::TextureInfo>& prt_packed_texture,
+    const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer) {
 
     renderer::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(10);
@@ -194,6 +201,7 @@ static renderer::WriteDescriptorList addPrtTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // prt.
+    /*
     for (int i = 0; i < prt_texes.size(); ++i) {
         renderer::Helper::addOneTexture(
             descriptor_writes,
@@ -203,7 +211,23 @@ static renderer::WriteDescriptorList addPrtTextures(
             texture_sampler,
             prt_texes[i]->view,
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    }
+    }*/
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::STORAGE_IMAGE,
+        PRT_TEX_INDEX,
+        nullptr,
+        prt_packed_texture->view,
+        renderer::ImageLayout::GENERAL);
+
+    renderer::Helper::addOneBuffer(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::STORAGE_BUFFER,
+        PRT_BUFFER_INDEX,
+        prt_minmax_buffer->buffer,
+        prt_minmax_buffer->buffer->getSize());
 
     return descriptor_writes;
 }
@@ -307,7 +331,8 @@ void PrtTest::draw(
     std::shared_ptr<Plane> unit_plane,
     const renderer::TextureInfo& prt_base_tex,
     const renderer::TextureInfo& prt_bump_tex,
-    const std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_texes) {
+    const std::shared_ptr<renderer::TextureInfo>& prt_packed_texture,
+    const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer) {
 
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
 
@@ -341,6 +366,7 @@ void PrtTest::draw(
     }
 
     params.height_scale = s_height_scale;
+    params.buffer_size = glm::vec2(prt_packed_texture->size);
 
     // create a global ibl texture descriptor set.
     auto material_descs = addPrtTextures(
@@ -349,7 +375,8 @@ void PrtTest::draw(
         prt_base_tex,
         prt_bump_tex,
         *cone_map_tex_,
-        prt_texes);
+        prt_packed_texture,
+        prt_minmax_buffer);
 
     device->updateDescriptorSets(material_descs);
 

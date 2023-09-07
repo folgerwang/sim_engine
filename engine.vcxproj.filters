@@ -469,5 +469,8 @@
     <None Include="shaders\prt_minmax_ds_f.comp">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\prt_pack.comp">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

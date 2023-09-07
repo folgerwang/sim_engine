@@ -13,18 +13,23 @@ namespace engine {
 
             std::shared_ptr<renderer::DescriptorSetLayout> prt_ds_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> prt_ds_f_desc_set_layout_;
+            std::shared_ptr<renderer::DescriptorSetLayout> prt_pack_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSet> prt_ds_tex_desc_set_;
             std::shared_ptr<renderer::DescriptorSet> prt_ds_f_tex_desc_set_;
+            std::shared_ptr<renderer::DescriptorSet> prt_pack_tex_desc_set_;
             std::shared_ptr<renderer::PipelineLayout> prt_ds_s_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_ds_s_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> prt_ds_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_ds_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> prt_ds_f_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_ds_f_pipeline_;
+            std::shared_ptr<renderer::PipelineLayout> prt_pack_pipeline_layout_;
+            std::shared_ptr<renderer::Pipeline> prt_pack_pipeline_;
 
             std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_texes_;
             std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_ds1_texes_;
             std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_ds2_texes_;
+            std::shared_ptr<renderer::TextureInfo> prt_pack_tex_;
             std::shared_ptr<renderer::BufferInfo> prt_minmax_buffer_;
 
         public:
@@ -39,8 +44,16 @@ namespace engine {
                 const std::shared_ptr<renderer::Sampler>& texture_sampler,
                 const renderer::TextureInfo& bump_tex);
 
-            inline std::array<std::shared_ptr<renderer::TextureInfo>, 7> getPrtTexes() const {
+/*          inline std::array<std::shared_ptr<renderer::TextureInfo>, 7> getPrtTexes() const {
                 return prt_texes_;
+            }*/
+
+            inline std::shared_ptr<renderer::TextureInfo> getPackedPrtTexture() const {
+                return prt_pack_tex_;
+            }
+
+            inline std::shared_ptr<renderer::BufferInfo> getPrtMinMaxBuffer() const {
+                return prt_minmax_buffer_;
             }
 
             void destroy(const std::shared_ptr<renderer::Device>& device);

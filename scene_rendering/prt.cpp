@@ -49,11 +49,11 @@ namespace {
             er::Helper::addOneTexture(
                 descriptor_writes,
                 description_set,
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                er::DescriptorType::STORAGE_IMAGE,
                 SRC_TEX_INDEX_0 + i,
                 texture_sampler,
                 src_prt_texes[i]->view,
-                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                er::ImageLayout::GENERAL);
         }
 
         for (int i = 0; i < dst_prt_texes.size(); ++i) {
@@ -82,11 +82,11 @@ namespace {
             er::Helper::addOneTexture(
                 descriptor_writes,
                 description_set,
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                er::DescriptorType::STORAGE_IMAGE,
                 SRC_TEX_INDEX_0 + i,
                 texture_sampler,
                 src_prt_texes[i]->view,
-                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                er::ImageLayout::GENERAL);
         }
 
         er::Helper::addOneBuffer(
@@ -96,6 +96,46 @@ namespace {
             DST_BUFFER_INDEX,
             dst_prt_minmax_buffer->buffer,
             dst_prt_minmax_buffer->buffer->getSize());
+
+        return descriptor_writes;
+    }
+
+    er::WriteDescriptorList addPackedPrtTextures(
+        const std::shared_ptr<er::DescriptorSet>& description_set,
+        const std::shared_ptr<er::Sampler>& texture_sampler,
+        const std::array<std::shared_ptr<er::TextureInfo>, 7>& src_prt_texes,
+        const std::shared_ptr<er::BufferInfo>& src_prt_minmax_buffer,
+        const std::shared_ptr<er::TextureInfo>& dst_prt_tex) {
+        er::WriteDescriptorList descriptor_writes;
+        descriptor_writes.reserve(9);
+
+        for (int i = 0; i < src_prt_texes.size(); ++i) {
+            er::Helper::addOneTexture(
+                descriptor_writes,
+                description_set,
+                er::DescriptorType::STORAGE_IMAGE,
+                SRC_TEX_INDEX_0 + i,
+                texture_sampler,
+                src_prt_texes[i]->view,
+                er::ImageLayout::GENERAL);
+        }
+
+        er::Helper::addOneBuffer(
+            descriptor_writes,
+            description_set,
+            er::DescriptorType::STORAGE_BUFFER,
+            SRC_BUFFER_INDEX,
+            src_prt_minmax_buffer->buffer,
+            src_prt_minmax_buffer->buffer->getSize());
+
+        er::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            er::DescriptorType::STORAGE_IMAGE,
+            DST_TEX_INDEX,
+            nullptr,
+            dst_prt_tex->view,
+            er::ImageLayout::GENERAL);
 
         return descriptor_writes;
     }
@@ -166,7 +206,7 @@ namespace {
             (params.size.y + 7) / 8,
             1);
 
-        er::helper::transitMapTextureFromStoreImage(cmd_buf, images);
+        er::helper::transitMapTextureFromStoreImage(cmd_buf, images/*, er::ImageLayout::GENERAL*/);
     }
 
 } // namespace
@@ -243,6 +283,16 @@ Prt::Prt(
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
+    prt_pack_tex_ = std::make_shared<renderer::TextureInfo>();
+    renderer::Helper::create2DTextureImage(
+        device_info,
+        renderer::Format::R32G32B32A32_UINT,
+        buffer_size,
+        *prt_pack_tex_,
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
+        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
     // create a global ibl texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
     bindings.reserve(8);
@@ -287,7 +337,7 @@ Prt::Prt(
             renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
                 SRC_TEX_INDEX_0 + i,
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER));
+                er::DescriptorType::STORAGE_IMAGE));
     }
 
     for (int i = 0; i < prt_texes_.size(); ++i) {
@@ -346,7 +396,7 @@ Prt::Prt(
             renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
                 SRC_TEX_INDEX_0 + i,
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER));
+                er::DescriptorType::STORAGE_IMAGE));
     }
 
     ds_f_bindings.push_back(
@@ -358,6 +408,11 @@ Prt::Prt(
     prt_ds_f_desc_set_layout_ =
         device->createDescriptorSetLayout(ds_f_bindings);
 
+    prt_ds_f_tex_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            prt_ds_f_desc_set_layout_, 1)[0];
+
     prt_ds_f_pipeline_layout_ =
         createPrtPipelineLayout(
             device,
@@ -368,6 +423,48 @@ Prt::Prt(
             device,
             prt_ds_f_pipeline_layout_,
             "prt_minmax_ds_f_comp.spv");
+
+    // create a global ibl texture descriptor set layout.
+    std::vector<renderer::DescriptorSetLayoutBinding> pack_bindings;
+    pack_bindings.reserve(9);
+    for (int i = 0; i < prt_texes_.size(); ++i) {
+        pack_bindings.push_back(
+            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                SRC_TEX_INDEX_0 + i,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_IMAGE));
+    }
+
+    pack_bindings.push_back(
+        renderer::helper::getBufferDescriptionSetLayoutBinding(
+            SRC_BUFFER_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_BUFFER));
+
+    pack_bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            DST_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_IMAGE));
+
+    prt_pack_desc_set_layout_ =
+        device->createDescriptorSetLayout(pack_bindings);
+
+    prt_pack_tex_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            prt_pack_desc_set_layout_, 1)[0];
+
+    prt_pack_pipeline_layout_ =
+        createPrtPipelineLayout(
+            device,
+            prt_pack_desc_set_layout_);
+
+    prt_pack_pipeline_ =
+        renderer::helper::createComputePipeline(
+            device,
+            prt_pack_pipeline_layout_,
+            "prt_pack_comp.spv");
 }
 
 void Prt::update(
@@ -422,7 +519,7 @@ void Prt::update(
             (src_size.y + 7) / 8,
             1);
 
-        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, images);
+        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, images/*, renderer::ImageLayout::GENERAL*/);
     }
 
     MinmaxDownsample(
@@ -486,6 +583,48 @@ void Prt::update(
             1,
             1,
             1);
+
+        er::BarrierList barrier_list;
+        er::helper::addBuffersToBarrierList(
+            barrier_list,
+            { prt_minmax_buffer_->buffer },
+            SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+            SET_FLAG_BIT(Access, SHADER_READ_BIT));
+
+        cmd_buf->addBarriers(
+            barrier_list,
+            SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
+            SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
+    }
+
+    src_size = glm::uvec2(prt_texes_[0]->size);
+    {
+        renderer::helper::transitMapTextureToStoreImage(cmd_buf, { prt_pack_tex_->image });
+
+        // create a global ibl texture descriptor set.
+        auto prt_texture_descs = addPackedPrtTextures(
+            prt_pack_tex_desc_set_,
+            texture_sampler,
+            prt_texes_,
+            prt_minmax_buffer_,
+            prt_pack_tex_);
+        device->updateDescriptorSets(prt_texture_descs);
+
+        cmd_buf->bindPipeline(
+            renderer::PipelineBindPoint::COMPUTE,
+            prt_pack_pipeline_);
+
+        cmd_buf->bindDescriptorSets(
+            renderer::PipelineBindPoint::COMPUTE,
+            prt_pack_pipeline_layout_,
+            { prt_pack_tex_desc_set_ });
+
+        cmd_buf->dispatch(
+            (src_size.x + 7) / 8,
+            (src_size.y + 7) / 8,
+            1);
+
+        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, { prt_pack_tex_->image });
     }
 }
 
@@ -504,18 +643,24 @@ void Prt::destroy(
         }
     }
 
+    prt_minmax_buffer_->destroy(device);
+    prt_pack_tex_->destroy(device);
+
     device->destroyDescriptorSetLayout(prt_desc_set_layout_);
     device->destroyPipelineLayout(prt_pipeline_layout_);
     device->destroyPipeline(prt_pipeline_);
 
     device->destroyDescriptorSetLayout(prt_ds_desc_set_layout_);
     device->destroyDescriptorSetLayout(prt_ds_f_desc_set_layout_);
+    device->destroyDescriptorSetLayout(prt_pack_desc_set_layout_);
     device->destroyPipelineLayout(prt_ds_s_pipeline_layout_);
     device->destroyPipeline(prt_ds_s_pipeline_);
     device->destroyPipelineLayout(prt_ds_pipeline_layout_);
     device->destroyPipeline(prt_ds_pipeline_);
     device->destroyPipelineLayout(prt_ds_f_pipeline_layout_);
     device->destroyPipeline(prt_ds_f_pipeline_);
+    device->destroyPipelineLayout(prt_pack_pipeline_layout_);
+    device->destroyPipeline(prt_pack_pipeline_);
 }
 
 }//namespace scene_rendering

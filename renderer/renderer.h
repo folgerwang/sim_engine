@@ -64,6 +64,9 @@ class Sampler {
 };
 
 class Image {
+public:
+    virtual ImageLayout getImageLayout() = 0;
+    virtual void setImageLayout(ImageLayout layout) = 0;
 };
 
 class Buffer {
@@ -202,8 +205,8 @@ class VulkanImage : public Image {
 public:
     VulkanImage(const VkImage& image) : image_(image) {}
     VkImage get() { return image_; }
-    ImageLayout getImageLayout() { return layout_; }
-    void setImageLayout(ImageLayout layout) { layout_ = layout; }
+    virtual ImageLayout getImageLayout() { return layout_; }
+    virtual void setImageLayout(ImageLayout layout) { layout_ = layout; }
 };
 
 class VulkanBuffer : public Buffer {

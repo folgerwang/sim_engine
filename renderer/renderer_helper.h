@@ -71,10 +71,22 @@ PipelineDepthStencilStateCreateInfo fillPipelineDepthStencilStateCreateInfo(
     StencilOpState front = {},
     StencilOpState back = {});
 
+void addTexturesToBarrierList(
+    renderer::BarrierList& barrier_list,
+    const std::vector<std::shared_ptr<renderer::Image>>& images,
+    const renderer::ImageLayout& new_layout,
+    AccessFlags src_access_mask,
+    AccessFlags dst_access_mask);
+
+void addBuffersToBarrierList(
+    renderer::BarrierList& barrier_list,
+    const std::vector<std::shared_ptr<renderer::Buffer>>& buffers,
+    AccessFlags src_access_mask,
+    AccessFlags dst_access_mask);
+
 void transitMapTextureToStoreImage(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const std::vector<std::shared_ptr<renderer::Image>>& images,
-    const renderer::ImageLayout& old_layout = renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    const std::vector<std::shared_ptr<renderer::Image>>& images);
 
 void transitMapTextureFromStoreImage(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

@@ -6,52 +6,58 @@ layout(push_constant) uniform PrtUniformBufferObject {
     PrtParams params;
 };
 
-layout(set = 0, binding = SRC_TEX_INDEX_0, rgba32f) uniform image2D src_img_0;
-layout(set = 0, binding = SRC_TEX_INDEX_1, rgba32f) uniform image2D src_img_1;
-layout(set = 0, binding = SRC_TEX_INDEX_2, rgba32f) uniform image2D src_img_2;
-layout(set = 0, binding = SRC_TEX_INDEX_3, rgba32f) uniform image2D src_img_3;
-layout(set = 0, binding = SRC_TEX_INDEX_4, rgba32f) uniform image2D src_img_4;
-layout(set = 0, binding = SRC_TEX_INDEX_5, rgba32f) uniform image2D src_img_5;
-layout(set = 0, binding = SRC_TEX_INDEX_6, r32f) uniform image2D src_img_6;
+layout(set = 0, binding = SRC_TEX_INDEX_0, rgba32f) uniform readonly image2D src_img_0;
+layout(set = 0, binding = SRC_TEX_INDEX_1, rgba32f) uniform readonly image2D src_img_1;
+layout(set = 0, binding = SRC_TEX_INDEX_2, rgba32f) uniform readonly image2D src_img_2;
+layout(set = 0, binding = SRC_TEX_INDEX_3, rgba32f) uniform readonly image2D src_img_3;
+layout(set = 0, binding = SRC_TEX_INDEX_4, rgba32f) uniform readonly image2D src_img_4;
+layout(set = 0, binding = SRC_TEX_INDEX_5, rgba32f) uniform readonly image2D src_img_5;
+layout(set = 0, binding = SRC_TEX_INDEX_6, r32f) uniform readonly image2D src_img_6;
 
 layout(std430, set = 0, binding = DST_BUFFER_INDEX) buffer PrtMinmaxBuffer {
 	PrtMinmaxInfo info;
 };
 
-shared vec4 s_shared_min[6][64];
-shared vec4 s_shared_max[6][64];
-
-shared float s_shared_min6[64];
-shared float s_shared_max6[64];
-
 layout(local_size_x = 8, local_size_y = 8) in;
+
+const uint g_block_size = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+
+shared vec4 s_shared_min[6][g_block_size];
+shared vec4 s_shared_max[6][g_block_size];
+
+shared float s_shared_min6[g_block_size];
+shared float s_shared_max6[g_block_size];
+
 void main()
 {
-    ivec2 pixel_coords = min(ivec2(gl_GlobalInvocationID.xy), ivec2(params.size) -1);
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    uint actual_block_size = params.size.x * params.size.y;
 	// get index in global work group i.e x,y position
     ivec2 min_src_pixel_coords = ivec2(pixel_coords.x * 2, pixel_coords.y);
     ivec2 max_src_pixel_coords = ivec2(pixel_coords.x * 2 + 1, pixel_coords.y);
-    uint local_id = gl_LocalInvocationIndex;
+    uint local_id = zOrder(pixel_coords.x, pixel_coords.y);
 
-    s_shared_min[0][local_id] = imageLoad(src_img_0, min_src_pixel_coords);
-    s_shared_max[0][local_id] = imageLoad(src_img_0, max_src_pixel_coords);
-    s_shared_min[1][local_id] = imageLoad(src_img_1, min_src_pixel_coords);
-    s_shared_max[1][local_id] = imageLoad(src_img_1, max_src_pixel_coords);
-    s_shared_min[2][local_id] = imageLoad(src_img_2, min_src_pixel_coords);
-    s_shared_max[2][local_id] = imageLoad(src_img_2, max_src_pixel_coords);
-    s_shared_min[3][local_id] = imageLoad(src_img_3, min_src_pixel_coords);
-    s_shared_max[3][local_id] = imageLoad(src_img_3, max_src_pixel_coords);
-    s_shared_min[4][local_id] = imageLoad(src_img_4, min_src_pixel_coords);
-    s_shared_max[4][local_id] = imageLoad(src_img_4, max_src_pixel_coords);
-    s_shared_min[5][local_id] = imageLoad(src_img_5, min_src_pixel_coords);
-    s_shared_max[5][local_id] = imageLoad(src_img_5, max_src_pixel_coords);
-    s_shared_min6[local_id] = imageLoad(src_img_6, min_src_pixel_coords).x;
-    s_shared_max6[local_id] = imageLoad(src_img_6, max_src_pixel_coords).x;
+    if (local_id < actual_block_size) {
+        s_shared_min[0][local_id] = imageLoad(src_img_0, min_src_pixel_coords);
+        s_shared_max[0][local_id] = imageLoad(src_img_0, max_src_pixel_coords);
+        s_shared_min[1][local_id] = imageLoad(src_img_1, min_src_pixel_coords);
+        s_shared_max[1][local_id] = imageLoad(src_img_1, max_src_pixel_coords);
+        s_shared_min[2][local_id] = imageLoad(src_img_2, min_src_pixel_coords);
+        s_shared_max[2][local_id] = imageLoad(src_img_2, max_src_pixel_coords);
+        s_shared_min[3][local_id] = imageLoad(src_img_3, min_src_pixel_coords);
+        s_shared_max[3][local_id] = imageLoad(src_img_3, max_src_pixel_coords);
+        s_shared_min[4][local_id] = imageLoad(src_img_4, min_src_pixel_coords);
+        s_shared_max[4][local_id] = imageLoad(src_img_4, max_src_pixel_coords);
+        s_shared_min[5][local_id] = imageLoad(src_img_5, min_src_pixel_coords);
+        s_shared_max[5][local_id] = imageLoad(src_img_5, max_src_pixel_coords);
+        s_shared_min6[local_id] = imageLoad(src_img_6, min_src_pixel_coords).x;
+        s_shared_max6[local_id] = imageLoad(src_img_6, max_src_pixel_coords).x;
+    }
     barrier();
 
     // Reduce in shared memory
-    for (uint stride = 1; stride < gl_WorkGroupSize.x * gl_WorkGroupSize.y; stride *= 2) {
-        if (local_id % (2 * stride) == 0 && local_id + stride < gl_WorkGroupSize.x * gl_WorkGroupSize.y) {
+    for (uint stride = 1; stride < actual_block_size; stride *= 2) {
+        if (local_id % (2 * stride) == 0 && local_id + stride < actual_block_size) {
             for (uint i = 0; i < 6; ++i) {
 				s_shared_min[i][local_id] = min(s_shared_min[i][local_id], s_shared_min[i][local_id + stride]);
 				s_shared_max[i][local_id] = max(s_shared_max[i][local_id], s_shared_max[i][local_id + stride]);
@@ -62,17 +68,66 @@ void main()
         barrier();
     }
 
-    ivec2 min_pixel_coords = ivec2(gl_WorkGroupID.x * 2, gl_WorkGroupID.y);
-    ivec2 max_pixel_coords = ivec2(gl_WorkGroupID.x * 2 + 1, gl_WorkGroupID.y);
-
     if (local_id < 25) {
+        vec2 minmax = vec2(0);
         if (local_id < 24) {
-            vec2 minmax = vec2(s_shared_min[local_id/4][0][local_id%4], s_shared_max[local_id/4][0][local_id%4]);
-            info.prt_minmax[local_id] = minmax;
+            minmax = vec2(s_shared_min[local_id/4][0][local_id%4], s_shared_max[local_id/4][0][local_id%4]);
         }
         else {
-            vec2 minmax = vec2(s_shared_min6[0], s_shared_max6[0]);
-            info.prt_minmax[local_id] = minmax;
+            minmax = vec2(s_shared_min6[0], s_shared_max6[0]);
         }
+
+/*        if (local_id == 0)
+            minmax = vec2(s_shared_min[0][0].x, s_shared_max[0][0].x);
+        else if (local_id == 1)
+            minmax = vec2(s_shared_min[0][0].y, s_shared_max[0][0].y);
+        else if (local_id == 2)
+            minmax = vec2(s_shared_min[0][0].z, s_shared_max[0][0].z);
+        else if (local_id == 3)
+            minmax = vec2(s_shared_min[0][0].w, s_shared_max[0][0].w);
+        else if (local_id == 4)
+            minmax = vec2(s_shared_min[1][0].x, s_shared_max[1][0].x);
+        else if (local_id == 5)
+            minmax = vec2(s_shared_min[1][0].y, s_shared_max[1][0].y);
+        else if (local_id == 6)
+            minmax = vec2(s_shared_min[1][0].z, s_shared_max[1][0].z);
+        else if (local_id == 7)
+            minmax = vec2(s_shared_min[1][0].w, s_shared_max[1][0].w);
+        else if (local_id == 8)
+            minmax = vec2(s_shared_min[2][0].x, s_shared_max[2][0].x);
+        else if (local_id == 9)
+            minmax = vec2(s_shared_min[2][0].y, s_shared_max[2][0].y);
+        else if (local_id == 10)
+            minmax = vec2(s_shared_min[2][0].z, s_shared_max[2][0].z);
+        else if (local_id == 11)
+            minmax = vec2(s_shared_min[2][0].w, s_shared_max[2][0].w);
+        else if (local_id == 12)
+            minmax = vec2(s_shared_min[3][0].x, s_shared_max[3][0].x);
+        else if (local_id == 13)
+            minmax = vec2(s_shared_min[3][0].y, s_shared_max[3][0].y);
+        else if (local_id == 14)
+            minmax = vec2(s_shared_min[3][0].z, s_shared_max[3][0].z);
+        else if (local_id == 15)
+            minmax = vec2(s_shared_min[3][0].w, s_shared_max[3][0].w);
+        else if (local_id == 16)
+            minmax = vec2(s_shared_min[4][0].x, s_shared_max[4][0].x);
+        else if (local_id == 17)
+            minmax = vec2(s_shared_min[4][0].y, s_shared_max[4][0].y);
+        else if (local_id == 18)
+            minmax = vec2(s_shared_min[4][0].z, s_shared_max[4][0].z);
+        else if (local_id == 19)
+            minmax = vec2(s_shared_min[4][0].w, s_shared_max[4][0].w);
+        else if (local_id == 20)
+            minmax = vec2(s_shared_min[5][0].x, s_shared_max[5][0].x);
+        else if (local_id == 21)
+            minmax = vec2(s_shared_min[5][0].y, s_shared_max[5][0].y);
+        else if (local_id == 22)
+            minmax = vec2(s_shared_min[5][0].z, s_shared_max[5][0].z);
+        else if (local_id == 23)
+            minmax = vec2(s_shared_min[5][0].w, s_shared_max[5][0].w);
+        else
+            minmax = vec2(s_shared_min6[0].x, s_shared_max6[0].x);*/
+
+        info.prt_minmax[local_id] = vec2(minmax.x, minmax.y - minmax.x);
     }
 }

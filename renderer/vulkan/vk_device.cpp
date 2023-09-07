@@ -110,6 +110,7 @@ std::shared_ptr<Image> VulkanDevice::createImage(
     }
 
     auto result = std::make_shared<VulkanImage>(image);
+    result->setImageLayout(layout);
     image_list_.push_back(result);
 
     return result;

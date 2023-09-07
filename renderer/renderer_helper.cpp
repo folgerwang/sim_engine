@@ -161,25 +161,58 @@ PipelineDepthStencilStateCreateInfo fillPipelineDepthStencilStateCreateInfo(
     return depth_stencil;
 }
 
-void transitMapTextureToStoreImage(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+void addTexturesToBarrierList(
+    renderer::BarrierList& barrier_list,
     const std::vector<std::shared_ptr<renderer::Image>>& images,
-    const renderer::ImageLayout& old_layout/* = renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL*/) {
-    renderer::BarrierList barrier_list;
-    barrier_list.image_barriers.reserve(images.size());
+    const renderer::ImageLayout& new_layout,
+    AccessFlags src_access_mask,
+    AccessFlags dst_access_mask) {
+    barrier_list.image_barriers.reserve(barrier_list.image_barriers.size() + images.size());
 
     for (auto& image : images) {
         renderer::ImageMemoryBarrier barrier;
         barrier.image = image;
-        barrier.old_layout = old_layout;
-        barrier.new_layout = renderer::ImageLayout::GENERAL;
-        barrier.src_access_mask = SET_FLAG_BIT(Access, SHADER_READ_BIT);
-        barrier.dst_access_mask =
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-            SET_FLAG_BIT(Access, SHADER_WRITE_BIT);
+        barrier.old_layout = image->getImageLayout();
+        barrier.new_layout = new_layout;
+        image->setImageLayout(barrier.new_layout);
+        barrier.src_access_mask = src_access_mask;
+        barrier.dst_access_mask = dst_access_mask;
         barrier.subresource_range.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
         barrier_list.image_barriers.push_back(barrier);
     }
+}
+
+void addBuffersToBarrierList(
+    renderer::BarrierList& barrier_list,
+    const std::vector<std::shared_ptr<renderer::Buffer>>& buffers,
+    AccessFlags src_access_mask,
+    AccessFlags dst_access_mask) {
+    barrier_list.buffer_barriers.reserve(barrier_list.buffer_barriers.size() + buffers.size());
+
+    for (auto& buffer : buffers) {
+        renderer::BufferMemoryBarrier barrier;
+
+        barrier.buffer = buffer;
+        barrier.offset = 0;
+        barrier.size = buffer->getSize();
+        barrier.src_access_mask = src_access_mask;
+        barrier.dst_access_mask = dst_access_mask;
+        barrier_list.buffer_barriers.push_back(barrier);
+    }
+}
+
+void transitMapTextureToStoreImage(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::vector<std::shared_ptr<renderer::Image>>& images) {
+    renderer::BarrierList barrier_list;
+    barrier_list.image_barriers.reserve(images.size());
+
+    addTexturesToBarrierList(
+        barrier_list,
+        images,
+        renderer::ImageLayout::GENERAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT));
 
     cmd_buf->addBarriers(
         barrier_list,
@@ -195,19 +228,12 @@ void transitMapTextureFromStoreImage(
     renderer::BarrierList barrier_list;
     barrier_list.image_barriers.reserve(images.size());
 
-    for (auto& image : images) {
-        renderer::ImageMemoryBarrier barrier;
-        barrier.image = image;
-        barrier.old_layout = renderer::ImageLayout::GENERAL;
-        barrier.new_layout = new_layout;
-        barrier.src_access_mask =
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-            SET_FLAG_BIT(Access, SHADER_WRITE_BIT);
-        barrier.dst_access_mask = SET_FLAG_BIT(Access, SHADER_READ_BIT);
-
-        barrier.subresource_range.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
-        barrier_list.image_barriers.push_back(barrier);
-    }
+    addTexturesToBarrierList(
+        barrier_list,
+        images,
+        new_layout,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
     cmd_buf->addBarriers(
         barrier_list,

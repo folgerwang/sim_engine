@@ -24,13 +24,19 @@ layout(location = 0) in VsPsData {
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BASE_TEX_INDEX) uniform sampler2D prt_base_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BUMP_TEX_INDEX) uniform sampler2D prt_bump_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_CONEMAP_TEX_INDEX) uniform sampler2D prt_conemap_tex;
+/*
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_0) uniform sampler2D prt_tex_0;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_1) uniform sampler2D prt_tex_1;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_2) uniform sampler2D prt_tex_2;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_3) uniform sampler2D prt_tex_3;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_4) uniform sampler2D prt_tex_4;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_5) uniform sampler2D prt_tex_5;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_6) uniform sampler2D prt_tex_6;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_6) uniform sampler2D prt_tex_6;*/
+
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX, rgba32ui) uniform readonly uimage2D src_packed_img;
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BUFFER_INDEX) readonly buffer PrtMinmaxBuffer {
+	PrtMinmaxInfo info;
+};
 
 const int s_cone_steps = 15;
 const int s_binary_steps = 8;
@@ -121,22 +127,53 @@ void main() {
 
     vec3 intersect_pos = relaxedConeStepping(v, vec3(in_data.vertex_tex_coord, 0.0), false);
 
-    vec4 prt_0 = texture(prt_tex_0, vec2(intersect_pos));
-    vec4 prt_1 = texture(prt_tex_1, vec2(intersect_pos));
-    vec4 prt_2 = texture(prt_tex_2, vec2(intersect_pos));
-    vec4 prt_3 = texture(prt_tex_3, vec2(intersect_pos));
-    vec4 prt_4 = texture(prt_tex_4, vec2(intersect_pos));
-    vec4 prt_5 = texture(prt_tex_5, vec2(intersect_pos));
-    float prt_6 = texture(prt_tex_6, vec2(intersect_pos)).x;
+    vec2 pixel_coords = clamp(vec2(intersect_pos), 0.0f, 1.0f) * (params.buffer_size - 1);
+    uvec4 prt_packed_info = imageLoad(src_packed_img, ivec2(pixel_coords));
+
+    vec4 coeffs[6];
+    float coeffs_6;
+    coeffs[0].x = ((prt_packed_info.x >> 30) | ((prt_packed_info.y >> 30) << 2) | ((prt_packed_info.z >> 30) << 4) | ((prt_packed_info.w >> 30) << 6)) / 255.0f * info.prt_minmax[0].y + info.prt_minmax[0].x;
+    coeffs[0].y = (prt_packed_info.x & 0x1f) / 31.0f * info.prt_minmax[1].y + info.prt_minmax[1].x;
+    coeffs[0].z = ((prt_packed_info.x >> 5) & 0x1f) / 31.0f * info.prt_minmax[2].y + info.prt_minmax[2].x;
+    coeffs[0].w = ((prt_packed_info.x >> 10) & 0x1f) / 31.0f * info.prt_minmax[3].y + info.prt_minmax[3].x;
+    coeffs[1].x = ((prt_packed_info.x >> 15) & 0x1f) / 31.0f * info.prt_minmax[4].y + info.prt_minmax[4].x;
+    coeffs[1].y = ((prt_packed_info.x >> 20) & 0x1f) / 31.0f * info.prt_minmax[5].y + info.prt_minmax[5].x;
+    coeffs[1].z = ((prt_packed_info.x >> 25) & 0x1f) / 31.0f * info.prt_minmax[6].y + info.prt_minmax[6].x;
+    coeffs[1].w = (prt_packed_info.y & 0x1f) / 31.0f * info.prt_minmax[7].y + info.prt_minmax[7].x;
+    coeffs[2].x = ((prt_packed_info.y >> 5) & 0x1f) / 31.0f * info.prt_minmax[8].y + info.prt_minmax[8].x;
+    coeffs[2].y = ((prt_packed_info.y >> 10) & 0x1f) / 31.0f * info.prt_minmax[9].y + info.prt_minmax[9].x;
+    coeffs[2].z = ((prt_packed_info.y >> 15) & 0x1f) / 31.0f * info.prt_minmax[10].y + info.prt_minmax[10].x;
+    coeffs[2].w = ((prt_packed_info.y >> 20) & 0x1f) / 31.0f * info.prt_minmax[11].y + info.prt_minmax[11].x;
+    coeffs[3].x = ((prt_packed_info.y >> 25) & 0x1f) / 31.0f * info.prt_minmax[12].y + info.prt_minmax[12].x;
+    coeffs[3].y = (prt_packed_info.z & 0x1f) / 31.0f * info.prt_minmax[13].y + info.prt_minmax[13].x;
+    coeffs[3].z = ((prt_packed_info.z >> 5) & 0x1f) / 31.0f * info.prt_minmax[14].y + info.prt_minmax[14].x;
+    coeffs[3].w = ((prt_packed_info.z >> 10) & 0x1f) / 31.0f * info.prt_minmax[15].y + info.prt_minmax[15].x;
+    coeffs[4].x = ((prt_packed_info.z >> 15) & 0x1f) / 31.0f * info.prt_minmax[16].y + info.prt_minmax[16].x;
+    coeffs[4].y = ((prt_packed_info.z >> 20) & 0x1f) / 31.0f * info.prt_minmax[17].y + info.prt_minmax[17].x;
+    coeffs[4].z = ((prt_packed_info.z >> 25) & 0x1f) / 31.0f * info.prt_minmax[18].y + info.prt_minmax[18].x;
+    coeffs[4].w = (prt_packed_info.w & 0x1f) / 31.0f * info.prt_minmax[19].y + info.prt_minmax[19].x;
+    coeffs[5].x = ((prt_packed_info.w >> 5) & 0x1f) / 31.0f * info.prt_minmax[20].y + info.prt_minmax[20].x;
+    coeffs[5].y = ((prt_packed_info.w >> 10) & 0x1f) / 31.0f * info.prt_minmax[21].y + info.prt_minmax[21].x;
+    coeffs[5].z = ((prt_packed_info.w >> 15) & 0x1f) / 31.0f * info.prt_minmax[22].y + info.prt_minmax[22].x;
+    coeffs[5].w = ((prt_packed_info.w >> 20) & 0x1f) / 31.0f * info.prt_minmax[23].y + info.prt_minmax[23].x;
+    coeffs_6 = ((prt_packed_info.w >> 25) & 0x1f) / 31.0f * info.prt_minmax[24].y + info.prt_minmax[24].x;
+
+    /*coeffs[0] = texture(prt_tex_0, vec2(intersect_pos));
+    coeffs[1] = texture(prt_tex_1, vec2(intersect_pos));
+    coeffs[2] = texture(prt_tex_2, vec2(intersect_pos));
+    coeffs[3] = texture(prt_tex_3, vec2(intersect_pos));
+    coeffs[4] = texture(prt_tex_4, vec2(intersect_pos));
+    coeffs[5] = texture(prt_tex_5, vec2(intersect_pos));
+    coeffs_6 = texture(prt_tex_6, vec2(intersect_pos)).x;*/
 
     float sum_visi = 0;
-    sum_visi += dot(prt_0, vec4(params.coeffs[0], params.coeffs[1], params.coeffs[2], params.coeffs[3]));
-    sum_visi += dot(prt_1, vec4(params.coeffs[4], params.coeffs[5], params.coeffs[6], params.coeffs[7]));
-    sum_visi += dot(prt_2, vec4(params.coeffs[8], params.coeffs[9], params.coeffs[10], params.coeffs[11]));
-    sum_visi += dot(prt_3, vec4(params.coeffs[12], params.coeffs[13], params.coeffs[14], params.coeffs[15]));
-    sum_visi += dot(prt_4, vec4(params.coeffs[16], params.coeffs[17], params.coeffs[18], params.coeffs[19]));
-    sum_visi += dot(prt_5, vec4(params.coeffs[20], params.coeffs[21], params.coeffs[22], params.coeffs[23]));
-    sum_visi += prt_6 * params.coeffs[24];
+    sum_visi += dot(coeffs[0], vec4(params.coeffs[0], params.coeffs[1], params.coeffs[2], params.coeffs[3]));
+    sum_visi += dot(coeffs[1], vec4(params.coeffs[4], params.coeffs[5], params.coeffs[6], params.coeffs[7]));
+    sum_visi += dot(coeffs[2], vec4(params.coeffs[8], params.coeffs[9], params.coeffs[10], params.coeffs[11]));
+    sum_visi += dot(coeffs[3], vec4(params.coeffs[12], params.coeffs[13], params.coeffs[14], params.coeffs[15]));
+    sum_visi += dot(coeffs[4], vec4(params.coeffs[16], params.coeffs[17], params.coeffs[18], params.coeffs[19]));
+    sum_visi += dot(coeffs[5], vec4(params.coeffs[20], params.coeffs[21], params.coeffs[22], params.coeffs[23]));
+    sum_visi += coeffs_6 * params.coeffs[24];
 
     vec4 base_color = vec4(texture(prt_base_tex, vec2(intersect_pos)).xyz, 1);
     outColor = vec4(base_color.xyz * sum_visi * sqrt(4.0f * PI), 1.0f);

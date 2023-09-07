@@ -586,8 +586,7 @@ void VolumeCloud::renderVolumeCloud(
     {
         renderer::helper::transitMapTextureToStoreImage(
             cmd_buf,
-            { hdr_color },
-            renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            { hdr_color });
 
         cmd_buf->bindPipeline(
             renderer::PipelineBindPoint::COMPUTE,

@@ -122,6 +122,7 @@
     <None Include="shaders\prt_minmax_ds_f.comp" />
     <None Include="shaders\prt_minmax_ds_s.comp" />
     <None Include="shaders\prt_minmax_ds.comp" />
+    <None Include="shaders\prt_pack.comp" />
     <None Include="shaders\prt_test.frag" />
     <None Include="shaders\prt_test.vert" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable1.rcall" />

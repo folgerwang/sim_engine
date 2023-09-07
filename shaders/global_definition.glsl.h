@@ -70,6 +70,8 @@
 #define PRT_TEX_INDEX_4             (PRT_BASE_TEX_INDEX + 7)
 #define PRT_TEX_INDEX_5             (PRT_BASE_TEX_INDEX + 8)
 #define PRT_TEX_INDEX_6             (PRT_BASE_TEX_INDEX + 9)
+#define PRT_TEX_INDEX               PRT_TEX_INDEX_0
+#define PRT_BUFFER_INDEX            PRT_TEX_INDEX_1
 
 // TILE_TEXTURE_PARAMS_SET
 #define TILE_BASE_PARAMS_INDEX              6
@@ -120,6 +122,7 @@
 #define PANORAMA_TEX_INDEX                  0
 #define ENVMAP_TEX_INDEX                    0
 #define SRC_TEX_INDEX                       0
+#define SRC_BUFFER_INDEX                    0
 #define SRC_TEX_INDEX_0                     1
 #define SRC_TEX_INDEX_1                     2
 #define SRC_TEX_INDEX_2                     3
@@ -271,6 +274,7 @@ struct PrtLightParams {
     mat4 model_mat;
     float coeffs[25];
     float height_scale;
+    vec2 buffer_size;
 };
 
 struct IblParams {
@@ -624,4 +628,20 @@ struct VertexBufferInfo {
 
 #ifdef __cplusplus
 } //namespace glsl
+#endif
+
+#ifndef __cplusplus
+// Partitions the bit pattern of 'x' so that we can interleave it with another number.
+uint partBy2(uint x) {
+    x = (x | (x << 8)) & 0x00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F;
+    x = (x | (x << 2)) & 0x33333333;
+    x = (x | (x << 1)) & 0x55555555;
+    return x;
+}
+
+// Interleave the bits of x and y to produce the Morton code / Z-order index
+uint zOrder(uint x, uint y) {
+    return (partBy2(x) | (partBy2(y) << 1));
+}
 #endif

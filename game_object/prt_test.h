@@ -30,7 +30,8 @@ public:
         std::shared_ptr<Plane> unit_plane,
         const renderer::TextureInfo& prt_base_tex,
         const renderer::TextureInfo& prt_bump_tex,
-        const std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_texes);
+        const std::shared_ptr<renderer::TextureInfo>& prt_packed_texture,
+        const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer);
 
     inline std::shared_ptr<renderer::TextureInfo> getConemapTex() const { return cone_map_tex_; }
     inline std::shared_ptr<renderer::TextureInfo> getPrtTex() const { return prt_tex_; }
