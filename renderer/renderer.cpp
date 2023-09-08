@@ -782,7 +782,8 @@ void Helper::submitQueue(
     const std::shared_ptr<Fence>& in_flight_fence,
     const std::vector<std::shared_ptr<Semaphore>>& wait_semaphores,
     const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
-    const std::vector<std::shared_ptr<Semaphore>>& signal_semaphores) {
+    const std::vector<std::shared_ptr<Semaphore>>& signal_semaphores,
+    const std::vector<uint64_t>& signal_semaphore_values) {
 
     std::vector<VkSemaphore> vk_wait_semaphores(wait_semaphores.size());
     for (auto i = 0; i < wait_semaphores.size(); i++) {
@@ -808,10 +809,20 @@ void Helper::submitQueue(
     submit_info.pCommandBuffers = vk_cmd_bufs.data();
     submit_info.signalSemaphoreCount = static_cast<uint32_t>(vk_signal_semaphores.size());
     submit_info.pSignalSemaphores = vk_signal_semaphores.data();
+    if (signal_semaphore_values.size() > 0) {
+        VkTimelineSemaphoreSubmitInfo timeline_info = {};
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.signalSemaphoreValueCount = static_cast<uint32_t>(signal_semaphore_values.size());  // We're signaling one semaphore in this example
+        timeline_info.pSignalSemaphoreValues = signal_semaphore_values.data();
+        timeline_info.waitSemaphoreValueCount = 0;
+        timeline_info.pWaitSemaphoreValues = nullptr;
+
+        submit_info.pNext = &timeline_info;
+    }
 
     auto vk_graphic_queue = RENDER_TYPE_CAST(Queue, graphic_queue);
     auto vk_in_flight_fence = RENDER_TYPE_CAST(Fence, in_flight_fence);
-    if (vkQueueSubmit(vk_graphic_queue->get(), 1, &submit_info, vk_in_flight_fence->get()) != VK_SUCCESS) {
+    if (vkQueueSubmit(vk_graphic_queue->get(), 1, &submit_info, vk_in_flight_fence ? vk_in_flight_fence->get() : nullptr) != VK_SUCCESS) {
         throw std::runtime_error("failed to submit draw command buffer!");
     }
 }

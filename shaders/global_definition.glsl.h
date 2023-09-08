@@ -452,11 +452,19 @@ struct CloudParams {
 struct ConemapParams {
     uvec2           size;
     vec2            inv_size;
+    uint            depth_channel;
 };
 
 struct PrtParams {
     uvec2           size;
     vec2            inv_size;
+};
+
+struct PrtGenParams {
+    uvec2           size;
+    vec2            inv_size;
+    float           shadow_intensity;
+    uint            depth_channel;
 };
 
 struct GameObjectsUpdateParams {

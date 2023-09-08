@@ -482,7 +482,8 @@ public:
         const std::shared_ptr<Fence>& in_flight_fence,
         const std::vector<std::shared_ptr<Semaphore>>& wait_semaphores,
         const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
-        const std::vector<std::shared_ptr<Semaphore>>& signal_semaphores);
+        const std::vector<std::shared_ptr<Semaphore>>& signal_semaphores,
+        const std::vector<uint64_t>& signal_semaphore_values);
 
     static bool presentQueue(
         const std::shared_ptr<Queue>& present_queue,

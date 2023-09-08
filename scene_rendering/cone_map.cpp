@@ -104,18 +104,21 @@ ConeMap::ConeMap(
 
 void ConeMap::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const renderer::TextureInfo& conemap_tex) {
+    const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj) {
+
+    const auto& conemap_tex = cone_map_obj->getConemapTexture();
 
     renderer::helper::transitMapTextureToStoreImage(
         cmd_buf,
-        { conemap_tex.image });
+        { conemap_tex->image});
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
         conemap_pipeline_);
     glsl::ConemapParams params = {};
-    params.size = glm::uvec2(conemap_tex.size);
-    params.inv_size = glm::vec2(1.0f / conemap_tex.size.x, 1.0f / conemap_tex.size.y);
+    params.size = glm::uvec2(conemap_tex->size);
+    params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
+    params.depth_channel = cone_map_obj->getDepthChannel();
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -129,13 +132,13 @@ void ConeMap::update(
         { conemap_tex_desc_set_ });
 
     cmd_buf->dispatch(
-        (conemap_tex.size.x + 7) / 8,
-        (conemap_tex.size.y + 7) / 8,
+        (params.size.x + 7) / 8,
+        (params.size.y + 7) / 8,
         1);
 
     renderer::helper::transitMapTextureFromStoreImage(
         cmd_buf,
-        { conemap_tex.image });
+        { conemap_tex->image });
 }
 
 void ConeMap::destroy(

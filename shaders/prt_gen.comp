@@ -4,7 +4,7 @@
 #include "prt_core.glsl.h"
 
 layout(push_constant) uniform PrtUniformBufferObject {
-    PrtParams params;
+    PrtGenParams params;
 };
 
 layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
@@ -16,27 +16,27 @@ layout(set = 0, binding = DST_TEX_INDEX_4, rgba32f) uniform image2D dst_img_4;
 layout(set = 0, binding = DST_TEX_INDEX_5, rgba32f) uniform image2D dst_img_5;
 layout(set = 0, binding = DST_TEX_INDEX_6, r32f) uniform image2D dst_img_6;
 
-float sampleVisi(vec2 sample_uv, float cur_depth, float theta, float phi) {
+const int NUM_Y_SAMPLES = 100;
+const int NUM_X_SAMPLES = 200;
+shared float s_pre_calculate_coeffs[NUM_Y_SAMPLES][15];
+
+float sampleRayMaxTangent(vec2 sample_uv, float cur_depth, float phi) {
     vec2 sample_ray = vec2(cos(phi), sin(phi));
     float t = getIntersection(sample_uv * 2.0f - 1.0f, sample_ray) * 0.5f;
-    uint sample_count = uint(t * min(params.size.x, params.size.y));
+    uint sample_count = max(uint(t * min(params.size.x, params.size.y)), 1);
     float step = t / sample_count;
-    float visi = 1.0f;
     float t1 = step * 0.5f;
-    float max_tan_angle = 0.0f;
+    float max_tan_angle = -1e20f;
     for (uint i = 0; i < sample_count; i++) {
         vec2 sample_pos = sample_uv + sample_ray * t1;
-        float sample_depth = texture(src_img, sample_pos).w;
-        max_tan_angle = max(max(cur_depth - sample_depth, 0.0f) / t1, max_tan_angle);
+        float sample_depth = texture(src_img, sample_pos)[params.depth_channel];
+        max_tan_angle = max((cur_depth - sample_depth) * params.shadow_intensity / t1, max_tan_angle);
         t1 += step;
     }
 
-    if (max_tan_angle > 0 && tan(theta) < max_tan_angle) {
-        visi = 0.0f;
-    }
-
-    return visi;
+    return max_tan_angle;
 }
+
 
 layout(local_size_x = 8, local_size_y = 8) in;
 void main()
@@ -44,32 +44,51 @@ void main()
 	// get index in global work group i.e x,y position
 	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
 
-    const int numSamples = 200; // Just an example number; in practice, you'd probably need more.
-    const float step_angle = PI / numSamples;
+    uint local_id = gl_LocalInvocationIndex;
+    const float step_theta = PI / NUM_Y_SAMPLES;
+    const float step_phi = 2.0f * PI / NUM_X_SAMPLES;
+    for (int i = int(local_id); i < NUM_Y_SAMPLES; i += 64) {
+        float theta = (i + 0.5f) * step_theta;  // From 0 to pi
+	    fillPreCalculateCoeffs(s_pre_calculate_coeffs[i], theta);
+	}
+    barrier();
+
     float sum_visi[25];
     for (int s = 0; s < 25; s++) {
         sum_visi[s] = 0.0f;
     }
 
     vec2 sample_uv = vec2(pixel_coords + 0.5) * params.inv_size;
-    float c_depth = texture(src_img, sample_uv).w;
+    float c_depth = texture(src_img, sample_uv)[params.depth_channel];
 
-    for (int i = 0; i < numSamples; i++) {
-        for (int j = 0; j < numSamples; j++) {
-            float theta = (i + 0.5f) * step_angle;  // From 0 to pi
-            float phi = (j + 0.5f) * step_angle * 2.0f;  // From 0 to 2*pi
+    float max_tan_angles[NUM_X_SAMPLES];
+    float phi = 0.0f;
+    for (int i = 0; i < NUM_X_SAMPLES; i++) {
+        max_tan_angles[i] = sampleRayMaxTangent(sample_uv, c_depth, phi);
+        phi += step_phi;
+    }
+
+    float sum_samples = 0;
+    for (int i = 0; i < NUM_Y_SAMPLES; i++) {
+        float theta = (i + 0.5f) * step_theta;  // From 0 to pi
+        float tan_theta = tan(theta);
+        float phi = 0.0f;
+        float weight = (2.0f * PI * sin(theta) / NUM_X_SAMPLES) / step_theta;
+        for (int j = 0; j < NUM_X_SAMPLES; j++) {
+            float sample_visi = (tan_theta < max_tan_angles[j] ? 0.0f : 1.0f) * weight;
 
             float y_value[25];
-            fillYVauleTablle(y_value, theta, phi);
+            fillYVauleTablle(y_value, s_pre_calculate_coeffs[i], phi);
 
-            float sample_visi = sampleVisi(sample_uv, c_depth, theta, phi);
             for (int s = 0; s < 25; s++) {
                 sum_visi[s] += y_value[s] * sample_visi;
             }
+            phi += step_phi;
         }
+        sum_samples += NUM_X_SAMPLES * weight;
     }
 
-    float inv_count = 1.0f / (numSamples * numSamples);
+    float inv_count = 1.0f / sum_samples;
     for (int s = 0; s < 25; s++) {
         sum_visi[s] = sum_visi[s] * inv_count;
     }

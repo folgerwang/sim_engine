@@ -150,6 +150,9 @@
     <ClCompile Include="scene_rendering\prt.cpp">
       <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\cone_map_obj.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -298,6 +301,9 @@
     </ClInclude>
     <ClInclude Include="shaders\prt_core.glsl.h">
       <Filter>Resource Files</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\cone_map_obj.h">
+      <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

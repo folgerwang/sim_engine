@@ -17,15 +17,16 @@ void main()
     vec2 uv = (pixel_coords.xy + 0.5f) * params.inv_size;
 
 	vec3 ray_origin = vec3(uv, 0.0f);
-    float c_depth = texture(src_img, uv).w;
+    float c_depth = texture(src_img, uv)[params.depth_channel];
     const uint search_steps = 128;
     vec4 best_inv_cone_ratio = vec4(0.0f);
 
-    for (uint ty = 0; ty < params.size.y; ty++) {
-        for (uint tx = 0; tx < params.size.x; tx++) {
+#if 1
+    for (uint ty = 0; ty < params.size.y; ty+=4) {
+        for (uint tx = 0; tx < params.size.x; tx+=4) {
             if (tx != pixel_coords.x && ty != pixel_coords.y) {
                 vec2 sample_uv = (vec2(tx, ty) + 0.5f) * params.inv_size;
-                vec3 lookup_pos = vec3(sample_uv, texture(src_img, sample_uv).w);
+                vec3 lookup_pos = vec3(sample_uv, texture(src_img, sample_uv)[params.depth_channel]);
                 vec3 v = lookup_pos - ray_origin;
                 if (v.z > 0.0f) {
                     v /= v.z;
@@ -34,7 +35,7 @@ void main()
                 v /= float(search_steps);
                 vec3 p = lookup_pos + v;
                 for (int i = 0; i < search_steps -1; i++) {
-                    float d = texture(src_img, p.xy).w;
+                    float d = texture(src_img, p.xy)[params.depth_channel];
                     if (d < p.z) {
                         p += v;
                     }
@@ -56,6 +57,13 @@ void main()
             }
         }
     }
+#else
+    for (uint ta = 0; ta < 1024; ta++) {
+        float alpha = (ta + 0.5f) / 1024.0f * 2.0f * PI;
+
+    }
+
+#endif
 
     float inv_half_pi = 1.0f / (PI * 0.5f);
 

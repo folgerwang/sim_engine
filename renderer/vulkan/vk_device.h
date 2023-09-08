@@ -135,7 +135,7 @@ public:
         const glm::uvec2& extent) final;
     virtual std::shared_ptr<Sampler> createSampler(Filter filter, SamplerAddressMode address_mode, SamplerMipmapMode mipmap_mode, float anisotropy) final;
     virtual std::shared_ptr<Semaphore> createSemaphore() final;
-    virtual std::shared_ptr<Fence> createFence() final;
+    virtual std::shared_ptr<Fence> createFence(bool signaled = false) final;
     virtual void bindBufferMemory(std::shared_ptr<Buffer> buffer, std::shared_ptr<DeviceMemory> buffer_memory, uint64_t offset = 0) final;
     virtual void bindImageMemory(std::shared_ptr<Image> image, std::shared_ptr<DeviceMemory> image_memory, uint64_t offset = 0) final;
     virtual std::vector<std::shared_ptr<CommandBuffer>> allocateCommandBuffers(std::shared_ptr<CommandPool> cmd_pool, uint32_t num_buffers, bool is_primary = true) final;
@@ -161,6 +161,7 @@ public:
     virtual void freeCommandBuffers(std::shared_ptr<CommandPool> cmd_pool, const std::vector<std::shared_ptr<CommandBuffer>>& cmd_bufs) final;
     virtual void resetFences(const std::vector<std::shared_ptr<Fence>>& fences) final;
     virtual void waitForFences(const std::vector<std::shared_ptr<Fence>>& fences) final;
+    virtual void waitForSemaphores(const std::vector<std::shared_ptr<Semaphore>>& semaphores, uint64_t value) final;
     virtual void waitIdle() final;
     virtual void getAccelerationStructureBuildSizes(
         AccelerationStructureBuildType         as_build_type,

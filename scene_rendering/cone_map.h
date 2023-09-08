@@ -2,7 +2,12 @@
 #include "renderer/renderer.h"
 #include "shaders/global_definition.glsl.h"
 
+#include "game_object/cone_map_obj.h"
+
 namespace engine {
+namespace game_object {
+    class ConeMapObj;
+}
 namespace scene_rendering {
 
 class ConeMap {
@@ -21,7 +26,7 @@ public:
 
     void update(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const renderer::TextureInfo& conemap_tex);
+        const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

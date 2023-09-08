@@ -1,6 +1,7 @@
 #pragma once
 #include "renderer/renderer.h"
 #include "plane.h"
+#include "cone_map_obj.h"
 
 namespace engine {
 namespace game_object {
@@ -10,8 +11,7 @@ class PrtTest {
     std::shared_ptr<renderer::DescriptorSetLayout> prt_desc_set_layout_;
     std::shared_ptr<renderer::PipelineLayout> prt_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> prt_pipeline_;
-    std::shared_ptr<renderer::TextureInfo> cone_map_tex_;
-    std::shared_ptr<renderer::TextureInfo> prt_tex_;
+
 public:
     PrtTest(
         const renderer::DeviceInfo& device_info,
@@ -19,22 +19,18 @@ public:
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const glm::uvec2& display_size,
-        const glm::uvec2& buffer_size,
-        std::shared_ptr<Plane> unit_plane);
-    void draw(
-        const std::shared_ptr<renderer::Device>& device,
-        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
-        std::shared_ptr<Plane> unit_plane,
         const renderer::TextureInfo& prt_base_tex,
         const renderer::TextureInfo& prt_bump_tex,
-        const std::shared_ptr<renderer::TextureInfo>& prt_packed_texture,
-        const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer);
+        const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj,
+        const glm::uvec2& display_size,
+        std::shared_ptr<Plane> unit_plane);
 
-    inline std::shared_ptr<renderer::TextureInfo> getConemapTex() const { return cone_map_tex_; }
-    inline std::shared_ptr<renderer::TextureInfo> getPrtTex() const { return prt_tex_; }
+    void draw(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_set_list,
+        std::shared_ptr<Plane> unit_plane,
+        const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

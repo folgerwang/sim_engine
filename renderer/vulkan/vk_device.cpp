@@ -184,8 +184,14 @@ std::shared_ptr<Sampler> VulkanDevice::createSampler(Filter filter, SamplerAddre
 }
 
 std::shared_ptr<Semaphore> VulkanDevice::createSemaphore() {
+    VkSemaphoreTypeCreateInfoKHR type_create_info = {};
+    type_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type_create_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type_create_info.initialValue = 0; // Initial value for the semaphore
+
     VkSemaphoreCreateInfo semaphore_info{};
     semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semaphore_info.pNext = &type_create_info;
 
     VkSemaphore semaphore;
     if (vkCreateSemaphore(device_, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) {
@@ -198,10 +204,12 @@ std::shared_ptr<Semaphore> VulkanDevice::createSemaphore() {
     return vk_semaphore;
 }
 
-std::shared_ptr<Fence> VulkanDevice::createFence() {
+std::shared_ptr<Fence> VulkanDevice::createFence(bool signaled/* = false*/) {
     VkFenceCreateInfo fence_info{};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (signaled) {
+        fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    }
 
     VkFence fence;
     if (vkCreateFence(device_, &fence_info, nullptr, &fence) != VK_SUCCESS) {
@@ -1094,6 +1102,27 @@ void VulkanDevice::waitForFences(const std::vector<std::shared_ptr<Fence>>& fenc
         vk_fences[i] = vk_fence->get();
     }
     vkWaitForFences(device_, static_cast<uint32_t>(vk_fences.size()), vk_fences.data(), VK_TRUE, UINT64_MAX);
+}
+
+void VulkanDevice::waitForSemaphores(
+    const std::vector<std::shared_ptr<Semaphore>>& semaphores,
+    uint64_t value) {
+
+    std::vector<VkSemaphore> vk_semaphores(semaphores.size());
+    std::vector<uint64_t> values(semaphores.size());
+    for (int i = 0; i < semaphores.size(); i++) {
+        auto vk_semaphore = RENDER_TYPE_CAST(Semaphore, semaphores[i]);
+        vk_semaphores[i] = vk_semaphore->get();
+        values[i] = value;
+    }
+
+    VkSemaphoreWaitInfo wait_info = {};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = vk_semaphores.size(); // Number of semaphores you're waiting on
+    wait_info.pSemaphores = vk_semaphores.data(); // The semaphores you're waiting on
+    wait_info.pValues = values.data(); // An array of values to wait for
+
+    vkWaitSemaphores(device_, &wait_info, UINT64_MAX);
 }
 
 void VulkanDevice::waitIdle() {
