@@ -22,16 +22,16 @@ shared float s_pre_calculate_coeffs[NUM_Y_SAMPLES][15];
 
 float sampleRayMaxTangent(vec2 sample_uv, float cur_depth, float phi) {
     vec2 sample_ray = vec2(cos(phi), sin(phi));
-    float t = getIntersection(sample_uv * 2.0f - 1.0f, sample_ray) * 0.5f;
-    uint sample_count = max(uint(t * min(params.size.x, params.size.y)), 1);
-    float step = t / sample_count;
-    float t1 = step * 0.5f;
+    float max_t = getIntersection(sample_uv * 2.0f - 1.0f, sample_ray) * 0.5f;
+    uint sample_count = max(uint(max_t * max(params.size.x, params.size.y)), 1);
+    float step_t = max_t / sample_count;
+    float t = step_t * 0.5f;
     float max_tan_angle = -1e20f;
     for (uint i = 0; i < sample_count; i++) {
-        vec2 sample_pos = sample_uv + sample_ray * t1;
+        vec2 sample_pos = sample_uv + sample_ray * t;
         float sample_depth = texture(src_img, sample_pos)[params.depth_channel];
-        max_tan_angle = max((cur_depth - sample_depth) * params.shadow_intensity / t1, max_tan_angle);
-        t1 += step;
+        max_tan_angle = max((cur_depth - sample_depth) * params.shadow_intensity / t, max_tan_angle);
+        t += step_t;
     }
 
     return max_tan_angle;
