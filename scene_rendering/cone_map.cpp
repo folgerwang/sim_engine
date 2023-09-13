@@ -115,26 +115,32 @@ void ConeMap::update(
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
         conemap_pipeline_);
-    glsl::ConemapParams params = {};
-    params.size = glm::uvec2(conemap_tex->size);
-    params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-    params.depth_channel = cone_map_obj->getDepthChannel();
-
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        conemap_pipeline_layout_,
-        &params,
-        sizeof(params));
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::COMPUTE,
         conemap_pipeline_layout_,
         { conemap_tex_desc_set_ });
 
-    cmd_buf->dispatch(
-        (params.size.x + 7) / 8,
-        (params.size.y + 7) / 8,
-        1);
+    glsl::ConemapParams params = {};
+    params.size = glm::uvec2(conemap_tex->size);
+    params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
+    params.depth_channel = cone_map_obj->getDepthChannel();
+    params.is_height_map = cone_map_obj->isHeightMap() ? 1 : 0;
+
+    for (int batch_start_idx = 0; batch_start_idx < kTotalConemapAngleSamples; batch_start_idx += kConemapAngleBatchSize) {
+        params.start_angle_idx = batch_start_idx;
+
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            conemap_pipeline_layout_,
+            &params,
+            sizeof(params));
+
+        cmd_buf->dispatch(
+            (params.size.x + 7) / 8,
+            (params.size.y + 7) / 8,
+            1);
+    }
 
     renderer::helper::transitMapTextureFromStoreImage(
         cmd_buf,

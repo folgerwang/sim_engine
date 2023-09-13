@@ -387,6 +387,8 @@ void Prt::update(
         params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
         params.shadow_intensity = cone_map_obj->getShadowIntensity();
         params.depth_channel = cone_map_obj->getDepthChannel();
+        params.is_height_map = cone_map_obj->isHeightMap() ? 1 : 0;
+        params.shadow_noise_thread = cone_map_obj->getShadowNoiseThread();
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),

@@ -346,7 +346,7 @@ void PrtTest::draw(
             glm::vec4(0, 0, 0, 1));
 
     float y_value[25];
-    static float s_theta = glm::pi<float>() / 4.0f;
+    static float s_theta = glm::pi<float>() / 3.0f;
     static float s_phi = glm::pi<float>() / 4.0f;
     glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sinf(s_theta) * cone_map_obj->getDepthScale(), std::cos(s_theta)));
     
@@ -358,7 +358,7 @@ void PrtTest::draw(
         params.coeffs[i] = y_value[i];
     }
 
-    params.height_scale = cone_map_obj->getDepthScale();
+    params.height_scale = cone_map_obj->getDepthScale() * (cone_map_obj->isHeightMap() ? -1.0f : 1.0f);
     params.buffer_size = glm::vec2(buffer_size);
 
     cmd_buf->pushConstants(

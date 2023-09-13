@@ -18,8 +18,10 @@ class ConeMapObj {
     std::shared_ptr<renderer::BufferInfo> prt_minmax_buffer_;
 
     uint32_t depth_channel_ = 0;
+    bool is_height_map_ = false;
     float depth_scale_ = 0.0f;
     float shadow_intensity_ = 0.0f;
+    float shadow_noise_thread_ = 0.0f;
 
 public:
     ConeMapObj(
@@ -29,13 +31,23 @@ public:
         const renderer::TextureInfo& prt_bump_tex,
         const std::shared_ptr<scene_rendering::Prt>& prt_gen,
         uint32_t depth_channel,
+        bool is_height_depth,
         float depth_scale,
-        float shadow_intensity);
+        float shadow_intensity,
+        float shadow_noise_thread);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 
     inline float getDepthScale() {
         return depth_scale_;
+    }
+
+    inline bool isHeightMap() {
+        return is_height_map_;
+    }
+
+    inline float getShadowNoiseThread() {
+        return shadow_noise_thread_;
     }
 
     inline float getShadowIntensity() {

@@ -17,7 +17,7 @@ void main()
 	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
     vec2 uv = (pixel_coords.xy + 0.5f) * params.inv_size;
 
-	vec3 ray_origin = vec3(uv, 0.0f);
+	vec3 ray_origin = vec3(uv, -0.0001f);
     float c_depth = texture(src_img, uv)[params.depth_channel];
     const uint search_steps = 128;
     vec4 best_inv_cone_ratio = vec4(0.0f);
@@ -27,7 +27,7 @@ void main()
         for (uint tx = 0; tx < params.size.x; tx++) {
             if (tx != pixel_coords.x && ty != pixel_coords.y) {
                 vec2 sample_uv = (vec2(tx, ty) + 0.5f) * params.inv_size;
-                vec3 lookup_pos = vec3(sample_uv, texture(src_img, sample_uv)[params.depth_channel]);
+                vec3 lookup_pos = vec3(sample_uv, texture(src_img, sample_uv)[params.depth_channel];
                 vec3 v = lookup_pos - ray_origin;
                 if (v.z > 0.0f) {
                     v /= v.z;
@@ -59,14 +59,15 @@ void main()
         }
     }
 #else
-    const uint MAX_SAMPLES = 1024;
     uint valid_size = max(params.size.x, params.size.y);
-    for (uint ta = 0; ta < MAX_SAMPLES; ta++) {
-        float alpha = (ta + 0.5f) / MAX_SAMPLES * 2.0f * PI;
+    for (uint ta = 0; ta < kConemapAngleBatchSize; ta++) {
+        float ratio = (ta + 0.5f + params.start_angle_idx) / kTotalConemapAngleSamples;
+        float alpha = ratio * 2.0f * PI;
         vec2 sample_ray = vec2(cos(alpha), sin(alpha));
         float max_t = getIntersection(vec2(ray_origin) * 2.0f - 1.0f, sample_ray) * 0.5f;
         if (max_t > 0.5f / valid_size) { // larger than half pixel.
-            uint sample_count = max(uint(max_t * valid_size), 3);
+            vec2 sample_count_xy = max_t * abs(sample_ray.xy) * params.size;
+            uint sample_count = max(uint(max(sample_count_xy.x, sample_count_xy.y)), 3);
 
             float step_t = max_t / sample_count;
             vec2 step_ray = step_t * sample_ray;
@@ -85,10 +86,11 @@ void main()
                 sample2.w = sample1.w + step_t;
 
                 float deta_height = sample1.z / sample1.w * step_t;
-                // sample0 and sample2 is below tangent plane created by ray origin and sample1.
+                // to check whether sample1 is on the tangent plane created by ray origin and sample1,
+                // sample0 and sample2 has to be below this tangent plane.
                 float inv_cone_ratio = max(c_depth - sample1.z, 0.0f) / sample1.w;
                 if (sample0.z >= sample1.z - deta_height && sample2.z >= sample1.z + deta_height) {
-                    best_inv_cone_ratio = max(best_inv_cone_ratio, inv_cone_ratio);
+                    best_inv_cone_ratio.x = max(best_inv_cone_ratio.x, inv_cone_ratio);
                 }
 
                 best_inv_cone_ratio.y = max(best_inv_cone_ratio.y, inv_cone_ratio);
@@ -110,6 +112,11 @@ void main()
         atan(best_inv_cone_ratio.x) * inv_half_pi,
         atan(best_inv_cone_ratio.y) * inv_half_pi,
         c_depth, 1.0f);
+
+    if (params.start_angle_idx > 0) {
+        vec2 current_conemap_info = imageLoad(dst_img, pixel_coords).xy;
+        conemap_info.xy = max(conemap_info.xy, current_conemap_info);
+    }
 
 	// output to a specific pixel in the image.
 	imageStore(dst_img, pixel_coords, conemap_info);

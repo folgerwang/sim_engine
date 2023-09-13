@@ -16,8 +16,8 @@ layout(set = 0, binding = DST_TEX_INDEX_4, rgba32f) uniform image2D dst_img_4;
 layout(set = 0, binding = DST_TEX_INDEX_5, rgba32f) uniform image2D dst_img_5;
 layout(set = 0, binding = DST_TEX_INDEX_6, r32f) uniform image2D dst_img_6;
 
-const int NUM_Y_SAMPLES = 100;
-const int NUM_X_SAMPLES = 200;
+const int NUM_Y_SAMPLES = 200;
+const int NUM_X_SAMPLES = 400;
 shared float s_pre_calculate_coeffs[NUM_Y_SAMPLES][15];
 
 float sampleRayMaxTangent(vec2 sample_uv, float cur_depth, float phi) {
@@ -30,7 +30,14 @@ float sampleRayMaxTangent(vec2 sample_uv, float cur_depth, float phi) {
     for (uint i = 0; i < sample_count; i++) {
         vec2 sample_pos = sample_uv + sample_ray * t;
         float sample_depth = texture(src_img, sample_pos)[params.depth_channel];
-        max_tan_angle = max((cur_depth - sample_depth) * params.shadow_intensity / t, max_tan_angle);
+        float delta_depth = cur_depth - sample_depth;
+        if (params.is_height_map == 1) {
+			delta_depth *= -1.0f;
+		};
+
+        delta_depth -= params.shadow_noise_thread; // get rid of shadow noise due to heightmap noise.
+
+        max_tan_angle = max(delta_depth * params.shadow_intensity / t, max_tan_angle);
         t += step_t;
     }
 

@@ -219,6 +219,9 @@
 #define kPayLoadHitValueIdx                     0
 #define kPayLoadShadowedIdx                     1
 
+#define kTotalConemapAngleSamples               1024
+#define kConemapAngleBatchSize                  256
+
 #define GLFW_KEY_W                  87
 #define GLFW_KEY_S                  83
 #define GLFW_KEY_A                  65
@@ -452,7 +455,9 @@ struct CloudParams {
 struct ConemapParams {
     uvec2           size;
     vec2            inv_size;
+    uint            is_height_map;
     uint            depth_channel;
+    uint            start_angle_idx;
 };
 
 struct PrtParams {
@@ -464,7 +469,9 @@ struct PrtGenParams {
     uvec2           size;
     vec2            inv_size;
     float           shadow_intensity;
+    float           shadow_noise_thread;
     uint            depth_channel;
+    uint            is_height_map;
 };
 
 struct GameObjectsUpdateParams {

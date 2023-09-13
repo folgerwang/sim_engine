@@ -176,5 +176,5 @@ void main() {
     sum_visi += coeffs_6 * params.coeffs[24];
 
     vec4 base_color = vec4(texture(prt_base_tex, vec2(intersect_pos)).xyz, 1);
-    outColor = vec4(base_color.xyz * vec3(sum_visi) * sqrt(4.0f * PI), 1.0f);
+    outColor = vec4(base_color.xyz * vec3(sum_visi) * sqrt(4.0f * PI) * 2.0f, 1.0f);
 }

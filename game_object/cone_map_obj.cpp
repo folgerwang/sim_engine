@@ -118,12 +118,16 @@ ConeMapObj::ConeMapObj(
     const renderer::TextureInfo& prt_bump_tex,
     const std::shared_ptr<scene_rendering::Prt>& prt_gen,
     uint32_t depth_channel,
+    bool is_height_map,
     float depth_scale,
-    float shadow_intensity) {
+    float shadow_intensity,
+    float shadow_noise_thread) {
 
     depth_channel_ = depth_channel;
+    is_height_map_ = is_height_map;
     depth_scale_ = depth_scale;
     shadow_intensity_ = shadow_intensity;
+    shadow_noise_thread_ = shadow_noise_thread;
 
     const glm::uvec2& buffer_size = glm::uvec2(prt_bump_tex.size);
 
