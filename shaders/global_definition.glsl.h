@@ -4,7 +4,7 @@
 #ifdef  HAS_TANGENT 
 #define HAS_NORMALS                 1
 #endif
-//#define USE_PUNCTUAL                1
+#define USE_PUNCTUAL                1
 
 #define PI                          3.1415926535897f
 

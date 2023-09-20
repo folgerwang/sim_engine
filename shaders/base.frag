@@ -74,6 +74,7 @@ void main() {
             in_material.lights[i],
             normal_info,
             v);
+    }
 #endif // !USE_PUNCTUAL
 
     layerBlending(

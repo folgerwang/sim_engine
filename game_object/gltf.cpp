@@ -188,11 +188,13 @@ static void setupMeshState(
             ubo.material_features |= (src_material.normalTexture.index >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
-            ubo.lights[0].type = glsl::LightType_Directional;
-            ubo.lights[0].color = glm::vec3(1, 0, 0);
-            ubo.lights[0].direction = glm::vec3(0, 0, -1);
-            ubo.lights[0].intensity = 1.0f;
-            ubo.lights[0].position = glm::vec3(0, 0, 0);
+            for (int l = 0; l < LIGHT_COUNT; l++) {
+                ubo.lights[l].type = glsl::LightType_Directional;
+                ubo.lights[l].color = glm::vec3(1, 0, 0);
+                ubo.lights[l].direction = glm::vec3(0, 0, -1);
+                ubo.lights[l].intensity = 1.0f;
+                ubo.lights[l].position = glm::vec3(0, 0, 0);
+            }
 
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
         }
