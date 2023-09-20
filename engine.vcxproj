@@ -89,8 +89,8 @@
     <ClInclude Include="shaders\global_definition.glsl.h" />
     <ClInclude Include="shaders\ibl.glsl.h" />
     <ClInclude Include="shaders\inoise.glsl.h" />
-    <ClInclude Include="shaders\lighting_common.glsl.h" />
     <ClInclude Include="shaders\noise.glsl.h" />
+    <ClInclude Include="shaders\pbr_lighting.glsl.h" />
     <ClInclude Include="shaders\prt_core.glsl.h" />
     <ClInclude Include="shaders\punctual.glsl.h" />
     <ClInclude Include="shaders\sky_scattering_lut_common.glsl.h" />

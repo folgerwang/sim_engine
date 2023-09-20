@@ -340,9 +340,9 @@ void PrtTest::draw(
     glsl::PrtLightParams params{};
     params.model_mat =
         glm::mat4(
-            glm::vec4(float(buffer_size.x) / float(buffer_size.y), 0, 0, 0),
+            glm::vec4(float(buffer_size.x) / float(buffer_size.y) * 1.0f, 0, 0, 0),
             glm::vec4(0, 1, 0, 0),
-            glm::vec4(0, 0, 1, 0),
+            glm::vec4(0, 0, 1.0f, 0),
             glm::vec4(0, 0, 0, 1));
 
     float y_value[25];

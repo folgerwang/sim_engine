@@ -34,48 +34,6 @@ layout(set = TILE_PARAMS_SET, binding = SRC_TEMP_TEX_INDEX) uniform sampler3D sr
 layout(set = TILE_PARAMS_SET, binding = DETAIL_NOISE_TEXTURE_INDEX) uniform sampler3D src_detail_noise_tex;
 layout(set = TILE_PARAMS_SET, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampler3D src_rough_noise_tex;
 
-struct MaterialInfo
-{
-    float perceptualRoughness;      // roughness value, as authored by the model creator (input to shader)
-    vec3 f0;                        // full reflectance color (n incidence angle)
-
-    float alphaRoughness;           // roughness mapped to a more linear change in the roughness (proposed by [2])
-    vec3 albedoColor;
-
-    vec3 f90;                       // reflectance color at grazing angle
-    float metallic;
-
-    vec3 n;
-    vec3 baseColor; // getBaseColor()
-
-    float sheenIntensity;
-    vec3 sheenColor;
-    float sheenRoughness;
-
-    float anisotropy;
-
-    vec3 clearcoatF0;
-    vec3 clearcoatF90;
-    float clearcoatFactor;
-    vec3 clearcoatNormal;
-    float clearcoatRoughness;
-
-    float subsurfaceScale;
-    float subsurfaceDistortion;
-    float subsurfacePower;
-    vec3 subsurfaceColor;
-    float subsurfaceThickness;
-
-    float thinFilmFactor;
-    float thinFilmThickness;
-
-    float thickness;
-
-    vec3 absorption;
-
-    float transmission;
-};
-
 void main() {
     vec3 pos = in_data.vertex_position;
     vec3 tnor = terrainNormal(vec2(pos.x, pos.z), 0.0625f, 100.0f);

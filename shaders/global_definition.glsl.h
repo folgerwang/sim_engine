@@ -6,7 +6,7 @@
 #endif
 //#define USE_PUNCTUAL                1
 
-#define PI                  3.1415926535897f
+#define PI                          3.1415926535897f
 
 //#define MATERIAL_UNLIT
 
@@ -494,6 +494,50 @@ struct NoiseInitParams {
     float           inv_vol_size;
 };
 
+struct MaterialInfo
+{
+    float perceptualRoughness;      // roughness value, as authored by the model creator (input to shader)
+    vec3 f0;                        // full reflectance color (n incidence angle)
+
+    float alphaRoughness;           // roughness mapped to a more linear change in the roughness (proposed by [2])
+    vec3 albedoColor;
+
+    vec3 f90;                       // reflectance color at grazing angle
+    float metallic;
+
+    float ior;
+    vec3 n;
+    float reflectance;
+    vec3 baseColor;                 // getBaseColor()
+
+    float sheenIntensity;
+    vec3 sheenColor;
+    float sheenRoughness;
+
+    float anisotropy;
+
+    vec3 clearcoatF0;
+    vec3 clearcoatF90;
+    float clearcoatFactor;
+    vec3 clearcoatNormal;
+    float clearcoatRoughness;
+
+    float subsurfaceScale;
+    float subsurfaceDistortion;
+    float subsurfacePower;
+    vec3 subsurfaceColor;
+    float subsurfaceThickness;
+
+    float thinFilmFactor;
+    float thinFilmThickness;
+
+    float thickness;
+
+    vec3 absorption;
+
+    float transmission;
+};
+
 struct PbrMaterialParams {
     vec4            base_color_factor;
 
@@ -546,6 +590,34 @@ struct PbrMaterialParams {
     mat3            base_color_uv_transform;
     mat3            normal_uv_transform;
     mat3            metallic_roughness_uv_transform;
+};
+
+struct PbrVsPsData {
+    vec3 vertex_position;
+    vec4 vertex_tex_coord;
+#ifdef HAS_NORMALS
+    vec3 vertex_normal;
+#ifdef HAS_TANGENT
+    vec3 vertex_tangent;
+    vec3 vertex_binormal;
+#endif
+#endif
+#ifdef HAS_VERTEX_COLOR_VEC3
+    vec3 vertex_color;
+#endif
+#ifdef HAS_VERTEX_COLOR_VEC4
+    vec4 vertex_color;
+#endif
+};
+
+struct PbrLightsColorInfo {
+    vec3 f_specular;
+    vec3 f_diffuse;
+    vec3 f_emissive;
+    vec3 f_clearcoat;
+    vec3 f_sheen;
+    vec3 f_subsurface;
+    vec3 f_transmission;
 };
 
 struct InstanceDataInfo {

@@ -32,48 +32,6 @@ layout(set = TILE_PARAMS_SET, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D s
 layout(set = TILE_PARAMS_SET, binding = WATER_NORMAL_BUFFER_INDEX) uniform sampler2D water_normal_tex;
 layout(set = TILE_PARAMS_SET, binding = WATER_FLOW_BUFFER_INDEX) uniform sampler2D water_flow_tex;
 
-struct MaterialInfo
-{
-    float perceptualRoughness;      // roughness value, as authored by the model creator (input to shader)
-    vec3 f0;                        // full reflectance color (n incidence angle)
-
-    float alphaRoughness;           // roughness mapped to a more linear change in the roughness (proposed by [2])
-    vec3 albedoColor;
-
-    vec3 f90;                       // reflectance color at grazing angle
-    float metallic;
-
-    vec3 n;
-    vec3 baseColor; // getBaseColor()
-
-    float sheenIntensity;
-    vec3 sheenColor;
-    float sheenRoughness;
-
-    float anisotropy;
-
-    vec3 clearcoatF0;
-    vec3 clearcoatF90;
-    float clearcoatFactor;
-    vec3 clearcoatNormal;
-    float clearcoatRoughness;
-
-    float subsurfaceScale;
-    float subsurfaceDistortion;
-    float subsurfacePower;
-    vec3 subsurfaceColor;
-    float subsurfaceThickness;
-
-    float thinFilmFactor;
-    float thinFilmThickness;
-
-    float thickness;
-
-    vec3 absorption;
-
-    float transmission;
-};
-
 // Standard noise warping. Call the noise function, then feed a variation of the result
 // into itself. Rinse and repeat, etc. Completely made up on the spot, but keeping your 
 // original concept in mind, which involved combining noise layers travelling in opposing

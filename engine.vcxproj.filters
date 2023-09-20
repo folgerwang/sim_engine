@@ -263,9 +263,6 @@
     <ClInclude Include="shaders\inoise.glsl.h">
       <Filter>Resource Files</Filter>
     </ClInclude>
-    <ClInclude Include="shaders\lighting_common.glsl.h">
-      <Filter>Resource Files</Filter>
-    </ClInclude>
     <ClInclude Include="shaders\noise.glsl.h">
       <Filter>Resource Files</Filter>
     </ClInclude>
@@ -304,6 +301,9 @@
     </ClInclude>
     <ClInclude Include="game_object\cone_map_obj.h">
       <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\pbr_lighting.glsl.h">
+      <Filter>Resource Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

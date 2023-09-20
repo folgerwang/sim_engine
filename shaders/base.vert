@@ -56,23 +56,7 @@ layout(location = IINPUT_MAT_ROT_1) in vec3 in_loc_rot_mat_1;
 layout(location = IINPUT_MAT_ROT_2) in vec3 in_loc_rot_mat_2;
 layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
 
-layout(location = 0) out VsPsData {
-    vec3 vertex_position;
-    vec4 vertex_tex_coord;
-#ifdef HAS_NORMALS
-    vec3 vertex_normal;
-#ifdef HAS_TANGENT
-    vec3 vertex_tangent;
-    vec3 vertex_binormal;
-#endif
-#endif
-#ifdef HAS_VERTEX_COLOR_VEC3
-    vec3 vertex_color;
-#endif
-#ifdef HAS_VERTEX_COLOR_VEC4
-    vec4 vertex_color;
-#endif
-} out_data;
+layout(location = 0) out PbrVsPsData out_data;
 
 #ifdef HAS_NORMALS
 vec3 getNormal()
