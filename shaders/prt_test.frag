@@ -21,9 +21,10 @@ layout(location = 0) in VsPsData {
     vec3 vertex_tangent;
 } in_data;
 
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BASE_TEX_INDEX) uniform sampler2D prt_base_tex;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_BUMP_TEX_INDEX) uniform sampler2D prt_bump_tex;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_CONEMAP_TEX_INDEX) uniform sampler2D prt_conemap_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = BASE_COLOR_TEX_INDEX) uniform sampler2D base_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = NORMAL_TEX_INDEX) uniform sampler2D normal_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = METAL_ROUGHNESS_TEX_INDEX) uniform sampler2D orh_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = CONEMAP_TEX_INDEX) uniform sampler2D conemap_tex;
 /*
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_0) uniform sampler2D prt_tex_0;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_1) uniform sampler2D prt_tex_1;
@@ -75,7 +76,7 @@ vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
 
     float dist = length(vec2(v));
 
-    vec4 relief_map_info = texture(prt_conemap_tex, vec2(p0));
+    vec4 relief_map_info = texture(conemap_tex, vec2(p0));
     float height = clamp(relief_map_info.z - p0.z, 0.0f, 1.0f);
 
     const float half_pi = PI / 2.0f;
@@ -87,7 +88,7 @@ vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
     for (int i = 0; i < s_cone_steps; i++)
     {
         p = p0 + v * cast_z;
-        vec4 relief_map_info = texture(prt_conemap_tex, vec2(p));
+        vec4 relief_map_info = texture(conemap_tex, vec2(p));
 
         //The use of the saturate() function when calculating the distance to move guarantees that we stop on the first visited texel for which the viewing ray is under the relief surface.
         float height = clamp(relief_map_info.z - p.z, 0.0f, 1.0f);
@@ -102,7 +103,7 @@ vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
     for (int i = 0; i < s_binary_steps; i++)
     {
         p = p0 + v * current_z;
-        vec4 relief_map_info = texture(prt_conemap_tex, vec2(p));
+        vec4 relief_map_info = texture(conemap_tex, vec2(p));
         step_z *= 0.5f;
         if (p.z < relief_map_info.z)
             current_z += step_z;
@@ -175,6 +176,6 @@ void main() {
     sum_visi += dot(coeffs[5], vec4(params.coeffs[20], params.coeffs[21], params.coeffs[22], params.coeffs[23]));
     sum_visi += coeffs_6 * params.coeffs[24];
 
-    vec4 base_color = vec4(texture(prt_base_tex, vec2(intersect_pos)).xyz, 1);
+    vec4 base_color = vec4(texture(base_tex, vec2(intersect_pos)).xyz, 1);
     outColor = vec4(base_color.xyz * vec3(sum_visi) * sqrt(4.0f * PI) * 2.0f, 1.0f);
 }

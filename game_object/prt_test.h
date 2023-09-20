@@ -21,7 +21,8 @@ public:
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& prt_base_tex,
-        const renderer::TextureInfo& prt_bump_tex,
+        const renderer::TextureInfo& prt_normal_tex,
+        const renderer::TextureInfo& prt_orh_tex,
         const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj,
         const glm::uvec2& display_size,
         std::shared_ptr<Plane> unit_plane);

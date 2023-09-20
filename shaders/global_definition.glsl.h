@@ -53,25 +53,23 @@
 #define PBR_CONSTANT_INDEX          7
 #define BASE_COLOR_TEX_INDEX        8
 #define NORMAL_TEX_INDEX            (BASE_COLOR_TEX_INDEX + 1)
-#define METAL_ROUGHNESS_TEX_INDEX   (BASE_COLOR_TEX_INDEX + 2)
-#define EMISSIVE_TEX_INDEX          (BASE_COLOR_TEX_INDEX + 3)
-#define OCCLUSION_TEX_INDEX         (BASE_COLOR_TEX_INDEX + 4)
+#define METAL_ROUGHNESS_TEX_INDEX   (NORMAL_TEX_INDEX + 1)
+#define EMISSIVE_TEX_INDEX          (METAL_ROUGHNESS_TEX_INDEX + 1)
+#define OCCLUSION_TEX_INDEX         (EMISSIVE_TEX_INDEX + 1)
 #define DIFFUSE_TEX_INDEX           BASE_COLOR_TEX_INDEX
 #define SPECULAR_TEX_INDEX          EMISSIVE_TEX_INDEX
 #define GLOSSNESS_TEX_INDEX         METAL_ROUGHNESS_TEX_INDEX
 
-#define PRT_BASE_TEX_INDEX          BASE_COLOR_TEX_INDEX
-#define PRT_BUMP_TEX_INDEX          (PRT_BASE_TEX_INDEX + 1)
-#define PRT_CONEMAP_TEX_INDEX       (PRT_BASE_TEX_INDEX + 2)
-#define PRT_TEX_INDEX_0             (PRT_BASE_TEX_INDEX + 3)
-#define PRT_TEX_INDEX_1             (PRT_BASE_TEX_INDEX + 4)
-#define PRT_TEX_INDEX_2             (PRT_BASE_TEX_INDEX + 5)
-#define PRT_TEX_INDEX_3             (PRT_BASE_TEX_INDEX + 6)
-#define PRT_TEX_INDEX_4             (PRT_BASE_TEX_INDEX + 7)
-#define PRT_TEX_INDEX_5             (PRT_BASE_TEX_INDEX + 8)
-#define PRT_TEX_INDEX_6             (PRT_BASE_TEX_INDEX + 9)
-#define PRT_TEX_INDEX               PRT_TEX_INDEX_0
-#define PRT_BUFFER_INDEX            PRT_TEX_INDEX_1
+#define CONEMAP_TEX_INDEX           (OCCLUSION_TEX_INDEX + 1)
+#define PRT_TEX_INDEX               (CONEMAP_TEX_INDEX + 1)
+#define PRT_BUFFER_INDEX            (PRT_TEX_INDEX + 1)
+/*#define PRT_TEX_INDEX_0             (CONEMAP_TEX_INDEX + 1)
+#define PRT_TEX_INDEX_1             (PRT_TEX_INDEX_0 + 1)
+#define PRT_TEX_INDEX_2             (PRT_TEX_INDEX_1 + 1)
+#define PRT_TEX_INDEX_3             (PRT_TEX_INDEX_2 + 1)
+#define PRT_TEX_INDEX_4             (PRT_TEX_INDEX_3 + 1)
+#define PRT_TEX_INDEX_5             (PRT_TEX_INDEX_4 + 1)
+#define PRT_TEX_INDEX_6             (PRT_TEX_INDEX_5 + 1)*/
 
 // TILE_TEXTURE_PARAMS_SET
 #define TILE_BASE_PARAMS_INDEX              6

@@ -11,7 +11,7 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 
 #ifndef NO_MTL
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform MaterialUniformBufferObject {
-    PbrMaterialParams in_material;
+    PbrMaterialParams material;
 };
 #endif
 
@@ -25,7 +25,7 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
 #ifndef NO_MTL
-    vec4 baseColor = getBaseColor(ps_in_data, in_material);
+    vec4 baseColor = getBaseColor(ps_in_data, material);
 #else
     vec4 baseColor = vec4(0);
 #endif
@@ -41,12 +41,12 @@ void main() {
     return;
 #endif // MATERIAL_UNLIT
     vec3 v = normalize(camera_info.position.xyz - ps_in_data.vertex_position);
-    NormalInfo normal_info = getNormalInfo(ps_in_data, in_material, v);
+    NormalInfo normal_info = getNormalInfo(ps_in_data, material, v);
 
     MaterialInfo material_info =
         setupMaterialInfo(
             ps_in_data,
-            in_material,
+            material,
             normal_info,
             v,
             baseColor.xyz);
@@ -58,7 +58,7 @@ void main() {
 #ifdef USE_IBL
     iblLighting(
         color_info,
-        in_material,
+        material,
         material_info,
         normal_info, v);
 #endif // USE_IBL
@@ -69,9 +69,9 @@ void main() {
         punctualLighting(
             color_info,
             ps_in_data,
-            in_material,
+            material,
             material_info,
-            in_material.lights[i],
+            material.lights[i],
             normal_info,
             v);
     }
@@ -80,7 +80,7 @@ void main() {
     layerBlending(
         color_info,
         ps_in_data,
-        in_material,
+        material,
         material_info,
         normal_info,
         v);
@@ -89,13 +89,13 @@ void main() {
         getFinalColor(
             color_info,
             ps_in_data,
-            in_material,
+            material,
             material_info,
             v);
 
 #ifdef ALPHAMODE_MASK
     // Late discard to avaoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if(baseColor.a < in_material.alpha_cutoff)
+    if(baseColor.a < material.alpha_cutoff)
     {
         discard;
     }
@@ -103,7 +103,7 @@ void main() {
 #endif // ALPHAMODE_MASK
 
     // regular shading
-    outColor = vec4(toneMap(in_material, color), baseColor.a);
+    outColor = vec4(toneMap(material, color), baseColor.a);
 #else
     outColor = baseColor;
 #endif // NO_MTL

@@ -141,11 +141,12 @@ static void fillYVauleTablle(float y_value[25], float theta, float phi) {
 static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(10);
+    bindings.reserve(6);
 
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BASE_TEX_INDEX));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_BUMP_TEX_INDEX));
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_CONEMAP_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(BASE_COLOR_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(NORMAL_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(METAL_ROUGHNESS_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(CONEMAP_TEX_INDEX));
 /*    for (int i = 0; i < 7; ++i)
         bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0 + i));*/
     bindings.push_back(
@@ -162,20 +163,21 @@ static renderer::WriteDescriptorList addPrtTextures(
     const std::shared_ptr<renderer::DescriptorSet>& desc_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& base_tex,
-    const renderer::TextureInfo& bump_tex,
+    const renderer::TextureInfo& normal_tex,
+    const renderer::TextureInfo& orh_tex,
     const std::shared_ptr<renderer::TextureInfo>& conemap_tex,
     const std::shared_ptr<renderer::TextureInfo>& prt_packed_texture,
     const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer) {
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(10);
+    descriptor_writes.reserve(6);
 
     // diffuse.
     renderer::Helper::addOneTexture(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_BASE_TEX_INDEX,
+        BASE_COLOR_TEX_INDEX,
         texture_sampler,
         base_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -185,9 +187,19 @@ static renderer::WriteDescriptorList addPrtTextures(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_BUMP_TEX_INDEX,
+        NORMAL_TEX_INDEX,
         texture_sampler,
-        bump_tex.view,
+        normal_tex.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // orh.
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        METAL_ROUGHNESS_TEX_INDEX,
+        texture_sampler,
+        orh_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // conemap.
@@ -195,7 +207,7 @@ static renderer::WriteDescriptorList addPrtTextures(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        PRT_CONEMAP_TEX_INDEX,
+        CONEMAP_TEX_INDEX,
         texture_sampler,
         conemap_tex->view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -262,12 +274,14 @@ PrtTest::PrtTest(
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& prt_base_tex,
-    const renderer::TextureInfo& prt_bump_tex,
+    const renderer::TextureInfo& prt_normal_tex,
+    const renderer::TextureInfo& prt_orh_tex,
     const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj,
     const glm::uvec2& display_size,
     std::shared_ptr<Plane> unit_plane) {
 
-    const glm::uvec2& buffer_size = glm::uvec2(prt_bump_tex.size);
+    const glm::uvec2& buffer_size =
+        glm::uvec2(prt_base_tex.size);
 
     prt_desc_set_layout_ = createPrtDescriptorSetLayout(
         device_info.device);
@@ -280,7 +294,8 @@ PrtTest::PrtTest(
         prt_desc_set_,
         texture_sampler,
         prt_base_tex,
-        prt_bump_tex,
+        prt_normal_tex,
+        prt_orh_tex,
         cone_map_obj->getConemapTexture(),
         cone_map_obj->getPackTexture(),
         cone_map_obj->getMinmaxBuffer());
