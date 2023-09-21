@@ -24,7 +24,7 @@ public:
         const renderer::TextureInfo& prt_base_tex,
         const renderer::TextureInfo& prt_normal_tex,
         const renderer::TextureInfo& prt_orh_tex,
-        const std::shared_ptr<game_object::ConemapObj>& cone_map_obj,
+        const std::shared_ptr<game_object::ConemapObj>& conemap_obj,
         const glm::uvec2& display_size,
         std::shared_ptr<Plane> unit_plane);
 
@@ -33,7 +33,7 @@ public:
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
         std::shared_ptr<Plane> unit_plane,
-        const std::shared_ptr<game_object::ConemapObj>& cone_map_obj);
+        const std::shared_ptr<game_object::ConemapObj>& conemap_obj);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };
