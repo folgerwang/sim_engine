@@ -181,7 +181,7 @@ static void setupMeshState(
 
             ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);
             ubo.exposure = 1.0f;
-            ubo.material_features = (src_material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0 ? FEATURE_HAS_METALLIC_ROUGHNESS_MAP : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
+            ubo.material_features = (src_material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
             ubo.material_features |= (src_material.pbrMetallicRoughness.baseColorTexture.index >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0);
             ubo.material_features |= (src_material.emissiveTexture.index >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
             ubo.material_features |= (src_material.occlusionTexture.index >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
@@ -698,7 +698,7 @@ static renderer::WriteDescriptorList addGltfTextures(
         descriptor_writes,
         material.desc_set_,
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        BASE_COLOR_TEX_INDEX,
+        ALBEDO_TEX_INDEX,
         texture_sampler,
         base_color_tex_view.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -900,7 +900,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createMaterialDescriptorSe
     ubo_pbr_layout_binding.immutable_samplers = nullptr; // Optional
     bindings.push_back(ubo_pbr_layout_binding);
 
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(BASE_COLOR_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALBEDO_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(NORMAL_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(METAL_ROUGHNESS_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(EMISSIVE_TEX_INDEX));

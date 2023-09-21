@@ -183,7 +183,7 @@ er::WriteDescriptorList addCloudTextures(
         descriptor_writes,
         description_set,
         er::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        BASE_COLOR_TEX_INDEX,
+        ALBEDO_TEX_INDEX,
         texture_sampler,
         nullptr,
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -324,7 +324,7 @@ VolumeNoise::VolumeNoise(
 #if 0
     {
         std::vector<renderer::DescriptorSetLayoutBinding> bindings(1);
-        bindings[0] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(BASE_COLOR_TEX_INDEX);
+        bindings[0] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALBEDO_TEX_INDEX);
 
         cloud_desc_set_layout_ =
             device->createDescriptorSetLayout(bindings);

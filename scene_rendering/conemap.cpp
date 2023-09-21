@@ -1,12 +1,12 @@
 #include "renderer/renderer_helper.h"
 #include "engine_helper.h"
 #include "shaders/global_definition.glsl.h"
-#include "cone_map.h"
+#include "conemap.h"
 
 namespace {
 namespace er = engine::renderer;
 
-er::WriteDescriptorList addConeMapTextures(
+er::WriteDescriptorList addConemapTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
@@ -38,7 +38,7 @@ er::WriteDescriptorList addConeMapTextures(
 }
 
 std::shared_ptr<er::PipelineLayout>
-createConeMapPipelineLayout(
+createConemapPipelineLayout(
     const std::shared_ptr<er::Device>& device,
     const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
     er::PushConstantRange push_const_range{};
@@ -56,7 +56,7 @@ createConeMapPipelineLayout(
 namespace engine {
 namespace scene_rendering {
 
-ConeMap::ConeMap(
+Conemap::Conemap(
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -82,7 +82,7 @@ ConeMap::ConeMap(
             conemap_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto conemap_texture_descs = addConeMapTextures(
+    auto conemap_texture_descs = addConemapTextures(
         conemap_tex_desc_set_,
         texture_sampler,
         bump_tex.view,
@@ -90,7 +90,7 @@ ConeMap::ConeMap(
     device->updateDescriptorSets(conemap_texture_descs);
 
     conemap_pipeline_layout_ =
-        createConeMapPipelineLayout(
+        createConemapPipelineLayout(
             device,
             conemap_desc_set_layout_);
 
@@ -102,11 +102,11 @@ ConeMap::ConeMap(
 
 }
 
-void ConeMap::update(
+void Conemap::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj) {
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
-    const auto& conemap_tex = cone_map_obj->getConemapTexture();
+    const auto& conemap_tex = conemap_obj->getConemapTexture();
 
     renderer::helper::transitMapTextureToStoreImage(
         cmd_buf,
@@ -124,8 +124,8 @@ void ConeMap::update(
     glsl::ConemapParams params = {};
     params.size = glm::uvec2(conemap_tex->size);
     params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-    params.depth_channel = cone_map_obj->getDepthChannel();
-    params.is_height_map = cone_map_obj->isHeightMap() ? 1 : 0;
+    params.depth_channel = conemap_obj->getDepthChannel();
+    params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
 
     for (int batch_start_idx = 0; batch_start_idx < kTotalConemapAngleSamples; batch_start_idx += kConemapAngleBatchSize) {
         params.start_angle_idx = batch_start_idx;
@@ -147,7 +147,7 @@ void ConeMap::update(
         { conemap_tex->image });
 }
 
-void ConeMap::destroy(
+void Conemap::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(conemap_desc_set_layout_);
     device->destroyPipelineLayout(conemap_pipeline_layout_);

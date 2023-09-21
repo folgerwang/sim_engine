@@ -9,11 +9,11 @@ namespace scene_rendering {
 }
 namespace game_object {
 
-class ConeMapObj {
+class ConemapObj {
     std::shared_ptr<renderer::DescriptorSet>  prt_gen_tex_desc_set_;
     renderer::DescriptorSetList prt_ds_final_tex_desc_sets_;
     std::shared_ptr<renderer::DescriptorSet>  prt_pack_tex_desc_set_;
-    std::shared_ptr<renderer::TextureInfo> cone_map_tex_;
+    std::shared_ptr<renderer::TextureInfo> conemap_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_pack_tex_;
     std::shared_ptr<renderer::BufferInfo> prt_minmax_buffer_;
 
@@ -24,7 +24,7 @@ class ConeMapObj {
     float shadow_noise_thread_ = 0.0f;
 
 public:
-    ConeMapObj(
+    ConemapObj(
         const renderer::DeviceInfo& device_info,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -71,7 +71,7 @@ public:
     }
 
     inline const std::shared_ptr<renderer::TextureInfo> getConemapTexture() {
-        return cone_map_tex_;
+        return conemap_tex_;
     }
 
     inline const std::shared_ptr<renderer::TextureInfo> getPackTexture() {

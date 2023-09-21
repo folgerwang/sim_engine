@@ -361,13 +361,13 @@ Prt::Prt(
 
 void Prt::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj) {
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
     if (prt_texes_.empty()) {
         return;
     }
 
-    auto src_size = glm::uvec2(cone_map_obj->getPackTexture()->size);
+    auto src_size = glm::uvec2(conemap_obj->getPackTexture()->size);
 
     // create prt textures.
     {
@@ -385,10 +385,10 @@ void Prt::update(
         glsl::PrtGenParams params = {};
         params.size = src_size;
         params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-        params.shadow_intensity = cone_map_obj->getShadowIntensity();
-        params.depth_channel = cone_map_obj->getDepthChannel();
-        params.is_height_map = cone_map_obj->isHeightMap() ? 1 : 0;
-        params.shadow_noise_thread = cone_map_obj->getShadowNoiseThread();
+        params.shadow_intensity = conemap_obj->getShadowIntensity();
+        params.depth_channel = conemap_obj->getDepthChannel();
+        params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
+        params.shadow_noise_thread = conemap_obj->getShadowNoiseThread();
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -399,7 +399,7 @@ void Prt::update(
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
             prt_gen_pipeline_layout_,
-            { cone_map_obj->getPrtGenTexDescSet() });
+            { conemap_obj->getPrtGenTexDescSet() });
 
         cmd_buf->dispatch(
             (src_size.x + 7) / 8,
@@ -455,14 +455,14 @@ void Prt::update(
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
             prt_ds_final_pipeline_layout_,
-            { cone_map_obj->getPrtDsFinalTexDescSet(double_buffer_idx)});
+            { conemap_obj->getPrtDsFinalTexDescSet(double_buffer_idx)});
 
         cmd_buf->dispatch(1, 1, 1);
 
         er::BarrierList barrier_list;
         er::helper::addBuffersToBarrierList(
             barrier_list,
-            { cone_map_obj->getMinmaxBuffer()->buffer },
+            { conemap_obj->getMinmaxBuffer()->buffer },
             SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
             SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
@@ -472,9 +472,9 @@ void Prt::update(
             SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
     }
 
-    src_size = glm::uvec2(cone_map_obj->getPackTexture()->size);
+    src_size = glm::uvec2(conemap_obj->getPackTexture()->size);
     {
-        renderer::helper::transitMapTextureToStoreImage(cmd_buf, { cone_map_obj->getPackTexture()->image });
+        renderer::helper::transitMapTextureToStoreImage(cmd_buf, { conemap_obj->getPackTexture()->image });
 
         cmd_buf->bindPipeline(
             renderer::PipelineBindPoint::COMPUTE,
@@ -483,14 +483,14 @@ void Prt::update(
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
             prt_pack_pipeline_layout_,
-            { cone_map_obj->getPrtPackTexDescSet()});
+            { conemap_obj->getPrtPackTexDescSet()});
 
         cmd_buf->dispatch(
             (src_size.x + 7) / 8,
             (src_size.y + 7) / 8,
             1);
 
-        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, { cone_map_obj->getPackTexture()->image});
+        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, { conemap_obj->getPackTexture()->image});
     }
 }
 

@@ -2,11 +2,11 @@
 #include "renderer/renderer.h"
 #include "shaders/global_definition.glsl.h"
 
-#include "game_object/cone_map_obj.h"
+#include "game_object/conemap_obj.h"
 
 namespace engine {
     namespace game_object {
-        class ConeMapObj;
+        class ConemapObj;
     }
     namespace scene_rendering {
 
@@ -40,7 +40,7 @@ namespace engine {
 
             void update(
                 const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-                const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj);
+                const std::shared_ptr<game_object::ConemapObj>& conemap_obj);
 
             inline const std::array<std::shared_ptr<renderer::TextureInfo>, 7>& getPrtTextures() {
                 return prt_texes_;

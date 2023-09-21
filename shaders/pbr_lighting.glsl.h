@@ -1,5 +1,5 @@
 #ifndef NO_MTL
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = BASE_COLOR_TEX_INDEX) uniform sampler2D basic_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D albedo_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = NORMAL_TEX_INDEX) uniform sampler2D normal_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = METAL_ROUGHNESS_TEX_INDEX) uniform sampler2D metallic_roughness_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = EMISSIVE_TEX_INDEX) uniform sampler2D emissive_tex;
@@ -199,7 +199,7 @@ vec4 getBaseColor(
     if (enable_metallic_roughness) {
         baseColor = in_mat.base_color_factor;
         if (has_base_color_map) {
-            baseColor *= sRGBToLinear(texture(basic_tex, getBaseColorUV(in_data, in_mat)));
+            baseColor *= sRGBToLinear(texture(albedo_tex, getBaseColorUV(in_data, in_mat)));
         }
     }
 #endif
@@ -251,12 +251,18 @@ void getMetallicRoughnessInfo(
     info.perceptualRoughness = in_mat.roughness_factor;
 
     bool has_metallic_roughness_map = (in_mat.material_features & FEATURE_HAS_METALLIC_ROUGHNESS_MAP) != 0;
+    bool has_metallic_channel = (in_mat.material_features & FEATURE_HAS_METALLIC_CHANNEL) != 0;
     if (has_metallic_roughness_map) {
         // Roughness is stored in the 'g' channel, metallic is stored in the 'b' channel.
         // This layout intentionally reserves the 'r' channel for (optional) occlusion map data
         vec4 mrSample = texture(metallic_roughness_tex, getMetallicRoughnessUV(in_data, in_mat));
         info.perceptualRoughness *= mrSample.g;
-        info.metallic *= mrSample.b;
+        if (has_metallic_channel) {
+            info.metallic *= mrSample.b;
+        }
+        else {
+            info.metallic *= (1.0f - mrSample.g);
+        }
     }
 
 #ifdef MATERIAL_METALLICROUGHNESS_SPECULAROVERRIDE
@@ -668,7 +674,8 @@ void punctualLighting(
     in MaterialInfo in_material_info,
     in Light light,
     in NormalInfo normal_info,
-    in vec3 view_dir) {
+    in vec3 view_dir,
+    in float light_intensity) {
     vec3 pointToLight = -light.direction;
     float rangeAttenuation = 1.0;
     float spotAttenuation = 1.0;
@@ -688,7 +695,12 @@ void punctualLighting(
         spotAttenuation = getSpotAttenuation(pointToLight, light.direction, light.outerConeCos, light.innerConeCos);
     }
 
-    vec3 intensity = rangeAttenuation * spotAttenuation * light.intensity * light.color;
+    vec3 intensity =
+        rangeAttenuation *
+        spotAttenuation *
+        light.intensity *
+        light_intensity *
+        light.color;
 
     vec3 n = normal_info.n;
     vec3 t = normal_info.t;
@@ -892,14 +904,14 @@ vec3 getFinalColor(
          (1.0 - in_material_info.reflectance) * in_color_info.f_sheen) * (1.0 - clearcoatFactor * clearcoatFresnel) +
         in_color_info.f_clearcoat * clearcoatFactor;
 
-    float ao = 1.0;
+/*    float ao = 1.0;
     // Apply optional PBR terms for additional (optional) shading
     if (has_occlusion_map) {
 #ifndef NO_MTL
         ao = texture(occlusion_tex, getOcclusionUV(in_data, in_material)).r;
         color = mix(color, color * ao, in_material.occlusion_strength);
 #endif
-    }
+    }*/
 
     return color;
 }

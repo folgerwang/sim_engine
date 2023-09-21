@@ -1,4 +1,4 @@
-#include "cone_map_obj.h"
+#include "conemap_obj.h"
 #include "engine_helper.h"
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -111,7 +111,7 @@ namespace {
 
 namespace game_object {
 
-ConeMapObj::ConeMapObj(
+ConemapObj::ConemapObj(
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -131,14 +131,14 @@ ConeMapObj::ConeMapObj(
 
     const glm::uvec2& buffer_size = glm::uvec2(prt_bump_tex.size);
 
-    cone_map_tex_ = std::make_shared<renderer::TextureInfo>();
+    conemap_tex_ = std::make_shared<renderer::TextureInfo>();
     prt_pack_tex_ = std::make_shared<renderer::TextureInfo>();
 
     renderer::Helper::create2DTextureImage(
         device_info,
         renderer::Format::R8G8B8A8_UNORM,
         buffer_size,
-        *cone_map_tex_,
+        *conemap_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -204,10 +204,10 @@ ConeMapObj::ConeMapObj(
     device_info.device->updateDescriptorSets(prt_pack_texture_descs);
 }
 
-void ConeMapObj::destroy(
+void ConemapObj::destroy(
     const std::shared_ptr<renderer::Device>& device) {
-    if (cone_map_tex_) {
-        cone_map_tex_->destroy(device);
+    if (conemap_tex_) {
+        conemap_tex_->destroy(device);
     }
 
     if (prt_pack_tex_) {

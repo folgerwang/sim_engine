@@ -1,4 +1,4 @@
-#include "prt_test.h"
+#include "conemap_test.h"
 #include "engine_helper.h"
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -141,9 +141,9 @@ static void fillYVauleTablle(float y_value[25], float theta, float phi) {
 static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(6);
+    bindings.reserve(7);
 
-    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(BASE_COLOR_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALBEDO_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(NORMAL_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(METAL_ROUGHNESS_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(CONEMAP_TEX_INDEX));
@@ -156,6 +156,14 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayo
             renderer::DescriptorType::STORAGE_IMAGE));
     bindings.push_back(renderer::helper::getBufferDescriptionSetLayoutBinding(PRT_BUFFER_INDEX));
 
+    renderer::DescriptorSetLayoutBinding ubo_pbr_layout_binding{};
+    ubo_pbr_layout_binding.binding = PBR_CONSTANT_INDEX;
+    ubo_pbr_layout_binding.descriptor_count = 1;
+    ubo_pbr_layout_binding.descriptor_type = renderer::DescriptorType::UNIFORM_BUFFER;
+    ubo_pbr_layout_binding.stage_flags = SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+    ubo_pbr_layout_binding.immutable_samplers = nullptr; // Optional
+    bindings.push_back(ubo_pbr_layout_binding);
+
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -167,7 +175,8 @@ static renderer::WriteDescriptorList addPrtTextures(
     const renderer::TextureInfo& orh_tex,
     const std::shared_ptr<renderer::TextureInfo>& conemap_tex,
     const std::shared_ptr<renderer::TextureInfo>& prt_packed_texture,
-    const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer) {
+    const std::shared_ptr<renderer::BufferInfo>& prt_minmax_buffer,
+    const std::shared_ptr<renderer::BufferInfo>& uniform_buffer) {
 
     renderer::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(6);
@@ -177,7 +186,7 @@ static renderer::WriteDescriptorList addPrtTextures(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        BASE_COLOR_TEX_INDEX,
+        ALBEDO_TEX_INDEX,
         texture_sampler,
         base_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -241,6 +250,14 @@ static renderer::WriteDescriptorList addPrtTextures(
         prt_minmax_buffer->buffer,
         prt_minmax_buffer->buffer->getSize());
 
+    renderer::Helper::addOneBuffer(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::UNIFORM_BUFFER,
+        PBR_CONSTANT_INDEX,
+        uniform_buffer->buffer,
+        uniform_buffer->buffer->getSize());
+
     return descriptor_writes;
 }
 
@@ -266,7 +283,7 @@ static std::shared_ptr<renderer::PipelineLayout> createPipelineLayout(
 
 namespace game_object {
 
-PrtTest::PrtTest(
+ConemapTest::ConemapTest(
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
@@ -276,7 +293,7 @@ PrtTest::PrtTest(
     const renderer::TextureInfo& prt_base_tex,
     const renderer::TextureInfo& prt_normal_tex,
     const renderer::TextureInfo& prt_orh_tex,
-    const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj,
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj,
     const glm::uvec2& display_size,
     std::shared_ptr<Plane> unit_plane) {
 
@@ -289,6 +306,16 @@ PrtTest::PrtTest(
     prt_desc_set_ = device_info.device->createDescriptorSets(
         descriptor_pool, prt_desc_set_layout_, 1)[0];
 
+    uniform_buffer_ = std::make_shared<renderer::BufferInfo>();
+    device_info.device->createBuffer(
+        sizeof(glsl::PbrMaterialParams),
+        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+        SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
+        0,
+        uniform_buffer_->buffer,
+        uniform_buffer_->memory);
+
     // create a global ibl texture descriptor set.
     auto material_descs = addPrtTextures(
         prt_desc_set_,
@@ -296,9 +323,10 @@ PrtTest::PrtTest(
         prt_base_tex,
         prt_normal_tex,
         prt_orh_tex,
-        cone_map_obj->getConemapTexture(),
-        cone_map_obj->getPackTexture(),
-        cone_map_obj->getMinmaxBuffer());
+        conemap_obj->getConemapTexture(),
+        conemap_obj->getPackTexture(),
+        conemap_obj->getMinmaxBuffer(),
+        uniform_buffer_);
 
     device_info.device->updateDescriptorSets(material_descs);
 
@@ -315,12 +343,12 @@ PrtTest::PrtTest(
     shader_modules[0] =
         renderer::helper::loadShaderModule(
             device_info.device,
-            "prt_test_vert.spv",
+            "conemap_test_vert.spv",
             renderer::ShaderStageFlagBits::VERTEX_BIT);
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device_info.device,
-            "prt_test_frag.spv",
+            "conemap_test_frag.spv",
             renderer::ShaderStageFlagBits::FRAGMENT_BIT);
 
     prt_pipeline_ = device_info.device->createPipeline(
@@ -334,15 +362,16 @@ PrtTest::PrtTest(
         display_size);
 }
 
-void PrtTest::draw(
+void ConemapTest::draw(
+    const std::shared_ptr<renderer::Device>& device,
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
     std::shared_ptr<Plane> unit_plane,
-    const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj) {
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
-    const auto buffer_size = glm::uvec2(cone_map_obj->getPackTexture()->size);
+    const auto buffer_size = glm::uvec2(conemap_obj->getPackTexture()->size);
 
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
+     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
 
     renderer::DescriptorSetList desc_sets = desc_set_list;
     desc_sets.push_back(prt_desc_set_);
@@ -357,23 +386,28 @@ void PrtTest::draw(
         glm::mat4(
             glm::vec4(float(buffer_size.x) / float(buffer_size.y) * 1.0f, 0, 0, 0),
             glm::vec4(0, 1, 0, 0),
-            glm::vec4(0, 0, 1.0f, 0),
+            glm::vec4(0, 0, 1, 0),
             glm::vec4(0, 0, 0, 1));
 
     float y_value[25];
     static float s_theta = glm::pi<float>() / 3.0f;
     static float s_phi = glm::pi<float>() / 4.0f;
-    glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sinf(s_theta) * cone_map_obj->getDepthScale(), std::cos(s_theta)));
+    glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sinf(s_theta) * conemap_obj->getDepthScale(), std::cos(s_theta)));
     
     fillYVauleTablle(y_value, std::acosf(ray_2d.y), s_phi);
-    //s_theta += 0.01f;
-    s_phi += 0.01f;
+    //s_theta += 0.001f;
+    s_phi += 0.003f;
+
+    glm::vec3 light_ray =
+        glm::vec3(std::sin(s_theta) * std::cos(s_phi),
+            std::cos(s_theta),
+            std::sin(s_theta) * std::sin(s_phi));
 
     for (int i = 0; i < 25; i++) {
         params.coeffs[i] = y_value[i];
     }
 
-    params.height_scale = cone_map_obj->getDepthScale() * (cone_map_obj->isHeightMap() ? -1.0f : 1.0f);
+    params.height_scale = conemap_obj->getDepthScale() * (conemap_obj->isHeightMap() ? -1.0f : 1.0f);
     params.buffer_size = glm::vec2(buffer_size);
 
     cmd_buf->pushConstants(
@@ -383,16 +417,53 @@ void PrtTest::draw(
         &params,
         sizeof(params));
 
+    {
+        glsl::PbrMaterialParams ubo{};
+        ubo.base_color_factor = glm::vec4(1.0f);
+        ubo.glossiness_factor = 1.0f;
+        ubo.metallic_roughness_specular_factor = 0.3f;
+        ubo.metallic_factor = static_cast<float>(1.0f);
+        ubo.roughness_factor = static_cast<float>(1.0f);
+        ubo.alpha_cutoff = static_cast<float>(1.0f);
+        ubo.mip_count = 11;
+        ubo.normal_scale = static_cast<float>(1.0f);
+        ubo.occlusion_strength = static_cast<float>(1.0f);
+
+        ubo.emissive_factor = glm::vec3(0.0f, 0.0f, 0.0f);
+        ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);
+        ubo.exposure = 1.0f;
+        ubo.material_features = FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_MATERIAL_METALLICROUGHNESS;
+        ubo.material_features |= FEATURE_HAS_BASE_COLOR_MAP;
+        ubo.material_features |= FEATURE_HAS_OCCLUSION_MAP;
+        ubo.material_features |= FEATURE_HAS_NORMAL_MAP;
+        ubo.tonemap_type = TONEMAP_DEFAULT;
+        ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
+        for (int l = 0; l < LIGHT_COUNT; l++) {
+            ubo.lights[l].type = glsl::LightType_Directional;
+            ubo.lights[l].color = glm::vec3(1, 0, 0);
+            ubo.lights[l].direction = light_ray;
+            ubo.lights[l].intensity = 100.0f;
+            ubo.lights[l].position = glm::vec3(0, 0, 0);
+        }
+
+        device->updateBufferMemory(
+            uniform_buffer_->memory,
+            sizeof(ubo),
+            &ubo);
+    }
+
+
     if (unit_plane) {
         unit_plane->draw(cmd_buf);
     }
 }
 
-void PrtTest::destroy(
+void ConemapTest::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(prt_desc_set_layout_);
     device->destroyPipelineLayout(prt_pipeline_layout_);
     device->destroyPipeline(prt_pipeline_);
+    uniform_buffer_->destroy(device);
 }
 
 } // game_object

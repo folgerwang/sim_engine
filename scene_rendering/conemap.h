@@ -2,22 +2,22 @@
 #include "renderer/renderer.h"
 #include "shaders/global_definition.glsl.h"
 
-#include "game_object/cone_map_obj.h"
+#include "game_object/conemap_obj.h"
 
 namespace engine {
 namespace game_object {
-    class ConeMapObj;
+    class ConemapObj;
 }
 namespace scene_rendering {
 
-class ConeMap {
+class Conemap {
     std::shared_ptr<renderer::DescriptorSetLayout> conemap_desc_set_layout_;
     std::shared_ptr<renderer::DescriptorSet> conemap_tex_desc_set_;
     std::shared_ptr<renderer::PipelineLayout> conemap_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> conemap_pipeline_;
 
 public:
-    ConeMap(
+    Conemap(
         const renderer::DeviceInfo& device_info,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -26,7 +26,7 @@ public:
 
     void update(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const std::shared_ptr<game_object::ConeMapObj>& cone_map_obj);
+        const std::shared_ptr<game_object::ConemapObj>& conemap_obj);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

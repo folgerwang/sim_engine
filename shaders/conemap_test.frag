@@ -14,16 +14,17 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 	GameCameraInfo camera_info;
 };
 
-layout(location = 0) in VsPsData {
-    vec3 vertex_position;
-    vec2 vertex_tex_coord;
-    vec3 vertex_normal;
-    vec3 vertex_tangent;
-} in_data;
+#ifndef NO_MTL
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform MaterialUniformBufferObject {
+    PbrMaterialParams material;
+};
+#endif
 
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = BASE_COLOR_TEX_INDEX) uniform sampler2D base_tex;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = NORMAL_TEX_INDEX) uniform sampler2D normal_tex;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = METAL_ROUGHNESS_TEX_INDEX) uniform sampler2D orh_tex;
+#include "ibl.glsl.h"
+#include "pbr_lighting.glsl.h"
+
+layout(location = 0) in PbrVsPsData in_data;
+
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = CONEMAP_TEX_INDEX) uniform sampler2D conemap_tex;
 /*
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PRT_TEX_INDEX_0) uniform sampler2D prt_tex_0;
@@ -117,18 +118,49 @@ vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    vec3 binormal = cross(in_data.vertex_normal, in_data.vertex_tangent);
-    mat3 world2local = mat3(in_data.vertex_tangent, binormal, in_data.vertex_normal);
+    PbrVsPsData ps_in_data = in_data;
+    mat3 world2local =
+        mat3(
+            ps_in_data.vertex_tangent,
+            ps_in_data.vertex_binormal,
+            ps_in_data.vertex_normal);
 
     // Run the relaxed cone stepping to find the new relief UV
-    vec3 v = in_data.vertex_position - camera_info.position.xyz;
+    vec3 v = ps_in_data.vertex_position - camera_info.position.xyz;
     v = world2local * v;
     v.z = abs(v.z);
     v.xy *= params.height_scale;
 
-    vec3 intersect_pos = relaxedConeStepping(v, vec3(in_data.vertex_tex_coord, 0.0), false);
+    ps_in_data.vertex_tex_coord.xy =
+        relaxedConeStepping(v, vec3(ps_in_data.vertex_tex_coord.xy, 0.0), false).xy;
 
-    vec2 pixel_coords = clamp(vec2(intersect_pos), 0.0f, 1.0f) * (params.buffer_size - 1);
+    vec4 baseColor = getBaseColor(ps_in_data, material);
+
+    v = normalize(camera_info.position.xyz - ps_in_data.vertex_position);
+    NormalInfo normal_info = getNormalInfo(ps_in_data, material, v);
+
+    MaterialInfo material_info =
+        setupMaterialInfo(
+            ps_in_data,
+            material,
+            normal_info,
+            v,
+            baseColor.xyz);
+
+    // LIGHTING
+    PbrLightsColorInfo color_info = initColorInfo();
+
+    // Calculate lighting contribution from image based lighting source (IBL)
+
+#ifdef USE_IBL
+    iblLighting(
+        color_info,
+        material,
+        material_info,
+        normal_info, v);
+#endif // USE_IBL
+
+    vec2 pixel_coords = clamp(ps_in_data.vertex_tex_coord.xy, 0.0f, 1.0f) * (params.buffer_size - 1);
     uvec4 prt_packed_info = imageLoad(src_packed_img, ivec2(pixel_coords));
 
     vec4 coeffs[6];
@@ -176,6 +208,39 @@ void main() {
     sum_visi += dot(coeffs[5], vec4(params.coeffs[20], params.coeffs[21], params.coeffs[22], params.coeffs[23]));
     sum_visi += coeffs_6 * params.coeffs[24];
 
-    vec4 base_color = vec4(texture(base_tex, vec2(intersect_pos)).xyz, 1);
-    outColor = vec4(base_color.xyz * vec3(sum_visi) * sqrt(4.0f * PI) * 2.0f, 1.0f);
+	// Calculate lighting contribution from punctual light sources
+#ifdef USE_PUNCTUAL
+    for (int i = 0; i < LIGHT_COUNT; ++i) {
+        punctualLighting(
+            color_info,
+            ps_in_data,
+            material,
+            material_info,
+            material.lights[i],
+            normal_info,
+            v,
+            sum_visi);
+    }
+#endif // !USE_PUNCTUAL
+
+    layerBlending(
+        color_info,
+        ps_in_data,
+        material,
+        material_info,
+        normal_info,
+        v);
+
+    vec3 color =
+        getFinalColor(
+            color_info,
+            ps_in_data,
+            material,
+            material_info,
+            v);
+
+
+
+    //outColor = vec4(color.xyz * vec3(sum_visi) * sqrt(4.0f * PI) * 2.0f, 1.0f);
+    outColor = vec4(toneMap(material, color), 1.0f);
 }

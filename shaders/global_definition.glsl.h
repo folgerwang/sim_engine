@@ -51,12 +51,12 @@
 
 // PBR_MATERIAL_PARAMS_SET
 #define PBR_CONSTANT_INDEX          7
-#define BASE_COLOR_TEX_INDEX        8
-#define NORMAL_TEX_INDEX            (BASE_COLOR_TEX_INDEX + 1)
+#define ALBEDO_TEX_INDEX            8
+#define NORMAL_TEX_INDEX            (ALBEDO_TEX_INDEX + 1)
 #define METAL_ROUGHNESS_TEX_INDEX   (NORMAL_TEX_INDEX + 1)
 #define EMISSIVE_TEX_INDEX          (METAL_ROUGHNESS_TEX_INDEX + 1)
 #define OCCLUSION_TEX_INDEX         (EMISSIVE_TEX_INDEX + 1)
-#define DIFFUSE_TEX_INDEX           BASE_COLOR_TEX_INDEX
+#define DIFFUSE_TEX_INDEX           ALBEDO_TEX_INDEX
 #define SPECULAR_TEX_INDEX          EMISSIVE_TEX_INDEX
 #define GLOSSNESS_TEX_INDEX         METAL_ROUGHNESS_TEX_INDEX
 
@@ -163,10 +163,11 @@
 #define FEATURE_HAS_METALLIC_ROUGHNESS_MAP      0x00040000
 #define FEATURE_HAS_EMISSIVE_MAP                0x00080000
 #define FEATURE_HAS_OCCLUSION_MAP               0x00100000
+#define FEATURE_HAS_METALLIC_CHANNEL            0x00200000
 
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
 
-#define LIGHT_COUNT                             4
+#define LIGHT_COUNT                             1
 
 #define TONEMAP_DEFAULT                         0
 #define TONEMAP_UNCHARTED                       1

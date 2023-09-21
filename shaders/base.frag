@@ -73,7 +73,8 @@ void main() {
             material_info,
             material.lights[i],
             normal_info,
-            v);
+            v,
+            1.0f);
     }
 #endif // !USE_PUNCTUAL
 
