@@ -1,4 +1,5 @@
 #pragma once
+#define __STDC_LIB_EXT1__
 #include <vector>
 #include "renderer/renderer.h"
 
