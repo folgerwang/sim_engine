@@ -777,6 +777,15 @@ void Helper::addImGuiToCommandBuffer(
     ImGui_ImplVulkan_RenderDrawData(draw_data, RENDER_TYPE_CAST(CommandBuffer, cmd_buf)->get());
 }
 
+ImTextureID Helper::addImTextureID(
+    const std::shared_ptr<Sampler>& sampler,
+    const std::shared_ptr<ImageView>& image_View) {
+    auto vk_sampler = RENDER_TYPE_CAST(Sampler, sampler) -> get();
+    auto vk_image_view = RENDER_TYPE_CAST(ImageView, image_View)->get();
+    
+    return ImGui_ImplVulkan_AddTexture(vk_sampler, vk_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
 void Helper::submitQueue(
     const std::shared_ptr<Queue>& graphic_queue,
     const std::shared_ptr<Fence>& in_flight_fence,
@@ -868,15 +877,15 @@ bool Helper::presentQueue(
 }
 
 void Helper::initImgui(
+    GLFWwindow* window,
     const DeviceInfo& device_info,
     const std::shared_ptr<Instance>& instance,
-    GLFWwindow* window,
     const QueueFamilyIndices& queue_family_indices,
     const SwapChainInfo& swap_chain_info,
-    std::shared_ptr<Queue> graphics_queue,
-    std::shared_ptr<DescriptorPool> descriptor_pool,
-    std::shared_ptr<RenderPass> render_pass,
-    std::shared_ptr<CommandBuffer> command_buffer) {
+    const std::shared_ptr<Queue>& graphics_queue,
+    const std::shared_ptr<DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<RenderPass>& render_pass,
+    const std::shared_ptr<CommandBuffer>& command_buffer) {
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

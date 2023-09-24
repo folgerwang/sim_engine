@@ -8,6 +8,152 @@ namespace engine {
 namespace renderer {
 namespace helper {
 
+AttachmentDescription FillAttachmentDescription(
+    Format format,
+    SampleCountFlagBits samples,
+    ImageLayout initial_layout,
+    ImageLayout final_layout,
+    AttachmentLoadOp load_op/* = AttachmentLoadOp::CLEAR*/,
+    AttachmentStoreOp store_op/* = AttachmentStoreOp::STORE*/,
+    AttachmentLoadOp stencil_load_op/* = AttachmentLoadOp::DONT_CARE*/,
+    AttachmentStoreOp stencil_store_op/* = AttachmentStoreOp::DONT_CARE*/) {
+
+    AttachmentDescription attachment{};
+    attachment.format = format;
+    attachment.samples = samples;
+    attachment.initial_layout = initial_layout;
+    attachment.final_layout = final_layout;
+    attachment.load_op = load_op;
+    attachment.store_op = store_op;
+    attachment.stencil_load_op = stencil_load_op;
+    attachment.stencil_store_op = stencil_store_op;
+
+    return attachment;
+}
+
+SubpassDescription FillSubpassDescription(
+    PipelineBindPoint pipeline_bind_point,
+    const std::vector<AttachmentReference>& color_attachments,
+    const AttachmentReference* depth_stencil_attachment,
+    SubpassDescriptionFlags flags/* = static_cast<SubpassDescriptionFlags>(0)*/,
+    const std::vector<AttachmentReference>& input_attachments/* = {}*/,
+    const std::vector<AttachmentReference>& resolve_attachments/* = {}*/) {
+    SubpassDescription desc{};
+    desc.flags = flags;
+    desc.input_attachments = input_attachments;
+    desc.color_attachments = color_attachments;
+    desc.resolve_attachments = resolve_attachments;
+    if (depth_stencil_attachment) {
+        desc.depth_stencil_attachment.resize(1);
+        desc.depth_stencil_attachment[0] = *depth_stencil_attachment;
+    }
+    desc.preserve_attachment_count = 0;
+    desc.preserve_attachments = nullptr;
+
+    return desc;
+}
+
+SubpassDependency FillSubpassDependency(
+    uint32_t src_subpass,
+    uint32_t dst_subpass,
+    PipelineStageFlags src_stage_mask,
+    PipelineStageFlags dst_stage_mask,
+    AccessFlags src_access_mask,
+    AccessFlags dst_access_mask,
+    DependencyFlags dependency_flags/* = 0*/) {
+    SubpassDependency dependency{};
+    dependency.src_subpass = src_subpass;
+    dependency.dst_subpass = dst_subpass;
+    dependency.src_stage_mask = src_stage_mask;
+    dependency.dst_stage_mask = dst_stage_mask;
+    dependency.src_access_mask = src_access_mask;
+    dependency.dst_access_mask = dst_access_mask;
+    dependency.dependency_flags = dependency_flags;
+    return dependency;
+}
+
+std::shared_ptr<RenderPass> createRenderPass(
+    const std::shared_ptr<Device>& device,
+    Format format,
+    Format depth_format,
+    bool clear/* = false */ ,
+    SampleCountFlagBits sample_count/* = SampleCountFlagBits::SC_1_BIT*/,
+    ImageLayout color_image_layout/* = ImageLayout::COLOR_ATTACHMENT_OPTIMAL*/) {
+    auto color_attachment = FillAttachmentDescription(
+        format,
+        sample_count,
+        clear ? ImageLayout::UNDEFINED : color_image_layout,
+        color_image_layout,
+        clear ? AttachmentLoadOp::CLEAR : AttachmentLoadOp::LOAD);
+
+    AttachmentReference color_attachment_ref(
+        0,
+        ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+    auto depth_attachment = FillAttachmentDescription(
+        depth_format,
+        sample_count,
+        clear ? ImageLayout::UNDEFINED : ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        clear ? AttachmentLoadOp::CLEAR : AttachmentLoadOp::LOAD);
+
+    AttachmentReference depth_attachment_ref(
+        1,
+        ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+    auto subpass = FillSubpassDescription(
+        PipelineBindPoint::GRAPHICS,
+        { color_attachment_ref },
+        &depth_attachment_ref);
+
+    auto depency = FillSubpassDependency(~0U, 0,
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT),
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT),
+        0,
+        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT) |
+        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_READ_BIT));
+
+    std::vector<AttachmentDescription> attachments(2);
+    attachments[0] = color_attachment;
+    attachments[1] = depth_attachment;
+
+    return device->createRenderPass(
+        attachments,
+        { subpass },
+        { depency });
+}
+
+std::shared_ptr<RenderPass> createCubemapRenderPass(
+    const std::shared_ptr<Device>& device,
+    Format format/* = Format::R16G16B16A16_SFLOAT */) {
+    auto color_attachment = FillAttachmentDescription(
+        format,
+        SampleCountFlagBits::SC_1_BIT,
+        ImageLayout::UNDEFINED,
+        ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+    std::vector<AttachmentReference> color_attachment_refs(6);
+    for (uint32_t i = 0; i < 6; i++) {
+        color_attachment_refs[i].attachment_ = i;
+        color_attachment_refs[i].layout_ = ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    }
+
+    auto subpass = FillSubpassDescription(
+        PipelineBindPoint::GRAPHICS,
+        color_attachment_refs,
+        nullptr);
+
+    auto depency = FillSubpassDependency(~0U, 0,
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT),
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT),
+        0,
+        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT));
+
+    std::vector<AttachmentDescription> attachments = { 6, color_attachment };
+
+    return device->createRenderPass(attachments, { subpass }, { depency });
+}
+
 DescriptorSetLayoutBinding getTextureSamplerDescriptionSetLayoutBinding(
     uint32_t binding, 
     ShaderStageFlags stage_flags/* = SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT)*/,

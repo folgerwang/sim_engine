@@ -28,15 +28,17 @@ namespace engine {
 namespace scene_rendering {
 
 Menu::Menu(
+    GLFWwindow* window,
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::Instance>& instance,
-    GLFWwindow* window,
     const renderer::QueueFamilyIndices& queue_family_indices,
     const renderer::SwapChainInfo& swap_chain_info,
-    std::shared_ptr<renderer::Queue> graphics_queue,
-    std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
-    std::shared_ptr<renderer::RenderPass> render_pass,
-    std::shared_ptr<renderer::CommandBuffer> command_buffer) {
+    const std::shared_ptr<renderer::Queue>& graphics_queue,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const std::shared_ptr<renderer::CommandBuffer>& command_buffer,
+    const std::shared_ptr<renderer::Sampler>& sampler,
+    const std::shared_ptr<renderer::ImageView>& image_view) {
     std::string path = "assets";
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
         auto path_string = entry.path();
@@ -47,9 +49,9 @@ Menu::Menu(
     }
 
     renderer::Helper::initImgui(
+        window,
         device_info,
         instance,
-        window,
         queue_family_indices,
         swap_chain_info,
         graphics_queue,
@@ -75,23 +77,25 @@ Menu::Menu(
     weather_controls_.cloud_forming_ratio = 0.5f;
     weather_controls_.frozen_ext_factor = 2.0f;
     weather_controls_.frozen_pow_curve = 1.0f / 2.0f;
+
+    texture_id_ = renderer::Helper::addImTextureID(sampler, image_view);
 }
 
 void Menu::init(
+    GLFWwindow* window,
     const renderer::DeviceInfo& device_info,
     const std::shared_ptr<renderer::Instance>& instance,
-    GLFWwindow* window,
     const renderer::QueueFamilyIndices& queue_family_indices,
     const renderer::SwapChainInfo& swap_chain_info,
-    std::shared_ptr<renderer::Queue> graphics_queue,
-    std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
-    std::shared_ptr<renderer::RenderPass> render_pass,
-    std::shared_ptr<renderer::CommandBuffer> command_buffer) {
+    const std::shared_ptr<renderer::Queue>& graphics_queue,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const std::shared_ptr<renderer::CommandBuffer>& command_buffer) {
 
     renderer::Helper::initImgui(
+        window,
         device_info,
         instance,
-        window,
         queue_family_indices,
         swap_chain_info,
         graphics_queue,
@@ -101,12 +105,11 @@ void Menu::init(
 }
 
 bool Menu::draw(
-    std::shared_ptr<er::CommandBuffer> command_buffer,
+    const std::shared_ptr<er::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
-    const er::SwapChainInfo& swap_chain_info,
+    const std::shared_ptr<renderer::Framebuffer>& framebuffer,
     const glm::uvec2& screen_size,
     const std::shared_ptr<scene_rendering::Skydome>& skydome,
-    uint32_t image_index,
     bool& dump_volume_noise,
     const float& delta_t) {
 
@@ -118,9 +121,9 @@ bool Menu::draw(
     clear_values[0].color = { 0.0f, 0.0f, 0.0f, 1.0f };
     clear_values[1].depth_stencil = { 1.0f, 0 };
 
-    command_buffer->beginRenderPass(
+    cmd_buf->beginRenderPass(
         render_pass,
-        swap_chain_info.framebuffers[image_index],
+        framebuffer,
         screen_size,
         clear_values);
 
@@ -133,17 +136,48 @@ bool Menu::draw(
     bool compile_shaders = false;
 
     bool test_true = true;
-    ImGui::Begin("fps", &test_true, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoInputs);
+    ImGui::Begin(
+        "fps",
+        &test_true,
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoInputs);
     ImGui::SetWindowPos(ImVec2(float(screen_size.x) - 128.0f, 20.0f));
     ImGui::SetWindowSize(ImVec2((float)128, (float)12));
-//    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1);
     ImGui::BeginChild("fps", ImVec2(0, 0), false);
     float fps = delta_t > 0.0f ? 1.0f / delta_t : 0.0f;
     ImGui::Text("fps : %8.5f", fps);
     ImGui::EndChild();
-//    ImGui::PopStyleVar(1);
     ImGui::End();
 
+#if 0
+    ImVec2 childSize = ImVec2(1024, 768);  // Define the size of the child window
+    ImGui::Begin(
+        "Viewport",
+        nullptr,
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar);
+    ImGui::SetWindowPos(ImVec2(0, 20.0f));
+    auto window_size = ImGui::GetWindowSize();
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::BeginChild("Viewport", ImVec2(0, 0), true);
+//    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    // Render something here, for example, a colored rectangle:
+    ImVec2 rectMin = ImGui::GetCursorScreenPos();
+    ImVec2 rectMax = ImVec2(rectMin.x + childSize.x, rectMin.y + childSize.y);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    //drawList->AddRectFilled(rectMin, rectMax, IM_COL32(100, 100, 255, 255), 20.0f, ImDrawFlags_RoundCornersAll);
+    // Convert the Vulkan image to an ImGui texture
+    drawList->AddImage(texture_id_, ImVec2(0, 0), window_size, ImVec2(0, 0), ImVec2(1, 1));
+
+//    ImGui::PopStyleVar(1);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::End();
+#endif
     if (ImGui::BeginMainMenuBar())
     {
         if (ImGui::BeginMenu("Raytracing"))
@@ -336,9 +370,9 @@ bool Menu::draw(
         ImGui::End();
     }
 
-    renderer::Helper::addImGuiToCommandBuffer(command_buffer);
+    renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
 
-    command_buffer->endRenderPass();
+    cmd_buf->endRenderPass();
 
     return in_focus;
 }

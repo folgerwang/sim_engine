@@ -5,6 +5,45 @@ namespace engine {
 namespace renderer {
 namespace helper {
 
+AttachmentDescription FillAttachmentDescription(
+    Format format,
+    SampleCountFlagBits samples,
+    ImageLayout initial_layout,
+    ImageLayout final_layout,
+    AttachmentLoadOp load_op = AttachmentLoadOp::CLEAR,
+    AttachmentStoreOp store_op = AttachmentStoreOp::STORE,
+    AttachmentLoadOp stencil_load_op = AttachmentLoadOp::DONT_CARE,
+    AttachmentStoreOp stencil_store_op = AttachmentStoreOp::DONT_CARE);
+
+SubpassDescription FillSubpassDescription(
+    PipelineBindPoint pipeline_bind_point,
+    const std::vector<AttachmentReference>& color_attachments,
+    const AttachmentReference* depth_stencil_attachment,
+    SubpassDescriptionFlags flags = static_cast<SubpassDescriptionFlags>(0),
+    const std::vector<AttachmentReference>& input_attachments = {},
+    const std::vector<AttachmentReference>& resolve_attachments = {});
+
+SubpassDependency FillSubpassDependency(
+    uint32_t src_subpass,
+    uint32_t dst_subpass,
+    PipelineStageFlags src_stage_mask,
+    PipelineStageFlags dst_stage_mask,
+    AccessFlags src_access_mask,
+    AccessFlags dst_access_mask,
+    DependencyFlags dependency_flags = 0);
+
+std::shared_ptr<RenderPass> createRenderPass(
+    const std::shared_ptr<Device>& device,
+    Format format,
+    Format depth_format,
+    bool clear = false,
+    SampleCountFlagBits sample_count = SampleCountFlagBits::SC_1_BIT,
+    ImageLayout color_image_layout = ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+std::shared_ptr<RenderPass> createCubemapRenderPass(
+    const std::shared_ptr<Device>& device,
+    Format format = Format::R16G16B16A16_SFLOAT);
+
 DescriptorSetLayoutBinding getTextureSamplerDescriptionSetLayoutBinding(
     uint32_t binding, 
     ShaderStageFlags stage_flags = SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),

@@ -35,17 +35,21 @@ class Menu {
 
     glsl::WeatherControl weather_controls_;
 
+    ImTextureID texture_id_;
+
 public:
     Menu(
+        GLFWwindow* window,
         const renderer::DeviceInfo& device_info,
         const std::shared_ptr<renderer::Instance>& instance,
-        GLFWwindow* window,
         const renderer::QueueFamilyIndices& queue_family_indices,
         const renderer::SwapChainInfo& swap_chain_info,
-        std::shared_ptr<renderer::Queue> graphics_queue,
-        std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
-        std::shared_ptr<renderer::RenderPass> render_pass,
-        std::shared_ptr<renderer::CommandBuffer> command_buffer);
+        const std::shared_ptr<renderer::Queue>& graphics_queue,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const std::shared_ptr<renderer::CommandBuffer>& command_buffer,
+        const std::shared_ptr<renderer::Sampler>& sampler,
+        const std::shared_ptr<renderer::ImageView>& image_view);
 
     std::vector<std::string> getToLoadGltfNamesAndClear() {
         auto result = to_load_gltf_names_;
@@ -148,23 +152,22 @@ public:
     }
 
     void init(
+        GLFWwindow* window,
         const renderer::DeviceInfo& device_info,
         const std::shared_ptr<renderer::Instance>& instance,
-        GLFWwindow* window,
         const renderer::QueueFamilyIndices& queue_family_indices,
         const renderer::SwapChainInfo& swap_chain_info,
-        std::shared_ptr<renderer::Queue> graphics_queue,
-        std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
-        std::shared_ptr<renderer::RenderPass> render_pass,
-        std::shared_ptr<renderer::CommandBuffer> command_buffer);
+        const std::shared_ptr<renderer::Queue>& graphics_queue,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const std::shared_ptr<renderer::CommandBuffer>& command_buffer);
 
     bool draw(
-        std::shared_ptr<renderer::CommandBuffer> command_buffer,
+        const std::shared_ptr<renderer::CommandBuffer>& command_buffer,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
-        const renderer::SwapChainInfo& swap_chain_info,
+        const std::shared_ptr<renderer::Framebuffer>& framebuffer,
         const glm::uvec2& screen_size,
         const std::shared_ptr<scene_rendering::Skydome>& skydome,
-        uint32_t image_index,
         bool& dump_volume_noise,
         const float& delta_t);
 

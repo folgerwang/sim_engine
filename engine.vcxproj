@@ -44,6 +44,7 @@
     <ClCompile Include="scene_rendering\menu.cpp" />
     <ClCompile Include="scene_rendering\prt.cpp" />
     <ClCompile Include="scene_rendering\skydome.cpp" />
+    <ClCompile Include="scene_rendering\view_capture.cpp" />
     <ClCompile Include="scene_rendering\volume_cloud.cpp" />
     <ClCompile Include="scene_rendering\volume_noise.cpp" />
     <ClCompile Include="scene_rendering\weather_system.cpp" />
@@ -81,6 +82,7 @@
     <ClInclude Include="scene_rendering\menu.h" />
     <ClInclude Include="scene_rendering\prt.h" />
     <ClInclude Include="scene_rendering\skydome.h" />
+    <ClInclude Include="scene_rendering\view_capture.h" />
     <ClInclude Include="scene_rendering\volume_cloud.h" />
     <ClInclude Include="scene_rendering\volume_noise.h" />
     <ClInclude Include="scene_rendering\weather_system.h" />

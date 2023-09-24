@@ -188,7 +188,7 @@ class VulkanImageView : public ImageView {
     VkImageView     image_view_;
 public:
     VulkanImageView(const VkImageView& image_view) : image_view_(image_view) {}
-    VkImageView get() { return image_view_; }
+    VkImageView& get() { return image_view_; }
 };
 
 class VulkanSampler : public Sampler {
@@ -477,6 +477,10 @@ public:
     static void addImGuiToCommandBuffer(
         const std::shared_ptr<CommandBuffer>& cmd_buf);
 
+    static ImTextureID addImTextureID(
+        const std::shared_ptr<Sampler>& sampler,
+        const std::shared_ptr<ImageView>& image_View);
+
     static void submitQueue(
         const std::shared_ptr<Queue>& present_queue,
         const std::shared_ptr<Fence>& in_flight_fence,
@@ -493,15 +497,15 @@ public:
         bool& frame_buffer_resized);
 
     static void initImgui(
+        GLFWwindow* window,
         const DeviceInfo& device_info,
         const std::shared_ptr<Instance>& instance,
-        GLFWwindow* window,
         const QueueFamilyIndices& queue_family_indices,
         const SwapChainInfo& swap_chain_info,
-        std::shared_ptr<Queue> graphics_queue,
-        std::shared_ptr<DescriptorPool> descriptor_pool,
-        std::shared_ptr<RenderPass> render_pass,
-        std::shared_ptr<CommandBuffer> command_buffer);
+        const std::shared_ptr<Queue>& graphics_queue,
+        const std::shared_ptr<DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<RenderPass>& render_pass,
+        const std::shared_ptr<CommandBuffer>& command_buffer);
 
     static TextureInfo& getBlackTexture() { return black_tex_; }
     static TextureInfo& getWhiteTexture() { return white_tex_; }
