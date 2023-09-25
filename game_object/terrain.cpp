@@ -1956,7 +1956,8 @@ static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileParams);
 

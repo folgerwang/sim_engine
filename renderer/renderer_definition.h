@@ -1128,6 +1128,21 @@ enum class MemoryPropertyFlagBits {
 };
 typedef uint32_t MemoryPropertyFlags;
 
+enum class QueueFlagBits {
+    GRAPHICS_BIT = 0x00000001,
+    COMPUTE_BIT = 0x00000002,
+    TRANSFER_BIT = 0x00000004,
+    SPARSE_BINDING_BIT = 0x00000008,
+    PROTECTED_BIT = 0x00000010,
+    VIDEO_DECODE_BIT_KHR = 0x00000020,
+#ifdef VK_ENABLE_BETA_EXTENSIONS
+    VIDEO_ENCODE_BIT_KHR = 0x00000040,
+#endif
+    OPTICAL_FLOW_BIT_NV = 0x00000100,
+    FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
+};
+typedef uint32_t QueueFlags;
+
 enum class CommandBufferUsageFlagBits {
     ONE_TIME_SUBMIT_BIT = 0x00000001,
     RENDER_PASS_CONTINUE_BIT = 0x00000002,

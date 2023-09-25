@@ -1118,7 +1118,7 @@ void VulkanDevice::waitForSemaphores(
 
     VkSemaphoreWaitInfo wait_info = {};
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    wait_info.semaphoreCount = vk_semaphores.size(); // Number of semaphores you're waiting on
+    wait_info.semaphoreCount = static_cast<uint32_t>(vk_semaphores.size()); // Number of semaphores you're waiting on
     wait_info.pSemaphores = vk_semaphores.data(); // The semaphores you're waiting on
     wait_info.pValues = values.data(); // An array of values to wait for
 

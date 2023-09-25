@@ -295,12 +295,60 @@ struct AccelerationStructDescriptor : public WriteDescriptor {
     std::vector<AccelerationStructure> acc_structs;
 };
 
-struct QueueFamilyIndices {
-    std::optional<uint32_t> graphics_family_;
-    std::optional<uint32_t> present_family_;
+struct QueueFamilyInfo {
+    QueueFlags queue_flags_;
+    uint32_t queue_count_;
+    uint32_t index_;
+    bool present_support_;
+};
 
-    bool isComplete() const {
-        return graphics_family_.has_value() && present_family_.has_value();
+struct QueueFamilyList {
+    std::vector<QueueFamilyInfo> queue_families_;
+
+    uint32_t getQueueFamilyIndex(QueueFlagBits queue_flags) const {
+        for (auto family : queue_families_) {
+            auto query_flags = static_cast<uint32_t>(queue_flags);
+            if ((static_cast<uint32_t>(family.queue_flags_) & query_flags) == query_flags) {
+                return family.index_;
+            }
+        }
+        return (uint32_t)-1;
+    }
+
+    std::vector<uint32_t> getGraphicAndPresentFamilyIndex() const {
+        auto query_flags = static_cast<uint32_t>(QueueFlagBits::GRAPHICS_BIT);
+        for (auto family : queue_families_) {
+            if ((static_cast<uint32_t>(family.queue_flags_) & query_flags) && family.present_support_) {
+                return { static_cast<uint32_t>(family.index_) };
+            }
+        }
+
+        std::vector<uint32_t> index;
+        index.reserve(2);
+        for (auto family : queue_families_) {
+            if ((static_cast<uint32_t>(family.queue_flags_) & query_flags)) {
+                index.push_back(family.index_);
+                break;
+            }
+        }
+
+        for (auto family : queue_families_) {
+            if (family.present_support_) {
+                index.push_back(family.index_);
+                break;
+            }
+        }
+
+        if (index.size() == 2) {
+            return index;
+        }
+        else {
+            return {};
+        }
+    }
+
+    bool isComplete() {
+        return getGraphicAndPresentFamilyIndex().size() > 0;
     }
 };
 

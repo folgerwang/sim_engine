@@ -311,14 +311,14 @@ public:
         const PhysicalDeviceList& physical_devices,
         const std::shared_ptr<Surface>& surface);
 
-    static QueueFamilyIndices findQueueFamilies(
+    static QueueFamilyList findQueueFamilies(
         const std::shared_ptr<PhysicalDevice>& physical_device,
         const std::shared_ptr<Surface>& surface);
 
     static std::shared_ptr<Device> createLogicalDevice(
         const std::shared_ptr<PhysicalDevice>& physical_device,
         const std::shared_ptr<Surface>& surface,
-        const QueueFamilyIndices& indices);
+        const QueueFamilyList& list);
 
     static void initRayTracingProperties(
         const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
@@ -330,7 +330,7 @@ public:
         GLFWwindow* window,
         const std::shared_ptr<Device>& device,
         const std::shared_ptr<Surface>& surface,
-        const QueueFamilyIndices& indices,
+        const QueueFamilyList& indices,
         SwapChainInfo& swap_chain_info,
         const ImageUsageFlags& usage);
 
@@ -500,7 +500,7 @@ public:
         GLFWwindow* window,
         const DeviceInfo& device_info,
         const std::shared_ptr<Instance>& instance,
-        const QueueFamilyIndices& queue_family_indices,
+        const QueueFamilyList& queue_family_indices,
         const SwapChainInfo& swap_chain_info,
         const std::shared_ptr<Queue>& graphics_queue,
         const std::shared_ptr<DescriptorPool>& descriptor_pool,

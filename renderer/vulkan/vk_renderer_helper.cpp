@@ -1707,10 +1707,10 @@ renderer::PhysicalDeviceList collectPhysicalDevices(
     return physical_devices;
 }
 
-renderer::QueueFamilyIndices findQueueFamilies(
+renderer::QueueFamilyList findQueueFamilies(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface) {
-    renderer::QueueFamilyIndices indices;
+    renderer::QueueFamilyList list;
 
     const auto& vk_physical_device = RENDER_TYPE_CAST(PhysicalDevice, physical_device);
     assert(vk_physical_device);
@@ -1725,26 +1725,20 @@ renderer::QueueFamilyIndices findQueueFamilies(
     std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_families.data());
 
-    int i = 0;
+    uint32_t i = 0;
     for (const auto& queue_family : queue_families) {
-        if (queue_family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            indices.graphics_family_ = i;
-        }
-
-        VkBool32 present_support = false;
+        QueueFamilyInfo info;
+        info.queue_flags_ = queue_family.queueFlags;
+        info.queue_count_ = queue_family.queueCount;
+        info.index_ = i;
+        VkBool32 present_support = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(device, i, vk_surface->get(), &present_support);
-
-        if (present_support) {
-            indices.present_family_ = i;
-        }
-        if (indices.isComplete()) {
-            break;
-        }
-
+        info.present_support_ = present_support == VK_TRUE ? true : false;
+        list.queue_families_.push_back(info);
         i++;
     }
 
-    return indices;
+    return list;
 }
 
 bool checkDeviceExtensionSupport(
@@ -1826,7 +1820,7 @@ void initRayTracing(const VkPhysicalDevice& device)
 bool isDeviceSuitable(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface) {
-    renderer::QueueFamilyIndices indices = findQueueFamilies(physical_device, surface);
+    auto list = findQueueFamilies(physical_device, surface);
 
     const auto& vk_physical_device = RENDER_TYPE_CAST(PhysicalDevice, physical_device);
     assert(vk_physical_device);
@@ -1845,7 +1839,7 @@ bool isDeviceSuitable(
     VkPhysicalDeviceFeatures supported_features;
     vkGetPhysicalDeviceFeatures(device, &supported_features);
 
-    return indices.isComplete() && extensions_supported && swap_chain_adequate && supported_features.samplerAnisotropy;
+    return list.isComplete() && extensions_supported && swap_chain_adequate && supported_features.samplerAnisotropy;
 }
 
 std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
@@ -1888,10 +1882,13 @@ std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
 std::shared_ptr<renderer::Device> createLogicalDevice(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface,
-    const renderer::QueueFamilyIndices& indices) {
+    const renderer::QueueFamilyList& list) {
 
     std::vector<VkDeviceQueueCreateInfo> queue_create_infos;
-    std::set<uint32_t> unique_queue_families = { indices.graphics_family_.value(), indices.present_family_.value() };
+    std::set<uint32_t> unique_queue_families;
+    for (auto& queue_family : list.getGraphicAndPresentFamilyIndex()) {
+        unique_queue_families.insert(queue_family);
+    }
 
     float queue_priority = 1.0f;
     for (uint32_t queue_family : unique_queue_families) {

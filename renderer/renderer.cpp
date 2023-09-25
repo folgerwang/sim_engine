@@ -131,7 +131,7 @@ std::shared_ptr<PhysicalDevice> Helper::pickPhysicalDevice(
     return vk::helper::pickPhysicalDevice(physical_devices, surface);
 }
 
-QueueFamilyIndices Helper::findQueueFamilies(
+QueueFamilyList Helper::findQueueFamilies(
     const std::shared_ptr<PhysicalDevice>& physical_device,
     const std::shared_ptr<Surface>& surface) {
     return vk::helper::findQueueFamilies(physical_device, surface);
@@ -140,8 +140,8 @@ QueueFamilyIndices Helper::findQueueFamilies(
 std::shared_ptr<Device> Helper::createLogicalDevice(
     const std::shared_ptr<PhysicalDevice>& physical_device,
     const std::shared_ptr<Surface>& surface,
-    const QueueFamilyIndices& indices) {
-    return vk::helper::createLogicalDevice(physical_device, surface, indices);
+    const QueueFamilyList& list) {
+    return vk::helper::createLogicalDevice(physical_device, surface, list);
 }
 
 void Helper::initRayTracingProperties(
@@ -156,7 +156,7 @@ void Helper::createSwapChain(
     GLFWwindow* window,
     const std::shared_ptr<Device>& device,
     const std::shared_ptr<Surface>& surface,
-    const QueueFamilyIndices& indices,
+    const QueueFamilyList& list,
     SwapChainInfo& swap_chain_info,
     const ImageUsageFlags& usage) {
     const auto& vk_device = RENDER_TYPE_CAST(Device, device);
@@ -172,12 +172,7 @@ void Helper::createSwapChain(
         image_count = swap_chain_support.capabilities_.maxImageCount;
     }
 
-    std::vector<uint32_t> queue_index(2);
-    queue_index[0] = indices.graphics_family_.value();
-    queue_index[1] = indices.present_family_.value();
-    std::sort(queue_index.begin(), queue_index.end());
-    auto last = std::unique(queue_index.begin(), queue_index.end());
-    queue_index.erase(last, queue_index.end());
+    auto queue_family_index = list.getGraphicAndPresentFamilyIndex();
 
     swap_chain_info.format = vk::helper::fromVkFormat(surface_format.format);
     swap_chain_info.extent = glm::uvec2(extent.width, extent.height);
@@ -190,7 +185,7 @@ void Helper::createSwapChain(
         vk::helper::fromVkSurfaceTransformFlags(swap_chain_support.capabilities_.currentTransform),
         present_mode,
         usage,
-        queue_index);
+        queue_family_index);
 
     swap_chain_info.images = device->getSwapchainImages(swap_chain_info.swap_chain);
 }
@@ -880,7 +875,7 @@ void Helper::initImgui(
     GLFWwindow* window,
     const DeviceInfo& device_info,
     const std::shared_ptr<Instance>& instance,
-    const QueueFamilyIndices& queue_family_indices,
+    const QueueFamilyList& queue_family_list,
     const SwapChainInfo& swap_chain_info,
     const std::shared_ptr<Queue>& graphics_queue,
     const std::shared_ptr<DescriptorPool>& descriptor_pool,
@@ -904,7 +899,7 @@ void Helper::initImgui(
     init_info.Instance = RENDER_TYPE_CAST(Instance, instance)->get();
     init_info.PhysicalDevice = RENDER_TYPE_CAST(PhysicalDevice, logic_device->getPhysicalDevice())->get();
     init_info.Device = logic_device->get();
-    init_info.QueueFamily = queue_family_indices.graphics_family_.value();
+    init_info.QueueFamily = queue_family_list.getGraphicAndPresentFamilyIndex()[0]; // get graphic queue family index.
     init_info.Queue = RENDER_TYPE_CAST(Queue, graphics_queue)->get();
     init_info.PipelineCache = nullptr;// g_PipelineCache;
     init_info.DescriptorPool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool)->get();

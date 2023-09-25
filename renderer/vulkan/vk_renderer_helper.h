@@ -135,7 +135,7 @@ void DestroyDebugUtilsMessengerEXT(const VkInstance& instance,
 renderer::PhysicalDeviceList collectPhysicalDevices(
     const std::shared_ptr<renderer::Instance>& instance);
 
-renderer::QueueFamilyIndices findQueueFamilies(
+renderer::QueueFamilyList findQueueFamilies(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface);
 
@@ -150,7 +150,7 @@ std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
 std::shared_ptr<renderer::Device> createLogicalDevice(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface,
-    const renderer::QueueFamilyIndices& indices);
+    const renderer::QueueFamilyList& list);
 
 void initRayTracingProperties(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,

@@ -141,12 +141,15 @@ static void fillYVauleTablle(float y_value[25], float theta, float phi) {
 static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(7);
+    bindings.reserve(10);
 
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALBEDO_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(NORMAL_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(METAL_ROUGHNESS_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(CONEMAP_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(EMISSIVE_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(OCCLUSION_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(THIN_FILM_LUT_INDEX));
 /*    for (int i = 0; i < 7; ++i)
         bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(PRT_TEX_INDEX_0 + i));*/
     bindings.push_back(
@@ -179,7 +182,7 @@ static renderer::WriteDescriptorList addPrtTextures(
     const std::shared_ptr<renderer::BufferInfo>& uniform_buffer) {
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(6);
+    descriptor_writes.reserve(10);
 
     // diffuse.
     renderer::Helper::addOneTexture(
@@ -241,6 +244,33 @@ static renderer::WriteDescriptorList addPrtTextures(
         nullptr,
         prt_packed_texture->view,
         renderer::ImageLayout::GENERAL);
+
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        EMISSIVE_TEX_INDEX,
+        texture_sampler,
+        renderer::Helper::getBlackTexture().view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        OCCLUSION_TEX_INDEX,
+        texture_sampler,
+        renderer::Helper::getBlackTexture().view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        THIN_FILM_LUT_INDEX,
+        texture_sampler,
+        renderer::Helper::getBlackTexture().view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::addOneBuffer(
         descriptor_writes,
