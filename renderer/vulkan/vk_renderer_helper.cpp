@@ -45,7 +45,8 @@ const std::vector<const char*> device_extensions = {
     VK_KHR_SPIRV_1_4_EXTENSION_NAME,
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
     VK_KHR_DEVICE_GROUP_EXTENSION_NAME,
-    VK_NV_MESH_SHADER_EXTENSION_NAME
+    VK_NV_MESH_SHADER_EXTENSION_NAME,
+    VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
 };
 
 #ifdef NDEBUG
@@ -1559,7 +1560,7 @@ std::shared_ptr<renderer::Instance> createInstance() {
     app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app_info.pEngineName = "No Engine";
     app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.apiVersion = VK_API_VERSION_1_0;
+    app_info.apiVersion = VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -1698,10 +1699,16 @@ renderer::PhysicalDeviceList collectPhysicalDevices(
 
     renderer::PhysicalDeviceList physical_devices;
 
+    uint32_t idx = 0;
+    std::cout << "Physical Device Count : " << device_count << std::endl;
     for (const auto& device : devices) {
+        VkPhysicalDeviceProperties deviceProperties;
+        vkGetPhysicalDeviceProperties(device, &deviceProperties);
+        std::cout << "Physical Device, id : " << idx << ", name : " << deviceProperties.deviceName << std::endl;
         auto physical_device = std::make_shared<renderer::vk::VulkanPhysicalDevice>();
         physical_device->set(device);
         physical_devices.push_back(physical_device);
+        idx++;
     }
 
     return physical_devices;
@@ -1752,6 +1759,12 @@ bool checkDeviceExtensionSupport(
 
     std::vector<VkExtensionProperties> available_extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, available_extensions.data());
+
+    std::cout << "available device extensions:\n";
+
+    for (const auto& extension : available_extensions) {
+        std::cout << '\t' << extension.extensionName << '\n';
+    }
 
     std::set<std::string> required_extensions(device_extensions.begin(), device_extensions.end());
 

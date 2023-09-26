@@ -18,7 +18,7 @@ layout(std430, set = 0, binding = DST_BUFFER_INDEX) buffer PrtMinmaxBuffer {
 	PrtMinmaxInfo info;
 };
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 8, local_size_y = 8) in;
 
 const uint g_block_size = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
 

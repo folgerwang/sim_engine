@@ -401,7 +401,7 @@ void ConemapTest::draw(
 
     const auto buffer_size = glm::uvec2(conemap_obj->getPackTexture()->size);
 
-     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
+    cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
 
     renderer::DescriptorSetList desc_sets = desc_set_list;
     desc_sets.push_back(prt_desc_set_);

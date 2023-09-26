@@ -184,10 +184,19 @@ std::shared_ptr<Sampler> VulkanDevice::createSampler(Filter filter, SamplerAddre
 }
 
 std::shared_ptr<Semaphore> VulkanDevice::createSemaphore() {
-    VkSemaphoreTypeCreateInfoKHR type_create_info = {};
+    VkTimelineSemaphoreSubmitInfo timeline_info = {};
+    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline_info.pNext = nullptr;
+    timeline_info.waitSemaphoreValueCount = 0;
+    timeline_info.pWaitSemaphoreValues = nullptr;
+    timeline_info.signalSemaphoreValueCount = 0;// 1;
+    timeline_info.pSignalSemaphoreValues = nullptr;// &timeline_value_;
+
+    VkSemaphoreTypeCreateInfo type_create_info = {};
     type_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-    type_create_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type_create_info.semaphoreType = VK_SEMAPHORE_TYPE_BINARY;// VK_SEMAPHORE_TYPE_TIMELINE;
     type_create_info.initialValue = 0; // Initial value for the semaphore
+    type_create_info.pNext = nullptr;// &timeline_info;
 
     VkSemaphoreCreateInfo semaphore_info{};
     semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;

@@ -149,14 +149,14 @@ public:
     ~GltfData() {}
 
     void update(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const uint32_t& active_anim_idx,
         const float& time);
 
     glm::mat4 getNodeMatrix(const int32_t& node_idx);
 
     void updateJoints(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         int32_t node_idx);
 
     void generateSharedDescriptorSet(
@@ -174,7 +174,7 @@ class GltfObject {
         kMaxNumObjects = 10240
     };
     const renderer::DeviceInfo& device_info_;
-    std::shared_ptr<GltfData> object_;
+    std::shared_ptr<GltfData>   object_;
     glm::mat4                   location_;
 
     // static members.
@@ -223,7 +223,9 @@ public:
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list);
 
-    void update(const renderer::DeviceInfo& device_info, const float& time);
+    void update(
+        const std::shared_ptr<renderer::Device>& device,
+        const float& time);
 
     void destroy() {
         if (object_) {

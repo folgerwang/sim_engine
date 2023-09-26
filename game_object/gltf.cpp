@@ -1363,7 +1363,7 @@ glm::mat4 GltfData::getNodeMatrix(const int32_t& node_idx) {
 }
 
 void GltfData::updateJoints(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     int32_t node_idx) {
     auto& node = nodes_[node_idx];
     if (node.skin_idx_ > -1)
@@ -1381,19 +1381,19 @@ void GltfData::updateJoints(
         }
 
         renderer::Helper::updateBufferWithSrcData(
-            device_info.device,
+            device,
             joint_matrices.size() * sizeof(glm::mat4),
             joint_matrices.data(),
             skin.joints_buffer_.memory);
     }
 
     for (auto& child : node.child_idx_) {
-        updateJoints(device_info, child);
+        updateJoints(device, child);
     }
 }
 
 void GltfData::update(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const uint32_t& active_anim_idx,
     const float& time) {
     // update all animations
@@ -1414,7 +1414,7 @@ void GltfData::update(
     if (animations_.size() > 0) {
         for (auto& scene : scenes_) {
             for (auto& node : scene.nodes_) {
-                updateJoints(device_info, node);
+                updateJoints(device, node);
             }
         }
     }
@@ -1960,10 +1960,10 @@ void GltfObject::draw(
 }
 
 void GltfObject::update(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const float& time) {
     if (object_) {
-        object_->update(device_info, 0, time);
+        object_->update(device, 0, time);
     }
 }
 
@@ -2020,7 +2020,7 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
         }
     }
 
-    gltf_object->update(device_info, 0, 0.0f);
+    gltf_object->update(device_info.device, 0, 0.0f);
 
     setupRaytracing(device_info, gltf_object);
 
