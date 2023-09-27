@@ -82,8 +82,9 @@ public:
         uint32_t draw_count = 1,
         uint32_t stride = sizeof(DrawIndirectCommand)) final;
     virtual void drawMeshTasks(
-        uint32_t task_count = 0,
-        uint32_t first_task = 0) final;
+        uint32_t group_count_x = 1,
+        uint32_t group_count_y = 1,
+        uint32_t group_count_z = 1) final;
     virtual void drawMeshTasksIndirect() final;
     virtual void drawMeshTasksIndirectCount() final;
     virtual void dispatch(

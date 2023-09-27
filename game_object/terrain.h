@@ -56,6 +56,7 @@ class TileObject {
     static std::shared_ptr<renderer::PipelineLayout> tile_flow_update_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline> tile_flow_update_pipeline_;
     static std::shared_ptr<renderer::PipelineLayout> tile_pipeline_layout_;
+    static std::shared_ptr<renderer::PipelineLayout> tile_grass_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline> tile_pipeline_;
     static std::shared_ptr<renderer::DescriptorSetLayout> tile_res_desc_set_layout_;
     static std::shared_ptr<renderer::DescriptorSet> tile_res_desc_set_[2];

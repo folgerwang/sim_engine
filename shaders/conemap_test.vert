@@ -15,7 +15,7 @@ layout(location = VINPUT_TEXCOORD0) in vec2 in_tex_coord;
 layout(location = VINPUT_NORMAL) in vec3 in_normal;
 layout(location = VINPUT_TANGENT) in vec3 in_tangent;
 
-layout(location = 0) out PbrVsPsData vs_out_data;
+layout(location = 0) out ObjectVsPsData vs_out_data;
 
 void main() {
     mat4 matrix_ws = model_params.model_mat;

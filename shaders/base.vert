@@ -56,7 +56,7 @@ layout(location = IINPUT_MAT_ROT_1) in vec3 in_loc_rot_mat_1;
 layout(location = IINPUT_MAT_ROT_2) in vec3 in_loc_rot_mat_2;
 layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
 
-layout(location = 0) out PbrVsPsData out_data;
+layout(location = 0) out ObjectVsPsData out_data;
 
 #ifdef HAS_NORMALS
 vec3 getNormal()

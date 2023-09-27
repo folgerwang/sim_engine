@@ -8,7 +8,7 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = THIN_FILM_LUT_INDEX) uniform sam
 #endif
 
 vec4 getVertexColor(
-    in PbrVsPsData in_data) {
+    in ObjectVsPsData in_data) {
    vec4 color = vec4(1.0, 1.0, 1.0, 1.0);
 
 #ifdef HAS_VERTEX_COLOR_VEC3
@@ -22,7 +22,7 @@ vec4 getVertexColor(
 }
 
 vec2 getBaseColorUV(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat) {
 #ifndef NO_MTL
     uint base_color_uv_set = in_mat.uv_set_flags.x & 0x0f;
@@ -39,7 +39,7 @@ vec2 getBaseColorUV(
 }
 
 vec2 getNormalUV(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat) {
 #ifndef NO_MTL
     uint normal_uv_set = (in_mat.uv_set_flags.x >> 4) & 0x0f;
@@ -56,7 +56,7 @@ vec2 getNormalUV(
 }
 
 vec2 getMetallicRoughnessUV(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat) {
 #ifndef NO_MTL
     uint metallic_roughness_uv_set = (in_mat.uv_set_flags.x >> 8) & 0x0f;
@@ -73,7 +73,7 @@ vec2 getMetallicRoughnessUV(
 }
 
 vec2 getEmissiveUV(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat) {
 #ifndef NO_MTL
     uint emissive_uv_set = (in_mat.uv_set_flags.x >> 12) & 0x0f;
@@ -90,7 +90,7 @@ vec2 getEmissiveUV(
 }
 
 vec2 getOcclusionUV(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat) {
 #ifndef NO_MTL
     uint occlusion_uv_set = (in_mat.uv_set_flags.x >> 16) & 0x0f;
@@ -108,7 +108,7 @@ vec2 getOcclusionUV(
 
 // Get normal, tangent and bitangent vectors.
 NormalInfo getNormalInfo(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat,
     in vec3 v) {
 #ifndef NO_MTL
@@ -190,7 +190,7 @@ NormalInfo getNormalInfo(
 }
 
 vec4 getBaseColor(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat) {
     vec4 baseColor = vec4(1, 1, 1, 1);
 #ifndef NO_MTL
@@ -242,7 +242,7 @@ float getMetallicRoughnessSpecularFactor(
 
 void getMetallicRoughnessInfo(
     inout MaterialInfo info,
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat,
     float f0_ior)
 {
@@ -494,7 +494,7 @@ vec3 toneMap(in PbrMaterialParams in_mat, vec3 color)
 
 #ifndef NO_MTL
 MaterialInfo setupMaterialInfo(
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_material,
     in NormalInfo normal_info,
     in vec3 view_dir,
@@ -669,7 +669,7 @@ void iblLighting(
 
 void punctualLighting(
     inout PbrLightsColorInfo color_info,
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_material,
     in MaterialInfo in_material_info,
     in Light light,
@@ -831,7 +831,7 @@ void punctualLighting(
 
 void layerBlending(
     inout PbrLightsColorInfo color_info,
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_material,
     in MaterialInfo in_material_info,
     in NormalInfo normal_info,
@@ -875,7 +875,7 @@ void layerBlending(
 
 vec3 getFinalColor(
     in PbrLightsColorInfo in_color_info,
-    in PbrVsPsData in_data,
+    in ObjectVsPsData in_data,
     in PbrMaterialParams in_material,
     in MaterialInfo in_material_info,
     in vec3 view_dir)

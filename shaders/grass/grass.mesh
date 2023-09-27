@@ -1,12 +1,12 @@
 #version 460
-#extension GL_NV_mesh_shader : enable
+#extension GL_EXT_mesh_shader : enable
 #include "..\global_definition.glsl.h"
 #include "..\terrain\tile_common.glsl.h"
 #include "..\noise.glsl.h"
 
-out gl_MeshPerVertexNV {
+out gl_MeshPerVertexEXT {
     vec4  gl_Position;
-} gl_MeshVerticesNV[];
+} gl_MeshVerticesEXT[];
 
 layout(push_constant) uniform TileUniformBufferObject {
     TileParams tile_params;
@@ -23,13 +23,17 @@ layout(location = 0) out VsPsData {
     vec2 tex_coord;
 } out_data[];
 
-layout(local_size_x = 16) in;
-layout(triangles, max_vertices=256, max_primitives=512) out;
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices=256, max_primitives=256) out;
 void main()
 {
     uint grass_idx = gl_GlobalInvocationID.x;
     uint local_idx = gl_LocalInvocationID.x;
     vec4 hash_values = clamp(hash43(vec3(tile_params.min, grass_idx)), 0.0f, 1.0f);
+
+    const uint num_vertex = 16 * 16;
+    const uint num_primitive = 16 * 14;
+    SetMeshOutputsEXT(num_vertex, num_primitive);
 
     // tile world position.
     vec2 pos_xz_ws = tile_params.min + hash_values.xy * tile_params.range;
@@ -63,22 +67,19 @@ void main()
         vec3 vert_ofs_0 = vec3(sincos_xy.x, 1.0f, sincos_xy.y) * vert_info[i_vert].xyx;
         vec3 vert_ofs_1 = vec3(-sincos_xy.x, 1.0f, -sincos_xy.y) * vert_info[i_vert].xyx;
         uint v_idx = local_idx * 16 + i_vert * 2;
-        gl_MeshVerticesNV[v_idx].gl_Position =
+        gl_MeshVerticesEXT[v_idx].gl_Position =
             camera_info.view_proj * vec4(grass_root_pos + vert_ofs_0, 1.0);
         out_data[v_idx].tex_coord = vec2(0.5 + vert_info[i_vert].x, vert_info[i_vert].y);
-        gl_MeshVerticesNV[v_idx+1].gl_Position =
+        gl_MeshVerticesEXT[v_idx+1].gl_Position =
             camera_info.view_proj * vec4(grass_root_pos + vert_ofs_1, 1.0);
         out_data[v_idx+1].tex_coord = vec2(0.5 - vert_info[i_vert].x, vert_info[i_vert].y);
     }
 
     for (int i_poly = 0; i_poly < 14; i_poly++) {
-        gl_PrimitiveIndicesNV[local_idx * 42 + i_poly * 3 + 0] = local_idx * 16 + i_poly;
-        gl_PrimitiveIndicesNV[local_idx * 42 + i_poly * 3 + 1] = local_idx * 16 + i_poly + 1;
-        gl_PrimitiveIndicesNV[local_idx * 42 + i_poly * 3 + 2] = local_idx * 16 + i_poly + 2;
-    }
-
-    if (local_idx == 0) {
-        gl_PrimitiveCountNV = 16 * 14;
+        gl_PrimitiveTriangleIndicesEXT[local_idx * 14 + i_poly] =
+            uvec3(local_idx * 16 + i_poly,
+                  local_idx * 16 + i_poly + 1,
+                  local_idx * 16 + i_poly + 2);
     }
 }
     

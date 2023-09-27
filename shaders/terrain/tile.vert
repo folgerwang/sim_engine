@@ -10,12 +10,7 @@ layout(push_constant) uniform TileUniformBufferObject {
     TileParams tile_params;
 };
 
-layout(location = 0) out VsPsData {
-    vec3    vertex_position;
-    vec2    world_map_uv;
-    vec3    test_color;
-    float   water_depth;
-} out_data;
+layout(location = 0) out TileVsPsData out_data;
 
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;

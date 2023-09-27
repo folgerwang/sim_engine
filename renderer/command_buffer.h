@@ -75,9 +75,14 @@ public:
         uint32_t buffer_offset = 0,
         uint32_t draw_count = 1,
         uint32_t stride = sizeof(DrawIndirectCommand)) = 0;
+    typedef void (VKAPI_PTR* PFN_vkCmdDrawMeshTasksEXT)(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+    typedef void (VKAPI_PTR* PFN_vkCmdDrawMeshTasksIndirectEXT)(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride);
+    typedef void (VKAPI_PTR* PFN_vkCmdDrawMeshTasksIndirectCountEXT)(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride);
+
     virtual void drawMeshTasks(
-        uint32_t task_count = 0,
-        uint32_t first_task = 0) = 0;
+        uint32_t group_count_x = 1,
+        uint32_t group_count_y = 1,
+        uint32_t group_count_z = 1) = 0;
     virtual void drawMeshTasksIndirect() = 0;
     virtual void drawMeshTasksIndirectCount() = 0;
     virtual void dispatch(

@@ -17,7 +17,7 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform Mate
 
 #include "ibl.glsl.h"
 
-layout(location = 0) in PbrVsPsData ps_in_data;
+layout(location = 0) in ObjectVsPsData ps_in_data;
 
 layout(location = 0) out vec4 outColor;
 

@@ -22,9 +22,9 @@ PFN_vkBuildAccelerationStructuresKHR vkBuildAccelerationStructuresKHR;
 PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR;
 PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR;
 PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
-PFN_vkCmdDrawMeshTasksNV vkCmdDrawMeshTasksNV;
-PFN_vkCmdDrawMeshTasksIndirectNV vkCmdDrawMeshTasksIndirectNV;
-PFN_vkCmdDrawMeshTasksIndirectCountNV vkCmdDrawMeshTasksIndirectCountNV;
+PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT;
+PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT;
+PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT;
 
 namespace helper {
 
@@ -45,8 +45,13 @@ const std::vector<const char*> device_extensions = {
     VK_KHR_SPIRV_1_4_EXTENSION_NAME,
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
     VK_KHR_DEVICE_GROUP_EXTENSION_NAME,
-    VK_NV_MESH_SHADER_EXTENSION_NAME,
+    VK_EXT_MESH_SHADER_EXTENSION_NAME,
     VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+    VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+    VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
+    VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+    VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME,
 };
 
 #ifdef NDEBUG
@@ -672,9 +677,8 @@ VkShaderStageFlagBits toVkShaderStageFlagBits(renderer::ShaderStageFlagBits stag
     else if (stage == renderer::ShaderStageFlagBits::MISS_BIT_KHR) return VK_SHADER_STAGE_MISS_BIT_KHR;
     else if (stage == renderer::ShaderStageFlagBits::INTERSECTION_BIT_KHR) return VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
     else if (stage == renderer::ShaderStageFlagBits::CALLABLE_BIT_KHR) return VK_SHADER_STAGE_CALLABLE_BIT_KHR;
-    else if (stage == renderer::ShaderStageFlagBits::TASK_BIT_NV) return VK_SHADER_STAGE_TASK_BIT_NV;
-    else if (stage == renderer::ShaderStageFlagBits::MESH_BIT_NV) return VK_SHADER_STAGE_MESH_BIT_NV;
-    else if (stage == renderer::ShaderStageFlagBits::MESH_BIT_NV) return VK_SHADER_STAGE_MESH_BIT_NV;
+    else if (stage == renderer::ShaderStageFlagBits::TASK_BIT_EXT) return VK_SHADER_STAGE_TASK_BIT_EXT;
+    else if (stage == renderer::ShaderStageFlagBits::MESH_BIT_EXT) return VK_SHADER_STAGE_MESH_BIT_EXT;
     return VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
 };
 
@@ -792,8 +796,8 @@ VkPipelineStageFlags toVkPipelineStageFlags(renderer::PipelineStageFlags flags) 
     ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, RAY_TRACING_SHADER_BIT_KHR);
     ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
     ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, SHADING_RATE_IMAGE_BIT_NV);
-    ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, TASK_SHADER_BIT_NV);
-    ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, MESH_SHADER_BIT_NV);
+    ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, TASK_SHADER_BIT_EXT);
+    ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, MESH_SHADER_BIT_EXT);
     ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, FRAGMENT_DENSITY_PROCESS_BIT_EXT);
     ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, COMMAND_PREPROCESS_BIT_NV);
     return result;
@@ -813,8 +817,8 @@ VkShaderStageFlags toVkShaderStageFlags(renderer::ShaderStageFlags flags) {
     ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, MISS_BIT_KHR);
     ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, INTERSECTION_BIT_KHR);
     ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, CALLABLE_BIT_KHR);
-    ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, TASK_BIT_NV);
-    ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, MESH_BIT_NV);
+    ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, TASK_BIT_EXT);
+    ADD_FLAG_BIT(ShaderStage, SHADER_STAGE, MESH_BIT_EXT);
 
     return result;
 }
@@ -1830,6 +1834,27 @@ void initRayTracing(const VkPhysicalDevice& device)
     vkGetPhysicalDeviceFeatures2(device, &device_features2);
 }
 
+//--------------------------------------------------------------------------------------------------
+// Initialize Vulkan mesh shader
+void initMeshShader(const VkPhysicalDevice& device)
+{
+    VkPhysicalDeviceMeshShaderPropertiesEXT
+        ms_properties{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
+
+    // Requesting ray tracing properties
+    VkPhysicalDeviceProperties2 prop2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    prop2.pNext = &ms_properties;
+    vkGetPhysicalDeviceProperties2(device, &prop2);
+
+    VkPhysicalDeviceMeshShaderFeaturesEXT ms_features{};
+    ms_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+    VkPhysicalDeviceFeatures2 device_features2{};
+    device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    device_features2.pNext = &ms_features;
+    vkGetPhysicalDeviceFeatures2(device, &device_features2);
+}
+
 bool isDeviceSuitable(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface) {
@@ -1840,6 +1865,8 @@ bool isDeviceSuitable(
     auto device = vk_physical_device->get();
 
     initRayTracing(device);
+
+    initMeshShader(device);
 
     bool extensions_supported = checkDeviceExtensionSupport(physical_device);
 
@@ -1945,6 +1972,8 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     VkPhysicalDeviceBufferDeviceAddressFeatures enabled_buffer_device_address_features{};
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR enabled_ray_tracing_pipeline_features{};
     VkPhysicalDeviceAccelerationStructureFeaturesKHR enabled_acceleration_structure_features{};
+    VkPhysicalDeviceMeshShaderFeaturesEXT enabled_mesh_shader_features{};
+    VkPhysicalDeviceMaintenance4Features enabled_maintenance4_features{};
 
     // Enable features required for ray tracing using feature chaining via pNext		
     enabled_buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
@@ -1958,11 +1987,20 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_acceleration_structure_features.accelerationStructure = VK_TRUE;
     enabled_acceleration_structure_features.pNext = &enabled_ray_tracing_pipeline_features;
 
+    enabled_mesh_shader_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+    enabled_mesh_shader_features.meshShader = VK_TRUE;
+    enabled_mesh_shader_features.taskShader = VK_TRUE;
+    enabled_mesh_shader_features.pNext = &enabled_acceleration_structure_features;
+
+    enabled_maintenance4_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES;
+    enabled_maintenance4_features.maintenance4 = VK_TRUE;
+    enabled_maintenance4_features.pNext = &enabled_mesh_shader_features;
+
     // If a pNext(Chain) has been passed, we need to add it to the device creation info
     VkPhysicalDeviceFeatures2 physical_device_features2{};
     physical_device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     physical_device_features2.features = device_features;
-    physical_device_features2.pNext = &enabled_acceleration_structure_features;
+    physical_device_features2.pNext = &enabled_maintenance4_features;
     create_info.pEnabledFeatures = nullptr;
     create_info.pNext = &physical_device_features2;
 
@@ -1996,9 +2034,9 @@ void initRayTracingProperties(
     vkCmdTraceRaysKHR = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(vkGetDeviceProcAddr(vk_device, "vkCmdTraceRaysKHR"));
     vkGetRayTracingShaderGroupHandlesKHR = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(vkGetDeviceProcAddr(vk_device, "vkGetRayTracingShaderGroupHandlesKHR"));
     vkCreateRayTracingPipelinesKHR = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(vkGetDeviceProcAddr(vk_device, "vkCreateRayTracingPipelinesKHR"));
-    vkCmdDrawMeshTasksNV = reinterpret_cast<PFN_vkCmdDrawMeshTasksNV>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksNV"));
-    vkCmdDrawMeshTasksIndirectNV = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectNV>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectNV"));
-    vkCmdDrawMeshTasksIndirectCountNV = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectCountNV>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectCountNV"));
+    vkCmdDrawMeshTasksEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksEXT"));
+    vkCmdDrawMeshTasksIndirectEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectEXT"));
+    vkCmdDrawMeshTasksIndirectCountEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectCountEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectCountEXT"));
 
     // Get ray tracing pipeline properties, which will be used later on in the sample
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR  ray_tracing_pipeline_properties{};

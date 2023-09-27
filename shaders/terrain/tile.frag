@@ -17,11 +17,7 @@ layout(push_constant) uniform TileUniformBufferObject {
     TileParams tile_params;
 };
 
-layout(location = 0) in VsPsData {
-    vec3 vertex_position;
-    vec2 world_map_uv;
-    vec3 test_color;
-} in_data;
+layout(location = 0) in TileVsPsData in_data;
 
 layout(location = 0) out vec4 outColor;
 

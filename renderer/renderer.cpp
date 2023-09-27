@@ -90,6 +90,7 @@ void Helper::init(const DeviceInfo& device_info) {
     image_as_store_ = {
         ImageLayout::GENERAL,
         SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) |
         SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
 
     image_as_shader_sampler_ = {

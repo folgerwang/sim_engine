@@ -22,7 +22,7 @@
 #include "terrain.h"
 #include "shaders/global_definition.glsl.h"
 
-#define USE_MESH_SHADER
+#define USE_MESH_SHADER 1
 
 #if 0
 float tree_line = 0.0f;
@@ -1796,7 +1796,7 @@ static renderer::ShaderModuleList getTileMeshShaderModules(
         renderer::helper::loadShaderModule(
             device,
             ms_name,
-            renderer::ShaderStageFlagBits::MESH_BIT_NV);
+            renderer::ShaderStageFlagBits::MESH_BIT_EXT);
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
@@ -1807,7 +1807,7 @@ static renderer::ShaderModuleList getTileMeshShaderModules(
             renderer::helper::loadShaderModule(
                 device,
                 ts_name,
-                renderer::ShaderStageFlagBits::TASK_BIT_NV));
+                renderer::ShaderStageFlagBits::TASK_BIT_EXT));
     }
     return shader_modules;
 }
@@ -1886,12 +1886,12 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescript
     bindings[2] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ROCK_LAYER_BUFFER_INDEX,
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV) |
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT) |
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
     bindings[3] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SOIL_WATER_LAYER_BUFFER_INDEX,
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV) |
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT) |
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
     bindings[4] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ORTHER_INFO_LAYER_BUFFER_INDEX,
@@ -1956,8 +1956,26 @@ static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+    push_const_range.offset = 0;
+    push_const_range.size = sizeof(glsl::TileParams);
+
+    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+}
+
+static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::DescriptorSetLayoutList& desc_set_layouts) {
+    renderer::PushConstantRange push_const_range{};
+    push_const_range.stage_flags =
+#if USE_MESH_SHADER
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV);
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT);
+#else
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
+        SET_FLAG_BIT(ShaderStage, GEOMETRY_BIT);
+#endif
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileParams);
 
@@ -2011,12 +2029,19 @@ static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const glm::uvec2& display_size) {
 
-#ifdef    USE_MESH_SHADER
+#if    USE_MESH_SHADER
     auto shader_modules =
-        getTileMeshShaderModules(device, "grass/grass_mesh.spv", "grass/grass_frag.spv");
+        getTileMeshShaderModules(
+            device,
+            "grass/grass_mesh.spv",
+            "grass/grass_frag.spv");
 #else
     auto shader_modules =
-        getTileShaderModules(device, "grass/grass_vert.spv", "grass/grass_frag.spv", "grass/grass_geom.spv");
+        getTileShaderModules(
+            device,
+            "grass/grass_vert.spv",
+            "grass/grass_frag.spv",
+            "grass/grass_geom.spv");
 #endif
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
@@ -2104,6 +2129,7 @@ std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_flow_update_desc
 std::shared_ptr<renderer::PipelineLayout> TileObject::tile_flow_update_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline> TileObject::tile_flow_update_pipeline_;
 std::shared_ptr<renderer::PipelineLayout> TileObject::tile_pipeline_layout_;
+std::shared_ptr<renderer::PipelineLayout> TileObject::tile_grass_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline> TileObject::tile_pipeline_;
 std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_res_desc_set_layout_;
 std::shared_ptr<renderer::DescriptorSet> TileObject::tile_res_desc_set_[2];
@@ -2293,13 +2319,20 @@ void TileObject::createStaticMembers(
                 "terrain/tile_water_frag.spv");
     }
 
+    if (tile_grass_pipeline_layout_ == nullptr) {
+        tile_grass_pipeline_layout_ =
+            createTileGrassPipelineLayout(
+                device,
+                desc_set_layouts);
+    }
+
     if (tile_grass_pipeline_ == nullptr) {
-        assert(tile_pipeline_layout_);
+        assert(tile_grass_pipeline_layout_);
         tile_grass_pipeline_ =
             createGrassPipeline(
                 device,
                 render_pass,
-                tile_pipeline_layout_,
+                tile_grass_pipeline_layout_,
                 graphic_double_face_pipeline_info,
                 display_size);
     }
@@ -2441,6 +2474,11 @@ void TileObject::recreateStaticMembers(
         tile_pipeline_layout_ = nullptr;
     }
 
+    if (tile_grass_pipeline_layout_) {
+        device->destroyPipelineLayout(tile_grass_pipeline_layout_);
+        tile_grass_pipeline_layout_ = nullptr;
+    }
+
     if (tile_pipeline_) {
         device->destroyPipeline(tile_pipeline_);
         tile_pipeline_ = nullptr;
@@ -2479,6 +2517,7 @@ void TileObject::destoryStaticMembers(
     device->destroyPipeline(tile_update_pipeline_);
     device->destroyPipeline(tile_flow_update_pipeline_);
     device->destroyPipelineLayout(tile_pipeline_layout_);
+    device->destroyPipelineLayout(tile_grass_pipeline_layout_);
     device->destroyPipeline(tile_pipeline_);
     device->destroyPipeline(tile_water_pipeline_);
     device->destroyPipeline(tile_grass_pipeline_);
@@ -2891,10 +2930,15 @@ void TileObject::drawGrass(
     tile_params.time = cur_time;
     tile_params.tile_index = block_idx_;
     cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_NV) |
+#if USE_MESH_SHADER
+        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT) |
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-        tile_pipeline_layout_,
+#else
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
+        SET_FLAG_BIT(ShaderStage, GEOMETRY_BIT),
+#endif
+        tile_grass_pipeline_layout_,
         &tile_params,
         sizeof(tile_params));
 
@@ -2903,11 +2947,12 @@ void TileObject::drawGrass(
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
-        tile_pipeline_layout_,
+        tile_grass_pipeline_layout_,
         new_desc_sets);
 
-#ifdef    USE_MESH_SHADER
-    cmd_buf->drawMeshTasks((static_cast<uint32_t>(num_grass * 2) + 15) / 16);
+#if    USE_MESH_SHADER
+    cmd_buf->drawMeshTasks(
+        (static_cast<uint32_t>(num_grass * 2) + 15) / 16);
 #else
     cmd_buf->drawIndexedIndirect(
         grass_indirect_draw_cmd_,

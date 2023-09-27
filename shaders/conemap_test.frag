@@ -23,7 +23,7 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform Mate
 #include "ibl.glsl.h"
 #include "pbr_lighting.glsl.h"
 
-layout(location = 0) in PbrVsPsData in_data;
+layout(location = 0) in ObjectVsPsData in_data;
 
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = CONEMAP_TEX_INDEX) uniform sampler2D conemap_tex;
 /*
@@ -118,7 +118,7 @@ vec3 relaxedConeStepping(vec3 iv, vec3 ip, bool use_conserve_conemap)
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    PbrVsPsData ps_in_data = in_data;
+    ObjectVsPsData ps_in_data = in_data;
     mat3 world2local =
         mat3(
             ps_in_data.vertex_tangent,

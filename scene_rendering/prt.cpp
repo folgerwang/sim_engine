@@ -82,7 +82,9 @@ namespace {
             images.push_back(tex->image);
         }
 
-        er::helper::transitMapTextureToStoreImage(cmd_buf, images);
+        er::helper::transitMapTextureToStoreImage(
+            cmd_buf,
+            images);
 
         cmd_buf->bindPipeline(
             er::PipelineBindPoint::COMPUTE,
@@ -107,7 +109,10 @@ namespace {
             (params.size.y + 7) / 8,
             1);
 
-        er::helper::transitMapTextureFromStoreImage(cmd_buf, images/*, er::ImageLayout::GENERAL*/);
+        er::helper::transitMapTextureFromStoreImage(
+            cmd_buf,
+            images,
+            er::ImageLayout::GENERAL);
     }
 
 } // namespace
@@ -377,7 +382,9 @@ void Prt::update(
             images.push_back(tex->image);
         }
 
-        renderer::helper::transitMapTextureToStoreImage(cmd_buf, images);
+        renderer::helper::transitMapTextureToStoreImage(
+            cmd_buf,
+            images);
 
         cmd_buf->bindPipeline(
             renderer::PipelineBindPoint::COMPUTE,
@@ -406,7 +413,10 @@ void Prt::update(
             (src_size.y + 7) / 8,
             1);
 
-        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, images/*, renderer::ImageLayout::GENERAL*/);
+        renderer::helper::transitMapTextureFromStoreImage(
+            cmd_buf,
+            images,
+            renderer::ImageLayout::GENERAL);
     }
 
     MinmaxDownsample(
@@ -490,7 +500,10 @@ void Prt::update(
             (src_size.y + 7) / 8,
             1);
 
-        renderer::helper::transitMapTextureFromStoreImage(cmd_buf, { conemap_obj->getPackTexture()->image});
+        cmd_buf->addImageBarrier(
+            conemap_obj->getPackTexture()->image,
+            er::Helper::getImageAsStore(),
+            er::Helper::getImageAsStore());
     }
 }
 

@@ -591,7 +591,7 @@ struct PbrMaterialParams {
     mat3            metallic_roughness_uv_transform;
 };
 
-struct PbrVsPsData {
+struct ObjectVsPsData {
     vec3 vertex_position;
     vec4 vertex_tex_coord;
 #ifdef HAS_NORMALS
@@ -607,6 +607,13 @@ struct PbrVsPsData {
 #ifdef HAS_VERTEX_COLOR_VEC4
     vec4 vertex_color;
 #endif
+};
+
+struct TileVsPsData {
+    vec3    vertex_position;
+    vec2    world_map_uv;
+    vec3    test_color;
+    float   water_depth;
 };
 
 struct PbrLightsColorInfo {

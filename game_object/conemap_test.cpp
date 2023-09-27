@@ -339,7 +339,8 @@ ConemapTest::ConemapTest(
     uniform_buffer_ = std::make_shared<renderer::BufferInfo>();
     device_info.device->createBuffer(
         sizeof(glsl::PbrMaterialParams),
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
+        SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
         SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
         0,
