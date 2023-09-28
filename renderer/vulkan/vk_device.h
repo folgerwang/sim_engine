@@ -13,6 +13,7 @@ class VulkanDevice : public Device {
     std::shared_ptr<CommandPool> transient_cmd_pool_;
     std::shared_ptr<CommandBuffer> transient_cmd_buffer_;
     std::shared_ptr<Queue> transient_compute_queue_;
+    std::shared_ptr<Fence> transient_fence_;
     std::vector<std::shared_ptr<Buffer>> buffer_list_;
     std::vector<std::shared_ptr<Image>> image_list_;
     std::vector<std::shared_ptr<ImageView>> image_view_list_;
@@ -34,11 +35,8 @@ public:
     virtual ~VulkanDevice() final;
 
     VkDevice get() { return device_; }
-    virtual std::shared_ptr<CommandBuffer> getIntransitCommandBuffer() final {
-        return transient_cmd_buffer_; }
-    virtual std::shared_ptr<Queue> getIntransitComputeQueue() final {
-        return transient_compute_queue_;
-    }
+    virtual std::shared_ptr<CommandBuffer> setupTransientCommandBuffer() final;
+    virtual void submitAndWaitTransientCommandBuffer() final;
     const std::shared_ptr<PhysicalDevice>& getPhysicalDevice() {
         return physical_device_; }
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool() final;

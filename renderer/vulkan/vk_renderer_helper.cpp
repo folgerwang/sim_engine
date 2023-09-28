@@ -2293,20 +2293,13 @@ void copyBuffer(
     uint64_t src_offset /* = 0*/,
     uint64_t dst_offset /* = 0*/) {
 
-    auto cmd_buf = device->getIntransitCommandBuffer();
-    auto cmd_queue = device->getIntransitComputeQueue();
-    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-
+    auto cmd_buf = device->setupTransientCommandBuffer();
     std::vector<renderer::BufferCopyInfo> copy_regions(1);
     copy_regions[0].src_offset = src_offset;
     copy_regions[0].dst_offset = dst_offset;
     copy_regions[0].size = buffer_size;
     cmd_buf->copyBuffer(src_buffer, dst_buffer, copy_regions);
-
-    cmd_buf->endCommandBuffer();
-    cmd_queue->submit({ cmd_buf });
-    cmd_queue->waitIdle();
-    cmd_buf->reset(0);
+    device->submitAndWaitTransientCommandBuffer();
 }
 
 bool hasStencilComponent(const renderer::Format& format) {
@@ -2453,19 +2446,14 @@ void transitionImageLayout(
     uint32_t base_layer/* = 0*/,
     uint32_t layer_count/* = 1*/) {
 
-    auto cmd_buf = device->getIntransitCommandBuffer();
-    auto cmd_queue = device->getIntransitComputeQueue();
-    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    auto cmd_buf = device->setupTransientCommandBuffer();
     vk::helper::transitionImageLayout(
         cmd_buf,
         image,
         format,
         old_layout,
         new_layout);
-    cmd_buf->endCommandBuffer();
-    cmd_queue->submit({ cmd_buf });
-    cmd_queue->waitIdle();
-    cmd_buf->reset(0);
+    device->submitAndWaitTransientCommandBuffer();
 }
 
 void copyBufferToImageWithMips(

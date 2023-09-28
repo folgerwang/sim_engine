@@ -34,7 +34,9 @@ void VulkanInstance::destroy() {
     vkDestroyInstance(instance_, nullptr);
 }
 
-void VulkanQueue::submit(const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers) {
+void VulkanQueue::submit(
+    const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
+    const std::shared_ptr<Fence>& in_flight_fence) {
     std::vector<VkCommandBuffer> vk_cmd_bufs(command_buffers.size());
     for (int i = 0; i < command_buffers.size(); i++) {
         auto vk_cmd_buf = RENDER_TYPE_CAST(CommandBuffer, command_buffers[i]);
@@ -46,7 +48,17 @@ void VulkanQueue::submit(const std::vector<std::shared_ptr<CommandBuffer>>& comm
     submit_info.commandBufferCount = static_cast<uint32_t>(command_buffers.size());
     submit_info.pCommandBuffers = vk_cmd_bufs.data();
 
-    vkQueueSubmit(queue_, 1, &submit_info, VK_NULL_HANDLE);
+    auto vk_in_flight_fence = RENDER_TYPE_CAST(Fence, in_flight_fence);
+    auto result =
+        vkQueueSubmit(
+            queue_,
+            1,
+            &submit_info,
+            vk_in_flight_fence ? vk_in_flight_fence->get() : VK_NULL_HANDLE);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("failed to submit command queue!");
+    }
 }
 
 void VulkanQueue::waitIdle() {
@@ -385,9 +397,7 @@ void Helper::create2DTextureImage(
         texture_image,
         texture_image_memory);
 
-    auto cmd_buf = device->getIntransitCommandBuffer();
-    auto cmd_queue = device->getIntransitComputeQueue();
-    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    auto cmd_buf = device->setupTransientCommandBuffer();
     vk::helper::transitionImageLayout(
         cmd_buf,
         texture_image,
@@ -405,10 +415,7 @@ void Helper::create2DTextureImage(
         format,
         ImageLayout::TRANSFER_DST_OPTIMAL,
         ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    cmd_buf->endCommandBuffer();
-    cmd_queue->submit({ cmd_buf });
-    cmd_queue->waitIdle();
-    cmd_buf->reset(0);
+    device->submitAndWaitTransientCommandBuffer();
 
     device->destroyBuffer(staging_buffer);
     device->freeMemory(staging_buffer_memory);
@@ -475,9 +482,7 @@ void Helper::dumpTextureImage(
         staging_buffer,
         staging_buffer_memory);
 
-    auto cmd_buf = device->getIntransitCommandBuffer();
-    auto cmd_queue = device->getIntransitComputeQueue();
-    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    auto cmd_buf = device->setupTransientCommandBuffer();
     vk::helper::transitionImageLayout(
         cmd_buf,
         src_texture_image,
@@ -495,10 +500,7 @@ void Helper::dumpTextureImage(
         format,
         ImageLayout::TRANSFER_SRC_OPTIMAL,
         ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    cmd_buf->endCommandBuffer();
-    cmd_queue->submit({ cmd_buf });
-    cmd_queue->waitIdle();
-    cmd_buf->reset(0);
+    device->submitAndWaitTransientCommandBuffer();
 
     device->dumpBufferMemory(staging_buffer_memory, buffer_size, pixels);
 
@@ -621,10 +623,7 @@ void Helper::createCubemapTexture(
     device->bindImageMemory(texture.image, texture.memory);
 
     if (data) {
-        auto cmd_buf = device->getIntransitCommandBuffer();
-        auto cmd_queue = device->getIntransitComputeQueue();
-        cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-
+        auto cmd_buf = device->setupTransientCommandBuffer();
         vk::helper::transitionImageLayout(
             cmd_buf,
             texture.image,
@@ -650,11 +649,7 @@ void Helper::createCubemapTexture(
             mip_count,
             0,
             6);
-
-        cmd_buf->endCommandBuffer();
-        cmd_queue->submit({ cmd_buf });
-        cmd_queue->waitIdle();
-        cmd_buf->reset(0);
+        device->submitAndWaitTransientCommandBuffer();
     }
 
     texture.view = device->createImageView(
@@ -878,7 +873,7 @@ ImTextureID Helper::addImTextureID(
 }
 
 void Helper::submitQueue(
-    const std::shared_ptr<Queue>& graphic_queue,
+    const std::shared_ptr<Queue>& command_queue,
     const std::shared_ptr<Fence>& in_flight_fence,
     const std::vector<std::shared_ptr<Semaphore>>& wait_semaphores,
     const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
@@ -912,7 +907,7 @@ void Helper::submitQueue(
     if (signal_semaphore_values.size() > 0) {
         VkTimelineSemaphoreSubmitInfo timeline_info = {};
         timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timeline_info.signalSemaphoreValueCount = static_cast<uint32_t>(signal_semaphore_values.size());  // We're signaling one semaphore in this example
+        timeline_info.signalSemaphoreValueCount = static_cast<uint32_t>(signal_semaphore_values.size());
         timeline_info.pSignalSemaphoreValues = signal_semaphore_values.data();
         timeline_info.waitSemaphoreValueCount = 0;
         timeline_info.pWaitSemaphoreValues = nullptr;
@@ -920,9 +915,15 @@ void Helper::submitQueue(
         submit_info.pNext = &timeline_info;
     }
 
-    auto vk_graphic_queue = RENDER_TYPE_CAST(Queue, graphic_queue);
+    auto vk_command_queue = RENDER_TYPE_CAST(Queue, command_queue);
     auto vk_in_flight_fence = RENDER_TYPE_CAST(Fence, in_flight_fence);
-    if (vkQueueSubmit(vk_graphic_queue->get(), 1, &submit_info, vk_in_flight_fence ? vk_in_flight_fence->get() : nullptr) != VK_SUCCESS) {
+    auto result =
+        vkQueueSubmit(
+            vk_command_queue->get(),
+            1,
+            &submit_info,
+            vk_in_flight_fence ? vk_in_flight_fence->get() : nullptr);
+    if (result != VK_SUCCESS) {
         throw std::runtime_error("failed to submit draw command buffer!");
     }
 }
@@ -1021,22 +1022,14 @@ void Helper::initImgui(
 
     // Upload Fonts
     {
-        auto cmd_buf = device->getIntransitCommandBuffer();
-        auto cmd_queue = device->getIntransitComputeQueue();
-        cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-
+        auto cmd_buf = device->setupTransientCommandBuffer();
         ImGui_ImplVulkan_CreateFontsTexture(
             RENDER_TYPE_CAST(
                 CommandBuffer,
                 cmd_buf
             )->get()
         );
-
-        cmd_buf->endCommandBuffer();
-        cmd_queue->submit({ cmd_buf });
-        cmd_queue->waitIdle();
-        cmd_buf->reset(0);
-
+        device->submitAndWaitTransientCommandBuffer();
         ImGui_ImplVulkan_DestroyFontUploadObjects();
     }
 }

@@ -20,7 +20,9 @@ namespace renderer {
 
 class Queue {
 public:
-    virtual void submit(const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers) = 0;
+    virtual void submit(
+        const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
+        const std::shared_ptr<Fence>& in_flight_fence) = 0;
     virtual void waitIdle() = 0;
 };
 
@@ -131,7 +133,9 @@ public:
     VkQueue get() { return queue_; }
     void set(const VkQueue& queue) { queue_ = queue; }
 
-    virtual void submit(const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers) final;
+    virtual void submit(
+        const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
+        const std::shared_ptr<Fence>& in_flight_fence) final;
     virtual void waitIdle() final;
 };
 

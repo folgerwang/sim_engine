@@ -38,6 +38,8 @@ VulkanDevice::VulkanDevice(
         getDeviceQueue(
             compute_queue_index,
             transit_queue_index);
+
+    transient_fence_ = createFence();
 }
 
 VulkanDevice::~VulkanDevice()
@@ -53,6 +55,21 @@ VulkanDevice::~VulkanDevice()
     assert(render_pass_list_.size() == 0);
     assert(semaphore_list_.size() == 0);
     assert(fence_list_.size() == 0);
+}
+
+std::shared_ptr<CommandBuffer> VulkanDevice::setupTransientCommandBuffer() {
+    transient_cmd_buffer_->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    return transient_cmd_buffer_;
+}
+
+void VulkanDevice::submitAndWaitTransientCommandBuffer() {
+    transient_cmd_buffer_->endCommandBuffer();
+    transient_compute_queue_->submit(
+        { transient_cmd_buffer_ },
+        transient_fence_);
+    waitForFences({ transient_fence_ });
+    resetFences({ transient_fence_ });
+    transient_cmd_buffer_->reset(0);
 }
 
 std::shared_ptr<Buffer> VulkanDevice::createBuffer(
@@ -1106,6 +1123,8 @@ void VulkanDevice::destroy() {
 
     destroyCommandPool(
         transient_cmd_pool_);
+
+    destroyFence(transient_fence_);
 
     vkDestroyDevice(device_, nullptr);
 }

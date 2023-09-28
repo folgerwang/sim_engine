@@ -226,14 +226,9 @@ void RayTracingShadowTest::initBottomLevelDataInfo(
 
     // Build the acceleration structure on the device via a one-time command buffer submission
     // Some implementations may support acceleration structure building on the host (VkPhysicalDeviceAccelerationStructureFeaturesKHR->accelerationStructureHostCommands), but we prefer device builds
-    auto cmd_buf = device->getIntransitCommandBuffer();
-    auto cmd_queue = device->getIntransitComputeQueue();
-    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    auto cmd_buf = device->setupTransientCommandBuffer();
     cmd_buf->buildAccelerationStructures({ as_build_geometry_info }, as_build_range_infos);
-    cmd_buf->endCommandBuffer();
-    cmd_queue->submit({ cmd_buf });
-    cmd_queue->waitIdle();
-    cmd_buf->reset(0);
+    device->submitAndWaitTransientCommandBuffer();
 
     bl_data_info->as_device_address =
         device->getAccelerationStructureDeviceAddress(bl_data_info->as_handle);
@@ -339,14 +334,9 @@ void RayTracingShadowTest::initTopLevelDataInfo(
 
     // Build the acceleration structure on the device via a one-time command buffer submission
     // Some implementations may support acceleration structure building on the host (VkPhysicalDeviceAccelerationStructureFeaturesKHR->accelerationStructureHostCommands), but we prefer device builds
-    auto cmd_buf = device->getIntransitCommandBuffer();
-    auto cmd_queue = device->getIntransitComputeQueue();
-    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    auto cmd_buf = device->setupTransientCommandBuffer();
     cmd_buf->buildAccelerationStructures({ as_build_geometry_info }, { as_build_range_info });
-    cmd_buf->endCommandBuffer();
-    cmd_queue->submit({ cmd_buf });
-    cmd_queue->waitIdle();
-    cmd_buf->reset(0);
+    device->submitAndWaitTransientCommandBuffer();
 
     tl_data_info->as_device_address =
         device->getAccelerationStructureDeviceAddress(tl_data_info->as_handle);
