@@ -22,7 +22,7 @@ class VolumeCloud {
 
 public:
     VolumeCloud(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::DescriptorSetLayout>& view_desc_set_layout,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -38,7 +38,7 @@ public:
         const glm::uvec2& display_size);
 
     void recreate(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::DescriptorSetLayout>& view_desc_set_layout,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,

@@ -7,7 +7,6 @@ namespace engine {
 namespace game_object {
 
 class GameCamera {
-    const renderer::DeviceInfo& device_info_;
 
     static std::shared_ptr<renderer::DescriptorSet> update_game_camera_desc_set_[2];
     static std::shared_ptr<renderer::DescriptorSetLayout> update_game_camera_desc_set_layout_;
@@ -18,10 +17,10 @@ class GameCamera {
 public:
     GameCamera() = delete;
     GameCamera(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
 
-    void update(const renderer::DeviceInfo& device_info, const float& time);
+    void update(const std::shared_ptr<renderer::Device>& device, const float& time);
 
     static void createGameCameraUpdateDescSet(
         const std::shared_ptr<renderer::Device>& device,
@@ -60,7 +59,7 @@ public:
         const renderer::TextureInfo& soil_water_layer_1,
         const renderer::BufferInfo& game_objects_buffer);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
     static void updateGameCameraBuffer(

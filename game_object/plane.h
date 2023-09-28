@@ -7,7 +7,7 @@ namespace game_object {
 
 class Plane : public ShapeBase {
 public:
-    Plane(const renderer::DeviceInfo& device_info);
+    Plane(const std::shared_ptr<renderer::Device>& device);
     void draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf);
 };
 

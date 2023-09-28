@@ -315,18 +315,16 @@ namespace engine {
 namespace scene_rendering {
 
 WeatherSystem::WeatherSystem(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::shared_ptr<renderer::ImageView>& rock_layer_tex,
     const std::vector<std::shared_ptr<renderer::ImageView>>& soil_water_layer_tex) {
 
-    const auto& device = device_info.device;
-
     for (int i = 0; i < 2; i++) {
         renderer::Helper::create3DTextureImage(
-            device_info,
+            device,
             renderer::Format::R16_SFLOAT,
             glm::uvec3(
                 kAirflowBufferWidth,
@@ -337,7 +335,7 @@ WeatherSystem::WeatherSystem(
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         renderer::Helper::create3DTextureImage(
-            device_info,
+            device,
             renderer::Format::R16_SFLOAT,
             glm::uvec3(
                 kAirflowBufferWidth,
@@ -348,7 +346,7 @@ WeatherSystem::WeatherSystem(
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         renderer::Helper::create3DTextureImage(
-            device_info,
+            device,
             renderer::Format::R16_SFLOAT,
             glm::uvec3(
                 kAirflowBufferWidth,
@@ -361,7 +359,7 @@ WeatherSystem::WeatherSystem(
     }
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R32_UINT,
         glm::uvec2(
             kAirflowBufferWidth * 8,
@@ -372,7 +370,7 @@ WeatherSystem::WeatherSystem(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R32G32_UINT,
         glm::uvec2(
             kAirflowBufferWidth,
@@ -383,7 +381,7 @@ WeatherSystem::WeatherSystem(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create3DTextureImage(
-        device_info,
+        device,
         renderer::Format::R8G8B8A8_UNORM,
         glm::uvec3(
             kAirflowBufferWidth,
@@ -396,7 +394,7 @@ WeatherSystem::WeatherSystem(
 
     uint32_t buffer_height = kAirflowBufferHeight;
     renderer::Helper::create3DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16_SFLOAT,
         glm::uvec3(
             kAirflowBufferWidth,

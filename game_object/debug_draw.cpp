@@ -159,17 +159,6 @@ std::shared_ptr<renderer::Pipeline> DebugDrawObject::debug_draw_pipeline_;
 std::shared_ptr<renderer::DescriptorSetLayout> DebugDrawObject::debug_draw_desc_set_layout_;
 std::shared_ptr<renderer::DescriptorSet> DebugDrawObject::debug_draw_desc_set_;
 
-DebugDrawObject::DebugDrawObject(
-    const renderer::DeviceInfo& device_info,
-    const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
-    const glm::vec2& min,
-    const glm::vec2& max) :
-    device_info_(device_info),
-    min_(min),
-    max_(max){
-    assert(debug_draw_desc_set_layout_);
-}
-
 void DebugDrawObject::createStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
@@ -200,12 +189,11 @@ void DebugDrawObject::createStaticMembers(
 }
 
 void DebugDrawObject::initStaticMembers(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const glm::uvec2& display_size) {
-    auto& device = device_info.device;
 
     if (debug_draw_desc_set_layout_ == nullptr) {
         debug_draw_desc_set_layout_ =
@@ -245,7 +233,7 @@ void DebugDrawObject::recreateStaticMembers(
         display_size);
 }
 
-void DebugDrawObject::destoryStaticMembers(
+void DebugDrawObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(debug_draw_desc_set_layout_);
     device->destroyPipelineLayout(debug_draw_pipeline_layout_);

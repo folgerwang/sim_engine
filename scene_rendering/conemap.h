@@ -18,7 +18,7 @@ class Conemap {
 
 public:
     Conemap(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& bump_tex,

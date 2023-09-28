@@ -65,7 +65,7 @@ er::ShaderModuleList getCubeSkyboxShaderModules(
 }
 
 er::BufferInfo createVertexBuffer(
-    const er::DeviceInfo& device_info) {
+    const std::shared_ptr<er::Device>& device) {
     const std::vector<SkyBoxVertex> vertices = {
         {{-1.0f, -1.0f, -1.0f}},
         {{1.0f, -1.0f, -1.0f}},
@@ -81,7 +81,7 @@ er::BufferInfo createVertexBuffer(
 
     er::BufferInfo buffer;
     er::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
@@ -94,7 +94,7 @@ er::BufferInfo createVertexBuffer(
 }
 
 er::BufferInfo createIndexBuffer(
-    const er::DeviceInfo& device_info) {
+    const std::shared_ptr<er::Device>& device) {
     const std::vector<uint16_t> indices = {
         0, 1, 2, 2, 1, 3,
         4, 6, 5, 5, 6, 7,
@@ -108,7 +108,7 @@ er::BufferInfo createIndexBuffer(
 
     er::BufferInfo buffer;
     er::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
@@ -311,7 +311,7 @@ namespace engine {
 namespace scene_rendering {
 
 Skydome::Skydome(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
@@ -323,13 +323,11 @@ Skydome::Skydome(
     const glm::uvec2& display_size,
     const uint32_t& cube_size) {
 
-    const auto& device = device_info.device;
-
-    vertex_buffer_ = createVertexBuffer(device_info);
-    index_buffer_ = createIndexBuffer(device_info);
+    vertex_buffer_ = createVertexBuffer(device);
+    index_buffer_ = createIndexBuffer(device);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(kAtmosphereScatteringLutWidth, kAtmosphereScatteringLutHeight),
         sky_scattering_lut_tex_,
@@ -338,7 +336,7 @@ Skydome::Skydome(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(kAtmosphereScatteringLutWidth, kAtmosphereScatteringLutHeight / 64),
         sky_scattering_lut_sum_tex_,

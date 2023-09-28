@@ -147,7 +147,7 @@ namespace engine {
 namespace scene_rendering {
 
 IblCreator::IblCreator(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const renderer::GraphicPipelineInfo& cube_graphic_pipeline_info,
@@ -155,13 +155,13 @@ IblCreator::IblCreator(
     const uint32_t& cube_size) {
 
     createCubeTextures(
-        device_info,
+        device,
         cube_render_pass,
         cube_size);
 
     auto format = er::Format::R8G8B8A8_UNORM;
     helper::createTextureImage(
-        device_info,
+        device,
         "assets/environments/doge2.hdr",
         format,
         panorama_tex_);
@@ -173,7 +173,7 @@ IblCreator::IblCreator(
         //bindings[1] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(ENVMAP_TEX_INDEX);
 
         ibl_desc_set_layout_ =
-            device_info.device->createDescriptorSetLayout(bindings);
+            device->createDescriptorSetLayout(bindings);
     }
 
     // ibl compute texture descriptor set layout.
@@ -187,44 +187,44 @@ IblCreator::IblCreator(
             er::DescriptorType::STORAGE_IMAGE);
 
         ibl_comp_desc_set_layout_ =
-            device_info.device->createDescriptorSetLayout(bindings);
+            device->createDescriptorSetLayout(bindings);
     }
 
     createDescriptorSets(
-        device_info.device,
+        device,
         descriptor_pool,
         texture_sampler);
 
     ibl_comp_pipeline_layout_ = createCubemapComputePipelineLayout(
-        device_info.device,
+        device,
         ibl_comp_desc_set_layout_);
 
     blur_comp_pipeline_ = 
         er::helper::createComputePipeline(
-            device_info.device,
+            device,
             ibl_comp_pipeline_layout_,
             "ibl_smooth_comp.spv");
 
     ibl_pipeline_layout_ = createCubemapPipelineLayout(
-        device_info.device,
+        device,
         ibl_desc_set_layout_);
 
     createIblGraphicsPipelines(
-        device_info.device,
+        device,
         cube_render_pass,
         cube_graphic_pipeline_info,
         cube_size);
 }
 
 void IblCreator::createCubeTextures(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const uint32_t& cube_size) {
     uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
     std::vector<renderer::BufferImageCopyInfo> dump_copies;
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,
@@ -234,7 +234,7 @@ void IblCreator::createCubeTextures(
         rt_envmap_tex_);
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,
@@ -244,7 +244,7 @@ void IblCreator::createCubeTextures(
         tmp_ibl_diffuse_tex_);
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,
@@ -254,7 +254,7 @@ void IblCreator::createCubeTextures(
         tmp_ibl_specular_tex_);
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,
@@ -264,7 +264,7 @@ void IblCreator::createCubeTextures(
         tmp_ibl_sheen_tex_);
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,
@@ -274,7 +274,7 @@ void IblCreator::createCubeTextures(
         rt_ibl_diffuse_tex_);
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,
@@ -284,7 +284,7 @@ void IblCreator::createCubeTextures(
         rt_ibl_specular_tex_);
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cube_render_pass,
         cube_size,
         cube_size,

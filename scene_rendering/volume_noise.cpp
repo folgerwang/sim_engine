@@ -249,7 +249,7 @@ namespace engine {
 namespace scene_rendering {
 
 VolumeNoise::VolumeNoise(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::DescriptorSetLayout>& view_desc_set_layout,
@@ -259,14 +259,13 @@ VolumeNoise::VolumeNoise(
     const std::shared_ptr<renderer::Sampler>& point_clamp_texture_sampler,
     const glm::uvec2& display_size) {
 
-    const auto& device = device_info.device;
 #if 0
-    vertex_buffer_ = createVertexBuffer(device_info);
-    index_buffer_ = createIndexBuffer(device_info);
+    vertex_buffer_ = createVertexBuffer(device);
+    index_buffer_ = createIndexBuffer(device);
 #endif
 
     renderer::Helper::create3DTextureImage(
-        device_info,
+        device,
         renderer::Format::R8G8B8A8_UNORM,
         glm::uvec3(
             kDetailNoiseTextureSize,
@@ -279,7 +278,7 @@ VolumeNoise::VolumeNoise(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     
     renderer::Helper::create3DTextureImage(
-        device_info,
+        device,
         renderer::Format::R8G8B8A8_UNORM,
         glm::uvec3(
             kRoughNoiseTextureSize,

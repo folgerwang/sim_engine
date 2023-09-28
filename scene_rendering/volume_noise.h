@@ -28,7 +28,7 @@ class VolumeNoise {
 
 public:
     VolumeNoise(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const std::shared_ptr<renderer::DescriptorSetLayout>& view_desc_set_layout,

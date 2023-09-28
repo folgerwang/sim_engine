@@ -41,30 +41,11 @@ static void createUnifiedQuad(
     new_faces[1] = glm::uvec3(0, 3, 2);
 }
 
-static std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
-    const renderer::DeviceInfo& device_info,
-    const renderer::BufferUsageFlags& usage,
-    const uint64_t& size,
-    const void* data) {
-    auto v_buffer = std::make_shared<renderer::BufferInfo>();
-    renderer::Helper::createBuffer(
-        device_info,
-        usage,
-        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-        0,
-        v_buffer->buffer,
-        v_buffer->memory,
-        size,
-        data);
-
-    return v_buffer;
-}
-
 } // namespace
 
 namespace game_object {
 
-Plane::Plane(const renderer::DeviceInfo& device_info)
+Plane::Plane(const std::shared_ptr<renderer::Device>& device)
 {
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;
@@ -79,11 +60,12 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
     std::vector<renderer::VertexInputBindingDescription> binding_descs;
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs;
 
-    setPositionBuffer(createUnifiedMeshBuffer(
-        device_info,
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-        vertices.size() * sizeof(vertices[0]),
-        vertices.data()));
+    setPositionBuffer(
+        helper::createUnifiedMeshBuffer(
+            device,
+            SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            vertices.size() * sizeof(vertices[0]),
+            vertices.data()));
     uint32_t binding_idx = 0;
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(vertices[0]);
@@ -97,11 +79,12 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
     attribute_descs.push_back(attribute_desc);
     binding_idx++;
 
-    setNormalBuffer(createUnifiedMeshBuffer(
-        device_info,
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-        normals.size() * sizeof(normals[0]),
-        normals.data()));
+    setNormalBuffer(
+        helper::createUnifiedMeshBuffer(
+            device,
+            SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            normals.size() * sizeof(normals[0]),
+            normals.data()));
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(normals[0]);
     binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
@@ -114,11 +97,12 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
     attribute_descs.push_back(attribute_desc);
     binding_idx++;
 
-    setTangentBuffer(createUnifiedMeshBuffer(
-        device_info,
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-        tangents.size() * sizeof(tangents[0]),
-        tangents.data()));
+    setTangentBuffer(
+        helper::createUnifiedMeshBuffer(
+            device,
+            SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            tangents.size() * sizeof(tangents[0]),
+            tangents.data()));
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(tangents[0]);
     binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
@@ -131,11 +115,12 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
     attribute_descs.push_back(attribute_desc);
     binding_idx++;
 
-    setUvBuffer(createUnifiedMeshBuffer(
-        device_info,
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-        uvs.size() * sizeof(uvs[0]),
-        uvs.data()));
+    setUvBuffer(
+        helper::createUnifiedMeshBuffer(
+            device,
+            SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            uvs.size() * sizeof(uvs[0]),
+            uvs.data()));
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(uvs[0]);
     binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
@@ -151,11 +136,12 @@ Plane::Plane(const renderer::DeviceInfo& device_info)
     setBindingDescs(binding_descs);
     setAttribDescs(attribute_descs);
 
-    setIndexBuffer(createUnifiedMeshBuffer(
-        device_info,
-        SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
-        faces.size() * sizeof(faces[0]),
-        faces.data()));
+    setIndexBuffer(
+        helper::createUnifiedMeshBuffer(
+            device,
+            SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+            faces.size() * sizeof(faces[0]),
+            faces.data()));
 }
 
 void Plane::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {

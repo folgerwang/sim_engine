@@ -79,7 +79,7 @@ static void createUnifiedMesh(
 }
 
 static std::shared_ptr<game_object::Patch> createPatch(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     std::vector<glm::vec3> new_vertices,
     std::vector<glm::vec3> new_normals,
     std::vector<glm::vec2> new_uvs,
@@ -92,8 +92,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs;
     assert(new_vertices.size() > 0);
     patch->setPositionBuffer(
-        createUnifiedMeshBuffer(
-            device_info,
+        helper::createUnifiedMeshBuffer(
+            device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             new_vertices.size() * sizeof(new_vertices[0]),
             new_vertices.data()));
@@ -113,8 +113,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
 
     if (new_normals.size() > 0) {
         patch->setNormalBuffer(
-            createUnifiedMeshBuffer(
-                device_info,
+            helper::createUnifiedMeshBuffer(
+                device,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
                 new_normals.size() * sizeof(new_normals[0]),
                 new_normals.data()));
@@ -134,8 +134,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
 
     if (new_uvs.size() > 0) {
         patch->setUvBuffer(
-            createUnifiedMeshBuffer(
-                device_info,
+            helper::createUnifiedMeshBuffer(
+                device,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
                 new_uvs.size() * sizeof(new_uvs[0]),
                 new_uvs.data()));
@@ -158,8 +158,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
 
     assert(new_faces.size() > 0);
     patch->setIndexBuffer(
-        createUnifiedMeshBuffer(
-            device_info,
+        helper::createUnifiedMeshBuffer(
+            device,
             SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
             new_faces.size() * sizeof(new_faces[0]),
             new_faces.data()));
@@ -168,7 +168,7 @@ static std::shared_ptr<game_object::Patch> createPatch(
 }
 
 static std::shared_ptr<game_object::Patch> createPatch(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::vector<glm::vec3>& vertices,
     const std::vector<glm::vec3>& normals,
     const std::vector<glm::vec2>& uvs,
@@ -197,7 +197,7 @@ static std::shared_ptr<game_object::Patch> createPatch(
     vt_faces.clear();
 
     return createPatch(
-        device_info,
+        device,
         new_vertices,
         new_normals,
         new_uvs,
@@ -293,7 +293,7 @@ static renderer::WriteDescriptorList addObjectTextures(
 namespace game_object {
 
 void ObjectMesh::loadObjectFile(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::string& object_name,
@@ -319,10 +319,26 @@ void ObjectMesh::loadObjectFile(
     specular_tex_ = std::make_shared<renderer::TextureInfo>();
 
     auto format = renderer::Format::R8G8B8A8_UNORM;
-    engine::helper::createTextureImage(device_info, "assets/lungs/lungs_default_Diffuse.png", format, *diffuse_tex_);
-    engine::helper::createTextureImage(device_info, "assets/lungs/lungs_default_Normal.png", format, *normal_tex_);
-    engine::helper::createTextureImage(device_info, "assets/lungs/lungs_default_Glossiness.png", format, *glossiness_tex_);
-    engine::helper::createTextureImage(device_info, "assets/lungs/lungs_default_Specular.png", format, *specular_tex_);
+    engine::helper::createTextureImage(
+        device,
+        "assets/lungs/lungs_default_Diffuse.png",
+        format,
+        *diffuse_tex_);
+    engine::helper::createTextureImage(
+        device,
+        "assets/lungs/lungs_default_Normal.png",
+        format,
+        *normal_tex_);
+    engine::helper::createTextureImage(
+        device,
+        "assets/lungs/lungs_default_Glossiness.png",
+        format,
+        *glossiness_tex_);
+    engine::helper::createTextureImage(
+        device,
+        "assets/lungs/lungs_default_Specular.png",
+        format,
+        *specular_tex_);
 
     bool start_process_faces = false;
     bool has_normal = false;
@@ -340,7 +356,7 @@ void ObjectMesh::loadObjectFile(
         if (start_process_faces && tag != "f") {
             patches_.push_back(
                 createPatch(
-                    device_info,
+                    device,
                     vertices,
                     normals,
                     uvs,
@@ -401,7 +417,7 @@ void ObjectMesh::loadObjectFile(
     if (v_faces.size() > 0) {
         patches_.push_back(
             createPatch(
-                device_info,
+                device,
                 vertices,
                 normals,
                 uvs,
@@ -411,9 +427,9 @@ void ObjectMesh::loadObjectFile(
     }
 
     object_desc_set_layout_ = createObjectDescriptorSetLayout(
-        device_info.device);
+        device);
 
-    object_desc_set_ = device_info.device->createDescriptorSets(
+    object_desc_set_ = device->createDescriptorSets(
         descriptor_pool, object_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
@@ -425,10 +441,10 @@ void ObjectMesh::loadObjectFile(
         *diffuse_tex_,
         *specular_tex_);
 
-    device_info.device->updateDescriptorSets(material_descs);
+    device->updateDescriptorSets(material_descs);
 
     object_pipeline_layout_ = createPipelineLayout(
-        device_info.device,
+        device,
         global_desc_set_layouts,
         object_desc_set_layout_);
 
@@ -439,16 +455,16 @@ void ObjectMesh::loadObjectFile(
     renderer::ShaderModuleList shader_modules(2);
     shader_modules[0] =
         renderer::helper::loadShaderModule(
-            device_info.device,
+            device,
             shader_name + "_vert.spv",
             renderer::ShaderStageFlagBits::VERTEX_BIT);
     shader_modules[1] =
         renderer::helper::loadShaderModule(
-            device_info.device,
+            device,
             shader_name + "_frag.spv",
             renderer::ShaderStageFlagBits::FRAGMENT_BIT);
 
-    object_pipeline_ = device_info.device->createPipeline(
+    object_pipeline_ = device->createPipeline(
         render_pass,
         object_pipeline_layout_,
         patches_[0]->getBindingDescs(),

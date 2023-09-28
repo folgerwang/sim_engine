@@ -33,7 +33,7 @@ class IblCreator {
 
 public:
     IblCreator(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
         const renderer::GraphicPipelineInfo& cube_graphic_pipeline_info,
@@ -56,7 +56,7 @@ public:
     }
 
     void createCubeTextures(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
         const uint32_t& cube_size);
 

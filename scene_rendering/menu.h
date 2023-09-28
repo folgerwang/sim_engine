@@ -40,14 +40,13 @@ class Menu {
 public:
     Menu(
         GLFWwindow* window,
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::Instance>& instance,
         const renderer::QueueFamilyList& queue_family_list,
         const renderer::SwapChainInfo& swap_chain_info,
         const std::shared_ptr<renderer::Queue>& graphics_queue,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
-        const std::shared_ptr<renderer::CommandBuffer>& command_buffer,
         const std::shared_ptr<renderer::Sampler>& sampler,
         const std::shared_ptr<renderer::ImageView>& image_view);
 
@@ -153,14 +152,13 @@ public:
 
     void init(
         GLFWwindow* window,
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::Instance>& instance,
         const renderer::QueueFamilyList& queue_family_list,
         const renderer::SwapChainInfo& swap_chain_info,
         const std::shared_ptr<renderer::Queue>& graphics_queue,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
-        const std::shared_ptr<renderer::CommandBuffer>& command_buffer);
+        const std::shared_ptr<renderer::RenderPass>& render_pass);
 
     bool draw(
         const std::shared_ptr<renderer::CommandBuffer>& command_buffer,

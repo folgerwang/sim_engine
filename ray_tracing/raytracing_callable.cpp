@@ -50,7 +50,7 @@ namespace ray_tracing {
 const uint32_t g_object_count = 3;
 
 void RayTracingCallableTest::init(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
     const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
@@ -61,21 +61,21 @@ void RayTracingCallableTest::init(
     rt_render_info_ = std::make_shared<RayTracingRenderingInfo>();
     rt_size_ = size;
 
-    initBottomLevelDataInfo(device_info);
-    initTopLevelDataInfo(device_info);
-    createRayTracingPipeline(device_info);
+    initBottomLevelDataInfo(device);
+    initTopLevelDataInfo(device);
+    createRayTracingPipeline(device);
     createShaderBindingTables(
-        device_info,
+        device,
         rt_pipeline_properties,
         as_features);
-    createRtResources(device_info);
+    createRtResources(device);
     createDescriptorSets(
-        device_info,
+        device,
         descriptor_pool);
 }
 
 void RayTracingCallableTest::initBottomLevelDataInfo(
-    const renderer::DeviceInfo& device_info) {
+    const std::shared_ptr<renderer::Device>& device) {
     assert(bl_data_info_);
     auto bl_data_info =
         std::reinterpret_pointer_cast<BottomLevelDataInfo>(bl_data_info_);
@@ -108,7 +108,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
     // For the sake of simplicity we won't stage the vertex data to the GPU memory
     // Vertex buffer
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
@@ -122,7 +122,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
 
     // Index buffer
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
@@ -136,7 +136,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
 
     // Transform buffer
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -177,12 +177,12 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
     renderer::AccelerationStructureBuildSizesInfo as_build_size_info{};
     as_build_size_info.struct_type = renderer::StructureType::ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 
-    device_info.device->getAccelerationStructureBuildSizes(
+    device->getAccelerationStructureBuildSizes(
         renderer::AccelerationStructureBuildType::DEVICE_KHR,
         as_build_geometry_info,
         as_build_size_info);
 
-    device_info.device->createBuffer(
+    device->createBuffer(
         as_build_size_info.as_size,
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -191,11 +191,11 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
         bl_data_info->as_buffer.buffer,
         bl_data_info->as_buffer.memory);
 
-    bl_data_info->as_handle = device_info.device->createAccelerationStructure(
+    bl_data_info->as_handle = device->createAccelerationStructure(
         bl_data_info->as_buffer.buffer,
         renderer::AccelerationStructureType::BOTTOM_LEVEL_KHR);
 
-    device_info.device->createBuffer(
+    device->createBuffer(
         as_build_size_info.build_scratch_size,
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -220,26 +220,21 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
 
     // Build the acceleration structure on the device via a one-time command buffer submission
     // Some implementations may support acceleration structure building on the host (VkPhysicalDeviceAccelerationStructureFeaturesKHR->accelerationStructureHostCommands), but we prefer device builds
-    auto command_buffers = device_info.device->allocateCommandBuffers(device_info.cmd_pool, 1);
-    if (command_buffers.size() > 0) {
-        auto& cmd_buf = command_buffers[0];
-        if (cmd_buf) {
-            cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-            cmd_buf->buildAccelerationStructures({ as_build_geometry_info }, as_build_range_infos);
-            cmd_buf->endCommandBuffer();
-        }
-
-        device_info.cmd_queue->submit(command_buffers);
-        device_info.cmd_queue->waitIdle();
-        device_info.device->freeCommandBuffers(device_info.cmd_pool, command_buffers);
-    }
+    auto cmd_buf = device->getIntransitCommandBuffer();
+    auto cmd_queue = device->getIntransitComputeQueue();
+    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    cmd_buf->buildAccelerationStructures({ as_build_geometry_info }, as_build_range_infos);
+    cmd_buf->endCommandBuffer();
+    cmd_queue->submit({ cmd_buf });
+    cmd_queue->waitIdle();
+    cmd_buf->reset(0);
 
     bl_data_info->as_device_address =
-        device_info.device->getAccelerationStructureDeviceAddress(bl_data_info->as_handle);
+        device->getAccelerationStructureDeviceAddress(bl_data_info->as_handle);
 }
 
 void RayTracingCallableTest::initTopLevelDataInfo(
-    const renderer::DeviceInfo& device_info) {
+    const std::shared_ptr<renderer::Device>& device) {
 
     auto bl_data_info =
         std::reinterpret_pointer_cast<BottomLevelDataInfo>(bl_data_info_);
@@ -263,7 +258,7 @@ void RayTracingCallableTest::initTopLevelDataInfo(
 
     // Instance buffer
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -297,12 +292,12 @@ void RayTracingCallableTest::initTopLevelDataInfo(
     renderer::AccelerationStructureBuildSizesInfo as_build_size_info{};
     as_build_size_info.struct_type = renderer::StructureType::ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 
-    device_info.device->getAccelerationStructureBuildSizes(
+    device->getAccelerationStructureBuildSizes(
         renderer::AccelerationStructureBuildType::DEVICE_KHR,
         as_build_geometry_info,
         as_build_size_info);
 
-    device_info.device->createBuffer(
+    device->createBuffer(
         as_build_size_info.as_size,
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -311,11 +306,11 @@ void RayTracingCallableTest::initTopLevelDataInfo(
         tl_data_info->as_buffer.buffer,
         tl_data_info->as_buffer.memory);
 
-    tl_data_info->as_handle = device_info.device->createAccelerationStructure(
+    tl_data_info->as_handle = device->createAccelerationStructure(
         tl_data_info->as_buffer.buffer,
         renderer::AccelerationStructureType::TOP_LEVEL_KHR);
 
-    device_info.device->createBuffer(
+    device->createBuffer(
         as_build_size_info.build_scratch_size,
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
@@ -337,27 +332,21 @@ void RayTracingCallableTest::initTopLevelDataInfo(
 
     // Build the acceleration structure on the device via a one-time command buffer submission
     // Some implementations may support acceleration structure building on the host (VkPhysicalDeviceAccelerationStructureFeaturesKHR->accelerationStructureHostCommands), but we prefer device builds
-    auto command_buffers = device_info.device->allocateCommandBuffers(device_info.cmd_pool, 1);
-    if (command_buffers.size() > 0) {
-        auto& cmd_buf = command_buffers[0];
-        if (cmd_buf) {
-            cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-            cmd_buf->buildAccelerationStructures({ as_build_geometry_info }, { as_build_range_info });
-            cmd_buf->endCommandBuffer();
-        }
-
-        device_info.cmd_queue->submit(command_buffers);
-        device_info.cmd_queue->waitIdle();
-        device_info.device->freeCommandBuffers(device_info.cmd_pool, command_buffers);
-    }
+    auto cmd_buf = device->getIntransitCommandBuffer();
+    auto cmd_queue = device->getIntransitComputeQueue();
+    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    cmd_buf->buildAccelerationStructures({ as_build_geometry_info }, { as_build_range_info });
+    cmd_buf->endCommandBuffer();
+    cmd_queue->submit({ cmd_buf });
+    cmd_queue->waitIdle();
+    cmd_buf->reset(0);
 
     tl_data_info->as_device_address =
-        device_info.device->getAccelerationStructureDeviceAddress(tl_data_info->as_handle);
+        device->getAccelerationStructureDeviceAddress(tl_data_info->as_handle);
 }
 
 void RayTracingCallableTest::createRayTracingPipeline(
-    const renderer::DeviceInfo& device_info) {
-    const auto& device = device_info.device;
+    const std::shared_ptr<renderer::Device>& device) {
 
     auto rt_render_info =
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
@@ -417,14 +406,13 @@ void RayTracingCallableTest::createRayTracingPipeline(
 }
 
 void RayTracingCallableTest::createShaderBindingTables(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
     const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features) {
 
     auto rt_render_info =
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
 
-    const auto& device = device_info.device;
     const uint32_t handle_size = rt_pipeline_properties.shader_group_handle_size;
     const uint32_t handle_size_aligned = 
         alignedSize(rt_pipeline_properties.shader_group_handle_size,
@@ -441,7 +429,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         shader_handle_storage.data());
 
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_BINDING_TABLE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -453,7 +441,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         shader_handle_storage.data());
 
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_BINDING_TABLE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -465,7 +453,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         shader_handle_storage.data() + handle_size_aligned);
 
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_BINDING_TABLE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -477,7 +465,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         shader_handle_storage.data() + handle_size_aligned * 2);
 
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, SHADER_BINDING_TABLE_BIT_KHR) |
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -510,12 +498,12 @@ void RayTracingCallableTest::createShaderBindingTables(
 }
 
 void RayTracingCallableTest::createRtResources(
-    const renderer::DeviceInfo& device_info) {
+    const std::shared_ptr<renderer::Device>& device) {
 
     auto rt_render_info =
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
 
-    device_info.device->createBuffer(
+    device->createBuffer(
         sizeof(UniformData),
         SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -525,7 +513,7 @@ void RayTracingCallableTest::createRtResources(
         rt_render_info->ubo.memory);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16G16B16A16_SFLOAT,
         rt_size_,
         rt_render_info->result_image,
@@ -535,9 +523,8 @@ void RayTracingCallableTest::createRtResources(
 }
 
 void RayTracingCallableTest::createDescriptorSets(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
-    const auto& device = device_info.device;
 
     auto bl_data_info =
         std::reinterpret_pointer_cast<BottomLevelDataInfo>(bl_data_info_);
@@ -599,7 +586,7 @@ void RayTracingCallableTest::createDescriptorSets(
 }
 
 renderer::TextureInfo RayTracingCallableTest::draw(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glsl::ViewParams& view_params) {
 
@@ -612,7 +599,7 @@ renderer::TextureInfo RayTracingCallableTest::draw(
     auto rt_render_info =
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
 
-    device_info.device->updateBufferMemory(
+    device->updateBufferMemory(
         rt_render_info->ubo.memory,
         sizeof(uniform_data),
         &uniform_data);

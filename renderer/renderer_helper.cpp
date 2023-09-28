@@ -149,9 +149,14 @@ std::shared_ptr<RenderPass> createCubemapRenderPass(
         0,
         SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT));
 
-    std::vector<AttachmentDescription> attachments = { 6, color_attachment };
+    std::vector<AttachmentDescription> attachments =
+        { 6,
+          color_attachment };
 
-    return device->createRenderPass(attachments, { subpass }, { depency });
+    return device->createRenderPass(
+        attachments,
+        { subpass },
+        { depency });
 }
 
 DescriptorSetLayoutBinding getTextureSamplerDescriptionSetLayoutBinding(

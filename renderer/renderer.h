@@ -287,7 +287,7 @@ struct SwapChainInfo {
 
 class Helper {
 public:
-    static void init(const DeviceInfo& device_info);
+    static void init(const std::shared_ptr<Device>& device);
 
     static void destroy(const std::shared_ptr<Device>& device);
 
@@ -368,7 +368,7 @@ public:
         const ImageLayout& cur_image_layout);
 
     static void create2DTextureImage(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         Format format,
         int tex_width,
         int tex_height,
@@ -378,7 +378,7 @@ public:
         std::shared_ptr<DeviceMemory>& texture_image_memory);
 
     static void create2DTextureImage(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         Format depth_format,
         const glm::uvec2& size,
         TextureInfo& texture_info,
@@ -388,7 +388,7 @@ public:
         const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
     static void dumpTextureImage(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<Image>& src_texture_image,
         Format depth_format,
         const glm::uvec3& buffer_size,
@@ -396,7 +396,7 @@ public:
         void* pixels);
 
     static void create3DTextureImage(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         Format depth_format,
         const glm::uvec3& size,
         TextureInfo& texture_info,
@@ -406,13 +406,13 @@ public:
         const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
     static void createDepthResources(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         Format format,
         glm::uvec2 size,
         TextureInfo& texture_2d);
 
     static void createCubemapTexture(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<RenderPass>& render_pass,
         uint32_t width,
         uint32_t height,
@@ -424,7 +424,7 @@ public:
         void* data = nullptr);
 
     static void createBuffer(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<Device>& device,
         const BufferUsageFlags& usage,
         const MemoryPropertyFlags& memory_property,
         const MemoryAllocateFlags& allocate_flags,
@@ -434,7 +434,7 @@ public:
         const void* src_data = nullptr);
 
     static void updateBufferWithSrcData(
-        const DeviceInfo& device_info,
+        const std::shared_ptr<Device>& device,
         const uint64_t& buffer_size,
         const void* src_data,
         const std::shared_ptr<Buffer>& buffer);
@@ -446,7 +446,18 @@ public:
         const std::shared_ptr<DeviceMemory>& buffer_memory);
 
     static void transitionImageLayout(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<CommandBuffer>& cmd_buf,
+        const std::shared_ptr<renderer::Image>& image,
+        const renderer::Format& format,
+        const renderer::ImageLayout& old_layout,
+        const renderer::ImageLayout& new_layout,
+        uint32_t base_mip_idx = 0,
+        uint32_t mip_count = 1,
+        uint32_t base_layer = 0,
+        uint32_t layer_count = 1);
+    
+    static void transitionImageLayout(
+        const std::shared_ptr<Device>& device,
         const std::shared_ptr<renderer::Image>& image,
         const renderer::Format& format,
         const renderer::ImageLayout& old_layout,
@@ -498,14 +509,13 @@ public:
 
     static void initImgui(
         GLFWwindow* window,
-        const DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<Instance>& instance,
         const QueueFamilyList& queue_family_indices,
         const SwapChainInfo& swap_chain_info,
         const std::shared_ptr<Queue>& graphics_queue,
         const std::shared_ptr<DescriptorPool>& descriptor_pool,
-        const std::shared_ptr<RenderPass>& render_pass,
-        const std::shared_ptr<CommandBuffer>& command_buffer);
+        const std::shared_ptr<RenderPass>& render_pass);
 
     static TextureInfo& getBlackTexture() { return black_tex_; }
     static TextureInfo& getWhiteTexture() { return white_tex_; }

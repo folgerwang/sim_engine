@@ -18,13 +18,19 @@ void writeImageFile(
     const void* image_data);
 
 void createTextureImage(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     renderer::Format format,
     renderer::TextureInfo& texture);
 
+std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::BufferUsageFlags& usage,
+    const uint64_t& size,
+    const void* data);
+
 void loadMtx2Texture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& cubemap_render_pass,
     const std::string& input_filename,
     renderer::TextureInfo& texture);

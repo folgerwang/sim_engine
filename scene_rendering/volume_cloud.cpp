@@ -230,7 +230,7 @@ namespace engine {
 namespace scene_rendering {
 
 VolumeCloud::VolumeCloud(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::DescriptorSetLayout>& view_desc_set_layout,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -244,8 +244,6 @@ VolumeCloud::VolumeCloud(
     const std::shared_ptr<renderer::ImageView>& detail_noise_tex,
     const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
     const glm::uvec2& display_size) {
-
-    const auto& device = device_info.device;
 
     blur_image_desc_set_layout_ =
         device->createDescriptorSetLayout(
@@ -322,7 +320,7 @@ VolumeCloud::VolumeCloud(
                 er::DescriptorType::COMBINED_IMAGE_SAMPLER)});
 
     recreate(
-        device_info,
+        device,
         descriptor_pool,
         view_desc_set_layout,
         texture_sampler,
@@ -339,7 +337,7 @@ VolumeCloud::VolumeCloud(
 }
 
 void VolumeCloud::recreate(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::DescriptorSetLayout>& view_desc_set_layout,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -354,12 +352,11 @@ void VolumeCloud::recreate(
     const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
     const glm::uvec2& display_size) {
 
-    auto& device = device_info.device;
     fog_cloud_tex_.destroy(device);
     blurred_fog_cloud_tex_.destroy(device);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16G16B16A16_SFLOAT,
         display_size,
         fog_cloud_tex_,
@@ -368,7 +365,7 @@ void VolumeCloud::recreate(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16G16B16A16_SFLOAT,
         display_size,
         blurred_fog_cloud_tex_,

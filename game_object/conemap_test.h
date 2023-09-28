@@ -15,7 +15,7 @@ class ConemapTest {
 
 public:
     ConemapTest(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,

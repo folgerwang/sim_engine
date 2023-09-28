@@ -121,11 +121,9 @@ namespace engine {
 namespace scene_rendering {
 
 Prt::Prt(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler) {
-
-    const auto& device = device_info.device;
 
     const glm::uvec2 buffer_size =
         glm::uvec2(s_max_prt_buffer_size, s_max_prt_buffer_size);
@@ -134,7 +132,7 @@ Prt::Prt(
     for (int i = 0; i < 6; i++) {
         prt_texes_[i] = std::make_shared<renderer::TextureInfo>();
         renderer::Helper::create2DTextureImage(
-            device_info,
+            device,
             renderer::Format::R32G32B32A32_SFLOAT,
             buffer_size,
             *prt_texes_[i],
@@ -144,7 +142,7 @@ Prt::Prt(
 
         prt_ds_texes_[0][i] = std::make_shared<renderer::TextureInfo>();
         renderer::Helper::create2DTextureImage(
-            device_info,
+            device,
             renderer::Format::R32G32B32A32_SFLOAT,
             glm::uvec2((buffer_size.x + 7) / 8 * 2, (buffer_size.y + 7) / 8),
             *prt_ds_texes_[0][i],
@@ -154,7 +152,7 @@ Prt::Prt(
 
         prt_ds_texes_[1][i] = std::make_shared<renderer::TextureInfo>();
         renderer::Helper::create2DTextureImage(
-            device_info,
+            device,
             renderer::Format::R32G32B32A32_SFLOAT,
             glm::uvec2((buffer_size.x + 63) / 64 * 2, (buffer_size.y + 63) / 64),
             *prt_ds_texes_[1][i],
@@ -165,7 +163,7 @@ Prt::Prt(
 
     prt_texes_[6] = std::make_shared<renderer::TextureInfo>();
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R32_SFLOAT,
         buffer_size,
         *prt_texes_[6],
@@ -175,7 +173,7 @@ Prt::Prt(
 
     prt_ds_texes_[0][6] = std::make_shared<renderer::TextureInfo>();
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R32_SFLOAT,
         glm::uvec2((buffer_size.x + 7) / 8 * 2, (buffer_size.y + 7) / 8),
         *prt_ds_texes_[0][6],
@@ -185,7 +183,7 @@ Prt::Prt(
 
     prt_ds_texes_[1][6] = std::make_shared<renderer::TextureInfo>();
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R32_SFLOAT,
         glm::uvec2((buffer_size.x + 63) / 64 * 2, (buffer_size.y + 63) / 64),
         *prt_ds_texes_[1][6],

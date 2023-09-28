@@ -27,7 +27,7 @@ class ViewCapture {
 
 public:
     ViewCapture(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const glm::uvec2& view_size);
 
     void draw(
@@ -36,7 +36,8 @@ public:
 
     void update();
 
-    void destroy(const std::shared_ptr<renderer::Device>& device);
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device);
 };
 
 }// namespace scene_rendering

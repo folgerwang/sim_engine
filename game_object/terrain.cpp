@@ -2137,35 +2137,35 @@ std::shared_ptr<renderer::Pipeline> TileObject::tile_water_pipeline_;
 std::shared_ptr<renderer::Pipeline> TileObject::tile_grass_pipeline_;
 
 TileObject::TileObject(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
     const glm::vec2& min,
     const glm::vec2& max,
     const size_t& hash_value,
     const uint32_t& block_idx) :
-    device_info_(device_info),
     min_(min),
     max_(max),
     hash_(hash_value),
     block_idx_(block_idx){
-    createMeshBuffers();
-    createGrassBuffers();
+    createMeshBuffers(device);
+    createGrassBuffers(device);
     assert(tile_creator_desc_set_layout_);
     assert(tile_update_desc_set_layout_);
     assert(tile_flow_update_desc_set_layout_);
     assert(tile_res_desc_set_layout_);
 }
 
-void TileObject::destory() {
-    index_buffer_.destroy(device_info_.device);
-    grass_vertex_buffer_.destroy(device_info_.device);
-    grass_index_buffer_.destroy(device_info_.device);
-    grass_indirect_draw_cmd_.destroy(device_info_.device);
-    grass_instance_buffer_.destroy(device_info_.device);
+void TileObject::destroy(
+    const std::shared_ptr<renderer::Device>& device) {
+    index_buffer_.destroy(device);
+    grass_vertex_buffer_.destroy(device);
+    grass_index_buffer_.destroy(device);
+    grass_indirect_draw_cmd_.destroy(device);
+    grass_instance_buffer_.destroy(device);
 }
 
 std::shared_ptr<TileObject> TileObject::addOneTile(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
     const glm::vec2& min,
     const glm::vec2& max) {
@@ -2178,7 +2178,7 @@ std::shared_ptr<TileObject> TileObject::addOneTile(
             available_block_indexes_.pop_back();
             tile_meshes_[hash_value] =
                 std::make_shared<TileObject>(
-                    device_info,
+                    device,
                     descriptor_pool,
                     min,
                     max,
@@ -2339,17 +2339,16 @@ void TileObject::createStaticMembers(
 }
 
 void TileObject::initStaticMembers(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::RenderPass>& water_render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const glm::uvec2& display_size) {
-    auto& device = device_info.device;
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16_SFLOAT,
         glm::uvec2(static_cast<uint32_t>(TileConst::kRockLayerSize)),
         rock_layer_,
@@ -2359,7 +2358,7 @@ void TileObject::initStaticMembers(
 
     for (int i = 0; i < 2; i++) {
         renderer::Helper::create2DTextureImage(
-            device_info,
+            device,
             renderer::Format::R16G16_UNORM,
             glm::uvec2(static_cast<uint32_t>(TileConst::kSoilLayerSize)),
             soil_water_layer_[i],
@@ -2369,7 +2368,7 @@ void TileObject::initStaticMembers(
     }
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R8G8_UNORM,
         glm::uvec2(static_cast<uint32_t>(TileConst::kGrassSnowLayerSize)),
         grass_snow_layer_,
@@ -2378,7 +2377,7 @@ void TileObject::initStaticMembers(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R8G8_SNORM,
         glm::uvec2(static_cast<uint32_t>(TileConst::kWaterlayerSize)),
         water_normal_,
@@ -2387,7 +2386,7 @@ void TileObject::initStaticMembers(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(static_cast<uint32_t>(TileConst::kWaterlayerSize)),
         water_flow_,
@@ -2504,7 +2503,7 @@ void TileObject::recreateStaticMembers(
         display_size);
 }
 
-void TileObject::destoryStaticMembers(
+void TileObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(tile_creator_desc_set_layout_);
     device->destroyDescriptorSetLayout(tile_update_desc_set_layout_);
@@ -2529,12 +2528,13 @@ void TileObject::destoryStaticMembers(
     water_flow_.destroy(device);
 }
 
-void TileObject::createMeshBuffers() {
+void TileObject::createMeshBuffers(
+    const std::shared_ptr<renderer::Device>& device) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
     auto index_buffer = generateTileMeshIndex(segment_count);
     auto index_buffer_size = static_cast<uint32_t>(sizeof(index_buffer[0]) * index_buffer.size());
     renderer::Helper::createBuffer(
-        device_info_,
+        device,
         SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
@@ -2559,11 +2559,12 @@ void addQuadIndex(
     index_list.push_back(c);
 }
 
-void TileObject::createGrassBuffers() {
+void TileObject::createGrassBuffers(
+    const std::shared_ptr<renderer::Device>& device) {
 
     glm::vec3 vertex_pos = glm::vec3(0);
     renderer::Helper::createBuffer(
-        device_info_,
+        device,
         SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
@@ -2576,7 +2577,7 @@ void TileObject::createGrassBuffers() {
     uint16_t index_list = 0;
 
     renderer::Helper::createBuffer(
-        device_info_,
+        device,
         SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
@@ -2594,7 +2595,7 @@ void TileObject::createGrassBuffers() {
     indirect_draw_cmd_buffer[0].instance_count = static_cast<uint32_t>(TileConst::kMaxNumGrass);
 
     renderer::Helper::createBuffer(
-        device_info_,
+        device,
         SET_FLAG_BIT(BufferUsage, INDIRECT_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -2605,7 +2606,7 @@ void TileObject::createGrassBuffers() {
         indirect_draw_cmd_buffer.size() * sizeof(renderer::DrawIndexedIndirectCommand),
         indirect_draw_cmd_buffer.data());
 
-    device_info_.device->createBuffer(
+    device->createBuffer(
         static_cast<uint32_t>(TileConst::kMaxNumGrass) * sizeof(glsl::GrassInstanceDataInfo),
         SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
@@ -3007,7 +3008,7 @@ void TileObject::drawAllVisibleTiles(
 }
 
 void TileObject::updateAllTiles(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
     const float& tile_size,
     const glm::vec2& camera_pos) {
@@ -3042,6 +3043,9 @@ void TileObject::updateAllTiles(
 
     for (auto& hash_value : to_delete_tiles) {
         available_block_indexes_.push_back(tile_meshes_[hash_value]->block_idx_);
+        auto search_result = tile_meshes_.find(hash_value);
+        assert(search_result != tile_meshes_.end());
+        search_result->second->destroy(device);
         tile_meshes_.erase(hash_value);
     }
 
@@ -3051,7 +3055,7 @@ void TileObject::updateAllTiles(
     for (int y = min_cache_tile_idx.y; y <= max_cache_tile_idx.y; y++) {
         for (int x = min_cache_tile_idx.x; x <= max_cache_tile_idx.x; x++) {
             auto tile = addOneTile(
-                device_info,
+                device,
                 descriptor_pool,
                 glm::vec2(x, y) * tile_size - tile_size / 2,
                 glm::vec2(x, y) * tile_size + tile_size / 2);
@@ -3100,14 +3104,18 @@ void TileObject::updateAllTiles(
         indirect_draw_cmd_buffer.first_index = 0;
         indirect_draw_cmd_buffer.first_instance = 0;
         indirect_draw_cmd_buffer.instance_count = int(num_grass);
-        device_info.device->updateBufferMemory(
+        device->updateBufferMemory(
             tile->grass_indirect_draw_cmd_.memory,
             sizeof(renderer::DrawIndexedIndirectCommand),
             &indirect_draw_cmd_buffer);
     }
 }
 
-void TileObject::destoryAllTiles() {
+void TileObject::destroyAllTiles(
+    const std::shared_ptr<renderer::Device>& device) {
+    for (auto& tile_mesh : tile_meshes_) {
+        tile_mesh.second->destroy(device);
+    }
     tile_meshes_.clear();
     visible_tiles_.clear();
 }

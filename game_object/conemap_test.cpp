@@ -314,7 +314,7 @@ static std::shared_ptr<renderer::PipelineLayout> createPipelineLayout(
 namespace game_object {
 
 ConemapTest::ConemapTest(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
@@ -331,13 +331,13 @@ ConemapTest::ConemapTest(
         glm::uvec2(prt_base_tex.size);
 
     prt_desc_set_layout_ = createPrtDescriptorSetLayout(
-        device_info.device);
+        device);
 
-    prt_desc_set_ = device_info.device->createDescriptorSets(
+    prt_desc_set_ = device->createDescriptorSets(
         descriptor_pool, prt_desc_set_layout_, 1)[0];
 
     uniform_buffer_ = std::make_shared<renderer::BufferInfo>();
-    device_info.device->createBuffer(
+    device->createBuffer(
         sizeof(glsl::PbrMaterialParams),
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
@@ -359,10 +359,10 @@ ConemapTest::ConemapTest(
         conemap_obj->getMinmaxBuffer(),
         uniform_buffer_);
 
-    device_info.device->updateDescriptorSets(material_descs);
+    device->updateDescriptorSets(material_descs);
 
     prt_pipeline_layout_ = createPipelineLayout(
-        device_info.device,
+        device,
         global_desc_set_layouts,
         prt_desc_set_layout_);
 
@@ -373,16 +373,16 @@ ConemapTest::ConemapTest(
     renderer::ShaderModuleList shader_modules(2);
     shader_modules[0] =
         renderer::helper::loadShaderModule(
-            device_info.device,
+            device,
             "conemap_test_vert.spv",
             renderer::ShaderStageFlagBits::VERTEX_BIT);
     shader_modules[1] =
         renderer::helper::loadShaderModule(
-            device_info.device,
+            device,
             "conemap_test_frag.spv",
             renderer::ShaderStageFlagBits::FRAGMENT_BIT);
 
-    prt_pipeline_ = device_info.device->createPipeline(
+    prt_pipeline_ = device->createPipeline(
         render_pass,
         prt_pipeline_layout_,
         unit_plane->getBindingDescs(),

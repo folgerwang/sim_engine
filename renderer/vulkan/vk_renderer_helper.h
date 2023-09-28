@@ -195,13 +195,26 @@ void createTextureImage(
     std::shared_ptr<renderer::DeviceMemory>& image_memory);
 
 void copyBuffer(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::Buffer>& src_buffer,
     const std::shared_ptr<renderer::Buffer>& dst_buffer,
-    uint64_t buffer_size);
+    uint64_t buffer_size,
+    uint64_t src_offset = 0,
+    uint64_t dst_offset = 0);
 
 void transitionImageLayout(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<renderer::Image>& image,
+    const renderer::Format& format,
+    const renderer::ImageLayout& old_layout,
+    const renderer::ImageLayout& new_layout,
+    uint32_t base_mip_idx = 0,
+    uint32_t mip_count = 1,
+    uint32_t base_layer = 0,
+    uint32_t layer_count = 1);
+
+void transitionImageLayout(
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::Image>& image,
     const renderer::Format& format,
     const renderer::ImageLayout& old_layout,
@@ -212,19 +225,19 @@ void transitionImageLayout(
     uint32_t layer_count = 1);
 
 void copyBufferToImageWithMips(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::shared_ptr<renderer::Image>& image,
     const std::vector<renderer::BufferImageCopyInfo>& copy_regions);
 
 void copyBufferToImage(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::shared_ptr<renderer::Image>& image,
     const glm::uvec3& tex_size);
 
 void copyImageToBuffer(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Image>& image,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const glm::uvec3& tex_size);
@@ -238,32 +251,32 @@ void generateMipmapLevels(
     const renderer::ImageLayout& cur_image_layout);
 
 void create2x2Texture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     uint32_t color,
     renderer::TextureInfo& texture);
 
 void createPermutationTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     renderer::TextureInfo& texture);
 
 void createPermutation2DTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     renderer::TextureInfo& texture);
 
 void createGradTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     renderer::TextureInfo& texture);
 
 void createPermGradTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     renderer::TextureInfo& texture);
 
 void createPermGrad4DTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     renderer::TextureInfo& texture);
 
 void createGrad4DTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     renderer::TextureInfo& texture);
 
 std::vector<VkPipelineShaderStageCreateInfo> getComputeShaderStages(

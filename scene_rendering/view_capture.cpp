@@ -16,12 +16,12 @@ namespace engine {
 namespace scene_rendering {
 
 ViewCapture::ViewCapture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const glm::uvec2& view_size) {
 
     // create color buffer.
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         color_format_,
         view_size,
         color_buffer_,
@@ -33,7 +33,7 @@ ViewCapture::ViewCapture(
 
     if (has_color_copy_) {
         renderer::Helper::create2DTextureImage(
-            device_info,
+            device,
             color_format_,
             view_size,
             color_buffer_copy_,
@@ -44,14 +44,14 @@ ViewCapture::ViewCapture(
 
     // create depth buffer.
     renderer::Helper::createDepthResources(
-        device_info,
+        device,
         depth_format_,
         view_size,
         depth_buffer_);
 
     if (has_depth_copy_) {
         renderer::Helper::create2DTextureImage(
-            device_info,
+            device,
             renderer::Format::D32_SFLOAT,
             view_size,
             depth_buffer_copy_,
@@ -64,14 +64,14 @@ ViewCapture::ViewCapture(
     // create render pass.
     render_pass_ =
         renderer::helper::createRenderPass(
-            device_info.device,
+            device,
             color_format_,
             depth_format_,
             true);
 
     translucent_render_pass_ =
         renderer::helper::createRenderPass(
-            device_info.device,
+            device,
             color_format_,
             depth_format_,
             false);
@@ -84,14 +84,14 @@ ViewCapture::ViewCapture(
     attachments[1] = depth_buffer_.view;
 
     frame_buffer_ =
-        device_info.device->createFrameBuffer(
+        device->createFrameBuffer(
             render_pass_,
             attachments,
             view_size);
 
     assert(translucent_render_pass_);
     translucent_frame_buffer_ =
-        device_info.device->createFrameBuffer(
+        device->createFrameBuffer(
             translucent_render_pass_,
             attachments,
             view_size);

@@ -34,7 +34,7 @@ class WeatherSystem {
 
 public:
     WeatherSystem(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,

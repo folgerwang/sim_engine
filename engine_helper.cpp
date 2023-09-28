@@ -61,18 +61,30 @@ void writeImageFile(
 }
 
 void createTextureImage(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     renderer::Format format,
     renderer::TextureInfo& texture) {
     int tex_width, tex_height, tex_channels;
     void* void_pixels = nullptr;
     if (format == engine::renderer::Format::R16_UNORM) {
-        stbi_us* pixels = stbi_load_16(file_name.c_str(), &tex_width, &tex_height, &tex_channels, STBI_grey);
+        stbi_us* pixels =
+            stbi_load_16(
+                file_name.c_str(),
+                &tex_width,
+                &tex_height,
+                &tex_channels,
+                STBI_grey);
         void_pixels = pixels;
     }
     else {
-        stbi_uc* pixels = stbi_load(file_name.c_str(), &tex_width, &tex_height, &tex_channels, STBI_rgb_alpha);
+        stbi_uc* pixels =
+            stbi_load(
+                file_name.c_str(),
+                &tex_width,
+                &tex_height,
+                &tex_channels,
+                STBI_rgb_alpha);
         void_pixels = pixels;
     }
 
@@ -80,7 +92,7 @@ void createTextureImage(
         throw std::runtime_error("failed to load texture image!");
     }
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         tex_width,
         tex_height,
@@ -93,15 +105,34 @@ void createTextureImage(
 
     stbi_image_free(void_pixels);
 
-    texture.view = device_info.device->createImageView(
+    texture.view = device->createImageView(
         texture.image,
         renderer::ImageViewType::VIEW_2D,
         format,
         SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
+std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::BufferUsageFlags& usage,
+    const uint64_t& size,
+    const void* data) {
+    auto v_buffer = std::make_shared<renderer::BufferInfo>();
+    renderer::Helper::createBuffer(
+        device,
+        usage,
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        0,
+        v_buffer->buffer,
+        v_buffer->memory,
+        size,
+        data);
+
+    return v_buffer;
+}
+
 void loadMtx2Texture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& cubemap_render_pass,
     const std::string& input_filename,
     renderer::TextureInfo& texture) {
@@ -163,7 +194,7 @@ void loadMtx2Texture(
     }
 
     renderer::Helper::createCubemapTexture(
-        device_info,
+        device,
         cubemap_render_pass,
         header_block->pixel_width,
         header_block->pixel_height,

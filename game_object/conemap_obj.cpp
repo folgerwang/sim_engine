@@ -112,7 +112,7 @@ namespace {
 namespace game_object {
 
 ConemapObj::ConemapObj(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& prt_bump_tex,
@@ -135,7 +135,7 @@ ConemapObj::ConemapObj(
     prt_pack_tex_ = std::make_shared<renderer::TextureInfo>();
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R8G8B8A8_UNORM,
         buffer_size,
         *conemap_tex_,
@@ -144,7 +144,7 @@ ConemapObj::ConemapObj(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         renderer::Format::R32G32B32A32_UINT,
         buffer_size,
         *prt_pack_tex_,
@@ -153,7 +153,7 @@ ConemapObj::ConemapObj(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     prt_minmax_buffer_ = std::make_shared<renderer::BufferInfo>();
-    device_info.device->createBuffer(
+    device->createBuffer(
         sizeof(glsl::PrtMinmaxInfo),
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
@@ -164,7 +164,7 @@ ConemapObj::ConemapObj(
 
     // create prt texture descriptor sets.
     prt_gen_tex_desc_set_ =
-        device_info.device->createDescriptorSets(
+        device->createDescriptorSets(
             descriptor_pool,
             prt_gen->getPrtGenDescSetLayout(), 1)[0];
 
@@ -173,10 +173,10 @@ ConemapObj::ConemapObj(
         texture_sampler,
         prt_bump_tex.view,
         prt_gen->getPrtTextures());
-    device_info.device->updateDescriptorSets(prt_texture_descs);
+    device->updateDescriptorSets(prt_texture_descs);
 
     prt_ds_final_tex_desc_sets_ =
-        device_info.device->createDescriptorSets(
+        device->createDescriptorSets(
             descriptor_pool,
             prt_gen->getPrtDsFinalDescSetLayout(), 2);
 
@@ -186,11 +186,11 @@ ConemapObj::ConemapObj(
             texture_sampler,
             prt_gen->getPrtDsTextures(i),
             prt_minmax_buffer_);
-        device_info.device->updateDescriptorSets(prt_ds_final_texture_descs);
+        device->updateDescriptorSets(prt_ds_final_texture_descs);
     }
 
     prt_pack_tex_desc_set_ =
-        device_info.device->createDescriptorSets(
+        device->createDescriptorSets(
             descriptor_pool,
             prt_gen->getPrtPackDescSetLayout(), 1)[0];
 
@@ -201,7 +201,7 @@ ConemapObj::ConemapObj(
         prt_minmax_buffer_,
         prt_pack_tex_);
 
-    device_info.device->updateDescriptorSets(prt_pack_texture_descs);
+    device->updateDescriptorSets(prt_pack_texture_descs);
 }
 
 void ConemapObj::destroy(

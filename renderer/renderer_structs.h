@@ -315,6 +315,19 @@ struct QueueFamilyList {
         return (uint32_t)-1;
     }
 
+    const QueueFamilyInfo getQueueInfo(uint32_t family_index) const {
+        if (family_index != (uint32_t)-1) {
+            return queue_families_[family_index];
+        }
+        else {
+            return QueueFamilyInfo{ 
+                static_cast<uint32_t>(QueueFlagBits::FLAG_BITS_MAX_ENUM),
+                0,
+                (uint32_t)-1,
+                false };
+        }
+    }
+
     std::vector<uint32_t> getGraphicAndPresentFamilyIndex() const {
         auto query_flags = static_cast<uint32_t>(QueueFlagBits::GRAPHICS_BIT);
         for (auto family : queue_families_) {
@@ -350,12 +363,6 @@ struct QueueFamilyList {
     bool isComplete() {
         return getGraphicAndPresentFamilyIndex().size() > 0;
     }
-};
-
-struct DeviceInfo {
-    std::shared_ptr<Device>             device;
-    std::shared_ptr<Queue>              cmd_queue;
-    std::shared_ptr<CommandPool>        cmd_pool;
 };
 
 struct TextureInfo {

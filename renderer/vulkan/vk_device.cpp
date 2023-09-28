@@ -11,9 +11,33 @@ namespace vk {
 
 VulkanDevice::VulkanDevice(
     const std::shared_ptr<PhysicalDevice>& physical_device,
-    const VkDevice& device)
+    const QueueFamilyList& queue_list,
+    const VkDevice& device,
+    uint32_t queue_family_index)
     : physical_device_(physical_device), device_(device)
 {
+    transient_cmd_pool_ =
+        createCommandPool(queue_family_index,
+            static_cast<uint32_t>(CommandPoolCreateFlagBits::TRANSIENT_BIT) |
+            static_cast<uint32_t>(CommandPoolCreateFlagBits::RESET_COMMAND_BUFFER_BIT));
+
+    transient_cmd_buffer_ =
+        allocateCommandBuffers(
+            transient_cmd_pool_,
+            1,
+            true)[0];
+
+    auto compute_queue_index =
+        queue_list.getQueueFamilyIndex(
+            QueueFlagBits::COMPUTE_BIT);
+
+    auto transit_queue_index =
+        queue_list.getQueueInfo(compute_queue_index).queue_count_ - 1;
+
+    transient_compute_queue_ =
+        getDeviceQueue(
+            compute_queue_index,
+            transit_queue_index);
 }
 
 VulkanDevice::~VulkanDevice()
@@ -252,7 +276,9 @@ VulkanDevice::createShaderModule(
     return vk_shader_module;
 }
 
-std::shared_ptr<CommandPool> VulkanDevice::createCommandPool(uint32_t queue_family_index, CommandPoolCreateFlags flags) {
+std::shared_ptr<CommandPool> VulkanDevice::createCommandPool(
+    uint32_t queue_family_index,
+    CommandPoolCreateFlags flags) {
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.queueFamilyIndex = queue_family_index;
@@ -268,7 +294,9 @@ std::shared_ptr<CommandPool> VulkanDevice::createCommandPool(uint32_t queue_fami
     return vk_cmd_pool;
 }
 
-std::shared_ptr<Queue> VulkanDevice::getDeviceQueue(uint32_t queue_family_index, uint32_t queue_index/* = 0*/) {
+std::shared_ptr<Queue> VulkanDevice::getDeviceQueue(
+    uint32_t queue_family_index,
+    uint32_t queue_index/* = 0*/) {
     VkQueue queue;
     vkGetDeviceQueue(device_, queue_family_index, queue_index, &queue);
     auto vk_queue = std::make_shared<VulkanQueue>();
@@ -650,7 +678,7 @@ std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool() {
 }
 
 void VulkanDevice::updateDescriptorSets(
-    const std::vector<std::shared_ptr<WriteDescriptor>>& write_descriptors) {
+    const WriteDescriptorList& write_descriptors) {
     std::vector<VkWriteDescriptorSet> descriptor_writes;
     std::vector<std::shared_ptr<VkDescriptorImageInfo>> desc_images;
     std::vector<std::shared_ptr<VkDescriptorBufferInfo>> desc_buffers;
@@ -1072,6 +1100,13 @@ void VulkanDevice::destroyShaderModule(
 }
 
 void VulkanDevice::destroy() {
+    freeCommandBuffers(
+        transient_cmd_pool_,
+        { transient_cmd_buffer_ });
+
+    destroyCommandPool(
+        transient_cmd_pool_);
+
     vkDestroyDevice(device_, nullptr);
 }
 

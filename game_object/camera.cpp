@@ -107,9 +107,8 @@ std::shared_ptr<renderer::Pipeline> GameCamera::update_game_camera_pipeline_;
 std::shared_ptr<renderer::BufferInfo> GameCamera::game_camera_buffer_;
 
 GameCamera::GameCamera(
-    const renderer::DeviceInfo& device_info,
-    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool)
-    : device_info_(device_info) {
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
 }
 
 void GameCamera::createGameCameraUpdateDescSet(
@@ -241,7 +240,7 @@ void GameCamera::generateDescriptorSet(
         game_objects_buffer);
 }
 
-void GameCamera::destoryStaticMembers(
+void GameCamera::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     game_camera_buffer_->destroy(device);
     device->destroyDescriptorSetLayout(update_game_camera_desc_set_layout_);
@@ -287,7 +286,7 @@ glsl::GameCameraInfo GameCamera::readCameraInfo(
 }
 
 void GameCamera::update(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const float& time) {
 }
 

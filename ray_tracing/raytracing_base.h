@@ -58,36 +58,36 @@ protected:
     glm::uvec2 rt_size_ = glm::vec2(0.0f);
 
     virtual void initBottomLevelDataInfo(
-        const renderer::DeviceInfo& device_info) = 0;
+        const std::shared_ptr<renderer::Device>& device) = 0;
 
     virtual void initTopLevelDataInfo(
-        const renderer::DeviceInfo& device_info) = 0;
+        const std::shared_ptr<renderer::Device>& device) = 0;
 
     virtual void createRayTracingPipeline(
-        const renderer::DeviceInfo& device_info) = 0;
+        const std::shared_ptr<renderer::Device>& device) = 0;
 
     virtual void createShaderBindingTables(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
         const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features) = 0;
 
     virtual void createRtResources(
-        const renderer::DeviceInfo& device_info) = 0;
+        const std::shared_ptr<renderer::Device>& device) = 0;
 
     virtual void createDescriptorSets(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) = 0;
 
 public:
     virtual void init(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
         const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
         glm::uvec2 size) = 0;
 
     virtual renderer::TextureInfo draw(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const glsl::ViewParams& view_params) = 0;
 

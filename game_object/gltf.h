@@ -166,14 +166,14 @@ public:
         const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout,
         const std::shared_ptr<renderer::BufferInfo>& game_objects_buffer);
 
-    void destroy();
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device);
 };
 
 class GltfObject {
     enum {
         kMaxNumObjects = 10240
     };
-    const renderer::DeviceInfo& device_info_;
     std::shared_ptr<GltfData>   object_;
     glm::mat4                   location_;
 
@@ -201,7 +201,7 @@ class GltfObject {
 public:
     GltfObject() = delete;
     GltfObject(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
@@ -227,9 +227,10 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const float& time);
 
-    void destroy() {
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device) {
         if (object_) {
-            object_->destroy();
+            object_->destroy(device);
         }
     }
 
@@ -282,7 +283,7 @@ public:
         const renderer::TextureInfo& water_flow,
         const std::shared_ptr<renderer::ImageView>& airflow_tex);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
     static void updateGameObjectsBuffer(
@@ -300,7 +301,7 @@ public:
     static std::shared_ptr<renderer::BufferInfo> getGameObjectsBuffer();
 
     static std::shared_ptr<GltfData> loadGltfModel(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::string& input_filename);
 };
 

@@ -67,15 +67,15 @@ TextureInfo Helper::perm_grad_tex_;
 TextureInfo Helper::perm_grad_4d_tex_;
 TextureInfo Helper::grad_4d_tex_;
 
-void Helper::init(const DeviceInfo& device_info) {
-    vk::helper::create2x2Texture(device_info, 0xffffffff, white_tex_);
-    vk::helper::create2x2Texture(device_info, 0xff000000, black_tex_);
-    vk::helper::createPermutationTexture(device_info, permutation_tex_);
-    vk::helper::createPermutation2DTexture(device_info, permutation_2d_tex_);
-    vk::helper::createGradTexture(device_info, grad_tex_);
-    vk::helper::createPermGradTexture(device_info, perm_grad_tex_);
-    vk::helper::createPermGrad4DTexture(device_info, perm_grad_4d_tex_);
-    vk::helper::createGrad4DTexture(device_info, grad_4d_tex_);
+void Helper::init(const std::shared_ptr<Device>& device) {
+    vk::helper::create2x2Texture(device, 0xffffffff, white_tex_);
+    vk::helper::create2x2Texture(device, 0xff000000, black_tex_);
+    vk::helper::createPermutationTexture(device, permutation_tex_);
+    vk::helper::createPermutation2DTexture(device, permutation_2d_tex_);
+    vk::helper::createGradTexture(device, grad_tex_);
+    vk::helper::createPermGradTexture(device, perm_grad_tex_);
+    vk::helper::createPermGrad4DTexture(device, perm_grad_4d_tex_);
+    vk::helper::createGrad4DTexture(device, grad_4d_tex_);
 
     image_source_info_ = {
         ImageLayout::UNDEFINED,
@@ -252,7 +252,7 @@ void Helper::addOneAccelerationStructure(
 }
 
 void Helper::createBuffer(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     const BufferUsageFlags& usage,
     const MemoryPropertyFlags& memory_property,
     const MemoryAllocateFlags& allocate_flags,
@@ -260,10 +260,13 @@ void Helper::createBuffer(
     std::shared_ptr<DeviceMemory>& buffer_memory,
     const uint64_t buffer_size /*= 0*/,
     const void* src_data/*= nullptr*/) {
-    const auto& device = device_info.device;
 
-    bool has_src_data = buffer_size > 0 && src_data;
-    bool need_stage_buffer = has_src_data && (memory_property == SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
+    bool has_src_data = 
+        buffer_size > 0 &&
+        src_data;
+    bool need_stage_buffer =
+        has_src_data &&
+        (memory_property == SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
     device->createBuffer(
         buffer_size,
@@ -288,7 +291,7 @@ void Helper::createBuffer(
 
             device->updateBufferMemory(staging_buffer_memory, buffer_size, src_data);
 
-            vk::helper::copyBuffer(device_info, staging_buffer, buffer, buffer_size);
+            vk::helper::copyBuffer(device, staging_buffer, buffer, buffer_size);
 
             device->destroyBuffer(staging_buffer);
             device->freeMemory(staging_buffer_memory);
@@ -300,11 +303,10 @@ void Helper::createBuffer(
 }
 
 void Helper::updateBufferWithSrcData(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     const uint64_t& buffer_size,
     const void* src_data,
     const std::shared_ptr<Buffer>& buffer) {
-    const auto& device = device_info.device;
 
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
@@ -319,7 +321,7 @@ void Helper::updateBufferWithSrcData(
 
     device->updateBufferMemory(staging_buffer_memory, buffer_size, src_data);
 
-    vk::helper::copyBuffer(device_info, staging_buffer, buffer, buffer_size);
+    vk::helper::copyBuffer(device, staging_buffer, buffer, buffer_size);
 
     device->destroyBuffer(staging_buffer);
     device->freeMemory(staging_buffer_memory);
@@ -344,7 +346,7 @@ void Helper::generateMipmapLevels(
 }
 
 void Helper::create2DTextureImage(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     Format format,
     int tex_width,
     int tex_height,
@@ -353,8 +355,8 @@ void Helper::create2DTextureImage(
     std::shared_ptr<Image>& texture_image,
     std::shared_ptr<DeviceMemory>& texture_image_memory) {
 
-    const auto& device = device_info.device;
-    VkDeviceSize image_size = static_cast<VkDeviceSize>(tex_width * tex_height * (format == Format::R16_UNORM ? 2 : 4));
+    VkDeviceSize image_size =
+        static_cast<VkDeviceSize>(tex_width * tex_height * (format == Format::R16_UNORM ? 2 : 4));
 
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
@@ -367,7 +369,10 @@ void Helper::create2DTextureImage(
         staging_buffer,
         staging_buffer_memory);
 
-    device->updateBufferMemory(staging_buffer_memory, image_size, pixels);
+    device->updateBufferMemory(
+        staging_buffer_memory,
+        image_size,
+        pixels);
 
     vk::helper::createTextureImage(
         device,
@@ -380,16 +385,37 @@ void Helper::create2DTextureImage(
         texture_image,
         texture_image_memory);
 
-    vk::helper::transitionImageLayout(device_info, texture_image, format, ImageLayout::UNDEFINED, ImageLayout::TRANSFER_DST_OPTIMAL);
-    vk::helper::copyBufferToImage(device_info, staging_buffer, texture_image, glm::uvec3(tex_width, tex_height, 1));
-    vk::helper::transitionImageLayout(device_info, texture_image, format, ImageLayout::TRANSFER_DST_OPTIMAL, ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    auto cmd_buf = device->getIntransitCommandBuffer();
+    auto cmd_queue = device->getIntransitComputeQueue();
+    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        texture_image,
+        format,
+        ImageLayout::UNDEFINED,
+        ImageLayout::TRANSFER_DST_OPTIMAL);
+    vk::helper::copyBufferToImage(
+        cmd_buf,
+        staging_buffer,
+        texture_image,
+        glm::uvec3(tex_width, tex_height, 1));
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        texture_image,
+        format,
+        ImageLayout::TRANSFER_DST_OPTIMAL,
+        ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    cmd_buf->endCommandBuffer();
+    cmd_queue->submit({ cmd_buf });
+    cmd_queue->waitIdle();
+    cmd_buf->reset(0);
 
     device->destroyBuffer(staging_buffer);
     device->freeMemory(staging_buffer_memory);
 }
 
 void Helper::create2DTextureImage(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     Format format,
     const glm::uvec2& size,
     TextureInfo& texture_2d,
@@ -397,7 +423,6 @@ void Helper::create2DTextureImage(
     const renderer::ImageLayout& image_layout,
     const renderer::ImageTiling image_tiling,
     const uint32_t memory_property) {
-    const auto& device = device_info.device;
     auto is_depth = vk::helper::isDepthFormat(format);
     vk::helper::createTextureImage(
         device,
@@ -419,7 +444,7 @@ void Helper::create2DTextureImage(
                 SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 
     vk::helper::transitionImageLayout(
-        device_info,
+        device,
         texture_2d.image,
         format,
         ImageLayout::UNDEFINED,
@@ -429,14 +454,13 @@ void Helper::create2DTextureImage(
 }
 
 void Helper::dumpTextureImage(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<Image>& src_texture_image,
     Format format,
     const glm::uvec3& image_size,
     const uint32_t& bytes_per_pixel,
     void* pixels) {
 
-    const auto& device = device_info.device;
     VkDeviceSize buffer_size = static_cast<VkDeviceSize>(
         image_size.x * image_size.y * image_size.z * bytes_per_pixel);
 
@@ -451,9 +475,30 @@ void Helper::dumpTextureImage(
         staging_buffer,
         staging_buffer_memory);
 
-    vk::helper::transitionImageLayout(device_info, src_texture_image, format, ImageLayout::UNDEFINED, ImageLayout::TRANSFER_SRC_OPTIMAL);
-    vk::helper::copyImageToBuffer(device_info, src_texture_image, staging_buffer, image_size);
-    vk::helper::transitionImageLayout(device_info, src_texture_image, format, ImageLayout::TRANSFER_SRC_OPTIMAL, ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    auto cmd_buf = device->getIntransitCommandBuffer();
+    auto cmd_queue = device->getIntransitComputeQueue();
+    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        src_texture_image,
+        format,
+        ImageLayout::UNDEFINED,
+        ImageLayout::TRANSFER_SRC_OPTIMAL);
+    vk::helper::copyImageToBuffer(
+        cmd_buf,
+        src_texture_image,
+        staging_buffer,
+        image_size);
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        src_texture_image,
+        format,
+        ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    cmd_buf->endCommandBuffer();
+    cmd_queue->submit({ cmd_buf });
+    cmd_queue->waitIdle();
+    cmd_buf->reset(0);
 
     device->dumpBufferMemory(staging_buffer_memory, buffer_size, pixels);
 
@@ -462,7 +507,7 @@ void Helper::dumpTextureImage(
 }
 
 void Helper::create3DTextureImage(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     Format format,
     const glm::uvec3& size,
     TextureInfo& texture_3d,
@@ -470,7 +515,6 @@ void Helper::create3DTextureImage(
     const renderer::ImageLayout& image_layout,
     const renderer::ImageTiling image_tiling,
     const uint32_t memory_property) {
-    const auto& device = device_info.device;
     auto is_depth = vk::helper::isDepthFormat(format);
     vk::helper::createTextureImage(
         device,
@@ -492,7 +536,7 @@ void Helper::create3DTextureImage(
             SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 
     vk::helper::transitionImageLayout(
-        device_info,
+        device,
         texture_3d.image,
         format,
         ImageLayout::UNDEFINED,
@@ -500,13 +544,13 @@ void Helper::create3DTextureImage(
 }
 
 void Helper::createDepthResources(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     Format format,
     glm::uvec2 size,
     TextureInfo& texture_2d) {
 
     create2DTextureImage(
-        device_info,
+        device,
         format,
         size,
         texture_2d,
@@ -516,7 +560,7 @@ void Helper::createDepthResources(
 }
 
 void Helper::createCubemapTexture(
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<RenderPass>& render_pass,
     uint32_t width,
     uint32_t height,
@@ -525,9 +569,7 @@ void Helper::createCubemapTexture(
     const std::vector<BufferImageCopyInfo>& copy_regions,
     TextureInfo& texture,
     uint64_t buffer_size /*= 0*/,
-    void* data /*= nullptr*/)
-{
-    const auto& device = device_info.device;
+    void* data /*= nullptr*/) {
     bool use_as_framebuffer = data == nullptr;
     VkDeviceSize image_size = static_cast<VkDeviceSize>(buffer_size);
 
@@ -579,9 +621,40 @@ void Helper::createCubemapTexture(
     device->bindImageMemory(texture.image, texture.memory);
 
     if (data) {
-        vk::helper::transitionImageLayout(device_info, texture.image, format, ImageLayout::UNDEFINED, ImageLayout::TRANSFER_DST_OPTIMAL, 0, mip_count, 0, 6);
-        vk::helper::copyBufferToImageWithMips(device_info, staging_buffer, texture.image, copy_regions);
-        vk::helper::transitionImageLayout(device_info, texture.image, format, ImageLayout::TRANSFER_DST_OPTIMAL, ImageLayout::SHADER_READ_ONLY_OPTIMAL, 0, mip_count, 0, 6);
+        auto cmd_buf = device->getIntransitCommandBuffer();
+        auto cmd_queue = device->getIntransitComputeQueue();
+        cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+
+        vk::helper::transitionImageLayout(
+            cmd_buf,
+            texture.image,
+            format,
+            ImageLayout::UNDEFINED,
+            ImageLayout::TRANSFER_DST_OPTIMAL,
+            0,
+            mip_count,
+            0,
+            6);
+        vk::helper::copyBufferToImageWithMips(
+            cmd_buf,
+            staging_buffer,
+            texture.image,
+            copy_regions);
+        vk::helper::transitionImageLayout(
+            cmd_buf,
+            texture.image,
+            format,
+            ImageLayout::TRANSFER_DST_OPTIMAL,
+            ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            0,
+            mip_count,
+            0,
+            6);
+
+        cmd_buf->endCommandBuffer();
+        cmd_queue->submit({ cmd_buf });
+        cmd_queue->waitIdle();
+        cmd_buf->reset(0);
     }
 
     texture.view = device->createImageView(
@@ -725,7 +798,7 @@ void Helper::blitImage(
 }
 
 void Helper::transitionImageLayout(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Image>& image,
     const renderer::Format& format,
     const renderer::ImageLayout& old_layout,
@@ -735,7 +808,29 @@ void Helper::transitionImageLayout(
     uint32_t base_layer/* = 0*/,
     uint32_t layer_count/* = 1*/) {
     vk::helper::transitionImageLayout(
-        device_info,
+        cmd_buf,
+        image,
+        format,
+        old_layout,
+        new_layout,
+        base_mip_idx,
+        mip_count,
+        base_layer,
+        layer_count);
+}
+
+void Helper::transitionImageLayout(
+    const std::shared_ptr<Device>& device,
+    const std::shared_ptr<renderer::Image>& image,
+    const renderer::Format& format,
+    const renderer::ImageLayout& old_layout,
+    const renderer::ImageLayout& new_layout,
+    uint32_t base_mip_idx/* = 0*/,
+    uint32_t mip_count/* = 1*/,
+    uint32_t base_layer/* = 0*/,
+    uint32_t layer_count/* = 1*/) {
+    vk::helper::transitionImageLayout(
+        device,
         image,
         format,
         old_layout,
@@ -874,14 +969,13 @@ bool Helper::presentQueue(
 
 void Helper::initImgui(
     GLFWwindow* window,
-    const DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<Instance>& instance,
     const QueueFamilyList& queue_family_list,
     const SwapChainInfo& swap_chain_info,
     const std::shared_ptr<Queue>& graphics_queue,
     const std::shared_ptr<DescriptorPool>& descriptor_pool,
-    const std::shared_ptr<RenderPass>& render_pass,
-    const std::shared_ptr<CommandBuffer>& command_buffer) {
+    const std::shared_ptr<RenderPass>& render_pass) {
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -894,7 +988,7 @@ void Helper::initImgui(
     //ImGui::StyleColorsClassic();
 
     // Setup Platform/Renderer backends
-    auto logic_device = RENDER_TYPE_CAST(Device, device_info.device);
+    auto logic_device = RENDER_TYPE_CAST(Device, device);
     ImGui_ImplGlfw_InitForVulkan(window, true);
     ImGui_ImplVulkan_InitInfo init_info = {};
     init_info.Instance = RENDER_TYPE_CAST(Instance, instance)->get();
@@ -927,31 +1021,22 @@ void Helper::initImgui(
 
     // Upload Fonts
     {
-        // Use any command queue
-        //VkCommandPool command_pool = wd->Frames[wd->FrameIndex].CommandPool;
-        auto cmd_buf = RENDER_TYPE_CAST(CommandBuffer, command_buffer)->get();
+        auto cmd_buf = device->getIntransitCommandBuffer();
+        auto cmd_queue = device->getIntransitComputeQueue();
+        cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
 
-        //auto err = vkResetCommandPool(init_info.Device, command_pool, 0);
-        //check_vk_result(err);
-        VkCommandBufferBeginInfo begin_info = {};
-        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin_info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        auto err = vkBeginCommandBuffer(cmd_buf, &begin_info);
-        check_vk_result(err);
+        ImGui_ImplVulkan_CreateFontsTexture(
+            RENDER_TYPE_CAST(
+                CommandBuffer,
+                cmd_buf
+            )->get()
+        );
 
-        ImGui_ImplVulkan_CreateFontsTexture(cmd_buf);
+        cmd_buf->endCommandBuffer();
+        cmd_queue->submit({ cmd_buf });
+        cmd_queue->waitIdle();
+        cmd_buf->reset(0);
 
-        VkSubmitInfo end_info = {};
-        end_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        end_info.commandBufferCount = 1;
-        end_info.pCommandBuffers = &cmd_buf;
-        err = vkEndCommandBuffer(cmd_buf);
-        check_vk_result(err);
-        err = vkQueueSubmit(init_info.Queue, 1, &end_info, VK_NULL_HANDLE);
-        check_vk_result(err);
-
-        err = vkDeviceWaitIdle(init_info.Device);
-        check_vk_result(err);
         ImGui_ImplVulkan_DestroyFontUploadObjects();
     }
 }

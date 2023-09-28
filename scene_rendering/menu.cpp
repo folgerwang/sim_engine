@@ -29,14 +29,13 @@ namespace scene_rendering {
 
 Menu::Menu(
     GLFWwindow* window,
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::Instance>& instance,
     const renderer::QueueFamilyList& queue_family_list,
     const renderer::SwapChainInfo& swap_chain_info,
     const std::shared_ptr<renderer::Queue>& graphics_queue,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
-    const std::shared_ptr<renderer::CommandBuffer>& command_buffer,
     const std::shared_ptr<renderer::Sampler>& sampler,
     const std::shared_ptr<renderer::ImageView>& image_view) {
     std::string path = "assets";
@@ -50,14 +49,13 @@ Menu::Menu(
 
     renderer::Helper::initImgui(
         window,
-        device_info,
+        device,
         instance,
         queue_family_list,
         swap_chain_info,
         graphics_queue,
         descriptor_pool,
-        render_pass,
-        command_buffer);
+        render_pass);
 
     const float kTempScale = 1.0f;
     const float kMoistScale = 1.0f;
@@ -83,25 +81,23 @@ Menu::Menu(
 
 void Menu::init(
     GLFWwindow* window,
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::Instance>& instance,
     const renderer::QueueFamilyList& queue_family_list,
     const renderer::SwapChainInfo& swap_chain_info,
     const std::shared_ptr<renderer::Queue>& graphics_queue,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
-    const std::shared_ptr<renderer::CommandBuffer>& command_buffer) {
+    const std::shared_ptr<renderer::RenderPass>& render_pass) {
 
     renderer::Helper::initImgui(
         window,
-        device_info,
+        device,
         instance,
         queue_family_list,
         swap_chain_info,
         graphics_queue,
         descriptor_pool,
-        render_pass,
-        command_buffer);
+        render_pass);
 }
 
 bool Menu::draw(

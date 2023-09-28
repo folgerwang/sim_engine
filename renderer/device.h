@@ -7,6 +7,8 @@ namespace renderer {
 class Device {
 public:
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool() = 0;
+    virtual std::shared_ptr<CommandBuffer> getIntransitCommandBuffer() = 0;
+    virtual std::shared_ptr<Queue> getIntransitComputeQueue() = 0;
     virtual void createBuffer(
         const uint64_t& buffer_size,
         const BufferUsageFlags& usage,

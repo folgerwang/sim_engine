@@ -84,11 +84,9 @@ static void calculateBbox(
 }
 
 static void setupMeshState(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const tinygltf::Model& model,
     std::shared_ptr<ego::GltfData>& gltf_object) {
-
-    const auto& device = device_info.device;
 
     // Buffer
     {
@@ -96,7 +94,7 @@ static void setupMeshState(
         for (size_t i = 0; i < model.buffers.size(); i++) {
             auto buffer = model.buffers[i];
             renderer::Helper::createBuffer(
-                device_info,
+                device,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
                 SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT) |
                 SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
@@ -208,7 +206,7 @@ static void setupMeshState(
             const auto& src_img = model.images[i_tex];
             auto format = renderer::Format::R8G8B8A8_UNORM;
             renderer::Helper::create2DTextureImage(
-                device_info,
+                device,
                 format,
                 src_img.width,
                 src_img.height,
@@ -488,7 +486,7 @@ static void setupAnimations(
 }
 
 static void setupSkin(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const tinygltf::Model& model,
     const tinygltf::Skin& src_skin,
     ego::SkinInfo& skin_info) {
@@ -514,7 +512,7 @@ static void setupSkin(
         memcpy(skin_info.inverse_bind_matrices_.data(), src_buffer_data, src_data_size);
 
         renderer::Helper::createBuffer(
-            device_info,
+            device,
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
             SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
             SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
@@ -527,12 +525,16 @@ static void setupSkin(
 }
 
 static void setupSkins(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const tinygltf::Model& model,
     std::shared_ptr<ego::GltfData>& gltf_object) {
     gltf_object->skins_.resize(model.skins.size());
     for (int i_skin = 0; i_skin < model.skins.size(); i_skin++) {
-        setupSkin(device_info, model, model.skins[i_skin], gltf_object->skins_[i_skin]);
+        setupSkin(
+            device,
+            model,
+            model.skins[i_skin],
+            gltf_object->skins_[i_skin]);
     }
 }
 
@@ -620,7 +622,6 @@ static void setupModel(
 }
 
 static void setupRaytracing(
-    const renderer::DeviceInfo& device_info,
     std::shared_ptr<ego::GltfData>& gltf_object) {
 
     for (auto& mesh : gltf_object->meshes_) {
@@ -1266,25 +1267,26 @@ void PrimitiveInfo::generateHash() {
     }
 }
 
-void GltfData::destroy() {
+void GltfData::destroy(
+    const std::shared_ptr<renderer::Device>& device) {
     for (auto& texture : textures_) {
-        texture.destroy(device_);
+        texture.destroy(device);
     }
 
     for (auto& material : materials_) {
-        material.uniform_buffer_.destroy(device_);
+        material.uniform_buffer_.destroy(device);
     }
 
     for (auto& buffer : buffers_) {
-        buffer.destroy(device_);
+        buffer.destroy(device);
     }
 
     for (int i_skin = 0; i_skin < skins_.size(); i_skin++) {
-        skins_[i_skin].joints_buffer_.destroy(device_);
+        skins_[i_skin].joints_buffer_.destroy(device);
     }
 
-    indirect_draw_cmd_.destroy(device_);
-    instance_buffer_.destroy(device_);
+    indirect_draw_cmd_.destroy(device);
+    instance_buffer_.destroy(device);
 }
 
 struct compare {
@@ -1421,7 +1423,7 @@ void GltfData::update(
 }
 
 GltfObject::GltfObject(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
@@ -1430,15 +1432,14 @@ GltfObject::GltfObject(
     const std::string& file_name,
     const glm::uvec2& display_size,
     glm::mat4 location/* = glm::mat4(1.0f)*/)
-    : device_info_(device_info),
-    location_(location){
+    : location_(location){
 
     auto result = object_list_.find(file_name);
     if (result == object_list_.end()) {
-        object_ = loadGltfModel(device_info, file_name);
+        object_ = loadGltfModel(device, file_name);
 
         updateDescriptorSets(
-            device_info.device,
+            device,
             descriptor_pool,
             material_desc_set_layout_,
             skin_desc_set_layout_,
@@ -1452,7 +1453,7 @@ GltfObject::GltfObject(
         if (result == gltf_pipeline_list_.end()) {
             gltf_pipeline_list_[hash_value] =
                 createGltfPipeline(
-                    device_info.device,
+                    device,
                     render_pass,
                     gltf_pipeline_layout_,
                     graphic_pipeline_info,
@@ -1460,7 +1461,7 @@ GltfObject::GltfObject(
                     primitive);
         }
 
-        device_info.device->createBuffer(
+        device->createBuffer(
             kNumGltfInstance * sizeof(glsl::InstanceDataInfo),
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
@@ -1470,7 +1471,7 @@ GltfObject::GltfObject(
             object_->instance_buffer_.memory);
 
         object_->generateSharedDescriptorSet(
-            device_info.device,
+            device,
             descriptor_pool,
             gltf_indirect_draw_desc_set_layout_,
             update_instance_buffer_desc_set_layout_,
@@ -1798,7 +1799,7 @@ void GltfObject::generateDescriptorSet(
         airflow_tex);
 }
 
-void GltfObject::destoryStaticMembers(
+void GltfObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     game_objects_buffer_->destroy(device);
     device->destroyDescriptorSetLayout(material_desc_set_layout_);
@@ -1972,7 +1973,7 @@ std::shared_ptr<renderer::BufferInfo> GltfObject::getGameObjectsBuffer() {
 }
 
 std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::string& input_filename)
 {
     tinygltf::Model model;
@@ -2005,13 +2006,13 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
         return nullptr;
     }
 
-    auto gltf_object = std::make_shared<ego::GltfData>(device_info.device);
+    auto gltf_object = std::make_shared<ego::GltfData>(device);
     gltf_object->meshes_.reserve(model.meshes.size());
 
-    setupMeshState(device_info, model, gltf_object);
+    setupMeshState(device, model, gltf_object);
     setupMeshes(model, gltf_object);
     setupAnimations(model, gltf_object);
-    setupSkins(device_info, model, gltf_object);
+    setupSkins(device, model, gltf_object);
     setupNodes(model, gltf_object);
     setupModel(model, gltf_object);
     for (auto& scene : gltf_object->scenes_) {
@@ -2020,9 +2021,9 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
         }
     }
 
-    gltf_object->update(device_info.device, 0, 0.0f);
+    gltf_object->update(device, 0, 0.0f);
 
-    setupRaytracing(device_info, gltf_object);
+    setupRaytracing(gltf_object);
 
     // init indirect draw buffer.
     uint32_t num_prims = 0;
@@ -2054,7 +2055,7 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
     }
 
     renderer::Helper::createBuffer(
-        device_info,
+        device,
         SET_FLAG_BIT(BufferUsage, INDIRECT_BUFFER_BIT) |
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),

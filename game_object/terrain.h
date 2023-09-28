@@ -5,8 +5,6 @@ namespace engine {
 namespace game_object {
 
 class TileObject {
-    const renderer::DeviceInfo& device_info_;
-
     enum class TileConst{
         kRockLayerSize = 8192,
         kSoilLayerSize = 4096,
@@ -66,16 +64,12 @@ class TileObject {
 public:
     TileObject() = delete;
     TileObject(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
         const glm::vec2& min,
         const glm::vec2& max,
         const size_t& hash_value,
         const uint32_t& block_idx);
-
-    ~TileObject() {
-        destory();
-    }
 
     inline size_t getHash() { return hash_; }
 
@@ -83,7 +77,8 @@ public:
         neighbors_ = neighbors;
     }
 
-    void destory();
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device);
 
     static const renderer::TextureInfo& getRockLayer();
     static const renderer::TextureInfo& getSoilWaterLayer(int idx);
@@ -96,13 +91,13 @@ public:
     float getMinDistToCamera(const glm::vec2& camera_pos);
 
     static std::shared_ptr<TileObject> addOneTile(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
         const glm::vec2& min,
         const glm::vec2& max);
 
     static void initStaticMembers(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const std::shared_ptr<renderer::RenderPass>& water_render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
@@ -128,7 +123,7 @@ public:
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const glm::uvec2& display_size);
 
-    static void destoryStaticMembers(
+    static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
     static void updateStaticDescriptorSet(
@@ -181,21 +176,24 @@ public:
         bool render_grass = false);
 
     static void updateAllTiles(
-        const renderer::DeviceInfo& device_info,
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
         const float& tile_size,
         const glm::vec2& camera_pos);
 
-    static void destoryAllTiles();
+    static void destroyAllTiles(
+        const std::shared_ptr<renderer::Device>& device);
 
     bool validTileBySize(
         const glm::ivec2& min_tile_idx,
         const glm::ivec2& max_tile_idx,
         const float& tile_size);
 
-    void createMeshBuffers();
+    void createMeshBuffers(
+        const std::shared_ptr<renderer::Device>& device);
 
-    void createGrassBuffers();
+    void createGrassBuffers(
+        const std::shared_ptr<renderer::Device>& device);
         
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,

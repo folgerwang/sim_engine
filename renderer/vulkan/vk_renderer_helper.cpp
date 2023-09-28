@@ -1930,13 +1930,16 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
         unique_queue_families.insert(queue_family);
     }
 
-    float queue_priority = 1.0f;
+    float priorities[32];
+    for (uint32_t i = 0; i < 32; ++i) {
+        priorities[i] = 1.0f;
+    }
     for (uint32_t queue_family : unique_queue_families) {
         VkDeviceQueueCreateInfo queue_create_info{};
         queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         queue_create_info.queueFamilyIndex = queue_family;
-        queue_create_info.queueCount = 1;
-        queue_create_info.pQueuePriorities = &queue_priority;
+        queue_create_info.queueCount = list.getQueueInfo(queue_family).queue_count_;
+        queue_create_info.pQueuePriorities = priorities;
         queue_create_infos.push_back(queue_create_info);
     }
 
@@ -2004,14 +2007,20 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     create_info.pEnabledFeatures = nullptr;
     create_info.pNext = &physical_device_features2;
 
-    const auto& vk_physical_device = RENDER_TYPE_CAST(PhysicalDevice, physical_device);
+    const auto& vk_physical_device =
+        RENDER_TYPE_CAST(PhysicalDevice, physical_device);
     assert(vk_physical_device);
     VkDevice vk_device;
     if (vkCreateDevice(vk_physical_device->get(), &create_info, nullptr, &vk_device) != VK_SUCCESS) {
         throw std::runtime_error("failed to create logical device!");
     }
 
-    auto vk_logic_device = std::make_shared<renderer::vk::VulkanDevice>(physical_device, vk_device);
+    auto vk_logic_device =
+        std::make_shared<renderer::vk::VulkanDevice>(
+            physical_device,
+            list,
+            vk_device,
+            list.getGraphicAndPresentFamilyIndex()[0]);
     return vk_logic_device;
 }
 
@@ -2069,7 +2078,8 @@ void initRayTracingProperties(
     as_features.descriptor_binding_acceleration_structure_update_after_bind = acceleration_structure_features.descriptorBindingAccelerationStructureUpdateAfterBind;
 }
 
-int rateDeviceSuitability(const VkPhysicalDevice& device) {
+int rateDeviceSuitability(
+    const VkPhysicalDevice& device) {
     VkPhysicalDeviceProperties device_properties;
     VkPhysicalDeviceFeatures device_features;
     vkGetPhysicalDeviceProperties(device, &device_properties);
@@ -2094,7 +2104,8 @@ int rateDeviceSuitability(const VkPhysicalDevice& device) {
     return score;
 }
 
-VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& available_formats) {
+VkSurfaceFormatKHR chooseSwapSurfaceFormat(
+    const std::vector<VkSurfaceFormatKHR>& available_formats) {
     for (const auto& available_format : available_formats) {
         if (available_format.format == VK_FORMAT_B8G8R8A8_UNORM &&
             available_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -2105,7 +2116,8 @@ VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>
     return available_formats[0];
 }
 
-renderer::PresentMode chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes) {
+renderer::PresentMode chooseSwapPresentMode(
+    const std::vector<VkPresentModeKHR>& availablePresentModes) {
     for (const auto& availablePresentMode : availablePresentModes) {
         if (availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
             return renderer::PresentMode::MAILBOX_KHR;
@@ -2115,7 +2127,9 @@ renderer::PresentMode chooseSwapPresentMode(const std::vector<VkPresentModeKHR>&
     return renderer::PresentMode::FIFO_KHR;
 }
 
-VkExtent2D chooseSwapExtent(GLFWwindow* window, const VkSurfaceCapabilitiesKHR& capabilities) {
+VkExtent2D chooseSwapExtent(
+    GLFWwindow* window,
+    const VkSurfaceCapabilitiesKHR& capabilities) {
     if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
         return capabilities.currentExtent;
     }
@@ -2272,34 +2286,27 @@ void createTextureImage(
 }
 
 void copyBuffer(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::Buffer>& src_buffer,
     const std::shared_ptr<renderer::Buffer>& dst_buffer,
-    uint64_t buffer_size) {
+    uint64_t buffer_size,
+    uint64_t src_offset /* = 0*/,
+    uint64_t dst_offset /* = 0*/) {
 
-    const auto& device = device_info.device;
-    const auto& cmd_queue = device_info.cmd_queue;
-    const auto& cmd_pool = device_info.cmd_pool;
+    auto cmd_buf = device->getIntransitCommandBuffer();
+    auto cmd_queue = device->getIntransitComputeQueue();
+    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
 
-    auto command_buffers = device->allocateCommandBuffers(cmd_pool, 1);
-    if (command_buffers.size() > 0) {
-        auto& cmd_buf = command_buffers[0];
-        if (cmd_buf) {
-            cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    std::vector<renderer::BufferCopyInfo> copy_regions(1);
+    copy_regions[0].src_offset = src_offset;
+    copy_regions[0].dst_offset = dst_offset;
+    copy_regions[0].size = buffer_size;
+    cmd_buf->copyBuffer(src_buffer, dst_buffer, copy_regions);
 
-            std::vector<renderer::BufferCopyInfo> copy_regions(1);
-            copy_regions[0].src_offset = 0; // Optional
-            copy_regions[0].dst_offset = 0; // Optional
-            copy_regions[0].size = buffer_size;
-            cmd_buf->copyBuffer(src_buffer, dst_buffer, copy_regions);
-
-            cmd_buf->endCommandBuffer();
-        }
-
-        cmd_queue->submit(command_buffers);
-        cmd_queue->waitIdle();
-        device->freeCommandBuffers(cmd_pool, command_buffers);
-    }
+    cmd_buf->endCommandBuffer();
+    cmd_queue->submit({ cmd_buf });
+    cmd_queue->waitIdle();
+    cmd_buf->reset(0);
 }
 
 bool hasStencilComponent(const renderer::Format& format) {
@@ -2309,7 +2316,7 @@ bool hasStencilComponent(const renderer::Format& format) {
 }
 
 void transitionImageLayout(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Image>& image,
     const renderer::Format& format,
     const renderer::ImageLayout& old_layout,
@@ -2319,193 +2326,175 @@ void transitionImageLayout(
     uint32_t base_layer/* = 0*/,
     uint32_t layer_count/* = 1*/) {
 
-    const auto& device = device_info.device;
-    const auto& cmd_queue = device_info.cmd_queue;
-    const auto& cmd_pool = device_info.cmd_pool;
-    assert(device);
-    assert(cmd_queue);
-    assert(cmd_pool);
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = toVkImageLayout(old_layout);
+    barrier.newLayout = toVkImageLayout(new_layout);
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 
-    auto command_buffers = device_info.device->allocateCommandBuffers(cmd_pool, 1);
-    if (command_buffers.size() > 0) {
-        auto& cmd_buf = command_buffers[0];
-        if (cmd_buf) {
-            cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    // todo.
+    auto vk_image = RENDER_TYPE_CAST(Image, image);
+    barrier.image = vk_image->get();
+    if (isDepthFormat(format)) {
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
 
-            VkImageMemoryBarrier barrier{};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.oldLayout = toVkImageLayout(old_layout);
-            barrier.newLayout = toVkImageLayout(new_layout);
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-
-            // todo.
-            auto vk_image = RENDER_TYPE_CAST(Image, image);
-            barrier.image = vk_image->get();
-            if (isDepthFormat(format)) {
-                barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-
-                if (hasStencilComponent(format)) {
-                    barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
-                }
-            }
-            else {
-                barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            }
-            barrier.subresourceRange.baseMipLevel = base_mip_idx;
-            barrier.subresourceRange.levelCount = mip_count;
-            barrier.subresourceRange.baseArrayLayer = base_layer;
-            barrier.subresourceRange.layerCount = layer_count;
-            VkPipelineStageFlags source_stage;
-            VkPipelineStageFlags destination_stage;
-
-            if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::TRANSFER_DST_OPTIMAL) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::TRANSFER_SRC_OPTIMAL) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::TRANSFER_DST_OPTIMAL &&
-                new_layout == renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL) {
-                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                destination_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::TRANSFER_SRC_OPTIMAL &&
-                new_layout == renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL) {
-                barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                destination_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::PRESENT_SRC_KHR) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            }
-            else if (old_layout == renderer::ImageLayout::UNDEFINED &&
-                new_layout == renderer::ImageLayout::GENERAL) {
-                barrier.srcAccessMask = 0;
-                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT| VK_ACCESS_SHADER_WRITE_BIT;
-
-                source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                destination_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-            }
-            else {
-                throw std::invalid_argument("unsupported layout transition!");
-            }
-
-            auto vk_cmd_Buf = RENDER_TYPE_CAST(CommandBuffer, cmd_buf);
-            assert(vk_cmd_Buf);
-            vkCmdPipelineBarrier(
-                vk_cmd_Buf->get(),
-                source_stage, destination_stage,
-                0,
-                0, nullptr,
-                0, nullptr,
-                1, &barrier
-            );
-
-            cmd_buf->endCommandBuffer();
+        if (hasStencilComponent(format)) {
+            barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
         }
-
-        cmd_queue->submit(command_buffers);
-        cmd_queue->waitIdle();
-        device->freeCommandBuffers(cmd_pool, command_buffers);
     }
+    else {
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+    barrier.subresourceRange.baseMipLevel = base_mip_idx;
+    barrier.subresourceRange.levelCount = mip_count;
+    barrier.subresourceRange.baseArrayLayer = base_layer;
+    barrier.subresourceRange.layerCount = layer_count;
+    VkPipelineStageFlags source_stage;
+    VkPipelineStageFlags destination_stage;
+
+    if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::TRANSFER_SRC_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::TRANSFER_DST_OPTIMAL &&
+        new_layout == renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destination_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::TRANSFER_SRC_OPTIMAL &&
+        new_layout == renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destination_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::PRESENT_SRC_KHR) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::UNDEFINED &&
+        new_layout == renderer::ImageLayout::GENERAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT| VK_ACCESS_SHADER_WRITE_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+    else {
+        throw std::invalid_argument("unsupported layout transition!");
+    }
+
+    auto vk_cmd_Buf = RENDER_TYPE_CAST(CommandBuffer, cmd_buf);
+    assert(vk_cmd_Buf);
+    vkCmdPipelineBarrier(
+        vk_cmd_Buf->get(),
+        source_stage, destination_stage,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &barrier
+    );
+}
+
+void transitionImageLayout(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::Image>& image,
+    const renderer::Format& format,
+    const renderer::ImageLayout& old_layout,
+    const renderer::ImageLayout& new_layout,
+    uint32_t base_mip_idx/* = 0*/,
+    uint32_t mip_count/* = 1*/,
+    uint32_t base_layer/* = 0*/,
+    uint32_t layer_count/* = 1*/) {
+
+    auto cmd_buf = device->getIntransitCommandBuffer();
+    auto cmd_queue = device->getIntransitComputeQueue();
+    cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        image,
+        format,
+        old_layout,
+        new_layout);
+    cmd_buf->endCommandBuffer();
+    cmd_queue->submit({ cmd_buf });
+    cmd_queue->waitIdle();
+    cmd_buf->reset(0);
 }
 
 void copyBufferToImageWithMips(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::shared_ptr<renderer::Image>& image,
     const std::vector<renderer::BufferImageCopyInfo>& copy_regions) {
-    const auto& device = device_info.device;
-    const auto& cmd_queue = device_info.cmd_queue;
-    const auto& cmd_pool = device_info.cmd_pool;
-
-    auto command_buffers = device->allocateCommandBuffers(cmd_pool, 1);
-    if (command_buffers.size() > 0) {
-        auto& cmd_buf = command_buffers[0];
-        if (cmd_buf) {
-            cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-            cmd_buf->copyBufferToImage(buffer, image, copy_regions, renderer::ImageLayout::TRANSFER_DST_OPTIMAL);
-            cmd_buf->endCommandBuffer();
-        }
-
-        cmd_queue->submit(command_buffers);
-        cmd_queue->waitIdle();
-        device->freeCommandBuffers(cmd_pool, command_buffers);
-    }
+    cmd_buf->copyBufferToImage(
+        buffer,
+        image,
+        copy_regions,
+        renderer::ImageLayout::TRANSFER_DST_OPTIMAL);
 }
 
 void copyImageToBufferWithMips(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Image>& image,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::vector<renderer::BufferImageCopyInfo>& copy_regions) {
-    const auto& device = device_info.device;
-    const auto& cmd_queue = device_info.cmd_queue;
-    const auto& cmd_pool = device_info.cmd_pool;
 
-    auto command_buffers = device->allocateCommandBuffers(cmd_pool, 1);
-    if (command_buffers.size() > 0) {
-        auto& cmd_buf = command_buffers[0];
-        if (cmd_buf) {
-            cmd_buf->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
-            cmd_buf->copyImageToBuffer(image, buffer, copy_regions, renderer::ImageLayout::TRANSFER_SRC_OPTIMAL);
-            cmd_buf->endCommandBuffer();
-        }
-
-        cmd_queue->submit(command_buffers);
-        cmd_queue->waitIdle();
-        device->freeCommandBuffers(cmd_pool, command_buffers);
-    }
+    cmd_buf->copyImageToBuffer(
+        image,
+        buffer,
+        copy_regions,
+        renderer::ImageLayout::TRANSFER_SRC_OPTIMAL);
 }
 
 void copyBufferToImage(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::shared_ptr<renderer::Image>& image,
     const glm::uvec3& tex_size) {
@@ -2523,11 +2512,11 @@ void copyBufferToImage(
     region.image_offset = glm::ivec3(0, 0, 0);
     region.image_extent = tex_size;
 
-    copyBufferToImageWithMips(device_info, buffer, image, copy_regions);
+    copyBufferToImageWithMips(cmd_buf, buffer, image, copy_regions);
 }
 
 void copyImageToBuffer(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Image>& image,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const glm::uvec3& tex_size) {
@@ -2545,7 +2534,7 @@ void copyImageToBuffer(
     region.image_offset = glm::ivec3(0, 0, 0);
     region.image_extent = tex_size;
 
-    copyImageToBufferWithMips(device_info, image, buffer, copy_regions);
+    copyImageToBufferWithMips(cmd_buf, image, buffer, copy_regions);
 }
 
 
@@ -2643,13 +2632,21 @@ void generateMipmapLevels(
 }
 
 void create2x2Texture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<Device>& device,
     uint32_t color,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8G8B8A8_UNORM;
     uint32_t colors[4] = { color };
-    renderer::Helper::create2DTextureImage(device_info, format, 2, 2, 4, colors, texture.image, texture.memory);
-    texture.view = device_info.device->createImageView(
+    renderer::Helper::create2DTextureImage(
+        device,
+        format,
+        2,
+        2,
+        4,
+        colors,
+        texture.image,
+        texture.memory);
+    texture.view = device->createImageView(
         texture.image,
         renderer::ImageViewType::VIEW_2D,
         format,
@@ -2734,11 +2731,11 @@ static glm::vec4 s_g4[] = {
 };
 
 void createPermutationTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8_UNORM;
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         sizeof(s_permutation) / sizeof(int8_t),
         1,
@@ -2747,11 +2744,12 @@ void createPermutationTexture(
         texture.image,
         texture.memory);
 
-    texture.view = device_info.device->createImageView(
-        texture.image,
-        renderer::ImageViewType::VIEW_2D,
-        format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+    texture.view =
+        device->createImageView(
+            texture.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
 // 2d permutation texture for optimized version
@@ -2761,7 +2759,7 @@ uint8_t perm(int i)
 }
 
 void createPermutation2DTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8G8B8A8_UNORM;
     auto n = sizeof(s_permutation) / sizeof(int8_t);
@@ -2782,7 +2780,7 @@ void createPermutation2DTexture(
     }
 
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         static_cast<int>(n),
         static_cast<int>(n),
@@ -2791,11 +2789,12 @@ void createPermutation2DTexture(
         texture.image,
         texture.memory);
 
-    texture.view = device_info.device->createImageView(
-        texture.image,
-        renderer::ImageViewType::VIEW_2D,
-        format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+    texture.view =
+        device->createImageView(
+            texture.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
 uint8_t safeConvert(float x) {
@@ -2812,7 +2811,7 @@ uint32_t packInitRgba8(const glm::vec4& data) {
 }
 
 void createGradTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = sizeof(s_g) / sizeof(glm::vec3);
@@ -2822,7 +2821,7 @@ void createGradTexture(
         grad[i] = packInitRgba8(s_g[i]);
     }
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         static_cast<uint32_t>(n),
         1,
@@ -2831,15 +2830,16 @@ void createGradTexture(
         texture.image,
         texture.memory);
 
-    texture.view = device_info.device->createImageView(
-        texture.image,
-        renderer::ImageViewType::VIEW_2D,
-        format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+    texture.view =
+        device->createImageView(
+            texture.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
 void createPermGradTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = 256;
@@ -2849,7 +2849,7 @@ void createPermGradTexture(
         grad[i] = packInitRgba8(s_g[s_permutation[i] % 16]);
     }
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         n,
         1,
@@ -2858,15 +2858,16 @@ void createPermGradTexture(
         texture.image,
         texture.memory);
 
-    texture.view = device_info.device->createImageView(
-        texture.image,
-        renderer::ImageViewType::VIEW_2D,
-        format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+    texture.view =
+        device->createImageView(
+            texture.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
 void createPermGrad4DTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = 256;
@@ -2876,7 +2877,7 @@ void createPermGrad4DTexture(
         grad[i] = packInitRgba8(s_g4[s_permutation[i] % 32]);
     }
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         n,
         1,
@@ -2885,15 +2886,16 @@ void createPermGrad4DTexture(
         texture.image,
         texture.memory);
 
-    texture.view = device_info.device->createImageView(
-        texture.image,
-        renderer::ImageViewType::VIEW_2D,
-        format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+    texture.view =
+        device->createImageView(
+            texture.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
 void createGrad4DTexture(
-    const renderer::DeviceInfo& device_info,
+    const std::shared_ptr<renderer::Device>& device,
     renderer::TextureInfo& texture) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = 32;
@@ -2903,7 +2905,7 @@ void createGrad4DTexture(
         grad[i] = packInitRgba8(s_g4[i]);
     }
     renderer::Helper::create2DTextureImage(
-        device_info,
+        device,
         format,
         n,
         1,
@@ -2912,11 +2914,12 @@ void createGrad4DTexture(
         texture.image,
         texture.memory);
 
-    texture.view = device_info.device->createImageView(
-        texture.image,
-        renderer::ImageViewType::VIEW_2D,
-        format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+    texture.view =
+        device->createImageView(
+            texture.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
 }
 
 std::vector<VkPipelineShaderStageCreateInfo> getComputeShaderStages(
