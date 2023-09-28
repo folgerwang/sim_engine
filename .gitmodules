@@ -13,3 +13,6 @@
 [submodule "third_parties/tinygltf"]
 	path = third_parties/tinygltf
 	url = git@github.com:syoyo/tinygltf.git
+[submodule "third_parties/libigl"]
+	path = third_parties/libigl
+	url = git@github.com:libigl/libigl.git
