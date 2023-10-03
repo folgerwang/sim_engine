@@ -248,3 +248,16 @@ float getIntersection(vec3 org, vec3 ray)
     vec3 factor = factor_a + factor_b;
     return min(min(factor.x, factor.y), factor.z);
 }
+
+vec2 getIntersection(vec2 org, vec2 inv_ray, vec2 box_min, vec2 box_max)
+{
+    vec2 temp_t_min = (box_min - org) * inv_ray;
+    vec2 temp_t_max = (box_max - org) * inv_ray;
+
+    vec2 t_min = min(temp_t_min, temp_t_max);
+    vec2 t_max = max(temp_t_min, temp_t_max);
+
+    vec2 t_result = max(vec2(max(t_min.x, t_min.y), min(t_max.x, t_max.y)), 0.0f);
+
+    return t_result.x > t_result.y ? vec2(0.0f) : t_result;
+}

@@ -1977,6 +1977,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     VkPhysicalDeviceAccelerationStructureFeaturesKHR enabled_acceleration_structure_features{};
     VkPhysicalDeviceMeshShaderFeaturesEXT enabled_mesh_shader_features{};
     VkPhysicalDeviceMaintenance4Features enabled_maintenance4_features{};
+    VkPhysicalDeviceFloat16Int8FeaturesKHR enabled_float16_int8_features{};
 
     // Enable features required for ray tracing using feature chaining via pNext		
     enabled_buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
@@ -1999,11 +2000,16 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_maintenance4_features.maintenance4 = VK_TRUE;
     enabled_maintenance4_features.pNext = &enabled_mesh_shader_features;
 
+    enabled_float16_int8_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
+    enabled_float16_int8_features.shaderFloat16 = VK_TRUE;
+    enabled_float16_int8_features.shaderInt8 = VK_TRUE;
+    enabled_float16_int8_features.pNext = &enabled_maintenance4_features;
+
     // If a pNext(Chain) has been passed, we need to add it to the device creation info
     VkPhysicalDeviceFeatures2 physical_device_features2{};
     physical_device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     physical_device_features2.features = device_features;
-    physical_device_features2.pNext = &enabled_maintenance4_features;
+    physical_device_features2.pNext = &enabled_float16_int8_features;
     create_info.pEnabledFeatures = nullptr;
     create_info.pNext = &physical_device_features2;
 

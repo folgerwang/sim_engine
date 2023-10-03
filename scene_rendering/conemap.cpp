@@ -124,9 +124,35 @@ void Conemap::update(
     params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
     params.depth_channel = conemap_obj->getDepthChannel();
     params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
+    params.block_offset = glm::uvec2(0, 0);
 
-    for (int batch_start_idx = 0; batch_start_idx < kTotalConemapAngleSamples; batch_start_idx += kConemapAngleBatchSize) {
-        params.start_angle_idx = batch_start_idx;
+    auto block_cache_num_x = (conemap_tex->size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX;
+    auto block_cache_num_y = (conemap_tex->size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY;
+    auto total_block_num = block_cache_num_x * block_cache_num_y;
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        conemap_pipeline_layout_,
+        &params,
+        sizeof(params));
+
+    cmd_buf->dispatch(
+        (params.size.x + kConemapGenDispatchX - 1) / kConemapGenDispatchX,
+        (params.size.y + kConemapGenDispatchY - 1) / kConemapGenDispatchY,
+        1);
+
+    // wait for writing to finish for first pass, after first pass, conemap buffer should be initialized.
+    renderer::helper::transitMapTextureFromStoreImage(
+        cmd_buf,
+        { conemap_tex->image },
+        renderer::ImageLayout::GENERAL);
+
+    for (int i = 1; i < total_block_num; i++) {
+        int y = i / block_cache_num_x;
+        int x = i % block_cache_num_x;
+
+        params.block_offset =
+            glm::uvec2(x * kConemapGenBlockCacheSizeX, y * kConemapGenBlockCacheSizeY);
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -135,8 +161,8 @@ void Conemap::update(
             sizeof(params));
 
         cmd_buf->dispatch(
-            (params.size.x + 7) / 8,
-            (params.size.y + 7) / 8,
+            (params.size.x + kConemapGenDispatchX - 1) / kConemapGenDispatchX,
+            (params.size.y + kConemapGenDispatchY - 1) / kConemapGenDispatchY,
             1);
     }
 
