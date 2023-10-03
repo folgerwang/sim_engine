@@ -334,7 +334,16 @@ void VulkanCommandBuffer::endRenderPass() {
 }
 
 void VulkanCommandBuffer::reset(uint32_t flags) {
-    vkResetCommandBuffer(cmd_buf_, flags);
+    auto result =
+        vkResetCommandBuffer(
+            cmd_buf_,
+            flags);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("reset command buffer error : ") +
+            VkResultToString(result));
+    }
 }
 
 void VulkanCommandBuffer::addBarriers(

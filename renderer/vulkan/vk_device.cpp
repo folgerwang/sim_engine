@@ -1392,7 +1392,17 @@ void VulkanDevice::resetFences(const std::vector<std::shared_ptr<Fence>>& fences
         auto vk_fence = RENDER_TYPE_CAST(Fence, fences[i]);
         vk_fences[i] = vk_fence->get();
     }
-    vkResetFences(device_, static_cast<uint32_t>(vk_fences.size()), vk_fences.data());
+    auto result =
+        vkResetFences(
+            device_,
+            static_cast<uint32_t>(vk_fences.size()),
+            vk_fences.data());
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("reset fences error : ") +
+            VkResultToString(result));
+    }
 }
 
 void VulkanDevice::waitForFences(const std::vector<std::shared_ptr<Fence>>& fences) {
