@@ -7,6 +7,8 @@ namespace engine {
 namespace renderer {
 namespace vk {
 
+const char* VkResultToString(VkResult result);
+
 class VulkanDevice : public Device {
     VkDevice        device_;
     const std::shared_ptr<PhysicalDevice>& physical_device_;

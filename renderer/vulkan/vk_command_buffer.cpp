@@ -1,6 +1,7 @@
 #include <iostream>
 
 #include "../renderer.h"
+#include "vk_device.h"
 #include "vk_command_buffer.h"
 #include "vk_renderer_helper.h"
 
@@ -8,20 +9,33 @@ namespace engine {
 namespace renderer {
 namespace vk {
 
-void VulkanCommandBuffer::beginCommandBuffer(CommandBufferUsageFlags flags) {
+void VulkanCommandBuffer::beginCommandBuffer(
+    CommandBufferUsageFlags flags) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = helper::toCommandBufferUsageFlags(flags);
     begin_info.pInheritanceInfo = nullptr; // Optional
 
-    if (vkBeginCommandBuffer(cmd_buf_, &begin_info) != VK_SUCCESS) {
-        throw std::runtime_error("failed to begin recording command buffer!");
+    auto result =
+        vkBeginCommandBuffer(
+            cmd_buf_,
+            &begin_info);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to start recording command buffer! : ") +
+            VkResultToString(result));
     }
 };
 
 void VulkanCommandBuffer::endCommandBuffer() {
-    if (vkEndCommandBuffer(cmd_buf_) != VK_SUCCESS) {
-        throw std::runtime_error("failed to record command buffer!");
+    auto result =
+        vkEndCommandBuffer(cmd_buf_);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to finish recording command buffer! : ") +
+            VkResultToString(result));
     }
 }
 
@@ -35,6 +49,7 @@ void VulkanCommandBuffer::copyBuffer(
     }
     auto vk_src_buf = RENDER_TYPE_CAST(Buffer, src_buf);
     auto vk_dst_buf = RENDER_TYPE_CAST(Buffer, dst_buf);
+
     vkCmdCopyBuffer(
         cmd_buf_,
         vk_src_buf->get(),
