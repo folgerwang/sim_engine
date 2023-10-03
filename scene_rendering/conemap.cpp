@@ -147,7 +147,7 @@ void Conemap::update(
         { conemap_tex->image },
         renderer::ImageLayout::GENERAL);
 
-    for (int i = 1; i < total_block_num; i++) {
+    for (int i = 1; i < int(total_block_num); i++) {
         int y = i / block_cache_num_x;
         int x = i % block_cache_num_x;
 

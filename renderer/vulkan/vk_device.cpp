@@ -7,6 +7,33 @@
 
 namespace engine {
 namespace renderer {
+namespace {
+    const char* VkResultToString(VkResult result) {
+        switch (result) {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_EVENT_SET: return "VK_EVENT_SET";
+        case VK_EVENT_RESET: return "VK_EVENT_RESET";
+        case VK_INCOMPLETE: return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+            // ... add other VkResult values as needed
+        default: return "UNKNOWN_ERROR";
+        }
+    }
+}
+
 namespace vk {
 
 VulkanDevice::VulkanDevice(
@@ -83,14 +110,26 @@ std::shared_ptr<Buffer> VulkanDevice::createBuffer(
     buffer_info.sharingMode = sharing ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer buffer;
-    if (vkCreateBuffer(device_, &buffer_info, nullptr, &buffer) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create buffer!");
+    auto result =
+        vkCreateBuffer(
+            device_,
+            &buffer_info,
+            nullptr,
+            &buffer);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create buffer! : ") +
+            VkResultToString(result));
     }
 
-    auto result = std::make_shared<VulkanBuffer>(buffer, static_cast<uint32_t>(buf_size));
-    buffer_list_.push_back(result);
+    auto vk_buffer =
+        std::make_shared<VulkanBuffer>(
+            buffer,
+            static_cast<uint32_t>(buf_size));
+    buffer_list_.push_back(vk_buffer);
 
-    return result;
+    return vk_buffer;
 }
 
 void VulkanDevice::createBuffer(
@@ -146,15 +185,25 @@ std::shared_ptr<Image> VulkanDevice::createImage(
     image_info.flags = helper::toVkImageCreateFlags(flags);
 
     VkImage image;
-    if (vkCreateImage(device_, &image_info, nullptr, &image) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create image!");
+    auto result =
+        vkCreateImage(
+            device_,
+            &image_info,
+            nullptr,
+            &image);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create image! : ") +
+            VkResultToString(result));
     }
 
-    auto result = std::make_shared<VulkanImage>(image);
-    result->setImageLayout(layout);
-    image_list_.push_back(result);
+    auto vk_image =
+        std::make_shared<VulkanImage>(image);
+    vk_image->setImageLayout(layout);
+    image_list_.push_back(vk_image);
 
-    return result;
+    return vk_image;
 }
 
 std::shared_ptr<ImageView> VulkanDevice::createImageView(
@@ -180,11 +229,21 @@ std::shared_ptr<ImageView> VulkanDevice::createImageView(
     view_info.subresourceRange.layerCount = layer_count;
 
     VkImageView image_view;
-    if (vkCreateImageView(device_, &view_info, nullptr, &image_view) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create texture image view!");
+    auto result =
+        vkCreateImageView(
+            device_,
+            &view_info,
+            nullptr,
+            &image_view);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create texture image view! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_image_view = std::make_shared<VulkanImageView>(image_view);
+    auto vk_image_view =
+        std::make_shared<VulkanImageView>(image_view);
     image_view_list_.push_back(vk_image_view);
 
     return vk_image_view;
@@ -214,11 +273,21 @@ std::shared_ptr<Sampler> VulkanDevice::createSampler(Filter filter, SamplerAddre
     sampler_info.maxLod = 1024.0f;
 
     VkSampler tex_sampler;
-    if (vkCreateSampler(device_, &sampler_info, nullptr, &tex_sampler) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create texture sampler!");
+    auto result =
+        vkCreateSampler(
+            device_,
+            &sampler_info,
+            nullptr,
+            &tex_sampler);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create texture sampler! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_tex_sampler = std::make_shared<VulkanSampler>(tex_sampler);
+    auto vk_tex_sampler =
+        std::make_shared<VulkanSampler>(tex_sampler);
     sampler_list_.push_back(vk_tex_sampler);
 
     return vk_tex_sampler;
@@ -244,11 +313,21 @@ std::shared_ptr<Semaphore> VulkanDevice::createSemaphore() {
     semaphore_info.pNext = &type_create_info;
 
     VkSemaphore semaphore;
-    if (vkCreateSemaphore(device_, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create semaphore!");
+    auto result =
+        vkCreateSemaphore(
+            device_,
+            &semaphore_info,
+            nullptr,
+            &semaphore);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create semaphore! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_semaphore = std::make_shared<VulkanSemaphore>(semaphore);
+    auto vk_semaphore =
+        std::make_shared<VulkanSemaphore>(semaphore);
     semaphore_list_.push_back(vk_semaphore);
 
     return vk_semaphore;
@@ -262,11 +341,21 @@ std::shared_ptr<Fence> VulkanDevice::createFence(bool signaled/* = false*/) {
     }
 
     VkFence fence;
-    if (vkCreateFence(device_, &fence_info, nullptr, &fence) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create fence!");
+    auto result =
+        vkCreateFence(
+            device_,
+            &fence_info,
+            nullptr,
+            &fence);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create fence! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_fence = std::make_shared<VulkanFence>(fence);
+    auto vk_fence =
+        std::make_shared<VulkanFence>(fence);
     fence_list_.push_back(vk_fence);
     
     return vk_fence;
@@ -283,11 +372,23 @@ VulkanDevice::createShaderModule(
     create_info.pCode = reinterpret_cast<const uint32_t*>(data);
 
     VkShaderModule shader_module;
-    if (vkCreateShaderModule(device_, &create_info, nullptr, &shader_module) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create shader module!");
+    auto result =
+        vkCreateShaderModule(
+            device_,
+            &create_info,
+            nullptr,
+            &shader_module);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create shader module! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_shader_module = std::make_shared<VulkanShaderModule>(shader_module, shader_stage);
+    auto vk_shader_module =
+        std::make_shared<VulkanShaderModule>(
+            shader_module,
+            shader_stage);
     shader_list_.push_back(vk_shader_module);
 
     return vk_shader_module;
@@ -302,11 +403,21 @@ std::shared_ptr<CommandPool> VulkanDevice::createCommandPool(
     pool_info.flags = helper::toVkCommandPoolCreateFlags(flags);
 
     VkCommandPool cmd_pool;
-    if (vkCreateCommandPool(device_, &pool_info, nullptr, &cmd_pool) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create command pool!");
+    auto result =
+        vkCreateCommandPool(
+            device_,
+            &pool_info,
+            nullptr,
+            &cmd_pool);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create command pool! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_cmd_pool = std::make_shared<VulkanCommandPool>();
+    auto vk_cmd_pool =
+        std::make_shared<VulkanCommandPool>();
     vk_cmd_pool->set(cmd_pool);
     return vk_cmd_pool;
 }
@@ -316,7 +427,9 @@ std::shared_ptr<Queue> VulkanDevice::getDeviceQueue(
     uint32_t queue_index/* = 0*/) {
     VkQueue queue;
     vkGetDeviceQueue(device_, queue_family_index, queue_index, &queue);
-    auto vk_queue = std::make_shared<VulkanQueue>();
+
+    auto vk_queue =
+        std::make_shared<VulkanQueue>();
     vk_queue->set(queue);
     return vk_queue;
 }
@@ -341,11 +454,21 @@ std::shared_ptr<DescriptorSetLayout> VulkanDevice::createDescriptorSetLayout(
     layout_info.pBindings = vk_bindings.data();
 
     VkDescriptorSetLayout descriptor_set_layout;
-    if (vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &descriptor_set_layout) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create descriptor set layout!");
+    auto result =
+        vkCreateDescriptorSetLayout(
+            device_,
+            &layout_info,
+            nullptr,
+            &descriptor_set_layout);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create descriptor set layout! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_set_layout = std::make_shared<VulkanDescriptorSetLayout>();
+    auto vk_set_layout =
+        std::make_shared<VulkanDescriptorSetLayout>();
     vk_set_layout->set(descriptor_set_layout);
     return vk_set_layout;
 }
@@ -388,11 +511,21 @@ std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
     render_pass_info.pDependencies = vk_dependencies.data();
 
     VkRenderPass render_pass;
-    if (vkCreateRenderPass(device_, &render_pass_info, nullptr, &render_pass) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create render pass!");
+    auto result =
+        vkCreateRenderPass(
+            device_,
+            &render_pass_info,
+            nullptr,
+            &render_pass);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create render pass! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_render_pass = std::make_shared<VulkanRenderPass>(render_pass);
+    auto vk_render_pass =
+        std::make_shared<VulkanRenderPass>(render_pass);
     render_pass_list_.push_back(vk_render_pass);
 
     return vk_render_pass;
@@ -413,8 +546,17 @@ DescriptorSetList VulkanDevice::createDescriptorSets(
 
     std::vector<VkDescriptorSet> vk_desc_sets;
     vk_desc_sets.resize(buffer_count);
-    if (vkAllocateDescriptorSets(device_, &alloc_info, vk_desc_sets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate descriptor sets!");
+
+    auto result =
+        vkAllocateDescriptorSets(
+            device_,
+            &alloc_info,
+            vk_desc_sets.data());
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to allocate descriptor sets! : ") +
+            VkResultToString(result));
     }
 
     DescriptorSetList desc_sets(vk_desc_sets.size());
@@ -456,10 +598,21 @@ std::shared_ptr<PipelineLayout> VulkanDevice::createPipelineLayout(
     pipeline_layout_info.pPushConstantRanges = vk_push_const_ranges.data();
 
     VkPipelineLayout pipeline_layout;
-    if (vkCreatePipelineLayout(device_, &pipeline_layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create pipeline layout!");
+    auto result =
+        vkCreatePipelineLayout(
+            device_,
+            &pipeline_layout_info,
+            nullptr,
+            &pipeline_layout);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create pipeline layout! : ") +
+            VkResultToString(result));
     }
-    auto vk_pipeline_layout = std::make_shared<VulkanPipelineLayout>(pipeline_layout);
+
+    auto vk_pipeline_layout =
+        std::make_shared<VulkanPipelineLayout>(pipeline_layout);
     pipeline_layout_list_.push_back(vk_pipeline_layout);
 
     return vk_pipeline_layout;
@@ -518,11 +671,23 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipeline_info.basePipelineIndex = -1; // Optional
 
     VkPipeline graphics_pipeline;
-    auto result = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &graphics_pipeline);
+    auto result =
+        vkCreateGraphicsPipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &pipeline_info,
+            nullptr,
+            &graphics_pipeline);
+
     if (result != VK_SUCCESS) {
-        throw std::runtime_error("failed to create graphics pipeline!");
+        throw std::runtime_error(
+            std::string("failed to create graphics pipeline! : ") +
+            VkResultToString(result));
     }
-    auto vk_pipeline = std::make_shared<VulkanPipeline>(graphics_pipeline);
+
+    auto vk_pipeline =
+        std::make_shared<VulkanPipeline>(graphics_pipeline);
     pipeline_list_.push_back(vk_pipeline);
 
     return vk_pipeline;
@@ -545,11 +710,23 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipeline_info.layout = vk_compute_pipeline_layout->get();
 
     VkPipeline compute_pipeline;
-    if (vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &compute_pipeline) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create compute pipeline!");
+    auto result =
+        vkCreateComputePipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &pipeline_info,
+            nullptr,
+            &compute_pipeline);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create compute pipeline! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_pipeline = std::make_shared<VulkanPipeline>(compute_pipeline);
+    auto vk_pipeline =
+        std::make_shared<VulkanPipeline>(compute_pipeline);
     pipeline_list_.push_back(vk_pipeline);
 
     return vk_pipeline;
@@ -577,11 +754,24 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipeline_info.layout = vk_rt_pipeline_layout->get();
 
     VkPipeline rt_pipeline;
-    if (vkCreateRayTracingPipelinesKHR(device_, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &rt_pipeline) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create ray tracing pipeline!");
+    auto result =
+        vkCreateRayTracingPipelinesKHR(
+            device_,
+            VK_NULL_HANDLE,
+            VK_NULL_HANDLE,
+            1,
+            &pipeline_info,
+            nullptr,
+            &rt_pipeline);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create ray tracing pipeline! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_pipeline = std::make_shared<VulkanPipeline>(rt_pipeline);
+    auto vk_pipeline =
+        std::make_shared<VulkanPipeline>(rt_pipeline);
     pipeline_list_.push_back(vk_pipeline);
 
     return vk_pipeline;
@@ -621,11 +811,21 @@ std::shared_ptr<Swapchain> VulkanDevice::createSwapchain(
     create_info.oldSwapchain = VK_NULL_HANDLE; //need to be handled when resize.
 
     VkSwapchainKHR swap_chain;
-    if (vkCreateSwapchainKHR(device_, &create_info, nullptr, &swap_chain) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create swap chain!");
+    auto result =
+        vkCreateSwapchainKHR(
+            device_,
+            &create_info,
+            nullptr,
+            &swap_chain);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create swap chain! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_swap_chain = std::make_shared<VulkanSwapchain>();
+    auto vk_swap_chain =
+        std::make_shared<VulkanSwapchain>();
     vk_swap_chain->set(swap_chain);
     return vk_swap_chain;
 }
@@ -652,11 +852,21 @@ std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
     framebuffer_info.layers = 1;
 
     VkFramebuffer frame_buffer;
-    if (vkCreateFramebuffer(device_, &framebuffer_info, nullptr, &frame_buffer) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create framebuffer!");
+    auto result =
+        vkCreateFramebuffer(
+            device_,
+            &framebuffer_info,
+            nullptr,
+            &frame_buffer);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create framebuffer! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_frame_buffer = std::make_shared<VulkanFramebuffer>(frame_buffer);
+    auto vk_frame_buffer =
+        std::make_shared<VulkanFramebuffer>(frame_buffer);
     framebuffer_list_.push_back(vk_frame_buffer);
 
     return vk_frame_buffer;
@@ -684,12 +894,23 @@ std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool() {
     pool_info.maxSets = 256 * IM_ARRAYSIZE(pool_sizes);
     pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
     pool_info.pPoolSizes = pool_sizes;
+
     VkDescriptorPool descriptor_pool;
-    if (vkCreateDescriptorPool(device_, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create descriptor pool!");
+    auto result =
+        vkCreateDescriptorPool(
+            device_,
+            &pool_info,
+            nullptr,
+            &descriptor_pool);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create descriptor pool! : ") +
+            VkResultToString(result));
     }
 
-    auto vk_descriptor_pool = std::make_shared<VulkanDescriptorPool>();
+    auto vk_descriptor_pool =
+        std::make_shared<VulkanDescriptorPool>();
     vk_descriptor_pool->set(descriptor_pool);
     return vk_descriptor_pool;
 }
@@ -862,14 +1083,24 @@ VulkanDevice::allocateMemory(
             properties);
 
     VkDeviceMemory memory;
-    if (vkAllocateMemory(device_, &alloc_info, nullptr, &memory) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate buffer memory!");
+    auto result =
+        vkAllocateMemory(
+            device_,
+            &alloc_info,
+            nullptr,
+            &memory);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to allocate buffer memory! : ") +
+            VkResultToString(result));
     }
 
-    auto result = std::make_shared<VulkanDeviceMemory>();
-    result->set(memory);
+    auto vk_device_memory =
+        std::make_shared<VulkanDeviceMemory>();
+    vk_device_memory->set(memory);
 
-    return result;
+    return vk_device_memory;
 }
 
 MemoryRequirements VulkanDevice::getBufferMemoryRequirements(std::shared_ptr<Buffer> buffer) {
@@ -934,8 +1165,16 @@ std::vector<std::shared_ptr<CommandBuffer>> VulkanDevice::allocateCommandBuffers
         alloc_info.level = is_primary ? VK_COMMAND_BUFFER_LEVEL_PRIMARY : VK_COMMAND_BUFFER_LEVEL_SECONDARY;
         alloc_info.commandBufferCount = num_buffers;
 
-        if (vkAllocateCommandBuffers(device_, &alloc_info, cmd_bufs.data()) != VK_SUCCESS) {
-            throw std::runtime_error("failed to allocate command buffers!");
+        auto result =
+            vkAllocateCommandBuffers(
+                device_,
+                &alloc_info,
+                cmd_bufs.data());
+
+        if (result != VK_SUCCESS) {
+            throw std::runtime_error(
+                std::string("failed to allocate command buffers! : ") +
+                VkResultToString(result));
         }
     }
 
@@ -1164,7 +1403,20 @@ void VulkanDevice::waitForFences(const std::vector<std::shared_ptr<Fence>>& fenc
         auto vk_fence = RENDER_TYPE_CAST(Fence, fences[i]);
         vk_fences[i] = vk_fence->get();
     }
-    vkWaitForFences(device_, static_cast<uint32_t>(vk_fences.size()), vk_fences.data(), VK_TRUE, UINT64_MAX);
+
+    auto result =
+        vkWaitForFences(
+            device_,
+            static_cast<uint32_t>(vk_fences.size()),
+            vk_fences.data(),
+            VK_TRUE,
+            UINT64_MAX);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("wait for fence error : ") +
+                VkResultToString(result));
+    }
 }
 
 void VulkanDevice::waitForSemaphores(
@@ -1185,11 +1437,28 @@ void VulkanDevice::waitForSemaphores(
     wait_info.pSemaphores = vk_semaphores.data(); // The semaphores you're waiting on
     wait_info.pValues = values.data(); // An array of values to wait for
 
-    vkWaitSemaphores(device_, &wait_info, UINT64_MAX);
+    auto result =
+        vkWaitSemaphores(
+            device_,
+            &wait_info,
+            UINT64_MAX);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("wait for semaphores error : ") +
+            VkResultToString(result));
+    }
 }
 
 void VulkanDevice::waitIdle() {
-    vkDeviceWaitIdle(device_);
+    auto result =
+        vkDeviceWaitIdle(device_);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("wait for device idle error : ") +
+            VkResultToString(result));
+    }
 }
 
 void VulkanDevice::getAccelerationStructureBuildSizes(
@@ -1256,14 +1525,19 @@ void VulkanDevice::getRayTracingShaderGroupHandles(
     const uint32_t sbt_size,
     void* shader_handle_storage) {
     auto vk_pipeline = RENDER_TYPE_CAST(Pipeline, pipeline);
-    if (vkGetRayTracingShaderGroupHandlesKHR(
-        device_,
-        vk_pipeline->get(),
-        0,
-        group_count,
-        sbt_size,
-        shader_handle_storage) != VK_SUCCESS) {
-        throw std::runtime_error("failed to call ray tracing shader group handles!");
+    auto result =
+        vkGetRayTracingShaderGroupHandlesKHR(
+            device_,
+            vk_pipeline->get(),
+            0,
+            group_count,
+            sbt_size,
+            shader_handle_storage);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to call ray tracing shader group handles! : ") +
+            VkResultToString(result));
     }
 }
 
