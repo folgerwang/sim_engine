@@ -57,7 +57,9 @@ void VulkanQueue::submit(
             vk_in_flight_fence ? vk_in_flight_fence->get() : VK_NULL_HANDLE);
 
     if (result != VK_SUCCESS) {
-        throw std::runtime_error("failed to submit command queue!");
+        throw std::runtime_error(
+            std::string("failed to submit command queue! : ") +
+            VkResultToString(result));
     }
 }
 
