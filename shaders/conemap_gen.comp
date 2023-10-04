@@ -124,9 +124,8 @@ void main()
         float t_step = t_range / float(sample_count);
         vec2 sample_ray_step = sample_ray * t_step;
 
-        float sample_t_step = length(mix(vec2(zone_start_offset), vec2(zone_end_offset), ratio));
-
 #if USE_SHARED_MEMORY
+        float sample_t_step = length(mix(vec2(zone_start_offset), vec2(zone_end_offset), ratio));
         float c_t = t.x + 0.5f * t_step;
         vec2 sample_offset = ray_org - box_corner_min;
         for (uint ts = 0; ts < sample_count; ts++) {
@@ -168,7 +167,7 @@ void main()
             // found tangent point.
             float inv_cone_ratio = (max(c_depth - s_d, 0.0f) * buffer_diagonal_length) / c_t;
             if (s_d_prev >= s_d - deta_height && s_d_next >= s_d + deta_height) {
-                    best_inv_cone_ratio.x = max(best_inv_cone_ratio.x, inv_cone_ratio);
+                best_inv_cone_ratio.x = max(best_inv_cone_ratio.x, inv_cone_ratio);
             }
 
             best_inv_cone_ratio.y = max(best_inv_cone_ratio.y, inv_cone_ratio);

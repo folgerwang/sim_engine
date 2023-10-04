@@ -226,8 +226,8 @@
 #define kConemapGenDispatchX                    32
 #define kConemapGenDispatchY                    32
 #else
-#define kConemapGenBlockCacheSizeX              512
-#define kConemapGenBlockCacheSizeY              512
+#define kConemapGenBlockCacheSizeX              256
+#define kConemapGenBlockCacheSizeY              256
 #define kConemapGenDispatchX                    32
 #define kConemapGenDispatchY                    32
 #endif
