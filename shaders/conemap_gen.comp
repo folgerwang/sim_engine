@@ -35,12 +35,15 @@ float alignAngle(float input_angle, float reference_angle) {
 layout(local_size_x = kConemapGenDispatchX, local_size_y = kConemapGenDispatchY) in;
 void main()
 {
-	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 group_idx = ivec2(gl_WorkGroupID);
-    ivec2 cache_block_idx =
-        group_idx *
-        ivec2(kConemapGenDispatchX, kConemapGenDispatchY) /
+    const ivec2 s_dispatch_size =
+        ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
+    const ivec2 s_cache_block_size =
         ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
+
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 group_idx = ivec2(gl_WorkGroupID);
+    ivec2 group_offset = group_idx * s_dispatch_size;
+    ivec2 center_cache_block_idx = group_offset / s_cache_block_size;
 
     // get index in global work group i.e x,y position
     vec2 uv = (pixel_coords.xy + 0.5f) * params.inv_size;
@@ -48,20 +51,19 @@ void main()
 
     bool skip_this_group = false;
     // if this dispatch group is with 3x3 cache blocks, means it has been processed, skip it.
-    if (params.block_index.x >= cache_block_idx.x - 1 &&
-        params.block_index.x <= cache_block_idx.x + 1 &&
-        params.block_index.y >= cache_block_idx.y - 1 &&
-        params.block_index.y <= cache_block_idx.y + 1) {
+    if (params.block_index.x >= center_cache_block_idx.x - 1 &&
+        params.block_index.x <= center_cache_block_idx.x + 1 &&
+        params.block_index.y >= center_cache_block_idx.y - 1 &&
+        params.block_index.y <= center_cache_block_idx.y + 1) {
         skip_this_group = true;
     }
 
     ivec2 box_corner_min = params.block_offset;
-    ivec2 box_corner_max = box_corner_min + ivec2(kConemapGenBlockCacheSizeX - 1, kConemapGenBlockCacheSizeY - 1);
+    ivec2 box_corner_max = box_corner_min + s_cache_block_size - 1;
     box_corner_max = clamp(box_corner_max, ivec2(0), ivec2(params.size - 1));
 
-    ivec2 dispatch_group_offset = group_idx.xy * ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
-    ivec2 close_dist_0 = max(dispatch_group_offset - box_corner_max, ivec2(0));
-    ivec2 close_dist_1 = max(box_corner_min - (dispatch_group_offset + ivec2(kConemapGenDispatchX, kConemapGenDispatchY)), ivec2(0));
+    ivec2 close_dist_0 = max(group_offset - box_corner_max, ivec2(0));
+    ivec2 close_dist_1 = max(box_corner_min - (group_offset + s_dispatch_size), ivec2(0));
     float closest_c_t = length(vec2(close_dist_0 + close_dist_1));
 
     vec2 saved_conemap_info = imageLoad(dst_img, pixel_coords).xy;
@@ -97,6 +99,7 @@ void main()
         vec4 best_inv_cone_ratio = vec4(0.0f);
 
         float alpha = start_angle + 0.5f * angle_step;
+        vec2 ray_org = pixel_coords.xy + 0.5f;
         for (uint ta = 0; ta < num_sample_rays; ta++) {
             vec2 sample_ray = vec2(cos(alpha), sin(alpha));
             vec2 ray_offset = (vec2(1.0f) - sign(abs(sample_ray))) * 1e-20;
@@ -113,7 +116,6 @@ void main()
             ivec2 zone_start_offset = ivec2(round(vec2(cos(zone_alpha_start), sin(zone_alpha_start))));
             ivec2 zone_end_offset = ivec2(round(vec2(cos(zone_alpha_end), sin(zone_alpha_end))));
 
-            vec2 ray_org = pixel_coords.xy + 0.5f;
             vec2 t = getIntersection(ray_org, inv_sample_ray, box_corner_min, box_corner_max);
             float t_range = t.y - t.x;
 
@@ -124,9 +126,8 @@ void main()
             vec2 sample_ray_step = sample_ray * t_step;
 
             float c_t = t.x + 0.5f * t_step;
-            vec2 sample_offset = ray_org - box_corner_min;
             vec2 sample_ray_uv_step = sample_ray_step * params.inv_size;
-            vec2 sample_uv = (sample_offset + c_t * sample_ray) * params.inv_size;
+            vec2 sample_uv = (ray_org + c_t * sample_ray) * params.inv_size;
             float s_d_prev = texture(src_img, sample_uv)[params.depth_channel];
             sample_uv += sample_ray_uv_step;
             float s_d = texture(src_img, sample_uv)[params.depth_channel];
@@ -153,7 +154,7 @@ void main()
         vec4 conemap_info = vec4(
             atan(best_inv_cone_ratio.x) * inv_half_pi,
             atan(best_inv_cone_ratio.y) * inv_half_pi,
-            c_depth, 1.0f);
+            c_depth, 0.0f);
 
         conemap_info.xy = max(conemap_info.xy, saved_conemap_info);
 
