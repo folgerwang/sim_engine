@@ -37,7 +37,7 @@ void main()
 
     uvec2 block_offset =
         group_idx *
-        uvec2(kConemapGenDispatchX, kConemapGenDispatchY);
+        uvec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
 
     for (uint p = 0; p < num_passes; p++) {
         for (uint i = local_idx; i < kConemapCacheBufferSize; i += dispatch_block_size) {

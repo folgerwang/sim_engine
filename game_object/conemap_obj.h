@@ -10,12 +10,18 @@ namespace scene_rendering {
 namespace game_object {
 
 class ConemapObj {
+    std::shared_ptr<renderer::DescriptorSetLayout> gen_minmax_depth_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet> gen_minmax_depth_tex_desc_set_;
+    std::shared_ptr<renderer::PipelineLayout> gen_minmax_depth_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline> gen_minmax_depth_pipeline_;
+
     std::shared_ptr<renderer::DescriptorSet>  prt_gen_tex_desc_set_;
     renderer::DescriptorSetList prt_ds_final_tex_desc_sets_;
     std::shared_ptr<renderer::DescriptorSet>  prt_pack_tex_desc_set_;
     std::shared_ptr<renderer::TextureInfo> conemap_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_pack_tex_;
     std::shared_ptr<renderer::BufferInfo> prt_minmax_buffer_;
+    std::shared_ptr<renderer::TextureInfo> minmax_depth_tex_;
 
     uint32_t depth_channel_ = 0;
     bool is_height_map_ = false;
@@ -36,7 +42,12 @@ public:
         float shadow_intensity,
         float shadow_noise_thread);
 
-    void destroy(const std::shared_ptr<renderer::Device>& device);
+    void update(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const glm::uvec2& src_buffer_size);
+
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device);
 
     inline float getDepthScale() {
         return depth_scale_;
@@ -72,6 +83,10 @@ public:
 
     inline const std::shared_ptr<renderer::TextureInfo> getConemapTexture() {
         return conemap_tex_;
+    }
+
+    inline const std::shared_ptr<renderer::TextureInfo> getMinmaxDepthTexture() {
+        return minmax_depth_tex_;
     }
 
     inline const std::shared_ptr<renderer::TextureInfo> getPackTexture() {

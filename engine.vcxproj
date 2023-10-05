@@ -109,7 +109,7 @@
     <None Include="shaders\blur_image_y_merge.comp" />
     <None Include="shaders\conemap_gen.comp" />
     <None Include="shaders\conemap_gen_init.comp" />
-    <None Include="shaders\conemap_minmax_depth.comp" />
+    <None Include="shaders\gen_minmax_depth.comp" />
     <None Include="shaders\cube_ibl.frag" />
     <None Include="shaders\cube_skybox.frag" />
     <None Include="shaders\debug_draw.frag" />

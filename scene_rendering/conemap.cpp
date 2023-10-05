@@ -103,19 +103,10 @@ Conemap::Conemap(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& bump_tex,
-    const renderer::TextureInfo& conemap_tex) {
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
-    auto buffer_size = glm::ivec2(conemap_tex.size);
-
-    conemap_minmax_depth_tex_ = std::make_shared<renderer::TextureInfo>();
-    renderer::Helper::create2DTextureImage(
-        device,
-        renderer::Format::R16G16_SFLOAT,
-        buffer_size / glm::ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY),
-        *conemap_minmax_depth_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+    auto buffer_size =
+        glm::ivec2(conemap_obj->getConemapTexture()->size);
 
     conemap_gen_init_desc_set_layout_ =
         device->createDescriptorSetLayout(
@@ -149,25 +140,13 @@ Conemap::Conemap(
             conemap_gen_init_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto conemap_gen_init_texture_descs = addConemapGenInitTextures(
-        conemap_gen_init_tex_desc_set_,
-        texture_sampler,
-        bump_tex.view,
-        conemap_tex.view);
+    auto conemap_gen_init_texture_descs =
+        addConemapGenInitTextures(
+            conemap_gen_init_tex_desc_set_,
+            texture_sampler,
+            bump_tex.view,
+            conemap_obj->getConemapTexture()->view);
     device->updateDescriptorSets(conemap_gen_init_texture_descs);
-
-    conemap_minmax_depth_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            conemap_gen_init_desc_set_layout_, 1)[0];
-
-    // create a global ibl texture descriptor set.
-    auto conemap_minmax_depth_texture_descs = addConemapGenInitTextures(
-        conemap_minmax_depth_tex_desc_set_,
-        texture_sampler,
-        bump_tex.view,
-        conemap_minmax_depth_tex_->view);
-    device->updateDescriptorSets(conemap_minmax_depth_texture_descs);
 
     conemap_gen_tex_desc_set_ =
         device->createDescriptorSets(
@@ -179,8 +158,8 @@ Conemap::Conemap(
         conemap_gen_tex_desc_set_,
         texture_sampler,
         bump_tex.view,
-        conemap_minmax_depth_tex_->view,
-        conemap_tex.view);
+        conemap_obj->getMinmaxDepthTexture()->view,
+        conemap_obj->getConemapTexture()->view);
     device->updateDescriptorSets(conemap_gen_texture_descs);
 
     conemap_gen_init_pipeline_layout_ =
@@ -199,12 +178,6 @@ Conemap::Conemap(
             conemap_gen_init_pipeline_layout_,
             "conemap_gen_init_comp.spv");
 
-    conemap_minmax_depth_pipeline_ =
-        renderer::helper::createComputePipeline(
-            device,
-            conemap_gen_init_pipeline_layout_,
-            "conemap_minmax_depth_comp.spv");
-
     conemap_gen_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
@@ -218,35 +191,6 @@ void Conemap::update(
 
     const auto& conemap_tex =
         conemap_obj->getConemapTexture();
-
-    // generate minmax depth texture.
-    {
-        cmd_buf->bindPipeline(
-            er::PipelineBindPoint::COMPUTE,
-            conemap_minmax_depth_pipeline_);
-
-        glsl::ConemapGenParams params = {};
-        params.size = glm::uvec2(conemap_tex->size);
-        params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-        params.depth_channel = conemap_obj->getDepthChannel();
-        params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
-
-        cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            conemap_gen_init_pipeline_layout_,
-            &params,
-            sizeof(params));
-
-        cmd_buf->bindDescriptorSets(
-            er::PipelineBindPoint::COMPUTE,
-            conemap_gen_init_pipeline_layout_,
-            { conemap_minmax_depth_tex_desc_set_ });
-
-        cmd_buf->dispatch(
-            (params.size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX,
-            (params.size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY,
-            1);
-    }
 
     // generate first pass of conemap with closer blocks.
     {
@@ -340,11 +284,7 @@ void Conemap::destroy(
     device->destroyPipelineLayout(conemap_gen_init_pipeline_layout_);
     device->destroyPipelineLayout(conemap_gen_pipeline_layout_);
     device->destroyPipeline(conemap_gen_init_pipeline_);
-    device->destroyPipeline(conemap_minmax_depth_pipeline_);
     device->destroyPipeline(conemap_gen_pipeline_);
-    if (conemap_minmax_depth_tex_) {
-        conemap_minmax_depth_tex_->destroy(device);
-    }
 }
 
 }//namespace scene_rendering
