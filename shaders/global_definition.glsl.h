@@ -6,8 +6,6 @@
 #endif
 #define USE_PUNCTUAL                1
 
-#define USE_SHARED_MEMORY           0
-
 #define PI                          3.1415926535897f
 
 //#define MATERIAL_UNLIT
@@ -220,17 +218,10 @@
 #define kPayLoadHitValueIdx                     0
 #define kPayLoadShadowedIdx                     1
 
-#if USE_SHARED_MEMORY
-#define kConemapGenBlockCacheSizeX              108
-#define kConemapGenBlockCacheSizeY              108
+#define kConemapGenBlockCacheSizeX              128
+#define kConemapGenBlockCacheSizeY              128
 #define kConemapGenDispatchX                    32
 #define kConemapGenDispatchY                    32
-#else
-#define kConemapGenBlockCacheSizeX              256
-#define kConemapGenBlockCacheSizeY              256
-#define kConemapGenDispatchX                    32
-#define kConemapGenDispatchY                    32
-#endif
 
 #define GLFW_KEY_W                  87
 #define GLFW_KEY_S                  83
@@ -462,9 +453,10 @@ struct CloudParams {
     float           pad;
 };
 
-struct ConemapParams {
+struct ConemapGenParams {
     uvec2           size;
     vec2            inv_size;
+    ivec2           block_index;
     ivec2           block_offset;
     uint            is_height_map;
     uint            depth_channel;

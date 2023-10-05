@@ -6,7 +6,7 @@
 namespace {
 namespace er = engine::renderer;
 
-er::WriteDescriptorList addConemapTextures(
+er::WriteDescriptorList addConemapGenInitTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
@@ -14,7 +14,7 @@ er::WriteDescriptorList addConemapTextures(
     er::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(2);
 
-    // envmap texture.
+    // height/depth map texture.
     er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
@@ -24,7 +24,49 @@ er::WriteDescriptorList addConemapTextures(
         src_image,
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    // envmap texture.
+    // conemap/height map texture.
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        DST_TEX_INDEX,
+        nullptr,
+        dst_image,
+        er::ImageLayout::GENERAL);
+
+    return descriptor_writes;
+}
+
+er::WriteDescriptorList addConemapGenTextures(
+    const std::shared_ptr<er::DescriptorSet>& description_set,
+    const std::shared_ptr<er::Sampler>& texture_sampler,
+    const std::shared_ptr<er::ImageView>& src_image,
+    const std::shared_ptr<er::ImageView>& minmax_depth_image,
+    const std::shared_ptr<er::ImageView>& dst_image) {
+    er::WriteDescriptorList descriptor_writes;
+    descriptor_writes.reserve(2);
+
+    // height/depth map texture.
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        SRC_TEX_INDEX,
+        texture_sampler,
+        src_image,
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // minmax depth texture.
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        SRC_TEX_INDEX_1,
+        texture_sampler,
+        minmax_depth_image,
+        er::ImageLayout::GENERAL);
+
+    // conemap/height map texture.
     er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
@@ -44,7 +86,7 @@ createConemapPipelineLayout(
     er::PushConstantRange push_const_range{};
     push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
     push_const_range.offset = 0;
-    push_const_range.size = sizeof(glsl::ConemapParams);
+    push_const_range.size = sizeof(glsl::ConemapGenParams);
 
     return device->createPipelineLayout(
         { desc_set_layout },
@@ -63,7 +105,19 @@ Conemap::Conemap(
     const renderer::TextureInfo& bump_tex,
     const renderer::TextureInfo& conemap_tex) {
 
-    conemap_desc_set_layout_ =
+    auto buffer_size = glm::ivec2(conemap_tex.size);
+
+    conemap_minmax_depth_tex_ = std::make_shared<renderer::TextureInfo>();
+    renderer::Helper::create2DTextureImage(
+        device,
+        renderer::Format::R16G16_SFLOAT,
+        buffer_size / glm::ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY),
+        *conemap_minmax_depth_tex_,
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
+        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        renderer::ImageLayout::GENERAL);
+
+    conemap_gen_init_desc_set_layout_ =
         device->createDescriptorSetLayout(
             { renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
                 SRC_TEX_INDEX,
@@ -74,89 +128,146 @@ Conemap::Conemap(
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                 er::DescriptorType::STORAGE_IMAGE) });
 
-    conemap_tex_desc_set_ =
+    conemap_gen_desc_set_layout_ =
+        device->createDescriptorSetLayout(
+            { renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                SRC_TEX_INDEX,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER),
+              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                SRC_TEX_INDEX_1,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_IMAGE),
+              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                DST_TEX_INDEX,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_IMAGE) });
+
+    conemap_gen_init_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            conemap_desc_set_layout_, 1)[0];
+            conemap_gen_init_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto conemap_texture_descs = addConemapTextures(
-        conemap_tex_desc_set_,
+    auto conemap_gen_init_texture_descs = addConemapGenInitTextures(
+        conemap_gen_init_tex_desc_set_,
         texture_sampler,
         bump_tex.view,
         conemap_tex.view);
-    device->updateDescriptorSets(conemap_texture_descs);
+    device->updateDescriptorSets(conemap_gen_init_texture_descs);
 
-    conemap_pipeline_layout_ =
+    conemap_minmax_depth_tex_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            conemap_gen_init_desc_set_layout_, 1)[0];
+
+    // create a global ibl texture descriptor set.
+    auto conemap_minmax_depth_texture_descs = addConemapGenInitTextures(
+        conemap_minmax_depth_tex_desc_set_,
+        texture_sampler,
+        bump_tex.view,
+        conemap_minmax_depth_tex_->view);
+    device->updateDescriptorSets(conemap_minmax_depth_texture_descs);
+
+    conemap_gen_tex_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            conemap_gen_desc_set_layout_, 1)[0];
+
+    // create a global ibl texture descriptor set.
+    auto conemap_gen_texture_descs = addConemapGenTextures(
+        conemap_gen_tex_desc_set_,
+        texture_sampler,
+        bump_tex.view,
+        conemap_minmax_depth_tex_->view,
+        conemap_tex.view);
+    device->updateDescriptorSets(conemap_gen_texture_descs);
+
+    conemap_gen_init_pipeline_layout_ =
         createConemapPipelineLayout(
             device,
-            conemap_desc_set_layout_);
+            conemap_gen_init_desc_set_layout_);
 
-    conemap_pipeline_ =
+    conemap_gen_pipeline_layout_ =
+        createConemapPipelineLayout(
+            device,
+            conemap_gen_desc_set_layout_);
+
+    conemap_gen_init_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
-            conemap_pipeline_layout_,
-            "conemap_gen_comp.spv");
+            conemap_gen_init_pipeline_layout_,
+            "conemap_gen_init_comp.spv");
 
+    conemap_minmax_depth_pipeline_ =
+        renderer::helper::createComputePipeline(
+            device,
+            conemap_gen_init_pipeline_layout_,
+            "conemap_minmax_depth_comp.spv");
+
+    conemap_gen_pipeline_ =
+        renderer::helper::createComputePipeline(
+            device,
+            conemap_gen_pipeline_layout_,
+            "conemap_gen_comp.spv");
 }
 
 void Conemap::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
-    const auto& conemap_tex = conemap_obj->getConemapTexture();
+    const auto& conemap_tex =
+        conemap_obj->getConemapTexture();
 
-    renderer::helper::transitMapTextureToStoreImage(
-        cmd_buf,
-        { conemap_tex->image});
+    // generate minmax depth texture.
+    {
+        cmd_buf->bindPipeline(
+            er::PipelineBindPoint::COMPUTE,
+            conemap_minmax_depth_pipeline_);
 
-    cmd_buf->bindPipeline(
-        renderer::PipelineBindPoint::COMPUTE,
-        conemap_pipeline_);
-
-    cmd_buf->bindDescriptorSets(
-        renderer::PipelineBindPoint::COMPUTE,
-        conemap_pipeline_layout_,
-        { conemap_tex_desc_set_ });
-
-    glsl::ConemapParams params = {};
-    params.size = glm::uvec2(conemap_tex->size);
-    params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-    params.depth_channel = conemap_obj->getDepthChannel();
-    params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
-    params.block_offset = glm::uvec2(0, 0);
-
-    auto block_cache_num_x = (conemap_tex->size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX;
-    auto block_cache_num_y = (conemap_tex->size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY;
-    auto total_block_num = block_cache_num_x * block_cache_num_y;
-
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        conemap_pipeline_layout_,
-        &params,
-        sizeof(params));
-
-    cmd_buf->dispatch(
-        (params.size.x + kConemapGenDispatchX - 1) / kConemapGenDispatchX,
-        (params.size.y + kConemapGenDispatchY - 1) / kConemapGenDispatchY,
-        1);
-
-    // wait for writing to finish for first pass, after first pass, conemap buffer should be initialized.
-    renderer::helper::transitMapTextureFromStoreImage(
-        cmd_buf,
-        { conemap_tex->image },
-        renderer::ImageLayout::GENERAL);
-
-    for (int i = 1; i < int(total_block_num); i++) {
-        int y = i / block_cache_num_x;
-        int x = i % block_cache_num_x;
-
-        params.block_offset =
-            glm::uvec2(x * kConemapGenBlockCacheSizeX, y * kConemapGenBlockCacheSizeY);
+        glsl::ConemapGenParams params = {};
+        params.size = glm::uvec2(conemap_tex->size);
+        params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
+        params.depth_channel = conemap_obj->getDepthChannel();
+        params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            conemap_pipeline_layout_,
+            conemap_gen_init_pipeline_layout_,
+            &params,
+            sizeof(params));
+
+        cmd_buf->bindDescriptorSets(
+            er::PipelineBindPoint::COMPUTE,
+            conemap_gen_init_pipeline_layout_,
+            { conemap_minmax_depth_tex_desc_set_ });
+
+        cmd_buf->dispatch(
+            (params.size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX,
+            (params.size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY,
+            1);
+    }
+
+    // generate first pass of conemap with closer blocks.
+    {
+        cmd_buf->bindPipeline(
+            renderer::PipelineBindPoint::COMPUTE,
+            conemap_gen_init_pipeline_);
+
+        cmd_buf->bindDescriptorSets(
+            renderer::PipelineBindPoint::COMPUTE,
+            conemap_gen_init_pipeline_layout_,
+            { conemap_gen_init_tex_desc_set_ });
+
+        glsl::ConemapGenParams params = {};
+        params.size = glm::uvec2(conemap_tex->size);
+        params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
+        params.depth_channel = conemap_obj->getDepthChannel();
+        params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
+
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            conemap_gen_init_pipeline_layout_,
             &params,
             sizeof(params));
 
@@ -164,6 +275,57 @@ void Conemap::update(
             (params.size.x + kConemapGenDispatchX - 1) / kConemapGenDispatchX,
             (params.size.y + kConemapGenDispatchY - 1) / kConemapGenDispatchY,
             1);
+
+        // wait for writing to finish for first pass, after first pass, conemap buffer should be initialized.
+        renderer::helper::transitMapTextureToStoreImage(
+            cmd_buf,
+            { conemap_tex->image });
+    }
+
+    {
+        auto block_cache_num_x = (conemap_tex->size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX;
+        auto block_cache_num_y = (conemap_tex->size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY;
+        auto total_block_num = block_cache_num_x * block_cache_num_y;
+
+        cmd_buf->bindPipeline(
+            renderer::PipelineBindPoint::COMPUTE,
+            conemap_gen_pipeline_);
+
+        cmd_buf->bindDescriptorSets(
+            renderer::PipelineBindPoint::COMPUTE,
+            conemap_gen_pipeline_layout_,
+            { conemap_gen_tex_desc_set_ });
+
+        glsl::ConemapGenParams params = {};
+        params.size = glm::uvec2(conemap_tex->size);
+        params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
+        params.depth_channel = conemap_obj->getDepthChannel();
+        params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
+
+        for (int i = 0; i < int(total_block_num); i++) {
+            int y = i / block_cache_num_x;
+            int x = i % block_cache_num_x;
+
+            params.block_index =
+                glm::uvec2(x, y);
+            params.block_offset =
+                glm::uvec2(x * kConemapGenBlockCacheSizeX, y * kConemapGenBlockCacheSizeY);
+
+            cmd_buf->pushConstants(
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                conemap_gen_pipeline_layout_,
+                &params,
+                sizeof(params));
+
+            cmd_buf->dispatch(
+                (params.size.x + kConemapGenDispatchX - 1) / kConemapGenDispatchX,
+                (params.size.y + kConemapGenDispatchY - 1) / kConemapGenDispatchY,
+                1);
+
+            renderer::helper::transitMapTextureToStoreImage(
+                cmd_buf,
+                { conemap_tex->image });
+        }
     }
 
     renderer::helper::transitMapTextureFromStoreImage(
@@ -173,9 +335,16 @@ void Conemap::update(
 
 void Conemap::destroy(
     const std::shared_ptr<renderer::Device>& device) {
-    device->destroyDescriptorSetLayout(conemap_desc_set_layout_);
-    device->destroyPipelineLayout(conemap_pipeline_layout_);
-    device->destroyPipeline(conemap_pipeline_);
+    device->destroyDescriptorSetLayout(conemap_gen_init_desc_set_layout_);
+    device->destroyDescriptorSetLayout(conemap_gen_desc_set_layout_);
+    device->destroyPipelineLayout(conemap_gen_init_pipeline_layout_);
+    device->destroyPipelineLayout(conemap_gen_pipeline_layout_);
+    device->destroyPipeline(conemap_gen_init_pipeline_);
+    device->destroyPipeline(conemap_minmax_depth_pipeline_);
+    device->destroyPipeline(conemap_gen_pipeline_);
+    if (conemap_minmax_depth_tex_) {
+        conemap_minmax_depth_tex_->destroy(device);
+    }
 }
 
 }//namespace scene_rendering

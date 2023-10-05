@@ -484,5 +484,11 @@
     <None Include="shaders\prt_pack.comp">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\conemap_gen_init.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\conemap_minmax_depth.comp">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

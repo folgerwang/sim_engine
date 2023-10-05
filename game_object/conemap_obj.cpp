@@ -141,7 +141,7 @@ ConemapObj::ConemapObj(
         *conemap_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::GENERAL);
 
     renderer::Helper::create2DTextureImage(
         device,

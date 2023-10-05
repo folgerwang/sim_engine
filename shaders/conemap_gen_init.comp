@@ -1,0 +1,101 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "global_definition.glsl.h"
+#include "prt_core.glsl.h"
+
+layout(push_constant) uniform ConemapUniformBufferObject {
+    ConemapGenParams params;
+};
+
+layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
+layout(set = 0, binding = DST_TEX_INDEX, rgba8) uniform image2D dst_img;
+
+layout(local_size_x = kConemapGenDispatchX, local_size_y = kConemapGenDispatchY) in;
+void main()
+{
+	// get index in global work group i.e x,y position
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 group_idx = ivec2(gl_WorkGroupID);
+    ivec2 cache_block_idx =
+        group_idx *
+        ivec2(kConemapGenDispatchX, kConemapGenDispatchY) /
+        ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
+    vec2 uv = (pixel_coords.xy + 0.5f) * params.inv_size;
+
+    float c_depth = texture(src_img, uv)[params.depth_channel];
+
+    uint num_sample_rays =
+        min((kConemapGenBlockCacheSizeY + kConemapGenBlockCacheSizeX) * 4, 1024);
+
+    ivec2 box_corner_min =
+        (cache_block_idx - 1) *
+        ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
+    ivec2 box_corner_max =
+        box_corner_min +
+        ivec2(kConemapGenBlockCacheSizeX * 3 - 1, kConemapGenBlockCacheSizeY * 3 - 1);
+    box_corner_min = clamp(box_corner_min, ivec2(0), ivec2(params.size - 1));
+    box_corner_max = clamp(box_corner_max, ivec2(0), ivec2(params.size - 1));
+
+    float angle_step = 2.0f * PI / float(num_sample_rays);
+
+    vec4 best_inv_cone_ratio = vec4(0.0f);
+
+    float alpha = 0.5f * angle_step;
+    float buffer_diagonal_length = length(vec2(params.size));
+    float inv_buffer_diagonal_length = 1.0f / buffer_diagonal_length;
+    for (uint a = 0; a < num_sample_rays; a++) {
+        vec2 sample_ray = vec2(cos(alpha), sin(alpha));
+        vec2 ray_offset = (vec2(1.0f) - sign(abs(sample_ray))) * 1e-20;
+        vec2 adj_sample_ray = sample_ray + ray_offset;
+        vec2 inv_sample_ray = 1.0f / adj_sample_ray;
+
+        vec2 ray_org = pixel_coords.xy + 0.5f;
+        vec2 t = getIntersection(ray_org, inv_sample_ray, box_corner_min, box_corner_max);
+        float t_range = t.y - t.x;
+
+        if (t_range > 0.5f) {
+            vec2 sample_ray_range = abs(t_range * sample_ray);
+            uint sample_count = uint(max(max(sample_ray_range.x, sample_ray_range.y), 1.0f));
+
+            float t_step = t_range / float(sample_count);
+            vec2 sample_ray_step = sample_ray * t_step;
+
+            float c_t = t.x - 0.5f * t_step;
+            vec2 sample_offset = ray_org - box_corner_min;
+
+            vec2 sample_ray_uv_step = sample_ray_step * params.inv_size;
+            vec2 sample_uv = (sample_offset + c_t * sample_ray) * params.inv_size;
+            float s_d_prev = texture(src_img, sample_uv)[params.depth_channel];
+            sample_uv += sample_ray_uv_step;
+            float s_d = texture(src_img, sample_uv)[params.depth_channel];
+            for (uint ts = 0; ts < sample_count; ts++) {
+                c_t += t_step;
+                sample_uv += sample_ray_uv_step;
+                float s_d_next = texture(src_img, sample_uv)[params.depth_channel];
+
+                float deta_height = s_d / c_t * t_step;
+                // found tangent point.
+                float inv_cone_ratio = max(c_depth - s_d, 0.0f) / (c_t * inv_buffer_diagonal_length);
+                if (s_d_prev >= s_d - deta_height && s_d_next >= s_d + deta_height) {
+                    best_inv_cone_ratio.x = max(best_inv_cone_ratio.x, inv_cone_ratio);
+                }
+
+                best_inv_cone_ratio.y = max(best_inv_cone_ratio.y, inv_cone_ratio);
+	            s_d_prev = s_d;
+			    s_d = s_d_next;
+		    }
+        }
+
+        alpha += angle_step;
+    }
+
+    float inv_half_pi = 1.0f / (PI * 0.5f);
+    vec4 conemap_info = vec4(
+        atan(best_inv_cone_ratio.x) * inv_half_pi,
+        atan(best_inv_cone_ratio.y) * inv_half_pi,
+        c_depth, 1.0f);
+
+	// output to a specific pixel in the image.
+	imageStore(dst_img, pixel_coords, conemap_info);
+}

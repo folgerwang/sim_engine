@@ -1,0 +1,94 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+layout(push_constant) uniform ConemapUniformBufferObject {
+    ConemapGenParams params;
+};
+
+layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
+layout(set = 0, binding = DST_TEX_INDEX, rg16f) uniform image2D dst_img;
+
+#define kConemapCacheBufferSize 4096
+
+shared vec2 s_depth[kConemapCacheBufferSize];
+shared vec2 s_minmax_height;
+layout(local_size_x = kConemapGenDispatchX, local_size_y = kConemapGenDispatchY) in;
+void main()
+{
+    // get index in global work group i.e x,y position
+	uvec2 pixel_coords = gl_GlobalInvocationID.xy;
+    uvec2 group_idx = gl_WorkGroupID.xy;
+    uint local_idx = gl_LocalInvocationIndex;
+
+    if (local_idx == 0) {
+        s_minmax_height = vec2(1.0f, 0.0f);
+    }
+    barrier();
+
+    const uint dispatch_block_size =
+        kConemapGenDispatchX * kConemapGenDispatchY;
+
+    const uint cache_block_size =
+        kConemapGenBlockCacheSizeX * kConemapGenBlockCacheSizeY;
+
+    const uint num_passes =
+        (cache_block_size + kConemapCacheBufferSize - 1) / kConemapCacheBufferSize;
+
+    uvec2 block_offset =
+        group_idx *
+        uvec2(kConemapGenDispatchX, kConemapGenDispatchY);
+
+    for (uint p = 0; p < num_passes; p++) {
+        for (uint i = local_idx; i < kConemapCacheBufferSize; i += dispatch_block_size) {
+            uint idx = i + p * kConemapCacheBufferSize;
+            uint y = idx / kConemapGenBlockCacheSizeX;
+            uint x = idx % kConemapGenBlockCacheSizeX;
+            vec2 sample_uv =
+                (block_offset + uvec2(x, y)) * params.inv_size;
+			s_depth[i] =
+                vec2(texture(src_img, sample_uv)[params.depth_channel]);
+		}
+        barrier();
+
+        uint num_items =
+            min(cache_block_size - p * kConemapCacheBufferSize, kConemapCacheBufferSize);
+        uint num_sub_passes =
+            (num_items + dispatch_block_size - 1) / dispatch_block_size;
+
+        for (int i = 0; i < num_sub_passes; i++) {
+            // Reduce in shared memory
+            uint offset = i * dispatch_block_size;
+            uint num_sub_items = min(num_items - offset, dispatch_block_size);
+            for (uint stride = 1; stride < num_sub_items; stride *= 2) {
+                if (local_idx % (2 * stride) == 0 && local_idx + stride < num_sub_items) {
+			        s_depth[offset + local_idx].x =
+                        min(s_depth[offset + local_idx].x,
+                            s_depth[offset + local_idx + stride].x);
+			        s_depth[offset + local_idx].y =
+                        max(s_depth[offset + local_idx].y,
+                            s_depth[offset + local_idx + stride].y);
+                }
+                barrier();
+            }
+            if (local_idx == 0) {
+			    s_minmax_height.x =
+                    min(s_minmax_height.x,
+                        s_depth[offset].x);
+			    s_minmax_height.y =
+                    max(s_minmax_height.y,
+                        s_depth[offset].y);
+		    }
+        }
+    }
+
+    barrier();
+
+	// output max height to texture.
+    if (local_idx == 0) {
+    	imageStore(
+            dst_img,
+            ivec2(gl_WorkGroupID),
+            vec4(s_minmax_height, 0, 0));
+    }
+}
