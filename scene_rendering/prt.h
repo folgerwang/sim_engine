@@ -15,22 +15,20 @@ namespace engine {
 
             std::shared_ptr<renderer::DescriptorSetLayout> prt_gen_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> prt_ds_desc_set_layout_;
-            std::shared_ptr<renderer::DescriptorSetLayout> prt_ds_final_desc_set_layout_;
-            std::shared_ptr<renderer::DescriptorSetLayout> prt_pack_desc_set_layout_;
+            std::shared_ptr<renderer::DescriptorSetLayout> gen_prt_pack_info_desc_set_layout_;
+            std::shared_ptr<renderer::DescriptorSetLayout> pack_prt_desc_set_layout_;
             std::shared_ptr<renderer::PipelineLayout> prt_gen_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_gen_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> prt_ds_first_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_ds_first_pipeline_;
-            std::shared_ptr<renderer::PipelineLayout> prt_ds_pipeline_layout_;
-            std::shared_ptr<renderer::Pipeline> prt_ds_pipeline_;
-            std::shared_ptr<renderer::PipelineLayout> prt_ds_final_pipeline_layout_;
-            std::shared_ptr<renderer::Pipeline> prt_ds_final_pipeline_;
-            std::shared_ptr<renderer::PipelineLayout> prt_pack_pipeline_layout_;
-            std::shared_ptr<renderer::Pipeline> prt_pack_pipeline_;
-            renderer::DescriptorSetList prt_ds_tex_desc_sets_;
+            std::shared_ptr<renderer::PipelineLayout> gen_prt_pack_info_pipeline_layout_;
+            std::shared_ptr<renderer::Pipeline> gen_prt_pack_info_pipeline_;
+            std::shared_ptr<renderer::PipelineLayout> pack_prt_pipeline_layout_;
+            std::shared_ptr<renderer::Pipeline> pack_prt_pipeline_;
+            std::shared_ptr<renderer::DescriptorSet> prt_ds_tex_desc_set_;
 
-            std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_texes_;
-            std::array<std::shared_ptr<renderer::TextureInfo>, 7> prt_ds_texes_[2];
+            std::shared_ptr<renderer::TextureInfo> prt_texes_;
+            std::shared_ptr<renderer::TextureInfo> prt_ds_texes_;
 
         public:
             Prt(
@@ -42,24 +40,24 @@ namespace engine {
                 const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
                 const std::shared_ptr<game_object::ConemapObj>& conemap_obj);
 
-            inline const std::array<std::shared_ptr<renderer::TextureInfo>, 7>& getPrtTextures() {
+            inline const std::shared_ptr<renderer::TextureInfo>& getPrtTextures() {
                 return prt_texes_;
             }
 
-            inline const std::array<std::shared_ptr<renderer::TextureInfo>, 7>& getPrtDsTextures(uint index) {
-                return prt_ds_texes_[index];
+            inline const std::shared_ptr<renderer::TextureInfo>& getPrtDsTextures() {
+                return prt_ds_texes_;
             }
 
             inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPrtGenDescSetLayout() {
                 return prt_gen_desc_set_layout_;
             }
                 
-            inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPrtDsFinalDescSetLayout() {
-                return prt_ds_final_desc_set_layout_;
+            inline const std::shared_ptr<renderer::DescriptorSetLayout>& getGenPrtPackInfoDescSetLayout() {
+                return gen_prt_pack_info_desc_set_layout_;
             }
 
-            inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPrtPackDescSetLayout() {
-                return prt_pack_desc_set_layout_;
+            inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPackPrtDescSetLayout() {
+                return pack_prt_desc_set_layout_;
             }
 
             void destroy(const std::shared_ptr<renderer::Device>& device);

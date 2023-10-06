@@ -1,0 +1,85 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+layout(push_constant) uniform PrtUniformBufferObject {
+    PrtPackParams params;
+};
+
+layout(set = 0, binding = SRC_TEX_INDEX, rgba32f) uniform readonly image2D src_img;
+layout(set = 0, binding = SRC_INFO_TEX_INDEX, rgba32f) uniform readonly image2D src_info_img;
+layout(set = 0, binding = DST_TEX_INDEX, rgba32ui) uniform uimage2D dst_packed_img;
+
+shared vec4 s_pack_info[14];
+layout(local_size_x = 8, local_size_y = 8) in;
+void main()
+{
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID);
+    uint local_idx = gl_LocalInvocationIndex;
+
+    ivec2 pack_info_offset =
+        ivec2(params.block_index * 4);
+
+    if (local_idx < 14) {
+        s_pack_info[local_idx] =
+            imageLoad(
+                src_info_img,
+                pack_info_offset + ivec2(local_idx % 4, local_idx / 4));
+    }
+    barrier();
+
+	// get index in global work group i.e x,y position
+    ivec2 src_pixel_coords =
+        ivec2(pixel_coords.x * 8, pixel_coords.y);
+
+    uvec4 scaled_coeffs[6];
+    for (int i = 0; i < 6; i++) {
+		vec4 coeffs =
+            imageLoad(src_img, src_pixel_coords + ivec2(i, 0));
+        scaled_coeffs[i] =
+            uvec4((coeffs[i] - s_pack_info[i * 2]) / s_pack_info[i * 2 + 1] * 31.0f);
+	}
+    float coeffs =
+        imageLoad(src_img, src_pixel_coords + ivec2(6, 0)).x;
+    uint scaled_coeffs_6 =
+        uint((coeffs - s_pack_info[12].x) / s_pack_info[13].x * 255.0f);
+
+    uvec4 coeff_pack;
+    coeff_pack.x =
+        scaled_coeffs[0].x |
+        (scaled_coeffs[0].y << 5) |
+        (scaled_coeffs[0].z << 10) |
+        (scaled_coeffs[0].w << 15) |
+        (scaled_coeffs[1].x << 20) |
+        (scaled_coeffs[1].y << 25);
+    coeff_pack.y =
+        scaled_coeffs[1].z |
+        (scaled_coeffs[1].w << 5) |
+        (scaled_coeffs[2].x << 10) |
+        (scaled_coeffs[2].y << 15) |
+        (scaled_coeffs[2].z << 20) |
+        (scaled_coeffs[2].w << 25);
+    coeff_pack.z =
+        scaled_coeffs[3].x |
+        (scaled_coeffs[3].y << 5) |
+        (scaled_coeffs[3].z << 10) |
+        (scaled_coeffs[3].w << 15) |
+        (scaled_coeffs[4].x << 20) |
+        (scaled_coeffs[4].y << 25);
+    coeff_pack.w =
+        scaled_coeffs[4].z |
+        (scaled_coeffs[4].w << 5) |
+        (scaled_coeffs[5].x << 10) |
+        (scaled_coeffs[5].y << 15) |
+        (scaled_coeffs[5].z << 20) |
+        (scaled_coeffs[5].w << 25);
+
+    coeff_pack.x |= (scaled_coeffs_6 & 0x03) << 30;
+    coeff_pack.y |= ((scaled_coeffs_6 >> 2) & 0x03) << 30;
+    coeff_pack.z |= ((scaled_coeffs_6 >> 4) & 0x03) << 30;
+    coeff_pack.w |= (scaled_coeffs_6 >> 6) << 30;
+
+    ivec2 dst_pixel_coords =
+        params.block_offset + pixel_coords;
+    imageStore(dst_packed_img, dst_pixel_coords, coeff_pack);
+}

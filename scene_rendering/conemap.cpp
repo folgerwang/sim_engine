@@ -44,7 +44,7 @@ er::WriteDescriptorList addConemapGenTextures(
     const std::shared_ptr<er::ImageView>& minmax_depth_image,
     const std::shared_ptr<er::ImageView>& dst_image) {
     er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(2);
+    descriptor_writes.reserve(3);
 
     // height/depth map texture.
     er::Helper::addOneTexture(
@@ -61,8 +61,8 @@ er::WriteDescriptorList addConemapGenTextures(
         descriptor_writes,
         description_set,
         er::DescriptorType::STORAGE_IMAGE,
-        SRC_TEX_INDEX_1,
-        texture_sampler,
+        SRC_INFO_TEX_INDEX,
+        nullptr,
         minmax_depth_image,
         er::ImageLayout::GENERAL);
 
@@ -126,7 +126,7 @@ Conemap::Conemap(
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                 er::DescriptorType::COMBINED_IMAGE_SAMPLER),
               renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                SRC_TEX_INDEX_1,
+                SRC_INFO_TEX_INDEX,
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                 er::DescriptorType::STORAGE_IMAGE),
               renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
@@ -227,8 +227,10 @@ void Conemap::update(
     }
 
     {
-        auto block_cache_num_x = (conemap_tex->size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX;
-        auto block_cache_num_y = (conemap_tex->size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY;
+        auto block_cache_num_x =
+            (conemap_tex->size.x + kConemapGenBlockCacheSizeX - 1) / kConemapGenBlockCacheSizeX;
+        auto block_cache_num_y =
+            (conemap_tex->size.y + kConemapGenBlockCacheSizeY - 1) / kConemapGenBlockCacheSizeY;
         auto total_block_num = block_cache_num_x * block_cache_num_y;
 
         cmd_buf->bindPipeline(

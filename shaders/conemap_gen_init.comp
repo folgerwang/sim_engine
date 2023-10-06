@@ -8,22 +8,22 @@ layout(push_constant) uniform ConemapUniformBufferObject {
     ConemapGenParams params;
 };
 
+const ivec2 g_dispatch_size =
+    ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
+const ivec2 g_cache_block_size =
+    ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
+
 layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
 layout(set = 0, binding = DST_TEX_INDEX, rgba8) uniform image2D dst_img;
 
 layout(local_size_x = kConemapGenDispatchX, local_size_y = kConemapGenDispatchY) in;
 void main()
 {
-    const ivec2 s_dispatch_size =
-        ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
-    const ivec2 s_cache_block_size =
-        ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
-
 	// get index in global work group i.e x,y position
 	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 group_idx = ivec2(gl_WorkGroupID);
-    ivec2 group_offset = group_idx * s_dispatch_size;
-    ivec2 center_cache_block_idx = group_offset / s_cache_block_size;
+    ivec2 group_offset = group_idx * g_dispatch_size;
+    ivec2 center_cache_block_idx = group_offset / g_cache_block_size;
 
     // load current depth value from source image
     vec2 uv = (pixel_coords.xy + 0.5f) * params.inv_size;
@@ -34,8 +34,8 @@ void main()
         min((kConemapGenBlockCacheSizeY + kConemapGenBlockCacheSizeX) * 4, 1024);
 
     // 3x3 cache block.
-    ivec2 box_corner_min = (center_cache_block_idx - 1) * s_cache_block_size;
-    ivec2 box_corner_max = box_corner_min + s_cache_block_size * 3 - 1;
+    ivec2 box_corner_min = (center_cache_block_idx - 1) * g_cache_block_size;
+    ivec2 box_corner_max = box_corner_min + g_cache_block_size * 3 - 1;
     box_corner_min = clamp(box_corner_min, ivec2(0), ivec2(params.size - 1));
     box_corner_max = clamp(box_corner_max, ivec2(0), ivec2(params.size - 1));
 

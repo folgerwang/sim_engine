@@ -13,6 +13,16 @@ layout(set = 0, binding = DST_TEX_INDEX, rg16f) uniform image2D dst_img;
 
 shared vec2 s_depth[kConemapCacheBufferSize];
 shared vec2 s_minmax_height;
+
+const uint g_dispatch_block_size =
+    kConemapGenDispatchX * kConemapGenDispatchY;
+
+const uint g_cache_block_size =
+    kConemapGenBlockCacheSizeX * kConemapGenBlockCacheSizeY;
+
+const uint g_num_passes =
+    (g_cache_block_size + kConemapCacheBufferSize - 1) / kConemapCacheBufferSize;
+
 layout(local_size_x = kConemapGenDispatchX, local_size_y = kConemapGenDispatchY) in;
 void main()
 {
@@ -26,21 +36,12 @@ void main()
     }
     barrier();
 
-    const uint dispatch_block_size =
-        kConemapGenDispatchX * kConemapGenDispatchY;
-
-    const uint cache_block_size =
-        kConemapGenBlockCacheSizeX * kConemapGenBlockCacheSizeY;
-
-    const uint num_passes =
-        (cache_block_size + kConemapCacheBufferSize - 1) / kConemapCacheBufferSize;
-
     uvec2 block_offset =
         group_idx *
         uvec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
 
-    for (uint p = 0; p < num_passes; p++) {
-        for (uint i = local_idx; i < kConemapCacheBufferSize; i += dispatch_block_size) {
+    for (uint p = 0; p < g_num_passes; p++) {
+        for (uint i = local_idx; i < kConemapCacheBufferSize; i += g_dispatch_block_size) {
             uint idx = i + p * kConemapCacheBufferSize;
             uint y = idx / kConemapGenBlockCacheSizeX;
             uint x = idx % kConemapGenBlockCacheSizeX;
@@ -52,14 +53,14 @@ void main()
         barrier();
 
         uint num_items =
-            min(cache_block_size - p * kConemapCacheBufferSize, kConemapCacheBufferSize);
+            min(g_cache_block_size - p * kConemapCacheBufferSize, kConemapCacheBufferSize);
         uint num_sub_passes =
-            (num_items + dispatch_block_size - 1) / dispatch_block_size;
+            (num_items + g_dispatch_block_size - 1) / g_dispatch_block_size;
 
         for (int i = 0; i < num_sub_passes; i++) {
             // Reduce in shared memory
-            uint offset = i * dispatch_block_size;
-            uint num_sub_items = min(num_items - offset, dispatch_block_size);
+            uint offset = i * g_dispatch_block_size;
+            uint num_sub_items = min(num_items - offset, g_dispatch_block_size);
             for (uint stride = 1; stride < num_sub_items; stride *= 2) {
                 if (local_idx % (2 * stride) == 0 && local_idx + stride < num_sub_items) {
 			        s_depth[offset + local_idx].x =

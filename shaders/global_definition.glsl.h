@@ -61,8 +61,8 @@
 #define GLOSSNESS_TEX_INDEX         METAL_ROUGHNESS_TEX_INDEX
 
 #define CONEMAP_TEX_INDEX           (OCCLUSION_TEX_INDEX + 1)
-#define PRT_TEX_INDEX               (CONEMAP_TEX_INDEX + 1)
-#define PRT_BUFFER_INDEX            (PRT_TEX_INDEX + 1)
+#define PRT_PACK_TEX_INDEX          (CONEMAP_TEX_INDEX + 1)
+#define PRT_PACK_INFO_TEX_INDEX     (PRT_PACK_TEX_INDEX + 1)
 /*#define PRT_TEX_INDEX_0             (CONEMAP_TEX_INDEX + 1)
 #define PRT_TEX_INDEX_1             (PRT_TEX_INDEX_0 + 1)
 #define PRT_TEX_INDEX_2             (PRT_TEX_INDEX_1 + 1)
@@ -120,23 +120,8 @@
 #define PANORAMA_TEX_INDEX                  0
 #define ENVMAP_TEX_INDEX                    0
 #define SRC_TEX_INDEX                       0
-#define SRC_BUFFER_INDEX                    0
-#define SRC_TEX_INDEX_0                     1
-#define SRC_TEX_INDEX_1                     2
-#define SRC_TEX_INDEX_2                     3
-#define SRC_TEX_INDEX_3                     4
-#define SRC_TEX_INDEX_4                     5
-#define SRC_TEX_INDEX_5                     6
-#define SRC_TEX_INDEX_6                     7
-#define DST_TEX_INDEX                       8
-#define DST_BUFFER_INDEX                    8
-#define DST_TEX_INDEX_0                     8
-#define DST_TEX_INDEX_1                     9
-#define DST_TEX_INDEX_2                     10
-#define DST_TEX_INDEX_3                     11
-#define DST_TEX_INDEX_4                     12
-#define DST_TEX_INDEX_5                     13
-#define DST_TEX_INDEX_6                     14
+#define SRC_INFO_TEX_INDEX                  1
+#define DST_TEX_INDEX                       2
 
 #define VERTEX_BUFFER_INDEX                 0
 #define INDEX_BUFFER_INDEX                  1
@@ -462,14 +447,16 @@ struct ConemapGenParams {
     uint            depth_channel;
 };
 
-struct PrtParams {
+struct PrtPackParams {
     uvec2           size;
-    vec2            inv_size;
+    ivec2           block_index;
+    ivec2           block_offset;
 };
 
 struct PrtGenParams {
     uvec2           size;
     vec2            inv_size;
+    uvec2           block_offset;
     float           shadow_intensity;
     float           shadow_noise_thread;
     uint            depth_channel;

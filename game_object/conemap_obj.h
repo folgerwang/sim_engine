@@ -15,12 +15,12 @@ class ConemapObj {
     std::shared_ptr<renderer::PipelineLayout> gen_minmax_depth_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> gen_minmax_depth_pipeline_;
 
-    std::shared_ptr<renderer::DescriptorSet>  prt_gen_tex_desc_set_;
-    renderer::DescriptorSetList prt_ds_final_tex_desc_sets_;
-    std::shared_ptr<renderer::DescriptorSet>  prt_pack_tex_desc_set_;
+    std::shared_ptr<renderer::DescriptorSet> prt_gen_tex_desc_set_;
+    std::shared_ptr<renderer::DescriptorSet> gen_prt_pack_info_tex_desc_set_;
+    std::shared_ptr<renderer::DescriptorSet> pack_prt_tex_desc_set_;
     std::shared_ptr<renderer::TextureInfo> conemap_tex_;
     std::shared_ptr<renderer::TextureInfo> prt_pack_tex_;
-    std::shared_ptr<renderer::BufferInfo> prt_minmax_buffer_;
+    std::shared_ptr<renderer::TextureInfo> prt_pack_info_tex_;
     std::shared_ptr<renderer::TextureInfo> minmax_depth_tex_;
 
     uint32_t depth_channel_ = 0;
@@ -73,12 +73,12 @@ public:
         return prt_gen_tex_desc_set_;
     }
 
-    inline const std::shared_ptr<renderer::DescriptorSet>& getPrtDsFinalTexDescSet(uint32_t index) {
-        return prt_ds_final_tex_desc_sets_[index];
+    inline const std::shared_ptr<renderer::DescriptorSet>& getGenPrtPackInfoTexDescSet() {
+        return gen_prt_pack_info_tex_desc_set_;
     }
 
-    inline const std::shared_ptr<renderer::DescriptorSet>& getPrtPackTexDescSet() {
-        return prt_pack_tex_desc_set_;
+    inline const std::shared_ptr<renderer::DescriptorSet>& getPackPrtTexDescSet() {
+        return pack_prt_tex_desc_set_;
     }
 
     inline const std::shared_ptr<renderer::TextureInfo> getConemapTexture() {
@@ -93,8 +93,8 @@ public:
         return prt_pack_tex_;
     }
 
-    inline const std::shared_ptr<renderer::BufferInfo> getMinmaxBuffer() {
-        return prt_minmax_buffer_;
+    inline const std::shared_ptr<renderer::TextureInfo> getPackInfoTexture() {
+        return prt_pack_info_tex_;
     }
 };
 

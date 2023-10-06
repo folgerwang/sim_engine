@@ -6,35 +6,33 @@
 namespace {
     namespace er = engine::renderer;
 
+    const glm::uvec2 g_block_size =
+        glm::uvec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
+
     er::WriteDescriptorList addDsPrtTextures(
         const std::shared_ptr<er::DescriptorSet>& description_set,
-        const std::shared_ptr<er::Sampler>& texture_sampler,
-        const std::array<std::shared_ptr<er::TextureInfo>, 7>& src_prt_texes,
-        const std::array<std::shared_ptr<er::TextureInfo>, 7>& dst_prt_texes) {
+        const std::shared_ptr<er::TextureInfo>& src_prt_texes,
+        const std::shared_ptr<er::TextureInfo>& dst_prt_texes) {
         er::WriteDescriptorList descriptor_writes;
-        descriptor_writes.reserve(14);
+        descriptor_writes.reserve(2);
 
-        for (int i = 0; i < src_prt_texes.size(); ++i) {
-            er::Helper::addOneTexture(
-                descriptor_writes,
-                description_set,
-                er::DescriptorType::STORAGE_IMAGE,
-                SRC_TEX_INDEX_0 + i,
-                texture_sampler,
-                src_prt_texes[i]->view,
-                er::ImageLayout::GENERAL);
-        }
+        er::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            er::DescriptorType::STORAGE_IMAGE,
+            SRC_TEX_INDEX,
+            nullptr,
+            src_prt_texes->view,
+            er::ImageLayout::GENERAL);
 
-        for (int i = 0; i < dst_prt_texes.size(); ++i) {
-            er::Helper::addOneTexture(
-                descriptor_writes,
-                description_set,
-                er::DescriptorType::STORAGE_IMAGE,
-                DST_TEX_INDEX_0 + i,
-                nullptr,
-                dst_prt_texes[i]->view,
-                er::ImageLayout::GENERAL);
-        }
+        er::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            er::DescriptorType::STORAGE_IMAGE,
+            DST_TEX_INDEX,
+            nullptr,
+            dst_prt_texes->view,
+            er::ImageLayout::GENERAL);
 
         return descriptor_writes;
     }
@@ -54,67 +52,27 @@ namespace {
     }
 
     std::shared_ptr<er::PipelineLayout>
-        createPrtPipelineLayout(
+        createPrtDsPipelineLayout(
+            const std::shared_ptr<er::Device>& device,
+            const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
+        return device->createPipelineLayout(
+            { desc_set_layout },
+            { });
+    }
+
+    std::shared_ptr<er::PipelineLayout>
+        createPrtPackPipelineLayout(
             const std::shared_ptr<er::Device>& device,
             const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
         er::PushConstantRange push_const_range{};
         push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
         push_const_range.offset = 0;
-        push_const_range.size = sizeof(glsl::PrtParams);
+        push_const_range.size = sizeof(glsl::PrtPackParams);
 
         return device->createPipelineLayout(
             { desc_set_layout },
             { push_const_range });
     }
-
-    // create prt textures.
-    void MinmaxDownsample(
-        const std::shared_ptr<er::CommandBuffer>& cmd_buf,
-        const std::shared_ptr<er::Pipeline>& pipeline,
-        const std::shared_ptr<er::PipelineLayout>& pipeline_layout,
-        const std::shared_ptr<er::DescriptorSet>& desc_set,
-        const std::array<std::shared_ptr<er::TextureInfo>, 7>& dst_prt_texes,
-        const glm::uvec2& src_buffer_size)
-    {
-        std::vector<std::shared_ptr<er::Image>> images;
-        images.reserve(dst_prt_texes.size());
-        for (const auto& tex : dst_prt_texes) {
-            images.push_back(tex->image);
-        }
-
-        er::helper::transitMapTextureToStoreImage(
-            cmd_buf,
-            images);
-
-        cmd_buf->bindPipeline(
-            er::PipelineBindPoint::COMPUTE,
-            pipeline);
-        glsl::PrtParams params = {};
-        params.size = src_buffer_size;
-        params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-
-        cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            pipeline_layout,
-            &params,
-            sizeof(params));
-
-        cmd_buf->bindDescriptorSets(
-            er::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
-            { desc_set });
-
-        cmd_buf->dispatch(
-            (params.size.x + 7) / 8,
-            (params.size.y + 7) / 8,
-            1);
-
-        er::helper::transitMapTextureFromStoreImage(
-            cmd_buf,
-            images,
-            er::ImageLayout::GENERAL);
-    }
-
 } // namespace
 
 namespace engine {
@@ -125,88 +83,46 @@ Prt::Prt(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler) {
 
-    const glm::uvec2 buffer_size =
-        glm::uvec2(s_max_prt_buffer_size, s_max_prt_buffer_size);
+    const glm::uvec2 temp_buffer_size =
+        g_block_size * glm::uvec2(8, 1);
 
-    // create 7 temporary prt textures and downsamples too.
-    for (int i = 0; i < 6; i++) {
-        prt_texes_[i] = std::make_shared<renderer::TextureInfo>();
-        renderer::Helper::create2DTextureImage(
-            device,
-            renderer::Format::R32G32B32A32_SFLOAT,
-            buffer_size,
-            *prt_texes_[i],
-            SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-            SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-        prt_ds_texes_[0][i] = std::make_shared<renderer::TextureInfo>();
-        renderer::Helper::create2DTextureImage(
-            device,
-            renderer::Format::R32G32B32A32_SFLOAT,
-            glm::uvec2((buffer_size.x + 7) / 8 * 2, (buffer_size.y + 7) / 8),
-            *prt_ds_texes_[0][i],
-            SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-            SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-        prt_ds_texes_[1][i] = std::make_shared<renderer::TextureInfo>();
-        renderer::Helper::create2DTextureImage(
-            device,
-            renderer::Format::R32G32B32A32_SFLOAT,
-            glm::uvec2((buffer_size.x + 63) / 64 * 2, (buffer_size.y + 63) / 64),
-            *prt_ds_texes_[1][i],
-            SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-            SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    prt_texes_[6] = std::make_shared<renderer::TextureInfo>();
+    prt_texes_ = std::make_shared<renderer::TextureInfo>();
     renderer::Helper::create2DTextureImage(
         device,
-        renderer::Format::R32_SFLOAT,
-        buffer_size,
-        *prt_texes_[6],
+        renderer::Format::R32G32B32A32_SFLOAT,
+        temp_buffer_size,
+        *prt_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::GENERAL);
 
-    prt_ds_texes_[0][6] = std::make_shared<renderer::TextureInfo>();
+    const glm::uvec2 temp_ds_buffer_size =
+        g_block_size / glm::uvec2(16) * glm::uvec2(4);
+
+    prt_ds_texes_ = std::make_shared<renderer::TextureInfo>();
     renderer::Helper::create2DTextureImage(
         device,
-        renderer::Format::R32_SFLOAT,
-        glm::uvec2((buffer_size.x + 7) / 8 * 2, (buffer_size.y + 7) / 8),
-        *prt_ds_texes_[0][6],
+        renderer::Format::R32G32B32A32_SFLOAT,
+        temp_ds_buffer_size,
+        *prt_ds_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    prt_ds_texes_[1][6] = std::make_shared<renderer::TextureInfo>();
-    renderer::Helper::create2DTextureImage(
-        device,
-        renderer::Format::R32_SFLOAT,
-        glm::uvec2((buffer_size.x + 63) / 64 * 2, (buffer_size.y + 63) / 64),
-        *prt_ds_texes_[1][6],
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::GENERAL);
 
     // create a global ibl texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(8);
+    bindings.reserve(2);
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             SRC_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::COMBINED_IMAGE_SAMPLER));
 
-    for (int i = 0; i < prt_texes_.size(); ++i) {
-        bindings.push_back(
-            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_0 + i,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE));
-    }
+    bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            DST_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_IMAGE));
 
     prt_gen_desc_set_layout_ =
         device->createDescriptorSetLayout(bindings);
@@ -224,55 +140,37 @@ Prt::Prt(
 
     // create a global ibl texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> ds_bindings;
-    ds_bindings.reserve(14);
-    for (int i = 0; i < prt_texes_.size(); ++i) {
-        ds_bindings.push_back(
-            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                SRC_TEX_INDEX_0 + i,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE));
-    }
+    ds_bindings.reserve(2);
+    ds_bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            SRC_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_IMAGE));
 
-    for (int i = 0; i < prt_texes_.size(); ++i) {
-        ds_bindings.push_back(
-            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                DST_TEX_INDEX_0 + i,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE));
-    }
+    ds_bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            DST_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_IMAGE));
 
     prt_ds_desc_set_layout_ =
         device->createDescriptorSetLayout(ds_bindings);
 
-    prt_ds_tex_desc_sets_ =
+    prt_ds_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_ds_desc_set_layout_, 3);
+            prt_ds_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto prt_ds_texture_descs = addDsPrtTextures(
-        prt_ds_tex_desc_sets_[0],
-        texture_sampler,
-        prt_texes_,
-        prt_ds_texes_[0]);
-    device->updateDescriptorSets(prt_ds_texture_descs);
-
-    prt_ds_texture_descs = addDsPrtTextures(
-        prt_ds_tex_desc_sets_[1],
-        texture_sampler,
-        prt_ds_texes_[0],
-        prt_ds_texes_[1]);
-    device->updateDescriptorSets(prt_ds_texture_descs);
-
-    prt_ds_texture_descs = addDsPrtTextures(
-        prt_ds_tex_desc_sets_[2],
-        texture_sampler,
-        prt_ds_texes_[1],
-        prt_ds_texes_[0]);
+    auto prt_ds_texture_descs =
+        addDsPrtTextures(
+            prt_ds_tex_desc_set_,
+            prt_texes_,
+            prt_ds_texes_);
     device->updateDescriptorSets(prt_ds_texture_descs);
 
     prt_ds_first_pipeline_layout_ =
-        createPrtPipelineLayout(
+        createPrtDsPipelineLayout(
             device,
             prt_ds_desc_set_layout_);
 
@@ -282,64 +180,35 @@ Prt::Prt(
             prt_ds_first_pipeline_layout_,
             "prt_minmax_ds_s_comp.spv");
 
-    prt_ds_pipeline_layout_ =
-        createPrtPipelineLayout(
-            device,
-            prt_ds_desc_set_layout_);
-
-    prt_ds_pipeline_ =
-        renderer::helper::createComputePipeline(
-            device,
-            prt_ds_pipeline_layout_,
-            "prt_minmax_ds_comp.spv");
-
     // create a global ibl texture descriptor set layout.
-    std::vector<renderer::DescriptorSetLayoutBinding> ds_f_bindings;
-    ds_f_bindings.reserve(8);
-    for (int i = 0; i < prt_texes_.size(); ++i) {
-        ds_f_bindings.push_back(
-            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                SRC_TEX_INDEX_0 + i,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE));
-    }
+    gen_prt_pack_info_desc_set_layout_ =
+        device->createDescriptorSetLayout(ds_bindings);
 
-    ds_f_bindings.push_back(
-        renderer::helper::getBufferDescriptionSetLayoutBinding(
-            DST_BUFFER_INDEX,
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            er::DescriptorType::STORAGE_BUFFER));
-
-    prt_ds_final_desc_set_layout_ =
-        device->createDescriptorSetLayout(ds_f_bindings);
-
-    prt_ds_final_pipeline_layout_ =
-        createPrtPipelineLayout(
+    gen_prt_pack_info_pipeline_layout_ =
+        createPrtPackPipelineLayout(
             device,
-            prt_ds_final_desc_set_layout_);
+            gen_prt_pack_info_desc_set_layout_);
 
-    prt_ds_final_pipeline_ =
+    gen_prt_pack_info_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
-            prt_ds_final_pipeline_layout_,
-            "prt_minmax_ds_f_comp.spv");
+            gen_prt_pack_info_pipeline_layout_,
+            "gen_prt_pack_info_comp.spv");
 
     // create a global ibl texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> pack_bindings;
-    pack_bindings.reserve(9);
-    for (int i = 0; i < prt_texes_.size(); ++i) {
-        pack_bindings.push_back(
-            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                SRC_TEX_INDEX_0 + i,
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::STORAGE_IMAGE));
-    }
+    pack_bindings.reserve(3);
+    pack_bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            SRC_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_IMAGE));
 
     pack_bindings.push_back(
-        renderer::helper::getBufferDescriptionSetLayoutBinding(
-            SRC_BUFFER_INDEX,
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            SRC_INFO_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            er::DescriptorType::STORAGE_BUFFER));
+            er::DescriptorType::STORAGE_IMAGE));
 
     pack_bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
@@ -347,177 +216,187 @@ Prt::Prt(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_IMAGE));
 
-    prt_pack_desc_set_layout_ =
+    pack_prt_desc_set_layout_ =
         device->createDescriptorSetLayout(pack_bindings);
 
-    prt_pack_pipeline_layout_ =
-        createPrtPipelineLayout(
+    pack_prt_pipeline_layout_ =
+        createPrtPackPipelineLayout(
             device,
-            prt_pack_desc_set_layout_);
+            pack_prt_desc_set_layout_);
 
-    prt_pack_pipeline_ =
+    pack_prt_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
-            prt_pack_pipeline_layout_,
-            "prt_pack_comp.spv");
+            pack_prt_pipeline_layout_,
+            "pack_prt_comp.spv");
 }
 
 void Prt::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
-    if (prt_texes_.empty()) {
-        return;
-    }
+    auto src_size =
+        glm::uvec2(conemap_obj->getPackTexture()->size);
 
-    auto src_size = glm::uvec2(conemap_obj->getPackTexture()->size);
+    auto block_count =
+        (src_size + g_block_size - glm::uvec2(1)) / g_block_size;
 
-    // create prt textures.
-    {
-        std::vector<std::shared_ptr<renderer::Image>> images;
-        images.reserve(prt_texes_.size());
-        for (const auto& tex : prt_texes_) {
-            images.push_back(tex->image);
+    auto num_passes = block_count.x * block_count.y;
+
+    for (uint p = 0; p < num_passes; p++) {
+        uint block_x = p % block_count.x;
+        uint block_y = p / block_count.x;
+
+        // create prt textures.
+        {
+            renderer::helper::transitMapTextureToStoreImage(
+                cmd_buf,
+                { prt_texes_->image });
+
+            cmd_buf->bindPipeline(
+                renderer::PipelineBindPoint::COMPUTE,
+                prt_gen_pipeline_);
+            glsl::PrtGenParams params = {};
+            params.size = src_size;
+            params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
+            params.block_offset =
+                glm::uvec2(block_x, block_y) * g_block_size;
+            params.shadow_intensity = conemap_obj->getShadowIntensity();
+            params.depth_channel = conemap_obj->getDepthChannel();
+            params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
+            params.shadow_noise_thread = conemap_obj->getShadowNoiseThread();
+
+            cmd_buf->pushConstants(
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                prt_gen_pipeline_layout_,
+                &params,
+                sizeof(params));
+
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::COMPUTE,
+                prt_gen_pipeline_layout_,
+                { conemap_obj->getPrtGenTexDescSet() });
+
+            cmd_buf->dispatch(
+                (g_block_size.x + 7) / 8,
+                (g_block_size.y + 7) / 8,
+                1);
+
+            renderer::helper::transitMapTextureFromStoreImage(
+                cmd_buf,
+                { prt_texes_->image },
+                renderer::ImageLayout::GENERAL);
         }
 
-        renderer::helper::transitMapTextureToStoreImage(
-            cmd_buf,
-            images);
+        {
+            er::helper::transitMapTextureToStoreImage(
+                cmd_buf,
+                { prt_ds_texes_->image });
 
-        cmd_buf->bindPipeline(
-            renderer::PipelineBindPoint::COMPUTE,
-            prt_gen_pipeline_);
-        glsl::PrtGenParams params = {};
-        params.size = src_size;
-        params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
-        params.shadow_intensity = conemap_obj->getShadowIntensity();
-        params.depth_channel = conemap_obj->getDepthChannel();
-        params.is_height_map = conemap_obj->isHeightMap() ? 1 : 0;
-        params.shadow_noise_thread = conemap_obj->getShadowNoiseThread();
+            cmd_buf->bindPipeline(
+                er::PipelineBindPoint::COMPUTE,
+                prt_ds_first_pipeline_);
 
-        cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            prt_gen_pipeline_layout_,
-            &params,
-            sizeof(params));
+            cmd_buf->bindDescriptorSets(
+                er::PipelineBindPoint::COMPUTE,
+                prt_ds_first_pipeline_layout_,
+                { prt_ds_tex_desc_set_ });
 
-        cmd_buf->bindDescriptorSets(
-            renderer::PipelineBindPoint::COMPUTE,
-            prt_gen_pipeline_layout_,
-            { conemap_obj->getPrtGenTexDescSet() });
+            cmd_buf->dispatch(
+                (g_block_size.x + 15) / 16,
+                (g_block_size.y + 15) / 16,
+                1);
 
-        cmd_buf->dispatch(
-            (src_size.x + 7) / 8,
-            (src_size.y + 7) / 8,
-            1);
+            er::helper::transitMapTextureFromStoreImage(
+                cmd_buf,
+                { prt_ds_texes_->image },
+                er::ImageLayout::GENERAL);
+        }
 
-        renderer::helper::transitMapTextureFromStoreImage(
-            cmd_buf,
-            images,
-            renderer::ImageLayout::GENERAL);
-    }
+        {
+            cmd_buf->bindPipeline(
+                renderer::PipelineBindPoint::COMPUTE,
+                gen_prt_pack_info_pipeline_);
 
-    MinmaxDownsample(
-        cmd_buf,
-        prt_ds_first_pipeline_,
-        prt_ds_first_pipeline_layout_,
-        prt_ds_tex_desc_sets_[0],
-        prt_ds_texes_[0],
-        src_size);
+            glsl::PrtPackParams params = {};
+            params.size = (g_block_size + uvec2(15)) / uvec2(16);
+            params.block_index = glm::uvec2(block_x, block_y);
 
-    src_size.x = (src_size.x + 7) / 8;
-    src_size.y = (src_size.y + 7) / 8;
+            cmd_buf->pushConstants(
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                gen_prt_pack_info_pipeline_layout_,
+                &params,
+                sizeof(params));
 
-    auto src_width = std::max(src_size.x, src_size.y);
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::COMPUTE,
+                gen_prt_pack_info_pipeline_layout_,
+                { conemap_obj->getGenPrtPackInfoTexDescSet() });
 
-    uint32_t double_buffer_idx = 0;
-    for (uint32_t w = src_width; w > 8; w = (w + 7) / 8) {
-        MinmaxDownsample(
-            cmd_buf,
-            prt_ds_pipeline_,
-            prt_ds_pipeline_layout_,
-            prt_ds_tex_desc_sets_[1 + double_buffer_idx],
-            prt_ds_texes_[1 - double_buffer_idx],
-            src_size);
+            cmd_buf->dispatch(1, 1, 1);
 
-        src_size.x = (src_size.x + 7) / 8;
-        src_size.y = (src_size.y + 7) / 8;
+            er::BarrierList barrier_list;
+            er::helper::addTexturesToBarrierList(
+                barrier_list,
+                { conemap_obj->getPackInfoTexture()->image },
+                renderer::ImageLayout::GENERAL,
+                SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+                SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
-        double_buffer_idx = 1 - double_buffer_idx;
-    }
-    
-    {
-        cmd_buf->bindPipeline(
-            renderer::PipelineBindPoint::COMPUTE,
-            prt_ds_final_pipeline_);
-        glsl::PrtParams params = {};
-        params.size = src_size;
-        params.inv_size = glm::vec2(1.0f / src_size.x, 1.0f / src_size.y);
+            cmd_buf->addBarriers(
+                barrier_list,
+                SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
+                SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
+        }
 
-        cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            prt_ds_final_pipeline_layout_,
-            &params,
-            sizeof(params));
+        src_size = glm::uvec2(conemap_obj->getPackTexture()->size);
+        {
+            renderer::helper::transitMapTextureToStoreImage(cmd_buf, { conemap_obj->getPackTexture()->image });
 
-        cmd_buf->bindDescriptorSets(
-            renderer::PipelineBindPoint::COMPUTE,
-            prt_ds_final_pipeline_layout_,
-            { conemap_obj->getPrtDsFinalTexDescSet(double_buffer_idx)});
+            cmd_buf->bindPipeline(
+                renderer::PipelineBindPoint::COMPUTE,
+                pack_prt_pipeline_);
 
-        cmd_buf->dispatch(1, 1, 1);
+            glsl::PrtPackParams params = {};
+            params.size = g_block_size;
+            params.block_index =
+                glm::uvec2(block_x, block_y);
+            params.block_offset =
+                glm::uvec2(block_x, block_y) * g_block_size;
 
-        er::BarrierList barrier_list;
-        er::helper::addBuffersToBarrierList(
-            barrier_list,
-            { conemap_obj->getMinmaxBuffer()->buffer },
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
-            SET_FLAG_BIT(Access, SHADER_READ_BIT));
+            cmd_buf->pushConstants(
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                pack_prt_pipeline_layout_,
+                &params,
+                sizeof(params));
 
-        cmd_buf->addBarriers(
-            barrier_list,
-            SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
-            SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
-    }
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::COMPUTE,
+                pack_prt_pipeline_layout_,
+                { conemap_obj->getPackPrtTexDescSet() });
 
-    src_size = glm::uvec2(conemap_obj->getPackTexture()->size);
-    {
-        renderer::helper::transitMapTextureToStoreImage(cmd_buf, { conemap_obj->getPackTexture()->image });
+            cmd_buf->dispatch(
+                (g_block_size.x + 7) / 8,
+                (g_block_size.y + 7) / 8,
+                1);
 
-        cmd_buf->bindPipeline(
-            renderer::PipelineBindPoint::COMPUTE,
-            prt_pack_pipeline_);
-
-        cmd_buf->bindDescriptorSets(
-            renderer::PipelineBindPoint::COMPUTE,
-            prt_pack_pipeline_layout_,
-            { conemap_obj->getPrtPackTexDescSet()});
-
-        cmd_buf->dispatch(
-            (src_size.x + 7) / 8,
-            (src_size.y + 7) / 8,
-            1);
-
-        cmd_buf->addImageBarrier(
-            conemap_obj->getPackTexture()->image,
-            er::Helper::getImageAsStore(),
-            er::Helper::getImageAsStore());
+            cmd_buf->addImageBarrier(
+                conemap_obj->getPackTexture()->image,
+                er::Helper::getImageAsStore(),
+                er::Helper::getImageAsStore());
+        }
     }
 }
 
 void Prt::destroy(
     const std::shared_ptr<renderer::Device>& device) {
 
-    for (int i = 0; i < prt_texes_.size(); i++) {
-        if (prt_texes_[i]) {
-            prt_texes_[i]->destroy(device);
-        }
-        if (prt_ds_texes_[0][i]) {
-            prt_ds_texes_[0][i]->destroy(device);
-        }
-        if (prt_ds_texes_[1][i]) {
-            prt_ds_texes_[1][i]->destroy(device);
-        }
+    if (prt_texes_) {
+        prt_texes_->destroy(device);
+    }
+
+    if (prt_ds_texes_) {
+            prt_ds_texes_->destroy(device);
     }
 
     device->destroyDescriptorSetLayout(prt_gen_desc_set_layout_);
@@ -525,16 +404,14 @@ void Prt::destroy(
     device->destroyPipeline(prt_gen_pipeline_);
 
     device->destroyDescriptorSetLayout(prt_ds_desc_set_layout_);
-    device->destroyDescriptorSetLayout(prt_ds_final_desc_set_layout_);
-    device->destroyDescriptorSetLayout(prt_pack_desc_set_layout_);
+    device->destroyDescriptorSetLayout(gen_prt_pack_info_desc_set_layout_);
+    device->destroyDescriptorSetLayout(pack_prt_desc_set_layout_);
     device->destroyPipelineLayout(prt_ds_first_pipeline_layout_);
     device->destroyPipeline(prt_ds_first_pipeline_);
-    device->destroyPipelineLayout(prt_ds_pipeline_layout_);
-    device->destroyPipeline(prt_ds_pipeline_);
-    device->destroyPipelineLayout(prt_ds_final_pipeline_layout_);
-    device->destroyPipeline(prt_ds_final_pipeline_);
-    device->destroyPipelineLayout(prt_pack_pipeline_layout_);
-    device->destroyPipeline(prt_pack_pipeline_);
+    device->destroyPipelineLayout(gen_prt_pack_info_pipeline_layout_);
+    device->destroyPipeline(gen_prt_pack_info_pipeline_);
+    device->destroyPipelineLayout(pack_prt_pipeline_layout_);
+    device->destroyPipeline(pack_prt_pipeline_);
 }
 
 }//namespace scene_rendering

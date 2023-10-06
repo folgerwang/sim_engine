@@ -195,9 +195,10 @@ IblCreator::IblCreator(
         descriptor_pool,
         texture_sampler);
 
-    ibl_comp_pipeline_layout_ = createCubemapComputePipelineLayout(
-        device,
-        ibl_comp_desc_set_layout_);
+    ibl_comp_pipeline_layout_ =
+        createCubemapComputePipelineLayout(
+            device,
+            ibl_comp_desc_set_layout_);
 
     blur_comp_pipeline_ = 
         er::helper::createComputePipeline(
@@ -205,9 +206,10 @@ IblCreator::IblCreator(
             ibl_comp_pipeline_layout_,
             "ibl_smooth_comp.spv");
 
-    ibl_pipeline_layout_ = createCubemapPipelineLayout(
-        device,
-        ibl_desc_set_layout_);
+    ibl_pipeline_layout_ =
+        createCubemapPipelineLayout(
+            device,
+            ibl_desc_set_layout_);
 
     createIblGraphicsPipelines(
         device,

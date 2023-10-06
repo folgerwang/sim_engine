@@ -8,13 +8,7 @@ layout(push_constant) uniform PrtUniformBufferObject {
 };
 
 layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
-layout(set = 0, binding = DST_TEX_INDEX_0, rgba32f) uniform image2D dst_img_0;
-layout(set = 0, binding = DST_TEX_INDEX_1, rgba32f) uniform image2D dst_img_1;
-layout(set = 0, binding = DST_TEX_INDEX_2, rgba32f) uniform image2D dst_img_2;
-layout(set = 0, binding = DST_TEX_INDEX_3, rgba32f) uniform image2D dst_img_3;
-layout(set = 0, binding = DST_TEX_INDEX_4, rgba32f) uniform image2D dst_img_4;
-layout(set = 0, binding = DST_TEX_INDEX_5, rgba32f) uniform image2D dst_img_5;
-layout(set = 0, binding = DST_TEX_INDEX_6, r32f) uniform image2D dst_img_6;
+layout(set = 0, binding = DST_TEX_INDEX, rgba32f) uniform image2D dst_img;
 
 const int NUM_Y_SAMPLES = 200;
 const int NUM_X_SAMPLES = 400;
@@ -28,8 +22,8 @@ float sampleRayMaxTangent(vec2 sample_uv, float cur_depth, float phi) {
     float t = step_t * 0.5f;
     float max_tan_angle = -1e20f;
     for (uint i = 0; i < sample_count; i++) {
-        vec2 sample_pos = sample_uv + sample_ray * t;
-        float sample_depth = texture(src_img, sample_pos)[params.depth_channel];
+        vec2 uv = sample_uv + sample_ray * t;
+        float sample_depth = texture(src_img, uv)[params.depth_channel];
         float delta_depth = cur_depth - sample_depth;
         if (params.is_height_map == 1) {
 			delta_depth *= -1.0f;
@@ -51,10 +45,10 @@ void main()
 	// get index in global work group i.e x,y position
 	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
 
-    uint local_id = gl_LocalInvocationIndex;
+    uint local_idx = gl_LocalInvocationIndex;
     const float step_theta = PI / NUM_Y_SAMPLES;
     const float step_phi = 2.0f * PI / NUM_X_SAMPLES;
-    for (int i = int(local_id); i < NUM_Y_SAMPLES; i += 64) {
+    for (int i = int(local_idx); i < NUM_Y_SAMPLES; i += 64) {
         float theta = (i + 0.5f) * step_theta;  // From 0 to pi
 	    fillPreCalculateCoeffs(s_pre_calculate_coeffs[i], theta);
 	}
@@ -65,8 +59,12 @@ void main()
         sum_visi[s] = 0.0f;
     }
 
-    vec2 sample_uv = vec2(pixel_coords + 0.5) * params.inv_size;
-    float c_depth = texture(src_img, sample_uv)[params.depth_channel];
+    uvec2 src_pixel_coords =
+        params.block_offset + pixel_coords;
+    vec2 sample_uv =
+        vec2(src_pixel_coords + 0.5f) * params.inv_size;
+    float c_depth =
+        texture(src_img, sample_uv)[params.depth_channel];
 
     float max_tan_angles[NUM_X_SAMPLES];
     float phi = 0.0f;
@@ -101,11 +99,12 @@ void main()
     }
 
 	// output to a specific pixel in the image.
-    imageStore(dst_img_0, pixel_coords, vec4(sum_visi[0], sum_visi[1], sum_visi[2], sum_visi[3]));
-    imageStore(dst_img_1, pixel_coords, vec4(sum_visi[4], sum_visi[5], sum_visi[6], sum_visi[7]));
-    imageStore(dst_img_2, pixel_coords, vec4(sum_visi[8], sum_visi[9], sum_visi[10], sum_visi[11]));
-    imageStore(dst_img_3, pixel_coords, vec4(sum_visi[12], sum_visi[13], sum_visi[14], sum_visi[15]));
-    imageStore(dst_img_4, pixel_coords, vec4(sum_visi[16], sum_visi[17], sum_visi[18], sum_visi[19]));
-    imageStore(dst_img_5, pixel_coords, vec4(sum_visi[20], sum_visi[21], sum_visi[22], sum_visi[23]));
-    imageStore(dst_img_6, pixel_coords, vec4(sum_visi[24]));
+    ivec2 dst_pixel_coords = ivec2(pixel_coords.x * 8, pixel_coords.y);
+    imageStore(dst_img, dst_pixel_coords, vec4(sum_visi[1], sum_visi[2], sum_visi[3], sum_visi[4]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(1, 0), vec4(sum_visi[5], sum_visi[6], sum_visi[7], sum_visi[8]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(2, 0), vec4(sum_visi[9], sum_visi[10], sum_visi[11], sum_visi[12]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(3, 0), vec4(sum_visi[13], sum_visi[14], sum_visi[15], sum_visi[16]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(4, 0), vec4(sum_visi[17], sum_visi[18], sum_visi[19], sum_visi[20]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(5, 0), vec4(sum_visi[21], sum_visi[22], sum_visi[23], sum_visi[24]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(6, 0), vec4(sum_visi[0]));
 }

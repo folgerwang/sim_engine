@@ -7,13 +7,13 @@
 namespace engine {
 namespace er = engine::renderer;
 namespace {
-er::WriteDescriptorList addPrtTextures(
+er::WriteDescriptorList addGenPrtTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
-    const std::array<std::shared_ptr<er::TextureInfo>, 7>& prt_texes) {
+    const std::shared_ptr<er::TextureInfo>& prt_texes) {
     er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(8);
+    descriptor_writes.reserve(2);
 
     er::Helper::addOneTexture(
         descriptor_writes,
@@ -24,77 +24,71 @@ er::WriteDescriptorList addPrtTextures(
         src_image,
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    for (int i = 0; i < prt_texes.size(); ++i) {
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            DST_TEX_INDEX_0 + i,
-            nullptr,
-            prt_texes[i]->view,
-            er::ImageLayout::GENERAL);
-    }
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        DST_TEX_INDEX,
+        nullptr,
+        prt_texes->view,
+        er::ImageLayout::GENERAL);
 
     return descriptor_writes;
 }
 
-er::WriteDescriptorList addDsFinalPrtTextures(
+er::WriteDescriptorList addGenPrtPackInfoTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
-    const std::shared_ptr<er::Sampler>& texture_sampler,
-    const std::array<std::shared_ptr<er::TextureInfo>, 7>& src_prt_texes,
-    const std::shared_ptr<er::BufferInfo>& dst_prt_minmax_buffer) {
+    const std::shared_ptr<er::TextureInfo>& src_prt_texes,
+    const std::shared_ptr<er::TextureInfo>& dst_prt_info_texes) {
     er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(8);
+    descriptor_writes.reserve(2);
 
-    for (int i = 0; i < src_prt_texes.size(); ++i) {
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            SRC_TEX_INDEX_0 + i,
-            texture_sampler,
-            src_prt_texes[i]->view,
-            er::ImageLayout::GENERAL);
-    }
-
-    er::Helper::addOneBuffer(
+    er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
-        er::DescriptorType::STORAGE_BUFFER,
-        DST_BUFFER_INDEX,
-        dst_prt_minmax_buffer->buffer,
-        dst_prt_minmax_buffer->buffer->getSize());
+        er::DescriptorType::STORAGE_IMAGE,
+        SRC_TEX_INDEX,
+        nullptr,
+        src_prt_texes->view,
+        er::ImageLayout::GENERAL);
+
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        DST_TEX_INDEX,
+        nullptr,
+        dst_prt_info_texes->view,
+        er::ImageLayout::GENERAL);
 
     return descriptor_writes;
 }
 
 er::WriteDescriptorList addPackedPrtTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
-    const std::shared_ptr<er::Sampler>& texture_sampler,
-    const std::array<std::shared_ptr<er::TextureInfo>, 7>& src_prt_texes,
-    const std::shared_ptr<er::BufferInfo>& src_prt_minmax_buffer,
+    const std::shared_ptr<er::TextureInfo>& src_prt_texes,
+    const std::shared_ptr<er::TextureInfo>& src_prt_info_texes,
     const std::shared_ptr<er::TextureInfo>& dst_prt_tex) {
     er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(9);
+    descriptor_writes.reserve(3);
 
-    for (int i = 0; i < src_prt_texes.size(); ++i) {
-        er::Helper::addOneTexture(
-            descriptor_writes,
-            description_set,
-            er::DescriptorType::STORAGE_IMAGE,
-            SRC_TEX_INDEX_0 + i,
-            texture_sampler,
-            src_prt_texes[i]->view,
-            er::ImageLayout::GENERAL);
-    }
-
-    er::Helper::addOneBuffer(
+    er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
-        er::DescriptorType::STORAGE_BUFFER,
-        SRC_BUFFER_INDEX,
-        src_prt_minmax_buffer->buffer,
-        src_prt_minmax_buffer->buffer->getSize());
+        er::DescriptorType::STORAGE_IMAGE,
+        SRC_TEX_INDEX,
+        nullptr,
+        src_prt_texes->view,
+        er::ImageLayout::GENERAL);
+
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        SRC_INFO_TEX_INDEX,
+        nullptr,
+        src_prt_info_texes->view,
+        er::ImageLayout::GENERAL);
 
     er::Helper::addOneTexture(
         descriptor_writes,
@@ -180,6 +174,7 @@ ConemapObj::ConemapObj(
     conemap_tex_ = std::make_shared<renderer::TextureInfo>();
     prt_pack_tex_ = std::make_shared<renderer::TextureInfo>();
     minmax_depth_tex_ = std::make_shared<renderer::TextureInfo>();
+    prt_pack_info_tex_ = std::make_shared<renderer::TextureInfo>();
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -208,15 +203,19 @@ ConemapObj::ConemapObj(
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    prt_minmax_buffer_ = std::make_shared<renderer::BufferInfo>();
-    device->createBuffer(
-        sizeof(glsl::PrtMinmaxInfo),
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
-        0,
-        prt_minmax_buffer_->buffer,
-        prt_minmax_buffer_->memory);
+    glm::uvec2 pack_info_tex_size =
+        buffer_size /
+        glm::uvec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY) *
+        glm::uvec2(4);
+
+    renderer::Helper::create2DTextureImage(
+        device,
+        renderer::Format::R32G32B32A32_SFLOAT,
+        pack_info_tex_size,
+        *prt_pack_info_tex_,
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
+        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        renderer::ImageLayout::GENERAL);
 
     // create prt texture descriptor sets.
     prt_gen_tex_desc_set_ =
@@ -224,40 +223,39 @@ ConemapObj::ConemapObj(
             descriptor_pool,
             prt_gen->getPrtGenDescSetLayout(), 1)[0];
 
-    auto prt_texture_descs = addPrtTextures(
-        prt_gen_tex_desc_set_,
-        texture_sampler,
-        prt_bump_tex.view,
-        prt_gen->getPrtTextures());
+    auto prt_texture_descs =
+        addGenPrtTextures(
+            prt_gen_tex_desc_set_,
+            texture_sampler,
+            prt_bump_tex.view,
+            prt_gen->getPrtTextures());
     device->updateDescriptorSets(prt_texture_descs);
 
-    prt_ds_final_tex_desc_sets_ =
+    gen_prt_pack_info_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPrtDsFinalDescSetLayout(), 2);
+            prt_gen->getGenPrtPackInfoDescSetLayout(), 1)[0];
 
-    for (uint32_t i = 0; i < 2; i++) {
-        auto prt_ds_final_texture_descs = addDsFinalPrtTextures(
-            prt_ds_final_tex_desc_sets_[i],
-            texture_sampler,
-            prt_gen->getPrtDsTextures(i),
-            prt_minmax_buffer_);
-        device->updateDescriptorSets(prt_ds_final_texture_descs);
-    }
+    auto gen_prt_pack_info_texture_descs =
+        addGenPrtPackInfoTextures(
+            gen_prt_pack_info_tex_desc_set_,
+            prt_gen->getPrtDsTextures(),
+            prt_pack_info_tex_);
+    device->updateDescriptorSets(gen_prt_pack_info_texture_descs);
 
-    prt_pack_tex_desc_set_ =
+    pack_prt_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPrtPackDescSetLayout(), 1)[0];
+            prt_gen->getPackPrtDescSetLayout(), 1)[0];
 
-    auto prt_pack_texture_descs = addPackedPrtTextures(
-        prt_pack_tex_desc_set_,
-        texture_sampler,
-        prt_gen->getPrtTextures(),
-        prt_minmax_buffer_,
-        prt_pack_tex_);
+    auto pack_prt_texture_descs =
+        addPackedPrtTextures(
+            pack_prt_tex_desc_set_,
+            prt_gen->getPrtTextures(),
+            prt_pack_info_tex_,
+            prt_pack_tex_);
 
-    device->updateDescriptorSets(prt_pack_texture_descs);
+    device->updateDescriptorSets(pack_prt_texture_descs);
 
     gen_minmax_depth_desc_set_layout_ =
         device->createDescriptorSetLayout(
@@ -339,8 +337,8 @@ void ConemapObj::destroy(
         prt_pack_tex_->destroy(device);
     }
 
-    if (prt_minmax_buffer_) {
-        prt_minmax_buffer_->destroy(device);
+    if (prt_pack_info_tex_) {
+        prt_pack_info_tex_->destroy(device);
     }
 
     if (minmax_depth_tex_) {

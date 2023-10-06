@@ -11,7 +11,7 @@ layout(push_constant) uniform ConemapUniformBufferObject {
 #define kSampleAngleStep (2.0f * PI / 1024.0f)
 
 layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
-layout(set = 0, binding = SRC_TEX_INDEX_1, rg16f) uniform image2D minmax_depth_img;
+layout(set = 0, binding = SRC_INFO_TEX_INDEX, rg16f) uniform image2D minmax_depth_img;
 layout(set = 0, binding = DST_TEX_INDEX, rgba8) uniform image2D dst_img;
 
 float getAngle(ivec2 coords) {
@@ -32,18 +32,18 @@ float alignAngle(float input_angle, float reference_angle) {
     return result;
 }
 
+const ivec2 g_dispatch_size =
+    ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
+const ivec2 g_cache_block_size =
+    ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
+
 layout(local_size_x = kConemapGenDispatchX, local_size_y = kConemapGenDispatchY) in;
 void main()
 {
-    const ivec2 s_dispatch_size =
-        ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
-    const ivec2 s_cache_block_size =
-        ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY);
-
     ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 group_idx = ivec2(gl_WorkGroupID);
-    ivec2 group_offset = group_idx * s_dispatch_size;
-    ivec2 center_cache_block_idx = group_offset / s_cache_block_size;
+    ivec2 group_offset = group_idx * g_dispatch_size;
+    ivec2 center_cache_block_idx = group_offset / g_cache_block_size;
 
     // get index in global work group i.e x,y position
     vec2 uv = (pixel_coords.xy + 0.5f) * params.inv_size;
@@ -59,11 +59,11 @@ void main()
     }
 
     ivec2 box_corner_min = params.block_offset;
-    ivec2 box_corner_max = box_corner_min + s_cache_block_size - 1;
+    ivec2 box_corner_max = box_corner_min + g_cache_block_size - 1;
     box_corner_max = clamp(box_corner_max, ivec2(0), ivec2(params.size - 1));
 
     ivec2 close_dist_0 = max(group_offset - box_corner_max, ivec2(0));
-    ivec2 close_dist_1 = max(box_corner_min - (group_offset + s_dispatch_size), ivec2(0));
+    ivec2 close_dist_1 = max(box_corner_min - (group_offset + g_dispatch_size), ivec2(0));
     float closest_c_t = length(vec2(close_dist_0 + close_dist_1));
 
     vec2 saved_conemap_info = imageLoad(dst_img, pixel_coords).xy;
