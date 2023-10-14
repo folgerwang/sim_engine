@@ -430,7 +430,7 @@ void ConemapTest::draw(
     float y_value[25];
     static float s_theta = glm::pi<float>() / 3.0f;
     static float s_phi = glm::pi<float>() / 4.0f;
-    glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sinf(s_theta) * conemap_obj->getDepthScale(), std::cos(s_theta)));
+    glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sinf(s_theta), std::cos(s_theta) / conemap_obj->getDepthScale()));
     
     fillYVauleTablle(y_value, std::acosf(ray_2d.y), s_phi);
 
@@ -448,6 +448,7 @@ void ConemapTest::draw(
 
     params.height_scale = conemap_obj->getDepthScale() * (conemap_obj->isHeightMap() ? -1.0f : 1.0f);
     params.buffer_size = glm::vec2(buffer_size);
+    params.test_color = light_ray * 0.5f + 0.5f;
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |

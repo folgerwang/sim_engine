@@ -207,6 +207,16 @@
 #define kConemapGenBlockCacheSizeY              128
 #define kConemapGenDispatchX                    32
 #define kConemapGenDispatchY                    32
+#define kPrtShadowGenBlockCacheSizeX            kConemapGenBlockCacheSizeX
+#define kPrtShadowGenBlockCacheSizeY            kConemapGenBlockCacheSizeY
+#define kPrtShadowGenDispatchX                  kConemapGenDispatchX
+#define kPrtShadowGenDispatchY                  kConemapGenDispatchY
+#define kPrtPhiSampleCount                      400
+#define kPrtThetaSampleCount                    200
+#define kPrtShadowInitBlockRadius               1
+
+#define kPrtSampleAngleStep                     (2.0f * PI / float(kPrtPhiSampleCount))
+
 
 #define GLFW_KEY_W                  87
 #define GLFW_KEY_S                  83
@@ -264,6 +274,7 @@ struct PrtLightParams {
     float coeffs[25];
     float height_scale;
     vec2 buffer_size;
+    vec3 test_color;
 };
 
 struct IblParams {
@@ -447,20 +458,35 @@ struct ConemapGenParams {
     uint            depth_channel;
 };
 
+struct PrtShadowCacheGenParams {
+    uvec2           size;
+    vec2            inv_size;
+    ivec2           block_index;
+    ivec2           block_offset;
+    ivec2           dst_block_offset;
+    uint            is_height_map;
+    uint            depth_channel;
+    float           shadow_noise_thread;
+    float           shadow_intensity;
+};
+
 struct PrtPackParams {
     uvec2           size;
     ivec2           block_index;
     ivec2           block_offset;
+    float           range_scale;
 };
 
 struct PrtGenParams {
     uvec2           size;
     vec2            inv_size;
     uvec2           block_offset;
+    vec2            pixel_sample_size;
     float           shadow_intensity;
     float           shadow_noise_thread;
     uint            depth_channel;
     uint            is_height_map;
+    float           sample_rate;
 };
 
 struct GameObjectsUpdateParams {

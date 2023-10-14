@@ -11,26 +11,8 @@ layout(push_constant) uniform ConemapUniformBufferObject {
 #define kSampleAngleStep (2.0f * PI / 1024.0f)
 
 layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
-layout(set = 0, binding = SRC_INFO_TEX_INDEX, rg16f) uniform image2D minmax_depth_img;
+layout(set = 0, binding = SRC_INFO_TEX_INDEX, rg16f) uniform readonly image2D minmax_depth_img;
 layout(set = 0, binding = DST_TEX_INDEX, rgba8) uniform image2D dst_img;
-
-float getAngle(ivec2 coords) {
-	return atan(coords.y, coords.x == 0 ? 0.01f : coords.x);
-}
-
-float alignAngle(float input_angle, float reference_angle) {
-    float delta_angle =
-        input_angle - reference_angle;
-
-    float result = input_angle;
-    if (delta_angle > PI) {
-		result = input_angle - 2.0f * PI;
-	} else if (delta_angle < -PI) {
-		result = input_angle + 2.0f * PI;
-	}
-
-    return result;
-}
 
 const ivec2 g_dispatch_size =
     ivec2(kConemapGenDispatchX, kConemapGenDispatchY);
@@ -105,16 +87,6 @@ void main()
             vec2 ray_offset = (vec2(1.0f) - sign(abs(sample_ray))) * 1e-20;
             vec2 adj_sample_ray = sample_ray + ray_offset;
             vec2 inv_sample_ray = 1.0f / adj_sample_ray;
-
-            float adj_alpha = alpha < 0.0f ? (alpha + 2.0f * PI) : alpha;
-            float zone = adj_alpha / (0.25f * PI );
-            float ratio = fract(zone);
-            float zone_idx = clamp(floor(zone), 0.0f, 7.0f);
-            float zone_alpha_start = zone_idx * 0.25f * PI;
-            float zone_alpha_end = zone_alpha_start + 0.25f * PI;
-
-            ivec2 zone_start_offset = ivec2(round(vec2(cos(zone_alpha_start), sin(zone_alpha_start))));
-            ivec2 zone_end_offset = ivec2(round(vec2(cos(zone_alpha_end), sin(zone_alpha_end))));
 
             vec2 t = getIntersection(ray_org, inv_sample_ray, box_corner_min, box_corner_max);
             float t_range = t.y - t.x;

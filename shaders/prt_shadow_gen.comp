@@ -1,0 +1,97 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "prt_core.glsl.h"
+
+layout(push_constant) uniform PrtUniformBufferObject {
+    PrtGenParams params;
+};
+
+layout(set = 0, binding = SRC_INFO_TEX_INDEX, rgba16f) readonly uniform image2D src_shadow_cache_img;
+layout(set = 0, binding = DST_TEX_INDEX, rgba32f) uniform image2D dst_img;
+
+shared float s_sum_coeffs_by_weight[kPrtThetaSampleCount][15];
+shared float s_sum_weights[kPrtThetaSampleCount];
+
+layout(
+    local_size_x = kPrtShadowGenDispatchX,
+    local_size_y = kPrtShadowGenDispatchY) in;
+
+void main()
+{
+	// get index in global work group i.e x,y position
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+
+    uint local_idx = gl_LocalInvocationIndex;
+    const float step_theta = PI * 0.5f / kPrtThetaSampleCount;
+    const float step_phi = 2.0f * PI / kPrtPhiSampleCount;
+    if (local_idx < kPrtThetaSampleCount) {
+        float theta = (local_idx + 0.5f) * step_theta;  // From 0 to pi / 2
+        float coeffs[15];
+	    fillPreCalculateCoeffs(coeffs, theta);
+        float weight =
+            (2.0f * PI * sin(theta) / kPrtPhiSampleCount) / step_theta;
+
+        s_sum_weights[local_idx] = weight;
+        for (int i = 0; i < 15; i++) {
+			s_sum_coeffs_by_weight[local_idx][i] = coeffs[i] * weight;
+		}
+	}
+    barrier();
+
+    // calculate sum of weights and coeffs.
+    uint mask = 0xffffffff;
+    for (uint stride = 1; stride < kPrtThetaSampleCount; stride *= 2) {
+        if ((local_idx & stride) != 0 && local_idx < kPrtThetaSampleCount) {
+            uint prev_sum_idx = (local_idx & mask) - 1;
+            for (int i = 0; i < 15; i++) {
+				s_sum_coeffs_by_weight[local_idx][i] += s_sum_coeffs_by_weight[prev_sum_idx][i];
+			}
+			s_sum_weights[local_idx] += s_sum_weights[prev_sum_idx];
+        }
+        barrier();
+        mask <<= 1;
+    }
+
+    float sum_visi[25];
+    for (int s = 0; s < 25; s++) {
+        sum_visi[s] = 0.0f;
+    }
+
+    float buffer_diagonal_length = length(vec2(params.size));
+    float a = params.shadow_intensity * buffer_diagonal_length;
+
+    float phi = step_phi * 0.5f;
+    for (int i = 0; i < kPrtPhiSampleCount / 4; i++) {
+        vec4 max_tangent_angles =
+            imageLoad(src_shadow_cache_img, ivec2(pixel_coords * 10) + ivec2(i % 10, i / 10)) * a;
+
+        for (int c = 0; c < 4; c++) {
+            float reference_theta = PI * 0.5f - atan(max_tangent_angles[c]);
+            int reference_theta_idx = clamp(int(reference_theta / step_theta), 0, kPrtThetaSampleCount - 1);
+            float y_value[25];
+            fillYVauleTablle(y_value, s_sum_coeffs_by_weight[reference_theta_idx], phi);
+
+            for (int s = 0; s < 25; s++) {
+                sum_visi[s] += y_value[s];
+            }
+            phi += step_phi;
+        }
+    }
+
+    float inv_sum_weights =
+        1.0f / (s_sum_weights[kPrtThetaSampleCount-1] * kPrtPhiSampleCount);
+    for (int s = 0; s < 25; s++) {
+        sum_visi[s] = sum_visi[s] * inv_sum_weights;
+    }
+
+	// output to a specific pixel in the image.
+    ivec2 dst_pixel_coords = ivec2(pixel_coords.x * 8, pixel_coords.y);
+    imageStore(dst_img, dst_pixel_coords, vec4(sum_visi[1], sum_visi[2], sum_visi[3], sum_visi[4]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(1, 0), vec4(sum_visi[5], sum_visi[6], sum_visi[7], sum_visi[8]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(2, 0), vec4(sum_visi[9], sum_visi[10], sum_visi[11], sum_visi[12]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(3, 0), vec4(sum_visi[13], sum_visi[14], sum_visi[15], sum_visi[16]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(4, 0), vec4(sum_visi[17], sum_visi[18], sum_visi[19], sum_visi[20]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(5, 0), vec4(sum_visi[21], sum_visi[22], sum_visi[23], sum_visi[24]));
+    imageStore(dst_img, dst_pixel_coords + ivec2(6, 0), vec4(sum_visi[0]));
+}

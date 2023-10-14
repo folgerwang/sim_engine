@@ -130,6 +130,9 @@
     <None Include="shaders\pack_prt.comp" />
     <None Include="shaders\conemap_test.frag" />
     <None Include="shaders\conemap_test.vert" />
+    <None Include="shaders\prt_shadow_cache_init.comp" />
+    <None Include="shaders\prt_shadow_cache_update.comp" />
+    <None Include="shaders\prt_shadow_gen.comp" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable1.rcall" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable2.rcall" />
     <None Include="shaders\ray_tracing\callable_test\rt_callable3.rcall" />

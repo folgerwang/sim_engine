@@ -95,9 +95,9 @@ void main()
 
     if (local_idx < 7) {
         vec4 min_value =
-            s_shared_minmax[local_idx * 2][0];
+            s_shared_minmax[local_idx * 2][0] * params.range_scale;
         vec4 max_value =
-            s_shared_minmax[local_idx * 2 + 1][0];
+            s_shared_minmax[local_idx * 2 + 1][0] * params.range_scale;
         s_pack_info[local_idx * 2] =
             min_value;
         s_pack_info[local_idx * 2 + 1] =
@@ -105,8 +105,8 @@ void main()
     }
     barrier();
 
-    ivec2 dst_pixel_coords =
-        ivec2(params.block_index * 4);
+    ivec2 dst_pixel_coords = ivec2(0);
+        //ivec2(params.block_index * 4);
 
     if (local_idx < 14) {
         imageStore(

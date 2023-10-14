@@ -17,8 +17,9 @@ void main()
     ivec2 pixel_coords = ivec2(gl_GlobalInvocationID);
     uint local_idx = gl_LocalInvocationIndex;
 
-    ivec2 pack_info_offset =
-        ivec2(params.block_index * 4);
+    ivec2 pack_info_offset = ivec2(0);
+        //use global prt range info.
+        //ivec2(params.block_index * 4);
 
     if (local_idx < 14) {
         s_pack_info[local_idx] =
@@ -37,12 +38,12 @@ void main()
 		vec4 coeffs =
             imageLoad(src_img, src_pixel_coords + ivec2(i, 0));
         scaled_coeffs[i] =
-            uvec4((coeffs[i] - s_pack_info[i * 2]) / s_pack_info[i * 2 + 1] * 31.0f);
+            uvec4(clamp((coeffs[i] - s_pack_info[i * 2]) / s_pack_info[i * 2 + 1], 0.0f, 1.0f) * 31.0f);
 	}
     float coeffs =
         imageLoad(src_img, src_pixel_coords + ivec2(6, 0)).x;
     uint scaled_coeffs_6 =
-        uint((coeffs - s_pack_info[12].x) / s_pack_info[13].x * 255.0f);
+        uint(clamp((coeffs - s_pack_info[12].x) / s_pack_info[13].x, 0.0f, 1.0f) * 255.0f);
 
     uvec4 coeff_pack;
     coeff_pack.x =

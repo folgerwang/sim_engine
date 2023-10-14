@@ -1,0 +1,134 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "global_definition.glsl.h"
+#include "prt_core.glsl.h"
+
+layout(push_constant) uniform ConemapUniformBufferObject {
+    PrtShadowCacheGenParams params;
+};
+
+layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
+layout(set = 0, binding = SRC_INFO_TEX_INDEX, rg16f) uniform readonly image2D minmax_depth_img;
+layout(set = 0, binding = DST_TEX_INDEX, rgba16f) uniform image2D dst_img;
+
+const ivec2 g_dispatch_size =
+    ivec2(kPrtShadowGenDispatchX, kPrtShadowGenDispatchY);
+const ivec2 g_cache_block_size =
+    ivec2(kPrtShadowGenBlockCacheSizeX, kPrtShadowGenBlockCacheSizeY);
+
+layout(
+    local_size_x = kPrtShadowGenDispatchX,
+    local_size_y = kPrtShadowGenDispatchY) in;
+void main()
+{
+    ivec2 local_pixel_coords =
+        ivec2(gl_GlobalInvocationID.xy);
+    ivec2 global_pixel_coords =
+        params.dst_block_offset + local_pixel_coords;
+    ivec2 group_offset =
+        params.dst_block_offset + ivec2(gl_WorkGroupID) * g_dispatch_size;
+
+    // get index in global work group i.e x,y position
+    vec2 ray_org = global_pixel_coords.xy + 0.5f;
+    vec2 uv = ray_org * params.inv_size;
+    float c_depth = texture(src_img, uv)[params.depth_channel];
+
+    ivec2 box_corner_min = params.block_offset;
+    ivec2 box_corner_max = box_corner_min + g_cache_block_size - 1;
+    box_corner_max = clamp(box_corner_max, ivec2(0), ivec2(params.size - 1));
+
+    ivec2 close_dist_0 = max(group_offset - box_corner_max, ivec2(0));
+    ivec2 close_dist_1 = max(box_corner_min - (group_offset + g_dispatch_size), ivec2(0));
+    float closest_c_t = length(vec2(close_dist_0 + close_dist_1));
+
+    vec2 minmax_depth = imageLoad(minmax_depth_img, params.block_index).xy;
+
+    float delta_depth = c_depth - minmax_depth.x;
+    if (params.is_height_map == 1) {
+        delta_depth = minmax_depth.y - c_depth;
+	};
+
+    float block_tangent_angle =
+        (delta_depth - params.shadow_noise_thread) / closest_c_t;
+
+    ivec2 ray_00 = box_corner_min - global_pixel_coords;
+    ivec2 ray_11 = box_corner_max - global_pixel_coords;
+    ivec2 ray_01 = ivec2(ray_00.x, ray_11.y);
+    ivec2 ray_10 = ivec2(ray_11.x, ray_00.y);
+
+    float angle_00 = getAngle(ray_00);
+    float angle_01 = alignAngle(getAngle(ray_01), angle_00);
+    float angle_10 = alignAngle(getAngle(ray_10), angle_00);
+    float angle_11 = alignAngle(getAngle(ray_11), angle_00);
+
+    float start_angle = min(min(angle_01, angle_10), min(angle_00, angle_11));
+    float end_angle = max(max(angle_01, angle_10), max(angle_00, angle_11));
+
+    int start_angle_idx = int(start_angle / kPrtSampleAngleStep - 0.5f);
+    int end_angle_idx = int(end_angle / kPrtSampleAngleStep - 0.5f);
+
+    int start_angle_idx4 = start_angle_idx / 4;
+    int end_angle_idx4 = (end_angle_idx + 3) / 4;
+
+    float depth_delta_scale =
+        params.is_height_map == 1 ? -1.0f : 1.0f;
+
+    for (int a = start_angle_idx4; a <= end_angle_idx4; a++) {
+        int a_t = a + (a < 0 ? kPrtPhiSampleCount / 4 : 0);
+        int x_t = a_t % 10;
+        int y_t = a_t / 10;
+
+        ivec2 block_pixel_coords = local_pixel_coords * 10 + ivec2(x_t, y_t);
+        vec4 saved_tangent_angle = imageLoad(dst_img, block_pixel_coords);
+        bool need_update = false;
+        for (int c = 0; c < 4; c++) {
+            float phi = (a * 4 + c + 0.5f) * kPrtSampleAngleStep;
+            float max_tangent_angle = saved_tangent_angle[c];
+            if (phi >= start_angle &&
+                phi <= end_angle &&
+                block_tangent_angle > max_tangent_angle) {
+                vec2 sample_ray = vec2(cos(phi), sin(phi));
+                vec2 ray_offset = (vec2(1.0f) - sign(abs(sample_ray))) * 1e-20;
+                vec2 adj_sample_ray = sample_ray + ray_offset;
+                vec2 inv_sample_ray = 1.0f / adj_sample_ray;
+
+                vec2 t = getIntersection(ray_org, inv_sample_ray, box_corner_min, box_corner_max);
+                float t_range = t.y - t.x;
+
+                vec2 sample_ray_range =
+                    abs(t_range * sample_ray);
+                uint sample_count =
+                    uint(max(max(sample_ray_range.x, sample_ray_range.y), 1.0f));
+
+                float t_step = t_range / float(sample_count);
+                vec2 sample_ray_step = sample_ray * t_step;
+
+                float c_t = t.x + 0.5f * t_step;
+
+                vec2 sample_ray_uv_step = sample_ray_step * params.inv_size;
+                vec2 sample_uv = (ray_org + c_t * sample_ray) * params.inv_size;
+                for (uint ts = 0; ts < sample_count; ts++) {
+                    float sample_depth =
+                        texture(src_img, sample_uv)[params.depth_channel];
+                    float delta_depth =
+                        (c_depth - sample_depth) * depth_delta_scale;
+                    max_tangent_angle =
+                        max((delta_depth - params.shadow_noise_thread) / c_t, max_tangent_angle);
+
+                    sample_uv += sample_ray_uv_step;
+                    c_t += t_step;
+		        }
+
+                if (saved_tangent_angle[c] != max_tangent_angle) {
+                    need_update = true;
+                    saved_tangent_angle[c] = max_tangent_angle;
+				}
+            }
+        }
+
+        if (need_update) {
+			imageStore(dst_img, block_pixel_coords, saved_tangent_angle);
+		}
+    }
+}

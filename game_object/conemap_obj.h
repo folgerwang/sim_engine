@@ -15,6 +15,8 @@ class ConemapObj {
     std::shared_ptr<renderer::PipelineLayout> gen_minmax_depth_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> gen_minmax_depth_pipeline_;
 
+    std::shared_ptr<renderer::DescriptorSet> prt_shadow_cache_tex_desc_set_;
+    std::shared_ptr<renderer::DescriptorSet> prt_shadow_cache_update_tex_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> prt_gen_tex_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> gen_prt_pack_info_tex_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> pack_prt_tex_desc_set_;
@@ -71,6 +73,14 @@ public:
 
     inline const std::shared_ptr<renderer::DescriptorSet>& getPrtGenTexDescSet() {
         return prt_gen_tex_desc_set_;
+    }
+
+    inline const std::shared_ptr<renderer::DescriptorSet>& getPrtShadowCacheTexDescSet() {
+        return prt_shadow_cache_tex_desc_set_;
+    }
+
+    inline const std::shared_ptr<renderer::DescriptorSet>& getPrtShadowCacheUpdateTexDescSet() {
+        return prt_shadow_cache_update_tex_desc_set_;
     }
 
     inline const std::shared_ptr<renderer::DescriptorSet>& getGenPrtPackInfoTexDescSet() {

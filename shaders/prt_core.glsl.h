@@ -261,3 +261,22 @@ vec2 getIntersection(vec2 org, vec2 inv_ray, vec2 box_min, vec2 box_max)
 
     return t_result.x > t_result.y ? vec2(0.0f) : t_result;
 }
+
+float getAngle(ivec2 coords) {
+    return atan(coords.y, coords.x == 0 ? 0.01f : coords.x);
+}
+
+float alignAngle(float input_angle, float reference_angle) {
+    float delta_angle =
+        input_angle - reference_angle;
+
+    float result = input_angle;
+    if (delta_angle > PI) {
+        result = input_angle - 2.0f * PI;
+    }
+    else if (delta_angle < -PI) {
+        result = input_angle + 2.0f * PI;
+    }
+
+    return result;
+}

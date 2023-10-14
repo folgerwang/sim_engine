@@ -1,0 +1,98 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "prt_core.glsl.h"
+
+layout(push_constant) uniform ConemapUniformBufferObject {
+    PrtGenParams params;
+};
+
+const ivec2 g_dispatch_size =
+    ivec2(kPrtShadowGenDispatchX, kPrtShadowGenDispatchY);
+const ivec2 g_cache_block_size =
+    ivec2(kPrtShadowGenBlockCacheSizeX, kPrtShadowGenBlockCacheSizeY);
+
+layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
+layout(set = 0, binding = DST_TEX_INDEX, rgba16f) uniform image2D dst_img;
+
+layout(local_size_x = kPrtShadowGenDispatchX, local_size_y = kPrtShadowGenDispatchY) in;
+void main()
+{
+	// get index in global work group i.e x,y position
+	ivec2 local_pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 global_pixel_coords = ivec2(params.block_offset) + local_pixel_coords;
+    ivec2 group_offset =
+        ivec2(params.block_offset) + ivec2(gl_WorkGroupID) * g_dispatch_size;
+    ivec2 center_cache_block_idx =
+        group_offset / g_cache_block_size;
+
+    // load current depth value from source image
+    vec2 ray_org = global_pixel_coords.xy + 0.5f;
+    vec2 uv = ray_org * params.inv_size;
+    float c_depth = texture(src_img, uv)[params.depth_channel];
+
+
+    // 3x3 cache block.
+    ivec2 box_corner_min =
+        (center_cache_block_idx - kPrtShadowInitBlockRadius) *
+        g_cache_block_size;
+    ivec2 box_corner_max =
+        box_corner_min +
+        g_cache_block_size * (kPrtShadowInitBlockRadius * 2 + 1) - 1;
+    box_corner_min = clamp(box_corner_min, ivec2(0), ivec2(params.size - 1));
+    box_corner_max = clamp(box_corner_max, ivec2(0), ivec2(params.size - 1));
+
+    vec4 best_inv_cone_ratio = vec4(0.0f);
+
+    float depth_delta_scale =
+        params.is_height_map == 1 ? -1.0f : 1.0f;
+
+    // phi start as half sample.
+    float phi = 0.5f * kPrtSampleAngleStep;
+    // go through all sample rays.
+    for (uint r = 0; r < kPrtPhiSampleCount / 4; r++) {
+        vec4 sample_ray_tangent = vec4(0);
+        for (uint c = 0; c < 4; c++) {
+            vec2 sample_ray = vec2(cos(phi), sin(phi));
+            vec2 ray_offset = (vec2(1.0f) - sign(abs(sample_ray))) * 1e-20;
+            vec2 adj_sample_ray = sample_ray + ray_offset;
+            vec2 inv_sample_ray = 1.0f / adj_sample_ray;
+
+            vec2 t = getIntersection(ray_org, inv_sample_ray, box_corner_min, box_corner_max);
+            float t_range = t.y - t.x;
+
+            // more than half pixel, do sampling.
+            if (t_range > 0.5f) {
+                vec2 sample_ray_range = abs(t_range * sample_ray);
+                uint sample_count = uint(max(max(sample_ray_range.x, sample_ray_range.y), 1.0f));
+
+                float t_step = t_range / float(sample_count);
+                vec2 sample_ray_step = sample_ray * t_step;
+
+                float c_t = t.x + 0.5f * t_step;
+
+                float max_tangent_angle = -1e20f;
+                vec2 sample_ray_uv_step = sample_ray_step * params.inv_size;
+                vec2 sample_uv = (ray_org + c_t * sample_ray) * params.inv_size;
+                for (uint ts = 0; ts < sample_count; ts++) {
+                    float sample_depth = texture(src_img, sample_uv)[params.depth_channel];
+                    float delta_depth = (c_depth - sample_depth) * depth_delta_scale;
+                    max_tangent_angle = max((delta_depth - params.shadow_noise_thread) / c_t, max_tangent_angle);
+
+                    sample_uv += sample_ray_uv_step;
+                    c_t += t_step;
+		        }
+
+                sample_ray_tangent[c] = max_tangent_angle;
+            }
+
+            // move to next ray.
+            phi += kPrtSampleAngleStep;
+        }
+        uint x = r % 10;
+        uint y = r / 10;
+
+	    // output to a specific pixel in the image.
+	    imageStore(dst_img, local_pixel_coords * 10 + ivec2(x, y), sample_ray_tangent);
+    }
+}

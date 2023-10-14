@@ -152,10 +152,10 @@ void main() {
     ivec2 pixel_coords =
         ivec2(clamp(ps_in_data.vertex_tex_coord.xy, 0.0f, 1.0f) * (params.buffer_size - 1));
 
-    ivec2 pack_info_pixel_coords =
-        pixel_coords /
+    ivec2 pack_info_pixel_coords = ivec2(0);
+/*        pixel_coords /
         ivec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY) *
-        ivec2(4);
+        ivec2(4);*/
 
     uvec4 prt_packed_info =
         imageLoad(src_prt_pack_img, pixel_coords);
@@ -253,5 +253,5 @@ void main() {
 
 
     //outColor = vec4(color.xyz * vec3(sum_visi) * sqrt(4.0f * PI) * 2.0f, 1.0f);
-    outColor = vec4(toneMap(material, color), 1.0f);
+    outColor = vec4(vec3(sum_visi)/*toneMap(material, color)*/, 1.0f);
 }

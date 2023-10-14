@@ -487,5 +487,14 @@
     <None Include="shaders\gen_minmax_depth.comp">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\prt_shadow_cache_init.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\prt_shadow_cache_update.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\prt_shadow_gen.comp">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

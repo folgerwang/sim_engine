@@ -7,11 +7,11 @@
 namespace engine {
 namespace er = engine::renderer;
 namespace {
-er::WriteDescriptorList addGenPrtTextures(
+er::WriteDescriptorList addPrtRelatedTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
-    const std::shared_ptr<er::TextureInfo>& prt_texes) {
+    const std::shared_ptr<er::TextureInfo>& dst_texes) {
     er::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(2);
 
@@ -30,7 +30,47 @@ er::WriteDescriptorList addGenPrtTextures(
         er::DescriptorType::STORAGE_IMAGE,
         DST_TEX_INDEX,
         nullptr,
-        prt_texes->view,
+        dst_texes->view,
+        er::ImageLayout::GENERAL);
+
+    return descriptor_writes;
+}
+
+er::WriteDescriptorList addPrtShadowCacheUpdateTextures(
+    const std::shared_ptr<er::DescriptorSet>& description_set,
+    const std::shared_ptr<er::Sampler>& texture_sampler,
+    const std::shared_ptr<er::ImageView>& src_image,
+    const std::shared_ptr<er::TextureInfo>& minmax_depth,
+    const std::shared_ptr<er::TextureInfo>& dst_texes) {
+    er::WriteDescriptorList descriptor_writes;
+    descriptor_writes.reserve(3);
+
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        SRC_TEX_INDEX,
+        texture_sampler,
+        src_image,
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // minmax depth texture.
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        SRC_INFO_TEX_INDEX,
+        nullptr,
+        minmax_depth->view,
+        er::ImageLayout::GENERAL);
+
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::STORAGE_IMAGE,
+        DST_TEX_INDEX,
+        nullptr,
+        dst_texes->view,
         er::ImageLayout::GENERAL);
 
     return descriptor_writes;
@@ -224,12 +264,39 @@ ConemapObj::ConemapObj(
             prt_gen->getPrtGenDescSetLayout(), 1)[0];
 
     auto prt_texture_descs =
-        addGenPrtTextures(
+        addPrtRelatedTextures(
             prt_gen_tex_desc_set_,
             texture_sampler,
             prt_bump_tex.view,
             prt_gen->getPrtTextures());
     device->updateDescriptorSets(prt_texture_descs);
+
+    prt_shadow_cache_tex_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            prt_gen->getPrtShadowCacheDescSetLayout(), 1)[0];
+
+    auto prt_shadow_cache_texture_descs =
+        addPrtRelatedTextures(
+            prt_shadow_cache_tex_desc_set_,
+            texture_sampler,
+            prt_bump_tex.view,
+            prt_gen->getPrtShadowCacheTextures());
+    device->updateDescriptorSets(prt_shadow_cache_texture_descs);
+
+    prt_shadow_cache_update_tex_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            prt_gen->getPrtShadowCacheUpdateDescSetLayout(), 1)[0];
+
+    auto prt_shadow_cache_update_texture_descs =
+        addPrtShadowCacheUpdateTextures(
+            prt_shadow_cache_update_tex_desc_set_,
+            texture_sampler,
+            prt_bump_tex.view,
+            minmax_depth_tex_,
+            prt_gen->getPrtShadowCacheTextures());
+    device->updateDescriptorSets(prt_shadow_cache_update_texture_descs);
 
     gen_prt_pack_info_tex_desc_set_ =
         device->createDescriptorSets(
