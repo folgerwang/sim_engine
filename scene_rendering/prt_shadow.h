@@ -10,7 +10,7 @@ namespace engine {
     }
     namespace scene_rendering {
 
-        class Prt {
+        class PrtShadow {
             const uint32_t s_max_prt_buffer_size = 4096;
 
             std::shared_ptr<renderer::DescriptorSetLayout> prt_shadow_cache_desc_set_layout_;
@@ -42,7 +42,7 @@ namespace engine {
             std::shared_ptr<renderer::TextureInfo> prt_shadow_cache_texes_;
 
         public:
-            Prt(
+            PrtShadow(
                 const std::shared_ptr<renderer::Device>& device,
                 const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
                 const std::shared_ptr<renderer::Sampler>& texture_sampler);

@@ -42,7 +42,7 @@
     <ClCompile Include="scene_rendering\conemap.cpp" />
     <ClCompile Include="scene_rendering\ibl_creator.cpp" />
     <ClCompile Include="scene_rendering\menu.cpp" />
-    <ClCompile Include="scene_rendering\prt.cpp" />
+    <ClCompile Include="scene_rendering\prt_shadow.cpp" />
     <ClCompile Include="scene_rendering\skydome.cpp" />
     <ClCompile Include="scene_rendering\view_capture.cpp" />
     <ClCompile Include="scene_rendering\volume_cloud.cpp" />
@@ -80,7 +80,7 @@
     <ClInclude Include="scene_rendering\conemap.h" />
     <ClInclude Include="scene_rendering\ibl_creator.h" />
     <ClInclude Include="scene_rendering\menu.h" />
-    <ClInclude Include="scene_rendering\prt.h" />
+    <ClInclude Include="scene_rendering\prt_shadow.h" />
     <ClInclude Include="scene_rendering\skydome.h" />
     <ClInclude Include="scene_rendering\view_capture.h" />
     <ClInclude Include="scene_rendering\volume_cloud.h" />

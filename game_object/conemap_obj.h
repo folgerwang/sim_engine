@@ -1,11 +1,11 @@
 #pragma once
 #include "renderer/renderer.h"
 #include "plane.h"
-#include "scene_rendering/prt.h"
+#include "scene_rendering/prt_shadow.h"
 
 namespace engine {
 namespace scene_rendering {
-    class Prt;
+    class PrtShadow;
 }
 namespace game_object {
 
@@ -37,7 +37,7 @@ public:
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& prt_bump_tex,
-        const std::shared_ptr<scene_rendering::Prt>& prt_gen,
+        const std::shared_ptr<scene_rendering::PrtShadow>& prt_shadow_gen,
         uint32_t depth_channel,
         bool is_height_depth,
         float depth_scale,

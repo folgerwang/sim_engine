@@ -2,7 +2,7 @@
 #include "renderer/renderer_helper.h"
 #include "engine_helper.h"
 #include "shaders/global_definition.glsl.h"
-#include "prt.h"
+#include "prt_shadow.h"
 
 namespace {
     namespace er = engine::renderer;
@@ -122,7 +122,7 @@ namespace {
 namespace engine {
 namespace scene_rendering {
 
-Prt::Prt(
+PrtShadow::PrtShadow(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler) {
@@ -380,7 +380,7 @@ Prt::Prt(
             "pack_prt_comp.spv");
 }
 
-void Prt::update(
+void PrtShadow::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
 
@@ -704,7 +704,7 @@ void Prt::update(
     }
 }
 
-void Prt::destroy(
+void PrtShadow::destroy(
     const std::shared_ptr<renderer::Device>& device) {
 
     if (prt_texes_) {

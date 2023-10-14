@@ -147,7 +147,7 @@
     <ClCompile Include="scene_rendering\conemap.cpp">
       <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
-    <ClCompile Include="scene_rendering\prt.cpp">
+    <ClCompile Include="scene_rendering\prt_shadow.cpp">
       <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
     <ClCompile Include="game_object\conemap_obj.cpp">
@@ -296,7 +296,7 @@
     <ClInclude Include="scene_rendering\conemap.h">
       <Filter>Header Files\engine\scene_rendering</Filter>
     </ClInclude>
-    <ClInclude Include="scene_rendering\prt.h">
+    <ClInclude Include="scene_rendering\prt_shadow.h">
       <Filter>Header Files\engine\scene_rendering</Filter>
     </ClInclude>
     <ClInclude Include="shaders\prt_core.glsl.h">

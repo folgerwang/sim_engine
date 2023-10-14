@@ -195,7 +195,7 @@ ConemapObj::ConemapObj(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& prt_bump_tex,
-    const std::shared_ptr<scene_rendering::Prt>& prt_gen,
+    const std::shared_ptr<scene_rendering::PrtShadow>& prt_shadowgen,
     uint32_t depth_channel,
     bool is_height_map,
     float depth_scale,
@@ -261,33 +261,33 @@ ConemapObj::ConemapObj(
     prt_shadow_gen_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPrtShadowGenDescSetLayout(), 1)[0];
+            prt_shadowgen->getPrtShadowGenDescSetLayout(), 1)[0];
 
     auto prt_shadow_gen_texture_descs =
         addPrtRelatedTextures(
             prt_shadow_gen_tex_desc_set_,
             texture_sampler,
             prt_bump_tex.view,
-            prt_gen->getPrtTextures());
+            prt_shadowgen->getPrtTextures());
     device->updateDescriptorSets(prt_shadow_gen_texture_descs);
 
     prt_shadow_cache_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPrtShadowCacheDescSetLayout(), 1)[0];
+            prt_shadowgen->getPrtShadowCacheDescSetLayout(), 1)[0];
 
     auto prt_shadow_cache_texture_descs =
         addPrtRelatedTextures(
             prt_shadow_cache_tex_desc_set_,
             texture_sampler,
             prt_bump_tex.view,
-            prt_gen->getPrtShadowCacheTextures());
+            prt_shadowgen->getPrtShadowCacheTextures());
     device->updateDescriptorSets(prt_shadow_cache_texture_descs);
 
     prt_shadow_cache_update_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPrtShadowCacheUpdateDescSetLayout(), 1)[0];
+            prt_shadowgen->getPrtShadowCacheUpdateDescSetLayout(), 1)[0];
 
     auto prt_shadow_cache_update_texture_descs =
         addPrtShadowCacheUpdateTextures(
@@ -295,30 +295,30 @@ ConemapObj::ConemapObj(
             texture_sampler,
             prt_bump_tex.view,
             minmax_depth_tex_,
-            prt_gen->getPrtShadowCacheTextures());
+            prt_shadowgen->getPrtShadowCacheTextures());
     device->updateDescriptorSets(prt_shadow_cache_update_texture_descs);
 
     gen_prt_pack_info_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getGenPrtPackInfoDescSetLayout(), 1)[0];
+            prt_shadowgen->getGenPrtPackInfoDescSetLayout(), 1)[0];
 
     auto gen_prt_pack_info_texture_descs =
         addGenPrtPackInfoTextures(
             gen_prt_pack_info_tex_desc_set_,
-            prt_gen->getPrtDsTextures(),
+            prt_shadowgen->getPrtDsTextures(),
             prt_pack_info_tex_);
     device->updateDescriptorSets(gen_prt_pack_info_texture_descs);
 
     pack_prt_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPackPrtDescSetLayout(), 1)[0];
+            prt_shadowgen->getPackPrtDescSetLayout(), 1)[0];
 
     auto pack_prt_texture_descs =
         addPackedPrtTextures(
             pack_prt_tex_desc_set_,
-            prt_gen->getPrtTextures(),
+            prt_shadowgen->getPrtTextures(),
             prt_pack_info_tex_,
             prt_pack_tex_);
 
