@@ -213,7 +213,7 @@
 #define kPrtShadowGenDispatchY                  kConemapGenDispatchY
 #define kPrtPhiSampleCount                      400
 #define kPrtThetaSampleCount                    200
-#define kPrtShadowInitBlockRadius               1
+#define kPrtShadowInitBlockRadius               2
 
 #define kPrtSampleAngleStep                     (2.0f * PI / float(kPrtPhiSampleCount))
 

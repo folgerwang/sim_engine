@@ -17,7 +17,7 @@ class ConemapObj {
 
     std::shared_ptr<renderer::DescriptorSet> prt_shadow_cache_tex_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> prt_shadow_cache_update_tex_desc_set_;
-    std::shared_ptr<renderer::DescriptorSet> prt_gen_tex_desc_set_;
+    std::shared_ptr<renderer::DescriptorSet> prt_shadow_gen_tex_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> gen_prt_pack_info_tex_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> pack_prt_tex_desc_set_;
     std::shared_ptr<renderer::TextureInfo> conemap_tex_;
@@ -71,8 +71,8 @@ public:
         return depth_channel_;
     }
 
-    inline const std::shared_ptr<renderer::DescriptorSet>& getPrtGenTexDescSet() {
-        return prt_gen_tex_desc_set_;
+    inline const std::shared_ptr<renderer::DescriptorSet>& getPrtShadowGenTexDescSet() {
+        return prt_shadow_gen_tex_desc_set_;
     }
 
     inline const std::shared_ptr<renderer::DescriptorSet>& getPrtShadowCacheTexDescSet() {

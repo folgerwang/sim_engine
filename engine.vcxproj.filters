@@ -460,7 +460,7 @@
     <None Include="shaders\weather\temperature_init.comp">
       <Filter>Resource Files\weather</Filter>
     </None>
-    <None Include="shaders\prt_gen.comp">
+    <None Include="shaders\prt_shadow_gen.comp">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\conemap_gen.comp">
@@ -472,7 +472,7 @@
     <None Include="shaders\conemap_test.vert">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="shaders\prt_minmax_ds_s.comp">
+    <None Include="shaders\prt_minmax_ds.comp">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\gen_prt_pack_info.comp">
@@ -493,7 +493,7 @@
     <None Include="shaders\prt_shadow_cache_update.comp">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="shaders\prt_shadow_gen.comp">
+    <None Include="shaders\prt_shadow_gen_with_cache.comp">
       <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>

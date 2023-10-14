@@ -258,18 +258,18 @@ ConemapObj::ConemapObj(
         renderer::ImageLayout::GENERAL);
 
     // create prt texture descriptor sets.
-    prt_gen_tex_desc_set_ =
+    prt_shadow_gen_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_gen->getPrtGenDescSetLayout(), 1)[0];
+            prt_gen->getPrtShadowGenDescSetLayout(), 1)[0];
 
-    auto prt_texture_descs =
+    auto prt_shadow_gen_texture_descs =
         addPrtRelatedTextures(
-            prt_gen_tex_desc_set_,
+            prt_shadow_gen_tex_desc_set_,
             texture_sampler,
             prt_bump_tex.view,
             prt_gen->getPrtTextures());
-    device->updateDescriptorSets(prt_texture_descs);
+    device->updateDescriptorSets(prt_shadow_gen_texture_descs);
 
     prt_shadow_cache_tex_desc_set_ =
         device->createDescriptorSets(

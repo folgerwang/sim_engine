@@ -7,21 +7,40 @@ layout(push_constant) uniform PrtUniformBufferObject {
     PrtGenParams params;
 };
 
-layout(set = 0, binding = SRC_INFO_TEX_INDEX, rgba16f) readonly uniform image2D src_shadow_cache_img;
+layout(set = 0, binding = SRC_TEX_INDEX) uniform sampler2D src_img;
 layout(set = 0, binding = DST_TEX_INDEX, rgba32f) uniform image2D dst_img;
 
-shared float s_sum_coeffs_by_weight[kPrtThetaSampleCount][15];
-shared float s_sum_weights[kPrtThetaSampleCount];
+shared float s_coeffs_by_weight[kPrtThetaSampleCount][15];
+shared float s_weights[kPrtThetaSampleCount];
 
-layout(
-    local_size_x = kPrtShadowGenDispatchX,
-    local_size_y = kPrtShadowGenDispatchY) in;
+float sampleRayMaxTangent(vec2 sample_uv, float cur_depth, float phi) {
+    vec2 sample_ray = vec2(cos(phi), sin(phi));
+    float max_t = getIntersection(sample_uv * 2.0f - 1.0f, sample_ray) * 0.5f;
+    uint sample_count =
+        max(uint(max_t * params.sample_rate * max(params.size.x, params.size.y)), 1);
+    float step_t = max_t / sample_count;
+    float t = step_t * 0.5f;
+    float max_tan_angle = -1e20f;
+    for (uint i = 0; i < sample_count; i++) {
+        vec2 uv = sample_uv + sample_ray * t;
+        float sample_depth = texture(src_img, uv)[params.depth_channel];
+        float delta_depth = cur_depth - sample_depth;
+        if (params.is_height_map == 1) {
+			delta_depth *= -1.0f;
+		};
 
+        delta_depth -= params.shadow_noise_thread; // get rid of shadow noise due to heightmap noise.
+
+        max_tan_angle = max(delta_depth * params.shadow_intensity / t, max_tan_angle);
+        t += step_t;
+    }
+
+    return max_tan_angle;
+}
+
+layout(local_size_x = 32, local_size_y = 32) in;
 void main()
 {
-	// get index in global work group i.e x,y position
-	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
-
     uint local_idx = gl_LocalInvocationIndex;
     const float step_theta = PI * 0.5f / kPrtThetaSampleCount;
     const float step_phi = 2.0f * PI / kPrtPhiSampleCount;
@@ -32,9 +51,9 @@ void main()
         float weight =
             (2.0f * PI * sin(theta) / kPrtPhiSampleCount) / step_theta;
 
-        s_sum_weights[local_idx] = weight;
+        s_weights[local_idx] = weight;
         for (int i = 0; i < 15; i++) {
-			s_sum_coeffs_by_weight[local_idx][i] = coeffs[i] * weight;
+			s_coeffs_by_weight[local_idx][i] = coeffs[i] * weight;
 		}
 	}
     barrier();
@@ -45,9 +64,9 @@ void main()
         if ((local_idx & stride) != 0 && local_idx < kPrtThetaSampleCount) {
             uint prev_sum_idx = (local_idx & mask) - 1;
             for (int i = 0; i < 15; i++) {
-				s_sum_coeffs_by_weight[local_idx][i] += s_sum_coeffs_by_weight[prev_sum_idx][i];
+				s_coeffs_by_weight[local_idx][i] += s_coeffs_by_weight[prev_sum_idx][i];
 			}
-			s_sum_weights[local_idx] += s_sum_weights[prev_sum_idx];
+			s_weights[local_idx] += s_weights[prev_sum_idx];
         }
         barrier();
         mask <<= 1;
@@ -58,29 +77,32 @@ void main()
         sum_visi[s] = 0.0f;
     }
 
-    float buffer_diagonal_length = length(vec2(params.size));
-    float a = params.shadow_intensity * buffer_diagonal_length;
+	// get index in global work group i.e x,y position
+	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
 
-    float phi = step_phi * 0.5f;
-    for (int i = 0; i < kPrtPhiSampleCount / 4; i++) {
-        vec4 max_tangent_angles =
-            imageLoad(src_shadow_cache_img, ivec2(pixel_coords * 10) + ivec2(i % 10, i / 10)) * a;
+    uvec2 src_pixel_coords =
+        params.block_offset + uvec2((pixel_coords + 0.5f) * params.pixel_sample_size);
+    vec2 sample_uv =
+        vec2(src_pixel_coords + 0.5f) * params.inv_size;
+    float c_depth =
+        texture(src_img, sample_uv)[params.depth_channel];
 
-        for (int c = 0; c < 4; c++) {
-            float reference_theta = PI * 0.5f - atan(max_tangent_angles[c]);
-            int reference_theta_idx = clamp(int(reference_theta / step_theta), 0, kPrtThetaSampleCount - 1);
-            float y_value[25];
-            fillYVauleTablle(y_value, s_sum_coeffs_by_weight[reference_theta_idx], phi);
+    float phi = 0.0f;
+    for (int i = 0; i < kPrtPhiSampleCount; i++) {
+        float max_tangent_angle = sampleRayMaxTangent(sample_uv, c_depth, phi);
+        float reference_theta = PI * 0.5f - atan(max_tangent_angle);
+        int reference_theta_idx = min(int(reference_theta / step_theta), kPrtThetaSampleCount - 1);
+        float y_value[25];
+        fillYVauleTablle(y_value, s_coeffs_by_weight[reference_theta_idx], phi);
 
-            for (int s = 0; s < 25; s++) {
-                sum_visi[s] += y_value[s];
-            }
-            phi += step_phi;
+        for (int s = 0; s < 25; s++) {
+            sum_visi[s] += y_value[s];
         }
+        phi += step_phi;
     }
 
     float inv_sum_weights =
-        1.0f / (s_sum_weights[kPrtThetaSampleCount-1] * kPrtPhiSampleCount);
+        1.0f / (s_weights[kPrtThetaSampleCount-1] * kPrtPhiSampleCount);
     for (int s = 0; s < 25; s++) {
         sum_visi[s] = sum_visi[s] * inv_sum_weights;
     }

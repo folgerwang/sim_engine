@@ -15,8 +15,8 @@ namespace engine {
 
             std::shared_ptr<renderer::DescriptorSetLayout> prt_shadow_cache_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> prt_shadow_cache_update_desc_set_layout_;
+            std::shared_ptr<renderer::DescriptorSetLayout> prt_shadow_gen_with_cache_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> prt_shadow_gen_desc_set_layout_;
-            std::shared_ptr<renderer::DescriptorSetLayout> prt_gen_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> prt_ds_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> gen_prt_pack_info_desc_set_layout_;
             std::shared_ptr<renderer::DescriptorSetLayout> pack_prt_desc_set_layout_;
@@ -24,17 +24,17 @@ namespace engine {
             std::shared_ptr<renderer::Pipeline> prt_shadow_cache_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> prt_shadow_cache_update_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_shadow_cache_update_pipeline_;
+            std::shared_ptr<renderer::PipelineLayout> prt_shadow_gen_with_cache_pipeline_layout_;
+            std::shared_ptr<renderer::Pipeline> prt_shadow_gen_with_cache_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> prt_shadow_gen_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_shadow_gen_pipeline_;
-            std::shared_ptr<renderer::PipelineLayout> prt_gen_pipeline_layout_;
-            std::shared_ptr<renderer::Pipeline> prt_gen_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> prt_ds_first_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> prt_ds_first_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> gen_prt_pack_info_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> gen_prt_pack_info_pipeline_;
             std::shared_ptr<renderer::PipelineLayout> pack_prt_pipeline_layout_;
             std::shared_ptr<renderer::Pipeline> pack_prt_pipeline_;
-            std::shared_ptr<renderer::DescriptorSet> prt_shadow_gen_tex_desc_set_;
+            std::shared_ptr<renderer::DescriptorSet> prt_shadow_gen_with_cache_tex_desc_set_;
             std::shared_ptr<renderer::DescriptorSet> prt_ds_tex_desc_set_;
 
             std::shared_ptr<renderer::TextureInfo> prt_texes_;
@@ -63,8 +63,8 @@ namespace engine {
                 return prt_shadow_cache_texes_;
             }
 
-            inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPrtGenDescSetLayout() {
-                return prt_gen_desc_set_layout_;
+            inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPrtShadowGenDescSetLayout() {
+                return prt_shadow_gen_desc_set_layout_;
             }
 
             inline const std::shared_ptr<renderer::DescriptorSetLayout>& getPrtShadowCacheDescSetLayout() {

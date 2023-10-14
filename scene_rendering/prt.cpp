@@ -68,7 +68,7 @@ namespace {
     }
 
     std::shared_ptr<er::PipelineLayout>
-        createPrtGenPipelineLayout(
+        createPrtShadowGenPipelineLayout(
             const std::shared_ptr<er::Device>& device,
             const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
         er::PushConstantRange push_const_range{};
@@ -168,46 +168,46 @@ Prt::Prt(
         renderer::ImageLayout::GENERAL);
 
     // create a prt shadow texture descriptor set layout.
-    std::vector<renderer::DescriptorSetLayoutBinding> prt_shadow_gen_bindings;
-    prt_shadow_gen_bindings.reserve(2);
-    prt_shadow_gen_bindings.push_back(
+    std::vector<renderer::DescriptorSetLayoutBinding> prt_shadow_gen_with_cache_bindings;
+    prt_shadow_gen_with_cache_bindings.reserve(2);
+    prt_shadow_gen_with_cache_bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             SRC_INFO_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_IMAGE));
 
-    prt_shadow_gen_bindings.push_back(
+    prt_shadow_gen_with_cache_bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             DST_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_IMAGE));
 
-    prt_shadow_gen_desc_set_layout_ =
-        device->createDescriptorSetLayout(prt_shadow_gen_bindings);
+    prt_shadow_gen_with_cache_desc_set_layout_ =
+        device->createDescriptorSetLayout(prt_shadow_gen_with_cache_bindings);
 
     // create prt texture descriptor sets.
-    prt_shadow_gen_tex_desc_set_ =
+    prt_shadow_gen_with_cache_tex_desc_set_ =
         device->createDescriptorSets(
             descriptor_pool,
-            prt_shadow_gen_desc_set_layout_, 1)[0];
+            prt_shadow_gen_with_cache_desc_set_layout_, 1)[0];
 
-    auto prt_shadow_gen_texture_descs =
+    auto prt_shadow_gen_with_cache_texture_descs =
         addPrtShadowGenTextures(
-            prt_shadow_gen_tex_desc_set_,
+            prt_shadow_gen_with_cache_tex_desc_set_,
             prt_shadow_cache_texes_,
             prt_texes_);
-    device->updateDescriptorSets(prt_shadow_gen_texture_descs);
+    device->updateDescriptorSets(prt_shadow_gen_with_cache_texture_descs);
 
-    prt_shadow_gen_pipeline_layout_ =
-        createPrtGenPipelineLayout(
+    prt_shadow_gen_with_cache_pipeline_layout_ =
+        createPrtShadowGenPipelineLayout(
             device,
-            prt_shadow_gen_desc_set_layout_);
+            prt_shadow_gen_with_cache_desc_set_layout_);
 
-    prt_shadow_gen_pipeline_ =
+    prt_shadow_gen_with_cache_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
-            prt_shadow_gen_pipeline_layout_,
-            "prt_shadow_gen_comp.spv");
+            prt_shadow_gen_with_cache_pipeline_layout_,
+            "prt_shadow_gen_with_cache_comp.spv");
 
 
     // create a prt shadow generating texture descriptor set layout.
@@ -225,25 +225,25 @@ Prt::Prt(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_IMAGE));
 
-    prt_gen_desc_set_layout_ =
+    prt_shadow_gen_desc_set_layout_ =
         device->createDescriptorSetLayout(bindings);
 
-    prt_gen_pipeline_layout_ =
-        createPrtGenPipelineLayout(
+    prt_shadow_gen_pipeline_layout_ =
+        createPrtShadowGenPipelineLayout(
             device,
-            prt_gen_desc_set_layout_);
+            prt_shadow_gen_desc_set_layout_);
 
-    prt_gen_pipeline_ =
+    prt_shadow_gen_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
-            prt_gen_pipeline_layout_,
-            "prt_gen_comp.spv");
+            prt_shadow_gen_pipeline_layout_,
+            "prt_shadow_gen_comp.spv");
 
     prt_shadow_cache_desc_set_layout_ =
         device->createDescriptorSetLayout(bindings);
 
     prt_shadow_cache_pipeline_layout_ =
-        createPrtGenPipelineLayout(
+        createPrtShadowGenPipelineLayout(
             device,
             prt_shadow_cache_desc_set_layout_);
 
@@ -327,7 +327,7 @@ Prt::Prt(
         renderer::helper::createComputePipeline(
             device,
             prt_ds_first_pipeline_layout_,
-            "prt_minmax_ds_s_comp.spv");
+            "prt_minmax_ds_comp.spv");
 
     // create a global ibl texture descriptor set layout.
     gen_prt_pack_info_desc_set_layout_ =
@@ -395,7 +395,7 @@ void Prt::update(
 
         cmd_buf->bindPipeline(
             renderer::PipelineBindPoint::COMPUTE,
-            prt_gen_pipeline_);
+            prt_shadow_gen_pipeline_);
         glsl::PrtGenParams params = {};
         params.size = src_size;
         params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
@@ -410,14 +410,14 @@ void Prt::update(
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            prt_gen_pipeline_layout_,
+            prt_shadow_gen_pipeline_layout_,
             &params,
             sizeof(params));
 
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
-            prt_gen_pipeline_layout_,
-            { conemap_obj->getPrtGenTexDescSet() });
+            prt_shadow_gen_pipeline_layout_,
+            { conemap_obj->getPrtShadowGenTexDescSet() });
 
         cmd_buf->dispatch(
             (g_block_size.x + 31) / 32,
@@ -632,7 +632,7 @@ void Prt::update(
 
             cmd_buf->bindPipeline(
                 renderer::PipelineBindPoint::COMPUTE,
-                prt_shadow_gen_pipeline_);
+                prt_shadow_gen_with_cache_pipeline_);
             glsl::PrtGenParams params = {};
             params.size = src_size;
             params.inv_size = glm::vec2(1.0f / params.size.x, 1.0f / params.size.y);
@@ -645,14 +645,14 @@ void Prt::update(
 
             cmd_buf->pushConstants(
                 SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                prt_shadow_gen_pipeline_layout_,
+                prt_shadow_gen_with_cache_pipeline_layout_,
                 &params,
                 sizeof(params));
 
             cmd_buf->bindDescriptorSets(
                 renderer::PipelineBindPoint::COMPUTE,
-                prt_shadow_gen_pipeline_layout_,
-                { prt_shadow_gen_tex_desc_set_ });
+                prt_shadow_gen_with_cache_pipeline_layout_,
+                { prt_shadow_gen_with_cache_tex_desc_set_ });
 
             cmd_buf->dispatch(
                 (g_block_size.x + kPrtShadowGenDispatchX - 1) / kPrtShadowGenDispatchX,
@@ -719,18 +719,18 @@ void Prt::destroy(
         prt_shadow_cache_texes_->destroy(device);
     }
 
-    device->destroyDescriptorSetLayout(prt_shadow_gen_desc_set_layout_);
-    device->destroyPipelineLayout(prt_shadow_gen_pipeline_layout_);
-    device->destroyPipeline(prt_shadow_gen_pipeline_);
+    device->destroyDescriptorSetLayout(prt_shadow_gen_with_cache_desc_set_layout_);
+    device->destroyPipelineLayout(prt_shadow_gen_with_cache_pipeline_layout_);
+    device->destroyPipeline(prt_shadow_gen_with_cache_pipeline_);
     device->destroyDescriptorSetLayout(prt_shadow_cache_desc_set_layout_);
     device->destroyPipelineLayout(prt_shadow_cache_pipeline_layout_);
     device->destroyPipeline(prt_shadow_cache_pipeline_);
     device->destroyDescriptorSetLayout(prt_shadow_cache_update_desc_set_layout_);
     device->destroyPipelineLayout(prt_shadow_cache_update_pipeline_layout_);
     device->destroyPipeline(prt_shadow_cache_update_pipeline_);
-    device->destroyDescriptorSetLayout(prt_gen_desc_set_layout_);
-    device->destroyPipelineLayout(prt_gen_pipeline_layout_);
-    device->destroyPipeline(prt_gen_pipeline_);
+    device->destroyDescriptorSetLayout(prt_shadow_gen_desc_set_layout_);
+    device->destroyPipelineLayout(prt_shadow_gen_pipeline_layout_);
+    device->destroyPipeline(prt_shadow_gen_pipeline_);
 
     device->destroyDescriptorSetLayout(prt_ds_desc_set_layout_);
     device->destroyDescriptorSetLayout(gen_prt_pack_info_desc_set_layout_);
