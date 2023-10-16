@@ -36,7 +36,9 @@ public:
 
     void update(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const std::shared_ptr<game_object::ConemapObj>& conemap_obj);
+        const std::shared_ptr<game_object::ConemapObj>& conemap_obj,
+        uint32_t pass_start,
+        uint32_t pass_count);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

@@ -343,7 +343,9 @@ Conemap::Conemap(
 
 void Conemap::update(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj,
+    uint32_t pass_start,
+    uint32_t pass_end) {
 
     const auto& conemap_tex =
         conemap_obj->getConemapTexture();
@@ -380,7 +382,7 @@ void Conemap::update(
         SET_FLAG_BIT(Access, SHADER_WRITE_BIT));
 
     // generate first pass of conemap with closer blocks.
-    for (uint p = 0; p < num_passes; p++) {
+    for (uint p = pass_start; p < pass_end; p++) {
         glm::uvec2 cur_block_index =
             glm::uvec2(p % dispatch_block_count.x, p / dispatch_block_count.x);
         glm::uvec2 cur_block_size =
@@ -512,7 +514,9 @@ void Conemap::update(
                 1);
         }
     }
-    {
+
+    // only do it after last pass.
+    if (pass_end == num_passes) {
         renderer::BarrierList barrier_list;
         barrier_list.image_barriers.clear();
         barrier_list.image_barriers.reserve(1);
