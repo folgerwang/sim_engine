@@ -120,8 +120,11 @@
 #define PANORAMA_TEX_INDEX                  0
 #define ENVMAP_TEX_INDEX                    0
 #define SRC_TEX_INDEX                       0
-#define SRC_INFO_TEX_INDEX                  1
-#define DST_TEX_INDEX                       2
+#define SRC_TEX_INDEX_1                     (SRC_TEX_INDEX + 1)
+#define SRC_TEX_INDEX_2                     (SRC_TEX_INDEX_1 + 1)
+#define SRC_INFO_TEX_INDEX                  (SRC_TEX_INDEX_2 + 1)
+#define DST_TEX_INDEX                       (SRC_INFO_TEX_INDEX + 1)
+#define DST_TEX_INDEX_1                     (DST_TEX_INDEX + 1)
 
 #define VERTEX_BUFFER_INDEX                 0
 #define INDEX_BUFFER_INDEX                  1
@@ -205,8 +208,11 @@
 
 #define kConemapGenBlockCacheSizeX              128
 #define kConemapGenBlockCacheSizeY              128
+#define kConemapGenBlockSizeX                   (kConemapGenBlockCacheSizeX * 4)
+#define kConemapGenBlockSizeY                   (kConemapGenBlockCacheSizeY * 4)
 #define kConemapGenDispatchX                    32
 #define kConemapGenDispatchY                    32
+#define kConemapGenBlockRadius                  2
 #define kPrtShadowGenBlockCacheSizeX            kConemapGenBlockCacheSizeX
 #define kPrtShadowGenBlockCacheSizeY            kConemapGenBlockCacheSizeY
 #define kPrtShadowGenDispatchX                  kConemapGenDispatchX
@@ -454,6 +460,7 @@ struct ConemapGenParams {
     vec2            inv_size;
     ivec2           block_index;
     ivec2           block_offset;
+    ivec2           dst_block_offset;
     uint            is_height_map;
     uint            depth_channel;
 };

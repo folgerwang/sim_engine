@@ -251,7 +251,8 @@ void main() {
             v);
 
 
-
+    //outColor = vec4(vec3(sum_visi), 1.0f);
     //outColor = vec4(color.xyz * vec3(sum_visi) * sqrt(4.0f * PI) * 2.0f, 1.0f);
-    outColor = vec4(vec3(sum_visi)/*toneMap(material, color)*/, 1.0f);
+    //outColor = vec4(texture(conemap_tex, ps_in_data.vertex_tex_coord.xy).xxx, 1.0f);
+    outColor = vec4(toneMap(material, color), 1.0f);
 }

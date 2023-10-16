@@ -496,5 +496,8 @@
     <None Include="shaders\prt_shadow_gen_with_cache.comp">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\conemap_pack.comp">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

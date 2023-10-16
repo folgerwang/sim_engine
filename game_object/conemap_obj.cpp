@@ -396,6 +396,7 @@ void ConemapObj::update(
 
 void ConemapObj::destroy(
     const std::shared_ptr<renderer::Device>& device) {
+
     if (conemap_tex_) {
         conemap_tex_->destroy(device);
     }
