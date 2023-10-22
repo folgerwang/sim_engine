@@ -156,6 +156,9 @@
     <ClCompile Include="scene_rendering\view_capture.cpp">
       <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\hair_test.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -310,6 +313,9 @@
     </ClInclude>
     <ClInclude Include="scene_rendering\view_capture.h">
       <Filter>Header Files\engine\scene_rendering</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\hair_test.h">
+      <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -497,6 +503,12 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\conemap_pack.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\hair_test.frag">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\hair_test.vert">
       <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>

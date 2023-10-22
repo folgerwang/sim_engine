@@ -632,6 +632,14 @@ struct ObjectVsPsData {
 #endif
 };
 
+struct HairVsPsData {
+    vec3 vertex_position;
+    vec4 vertex_tex_coord;
+    vec3 vertex_normal;
+    vec3 vertex_tangent;
+    vec3 vertex_binormal;
+};
+
 struct TileVsPsData {
     vec3    vertex_position;
     vec2    world_map_uv;
