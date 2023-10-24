@@ -69,3 +69,11 @@ float rsi(vec3 r0, vec3 rd, float sr) {
     float c = dot(r0, r0) - (sr * sr);
     return (-b + sqrt((b * b) - 4.0 * a * c)) / (2.0 * a);
 }
+
+vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
+    vec3 direction;
+    direction.x = cos(radians(-yaw)) * cos(radians(pitch));
+    direction.y = sin(radians(pitch));
+    direction.z = sin(radians(-yaw)) * cos(radians(pitch));
+    return normalize(direction);
+}

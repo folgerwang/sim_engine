@@ -4,56 +4,168 @@
 namespace engine {
 namespace {
 
-static void createUnifiedQuad(
-    std::vector<glm::vec3>& new_vertices,
-    std::vector<glm::vec3>& new_normals,
-    std::vector<glm::vec3>& new_tangents,
-    std::vector<glm::vec2>& new_uvs,
-    std::vector<glm::uvec3>& new_faces) {
+// generate a plane with width segments x and height segments y
+static void generatePlaneMesh(
+    std::vector<glm::vec3>& vertices,
+    std::vector<glm::vec2>& uvs,
+    std::vector<glm::uvec3>& triangles,
+    const std::vector<glm::vec3>& v,
+    uint32_t segment_x,
+    uint32_t segment_y) {
 
-    new_vertices.resize(4);
-    new_normals.resize(4);
-    new_tangents.resize(4);
-    new_uvs.resize(4);
-    new_faces.resize(2);
+    uint32_t num_vertex =
+        (segment_x + 1) * (segment_y + 1);
 
-    new_vertices[0] = glm::vec3(-1.0f, 0.0f, -1.0f);
-    new_vertices[1] = glm::vec3(1.0f, 0.0f, -1.0f);
-    new_vertices[2] = glm::vec3(1.0f, 0.0f, 1.0f);
-    new_vertices[3] = glm::vec3(-1.0f, 0.0f, 1.0f);
+    uint32_t num_faces =
+        segment_x * segment_y * 2;
 
-    new_normals[0] = glm::vec3(0.0f, 1.0f, 0.0f);
-    new_normals[1] = glm::vec3(0.0f, 1.0f, 0.0f);
-    new_normals[2] = glm::vec3(0.0f, 1.0f, 0.0f);
-    new_normals[3] = glm::vec3(0.0f, 1.0f, 0.0f);
+    vertices.resize(num_vertex);
+    uvs.resize(num_vertex);
+    triangles.resize(num_faces);
 
-    new_tangents[0] = glm::vec3(1.0f, 0.0f, 0.0f);
-    new_tangents[1] = glm::vec3(1.0f, 0.0f, 0.0f);
-    new_tangents[2] = glm::vec3(1.0f, 0.0f, 0.0f);
-    new_tangents[3] = glm::vec3(1.0f, 0.0f, 0.0f);
+    std::vector<glm::vec3> n(4), t(4);
+    n[0] = normalize(cross(v[3] - v[0], v[1] - v[0]));
+    n[1] = normalize(cross(v[0] - v[1], v[2] - v[1]));
+    n[2] = normalize(cross(v[1] - v[2], v[3] - v[2]));
+    n[3] = normalize(cross(v[2] - v[3], v[0] - v[3]));
+    for (uint32_t y = 0; y < segment_y + 1; y++) {
+        float factor_y = (float)y / (float)segment_y;
+        auto x_start = mix(v[0], v[3], factor_y);
+        auto x_end = mix(v[1], v[2], factor_y);
+        auto n_start = mix(n[0], n[3], factor_y);
+        auto n_end = mix(n[1], n[2], factor_y);
+        for (uint32_t x = 0; x < segment_x + 1; x++) {
+            uint32_t idx = y * (segment_x + 1) + x;
+            float factor_x = (float)x / (float)segment_x;
 
-    new_uvs[0] = glm::vec2(0.0f, 0.0f);
-    new_uvs[1] = glm::vec2(1.0f, 0.0f);
-    new_uvs[2] = glm::vec2(1.0f, 1.0f);
-    new_uvs[3] = glm::vec2(0.0f, 1.0f);
+            vertices[idx] = mix(x_start, x_end, factor_x);
+            uvs[idx] = glm::vec2(factor_x, factor_y);
+        }
+    }
 
-    new_faces[0] = glm::uvec3(0, 2, 1);
-    new_faces[1] = glm::uvec3(0, 3, 2);
+    for (uint32_t y = 0; y < segment_y; y++) {
+        for (uint32_t x = 0; x < segment_x; x++) {
+            uint32_t idx = y * segment_x + x;
+            uint32_t quad_idx_00 = y * (segment_x + 1) + x;
+            uint32_t quad_idx_01 = quad_idx_00 + 1;
+            uint32_t quad_idx_10 = quad_idx_01 + segment_x;
+            uint32_t quad_idx_11 = quad_idx_10 + 1;
+
+            triangles[idx * 2] = glm::uvec3(
+                quad_idx_00,
+                quad_idx_10,
+                quad_idx_01);
+            triangles[idx * 2 + 1] = glm::uvec3(
+                quad_idx_01,
+                quad_idx_10,
+                quad_idx_11);
+        }
+    }
+}
+
+void calculateNormalAndTangent(
+    std::vector<glm::vec3>& normals,
+    std::vector<glm::vec3>& tangents,
+    const std::vector<glm::vec3>& vertices,
+    const std::vector<glm::vec2>& uvs,
+    const std::vector<glm::uvec3>& triangles) {
+
+    uint32_t num_vertex = vertices.size();
+    uint32_t num_faces = triangles.size();
+
+    normals.resize(num_vertex);
+    tangents.resize(num_vertex);
+
+    for (uint32_t n = 0; n < num_vertex; n++) {
+        normals[n] = glm::vec3(0, 0, 0);
+        tangents[n] = glm::vec3(0, 0, 0);
+    }
+
+    for (uint32_t f = 0; f < num_faces; f++) {
+        auto& triangle = triangles[f];
+        auto& v0 = vertices[triangle[0]];
+        auto& v1 = vertices[triangle[1]];
+        auto& v2 = vertices[triangle[2]];
+
+        auto& uv0 = uvs[triangle[0]];
+        auto& uv1 = uvs[triangle[1]];
+        auto& uv2 = uvs[triangle[2]];
+
+        auto edge10 = normalize(v1 - v0);
+        auto edge20 = normalize(v2 - v0);
+        auto edge21 = normalize(v2 - v1);
+
+        float angle0 = acos(dot(edge10, edge20));
+        float angle1 = acos(-dot(edge10, edge21));
+        float angle2 = acos(dot(edge20, edge21));
+
+        auto edge_uv10 = uv1 - uv0;
+        auto edge_uv20 = uv2 - uv0;
+        auto edge_uv21 = uv2 - uv1;
+
+        glm::vec3 normal = cross(edge10, edge20);
+
+        float r0 = 1.0f / (edge_uv10.x * edge_uv20.y - edge_uv10.y * edge_uv20.x);
+        float r1 = 1.0f / (edge_uv10.x * edge_uv21.y - edge_uv10.y * edge_uv21.x);
+        float r2 = 1.0f / (edge_uv20.x * edge_uv21.y - edge_uv20.y * edge_uv21.x);
+        auto t0 = (edge10 * edge_uv20.y - edge20 * edge_uv10.y) * r0;
+        auto t1 = (edge10 * edge_uv21.y - edge21 * edge_uv10.y) * r1;
+        auto t2 = (edge20 * edge_uv21.y - edge21 * edge_uv20.y) * r2;
+
+        auto b0 = (edge20 * edge_uv10.x - edge10 * edge_uv20.x) * r0;
+        auto b1 = (edge21 * edge_uv10.x - edge10 * edge_uv21.x) * r1;
+        auto b2 = (edge21 * edge_uv20.x - edge20 * edge_uv21.x) * r2;
+
+        normals[triangle[0]] += normal * angle0;
+        normals[triangle[1]] += normal * angle1;
+        normals[triangle[2]] += normal * angle2;
+
+        tangents[triangle[0]] += t0 * angle0;
+        tangents[triangle[1]] += t1 * angle1;
+        tangents[triangle[2]] += t2 * angle2;
+    }
+
+    for (uint32_t n = 0; n < num_vertex; n++) {
+        normals[n] = normalize(normals[n]);
+        tangents[n] = normalize(tangents[n]);
+    }
 }
 
 } // namespace
 
 namespace game_object {
 
-Plane::Plane(const std::shared_ptr<renderer::Device>& device)
-{
+Plane::Plane(
+    const std::shared_ptr<renderer::Device>& device,
+    uint32_t split_num_x,
+    uint32_t split_num_y) {
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;
     std::vector<glm::vec3> tangents;
     std::vector<glm::vec2> uvs;
     std::vector<glm::uvec3> faces;
 
-    createUnifiedQuad(vertices, normals, tangents, uvs, faces);
+    // 4 vertices
+    std::vector<glm::vec3> v(4);
+    v[0] = glm::vec3(-1.0f, 0.0f, -1.0f);
+    v[1] = glm::vec3(1.0f, 0.0f, -1.0f);
+    v[2] = glm::vec3(1.0f, 0.0f, 1.0f);
+    v[3] = glm::vec3(-1.0f, 0.0f, 1.0f);
+
+    generatePlaneMesh(
+        vertices,
+        uvs,
+        faces,
+        v,
+        split_num_x,
+        split_num_y);
+
+    calculateNormalAndTangent(
+        normals,
+        tangents,
+        vertices,
+        uvs,
+        faces);
 
     renderer::VertexInputBindingDescription binding_desc;
     renderer::VertexInputAttributeDescription attribute_desc;
@@ -174,7 +286,9 @@ void Plane::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
         0,
         renderer::IndexType::UINT32);
 
-    cmd_buf->drawIndexed(static_cast<uint32_t>(getIndexBuffer()->buffer->getSize() / sizeof(uint32_t)));
+    uint32_t index_count =
+        static_cast<uint32_t>(getIndexBuffer()->buffer->getSize() / sizeof(uint32_t));
+    cmd_buf->drawIndexed(index_count);
 }
 
 } // game_object
