@@ -192,7 +192,8 @@ void createTextureImage(
     const renderer::ImageUsageFlags& usage,
     const renderer::MemoryPropertyFlags& properties,
     std::shared_ptr<renderer::Image>& image,
-    std::shared_ptr<renderer::DeviceMemory>& image_memory);
+    std::shared_ptr<renderer::DeviceMemory>& image_memory,
+    bool with_mips = false);
 
 void copyBuffer(
     const std::shared_ptr<renderer::Device>& device,

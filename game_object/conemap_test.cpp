@@ -138,7 +138,7 @@ static void fillYVauleTablle(float y_value[25], float theta, float phi) {
     y_value[24] = cos_4phi * a44;
 }
 
-static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayout(
+static auto createPrtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
     bindings.reserve(10);
@@ -174,7 +174,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createPrtDescriptorSetLayo
     return device->createDescriptorSetLayout(bindings);
 }
 
-static renderer::WriteDescriptorList addPrtTestTextures(
+static auto addPrtTestTextures(
     const std::shared_ptr<renderer::DescriptorSet>& desc_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& base_tex,
@@ -296,7 +296,7 @@ static renderer::WriteDescriptorList addPrtTestTextures(
     return descriptor_writes;
 }
 
-static std::shared_ptr<renderer::PipelineLayout> createPipelineLayout(
+static auto createPipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::DescriptorSetLayout>& prt_desc_set_layout) {
@@ -448,7 +448,6 @@ void ConemapTest::draw(
 
     params.height_scale = conemap_obj->getDepthScale() * (conemap_obj->isHeightMap() ? -1.0f : 1.0f);
     params.buffer_size = glm::vec2(buffer_size);
-    params.test_color = light_ray * 0.5f + 0.5f;
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |

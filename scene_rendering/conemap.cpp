@@ -518,7 +518,6 @@ void Conemap::update(
     // only do it after last pass.
     if (pass_end == num_passes) {
         renderer::BarrierList barrier_list;
-        barrier_list.image_barriers.clear();
         barrier_list.image_barriers.reserve(1);
 
         renderer::helper::addTexturesToBarrierList(

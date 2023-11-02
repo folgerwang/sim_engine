@@ -2270,7 +2270,10 @@ void createTextureImage(
     const renderer::ImageUsageFlags& usage,
     const renderer::MemoryPropertyFlags& properties,
     std::shared_ptr<renderer::Image>& image,
-    std::shared_ptr<renderer::DeviceMemory>& image_memory) {
+    std::shared_ptr<renderer::DeviceMemory>& image_memory,
+    bool with_mips/* = false*/) {
+    uint32_t mip_count =
+        with_mips ? uint32_t(std::log2(std::max(tex_size.x, tex_size.y))) : 1;
     image = device->createImage(
         tex_size.z > 1 ?
             renderer::ImageType::TYPE_3D :
@@ -2279,7 +2282,11 @@ void createTextureImage(
         format,
         usage,
         tiling,
-        renderer::ImageLayout::UNDEFINED);
+        renderer::ImageLayout::UNDEFINED,
+        0U,
+        false,
+        1U,
+        mip_count);
     auto mem_requirements =
         device->getImageMemoryRequirements(image);
     image_memory =

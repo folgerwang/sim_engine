@@ -389,7 +389,8 @@ public:
         const renderer::ImageUsageFlags& usage,
         const renderer::ImageLayout& image_layout,
         const renderer::ImageTiling image_tiling = renderer::ImageTiling::OPTIMAL,
-        const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
+        const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        bool with_mips = false);
 
     static void dumpTextureImage(
         const std::shared_ptr<renderer::Device>& device,

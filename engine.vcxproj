@@ -25,6 +25,7 @@
     <ClCompile Include="game_object\conemap_obj.cpp" />
     <ClCompile Include="game_object\debug_draw.cpp" />
     <ClCompile Include="game_object\gltf.cpp" />
+    <ClCompile Include="game_object\hair_patch.cpp" />
     <ClCompile Include="game_object\hair_test.cpp" />
     <ClCompile Include="game_object\object_file.cpp" />
     <ClCompile Include="game_object\patch.cpp" />
@@ -57,6 +58,7 @@
     <ClInclude Include="game_object\conemap_obj.h" />
     <ClInclude Include="game_object\debug_draw.h" />
     <ClInclude Include="game_object\gltf.h" />
+    <ClInclude Include="game_object\hair_patch.h" />
     <ClInclude Include="game_object\hair_test.h" />
     <ClInclude Include="game_object\object_file.h" />
     <ClInclude Include="game_object\patch.h" />
@@ -123,6 +125,7 @@
     <None Include="shaders\grass\grass.geom" />
     <None Include="shaders\grass\grass.mesh" />
     <None Include="shaders\grass\grass.vert" />
+    <None Include="shaders\hair_patch.comp" />
     <None Include="shaders\hair_test.frag" />
     <None Include="shaders\hair_test.vert" />
     <None Include="shaders\ibl_smooth.comp" />

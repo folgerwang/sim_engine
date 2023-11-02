@@ -159,6 +159,9 @@
     <ClCompile Include="game_object\hair_test.cpp">
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\hair_patch.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -315,6 +318,9 @@
       <Filter>Header Files\engine\scene_rendering</Filter>
     </ClInclude>
     <ClInclude Include="game_object\hair_test.h">
+      <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\hair_patch.h">
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
@@ -509,6 +515,9 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\hair_test.vert">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\hair_patch.comp">
       <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>

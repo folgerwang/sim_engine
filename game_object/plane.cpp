@@ -9,7 +9,7 @@ static void generatePlaneMesh(
     std::vector<glm::vec3>& vertices,
     std::vector<glm::vec2>& uvs,
     std::vector<glm::uvec3>& triangles,
-    const std::vector<glm::vec3>& v,
+    const std::array<glm::vec3, 4>& v,
     uint32_t segment_x,
     uint32_t segment_y) {
 
@@ -23,17 +23,10 @@ static void generatePlaneMesh(
     uvs.resize(num_vertex);
     triangles.resize(num_faces);
 
-    std::vector<glm::vec3> n(4), t(4);
-    n[0] = normalize(cross(v[3] - v[0], v[1] - v[0]));
-    n[1] = normalize(cross(v[0] - v[1], v[2] - v[1]));
-    n[2] = normalize(cross(v[1] - v[2], v[3] - v[2]));
-    n[3] = normalize(cross(v[2] - v[3], v[0] - v[3]));
     for (uint32_t y = 0; y < segment_y + 1; y++) {
         float factor_y = (float)y / (float)segment_y;
         auto x_start = mix(v[0], v[3], factor_y);
         auto x_end = mix(v[1], v[2], factor_y);
-        auto n_start = mix(n[0], n[3], factor_y);
-        auto n_end = mix(n[1], n[2], factor_y);
         for (uint32_t x = 0; x < segment_x + 1; x++) {
             uint32_t idx = y * (segment_x + 1) + x;
             float factor_x = (float)x / (float)segment_x;
@@ -53,12 +46,12 @@ static void generatePlaneMesh(
 
             triangles[idx * 2] = glm::uvec3(
                 quad_idx_00,
-                quad_idx_10,
-                quad_idx_01);
+                quad_idx_01,
+                quad_idx_10);
             triangles[idx * 2 + 1] = glm::uvec3(
                 quad_idx_01,
-                quad_idx_10,
-                quad_idx_11);
+                quad_idx_11,
+                quad_idx_10);
         }
     }
 }
@@ -70,8 +63,10 @@ void calculateNormalAndTangent(
     const std::vector<glm::vec2>& uvs,
     const std::vector<glm::uvec3>& triangles) {
 
-    uint32_t num_vertex = vertices.size();
-    uint32_t num_faces = triangles.size();
+    uint32_t num_vertex =
+        static_cast<uint32_t>(vertices.size());
+    uint32_t num_faces =
+        static_cast<uint32_t>(triangles.size());
 
     normals.resize(num_vertex);
     tangents.resize(num_vertex);
@@ -137,6 +132,7 @@ namespace game_object {
 
 Plane::Plane(
     const std::shared_ptr<renderer::Device>& device,
+    std::shared_ptr<std::array<glm::vec3, 4>> v,
     uint32_t split_num_x,
     uint32_t split_num_y) {
     std::vector<glm::vec3> vertices;
@@ -146,17 +142,19 @@ Plane::Plane(
     std::vector<glm::uvec3> faces;
 
     // 4 vertices
-    std::vector<glm::vec3> v(4);
-    v[0] = glm::vec3(-1.0f, 0.0f, -1.0f);
-    v[1] = glm::vec3(1.0f, 0.0f, -1.0f);
-    v[2] = glm::vec3(1.0f, 0.0f, 1.0f);
-    v[3] = glm::vec3(-1.0f, 0.0f, 1.0f);
+    if (v == nullptr) {
+        v = std::make_shared<std::array<glm::vec3, 4>>();
+        (*v)[0] = glm::vec3(-1.0f, 0.0f, -1.0f);
+        (*v)[1] = glm::vec3(-1.0f, 0.0f, 1.0f);
+        (*v)[2] = glm::vec3(1.0f, 0.0f, 1.0f);
+        (*v)[3] = glm::vec3(1.0f, 0.0f, -1.0f);
+    }
 
     generatePlaneMesh(
         vertices,
         uvs,
         faces,
-        v,
+        *v,
         split_num_x,
         split_num_y);
 

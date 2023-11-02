@@ -280,7 +280,7 @@ struct PrtLightParams {
     float coeffs[25];
     float height_scale;
     vec2 buffer_size;
-    vec3 test_color;
+    vec2 inv_buffer_size;
 };
 
 struct IblParams {

@@ -7,7 +7,7 @@
 namespace engine {
 namespace er = engine::renderer;
 namespace {
-er::WriteDescriptorList addPrtRelatedTextures(
+static auto addPrtRelatedTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
@@ -36,7 +36,7 @@ er::WriteDescriptorList addPrtRelatedTextures(
     return descriptor_writes;
 }
 
-er::WriteDescriptorList addPrtShadowCacheUpdateTextures(
+static auto addPrtShadowCacheUpdateTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
@@ -76,7 +76,7 @@ er::WriteDescriptorList addPrtShadowCacheUpdateTextures(
     return descriptor_writes;
 }
 
-er::WriteDescriptorList addGenPrtPackInfoTextures(
+static auto addGenPrtPackInfoTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::TextureInfo>& src_prt_texes,
     const std::shared_ptr<er::TextureInfo>& dst_prt_info_texes) {
@@ -104,7 +104,7 @@ er::WriteDescriptorList addGenPrtPackInfoTextures(
     return descriptor_writes;
 }
 
-er::WriteDescriptorList addPackedPrtTextures(
+static auto addPackedPrtTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::TextureInfo>& src_prt_texes,
     const std::shared_ptr<er::TextureInfo>& src_prt_info_texes,
@@ -142,7 +142,7 @@ er::WriteDescriptorList addPackedPrtTextures(
     return descriptor_writes;
 }
 
-er::WriteDescriptorList addGenMinmaxDepthTextures(
+static auto addGenMinmaxDepthTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
     const std::shared_ptr<er::ImageView>& src_image,
@@ -173,10 +173,9 @@ er::WriteDescriptorList addGenMinmaxDepthTextures(
     return descriptor_writes;
 }
 
-std::shared_ptr<er::PipelineLayout>
-    generateMinmaxDepthPipelineLayout(
-        const std::shared_ptr<er::Device>& device,
-        const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
+static auto generateMinmaxDepthPipelineLayout(
+    const std::shared_ptr<er::Device>& device,
+    const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
     er::PushConstantRange push_const_range{};
     push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
     push_const_range.offset = 0;

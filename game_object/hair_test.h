@@ -1,6 +1,7 @@
 #pragma once
 #include "renderer/renderer.h"
 #include "plane.h"
+#include "box.h"
 
 namespace engine {
 namespace game_object {
@@ -19,6 +20,7 @@ public:
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
+        const std::shared_ptr<renderer::TextureInfo>& hair_patch_tex,
         const glm::uvec2& display_size,
         std::shared_ptr<Plane> unit_plane);
 
@@ -26,7 +28,8 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
-        std::shared_ptr<Plane> unit_plane);
+        std::shared_ptr<Plane> unit_plane,
+        std::shared_ptr<Box> unit_box);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

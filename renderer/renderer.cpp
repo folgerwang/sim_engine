@@ -431,7 +431,8 @@ void Helper::create2DTextureImage(
     const renderer::ImageUsageFlags& usage,
     const renderer::ImageLayout& image_layout,
     const renderer::ImageTiling image_tiling,
-    const uint32_t memory_property) {
+    const uint32_t memory_property,
+    bool with_mips/* = false */) {
     auto is_depth = vk::helper::isDepthFormat(format);
     vk::helper::createTextureImage(
         device,
@@ -441,7 +442,8 @@ void Helper::create2DTextureImage(
         usage,
         memory_property,
         texture_2d.image,
-        texture_2d.memory);
+        texture_2d.memory,
+        with_mips);
 
     texture_2d.view =
         device->createImageView(
