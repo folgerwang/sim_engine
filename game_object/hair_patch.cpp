@@ -14,7 +14,7 @@ static auto createHairPatchDescriptorSetLayout(
 
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-            DST_TEX_INDEX,
+            DIFFUSE_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             renderer::DescriptorType::STORAGE_IMAGE));
 #if 0
@@ -61,7 +61,7 @@ static auto addHairPatchTextures(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::STORAGE_IMAGE,
-        DST_TEX_INDEX,
+        DIFFUSE_TEX_INDEX,
         nullptr,
         dst_image,
         renderer::ImageLayout::GENERAL);
@@ -80,10 +80,12 @@ static auto createHairPatchPipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::PrtLightParams);
 
-    renderer::DescriptorSetLayoutList desc_set_layouts;// = global_desc_set_layouts;
+    auto desc_set_layouts = global_desc_set_layouts;
     desc_set_layouts.push_back(prt_desc_set_layout);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range });
 }
 
 } // namespace
@@ -153,7 +155,7 @@ void HairPatch::update(
         renderer::PipelineBindPoint::COMPUTE,
         hair_patch_pipeline_);
 
-    renderer::DescriptorSetList desc_sets;// = desc_set_list;
+    auto desc_sets = desc_set_list;
     desc_sets.push_back(hair_patch_desc_set_);
 
     cmd_buf->bindDescriptorSets(

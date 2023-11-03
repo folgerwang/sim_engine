@@ -6,9 +6,9 @@
 #include "punctual.glsl.h"
 #include "noise.glsl.h"
 
-/*layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	GameCameraInfo camera_info;
-};*/
+};
 
 layout(push_constant) uniform HairPatchUniformBufferObject {
     PrtLightParams params;
@@ -20,14 +20,16 @@ const float s_hair_oquacity = 6.0f;
 const float s_hair_width = 0.1f;
 const float s_inv_hair_width = 1.0f / s_hair_width;
 
-layout(set = 0, binding = DST_TEX_INDEX, rgba16f) uniform image2D dst_img;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = DIFFUSE_TEX_INDEX, rgba16f) uniform image2D dst_img;
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
 void main() {
 	ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
     vec2 uv = (vec2(pixel_coords) + vec2(0.5f)) * params.inv_buffer_size;
-    vec3 v = normalize(vec3(0, 1, 0) - vec3(uv.x * 2.0f - 1.0f, 0.0f, uv.y * 2.0f - 1.0f));
+
+    vec3 vertex_position = vec3(uv.x * 2.0f - 1.0f, 0.0f, uv.y * 2.0f - 1.0f);
+    vec3 v = normalize(camera_info.position.xyz - vertex_position);
 
     mat3 tangent_world_matrix =
         mat3(vec3(1, 0, 0), vec3(0, 0, 1), vec3(0, 1, 0));
