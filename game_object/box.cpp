@@ -74,5 +74,11 @@ void Box::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
     }
 }
 
+void Box::destroy(const std::shared_ptr<renderer::Device>& device) {
+    for (auto& plane : planes_) {
+        plane->destroy(device);
+    }
+}
+
 } // game_object
 } // engine

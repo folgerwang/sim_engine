@@ -73,7 +73,7 @@ public:
         return index_buffer_;
     }
 
-    void destroy(const std::shared_ptr<renderer::Device>& device_);
+    void destroy(const std::shared_ptr<renderer::Device>& device);
 };
 
 } // game_object

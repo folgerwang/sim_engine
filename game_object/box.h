@@ -16,6 +16,8 @@ public:
         uint32_t split_num_y,
         uint32_t split_num_z);
     void draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+
+    void destroy(const std::shared_ptr<renderer::Device>& device);
 };
 
 } // game_object
