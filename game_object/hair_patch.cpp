@@ -10,13 +10,20 @@ namespace {
 static auto createHairPatchDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(11);
+    bindings.reserve(2);
 
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-            DIFFUSE_TEX_INDEX,
+            DST_COLOR_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             renderer::DescriptorType::STORAGE_IMAGE));
+
+    bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            DST_WEIGHT_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            renderer::DescriptorType::STORAGE_IMAGE));
+
 #if 0
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALBEDO_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(NORMAL_TEX_INDEX));
@@ -52,18 +59,28 @@ static auto createHairPatchDescriptorSetLayout(
 static auto addHairPatchTextures(
     const std::shared_ptr<renderer::DescriptorSet>& desc_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::ImageView>& dst_image) {
+    const std::shared_ptr<renderer::ImageView>& dst_color_image,
+    const std::shared_ptr<renderer::ImageView>& dst_weight_image) {
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(1);
+    descriptor_writes.reserve(2);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
         desc_set,
         renderer::DescriptorType::STORAGE_IMAGE,
-        DIFFUSE_TEX_INDEX,
+        DST_COLOR_TEX_INDEX,
         nullptr,
-        dst_image,
+        dst_color_image,
+        renderer::ImageLayout::GENERAL);
+
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::STORAGE_IMAGE,
+        DST_WEIGHT_TEX_INDEX,
+        nullptr,
+        dst_weight_image,
         renderer::ImageLayout::GENERAL);
 
     return descriptor_writes;
@@ -99,14 +116,29 @@ HairPatch::HairPatch(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const glm::uvec2& patch_size) {
 
-    hair_patch_tex_ =
+    hair_patch_color_tex_ =
+        std::make_shared<renderer::TextureInfo>();
+
+    hair_patch_weight_tex_ =
         std::make_shared<renderer::TextureInfo>();
 
     renderer::Helper::create2DTextureImage(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         patch_size,
-        *hair_patch_tex_,
+        *hair_patch_color_tex_,
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
+        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        renderer::ImageLayout::GENERAL,
+        renderer::ImageTiling::OPTIMAL,
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        true);
+
+    renderer::Helper::create2DTextureImage(
+        device,
+        renderer::Format::R16_SFLOAT,
+        patch_size,
+        *hair_patch_weight_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
@@ -127,7 +159,8 @@ HairPatch::HairPatch(
         addHairPatchTextures(
             hair_patch_desc_set_,
             texture_sampler,
-            hair_patch_tex_->view);
+            hair_patch_color_tex_->view,
+            hair_patch_weight_tex_->view);
 
     device->updateDescriptorSets(hair_test_material_descs);
 
@@ -149,7 +182,7 @@ void HairPatch::update(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list) {
 
-    auto buffer_size = hair_patch_tex_->size;
+    auto buffer_size = hair_patch_color_tex_->size;
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
@@ -190,7 +223,8 @@ void HairPatch::update(
 
     renderer::helper::addTexturesToBarrierList(
         barrier_list,
-        { hair_patch_tex_->image },
+        { hair_patch_color_tex_->image,
+          hair_patch_weight_tex_->image },
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         SET_FLAG_BIT(Access, SHADER_READ_BIT) |
         SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
@@ -208,8 +242,12 @@ void HairPatch::destroy(
     device->destroyPipelineLayout(hair_patch_pipeline_layout_);
     device->destroyPipeline(hair_patch_pipeline_);
 
-    if (hair_patch_tex_) {
-        hair_patch_tex_->destroy(device);
+    if (hair_patch_color_tex_) {
+        hair_patch_color_tex_->destroy(device);
+    }
+
+    if (hair_patch_weight_tex_) {
+        hair_patch_weight_tex_->destroy(device);
     }
 }
 

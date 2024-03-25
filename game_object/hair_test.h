@@ -20,7 +20,8 @@ public:
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
-        const std::shared_ptr<renderer::TextureInfo>& hair_patch_tex,
+        const std::shared_ptr<renderer::TextureInfo>& hair_patch_color_tex,
+        const std::shared_ptr<renderer::TextureInfo>& hair_patch_weight_tex,
         const glm::uvec2& display_size,
         std::shared_ptr<Plane> unit_plane);
 

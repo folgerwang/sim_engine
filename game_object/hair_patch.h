@@ -12,7 +12,8 @@ class HairPatch {
     std::shared_ptr<renderer::PipelineLayout> hair_patch_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> hair_patch_pipeline_;
 
-    std::shared_ptr<renderer::TextureInfo> hair_patch_tex_;
+    std::shared_ptr<renderer::TextureInfo> hair_patch_color_tex_;
+    std::shared_ptr<renderer::TextureInfo> hair_patch_weight_tex_;
 
 public:
     HairPatch(
@@ -27,8 +28,12 @@ public:
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_set_list);
 
-    inline const auto getHairPatchTexture() {
-        return hair_patch_tex_;
+    inline const auto getHairPatchColorTexture() {
+        return hair_patch_color_tex_;
+    }
+
+    inline const auto getHairPatchWeightTexture() {
+        return hair_patch_weight_tex_;
     }
 
     void destroy(const std::shared_ptr<renderer::Device>& device);

@@ -14,13 +14,14 @@ layout(push_constant) uniform HairPatchUniformBufferObject {
     PrtLightParams params;
 };
 
-const float s_num_hairs = 200.0f;
+const float s_num_hairs = 5;//200.0f;
 const uint  s_num_layers = 10;
 const float s_hair_oquacity = 6.0f;
 const float s_hair_width = 0.1f;
 const float s_inv_hair_width = 1.0f / s_hair_width;
 
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = DIFFUSE_TEX_INDEX, rgba16f) uniform image2D dst_img;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = DST_COLOR_TEX_INDEX, rgba16f) uniform image2D dst_color_img;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = DST_WEIGHT_TEX_INDEX, r16f) uniform image2D dst_weight_img;
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -38,7 +39,9 @@ void main() {
     float accum_hair_color = 0.0f;
     float offset_dir = 1.0f;
     float hair_color = 0.8f;
+    float sum_weight = 0.0f;
     for (int i = 0; i < s_num_layers && accum_opacity > 0.01f; ++i) {
+        float weight = 1.0f;
         vec2 noise_value = hash21(i * 1.34f);
         float uv_start = uv.x * 1.1f - 0.05f;
         float uv_end = uv_start * (1.0f + (noise_value.x - 0.5f) * 0.1f);
@@ -52,12 +55,14 @@ void main() {
         vec3 hair_normal = tangent_world_matrix * vec3(sin_theta, cos_theta, 0);
         if (cur_uv > 1.0f || cur_uv < 0.0f || uv.y > hair_length)
 			cur_opacity = 0.0f;
-        accum_hair_color += accum_opacity * cur_opacity * hair_color * max(dot(-v, hair_normal), 0.0f);
+        accum_hair_color += (accum_opacity * cur_opacity * hair_color * max(dot(-v, hair_normal), 0.0f)) * weight;
         accum_opacity *= (1.0f - cur_opacity);
 
         offset_dir *= -1.0f;
+        sum_weight += weight;
 	}
 
-    vec4 final_hair_color = vec4(vec3(accum_hair_color), accum_opacity);
-    imageStore(dst_img, pixel_coords, final_hair_color);
+    vec4 final_hair_color = vec4(vec3(accum_hair_color), accum_opacity * sum_weight);
+    imageStore(dst_color_img, pixel_coords, final_hair_color);
+    imageStore(dst_weight_img, pixel_coords, vec4(sum_weight));
 }
