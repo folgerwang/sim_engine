@@ -182,6 +182,8 @@ void HairPatch::update(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list) {
 
+    cmd_buf->beginDebugUtilsLabel("hair patch update");
+
     auto buffer_size = hair_patch_color_tex_->size;
 
     cmd_buf->bindPipeline(
@@ -234,6 +236,8 @@ void HairPatch::update(
         barrier_list,
         SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
         SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT));
+
+    cmd_buf->endDebugUtilsLabel();
 }
 
 void HairPatch::destroy(

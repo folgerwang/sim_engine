@@ -25,6 +25,8 @@ PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
 PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT;
 PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT;
 PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT;
+PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
+PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
 
 namespace helper {
 
@@ -2052,6 +2054,8 @@ void initRayTracingProperties(
     vkCmdDrawMeshTasksEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksEXT"));
     vkCmdDrawMeshTasksIndirectEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectEXT"));
     vkCmdDrawMeshTasksIndirectCountEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectCountEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectCountEXT"));
+    vkCmdBeginDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdBeginDebugUtilsLabelEXT"));
+    vkCmdEndDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdEndDebugUtilsLabelEXT"));
 
     // Get ray tracing pipeline properties, which will be used later on in the sample
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR  ray_tracing_pipeline_properties{};

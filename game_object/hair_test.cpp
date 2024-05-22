@@ -151,6 +151,8 @@ void HairTest::draw(
     std::shared_ptr<Plane> unit_plane,
     std::shared_ptr<Box> unit_box) {
 
+    cmd_buf->beginDebugUtilsLabel("hair test draw");
+
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
         hair_pipeline_);
@@ -185,6 +187,8 @@ void HairTest::draw(
 /*    if (unit_box) {
         unit_box->draw(cmd_buf);
     }*/
+
+    cmd_buf->endDebugUtilsLabel();
 }
 
 void HairTest::destroy(
