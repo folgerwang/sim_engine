@@ -15,7 +15,8 @@ public:
         const MemoryPropertyFlags& properties,
         const MemoryAllocateFlags& alloc_flags,
         std::shared_ptr<Buffer>& buffer,
-        std::shared_ptr<DeviceMemory>& buffer_memory) = 0;
+        std::shared_ptr<DeviceMemory>& buffer_memory,
+        const std::source_location& src_location) = 0;
     virtual void updateDescriptorSets(
         const WriteDescriptorList& write_descriptors) = 0;
     virtual DescriptorSetList createDescriptorSets(
@@ -24,13 +25,15 @@ public:
         uint64_t buffer_count) = 0;
     virtual std::shared_ptr<PipelineLayout> createPipelineLayout(
         const DescriptorSetLayoutList& desc_set_layouts,
-        const std::vector<PushConstantRange>& push_const_ranges) = 0;
+        const std::vector<PushConstantRange>& push_const_ranges,
+        const std::source_location& src_location) = 0;
     virtual std::shared_ptr<DescriptorSetLayout> createDescriptorSetLayout(
         const std::vector<DescriptorSetLayoutBinding>& bindings) = 0;
     virtual std::shared_ptr<RenderPass> createRenderPass(
         const std::vector<AttachmentDescription>& attachments,
         const std::vector<SubpassDescription>& subpasses,
-        const std::vector<SubpassDependency>& dependencies) = 0;
+        const std::vector<SubpassDependency>& dependencies,
+        const std::source_location& src_location) = 0;
     virtual std::shared_ptr<Pipeline> createPipeline(
         const std::shared_ptr<RenderPass>& render_pass,
         const std::shared_ptr<PipelineLayout>& pipeline_layout,
@@ -39,14 +42,17 @@ public:
         const PipelineInputAssemblyStateCreateInfo& topology_info,
         const GraphicPipelineInfo& graphic_pipeline_info,
         const ShaderModuleList& shader_modules,
-        const glm::uvec2& extent) = 0;
+        const glm::uvec2& extent,
+        const std::source_location& src_location) = 0;
     virtual std::shared_ptr<Pipeline> createPipeline(
         const std::shared_ptr<PipelineLayout>& pipeline_layout,
-        const std::shared_ptr<renderer::ShaderModule>& shader_module) = 0;
+        const std::shared_ptr<renderer::ShaderModule>& shader_module,
+        const std::source_location& src_location) = 0;
     virtual std::shared_ptr<Pipeline> createPipeline(
         const std::shared_ptr<PipelineLayout>& pipeline_layout,
         const ShaderModuleList& src_shader_modules,
         const RtShaderGroupCreateInfoList& src_shader_groups,
+        const std::source_location& src_location,
         const uint32_t ray_recursion_depth = 1) = 0;
     virtual std::shared_ptr<Swapchain> createSwapchain(
         const std::shared_ptr<Surface>& surface,
@@ -78,7 +84,11 @@ public:
         const MemoryAllocateFlags& allocate_flags) = 0;
     virtual MemoryRequirements getBufferMemoryRequirements(std::shared_ptr<Buffer> buffer) = 0;
     virtual MemoryRequirements getImageMemoryRequirements(std::shared_ptr<Image> image) = 0;
-    virtual std::shared_ptr<Buffer> createBuffer(uint64_t buf_size, BufferUsageFlags usage, bool sharing = false) = 0;
+    virtual std::shared_ptr<Buffer> createBuffer(
+        uint64_t buf_size,
+        BufferUsageFlags usage,
+        const std::source_location& src_location,
+        bool sharing = false) = 0;
     virtual std::shared_ptr<Image> createImage(
         ImageType image_type,
         glm::uvec3 image_size,
@@ -86,6 +96,7 @@ public:
         ImageUsageFlags usage,
         ImageTiling tiling,
         ImageLayout layout,
+        const std::source_location& src_location,
         ImageCreateFlags flags = 0,
         bool sharing = false,
         uint32_t num_samples = 1,
@@ -95,13 +106,15 @@ public:
         createShaderModule(
             uint64_t size,
             void* data,
-            ShaderStageFlagBits shader_stage) = 0;
+            ShaderStageFlagBits shader_stage,
+            const std::source_location& src_location) = 0;
     virtual std::shared_ptr<ImageView>
         createImageView(
         std::shared_ptr<Image> image,
         ImageViewType view_type,
         Format format,
         ImageAspectFlags aspect_flags,
+        const std::source_location& src_location,
         uint32_t base_mip = 0,
         uint32_t mip_count = 1,
         uint32_t base_layer = 0,
@@ -110,10 +123,19 @@ public:
         createFrameBuffer(
         const std::shared_ptr<RenderPass>& render_pass,
         const std::vector<std::shared_ptr<ImageView>>& attachments,
-        const glm::uvec2& extent) = 0;
-    virtual std::shared_ptr<Sampler> createSampler(Filter filter, SamplerAddressMode address_mode, SamplerMipmapMode mipmap_mode, float anisotropy) = 0;
-    virtual std::shared_ptr<Semaphore> createSemaphore() = 0;
-    virtual std::shared_ptr<Fence> createFence(bool signaled = false) = 0;
+        const glm::uvec2& extent,
+        const std::source_location& src_location) = 0;
+    virtual std::shared_ptr<Sampler> createSampler(
+        Filter filter,
+        SamplerAddressMode address_mode,
+        SamplerMipmapMode mipmap_mode,
+        float anisotropy,
+        const std::source_location& src_location) = 0;
+    virtual std::shared_ptr<Semaphore> createSemaphore(
+        const std::source_location& src_location) = 0;
+    virtual std::shared_ptr<Fence> createFence(
+        const std::source_location& src_location,
+        bool signaled = false) = 0;
     virtual void bindBufferMemory(std::shared_ptr<Buffer> buffer, std::shared_ptr<DeviceMemory> buffer_memory, uint64_t offset = 0) = 0;
     virtual void bindImageMemory(std::shared_ptr<Image> image, std::shared_ptr<DeviceMemory> image_memory, uint64_t offset = 0) = 0;
     virtual std::vector<std::shared_ptr<CommandBuffer>> allocateCommandBuffers(std::shared_ptr<CommandPool> cmd_pool, uint32_t num_buffers, bool is_primary = true) = 0;

@@ -21,19 +21,22 @@ void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     renderer::Format format,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::BufferUsageFlags& usage,
     const uint64_t& size,
-    const void* data);
+    const void* data,
+    const std::source_location& src_location);
 
 void loadMtx2Texture(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& cubemap_render_pass,
     const std::string& input_filename,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void saveDdsTexture(
     const glm::uvec3& size,

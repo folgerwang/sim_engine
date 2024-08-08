@@ -4,6 +4,7 @@
 #include <optional>
 #include <functional>
 #include <string>
+#include <source_location>
 
 #define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>

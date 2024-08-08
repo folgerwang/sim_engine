@@ -76,6 +76,7 @@ std::shared_ptr<RenderPass> createRenderPass(
     const std::shared_ptr<Device>& device,
     Format format,
     Format depth_format,
+    const std::source_location& src_location,
     bool clear/* = false */ ,
     SampleCountFlagBits sample_count/* = SampleCountFlagBits::SC_1_BIT*/,
     ImageLayout color_image_layout/* = ImageLayout::COLOR_ATTACHMENT_OPTIMAL*/) {
@@ -120,11 +121,13 @@ std::shared_ptr<RenderPass> createRenderPass(
     return device->createRenderPass(
         attachments,
         { subpass },
-        { depency });
+        { depency },
+        src_location);
 }
 
 std::shared_ptr<RenderPass> createCubemapRenderPass(
     const std::shared_ptr<Device>& device,
+    const std::source_location& src_location,
     Format format/* = Format::R16G16B16A16_SFLOAT */) {
     auto color_attachment = FillAttachmentDescription(
         format,
@@ -156,7 +159,8 @@ std::shared_ptr<RenderPass> createCubemapRenderPass(
     return device->createRenderPass(
         attachments,
         { subpass },
-        { depency });
+        { depency },
+        src_location);
 }
 
 DescriptorSetLayoutBinding getTextureSamplerDescriptionSetLayoutBinding(
@@ -397,14 +401,17 @@ static std::unordered_map<std::string, std::shared_ptr<ShaderModule>> s_shader_m
 std::shared_ptr<ShaderModule> loadShaderModule(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& shader_name,
-    const ShaderStageFlagBits& shader_stage) {
+    const ShaderStageFlagBits& shader_stage,
+    const std::source_location& src_location) {
     auto path_file_name = std::string("lib/shaders/") + shader_name;
     auto search_result = s_shader_module_list.find(path_file_name);
     std::shared_ptr<ShaderModule> result;
     if (search_result == s_shader_module_list.end()) {
         uint64_t shader_code_size;
-        auto shader_code = engine::helper::readFile(path_file_name.c_str(), shader_code_size);
-        auto shader_module = device->createShaderModule(shader_code_size, shader_code.data(), shader_stage);
+        auto shader_code =
+            engine::helper::readFile(path_file_name.c_str(), shader_code_size);
+        auto shader_module =
+            device->createShaderModule(shader_code_size, shader_code.data(), shader_stage, src_location);
         s_shader_module_list[path_file_name] = shader_module;
         result = shader_module;
     }
@@ -431,22 +438,28 @@ std::shared_ptr<renderer::PipelineLayout> createComputePipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = push_const_range_size;
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts, 
+        { push_const_range },
+        std::source_location::current());
 }
 
 std::shared_ptr<renderer::Pipeline> createComputePipeline(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
-    const std::string& compute_shader_name) {
+    const std::string& compute_shader_name,
+    const std::source_location& src_location) {
     auto shader_module =
         renderer::helper::loadShaderModule(
             device,
             compute_shader_name,
-            renderer::ShaderStageFlagBits::COMPUTE_BIT);
+            renderer::ShaderStageFlagBits::COMPUTE_BIT,
+            src_location);
 
     auto pipeline = device->createPipeline(
         pipeline_layout,
-        shader_module);
+        shader_module,
+        std::source_location::current());
 
     return pipeline;
 }

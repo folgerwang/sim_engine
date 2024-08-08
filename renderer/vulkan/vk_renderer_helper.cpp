@@ -1708,7 +1708,6 @@ renderer::PhysicalDeviceList collectPhysicalDevices(
     for (const auto& device : devices) {
         VkPhysicalDeviceProperties deviceProperties;
         vkGetPhysicalDeviceProperties(device, &deviceProperties);
-        std::cout << "Physical Device, id : " << idx << ", name : " << deviceProperties.deviceName << std::endl;
         auto physical_device = std::make_shared<renderer::vk::VulkanPhysicalDevice>();
         physical_device->set(device);
         physical_devices.push_back(physical_device);
@@ -1864,10 +1863,6 @@ bool isDeviceSuitable(
     assert(vk_physical_device);
     auto device = vk_physical_device->get();
 
-    initRayTracing(device);
-
-    initMeshShader(device);
-
     bool extensions_supported = checkDeviceExtensionSupport(physical_device);
 
     bool swap_chain_adequate = false;
@@ -1904,17 +1899,31 @@ std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
         throw std::runtime_error("failed to find a suitable GPU!");
     }
 #else
+    uint32_t idx = 0;
     for (const auto& device : physical_devices) {
+        const auto& vk_physical_device =
+            RENDER_TYPE_CAST(PhysicalDevice, device)->get();
+        VkPhysicalDeviceProperties deviceProperties;
+        vkGetPhysicalDeviceProperties(vk_physical_device, &deviceProperties);
+        std::cout << "Physical Device, id : " << idx << ", name : " << deviceProperties.deviceName << std::endl;
+
         if (isDeviceSuitable(device, surface)) {
             picked_device = device;
-            //break;
+            break;
         }
+        idx ++;
     }
 
     if (picked_device == VK_NULL_HANDLE) {
         throw std::runtime_error("failed to find a suitable GPU!");
     }
 #endif
+
+    const auto& vk_physical_device =
+        RENDER_TYPE_CAST(PhysicalDevice, picked_device)->get();
+
+    initRayTracing(vk_physical_device);
+    initMeshShader(vk_physical_device);
 
     return picked_device;
 }
@@ -2017,7 +2026,8 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
         RENDER_TYPE_CAST(PhysicalDevice, physical_device);
     assert(vk_physical_device);
     VkDevice vk_device;
-    if (vkCreateDevice(vk_physical_device->get(), &create_info, nullptr, &vk_device) != VK_SUCCESS) {
+    auto result = vkCreateDevice(vk_physical_device->get(), &create_info, nullptr, &vk_device);
+    if (result != VK_SUCCESS) {
         throw std::runtime_error("failed to create logical device!");
     }
 
@@ -2271,6 +2281,7 @@ void createTextureImage(
     const renderer::MemoryPropertyFlags& properties,
     std::shared_ptr<renderer::Image>& image,
     std::shared_ptr<renderer::DeviceMemory>& image_memory,
+    const std::source_location& src_location,
     bool with_mips/* = false*/) {
     uint32_t mip_count =
         with_mips ? uint32_t(std::log2(std::max(tex_size.x, tex_size.y))) : 1;
@@ -2283,6 +2294,7 @@ void createTextureImage(
         usage,
         tiling,
         renderer::ImageLayout::UNDEFINED,
+        src_location,
         0U,
         false,
         1U,
@@ -2635,7 +2647,8 @@ void generateMipmapLevels(
 void create2x2Texture(
     const std::shared_ptr<Device>& device,
     uint32_t color,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8G8B8A8_UNORM;
     uint32_t colors[4] = { color };
     renderer::Helper::create2DTextureImage(
@@ -2646,12 +2659,14 @@ void create2x2Texture(
         4,
         colors,
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
     texture.view = device->createImageView(
         texture.image,
         renderer::ImageViewType::VIEW_2D,
         format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+        SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+        src_location);
 }
 
 /*
@@ -2733,7 +2748,8 @@ static glm::vec4 s_g4[] = {
 
 void createPermutationTexture(
     const std::shared_ptr<renderer::Device>& device,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8_UNORM;
     renderer::Helper::create2DTextureImage(
         device,
@@ -2743,14 +2759,16 @@ void createPermutationTexture(
         1,
         s_permutation,
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.view =
         device->createImageView(
             texture.image,
             renderer::ImageViewType::VIEW_2D,
             format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 }
 
 // 2d permutation texture for optimized version
@@ -2761,7 +2779,8 @@ uint8_t perm(int i)
 
 void createPermutation2DTexture(
     const std::shared_ptr<renderer::Device>& device,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8G8B8A8_UNORM;
     auto n = sizeof(s_permutation) / sizeof(int8_t);
     std::vector<uint32_t> permutation_2d;
@@ -2788,14 +2807,16 @@ void createPermutation2DTexture(
         4,
         permutation_2d.data(),
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.view =
         device->createImageView(
             texture.image,
             renderer::ImageViewType::VIEW_2D,
             format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 }
 
 uint8_t safeConvert(float x) {
@@ -2813,7 +2834,8 @@ uint32_t packInitRgba8(const glm::vec4& data) {
 
 void createGradTexture(
     const std::shared_ptr<renderer::Device>& device,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = sizeof(s_g) / sizeof(glm::vec3);
     std::vector<uint32_t> grad;
@@ -2829,19 +2851,22 @@ void createGradTexture(
         4,
         grad.data(),
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.view =
         device->createImageView(
             texture.image,
             renderer::ImageViewType::VIEW_2D,
             format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 }
 
 void createPermGradTexture(
     const std::shared_ptr<renderer::Device>& device,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = 256;
     std::vector<uint32_t> grad;
@@ -2857,19 +2882,22 @@ void createPermGradTexture(
         4,
         grad.data(),
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.view =
         device->createImageView(
             texture.image,
             renderer::ImageViewType::VIEW_2D,
             format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 }
 
 void createPermGrad4DTexture(
     const std::shared_ptr<renderer::Device>& device,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = 256;
     std::vector<uint32_t> grad;
@@ -2885,19 +2913,22 @@ void createPermGrad4DTexture(
         4,
         grad.data(),
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.view =
         device->createImageView(
             texture.image,
             renderer::ImageViewType::VIEW_2D,
             format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 }
 
 void createGrad4DTexture(
     const std::shared_ptr<renderer::Device>& device,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     auto format = renderer::Format::R8G8B8A8_SNORM;
     auto n = 32;
     std::vector<uint32_t> grad;
@@ -2913,14 +2944,16 @@ void createGrad4DTexture(
         4,
         grad.data(),
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.view =
         device->createImageView(
             texture.image,
             renderer::ImageViewType::VIEW_2D,
             format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 }
 
 std::vector<VkPipelineShaderStageCreateInfo> getComputeShaderStages(

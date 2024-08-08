@@ -64,7 +64,8 @@ VulkanDevice::VulkanDevice(
             compute_queue_index,
             transit_queue_index);
 
-    transient_fence_ = createFence();
+    transient_fence_ =
+        createFence(std::source_location::current());
 }
 
 VulkanDevice::~VulkanDevice()
@@ -100,6 +101,7 @@ void VulkanDevice::submitAndWaitTransientCommandBuffer() {
 std::shared_ptr<Buffer> VulkanDevice::createBuffer(
     uint64_t buf_size,
     BufferUsageFlags usage,
+    const std::source_location& src_location,
     bool sharing/* = false*/) {
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -125,6 +127,7 @@ std::shared_ptr<Buffer> VulkanDevice::createBuffer(
         std::make_shared<VulkanBuffer>(
             buffer,
             static_cast<uint32_t>(buf_size));
+    vk_buffer->set_source_location(src_location);
     buffer_list_.push_back(vk_buffer);
 
     return vk_buffer;
@@ -136,8 +139,9 @@ void VulkanDevice::createBuffer(
     const MemoryPropertyFlags& properties,
     const MemoryAllocateFlags& allocate_flags,
     std::shared_ptr<Buffer>& buffer,
-    std::shared_ptr<DeviceMemory>& buffer_memory) {
-    buffer = createBuffer(buffer_size, usage);
+    std::shared_ptr<DeviceMemory>& buffer_memory,
+    const std::source_location& src_location) {
+    buffer = createBuffer(buffer_size, usage, src_location);
     auto mem_requirements = getBufferMemoryRequirements(buffer);
     buffer_memory = allocateMemory(mem_requirements.size,
         mem_requirements.memory_type_bits,
@@ -161,6 +165,7 @@ std::shared_ptr<Image> VulkanDevice::createImage(
     ImageUsageFlags usage,
     ImageTiling tiling,
     ImageLayout layout,
+    const std::source_location& src_location,
     ImageCreateFlags flags/* = 0*/,
     bool sharing/* = false*/,
     uint32_t num_samples/* = 1*/,
@@ -199,6 +204,7 @@ std::shared_ptr<Image> VulkanDevice::createImage(
     auto vk_image =
         std::make_shared<VulkanImage>(image);
     vk_image->setImageLayout(layout);
+    vk_image->set_source_location(src_location);
     image_list_.push_back(vk_image);
 
     return vk_image;
@@ -209,6 +215,7 @@ std::shared_ptr<ImageView> VulkanDevice::createImageView(
     ImageViewType view_type,
     Format format,
     ImageAspectFlags aspect_flags,
+    const std::source_location& src_location,
     uint32_t base_mip/* = 0*/,
     uint32_t mip_count/* = 1*/,
     uint32_t base_layer/* = 0*/,
@@ -242,12 +249,19 @@ std::shared_ptr<ImageView> VulkanDevice::createImageView(
 
     auto vk_image_view =
         std::make_shared<VulkanImageView>(image_view);
+    vk_image_view->set_source_location(src_location);
     image_view_list_.push_back(vk_image_view);
 
     return vk_image_view;
 }
 
-std::shared_ptr<Sampler> VulkanDevice::createSampler(Filter filter, SamplerAddressMode address_mode, SamplerMipmapMode mipmap_mode, float anisotropy) {
+std::shared_ptr<Sampler>
+VulkanDevice::createSampler(
+    Filter filter,
+    SamplerAddressMode address_mode,
+    SamplerMipmapMode mipmap_mode,
+    float anisotropy,
+    const std::source_location& src_location) {
     auto vk_filter = helper::toVkFilter(filter);
     auto vk_address_mode = helper::toVkSamplerAddressMode(address_mode);
     auto vk_mipmap_mode = helper::toVkSamplerMipmapMode(mipmap_mode);
@@ -286,12 +300,14 @@ std::shared_ptr<Sampler> VulkanDevice::createSampler(Filter filter, SamplerAddre
 
     auto vk_tex_sampler =
         std::make_shared<VulkanSampler>(tex_sampler);
+    vk_tex_sampler->set_source_location(src_location);
     sampler_list_.push_back(vk_tex_sampler);
 
     return vk_tex_sampler;
 }
 
-std::shared_ptr<Semaphore> VulkanDevice::createSemaphore() {
+std::shared_ptr<Semaphore> VulkanDevice::createSemaphore(
+    const std::source_location& src_location) {
     VkTimelineSemaphoreSubmitInfo timeline_info = {};
     timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     timeline_info.pNext = nullptr;
@@ -326,12 +342,15 @@ std::shared_ptr<Semaphore> VulkanDevice::createSemaphore() {
 
     auto vk_semaphore =
         std::make_shared<VulkanSemaphore>(semaphore);
+    vk_semaphore->set_source_location(src_location);
     semaphore_list_.push_back(vk_semaphore);
 
     return vk_semaphore;
 }
 
-std::shared_ptr<Fence> VulkanDevice::createFence(bool signaled/* = false*/) {
+std::shared_ptr<Fence> VulkanDevice::createFence(
+    const std::source_location& src_location,
+    bool signaled/* = false*/) {
     VkFenceCreateInfo fence_info{};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (signaled) {
@@ -354,6 +373,7 @@ std::shared_ptr<Fence> VulkanDevice::createFence(bool signaled/* = false*/) {
 
     auto vk_fence =
         std::make_shared<VulkanFence>(fence);
+    vk_fence->set_source_location(src_location);
     fence_list_.push_back(vk_fence);
     
     return vk_fence;
@@ -363,7 +383,8 @@ std::shared_ptr<ShaderModule>
 VulkanDevice::createShaderModule(
     uint64_t size,
     void* data,
-    ShaderStageFlagBits shader_stage) {
+    ShaderStageFlagBits shader_stage,
+    const std::source_location& src_location) {
     VkShaderModuleCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     create_info.codeSize = size;
@@ -387,6 +408,7 @@ VulkanDevice::createShaderModule(
         std::make_shared<VulkanShaderModule>(
             shader_module,
             shader_stage);
+    vk_shader_module->set_source_location(src_location),
     shader_list_.push_back(vk_shader_module);
 
     return vk_shader_module;
@@ -474,7 +496,8 @@ std::shared_ptr<DescriptorSetLayout> VulkanDevice::createDescriptorSetLayout(
 std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
     const std::vector<AttachmentDescription>& attachments,
     const std::vector<SubpassDescription>& subpasses,
-    const std::vector<SubpassDependency>& dependencies) {
+    const std::vector<SubpassDependency>& dependencies,
+    const std::source_location& src_location) {
 
     std::vector<VkAttachmentDescription> vk_attachments(attachments.size());
     for (int i = 0; i < attachments.size(); i++) {
@@ -524,6 +547,7 @@ std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
 
     auto vk_render_pass =
         std::make_shared<VulkanRenderPass>(render_pass);
+    vk_render_pass->set_source_location(src_location);
     render_pass_list_.push_back(vk_render_pass);
 
     return vk_render_pass;
@@ -569,7 +593,8 @@ DescriptorSetList VulkanDevice::createDescriptorSets(
 
 std::shared_ptr<PipelineLayout> VulkanDevice::createPipelineLayout(
     const DescriptorSetLayoutList& desc_set_layouts,
-    const std::vector<PushConstantRange>& push_const_ranges) {
+    const std::vector<PushConstantRange>& push_const_ranges,
+    const std::source_location& src_location) {
 
     std::vector<VkPushConstantRange> vk_push_const_ranges;
     vk_push_const_ranges.reserve(push_const_ranges.size());
@@ -611,6 +636,7 @@ std::shared_ptr<PipelineLayout> VulkanDevice::createPipelineLayout(
 
     auto vk_pipeline_layout =
         std::make_shared<VulkanPipelineLayout>(pipeline_layout);
+    vk_pipeline_layout->set_source_location(src_location);
     pipeline_layout_list_.push_back(vk_pipeline_layout);
 
     return vk_pipeline_layout;
@@ -624,7 +650,8 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     const PipelineInputAssemblyStateCreateInfo& topology_info,
     const GraphicPipelineInfo& graphic_pipeline_info,
     const ShaderModuleList& shader_modules,
-    const glm::uvec2& extent) {
+    const glm::uvec2& extent,
+    const std::source_location& src_location) {
 
     VkGraphicsPipelineCreateInfo pipeline_info{};
 
@@ -686,6 +713,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(graphics_pipeline);
+    vk_pipeline->set_source_location(src_location);
     pipeline_list_.push_back(vk_pipeline);
 
     return vk_pipeline;
@@ -693,7 +721,8 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
 std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     const std::shared_ptr<PipelineLayout>& pipeline_layout,
-    const std::shared_ptr<ShaderModule>& shader_module) {
+    const std::shared_ptr<ShaderModule>& shader_module,
+    const std::source_location& src_location) {
     auto shader_stages = helper::getShaderStages({ shader_module });
 
     auto vk_compute_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
@@ -725,6 +754,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(compute_pipeline);
+    vk_pipeline->set_source_location(src_location);
     pipeline_list_.push_back(vk_pipeline);
 
     return vk_pipeline;
@@ -734,6 +764,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     const std::shared_ptr<PipelineLayout>& pipeline_layout, 
     const ShaderModuleList& src_shader_modules,
     const RtShaderGroupCreateInfoList& src_shader_groups,
+    const std::source_location& src_location,
     const uint32_t ray_recursion_depth /*= 1*/) {
 
     auto vk_rt_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
@@ -770,6 +801,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(rt_pipeline);
+    vk_pipeline->set_source_location(src_location);
     pipeline_list_.push_back(vk_pipeline);
 
     return vk_pipeline;
@@ -831,7 +863,8 @@ std::shared_ptr<Swapchain> VulkanDevice::createSwapchain(
 std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
     const std::shared_ptr<RenderPass>& render_pass,
     const std::vector<std::shared_ptr<ImageView>>& attachments,
-    const glm::uvec2& extent) {
+    const glm::uvec2& extent,
+    const std::source_location& src_location) {
 
     std::vector<VkImageView> image_views(attachments.size());
     for (int i = 0; i < attachments.size(); i++) {
@@ -865,6 +898,7 @@ std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
 
     auto vk_frame_buffer =
         std::make_shared<VulkanFramebuffer>(frame_buffer);
+    vk_frame_buffer->set_source_location(src_location);
     framebuffer_list_.push_back(vk_frame_buffer);
 
     return vk_frame_buffer;

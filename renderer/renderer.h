@@ -4,6 +4,7 @@
 #include <array>
 #include <unordered_map>
 #include <optional>
+#include <source_location>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -38,6 +39,17 @@ public:
 class PhysicalDevice {
 };
 
+class DeviceDebug {
+    std::source_location location_;
+public:
+    virtual void set_source_location(const std::source_location& location) {
+        location_ = location;
+    }
+    virtual std::source_location get_source_location() {
+        return location_;
+    }
+};
+
 class Surface {
 };
 
@@ -47,40 +59,40 @@ class Swapchain {
 class DescriptorPool {
 };
 
-class Pipeline {
+class Pipeline : public DeviceDebug {
 };
 
-class PipelineLayout {
+class PipelineLayout : public DeviceDebug {
 };
 
-class RenderPass {
+class RenderPass : public DeviceDebug {
 };
 
-class Framebuffer {
+class Framebuffer : public DeviceDebug {
 };
 
-class ImageView {
+class ImageView : public DeviceDebug {
 };
 
-class Sampler {
+class Sampler : public DeviceDebug {
 };
 
-class Image {
+class Image : public DeviceDebug {
 public:
     virtual ImageLayout getImageLayout() = 0;
     virtual void setImageLayout(ImageLayout layout) = 0;
 };
 
-class Buffer {
+class Buffer : public DeviceDebug {
 public:
     virtual uint32_t getSize() = 0;
     virtual uint64_t getDeviceAddress() = 0;
 };
 
-class Semaphore {
+class Semaphore : public DeviceDebug {
 };
 
-class Fence {
+class Fence : public DeviceDebug {
 };
 
 class DeviceMemory {
@@ -92,7 +104,7 @@ class DescriptorSetLayout {
 class DescriptorSet {
 };
 
-class ShaderModule {
+class ShaderModule : public DeviceDebug {
 };
 
 namespace vk {
@@ -379,7 +391,8 @@ public:
         int tex_channels,
         const void* pixels,
         std::shared_ptr<Image>& texture_image,
-        std::shared_ptr<DeviceMemory>& texture_image_memory);
+        std::shared_ptr<DeviceMemory>& texture_image_memory,
+        const std::source_location& src_location);
 
     static void create2DTextureImage(
         const std::shared_ptr<renderer::Device>& device,
@@ -388,6 +401,7 @@ public:
         TextureInfo& texture_info,
         const renderer::ImageUsageFlags& usage,
         const renderer::ImageLayout& image_layout,
+        const std::source_location& src_location,
         const renderer::ImageTiling image_tiling = renderer::ImageTiling::OPTIMAL,
         const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         bool with_mips = false);
@@ -398,7 +412,8 @@ public:
         Format depth_format,
         const glm::uvec3& buffer_size,
         const uint32_t& bytes_per_pixel,
-        void* pixels);
+        void* pixels,
+        const std::source_location& src_location);
 
     static void create3DTextureImage(
         const std::shared_ptr<renderer::Device>& device,
@@ -407,6 +422,7 @@ public:
         TextureInfo& texture_info,
         const renderer::ImageUsageFlags& usage,
         const renderer::ImageLayout& image_layout,
+        const std::source_location& src_location,
         const renderer::ImageTiling image_tiling = renderer::ImageTiling::OPTIMAL,
         const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
@@ -414,7 +430,8 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         Format format,
         glm::uvec2 size,
-        TextureInfo& texture_2d);
+        TextureInfo& texture_2d,
+        const std::source_location& src_location);
 
     static void createCubemapTexture(
         const std::shared_ptr<renderer::Device>& device,
@@ -425,6 +442,7 @@ public:
         Format format,
         const std::vector<BufferImageCopyInfo>& copy_regions,
         TextureInfo& texture,
+        const std::source_location& src_location,
         uint64_t buffer_size = 0,
         void* data = nullptr);
 
@@ -435,6 +453,7 @@ public:
         const MemoryAllocateFlags& allocate_flags,
         std::shared_ptr<Buffer>& buffer,
         std::shared_ptr<DeviceMemory>& buffer_memory,
+        const std::source_location& src_location,
         const uint64_t buffer_size = 0,
         const void* src_data = nullptr);
 
@@ -442,7 +461,8 @@ public:
         const std::shared_ptr<Device>& device,
         const uint64_t& buffer_size,
         const void* src_data,
-        const std::shared_ptr<Buffer>& buffer);
+        const std::shared_ptr<Buffer>& buffer,
+        const std::source_location& src_location);
 
     static void updateBufferWithSrcData(
         const std::shared_ptr<Device>& device,

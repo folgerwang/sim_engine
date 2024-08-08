@@ -193,6 +193,7 @@ void createTextureImage(
     const renderer::MemoryPropertyFlags& properties,
     std::shared_ptr<renderer::Image>& image,
     std::shared_ptr<renderer::DeviceMemory>& image_memory,
+    const std::source_location& src_location,
     bool with_mips = false);
 
 void copyBuffer(
@@ -254,31 +255,38 @@ void generateMipmapLevels(
 void create2x2Texture(
     const std::shared_ptr<Device>& device,
     uint32_t color,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void createPermutationTexture(
     const std::shared_ptr<Device>& device,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void createPermutation2DTexture(
     const std::shared_ptr<Device>& device,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void createGradTexture(
     const std::shared_ptr<Device>& device,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void createPermGradTexture(
     const std::shared_ptr<Device>& device,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void createPermGrad4DTexture(
     const std::shared_ptr<Device>& device,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 void createGrad4DTexture(
     const std::shared_ptr<Device>& device,
-    renderer::TextureInfo& texture);
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location);
 
 std::vector<VkPipelineShaderStageCreateInfo> getComputeShaderStages(
     const std::vector<std::shared_ptr<renderer::ShaderModule>>& shader_modules);

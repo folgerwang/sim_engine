@@ -275,7 +275,8 @@ VolumeNoise::VolumeNoise(
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
     
     renderer::Helper::create3DTextureImage(
         device,
@@ -287,7 +288,8 @@ VolumeNoise::VolumeNoise(
         rough_noise_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     noise_init_desc_set_layout_ =
         device->createDescriptorSetLayout(
@@ -391,7 +393,8 @@ void VolumeNoise::recreate(
         erh::createComputePipeline(
             device,
             noise_init_pipeline_layout_,
-            "perlin_noise_init_comp.spv");
+            "perlin_noise_init_comp.spv",
+            std::source_location::current());
 
 #if 0
     // create a global ibl texture descriptor set.

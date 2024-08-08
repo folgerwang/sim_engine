@@ -117,6 +117,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->vertex_buffer.buffer,
         bl_data_info->vertex_buffer.memory,
+        std::source_location::current(),
         vertices.size() * sizeof(Vertex),
         vertices.data());
 
@@ -131,6 +132,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->index_buffer.buffer,
         bl_data_info->index_buffer.memory,
+        std::source_location::current(),
         indices.size() * sizeof(uint32_t),
         indices.data());
 
@@ -144,6 +146,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->transform_buffer.buffer,
         bl_data_info->transform_buffer.memory,
+        std::source_location::current(),
         sizeof(glm::mat3x4) * g_object_count,
         &transform_matrices[0]);
 
@@ -189,7 +192,8 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->as_buffer.buffer,
-        bl_data_info->as_buffer.memory);
+        bl_data_info->as_buffer.memory,
+        std::source_location::current());
 
     bl_data_info->as_handle = device->createAccelerationStructure(
         bl_data_info->as_buffer.buffer,
@@ -202,7 +206,8 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->scratch_buffer.buffer,
-        bl_data_info->scratch_buffer.memory);
+        bl_data_info->scratch_buffer.memory,
+        std::source_location::current());
 
     as_build_geometry_info.mode = renderer::BuildAccelerationStructureMode::BUILD_KHR;
     as_build_geometry_info.dst_as = bl_data_info->as_handle;
@@ -261,6 +266,7 @@ void RayTracingCallableTest::initTopLevelDataInfo(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         tl_data_info->instance_buffer.buffer,
         tl_data_info->instance_buffer.memory,
+        std::source_location::current(),
         sizeof(instance),
         &instance);
 
@@ -299,7 +305,8 @@ void RayTracingCallableTest::initTopLevelDataInfo(
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         tl_data_info->as_buffer.buffer,
-        tl_data_info->as_buffer.memory);
+        tl_data_info->as_buffer.memory,
+        std::source_location::current());
 
     tl_data_info->as_handle = device->createAccelerationStructure(
         tl_data_info->as_buffer.buffer,
@@ -312,7 +319,8 @@ void RayTracingCallableTest::initTopLevelDataInfo(
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         tl_data_info->scratch_buffer.buffer,
-        tl_data_info->scratch_buffer.memory);
+        tl_data_info->scratch_buffer.memory,
+        std::source_location::current());
 
     as_build_geometry_info.mode = renderer::BuildAccelerationStructureMode::BUILD_KHR;
     as_build_geometry_info.dst_as = tl_data_info->as_handle;
@@ -346,17 +354,20 @@ void RayTracingCallableTest::createRayTracingPipeline(
         renderer::helper::loadShaderModule(
             device,
             "ray_tracing/callable_test/rt_raygen_rgen.spv",
-            renderer::ShaderStageFlagBits::RAYGEN_BIT_KHR);
+            renderer::ShaderStageFlagBits::RAYGEN_BIT_KHR,
+            std::source_location::current());
     rt_render_info->shader_modules[kRayMissIndex] =
         renderer::helper::loadShaderModule(
             device,
             "ray_tracing/callable_test/rt_miss_rmiss.spv",
-            renderer::ShaderStageFlagBits::MISS_BIT_KHR);
+            renderer::ShaderStageFlagBits::MISS_BIT_KHR,
+            std::source_location::current());
     rt_render_info->shader_modules[kClosestHitIndex] =
         renderer::helper::loadShaderModule(
             device,
             "ray_tracing/callable_test/rt_closesthit_rchit.spv",
-            renderer::ShaderStageFlagBits::CLOSEST_HIT_BIT_KHR);
+            renderer::ShaderStageFlagBits::CLOSEST_HIT_BIT_KHR,
+            std::source_location::current());
     for (auto i = 0; i < g_object_count; i++) {
         auto index = kCallable1Index + static_cast<uint32_t>(i);
         auto callable_shader_name =
@@ -367,7 +378,8 @@ void RayTracingCallableTest::createRayTracingPipeline(
             renderer::helper::loadShaderModule(
                 device,
                 callable_shader_name,
-                renderer::ShaderStageFlagBits::CALLABLE_BIT_KHR);
+                renderer::ShaderStageFlagBits::CALLABLE_BIT_KHR,
+                std::source_location::current());
     }
 
     rt_render_info->shader_groups.resize(kNumRtShaders);
@@ -386,12 +398,15 @@ void RayTracingCallableTest::createRayTracingPipeline(
     rt_render_info->rt_desc_set_layout = createRtDescriptorSetLayout(device);
     rt_render_info->rt_pipeline_layout =
         device->createPipelineLayout(
-            { rt_render_info->rt_desc_set_layout }, { });
+            { rt_render_info->rt_desc_set_layout },
+            { },
+            std::source_location::current());
     rt_render_info->rt_pipeline =
         device->createPipeline(
             rt_render_info->rt_pipeline_layout,
             rt_render_info->shader_modules,
             rt_render_info->shader_groups,
+            std::source_location::current(),
             2);
 }
 
@@ -427,6 +442,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         rt_render_info->raygen_shader_binding_table.buffer,
         rt_render_info->raygen_shader_binding_table.memory,
+        std::source_location::current(),
         handle_size,
         shader_handle_storage.data());
 
@@ -439,6 +455,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         rt_render_info->miss_shader_binding_table.buffer,
         rt_render_info->miss_shader_binding_table.memory,
+        std::source_location::current(),
         handle_size,
         shader_handle_storage.data() + handle_size_aligned);
 
@@ -451,6 +468,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         rt_render_info->hit_shader_binding_table.buffer,
         rt_render_info->hit_shader_binding_table.memory,
+        std::source_location::current(),
         handle_size,
         shader_handle_storage.data() + handle_size_aligned * 2);
 
@@ -463,6 +481,7 @@ void RayTracingCallableTest::createShaderBindingTables(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         rt_render_info->callable_shader_binding_table.buffer,
         rt_render_info->callable_shader_binding_table.memory,
+        std::source_location::current(),
         handle_size * g_object_count,
         shader_handle_storage.data() + handle_size_aligned * 3);
 
@@ -500,7 +519,8 @@ void RayTracingCallableTest::createRtResources(
         SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
         0,
         rt_render_info->ubo.buffer,
-        rt_render_info->ubo.memory);
+        rt_render_info->ubo.memory,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -509,7 +529,8 @@ void RayTracingCallableTest::createRtResources(
         rt_render_info->result_image,
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 }
 
 void RayTracingCallableTest::createDescriptorSets(

@@ -333,7 +333,9 @@ WeatherSystem::WeatherSystem(
             temp_volume_[i],
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
+
         renderer::Helper::create3DTextureImage(
             device,
             renderer::Format::R16_SFLOAT,
@@ -344,7 +346,9 @@ WeatherSystem::WeatherSystem(
             moisture_volume_[i],
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
+
         renderer::Helper::create3DTextureImage(
             device,
             renderer::Format::R16_SFLOAT,
@@ -355,7 +359,8 @@ WeatherSystem::WeatherSystem(
             pressure_volume_[i],
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
     }
 
     renderer::Helper::create2DTextureImage(
@@ -367,7 +372,8 @@ WeatherSystem::WeatherSystem(
         temp_ground_airflow_info_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -378,7 +384,8 @@ WeatherSystem::WeatherSystem(
         ground_airflow_info_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     renderer::Helper::create3DTextureImage(
         device,
@@ -390,7 +397,8 @@ WeatherSystem::WeatherSystem(
         airflow_volume_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     uint32_t buffer_height = kAirflowBufferHeight;
     renderer::Helper::create3DTextureImage(
@@ -403,7 +411,8 @@ WeatherSystem::WeatherSystem(
         cloud_shadow_volume_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     temperature_init_desc_set_layout_ = createTemperatureInitDescSetLayout(device);
     airflow_desc_set_layout_ = createAirflowUpdateDescSetLayout(device);
@@ -509,7 +518,8 @@ void WeatherSystem::recreate(
     temperature_init_pipeline_ = erh::createComputePipeline(
         device,
         temperature_init_pipeline_layout_,
-        "weather/temperature_init_comp.spv");
+        "weather/temperature_init_comp.spv",
+        std::source_location::current());
 
     airflow_pipeline_layout_ =
         erh::createComputePipelineLayout(
@@ -520,7 +530,8 @@ void WeatherSystem::recreate(
     airflow_pipeline_ = erh::createComputePipeline(
         device,
         airflow_pipeline_layout_,
-        "weather/airflow_update_comp.spv");
+        "weather/airflow_update_comp.spv",
+        std::source_location::current());
 
     cloud_shadow_pipeline_layout_ =
         erh::createComputePipelineLayout(
@@ -531,7 +542,8 @@ void WeatherSystem::recreate(
     cloud_shadow_init_pipeline_ = erh::createComputePipeline(
         device,
         cloud_shadow_pipeline_layout_,
-        "weather/cloud_shadow_init_comp.spv");
+        "weather/cloud_shadow_init_comp.spv",
+        std::source_location::current());
 
     cloud_shadow_merge_pipeline_layout_ =
         erh::createComputePipelineLayout(
@@ -542,7 +554,8 @@ void WeatherSystem::recreate(
     cloud_shadow_merge_pipeline_ = erh::createComputePipeline(
         device,
         cloud_shadow_merge_pipeline_layout_,
-        "weather/cloud_shadow_merge_comp.spv");
+        "weather/cloud_shadow_merge_comp.spv",
+        std::source_location::current());
 }
 
 // update air flow buffer.

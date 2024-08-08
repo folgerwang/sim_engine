@@ -1,4 +1,4 @@
-#include "hair_test.h"
+#include "lbm_test.h"
 #include "engine_helper.h"
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -7,7 +7,7 @@
 namespace engine {
 namespace {
 
-static auto createHairTestDescriptorSetLayout(
+static auto createLbmTestDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
     bindings.reserve(1);
@@ -21,7 +21,7 @@ static auto createHairTestDescriptorSetLayout(
     return device->createDescriptorSetLayout(bindings);
 }
 
-static auto addHairTestTextures(
+static auto addLbmTestTextures(
     const std::shared_ptr<renderer::DescriptorSet>& desc_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::shared_ptr<renderer::ImageView>& src_image) {
@@ -66,40 +66,40 @@ static auto createPipelineLayout(
 
 namespace game_object {
 
-HairTest::HairTest(
+LbmTest::LbmTest(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::TextureInfo>& hair_patch_tex,
+    const std::shared_ptr<renderer::TextureInfo>& lbm_patch_tex,
     const glm::uvec2& display_size,
     std::shared_ptr<Plane> unit_plane) {
 
-    hair_desc_set_layout_ =
-        createHairTestDescriptorSetLayout(
+    lbm_desc_set_layout_ =
+        createLbmTestDescriptorSetLayout(
             device);
 
-    hair_desc_set_ =
+    lbm_desc_set_ =
         device->createDescriptorSets(
-            descriptor_pool, hair_desc_set_layout_, 1)[0];
+            descriptor_pool, lbm_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto hair_test_material_descs =
-        addHairTestTextures(
-            hair_desc_set_,
+    auto lbm_test_material_descs =
+        addLbmTestTextures(
+            lbm_desc_set_,
             texture_sampler,
-            hair_patch_tex->view);
+            lbm_patch_tex->view);
 
     device->updateDescriptorSets(
-        hair_test_material_descs);
+        lbm_test_material_descs);
 
-    hair_pipeline_layout_ =
+    lbm_pipeline_layout_ =
         createPipelineLayout(
             device,
             global_desc_set_layouts,
-            hair_desc_set_layout_);
+            lbm_desc_set_layout_);
 
     renderer::PipelineInputAssemblyStateCreateInfo input_assembly;
     input_assembly.topology = renderer::PrimitiveTopology::TRIANGLE_LIST;
@@ -109,20 +109,20 @@ HairTest::HairTest(
     shader_modules[0] =
         renderer::helper::loadShaderModule(
             device,
-            "hair_test_vert.spv",
+            "lbm_test_vert.spv",
             renderer::ShaderStageFlagBits::VERTEX_BIT,
             std::source_location::current());
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
-            "hair_test_frag.spv",
+            "lbm_test_frag.spv",
             renderer::ShaderStageFlagBits::FRAGMENT_BIT,
             std::source_location::current());
 
-    hair_pipeline_ =
+    lbm_pipeline_ =
         device->createPipeline(
             render_pass,
-            hair_pipeline_layout_,
+            lbm_pipeline_layout_,
             unit_plane->getBindingDescs(),
             unit_plane->getAttribDescs(),
             input_assembly,
@@ -132,7 +132,7 @@ HairTest::HairTest(
             std::source_location::current());
 }
 
-void HairTest::draw(
+void LbmTest::draw(
     const std::shared_ptr<renderer::Device>& device,
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
@@ -141,14 +141,14 @@ void HairTest::draw(
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
-        hair_pipeline_);
+        lbm_pipeline_);
 
     renderer::DescriptorSetList desc_sets = desc_set_list;
-    desc_sets.push_back(hair_desc_set_);
+    desc_sets.push_back(lbm_desc_set_);
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
-        hair_pipeline_layout_,
+        lbm_pipeline_layout_,
         desc_sets);
 
     glsl::PrtLightParams params{};
@@ -162,7 +162,7 @@ void HairTest::draw(
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-        hair_pipeline_layout_,
+        lbm_pipeline_layout_,
         &params,
         sizeof(params));
 
@@ -175,11 +175,11 @@ void HairTest::draw(
     }*/
 }
 
-void HairTest::destroy(
+void LbmTest::destroy(
     const std::shared_ptr<renderer::Device>& device) {
-    device->destroyDescriptorSetLayout(hair_desc_set_layout_);
-    device->destroyPipelineLayout(hair_pipeline_layout_);
-    device->destroyPipeline(hair_pipeline_);
+    device->destroyDescriptorSetLayout(lbm_desc_set_layout_);
+    device->destroyPipelineLayout(lbm_pipeline_layout_);
+    device->destroyPipeline(lbm_pipeline_);
 }
 
 } // game_object

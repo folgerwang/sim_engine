@@ -162,6 +162,12 @@
     <ClCompile Include="game_object\hair_patch.cpp">
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\lbm_patch.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
+    <ClCompile Include="game_object\lbm_test.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -321,6 +327,12 @@
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
     <ClInclude Include="game_object\hair_patch.h">
+      <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\lbm_test.h">
+      <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\lbm_patch.h">
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
@@ -518,6 +530,15 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="shaders\hair_patch.comp">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\lbm_test.frag">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\lbm_test.vert">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\lbm_patch.comp">
       <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>

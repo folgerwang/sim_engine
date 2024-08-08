@@ -311,7 +311,10 @@ static auto createPipelineLayout(
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
     desc_set_layouts.push_back(prt_desc_set_layout);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 } // namespace
@@ -350,7 +353,8 @@ ConemapTest::ConemapTest(
         SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
         0,
         uniform_buffer_->buffer,
-        uniform_buffer_->memory);
+        uniform_buffer_->memory,
+        std::source_location::current());
 
     // create a global ibl texture descriptor set.
     auto prt_test_material_descs =
@@ -381,12 +385,14 @@ ConemapTest::ConemapTest(
         renderer::helper::loadShaderModule(
             device,
             "conemap_test_vert.spv",
-            renderer::ShaderStageFlagBits::VERTEX_BIT);
+            renderer::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
             "conemap_test_frag.spv",
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
 
     prt_pipeline_ = device->createPipeline(
         render_pass,
@@ -396,7 +402,8 @@ ConemapTest::ConemapTest(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 }
 
 void ConemapTest::draw(

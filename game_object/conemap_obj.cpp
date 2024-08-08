@@ -183,7 +183,8 @@ static auto generateMinmaxDepthPipelineLayout(
 
     return device->createPipelineLayout(
         { desc_set_layout },
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 } // namespace
 
@@ -222,7 +223,8 @@ ConemapObj::ConemapObj(
         *minmax_depth_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -231,7 +233,8 @@ ConemapObj::ConemapObj(
         *conemap_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -240,7 +243,8 @@ ConemapObj::ConemapObj(
         *prt_pack_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     glm::uvec2 pack_info_tex_size =
         buffer_size /
@@ -254,7 +258,8 @@ ConemapObj::ConemapObj(
         *prt_pack_info_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     // create prt texture descriptor sets.
     prt_shadow_gen_tex_desc_set_ =
@@ -357,7 +362,8 @@ ConemapObj::ConemapObj(
         renderer::helper::createComputePipeline(
             device,
             gen_minmax_depth_pipeline_layout_,
-            "gen_minmax_depth_comp.spv");
+            "gen_minmax_depth_comp.spv",
+            std::source_location::current());
 }
 
 void ConemapObj::update(

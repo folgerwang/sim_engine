@@ -104,6 +104,7 @@ static void setupMeshState(
                 SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
                 gltf_object->buffers_[i].buffer,
                 gltf_object->buffers_[i].memory,
+                std::source_location::current(),
                 buffer.data.size(),
                 buffer.data.data());
         }
@@ -154,7 +155,8 @@ static void setupMeshState(
                 SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
                 0,
                 dst_material.uniform_buffer_.buffer,
-                dst_material.uniform_buffer_.memory);
+                dst_material.uniform_buffer_.memory,
+                std::source_location::current());
 
             glsl::PbrMaterialParams ubo{};
             ubo.base_color_factor = glm::vec4(
@@ -213,13 +215,15 @@ static void setupMeshState(
                 src_img.component,
                 src_img.image.data(),
                 dst_tex.image,
-                dst_tex.memory);
+                dst_tex.memory,
+                std::source_location::current());
 
             dst_tex.view = device->createImageView(
                 dst_tex.image,
                 renderer::ImageViewType::VIEW_2D,
                 format,
-                SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                std::source_location::current());
         }
     }
 }
@@ -519,6 +523,7 @@ static void setupSkin(
             0,
             skin_info.joints_buffer_.buffer,
             skin_info.joints_buffer_.memory,
+            std::source_location::current(),
             src_data_size,
             src_buffer_data);
     }
@@ -935,7 +940,10 @@ static std::shared_ptr<renderer::PipelineLayout> createGltfPipelineLayout(
     desc_set_layouts.push_back(material_desc_set_layout);
     desc_set_layouts.push_back(skin_desc_set_layout);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static renderer::ShaderModuleList getGltfShaderModules(
@@ -958,13 +966,15 @@ static renderer::ShaderModuleList getGltfShaderModules(
         renderer::helper::loadShaderModule(
             device,
             "base_vert" + vert_feature_str + ".spv",
-            renderer::ShaderStageFlagBits::VERTEX_BIT);
+            renderer::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
 
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
             "base_frag" + frag_feature_str + ".spv",
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
 
     return shader_modules;
 }
@@ -1024,7 +1034,8 @@ static std::shared_ptr<renderer::Pipeline> createGltfPipeline(
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 
     return gltf_pipeline;
 }
@@ -1200,7 +1211,10 @@ static std::shared_ptr<renderer::PipelineLayout> createGltfIndirectDrawPipelineL
     push_const_range.offset = 0;
     push_const_range.size = sizeof(uint32_t);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createGameObjectsPipelineLayout(
@@ -1211,7 +1225,10 @@ static std::shared_ptr<renderer::PipelineLayout> createGameObjectsPipelineLayout
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::GameObjectsUpdateParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createInstanceBufferPipelineLayout(
@@ -1222,7 +1239,10 @@ static std::shared_ptr<renderer::PipelineLayout> createInstanceBufferPipelineLay
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::InstanceBufferUpdateParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 } // namespace
@@ -1468,7 +1488,8 @@ GltfObject::GltfObject(
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0,
             object_->instance_buffer_.buffer,
-            object_->instance_buffer_.memory);
+            object_->instance_buffer_.memory,
+            std::source_location::current());
 
         object_->generateSharedDescriptorSet(
             device,
@@ -1556,7 +1577,8 @@ void GltfObject::initGameObjectBuffer(
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0,
             game_objects_buffer_->buffer,
-            game_objects_buffer_->memory);
+            game_objects_buffer_->memory,
+            std::source_location::current());
     }
 }
 
@@ -1661,7 +1683,8 @@ void GltfObject::createStaticMembers(
                 renderer::helper::createComputePipeline(
                     device,
                     gltf_indirect_draw_pipeline_layout_,
-                    "update_gltf_indirect_draw_comp.spv");
+                    "update_gltf_indirect_draw_comp.spv",
+                    std::source_location::current());
         }
     }
 
@@ -1691,7 +1714,8 @@ void GltfObject::createStaticMembers(
                 renderer::helper::createComputePipeline(
                     device,
                     update_game_objects_pipeline_layout_,
-                    "update_game_objects_comp.spv");
+                    "update_game_objects_comp.spv",
+                    std::source_location::current());
         }
     }
 
@@ -1721,7 +1745,8 @@ void GltfObject::createStaticMembers(
                 renderer::helper::createComputePipeline(
                     device,
                     update_instance_buffer_pipeline_layout_,
-                    "update_instance_buffer_comp.spv");
+                    "update_instance_buffer_comp.spv",
+                    std::source_location::current());
         }
     }
 }
@@ -2062,6 +2087,7 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
         0,
         gltf_object->indirect_draw_cmd_.buffer,
         gltf_object->indirect_draw_cmd_.memory,
+        std::source_location::current(),
         indirect_draw_cmd_buffer.size() * sizeof(uint32_t),
         indirect_draw_cmd_buffer.data());
 

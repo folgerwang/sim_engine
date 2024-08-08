@@ -82,14 +82,14 @@ TextureInfo Helper::perm_grad_4d_tex_;
 TextureInfo Helper::grad_4d_tex_;
 
 void Helper::init(const std::shared_ptr<Device>& device) {
-    vk::helper::create2x2Texture(device, 0xffffffff, white_tex_);
-    vk::helper::create2x2Texture(device, 0xff000000, black_tex_);
-    vk::helper::createPermutationTexture(device, permutation_tex_);
-    vk::helper::createPermutation2DTexture(device, permutation_2d_tex_);
-    vk::helper::createGradTexture(device, grad_tex_);
-    vk::helper::createPermGradTexture(device, perm_grad_tex_);
-    vk::helper::createPermGrad4DTexture(device, perm_grad_4d_tex_);
-    vk::helper::createGrad4DTexture(device, grad_4d_tex_);
+    vk::helper::create2x2Texture(device, 0xffffffff, white_tex_, std::source_location::current());
+    vk::helper::create2x2Texture(device, 0xff000000, black_tex_, std::source_location::current());
+    vk::helper::createPermutationTexture(device, permutation_tex_, std::source_location::current());
+    vk::helper::createPermutation2DTexture(device, permutation_2d_tex_, std::source_location::current());
+    vk::helper::createGradTexture(device, grad_tex_, std::source_location::current());
+    vk::helper::createPermGradTexture(device, perm_grad_tex_, std::source_location::current());
+    vk::helper::createPermGrad4DTexture(device, perm_grad_4d_tex_, std::source_location::current());
+    vk::helper::createGrad4DTexture(device, grad_4d_tex_, std::source_location::current());
 
     image_source_info_ = {
         ImageLayout::UNDEFINED,
@@ -272,6 +272,7 @@ void Helper::createBuffer(
     const MemoryAllocateFlags& allocate_flags,
     std::shared_ptr<Buffer>& buffer,
     std::shared_ptr<DeviceMemory>& buffer_memory,
+    const std::source_location& src_location,
     const uint64_t buffer_size /*= 0*/,
     const void* src_data/*= nullptr*/) {
 
@@ -288,7 +289,8 @@ void Helper::createBuffer(
         memory_property,
         allocate_flags,
         buffer,
-        buffer_memory);
+        buffer_memory,
+        src_location);
 
     if (has_src_data) {
         if (need_stage_buffer) {
@@ -301,7 +303,8 @@ void Helper::createBuffer(
                 SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
                 0,
                 staging_buffer,
-                staging_buffer_memory);
+                staging_buffer_memory,
+                src_location);
 
             device->updateBufferMemory(staging_buffer_memory, buffer_size, src_data);
 
@@ -320,7 +323,8 @@ void Helper::updateBufferWithSrcData(
     const std::shared_ptr<Device>& device,
     const uint64_t& buffer_size,
     const void* src_data,
-    const std::shared_ptr<Buffer>& buffer) {
+    const std::shared_ptr<Buffer>& buffer,
+    const std::source_location& src_location) {
 
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;
@@ -331,7 +335,8 @@ void Helper::updateBufferWithSrcData(
         SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
         0,
         staging_buffer,
-        staging_buffer_memory);
+        staging_buffer_memory,
+        src_location);
 
     device->updateBufferMemory(staging_buffer_memory, buffer_size, src_data);
 
@@ -367,7 +372,8 @@ void Helper::create2DTextureImage(
     int tex_channels,
     const void* pixels,
     std::shared_ptr<Image>& texture_image,
-    std::shared_ptr<DeviceMemory>& texture_image_memory) {
+    std::shared_ptr<DeviceMemory>& texture_image_memory,
+    const std::source_location& src_location) {
 
     VkDeviceSize image_size =
         static_cast<VkDeviceSize>(tex_width * tex_height * (format == Format::R16_UNORM ? 2 : 4));
@@ -381,7 +387,8 @@ void Helper::create2DTextureImage(
         SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
         0,
         staging_buffer,
-        staging_buffer_memory);
+        staging_buffer_memory,
+        src_location);
 
     device->updateBufferMemory(
         staging_buffer_memory,
@@ -397,7 +404,8 @@ void Helper::create2DTextureImage(
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         texture_image,
-        texture_image_memory);
+        texture_image_memory,
+        src_location);
 
     auto cmd_buf = device->setupTransientCommandBuffer();
     vk::helper::transitionImageLayout(
@@ -430,9 +438,10 @@ void Helper::create2DTextureImage(
     TextureInfo& texture_2d,
     const renderer::ImageUsageFlags& usage,
     const renderer::ImageLayout& image_layout,
-    const renderer::ImageTiling image_tiling,
-    const uint32_t memory_property,
-    bool with_mips/* = false */) {
+    const std::source_location& src_location,
+    const renderer::ImageTiling image_tiling/* = renderer::ImageTiling::OPTIMAL*/,
+    const uint32_t memory_property/* = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT) */,
+    bool with_mips/* = false*/) {
     auto is_depth = vk::helper::isDepthFormat(format);
     vk::helper::createTextureImage(
         device,
@@ -443,6 +452,7 @@ void Helper::create2DTextureImage(
         memory_property,
         texture_2d.image,
         texture_2d.memory,
+        src_location,
         with_mips);
 
     texture_2d.view =
@@ -452,7 +462,8 @@ void Helper::create2DTextureImage(
             format,
             is_depth ?
                 SET_FLAG_BIT(ImageAspect, DEPTH_BIT) :
-                SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 
     vk::helper::transitionImageLayout(
         device,
@@ -470,7 +481,8 @@ void Helper::dumpTextureImage(
     Format format,
     const glm::uvec3& image_size,
     const uint32_t& bytes_per_pixel,
-    void* pixels) {
+    void* pixels,
+    const std::source_location& src_location) {
 
     VkDeviceSize buffer_size = static_cast<VkDeviceSize>(
         image_size.x * image_size.y * image_size.z * bytes_per_pixel);
@@ -484,7 +496,8 @@ void Helper::dumpTextureImage(
         SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
         0,
         staging_buffer,
-        staging_buffer_memory);
+        staging_buffer_memory,
+        src_location);
 
     auto cmd_buf = device->setupTransientCommandBuffer();
     vk::helper::transitionImageLayout(
@@ -519,8 +532,9 @@ void Helper::create3DTextureImage(
     TextureInfo& texture_3d,
     const renderer::ImageUsageFlags& usage,
     const renderer::ImageLayout& image_layout,
-    const renderer::ImageTiling image_tiling,
-    const uint32_t memory_property) {
+    const std::source_location& src_location,
+    const renderer::ImageTiling image_tiling/* = renderer::ImageTiling::OPTIMAL*/,
+    const uint32_t memory_property/* = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT)*/) {
     auto is_depth = vk::helper::isDepthFormat(format);
     vk::helper::createTextureImage(
         device,
@@ -530,7 +544,8 @@ void Helper::create3DTextureImage(
         usage,
         memory_property,
         texture_3d.image,
-        texture_3d.memory);
+        texture_3d.memory,
+        src_location);
 
     texture_3d.view =
         device->createImageView(
@@ -539,7 +554,8 @@ void Helper::create3DTextureImage(
             format,
             is_depth ?
             SET_FLAG_BIT(ImageAspect, DEPTH_BIT) :
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            src_location);
 
     vk::helper::transitionImageLayout(
         device,
@@ -553,7 +569,8 @@ void Helper::createDepthResources(
     const std::shared_ptr<renderer::Device>& device,
     Format format,
     glm::uvec2 size,
-    TextureInfo& texture_2d) {
+    TextureInfo& texture_2d,
+    const std::source_location& src_location) {
 
     create2DTextureImage(
         device,
@@ -562,7 +579,8 @@ void Helper::createDepthResources(
         texture_2d,
         SET_FLAG_BIT(ImageUsage, DEPTH_STENCIL_ATTACHMENT_BIT) |
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT),
-        ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        src_location);
 }
 
 void Helper::createCubemapTexture(
@@ -574,6 +592,7 @@ void Helper::createCubemapTexture(
     Format format,
     const std::vector<BufferImageCopyInfo>& copy_regions,
     TextureInfo& texture,
+    const std::source_location& src_location,
     uint64_t buffer_size /*= 0*/,
     void* data /*= nullptr*/) {
     bool use_as_framebuffer = data == nullptr;
@@ -589,7 +608,8 @@ void Helper::createCubemapTexture(
             SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
             0,
             staging_buffer,
-            staging_buffer_memory);
+            staging_buffer_memory,
+            src_location);
 
         device->updateBufferMemory(staging_buffer_memory, buffer_size, data);
     }
@@ -612,6 +632,7 @@ void Helper::createCubemapTexture(
         image_usage_flags,
         ImageTiling::OPTIMAL,
         ImageLayout::UNDEFINED,
+        src_location,
         SET_FLAG_BIT(ImageCreate, CUBE_COMPATIBLE_BIT),
         false,
         1,
@@ -661,6 +682,7 @@ void Helper::createCubemapTexture(
         ImageViewType::VIEW_CUBE,
         format,
         SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+        src_location,
         0,
         mip_count,
         0,
@@ -686,13 +708,19 @@ void Helper::createCubemapTexture(
                         ImageViewType::VIEW_2D,
                         format,
                         SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                        src_location,
                         i,
                         1,
                         j,
                         1);
             }
 
-            texture.framebuffers[i] = device->createFrameBuffer(render_pass, texture.surface_views[i], glm::uvec2(w, h));
+            texture.framebuffers[i] =
+                device->createFrameBuffer(
+                    render_pass,
+                    texture.surface_views[i],
+                    glm::uvec2(w, h),
+                    src_location);
             w = std::max(w >> 1, 1u);
             h = std::max(h >> 1, 1u);
         }

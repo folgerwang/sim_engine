@@ -64,7 +64,8 @@ void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     renderer::Format format,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     int tex_width, tex_height, tex_channels;
     void* void_pixels = nullptr;
     if (format == engine::renderer::Format::R16_UNORM) {
@@ -99,7 +100,8 @@ void createTextureImage(
         tex_channels,
         void_pixels,
         texture.image,
-        texture.memory);
+        texture.memory,
+        src_location);
 
     texture.size = { tex_width, tex_height, 1.0f };
 
@@ -109,14 +111,16 @@ void createTextureImage(
         texture.image,
         renderer::ImageViewType::VIEW_2D,
         format,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT));
+        SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+        src_location);
 }
 
 std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::BufferUsageFlags& usage,
     const uint64_t& size,
-    const void* data) {
+    const void* data,
+    const std::source_location& src_location) {
     auto v_buffer = std::make_shared<renderer::BufferInfo>();
     renderer::Helper::createBuffer(
         device,
@@ -125,6 +129,7 @@ std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
         0,
         v_buffer->buffer,
         v_buffer->memory,
+        src_location,
         size,
         data);
 
@@ -135,7 +140,8 @@ void loadMtx2Texture(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& cubemap_render_pass,
     const std::string& input_filename,
-    renderer::TextureInfo& texture) {
+    renderer::TextureInfo& texture,
+    const std::source_location& src_location) {
     uint64_t buffer_size;
     auto mtx2_data = engine::helper::readFile(input_filename, buffer_size);
     auto src_data = (char*)mtx2_data.data();
@@ -202,6 +208,7 @@ void loadMtx2Texture(
         header_block->format,
         copy_regions,
         texture,
+        src_location,
         buffer_size,
         mtx2_data.data());
 }

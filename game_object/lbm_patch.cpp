@@ -1,4 +1,4 @@
-#include "hair_patch.h"
+#include "lbm_patch.h"
 #include "engine_helper.h"
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -7,7 +7,7 @@
 namespace engine {
 namespace {
 
-static auto createHairPatchDescriptorSetLayout(
+static auto createLbmPatchDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
     bindings.reserve(11);
@@ -49,7 +49,7 @@ static auto createHairPatchDescriptorSetLayout(
     return device->createDescriptorSetLayout(bindings);
 }
 
-static auto addHairPatchTextures(
+static auto addLbmPatchTextures(
     const std::shared_ptr<renderer::DescriptorSet>& desc_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::shared_ptr<renderer::ImageView>& dst_image) {
@@ -69,7 +69,7 @@ static auto addHairPatchTextures(
     return descriptor_writes;
 }
 
-static auto createHairPatchPipelineLayout(
+static auto createLbmPatchPipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::DescriptorSetLayout>& prt_desc_set_layout) {
@@ -93,21 +93,21 @@ static auto createHairPatchPipelineLayout(
 
 namespace game_object {
 
-HairPatch::HairPatch(
+LbmPatch::LbmPatch(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const glm::uvec2& patch_size) {
 
-    hair_patch_tex_ =
+    lbm_patch_tex_ =
         std::make_shared<renderer::TextureInfo>();
 
     renderer::Helper::create2DTextureImage(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         patch_size,
-        *hair_patch_tex_,
+        *lbm_patch_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
@@ -116,43 +116,43 @@ HairPatch::HairPatch(
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         true);
 
-    hair_patch_desc_set_layout_ =
-        createHairPatchDescriptorSetLayout(
+    lbm_patch_desc_set_layout_ =
+        createLbmPatchDescriptorSetLayout(
             device);
 
-    hair_patch_desc_set_ =
+    lbm_patch_desc_set_ =
         device->createDescriptorSets(
-            descriptor_pool, hair_patch_desc_set_layout_, 1)[0];
+            descriptor_pool, lbm_patch_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto hair_test_material_descs =
-        addHairPatchTextures(
-            hair_patch_desc_set_,
+    auto lbm_test_material_descs =
+        addLbmPatchTextures(
+            lbm_patch_desc_set_,
             texture_sampler,
-            hair_patch_tex_->view);
+            lbm_patch_tex_->view);
 
-    device->updateDescriptorSets(hair_test_material_descs);
+    device->updateDescriptorSets(lbm_test_material_descs);
 
-    hair_patch_pipeline_layout_ =
-        createHairPatchPipelineLayout(
+    lbm_patch_pipeline_layout_ =
+        createLbmPatchPipelineLayout(
             device,
             global_desc_set_layouts,
-            hair_patch_desc_set_layout_);
+            lbm_patch_desc_set_layout_);
 
-    hair_patch_pipeline_ =
+    lbm_patch_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
-            hair_patch_pipeline_layout_,
-            "hair_patch_comp.spv",
+            lbm_patch_pipeline_layout_,
+            "lbm_patch_comp.spv",
             std::source_location::current());
 }
 
-void HairPatch::update(
+void LbmPatch::update(
     const std::shared_ptr<renderer::Device>& device,
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list) {
 
-    auto buffer_size = hair_patch_tex_->size;
+    auto buffer_size = lbm_patch_tex_->size;
 
     {
         renderer::BarrierList barrier_list;
@@ -160,7 +160,7 @@ void HairPatch::update(
 
         renderer::helper::addTexturesToBarrierList(
             barrier_list,
-            { hair_patch_tex_->image },
+            { lbm_patch_tex_->image },
             renderer::ImageLayout::GENERAL,
             SET_FLAG_BIT(Access, SHADER_READ_BIT),
             SET_FLAG_BIT(Access, SHADER_READ_BIT) |
@@ -174,14 +174,14 @@ void HairPatch::update(
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE,
-        hair_patch_pipeline_);
+        lbm_patch_pipeline_);
 
     auto desc_sets = desc_set_list;
-    desc_sets.push_back(hair_patch_desc_set_);
+    desc_sets.push_back(lbm_patch_desc_set_);
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::COMPUTE,
-        hair_patch_pipeline_layout_,
+        lbm_patch_pipeline_layout_,
         desc_sets);
 
     glsl::PrtLightParams params{};
@@ -197,13 +197,13 @@ void HairPatch::update(
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        hair_patch_pipeline_layout_,
+        lbm_patch_pipeline_layout_,
         &params,
         sizeof(params));
 
     cmd_buf->dispatch(
-        (buffer_size.x + kHairPatchDispatchX - 1) / kHairPatchDispatchX,
-        (buffer_size.y + kHairPatchDispatchY - 1) / kHairPatchDispatchY,
+        (buffer_size.x + kLbmPatchDispatchX - 1) / kLbmPatchDispatchX,
+        (buffer_size.y + kLbmPatchDispatchY - 1) / kLbmPatchDispatchY,
         1);
 
     {
@@ -212,7 +212,7 @@ void HairPatch::update(
 
         renderer::helper::addTexturesToBarrierList(
             barrier_list,
-            { hair_patch_tex_->image },
+            { lbm_patch_tex_->image },
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             SET_FLAG_BIT(Access, SHADER_READ_BIT) |
             SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
@@ -225,14 +225,14 @@ void HairPatch::update(
     }
 }
 
-void HairPatch::destroy(
+void LbmPatch::destroy(
     const std::shared_ptr<renderer::Device>& device) {
-    device->destroyDescriptorSetLayout(hair_patch_desc_set_layout_);
-    device->destroyPipelineLayout(hair_patch_pipeline_layout_);
-    device->destroyPipeline(hair_patch_pipeline_);
+    device->destroyDescriptorSetLayout(lbm_patch_desc_set_layout_);
+    device->destroyPipelineLayout(lbm_patch_pipeline_layout_);
+    device->destroyPipeline(lbm_patch_pipeline_);
 
-    if (hair_patch_tex_) {
-        hair_patch_tex_->destroy(device);
+    if (lbm_patch_tex_) {
+        lbm_patch_tex_->destroy(device);
     }
 }
 

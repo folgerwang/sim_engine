@@ -78,7 +78,8 @@ namespace {
 
         return device->createPipelineLayout(
             { desc_set_layout },
-            { push_const_range });
+            { push_const_range },
+            std::source_location::current());
     }
 
     std::shared_ptr<er::PipelineLayout>
@@ -92,7 +93,8 @@ namespace {
 
         return device->createPipelineLayout(
             { desc_set_layout },
-            { push_const_range });
+            { push_const_range },
+            std::source_location::current());
     }
 
     std::shared_ptr<er::PipelineLayout>
@@ -101,7 +103,8 @@ namespace {
             const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
         return device->createPipelineLayout(
             { desc_set_layout },
-            { });
+            { },
+            std::source_location::current());
     }
 
     std::shared_ptr<er::PipelineLayout>
@@ -115,7 +118,8 @@ namespace {
 
         return device->createPipelineLayout(
             { desc_set_layout },
-            { push_const_range });
+            { push_const_range },
+            std::source_location::current());
     }
 } // namespace
 
@@ -138,7 +142,8 @@ PrtShadow::PrtShadow(
         *prt_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     // 400 sample rays per pixel saved tangent angle for shadowing.
     const glm::uvec2 prt_shadow_cache_tex_size =
@@ -152,7 +157,8 @@ PrtShadow::PrtShadow(
         *prt_shadow_cache_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     const glm::uvec2 temp_ds_buffer_size =
         g_block_size / glm::uvec2(16) * glm::uvec2(4);
@@ -165,7 +171,8 @@ PrtShadow::PrtShadow(
         *prt_ds_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     // create a prt shadow texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> prt_shadow_gen_with_cache_bindings;
@@ -207,7 +214,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             prt_shadow_gen_with_cache_pipeline_layout_,
-            "prt_shadow_gen_with_cache_comp.spv");
+            "prt_shadow_gen_with_cache_comp.spv",
+            std::source_location::current());
 
 
     // create a prt shadow generating texture descriptor set layout.
@@ -237,7 +245,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             prt_shadow_gen_pipeline_layout_,
-            "prt_shadow_gen_comp.spv");
+            "prt_shadow_gen_comp.spv",
+            std::source_location::current());
 
     prt_shadow_cache_desc_set_layout_ =
         device->createDescriptorSetLayout(bindings);
@@ -251,7 +260,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             prt_shadow_cache_pipeline_layout_,
-            "prt_shadow_cache_init_comp.spv");
+            "prt_shadow_cache_init_comp.spv",
+            std::source_location::current());
 
     std::vector<renderer::DescriptorSetLayoutBinding> prt_shadow_update_bindings;
     prt_shadow_update_bindings.reserve(3);
@@ -285,7 +295,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             prt_shadow_cache_update_pipeline_layout_,
-            "prt_shadow_cache_update_comp.spv");
+            "prt_shadow_cache_update_comp.spv",
+            std::source_location::current());
 
     // create a global ibl texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> ds_bindings;
@@ -327,7 +338,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             prt_ds_first_pipeline_layout_,
-            "prt_minmax_ds_comp.spv");
+            "prt_minmax_ds_comp.spv",
+            std::source_location::current());
 
     // create a global ibl texture descriptor set layout.
     gen_prt_pack_info_desc_set_layout_ =
@@ -342,7 +354,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             gen_prt_pack_info_pipeline_layout_,
-            "gen_prt_pack_info_comp.spv");
+            "gen_prt_pack_info_comp.spv",
+            std::source_location::current());
 
     // create a global ibl texture descriptor set layout.
     std::vector<renderer::DescriptorSetLayoutBinding> pack_bindings;
@@ -377,7 +390,8 @@ PrtShadow::PrtShadow(
         renderer::helper::createComputePipeline(
             device,
             pack_prt_pipeline_layout_,
-            "pack_prt_comp.spv");
+            "pack_prt_comp.spv",
+            std::source_location::current());
 }
 
 void PrtShadow::update(

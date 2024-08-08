@@ -27,6 +27,8 @@
     <ClCompile Include="game_object\gltf.cpp" />
     <ClCompile Include="game_object\hair_patch.cpp" />
     <ClCompile Include="game_object\hair_test.cpp" />
+    <ClCompile Include="game_object\lbm_test.cpp" />
+    <ClCompile Include="game_object\lbm_patch.cpp" />
     <ClCompile Include="game_object\object_file.cpp" />
     <ClCompile Include="game_object\patch.cpp" />
     <ClCompile Include="game_object\plane.cpp" />
@@ -60,6 +62,8 @@
     <ClInclude Include="game_object\gltf.h" />
     <ClInclude Include="game_object\hair_patch.h" />
     <ClInclude Include="game_object\hair_test.h" />
+    <ClInclude Include="game_object\lbm_test.h" />
+    <ClInclude Include="game_object\lbm_patch.h" />
     <ClInclude Include="game_object\object_file.h" />
     <ClInclude Include="game_object\patch.h" />
     <ClInclude Include="game_object\plane.h" />
@@ -129,6 +133,9 @@
     <None Include="shaders\hair_test.frag" />
     <None Include="shaders\hair_test.vert" />
     <None Include="shaders\ibl_smooth.comp" />
+    <None Include="shaders\lbm_patch.comp" />
+    <None Include="shaders\lbm_test.frag" />
+    <None Include="shaders\lbm_test.vert" />
     <None Include="shaders\lungs.frag" />
     <None Include="shaders\lungs.vert" />
     <None Include="shaders\perlin_noise_init.comp" />
@@ -275,7 +282,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_LIB;%(PreprocessorDefinitions);STBI_MSC_SECURE_CRT</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_LIB;%(PreprocessorDefinitions);STBI_MSC_SECURE_CRT;</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>

@@ -29,7 +29,8 @@ ViewCapture::ViewCapture(
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT) |
         SET_FLAG_BIT(ImageUsage, COLOR_ATTACHMENT_BIT) |
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT),
-        renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        std::source_location::current());
 
     if (has_color_copy_) {
         renderer::Helper::create2DTextureImage(
@@ -39,7 +40,8 @@ ViewCapture::ViewCapture(
             color_buffer_copy_,
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, TRANSFER_DST_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
     }
 
     // create depth buffer.
@@ -47,7 +49,8 @@ ViewCapture::ViewCapture(
         device,
         depth_format_,
         view_size,
-        depth_buffer_);
+        depth_buffer_,
+        std::source_location::current());
 
     if (has_depth_copy_) {
         renderer::Helper::create2DTextureImage(
@@ -58,7 +61,8 @@ ViewCapture::ViewCapture(
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, DEPTH_STENCIL_ATTACHMENT_BIT) |
             SET_FLAG_BIT(ImageUsage, TRANSFER_DST_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
     }
 
     // create render pass.
@@ -67,6 +71,7 @@ ViewCapture::ViewCapture(
             device,
             color_format_,
             depth_format_,
+            std::source_location::current(),
             true);
 
     translucent_render_pass_ =
@@ -74,6 +79,7 @@ ViewCapture::ViewCapture(
             device,
             color_format_,
             depth_format_,
+            std::source_location::current(),
             false);
 
     // create frame buffer.
@@ -87,14 +93,16 @@ ViewCapture::ViewCapture(
         device->createFrameBuffer(
             render_pass_,
             attachments,
-            view_size);
+            view_size,
+            std::source_location::current());
 
     assert(translucent_render_pass_);
     translucent_frame_buffer_ =
         device->createFrameBuffer(
             translucent_render_pass_,
             attachments,
-            view_size);
+            view_size,
+            std::source_location::current());
 }
 
 void ViewCapture::draw(

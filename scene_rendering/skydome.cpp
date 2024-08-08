@@ -38,12 +38,14 @@ er::ShaderModuleList getSkyboxShaderModules(
         er::helper::loadShaderModule(
             device,
             "skybox_vert.spv",
-            er::ShaderStageFlagBits::VERTEX_BIT);
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         er::helper::loadShaderModule(
             device,
             "skybox_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT);
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
     return shader_modules;
 }
 
@@ -55,12 +57,14 @@ er::ShaderModuleList getCubeSkyboxShaderModules(
         er::helper::loadShaderModule(
             device,
             "full_screen_vert.spv",
-            er::ShaderStageFlagBits::VERTEX_BIT);
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         er::helper::loadShaderModule(
             device,
             "cube_skybox.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT);
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
     return shader_modules;
 }
 
@@ -87,6 +91,7 @@ er::BufferInfo createVertexBuffer(
         0,
         buffer.buffer,
         buffer.memory,
+        std::source_location::current(),
         buffer_size,
         vertices.data());
 
@@ -114,6 +119,7 @@ er::BufferInfo createIndexBuffer(
         0,
         buffer.buffer,
         buffer.memory,
+        std::source_location::current(),
         buffer_size,
         indices.data());
 
@@ -225,7 +231,8 @@ std::shared_ptr<er::PipelineLayout>
 
     return device->createPipelineLayout(
         desc_set_layouts,
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 std::shared_ptr<er::Pipeline> createGraphicsPipeline(
@@ -259,7 +266,8 @@ std::shared_ptr<er::Pipeline> createGraphicsPipeline(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 
     return skybox_pipeline;
 }
@@ -281,7 +289,8 @@ std::shared_ptr<er::Pipeline> createCubeGraphicsPipeline(
         input_assembly,
         graphic_pipeline_info,
         cube_shader_modules,
-        glm::uvec2(cube_size, cube_size));
+        glm::uvec2(cube_size, cube_size),
+        std::source_location::current());
 }
 
 std::shared_ptr<er::PipelineLayout> createSkyScatteringLutFirstPassPipelineLayout(
@@ -294,7 +303,8 @@ std::shared_ptr<er::PipelineLayout> createSkyScatteringLutFirstPassPipelineLayou
 
     return device->createPipelineLayout(
         { desc_set_layout },
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 std::shared_ptr<er::PipelineLayout> createSkyScatteringLutPipelineLayout(
@@ -302,7 +312,8 @@ std::shared_ptr<er::PipelineLayout> createSkyScatteringLutPipelineLayout(
     const std::shared_ptr<er::DescriptorSetLayout>& desc_set_layout) {
     return device->createPipelineLayout(
         { desc_set_layout},
-        { });
+        { },
+        std::source_location::current());
 }
 
 } // namespace
@@ -333,7 +344,8 @@ Skydome::Skydome(
         sky_scattering_lut_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -342,7 +354,8 @@ Skydome::Skydome(
         sky_scattering_lut_sum_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     skybox_desc_set_layout_ =
         device->createDescriptorSetLayout(
@@ -419,19 +432,22 @@ Skydome::Skydome(
         renderer::helper::createComputePipeline(
             device,
             sky_scattering_lut_first_pass_pipeline_layout_,
-            "sky_scattering_lut_first_pass_comp.spv");
+            "sky_scattering_lut_first_pass_comp.spv",
+            std::source_location::current());
 
     sky_scattering_lut_sum_pass_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
             sky_scattering_lut_sum_pass_pipeline_layout_,
-            "sky_scattering_lut_sum_pass_comp.spv");
+            "sky_scattering_lut_sum_pass_comp.spv",
+            std::source_location::current());
 
     sky_scattering_lut_final_pass_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
             sky_scattering_lut_final_pass_pipeline_layout_,
-            "sky_scattering_lut_final_pass_comp.spv");
+            "sky_scattering_lut_final_pass_comp.spv",
+            std::source_location::current());
 }
 
 void Skydome::recreate(

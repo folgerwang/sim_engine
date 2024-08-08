@@ -171,7 +171,8 @@ createConemapPipelineLayout(
 
     return device->createPipelineLayout(
         { desc_set_layout },
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 } // namespace
@@ -196,7 +197,8 @@ Conemap::Conemap(
         *conemap_temp_tex_[0],
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -205,7 +207,8 @@ Conemap::Conemap(
         *conemap_temp_tex_[1],
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::GENERAL);
+        renderer::ImageLayout::GENERAL,
+        std::source_location::current());
 
     conemap_gen_init_desc_set_layout_ =
         device->createDescriptorSetLayout(
@@ -326,19 +329,22 @@ Conemap::Conemap(
         renderer::helper::createComputePipeline(
             device,
             conemap_gen_init_pipeline_layout_,
-            "conemap_gen_init_comp.spv");
+            "conemap_gen_init_comp.spv",
+            std::source_location::current());
 
     conemap_gen_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
             conemap_gen_pipeline_layout_,
-            "conemap_gen_comp.spv");
+            "conemap_gen_comp.spv",
+            std::source_location::current());
 
     conemap_pack_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
             conemap_pack_pipeline_layout_,
-            "conemap_pack_comp.spv");
+            "conemap_pack_comp.spv",
+            std::source_location::current());
 }
 
 void Conemap::update(

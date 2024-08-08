@@ -96,7 +96,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             new_vertices.size() * sizeof(new_vertices[0]),
-            new_vertices.data()));
+            new_vertices.data(),
+            std::source_location::current()));
 
     uint32_t binding_idx = 0;
     binding_desc.binding = binding_idx;
@@ -117,7 +118,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
                 device,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
                 new_normals.size() * sizeof(new_normals[0]),
-                new_normals.data()));
+                new_normals.data(),
+                std::source_location::current()));
 
         binding_desc.binding = binding_idx;
         binding_desc.stride = sizeof(new_normals[0]);
@@ -138,7 +140,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
                 device,
                 SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
                 new_uvs.size() * sizeof(new_uvs[0]),
-                new_uvs.data()));
+                new_uvs.data(),
+                std::source_location::current()));
 
         binding_desc.binding = binding_idx;
         binding_desc.stride = sizeof(new_uvs[0]);
@@ -162,7 +165,8 @@ static std::shared_ptr<game_object::Patch> createPatch(
             device,
             SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
             new_faces.size() * sizeof(new_faces[0]),
-            new_faces.data()));
+            new_faces.data(),
+            std::source_location::current()));
 
     return patch;
 }
@@ -218,7 +222,10 @@ static std::shared_ptr<renderer::PipelineLayout> createPipelineLayout(
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
     desc_set_layouts.push_back(object_desc_set_layout);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::DescriptorSetLayout> createObjectDescriptorSetLayout(
@@ -323,22 +330,26 @@ void ObjectMesh::loadObjectFile(
         device,
         "assets/lungs/lungs_default_Diffuse.png",
         format,
-        *diffuse_tex_);
+        *diffuse_tex_,
+        std::source_location::current());
     engine::helper::createTextureImage(
         device,
         "assets/lungs/lungs_default_Normal.png",
         format,
-        *normal_tex_);
+        *normal_tex_,
+        std::source_location::current());
     engine::helper::createTextureImage(
         device,
         "assets/lungs/lungs_default_Glossiness.png",
         format,
-        *glossiness_tex_);
+        *glossiness_tex_,
+        std::source_location::current());
     engine::helper::createTextureImage(
         device,
         "assets/lungs/lungs_default_Specular.png",
         format,
-        *specular_tex_);
+        *specular_tex_,
+        std::source_location::current());
 
     bool start_process_faces = false;
     bool has_normal = false;
@@ -457,12 +468,14 @@ void ObjectMesh::loadObjectFile(
         renderer::helper::loadShaderModule(
             device,
             shader_name + "_vert.spv",
-            renderer::ShaderStageFlagBits::VERTEX_BIT);
+            renderer::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
             shader_name + "_frag.spv",
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
 
     object_pipeline_ = device->createPipeline(
         render_pass,
@@ -472,7 +485,8 @@ void ObjectMesh::loadObjectFile(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 }
 
 void ObjectMesh::draw(

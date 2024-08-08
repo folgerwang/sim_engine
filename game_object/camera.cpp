@@ -92,7 +92,10 @@ static std::shared_ptr<renderer::PipelineLayout> createGameCameraPipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::GameCameraParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 } // namespace
@@ -150,7 +153,8 @@ void GameCamera::initGameCameraBuffer(
             SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
             0,
             game_camera_buffer_->buffer,
-            game_camera_buffer_->memory);
+            game_camera_buffer_->memory,
+            std::source_location::current());
     }
 }
 
@@ -210,7 +214,8 @@ void GameCamera::createStaticMembers(
                 renderer::helper::createComputePipeline(
                     device,
                     update_game_camera_pipeline_layout_,
-                    "update_camera_comp.spv");
+                    "update_camera_comp.spv",
+                    std::source_location::current());
         }
     }
 }

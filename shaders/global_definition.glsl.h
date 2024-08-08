@@ -221,13 +221,19 @@
 #define kPrtThetaSampleCount                    200
 #define kPrtShadowInitBlockRadius               2
 
+#define kHairPatchDispatchX                     8
+#define kHairPatchDispatchY                     64
+
+#define kLbmPatchDispatchX                      8
+#define kLbmPatchDispatchY                      64
+
 #define kPrtSampleAngleStep                     (2.0f * PI / float(kPrtPhiSampleCount))
 
 
-#define GLFW_KEY_W                  87
-#define GLFW_KEY_S                  83
-#define GLFW_KEY_A                  65
-#define GLFW_KEY_D                  68
+#define GLFW_KEY_W                              87
+#define GLFW_KEY_S                              83
+#define GLFW_KEY_A                              65
+#define GLFW_KEY_D                              68
 
 #ifdef __cplusplus
 #pragma once

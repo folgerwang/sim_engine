@@ -16,27 +16,32 @@ er::ShaderModuleList getIblShaderModules(
         er::helper::loadShaderModule(
             device,
             "full_screen_vert.spv",
-            er::ShaderStageFlagBits::VERTEX_BIT);
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         er::helper::loadShaderModule(
             device,
             "panorama_to_cubemap_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT);
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
     shader_modules[2] =
         er::helper::loadShaderModule(
             device,
             "ibl_labertian_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT);
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
     shader_modules[3] =
         er::helper::loadShaderModule(
             device,
             "ibl_ggx_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT);
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
     shader_modules[4] =
         er::helper::loadShaderModule(
             device,
             "ibl_charlie_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT);
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
 
     return shader_modules;
 }
@@ -51,7 +56,8 @@ std::shared_ptr<er::PipelineLayout> createCubemapPipelineLayout(
 
     return device->createPipelineLayout(
         { ibl_desc_set_layout },
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 er::WriteDescriptorList addPanoramaTextures(
@@ -138,7 +144,8 @@ std::shared_ptr<er::PipelineLayout> createCubemapComputePipelineLayout(
 
     return device->createPipelineLayout(
         desc_set_layouts,
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 }
@@ -164,7 +171,8 @@ IblCreator::IblCreator(
         device,
         "assets/environments/doge2.hdr",
         format,
-        panorama_tex_);
+        panorama_tex_,
+        std::source_location::current());
 
     // ibl texture descriptor set layout.
     {
@@ -204,7 +212,8 @@ IblCreator::IblCreator(
         er::helper::createComputePipeline(
             device,
             ibl_comp_pipeline_layout_,
-            "ibl_smooth_comp.spv");
+            "ibl_smooth_comp.spv",
+            std::source_location::current());
 
     ibl_pipeline_layout_ =
         createCubemapPipelineLayout(
@@ -233,7 +242,8 @@ void IblCreator::createCubeTextures(
         num_mips,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        rt_envmap_tex_);
+        rt_envmap_tex_,
+        std::source_location::current());
 
     renderer::Helper::createCubemapTexture(
         device,
@@ -243,7 +253,8 @@ void IblCreator::createCubeTextures(
         1,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        tmp_ibl_diffuse_tex_);
+        tmp_ibl_diffuse_tex_,
+        std::source_location::current());
 
     renderer::Helper::createCubemapTexture(
         device,
@@ -253,7 +264,8 @@ void IblCreator::createCubeTextures(
         num_mips,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        tmp_ibl_specular_tex_);
+        tmp_ibl_specular_tex_,
+        std::source_location::current());
 
     renderer::Helper::createCubemapTexture(
         device,
@@ -263,7 +275,8 @@ void IblCreator::createCubeTextures(
         num_mips,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        tmp_ibl_sheen_tex_);
+        tmp_ibl_sheen_tex_,
+        std::source_location::current());
 
     renderer::Helper::createCubemapTexture(
         device,
@@ -273,7 +286,8 @@ void IblCreator::createCubeTextures(
         1,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        rt_ibl_diffuse_tex_);
+        rt_ibl_diffuse_tex_,
+        std::source_location::current());
 
     renderer::Helper::createCubemapTexture(
         device,
@@ -283,7 +297,8 @@ void IblCreator::createCubeTextures(
         num_mips,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        rt_ibl_specular_tex_);
+        rt_ibl_specular_tex_,
+        std::source_location::current());
 
     renderer::Helper::createCubemapTexture(
         device,
@@ -293,7 +308,8 @@ void IblCreator::createCubeTextures(
         num_mips,
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
-        rt_ibl_sheen_tex_);
+        rt_ibl_sheen_tex_,
+        std::source_location::current());
 }
 
 void IblCreator::createIblGraphicsPipelines(
@@ -314,7 +330,8 @@ void IblCreator::createIblGraphicsPipelines(
             input_assembly,
             cube_graphic_pipeline_info,
             { ibl_shader_modules[0], ibl_shader_modules[1] },
-            glm::uvec2(cube_size, cube_size));
+            glm::uvec2(cube_size, cube_size),
+            std::source_location::current());
 
         lambertian_pipeline_ = device->createPipeline(
             cube_render_pass,
@@ -323,7 +340,8 @@ void IblCreator::createIblGraphicsPipelines(
             input_assembly,
             cube_graphic_pipeline_info,
             { ibl_shader_modules[0], ibl_shader_modules[2] },
-            glm::uvec2(cube_size, cube_size));
+            glm::uvec2(cube_size, cube_size),
+            std::source_location::current());
 
         ggx_pipeline_ = device->createPipeline(
             cube_render_pass,
@@ -332,7 +350,8 @@ void IblCreator::createIblGraphicsPipelines(
             input_assembly,
             cube_graphic_pipeline_info,
             { ibl_shader_modules[0], ibl_shader_modules[3] },
-            glm::uvec2(cube_size, cube_size));
+            glm::uvec2(cube_size, cube_size),
+            std::source_location::current());
 
         charlie_pipeline_ = device->createPipeline(
             cube_render_pass,
@@ -341,7 +360,8 @@ void IblCreator::createIblGraphicsPipelines(
             input_assembly,
             cube_graphic_pipeline_info,
             { ibl_shader_modules[0], ibl_shader_modules[4] },
-            glm::uvec2(cube_size, cube_size));
+            glm::uvec2(cube_size, cube_size),
+            std::source_location::current());
     }
 }
 

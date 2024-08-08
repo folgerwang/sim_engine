@@ -1769,19 +1769,22 @@ static renderer::ShaderModuleList getTileShaderModules(
         renderer::helper::loadShaderModule(
             device,
             vs_name,
-            renderer::ShaderStageFlagBits::VERTEX_BIT);
+            renderer::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
             ps_name,
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
 
     if (gs_name.size() > 0) {
         shader_modules.push_back(
             renderer::helper::loadShaderModule(
                 device,
                 gs_name,
-                renderer::ShaderStageFlagBits::GEOMETRY_BIT));
+                renderer::ShaderStageFlagBits::GEOMETRY_BIT,
+                std::source_location::current()));
     }
     return shader_modules;
 }
@@ -1796,18 +1799,21 @@ static renderer::ShaderModuleList getTileMeshShaderModules(
         renderer::helper::loadShaderModule(
             device,
             ms_name,
-            renderer::ShaderStageFlagBits::MESH_BIT_EXT);
+            renderer::ShaderStageFlagBits::MESH_BIT_EXT,
+            std::source_location::current());
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
             ps_name,
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
     if (ts_name.size() > 0) {
         shader_modules.push_back(
             renderer::helper::loadShaderModule(
                 device,
                 ts_name,
-                renderer::ShaderStageFlagBits::TASK_BIT_EXT));
+                renderer::ShaderStageFlagBits::TASK_BIT_EXT,
+                std::source_location::current()));
     }
     return shader_modules;
 }
@@ -1925,7 +1931,10 @@ static std::shared_ptr<renderer::PipelineLayout> createTileCreatorPipelineLayout
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileCreateParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createTileUpdatePipelineLayout(
@@ -1936,7 +1945,10 @@ static std::shared_ptr<renderer::PipelineLayout> createTileUpdatePipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileUpdateParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createTileFlowUpdatePipelineLayout(
@@ -1947,7 +1959,10 @@ static std::shared_ptr<renderer::PipelineLayout> createTileFlowUpdatePipelineLay
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileUpdateParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
@@ -1960,7 +1975,10 @@ static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
@@ -1979,7 +1997,10 @@ static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::Pipeline> createTilePipeline(
@@ -2004,7 +2025,8 @@ static std::shared_ptr<renderer::Pipeline> createTilePipeline(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 
     return pipeline;
 }
@@ -2099,7 +2121,8 @@ static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 
     return grass_pipeline;
 }
@@ -2246,7 +2269,8 @@ void TileObject::createStaticMembers(
             renderer::helper::createComputePipeline(
                 device,
                 tile_creator_pipeline_layout_,
-                "terrain/tile_creator_comp.spv");
+                "terrain/tile_creator_comp.spv",
+                std::source_location::current());
     }
 
     if (tile_update_pipeline_layout_ == nullptr) {
@@ -2263,7 +2287,8 @@ void TileObject::createStaticMembers(
             renderer::helper::createComputePipeline(
                 device,
                 tile_update_pipeline_layout_,
-                "terrain/tile_update_comp.spv");
+                "terrain/tile_update_comp.spv",
+                std::source_location::current());
     }
 
     if (tile_flow_update_pipeline_layout_ == nullptr) {
@@ -2280,7 +2305,8 @@ void TileObject::createStaticMembers(
             renderer::helper::createComputePipeline(
                 device,
                 tile_flow_update_pipeline_layout_,
-                "terrain/tile_flow_update_comp.spv");
+                "terrain/tile_flow_update_comp.spv",
+                std::source_location::current());
     }
 
     auto desc_set_layouts = global_desc_set_layouts;
@@ -2354,7 +2380,8 @@ void TileObject::initStaticMembers(
         rock_layer_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     for (int i = 0; i < 2; i++) {
         renderer::Helper::create2DTextureImage(
@@ -2364,7 +2391,8 @@ void TileObject::initStaticMembers(
             soil_water_layer_[i],
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
     }
 
     renderer::Helper::create2DTextureImage(
@@ -2374,7 +2402,8 @@ void TileObject::initStaticMembers(
         grass_snow_layer_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -2383,7 +2412,8 @@ void TileObject::initStaticMembers(
         water_normal_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -2392,7 +2422,8 @@ void TileObject::initStaticMembers(
         water_flow_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     auto num_cache_blocks = static_cast<uint32_t>(TileConst::kNumCachedBlocks);
     available_block_indexes_.resize(num_cache_blocks);
@@ -2541,6 +2572,7 @@ void TileObject::createMeshBuffers(
         0,
         index_buffer_.buffer,
         index_buffer_.memory,
+        std::source_location::current(),
         index_buffer_size,
         index_buffer.data());
 }
@@ -2571,6 +2603,7 @@ void TileObject::createGrassBuffers(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         grass_vertex_buffer_.buffer,
         grass_vertex_buffer_.memory,
+        std::source_location::current(),
         sizeof(glm::vec3),
         &vertex_pos);
 
@@ -2584,6 +2617,7 @@ void TileObject::createGrassBuffers(
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         grass_index_buffer_.buffer,
         grass_index_buffer_.memory,
+        std::source_location::current(),
         sizeof(uint16_t),
         &index_list);
 
@@ -2603,6 +2637,7 @@ void TileObject::createGrassBuffers(
         0,
         grass_indirect_draw_cmd_.buffer,
         grass_indirect_draw_cmd_.memory,
+        std::source_location::current(),
         indirect_draw_cmd_buffer.size() * sizeof(renderer::DrawIndexedIndirectCommand),
         indirect_draw_cmd_buffer.data());
 
@@ -2613,7 +2648,8 @@ void TileObject::createGrassBuffers(
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
         grass_instance_buffer_.buffer,
-        grass_instance_buffer_.memory);
+        grass_instance_buffer_.memory,
+        std::source_location::current());
 }
 
 void TileObject::generateStaticDescriptorSet(

@@ -36,12 +36,14 @@ std::shared_ptr<RenderPass> createRenderPass(
     const std::shared_ptr<Device>& device,
     Format format,
     Format depth_format,
+    const std::source_location& src_location,
     bool clear = false,
     SampleCountFlagBits sample_count = SampleCountFlagBits::SC_1_BIT,
     ImageLayout color_image_layout = ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
 std::shared_ptr<RenderPass> createCubemapRenderPass(
     const std::shared_ptr<Device>& device,
+    const std::source_location& src_location,
     Format format = Format::R16G16B16A16_SFLOAT);
 
 DescriptorSetLayoutBinding getTextureSamplerDescriptionSetLayoutBinding(
@@ -135,7 +137,8 @@ void transitMapTextureFromStoreImage(
 std::shared_ptr<ShaderModule> loadShaderModule(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& shader_name,
-    const ShaderStageFlagBits& shader_stage);
+    const ShaderStageFlagBits& shader_stage,
+    const std::source_location& src_location);
 
 void clearCachedShaderModules(const std::shared_ptr<renderer::Device>& device);
 
@@ -147,7 +150,8 @@ std::shared_ptr<renderer::PipelineLayout> createComputePipelineLayout(
 std::shared_ptr<renderer::Pipeline> createComputePipeline(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
-    const std::string& compute_shader_name);
+    const std::string& compute_shader_name,
+    const std::source_location& src_location);
 
 void releasePipelineLayout(
     const std::shared_ptr<renderer::Device>& device,

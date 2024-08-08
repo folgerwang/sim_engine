@@ -14,8 +14,10 @@ public:
         std::shared_ptr<std::array<glm::vec3, 8>> v,
         uint32_t split_num_x,
         uint32_t split_num_y,
-        uint32_t split_num_z);
+        uint32_t split_num_z,
+        const std::source_location& src_location);
     void draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+    void destroy(const std::shared_ptr<renderer::Device>& device);
 };
 
 } // game_object

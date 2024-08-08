@@ -76,12 +76,14 @@ static renderer::ShaderModuleList getDebugDrawShaderModules(
         renderer::helper::loadShaderModule(
             device,
             "debug_draw_vert.spv",
-            renderer::ShaderStageFlagBits::VERTEX_BIT);
+            renderer::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
     shader_modules[1] =
         renderer::helper::loadShaderModule(
             device,
             "debug_draw_frag.spv",
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT);
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
 
     return shader_modules;
 }
@@ -115,7 +117,10 @@ static std::shared_ptr<renderer::PipelineLayout> createDebugDrawPipelineLayout(
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::DebugDrawParams);
 
-    return device->createPipelineLayout(desc_set_layouts, { push_const_range });
+    return device->createPipelineLayout(
+        desc_set_layouts,
+        { push_const_range },
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::Pipeline> createDebugDrawPipeline(
@@ -146,7 +151,8 @@ static std::shared_ptr<renderer::Pipeline> createDebugDrawPipeline(
         input_assembly,
         new_graphic_pipeline_info,
         shader_modules,
-        display_size);
+        display_size,
+        std::source_location::current());
 
     return pipeline;
 }

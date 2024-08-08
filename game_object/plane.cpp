@@ -134,7 +134,8 @@ Plane::Plane(
     const std::shared_ptr<renderer::Device>& device,
     std::shared_ptr<std::array<glm::vec3, 4>> v,
     uint32_t split_num_x,
-    uint32_t split_num_y) {
+    uint32_t split_num_y,
+    const std::source_location& src_location) {
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;
     std::vector<glm::vec3> tangents;
@@ -175,7 +176,8 @@ Plane::Plane(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             vertices.size() * sizeof(vertices[0]),
-            vertices.data()));
+            vertices.data(),
+            src_location));
     uint32_t binding_idx = 0;
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(vertices[0]);
@@ -194,7 +196,8 @@ Plane::Plane(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             normals.size() * sizeof(normals[0]),
-            normals.data()));
+            normals.data(),
+            src_location));
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(normals[0]);
     binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
@@ -212,7 +215,8 @@ Plane::Plane(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             tangents.size() * sizeof(tangents[0]),
-            tangents.data()));
+            tangents.data(),
+            src_location));
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(tangents[0]);
     binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
@@ -230,7 +234,8 @@ Plane::Plane(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             uvs.size() * sizeof(uvs[0]),
-            uvs.data()));
+            uvs.data(),
+            src_location));
     binding_desc.binding = binding_idx;
     binding_desc.stride = sizeof(uvs[0]);
     binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
@@ -251,7 +256,8 @@ Plane::Plane(
             device,
             SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
             faces.size() * sizeof(faces[0]),
-            faces.data()));
+            faces.data(),
+            src_location));
 }
 
 void Plane::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {

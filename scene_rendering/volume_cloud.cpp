@@ -207,7 +207,8 @@ std::shared_ptr<er::PipelineLayout>
 
     return device->createPipelineLayout(
         { desc_set_layout, view_desc_set_layout },
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 std::shared_ptr<er::PipelineLayout> createRenderCloudFogPipelineLayout(
@@ -221,7 +222,8 @@ std::shared_ptr<er::PipelineLayout> createRenderCloudFogPipelineLayout(
 
     return device->createPipelineLayout(
         { desc_set_layout , view_desc_set_layout },
-        { push_const_range });
+        { push_const_range },
+        std::source_location::current());
 }
 
 } // namespace
@@ -362,7 +364,8 @@ void VolumeCloud::recreate(
         fog_cloud_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -371,7 +374,8 @@ void VolumeCloud::recreate(
         blurred_fog_cloud_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
 
     if (blur_image_pipeline_layout_ != nullptr) {
         device->destroyPipelineLayout(blur_image_pipeline_layout_);
@@ -431,13 +435,15 @@ void VolumeCloud::recreate(
         renderer::helper::createComputePipeline(
             device,
             blur_image_pipeline_layout_,
-            "blur_image_x_comp.spv");
+            "blur_image_x_comp.spv",
+            std::source_location::current());
 
     blur_image_y_merge_pipeline_ =
         renderer::helper::createComputePipeline(
             device,
             blur_image_pipeline_layout_,
-            "blur_image_y_merge_comp.spv");
+            "blur_image_y_merge_comp.spv",
+            std::source_location::current());
 
     for (auto dbuf_idx = 0; dbuf_idx < 2; dbuf_idx++) {
         render_cloud_fog_desc_set_[dbuf_idx] = nullptr;
@@ -473,7 +479,8 @@ void VolumeCloud::recreate(
         renderer::helper::createComputePipeline(
             device,
             render_cloud_fog_pipeline_layout_,
-            "weather/render_volume_cloud_comp.spv");
+            "weather/render_volume_cloud_comp.spv",
+            std::source_location::current());
 }
 
 void VolumeCloud::renderVolumeCloud(
