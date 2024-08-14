@@ -30,7 +30,7 @@ std::shared_ptr<renderer::DescriptorSetLayout> createRtDescriptorSetLayout(
         SET_FLAG_BIT(ShaderStage, RAYGEN_BIT_KHR) |
         SET_FLAG_BIT(ShaderStage, CLOSEST_HIT_BIT_KHR) |
         SET_FLAG_BIT(ShaderStage, MISS_BIT_KHR),
-        renderer::DescriptorType::UNIFORM_BUFFER);
+        renderer::DescriptorType::STORAGE_BUFFER);
     bindings[3] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         3,
         SET_FLAG_BIT(ShaderStage, CLOSEST_HIT_BIT_KHR),
