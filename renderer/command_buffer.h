@@ -8,6 +8,8 @@ class CommandBuffer {
 public:
     virtual void beginCommandBuffer(CommandBufferUsageFlags flags) = 0;
     virtual void endCommandBuffer() = 0;
+    virtual void beginDebugUtilsLabel(const char* label_name) = 0;
+    virtual void endDebugUtilsLabel() = 0;
     virtual void copyBuffer(
         std::shared_ptr<Buffer> src_buf,
         std::shared_ptr<Buffer> dst_buf,

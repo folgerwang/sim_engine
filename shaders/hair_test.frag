@@ -10,7 +10,8 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 	GameCameraInfo camera_info;
 };
 
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D src_img;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D src_color_img;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = SRC_WEIGHT_TEX_INDEX) uniform sampler2D src_weight_img;
 
 layout(location = 0) out vec4 outColor;
 
@@ -58,7 +59,14 @@ void main() {
     if (accum_opacity > 0.99f)
         discard;
 #else
-	outColor = texture(src_img, ps_in_data.vertex_tex_coord.xy);
+    vec4 src_color = texture(src_color_img, ps_in_data.vertex_tex_coord.xy);
+    float src_weight = texture(src_weight_img, ps_in_data.vertex_tex_coord.xy).x;
+
+    if (src_weight > 0.0f) {
+        src_color /= src_weight;
+    }
+
+	outColor = src_color;
 
     if (outColor.a > 0.99f)
         discard;

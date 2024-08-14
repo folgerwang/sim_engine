@@ -14,6 +14,8 @@ public:
 
     virtual void beginCommandBuffer(CommandBufferUsageFlags flags) final;
     virtual void endCommandBuffer() final;
+    virtual void beginDebugUtilsLabel(const char* label_name) final;
+    virtual void endDebugUtilsLabel() final;
     virtual void copyBuffer(
         std::shared_ptr<Buffer> src_buf,
         std::shared_ptr<Buffer> dst_buf,

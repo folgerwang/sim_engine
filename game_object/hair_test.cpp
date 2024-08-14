@@ -10,11 +10,17 @@ namespace {
 static auto createHairTestDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings;
-    bindings.reserve(1);
+    bindings.reserve(2);
 
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             ALBEDO_TEX_INDEX,
+            SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER));
+
+    bindings.push_back(
+        renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            SRC_WEIGHT_TEX_INDEX,
             SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
             renderer::DescriptorType::COMBINED_IMAGE_SAMPLER));
 
@@ -24,10 +30,11 @@ static auto createHairTestDescriptorSetLayout(
 static auto addHairTestTextures(
     const std::shared_ptr<renderer::DescriptorSet>& desc_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::ImageView>& src_image) {
+    const std::shared_ptr<renderer::ImageView>& hair_patch_color_tex,
+    const std::shared_ptr<renderer::ImageView>& hair_patch_weight_tex) {
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(1);
+    descriptor_writes.reserve(2);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -35,7 +42,16 @@ static auto addHairTestTextures(
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
         ALBEDO_TEX_INDEX,
         texture_sampler,
-        src_image,
+        hair_patch_color_tex,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        desc_set,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        SRC_WEIGHT_TEX_INDEX,
+        texture_sampler,
+        hair_patch_weight_tex,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     return descriptor_writes;
@@ -73,7 +89,8 @@ HairTest::HairTest(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::TextureInfo>& hair_patch_tex,
+    const std::shared_ptr<renderer::TextureInfo>& hair_patch_color_tex,
+    const std::shared_ptr<renderer::TextureInfo>& hair_patch_weight_tex,
     const glm::uvec2& display_size,
     std::shared_ptr<Plane> unit_plane) {
 
@@ -90,7 +107,8 @@ HairTest::HairTest(
         addHairTestTextures(
             hair_desc_set_,
             texture_sampler,
-            hair_patch_tex->view);
+            hair_patch_color_tex->view,
+            hair_patch_weight_tex->view);
 
     device->updateDescriptorSets(
         hair_test_material_descs);
@@ -139,6 +157,8 @@ void HairTest::draw(
     std::shared_ptr<Plane> unit_plane,
     std::shared_ptr<Box> unit_box) {
 
+    cmd_buf->beginDebugUtilsLabel("hair test draw");
+
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
         hair_pipeline_);
@@ -173,6 +193,8 @@ void HairTest::draw(
 /*    if (unit_box) {
         unit_box->draw(cmd_buf);
     }*/
+
+    cmd_buf->endDebugUtilsLabel();
 }
 
 void HairTest::destroy(

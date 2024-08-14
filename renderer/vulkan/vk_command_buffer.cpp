@@ -39,6 +39,17 @@ void VulkanCommandBuffer::endCommandBuffer() {
     }
 }
 
+void VulkanCommandBuffer::beginDebugUtilsLabel(const char* label_name) {
+    VkDebugUtilsLabelEXT label = {};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = label_name;
+    vkCmdBeginDebugUtilsLabelEXT(cmd_buf_, &label);
+}
+
+void VulkanCommandBuffer::endDebugUtilsLabel() {
+    vkCmdEndDebugUtilsLabelEXT(cmd_buf_);
+}
+
 void VulkanCommandBuffer::copyBuffer(
     std::shared_ptr<Buffer> src_buf,
     std::shared_ptr<Buffer> dst_buf,
