@@ -52,6 +52,7 @@ const uint32_t g_object_count = 3;
 void RayTracingCallableTest::init(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::BufferInfo>& camera_info,
     const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
     const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
     glm::uvec2 size) {
@@ -71,7 +72,8 @@ void RayTracingCallableTest::init(
     createRtResources(device);
     createDescriptorSets(
         device,
-        descriptor_pool);
+        descriptor_pool,
+        camera_info);
 }
 
 void RayTracingCallableTest::initBottomLevelDataInfo(
@@ -535,7 +537,8 @@ void RayTracingCallableTest::createRtResources(
 
 void RayTracingCallableTest::createDescriptorSets(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::BufferInfo>& camera_info) {
 
     auto bl_data_info =
         std::reinterpret_pointer_cast<BottomLevelDataInfo>(bl_data_info_);
@@ -572,10 +575,10 @@ void RayTracingCallableTest::createDescriptorSets(
     renderer::Helper::addOneBuffer(
         descriptor_writes,
         rt_render_info->rt_desc_set,
-        renderer::DescriptorType::UNIFORM_BUFFER,
+        renderer::DescriptorType::STORAGE_BUFFER,
         2,
-        rt_render_info->ubo.buffer,
-        rt_render_info->ubo.buffer->getSize());
+        camera_info->buffer,
+        camera_info->buffer->getSize());
 
     renderer::Helper::addOneBuffer(
         descriptor_writes,
@@ -601,19 +604,8 @@ renderer::TextureInfo RayTracingCallableTest::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glsl::ViewParams& view_params) {
 
-    auto view = view_params.view;
-    view[3] = glm::vec4(0, 0, -5, 1);
-    UniformData uniform_data;
-    uniform_data.proj_inverse = glm::inverse(view_params.proj);
-    uniform_data.view_inverse = glm::inverse(view);
-
     auto rt_render_info =
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
-
-    device->updateBufferMemory(
-        rt_render_info->ubo.memory,
-        sizeof(uniform_data),
-        &uniform_data);
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::RAY_TRACING,

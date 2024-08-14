@@ -12,7 +12,7 @@ class Menu {
     std::string spawn_gltf_name_;
     bool turn_off_water_pass_ = false;
     bool turn_off_grass_pass_ = false;
-    bool turn_off_ray_tracing_ = true;
+    bool turn_off_ray_tracing_ = false;
     bool turn_off_volume_moist_ = false;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;

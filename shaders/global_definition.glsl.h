@@ -731,6 +731,8 @@ struct GameCameraInfo {
     mat4            view_proj;
     mat4            inv_view_proj;
     mat4            inv_view_proj_relative;
+    mat4            inv_view;
+    mat4            inv_proj;
     vec4            depth_params;
     vec3            position;
     uint            status;                   // 32 bits for status, todo.

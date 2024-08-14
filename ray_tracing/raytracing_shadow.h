@@ -42,7 +42,8 @@ class RayTracingShadowTest : public RayTracingBase {
 
     virtual void createDescriptorSets(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) final;
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::BufferInfo>& camera_info) final;
 
 public:
     RayTracingShadowTest() {}
@@ -50,6 +51,7 @@ public:
     virtual void init(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::BufferInfo>& camera_info,
         const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
         const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
         glm::uvec2 size) final;

@@ -206,6 +206,9 @@ void main()
     camera_info.proj[1].y *= -1.0f;
     camera_info.view_proj = camera_info.proj * camera_info.view;
     camera_info.inv_view_proj = inverse(camera_info.view_proj);
+    camera_info.inv_view = inverse(camera_info.view);
+    camera_info.inv_proj = inverse(camera_info.proj);
+
     mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
     camera_info.inv_view_proj_relative = inverse(camera_info.proj * view_relative);
     camera_info.depth_params = vec4(

@@ -15,7 +15,7 @@ enum {
 
 std::shared_ptr<renderer::DescriptorSetLayout> createRtDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(6);
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(7);
     bindings[0] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         0,
         SET_FLAG_BIT(ShaderStage, RAYGEN_BIT_KHR) |
@@ -43,6 +43,12 @@ std::shared_ptr<renderer::DescriptorSetLayout> createRtDescriptorSetLayout(
         5,
         SET_FLAG_BIT(ShaderStage, CLOSEST_HIT_BIT_KHR),
         renderer::DescriptorType::STORAGE_BUFFER);
+    bindings[6] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        6,
+        SET_FLAG_BIT(ShaderStage, RAYGEN_BIT_KHR) |
+        SET_FLAG_BIT(ShaderStage, CLOSEST_HIT_BIT_KHR) |
+        SET_FLAG_BIT(ShaderStage, MISS_BIT_KHR),
+        renderer::DescriptorType::UNIFORM_BUFFER);
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -53,6 +59,7 @@ namespace ray_tracing {
 void RayTracingShadowTest::init(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::BufferInfo>& camera_info,
     const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
     const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
     glm::uvec2 size) {
@@ -121,7 +128,8 @@ void RayTracingShadowTest::init(
     createRtResources(device);
     createDescriptorSets(
         device,
-        descriptor_pool);
+        descriptor_pool,
+        camera_info);
 }
 
 void RayTracingShadowTest::initBottomLevelDataInfo(
@@ -513,7 +521,8 @@ void RayTracingShadowTest::createRtResources(
 
 void RayTracingShadowTest::createDescriptorSets(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::BufferInfo>& camera_info) {
 
     auto bl_data_info =
         std::reinterpret_pointer_cast<BottomLevelDataInfo>(bl_data_info_);
@@ -529,7 +538,7 @@ void RayTracingShadowTest::createDescriptorSets(
             1)[0];
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(6);
+    descriptor_writes.reserve(7);
 
     renderer::Helper::addOneAccelerationStructure(
         descriptor_writes,
@@ -550,10 +559,10 @@ void RayTracingShadowTest::createDescriptorSets(
     renderer::Helper::addOneBuffer(
         descriptor_writes,
         rt_render_info->rt_desc_set,
-        renderer::DescriptorType::UNIFORM_BUFFER,
+        renderer::DescriptorType::STORAGE_BUFFER,
         2,
-        rt_render_info->ubo.buffer,
-        rt_render_info->ubo.buffer->getSize());
+        camera_info->buffer,
+        camera_info->buffer->getSize());
 
     renderer::Helper::addOneBuffer(
         descriptor_writes,
@@ -579,6 +588,14 @@ void RayTracingShadowTest::createDescriptorSets(
         bl_data_info->rt_geometry_info_buffer.buffer,
         bl_data_info->rt_geometry_info_buffer.buffer->getSize());
 
+    renderer::Helper::addOneBuffer(
+        descriptor_writes,
+        rt_render_info->rt_desc_set,
+        renderer::DescriptorType::UNIFORM_BUFFER,
+        6,
+        rt_render_info->ubo.buffer,
+        rt_render_info->ubo.buffer->getSize());
+
     device->updateDescriptorSets(descriptor_writes);
 }
 
@@ -590,11 +607,7 @@ renderer::TextureInfo RayTracingShadowTest::draw(
     auto rt_render_info =
         std::reinterpret_pointer_cast<RayTracingRenderingInfo>(rt_render_info_);
 
-    auto view = view_params.view;
-    view[3] = glm::vec4(0, 0, -20, 1);
     UniformData uniform_data;
-    uniform_data.proj_inverse = glm::inverse(view_params.proj);
-    uniform_data.view_inverse = glm::inverse(view);
     uniform_data.light_pos = vec4(0.5, 1, 0, 0);
 
     device->updateBufferMemory(

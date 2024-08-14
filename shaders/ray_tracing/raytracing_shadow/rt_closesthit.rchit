@@ -11,15 +11,17 @@ layout(location = kPayLoadShadowedIdx) rayPayloadEXT bool shadowed;
 hitAttributeEXT vec2 attribs;
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 2, set = 0) uniform UBO {
-	mat4 view_inverse;
-	mat4 proj_inverse;
-	vec4 light_pos;
-} ubo;
+layout(binding = 2, set = 0) readonly buffer CameraInfoBuffer {
+	GameCameraInfo camera_info;
+};
 
 layout(binding = 3, set = 0) buffer Vertices { float v[]; } vertices;
 layout(binding = 4, set = 0) buffer Indices { uint16_t i[]; } indices;
 layout(binding = 5, set = 0) buffer Geometries { VertexBufferInfo info[]; } geometries;
+layout(binding = 6, set = 0) uniform LightProperties
+{
+       vec4 light_pos;
+} light_info;
 
 struct Vertex
 {
@@ -71,7 +73,7 @@ void main()
 							v2.normal * barycentricCoords.z);
 
 	// Basic lighting
-	vec3 light_vector = normalize(ubo.light_pos.xyz);
+	vec3 light_vector = normalize(light_info.light_pos.xyz);
 	float dot_product = max(dot(light_vector, normal), 0.2);
 	hit_value = v0.color.rgb * dot_product;
  

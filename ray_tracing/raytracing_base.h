@@ -46,8 +46,6 @@ struct RayTracingRenderingInfoBase {
 };
 
 struct UniformDataBase {
-    glm::mat4 view_inverse;
-    glm::mat4 proj_inverse;
 };
 
 class RayTracingBase {
@@ -76,12 +74,14 @@ protected:
 
     virtual void createDescriptorSets(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) = 0;
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::BufferInfo>& camera_info) = 0;
 
 public:
     virtual void init(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::BufferInfo>& camera_info,
         const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
         const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
         glm::uvec2 size) = 0;
