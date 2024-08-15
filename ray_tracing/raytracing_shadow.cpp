@@ -599,7 +599,7 @@ void RayTracingShadowTest::createDescriptorSets(
     device->updateDescriptorSets(descriptor_writes);
 }
 
-renderer::TextureInfo RayTracingShadowTest::draw(
+void RayTracingShadowTest::draw(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glsl::ViewParams& view_params) {
@@ -630,8 +630,6 @@ renderer::TextureInfo RayTracingShadowTest::draw(
         rt_render_info->hit_shader_sbt_entry,
         {0, 0, 0},
         glm::uvec3(rt_size_, 1));
-
-    return rt_render_info->result_image;
 }
 
 void RayTracingShadowTest::destroy(

@@ -86,10 +86,12 @@ public:
         const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
         glm::uvec2 size) = 0;
 
-    virtual renderer::TextureInfo draw(
+    virtual void draw(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const glsl::ViewParams& view_params) = 0;
+
+    virtual renderer::TextureInfo getFinalImage() = 0;
 
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device) = 0;

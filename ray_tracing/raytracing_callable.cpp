@@ -599,7 +599,7 @@ void RayTracingCallableTest::createDescriptorSets(
     device->updateDescriptorSets(descriptor_writes);
 }
 
-renderer::TextureInfo RayTracingCallableTest::draw(
+void RayTracingCallableTest::draw(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glsl::ViewParams& view_params) {
@@ -622,8 +622,6 @@ renderer::TextureInfo RayTracingCallableTest::draw(
         rt_render_info->hit_shader_sbt_entry,
         rt_render_info->callable_shader_sbt_entry,
         glm::uvec3(rt_size_, 1));
-
-    return rt_render_info->result_image;
 }
 
 void RayTracingCallableTest::destroy(

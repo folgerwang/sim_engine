@@ -148,7 +148,7 @@ bool Menu::draw(
     ImGui::EndChild();
     ImGui::End();
 
-#if 0
+#if 1
     ImVec2 childSize = ImVec2(1024, 768);  // Define the size of the child window
     ImGui::Begin(
         "Viewport",
@@ -158,7 +158,7 @@ bool Menu::draw(
         ImGuiWindowFlags_NoScrollbar);
     ImGui::SetWindowPos(ImVec2(0, 20.0f));
     auto window_size = ImGui::GetWindowSize();
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
     ImGui::BeginChild("Viewport", ImVec2(0, 0), true);
 //    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
     // Render something here, for example, a colored rectangle:
