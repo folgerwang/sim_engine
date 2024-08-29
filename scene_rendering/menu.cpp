@@ -76,7 +76,8 @@ Menu::Menu(
     weather_controls_.frozen_ext_factor = 2.0f;
     weather_controls_.frozen_pow_curve = 1.0f / 2.0f;
 
-    texture_id_ = renderer::Helper::addImTextureID(sampler, image_view);
+    texture_id_ =
+        renderer::Helper::addImTextureID(sampler, image_view);
 }
 
 void Menu::init(
