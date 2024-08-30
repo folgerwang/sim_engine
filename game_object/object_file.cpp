@@ -214,8 +214,7 @@ static std::shared_ptr<renderer::PipelineLayout> createPipelineLayout(
     const std::shared_ptr<renderer::DescriptorSetLayout>& object_desc_set_layout) {
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::ModelParams);
 
@@ -513,8 +512,7 @@ void ObjectMesh::draw(
             glm::vec4(0, 0, 0, 1));
 
     cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
         object_pipeline_layout_,
         &model_params,
         sizeof(model_params));

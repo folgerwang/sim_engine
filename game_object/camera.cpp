@@ -149,8 +149,7 @@ void GameCamera::initGameCameraBuffer(
         device->createBuffer(
             sizeof(glsl::GameCameraInfo),
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-            SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-            SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT),
             0,
             game_camera_buffer_->buffer,
             game_camera_buffer_->memory,

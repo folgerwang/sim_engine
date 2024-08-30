@@ -9,6 +9,7 @@
 #define SET_2_FLAG_BITS(type, name1, name2) (SET_FLAG_BIT(type, name1) | SET_FLAG_BIT(type, name2))
 #define SET_3_FLAG_BITS(type, name1, name2, name3) (SET_2_FLAG_BITS(type, name1, name2) | SET_FLAG_BIT(type, name3))
 #define SET_4_FLAG_BITS(type, name1, name2, name3, name4) (SET_2_FLAG_BITS(type, name1, name2) | SET_2_FLAG_BITS(type, name3, name4))
+#define SET_5_FLAG_BITS(type, name1, name2, name3, name4, name5) (SET_2_FLAG_BITS(type, name1, name2) | SET_3_FLAG_BITS(type, name3, name4, name5))
 
 namespace engine {
 namespace renderer {

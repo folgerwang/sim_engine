@@ -221,8 +221,7 @@ ConemapObj::ConemapObj(
         renderer::Format::R16G16_SFLOAT,
         buffer_size / glm::uvec2(kConemapGenBlockCacheSizeX, kConemapGenBlockCacheSizeY),
         *minmax_depth_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
         std::source_location::current());
 
@@ -231,8 +230,7 @@ ConemapObj::ConemapObj(
         renderer::Format::R8G8B8A8_UNORM,
         buffer_size,
         *conemap_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
         std::source_location::current());
 
@@ -241,8 +239,7 @@ ConemapObj::ConemapObj(
         renderer::Format::R32G32B32A32_UINT,
         buffer_size,
         *prt_pack_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
 
@@ -256,8 +253,7 @@ ConemapObj::ConemapObj(
         renderer::Format::R32G32B32A32_SFLOAT,
         pack_info_tex_size,
         *prt_pack_info_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
         std::source_location::current());
 

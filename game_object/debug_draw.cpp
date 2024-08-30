@@ -94,15 +94,15 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateDebugDrawDescriptorS
 
     bindings[0] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_TEMP_TEX_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, VERTEX_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, VERTEX_BIT));
 
     bindings[1] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_MOISTURE_TEX_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, VERTEX_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, VERTEX_BIT));
 
     bindings[2] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_AIRFLOW_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, VERTEX_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, VERTEX_BIT));
     
     return device->createDescriptorSetLayout(bindings);
 }
@@ -112,8 +112,7 @@ static std::shared_ptr<renderer::PipelineLayout> createDebugDrawPipelineLayout(
     const renderer::DescriptorSetLayoutList& desc_set_layouts) {
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::DebugDrawParams);
 
@@ -306,8 +305,7 @@ void DebugDrawObject::draw(
     debug_params.inv_size = 1.0f / glm::vec3(debug_params.size);
     debug_params.debug_type = debug_type;
     cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | 
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
         debug_draw_pipeline_layout_,
         &debug_params,
         sizeof(debug_params));

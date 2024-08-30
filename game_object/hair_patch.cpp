@@ -37,12 +37,12 @@ static auto createHairPatchDescriptorSetLayout(
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             PRT_PACK_TEX_INDEX,
-            SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             renderer::DescriptorType::STORAGE_IMAGE));
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             PRT_PACK_INFO_TEX_INDEX,
-            SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             renderer::DescriptorType::STORAGE_IMAGE));
 
     renderer::DescriptorSetLayoutBinding ubo_pbr_layout_binding{};
@@ -128,8 +128,7 @@ HairPatch::HairPatch(
         renderer::Format::R16G16B16A16_SFLOAT,
         patch_size,
         *hair_patch_color_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
         std::source_location::current(),
         renderer::ImageTiling::OPTIMAL,
@@ -141,8 +140,7 @@ HairPatch::HairPatch(
         renderer::Format::R16_SFLOAT,
         patch_size,
         *hair_patch_weight_tex_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
         std::source_location::current(),
         renderer::ImageTiling::OPTIMAL,
@@ -199,8 +197,7 @@ void HairPatch::update(
             { hair_patch_color_tex_->image },
             renderer::ImageLayout::GENERAL,
             SET_FLAG_BIT(Access, SHADER_READ_BIT),
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-            SET_FLAG_BIT(Access, SHADER_WRITE_BIT));
+            SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT));
 
         cmd_buf->addBarriers(
             barrier_list,
@@ -251,8 +248,7 @@ void HairPatch::update(
             { hair_patch_color_tex_->image,
               hair_patch_weight_tex_->image },
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-            SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+            SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
             SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
         cmd_buf->addBarriers(

@@ -20,8 +20,7 @@ createRtDescriptorSetLayout(
     std::vector<renderer::DescriptorSetLayoutBinding> bindings(5);
     bindings[0] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         0,
-        SET_FLAG_BIT(ShaderStage, RAYGEN_BIT_KHR) |
-        SET_FLAG_BIT(ShaderStage, CLOSEST_HIT_BIT_KHR),
+        SET_2_FLAG_BITS(ShaderStage, RAYGEN_BIT_KHR, CLOSEST_HIT_BIT_KHR),
         renderer::DescriptorType::ACCELERATION_STRUCTURE_KHR);
     bindings[1] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         1,
@@ -29,9 +28,7 @@ createRtDescriptorSetLayout(
         renderer::DescriptorType::STORAGE_IMAGE);
     bindings[2] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         2,
-        SET_FLAG_BIT(ShaderStage, RAYGEN_BIT_KHR) |
-        SET_FLAG_BIT(ShaderStage, CLOSEST_HIT_BIT_KHR) |
-        SET_FLAG_BIT(ShaderStage, MISS_BIT_KHR),
+        SET_3_FLAG_BITS(ShaderStage, RAYGEN_BIT_KHR, CLOSEST_HIT_BIT_KHR, MISS_BIT_KHR),
         renderer::DescriptorType::STORAGE_BUFFER);
     bindings[3] = renderer::helper::getBufferDescriptionSetLayoutBinding(
         3,
@@ -111,11 +108,12 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
     // Vertex buffer
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        SET_3_FLAG_BITS(
+            BufferUsage,
+            SHADER_DEVICE_ADDRESS_BIT,
+            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+            STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->vertex_buffer.buffer,
         bl_data_info->vertex_buffer.memory,
@@ -126,11 +124,12 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
     // Index buffer
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        SET_3_FLAG_BITS(
+            BufferUsage,
+            SHADER_DEVICE_ADDRESS_BIT,
+            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+            STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->index_buffer.buffer,
         bl_data_info->index_buffer.memory,
@@ -141,10 +140,8 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
     // Transform buffer
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        SET_2_FLAG_BITS(BufferUsage, SHADER_DEVICE_ADDRESS_BIT, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->transform_buffer.buffer,
         bl_data_info->transform_buffer.memory,
@@ -189,8 +186,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
 
     device->createBuffer(
         as_build_size_info.as_size,
-        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+        SET_2_FLAG_BITS(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, SHADER_DEVICE_ADDRESS_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->as_buffer.buffer,
@@ -203,8 +199,7 @@ void RayTracingCallableTest::initBottomLevelDataInfo(
 
     device->createBuffer(
         as_build_size_info.build_scratch_size,
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+        SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, SHADER_DEVICE_ADDRESS_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         bl_data_info->scratch_buffer.buffer,
@@ -261,10 +256,8 @@ void RayTracingCallableTest::initTopLevelDataInfo(
     // Instance buffer
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        SET_2_FLAG_BITS(BufferUsage, SHADER_DEVICE_ADDRESS_BIT, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         tl_data_info->instance_buffer.buffer,
         tl_data_info->instance_buffer.memory,

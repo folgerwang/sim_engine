@@ -155,12 +155,12 @@ static auto createPrtDescriptorSetLayout(
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             PRT_PACK_TEX_INDEX,
-            SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             renderer::DescriptorType::STORAGE_IMAGE));
     bindings.push_back(
         renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
             PRT_PACK_INFO_TEX_INDEX,
-            SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             renderer::DescriptorType::STORAGE_IMAGE));
 
     renderer::DescriptorSetLayoutBinding ubo_pbr_layout_binding{};
@@ -303,8 +303,7 @@ static auto createPipelineLayout(
 
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::PrtLightParams);
 
@@ -347,10 +346,8 @@ ConemapTest::ConemapTest(
     uniform_buffer_ = std::make_shared<renderer::BufferInfo>();
     device->createBuffer(
         sizeof(glsl::PbrMaterialParams),
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_CACHED_BIT),
+        SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, UNIFORM_BUFFER_BIT),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT),
         0,
         uniform_buffer_->buffer,
         uniform_buffer_->memory,
@@ -457,8 +454,7 @@ void ConemapTest::draw(
     params.buffer_size = glm::vec2(buffer_size);
 
     cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
         prt_pipeline_layout_,
         &params,
         sizeof(params));

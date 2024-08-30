@@ -95,11 +95,13 @@ static void setupMeshState(
             auto buffer = model.buffers[i];
             renderer::Helper::createBuffer(
                 device,
-                SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
-                SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT) |
-                SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-                SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
-                SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+                SET_5_FLAG_BITS(
+                    BufferUsage,
+                    VERTEX_BUFFER_BIT,
+                    INDEX_BUFFER_BIT,
+                    SHADER_DEVICE_ADDRESS_BIT,
+                    STORAGE_BUFFER_BIT,
+                    ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
                 SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
                 SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
                 gltf_object->buffers_[i].buffer,
@@ -151,8 +153,7 @@ static void setupMeshState(
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
                 SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
-                SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-                SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
                 0,
                 dst_material.uniform_buffer_.buffer,
                 dst_material.uniform_buffer_.memory,
@@ -518,8 +519,7 @@ static void setupSkin(
         renderer::Helper::createBuffer(
             device,
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-            SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-            SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
             0,
             skin_info.joints_buffer_.buffer,
             skin_info.joints_buffer_.memory,
@@ -1483,8 +1483,7 @@ GltfObject::GltfObject(
 
         device->createBuffer(
             kNumGltfInstance * sizeof(glsl::InstanceDataInfo),
-            SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
-            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+            SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0,
             object_->instance_buffer_.buffer,
@@ -2081,8 +2080,7 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
 
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, INDIRECT_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
         gltf_object->indirect_draw_cmd_.buffer,

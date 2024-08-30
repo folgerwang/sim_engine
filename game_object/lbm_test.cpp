@@ -48,8 +48,7 @@ static auto createPipelineLayout(
 
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::PrtLightParams);
 
@@ -160,8 +159,7 @@ void LbmTest::draw(
             glm::vec4(0, 0, 0, 1));
 
     cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
         lbm_pipeline_layout_,
         &params,
         sizeof(params));

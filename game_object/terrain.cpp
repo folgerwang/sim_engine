@@ -1891,35 +1891,31 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescript
         SRC_DEPTH_TEX_INDEX);
     bindings[2] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ROCK_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT) |
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, MESH_BIT_EXT, COMPUTE_BIT));
     bindings[3] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SOIL_WATER_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT) |
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, MESH_BIT_EXT, COMPUTE_BIT));
     bindings[4] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ORTHER_INFO_LAYER_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, COMPUTE_BIT));
     bindings[5] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         WATER_NORMAL_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
     bindings[6] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         WATER_FLOW_BUFFER_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
     bindings[7] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_TEMP_TEX_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
     bindings[8] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_MAP_MASK_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
     bindings[9] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         DETAIL_NOISE_TEXTURE_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
     bindings[10] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ROUGH_NOISE_TEXTURE_INDEX,
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT));
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -1970,8 +1966,7 @@ static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
     const renderer::DescriptorSetLayoutList& desc_set_layouts) {
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileParams);
 
@@ -1987,12 +1982,9 @@ static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
     renderer::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
 #if USE_MESH_SHADER
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT);
+        SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, MESH_BIT_EXT);
 #else
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
-        SET_FLAG_BIT(ShaderStage, GEOMETRY_BIT);
+        SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT, GEOMETRY_BIT);
 #endif
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::TileParams);
@@ -2378,8 +2370,7 @@ void TileObject::initStaticMembers(
         renderer::Format::R16_SFLOAT,
         glm::uvec2(static_cast<uint32_t>(TileConst::kRockLayerSize)),
         rock_layer_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
 
@@ -2389,8 +2380,7 @@ void TileObject::initStaticMembers(
             renderer::Format::R16G16_UNORM,
             glm::uvec2(static_cast<uint32_t>(TileConst::kSoilLayerSize)),
             soil_water_layer_[i],
-            SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-            SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+            SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             std::source_location::current());
     }
@@ -2400,8 +2390,7 @@ void TileObject::initStaticMembers(
         renderer::Format::R8G8_UNORM,
         glm::uvec2(static_cast<uint32_t>(TileConst::kGrassSnowLayerSize)),
         grass_snow_layer_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
 
@@ -2410,8 +2399,7 @@ void TileObject::initStaticMembers(
         renderer::Format::R8G8_SNORM,
         glm::uvec2(static_cast<uint32_t>(TileConst::kWaterlayerSize)),
         water_normal_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
 
@@ -2420,8 +2408,7 @@ void TileObject::initStaticMembers(
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(static_cast<uint32_t>(TileConst::kWaterlayerSize)),
         water_flow_,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
-        SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
 
@@ -2566,8 +2553,7 @@ void TileObject::createMeshBuffers(
     auto index_buffer_size = static_cast<uint32_t>(sizeof(index_buffer[0]) * index_buffer.size());
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
         index_buffer_.buffer,
@@ -2597,8 +2583,7 @@ void TileObject::createGrassBuffers(
     glm::vec3 vertex_pos = glm::vec3(0);
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         grass_vertex_buffer_.buffer,
@@ -2611,8 +2596,7 @@ void TileObject::createGrassBuffers(
 
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         grass_index_buffer_.buffer,
@@ -2630,10 +2614,8 @@ void TileObject::createGrassBuffers(
 
     renderer::Helper::createBuffer(
         device,
-        SET_FLAG_BIT(BufferUsage, INDIRECT_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
         0,
         grass_indirect_draw_cmd_.buffer,
         grass_indirect_draw_cmd_.memory,
@@ -2643,8 +2625,7 @@ void TileObject::createGrassBuffers(
 
     device->createBuffer(
         static_cast<uint32_t>(TileConst::kMaxNumGrass) * sizeof(glsl::GrassInstanceDataInfo),
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT) |
-        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
         grass_instance_buffer_.buffer,
@@ -2910,8 +2891,7 @@ void TileObject::draw(
     tile_params.time = cur_time;
     tile_params.tile_index = block_idx_;
     cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | 
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
         tile_pipeline_layout_, 
         &tile_params, 
         sizeof(tile_params));
@@ -2968,12 +2948,9 @@ void TileObject::drawGrass(
     tile_params.tile_index = block_idx_;
     cmd_buf->pushConstants(
 #if USE_MESH_SHADER
-        SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        SET_2_FLAG_BITS(ShaderStage, MESH_BIT_EXT, FRAGMENT_BIT),
 #else
-        SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
-        SET_FLAG_BIT(ShaderStage, GEOMETRY_BIT),
+        SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT, GEOMETRY_BIT),
 #endif
         tile_grass_pipeline_layout_,
         &tile_params,
