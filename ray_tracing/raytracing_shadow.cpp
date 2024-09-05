@@ -513,8 +513,8 @@ void RayTracingShadowTest::createRtResources(
         renderer::Format::R16G16B16A16_SFLOAT,
         rt_size_,
         rt_render_info->result_image,
-        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT),
-        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_3_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT, TRANSFER_SRC_BIT),
+        renderer::ImageLayout::GENERAL,
         std::source_location::current());
 }
 

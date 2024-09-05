@@ -382,10 +382,8 @@ void Conemap::update(
         { conemap_temp_tex_[0]->image,
           conemap_temp_tex_[1]->image },
         renderer::ImageLayout::GENERAL,
-        SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-        SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
-        SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-        SET_FLAG_BIT(Access, SHADER_WRITE_BIT));
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT));
 
     // generate first pass of conemap with closer blocks.
     for (uint p = pass_start; p < pass_end; p++) {
@@ -530,8 +528,7 @@ void Conemap::update(
             barrier_list,
             { conemap_tex->image },
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) |
-            SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+            SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
             SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
         cmd_buf->addBarriers(

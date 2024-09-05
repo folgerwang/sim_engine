@@ -367,12 +367,11 @@ void transitMapTextureToStoreImage(
         images,
         renderer::ImageLayout::GENERAL,
         SET_FLAG_BIT(Access, SHADER_READ_BIT),
-        SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT));
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT));
 
     cmd_buf->addBarriers(
         barrier_list,
-        SET_FLAG_BIT(PipelineStage, VERTEX_SHADER_BIT) |
-        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
+        SET_2_FLAG_BITS(PipelineStage, VERTEX_SHADER_BIT, COMPUTE_SHADER_BIT),
         SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
 }
 
@@ -387,14 +386,13 @@ void transitMapTextureFromStoreImage(
         barrier_list,
         images,
         new_layout,
-        SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
         SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
     cmd_buf->addBarriers(
         barrier_list,
         SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
-        SET_FLAG_BIT(PipelineStage, VERTEX_SHADER_BIT) |
-        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
+        SET_2_FLAG_BITS(PipelineStage, VERTEX_SHADER_BIT, COMPUTE_SHADER_BIT));
 }
 
 static std::unordered_map<std::string, std::shared_ptr<ShaderModule>> s_shader_module_list;

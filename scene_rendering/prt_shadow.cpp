@@ -497,7 +497,7 @@ void PrtShadow::update(
             barrier_list,
             { conemap_obj->getPackInfoTexture()->image },
             renderer::ImageLayout::GENERAL,
-            SET_FLAG_BIT(Access, SHADER_READ_BIT) | SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+            SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
             SET_FLAG_BIT(Access, SHADER_READ_BIT));
 
         cmd_buf->addBarriers(
