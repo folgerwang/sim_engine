@@ -76,6 +76,7 @@ Menu::Menu(
     weather_controls_.frozen_ext_factor = 2.0f;
     weather_controls_.frozen_pow_curve = 1.0f / 2.0f;
 
+    // Convert the Vulkan image to an ImGui texture
     texture_id_ =
         renderer::Helper::addImTextureID(sampler, image_view);
 }
@@ -167,7 +168,7 @@ bool Menu::draw(
     ImVec2 rectMax = ImVec2(rectMin.x + childSize.x, rectMin.y + childSize.y);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     //drawList->AddRectFilled(rectMin, rectMax, IM_COL32(100, 100, 255, 255), 20.0f, ImDrawFlags_RoundCornersAll);
-    // Convert the Vulkan image to an ImGui texture
+ 
     drawList->AddImage(texture_id_, ImVec2(0, 0), window_size, ImVec2(0, 0), ImVec2(1, 1));
 
 //    ImGui::PopStyleVar(1);
