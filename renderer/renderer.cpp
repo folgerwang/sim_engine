@@ -400,7 +400,7 @@ void Helper::create2DTextureImage(
         glm::vec3(tex_width, tex_height, 1),
         format,
         ImageTiling::OPTIMAL,
-        SET_2_FLAG_BITS(ImageUsage, TRANSFER_SRC_BIT, SAMPLED_BIT),
+        SET_2_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, SAMPLED_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         texture_image,
         texture_image_memory,
