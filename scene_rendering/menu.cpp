@@ -22,6 +22,27 @@ namespace {
         if (err < 0)
             abort();
     }
+
+    static void drawViewport(
+        const ImTextureID& texture_id,
+        const ImVec2& offset,
+        const ImVec2& size) {
+
+        ImGui::BeginGroup();
+        ImGui::Begin(
+            "Viewport",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar);
+        ImGui::SetWindowPos(offset);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+        drawList->AddImage(texture_id,ImVec2(0, 0), size, ImVec2(0, 0), ImVec2(1, 1));
+
+        ImGui::End();
+        ImGui::EndGroup();
+    }
 }
 
 namespace engine {
@@ -151,30 +172,13 @@ bool Menu::draw(
     ImGui::End();
 
 #if 1
-    ImVec2 childSize = ImVec2(1024, 768);  // Define the size of the child window
-    ImGui::Begin(
-        "Viewport",
-        nullptr,
-        ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoScrollbar);
-    ImGui::SetWindowPos(ImVec2(0, 20.0f));
-    auto window_size = ImGui::GetWindowSize();
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
-    ImGui::BeginChild("Viewport", ImVec2(0, 0), true);
-//    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    // Render something here, for example, a colored rectangle:
-    ImVec2 rectMin = ImGui::GetCursorScreenPos();
-    ImVec2 rectMax = ImVec2(rectMin.x + childSize.x, rectMin.y + childSize.y);
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
-    //drawList->AddRectFilled(rectMin, rectMax, IM_COL32(100, 100, 255, 255), 20.0f, ImDrawFlags_RoundCornersAll);
- 
-    drawList->AddImage(texture_id_, ImVec2(0, 0), window_size, ImVec2(0, 0), ImVec2(1, 1));
+    // Define the rectangle's position and size
+    float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
 
-//    ImGui::PopStyleVar(1);
-    ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::End();
+    drawViewport(
+        texture_id_,
+        ImVec2(0, menu_height),
+        ImVec2(screen_size.x / 2, screen_size.y / 2));
 #endif
     if (ImGui::BeginMainMenuBar())
     {
