@@ -175,10 +175,24 @@ bool Menu::draw(
     // Define the rectangle's position and size
     float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
 
+     // Set up the size for the first child window
+    ImVec2 child1_size(300, 200); // Initial size of the child window (width, height)
+    ImGui::BeginChild("Child Window 1", child1_size, true); // 'true' enables the border
     drawViewport(
         texture_id_,
         ImVec2(0, menu_height),
-        ImVec2(screen_size.x / 2, screen_size.y / 2));
+        ImVec2(screen_size.x / 2.0f, screen_size.y / 2.0f));
+    ImGui::EndChild();
+
+    // Add some spacing between the sub-windows
+    ImGui::Spacing();
+
+    // Set up the size for the second child window
+    ImVec2 child2_size(300, 200);
+    ImGui::BeginChild("Child Window 2", child2_size, true);
+    ImGui::Text("This is another adjustable sub-window.");
+    ImGui::EndChild();
+
 #endif
     if (ImGui::BeginMainMenuBar())
     {

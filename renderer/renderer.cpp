@@ -1011,9 +1011,9 @@ void Helper::initImgui(
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    //io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
-    //io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
@@ -1030,11 +1030,14 @@ void Helper::initImgui(
     init_info.Queue = RENDER_TYPE_CAST(Queue, graphics_queue)->get();
     init_info.PipelineCache = nullptr;// g_PipelineCache;
     init_info.DescriptorPool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool)->get();
+    init_info.RenderPass = RENDER_TYPE_CAST(RenderPass, render_pass)->get();
+    init_info.Subpass = 0;
     init_info.Allocator = nullptr; // g_Allocator;
     init_info.MinImageCount = static_cast<uint32_t>(swap_chain_info.framebuffers.size());
     init_info.ImageCount = static_cast<uint32_t>(swap_chain_info.framebuffers.size());
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.CheckVkResultFn = check_vk_result;
-    ImGui_ImplVulkan_Init(&init_info, RENDER_TYPE_CAST(RenderPass, render_pass)->get());
+    ImGui_ImplVulkan_Init(&init_info);
 
     // Load Fonts
     // - If no fonts are loaded, dear imgui will use the default font. You can also load multiple fonts and use ImGui::PushFont()/PopFont() to select them.
@@ -1043,25 +1046,28 @@ void Helper::initImgui(
     // - The fonts will be rasterized at a given size (w/ oversampling) and stored into a texture when calling ImFontAtlas::Build()/GetTexDataAsXXXX(), which ImGui_ImplXXXX_NewFrame below will call.
     // - Read 'docs/FONTS.md' for more instructions and details.
     // - Remember that in C/C++ if you want to include a backslash \ in a string literal you need to write a double backslash \\ !
-    //io.Fonts->AddFontDefault();
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/Roboto-Medium.ttf", 16.0f);
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/Cousine-Regular.ttf", 15.0f);
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/DroidSans.ttf", 16.0f);
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/ProggyTiny.ttf", 10.0f);
-    //ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
-    //IM_ASSERT(font != NULL);
+    ImFontConfig config;
+    config.OversampleH = 2;
+    config.OversampleV = 1;
+    config.GlyphExtraSpacing.x = 1.0f;
+
+    const auto& font_path =
+        std::string("src/sim_engine/third_parties/imgui/misc/fonts/");
+
+//    io.Fonts->AddFontDefault(&config);
+    io.Fonts->AddFontFromFileTTF((font_path + "Cousine-Regular.ttf").c_str(), 24.0f, &config);
+//    io.Fonts->AddFontFromFileTTF((font_path + "Roboto-Medium.ttf").c_str(), 16.0f);
+//    io.Fonts->AddFontFromFileTTF((font_path + "DroidSans.ttf").c_str(), 15.0f);
+//    io.Fonts->AddFontFromFileTTF((font_path + "ProggyClean.ttf").c_str(), 16.0f);
+//    io.Fonts->AddFontFromFileTTF((font_path + "Karla-Regular.ttf").c_str(), 16.0f);
+//    io.Fonts->AddFontFromFileTTF((font_path + "ProggyTiny.ttf").c_str(), 16.0f);
+//    io.Fonts->Build();
 
     // Upload Fonts
     {
         auto cmd_buf = device->setupTransientCommandBuffer();
-        ImGui_ImplVulkan_CreateFontsTexture(
-            RENDER_TYPE_CAST(
-                CommandBuffer,
-                cmd_buf
-            )->get()
-        );
+        ImGui_ImplVulkan_CreateFontsTexture();
         device->submitAndWaitTransientCommandBuffer();
-        ImGui_ImplVulkan_DestroyFontUploadObjects();
     }
 }
 
