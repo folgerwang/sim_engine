@@ -140,6 +140,8 @@ bool Menu::draw(
     clear_values[0].color = { 0.0f, 0.0f, 0.0f, 1.0f };
     clear_values[1].depth_stencil = { 1.0f, 0 };
 
+    float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
+
     cmd_buf->beginRenderPass(
         render_pass,
         framebuffer,
@@ -163,8 +165,8 @@ bool Menu::draw(
         ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoInputs);
-    ImGui::SetWindowPos(ImVec2(float(screen_size.x) - 128.0f, 20.0f));
-    ImGui::SetWindowSize(ImVec2((float)128, (float)12));
+    ImGui::SetWindowPos(ImVec2(float(screen_size.x) - 196.0f, menu_height));
+    ImGui::SetWindowSize(ImVec2((float)196, (float)36));
     ImGui::BeginChild("fps", ImVec2(0, 0), false);
     float fps = delta_t > 0.0f ? 1.0f / delta_t : 0.0f;
     ImGui::Text("fps : %8.5f", fps);
@@ -173,7 +175,6 @@ bool Menu::draw(
 
 #if 1
     // Define the rectangle's position and size
-    float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
 
      // Set up the size for the first child window
     ImVec2 child1_size(300, 200); // Initial size of the child window (width, height)
