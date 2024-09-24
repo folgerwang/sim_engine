@@ -26,7 +26,8 @@ namespace {
     static void drawViewport(
         const ImTextureID& texture_id,
         const ImVec2& offset,
-        const ImVec2& size) {
+        const ImVec2& size,
+        const float& aspect) {
 
         ImGui::BeginGroup();
         ImGui::Begin(
@@ -35,10 +36,16 @@ namespace {
             ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoScrollbar);
-        ImGui::SetWindowPos(offset);
-        ImDrawList* drawList = ImGui::GetWindowDrawList();
 
-        drawList->AddImage(texture_id,ImVec2(0, 0), size, ImVec2(0, 0), ImVec2(1, 1));
+        ImVec2 available_size = ImGui::GetContentRegionAvail();
+        ImVec2 clamped_size = available_size;
+        clamped_size.y = std::min(available_size.y, available_size.x * aspect);
+        clamped_size.x = clamped_size.y / aspect;
+
+        ImGui::SetWindowPos(offset);
+
+        ImGui::SetCursorPos(ImVec2((available_size.x - clamped_size.x) / 2, (available_size.y - clamped_size.y) / 2));
+        ImGui::Image(texture_id, clamped_size);
 
         ImGui::End();
         ImGui::EndGroup();
@@ -179,10 +186,12 @@ bool Menu::draw(
      // Set up the size for the first child window
     ImVec2 child1_size(300, 200); // Initial size of the child window (width, height)
     ImGui::BeginChild("Child Window 1", child1_size, true); // 'true' enables the border
+    float aspect = (float)screen_size.y / (float)screen_size.x;
     drawViewport(
         texture_id_,
         ImVec2(0, menu_height),
-        ImVec2(screen_size.x / 2.0f, screen_size.y / 2.0f));
+        ImVec2(screen_size.x / 2.0f, screen_size.y / 2.0f),
+        aspect);
     ImGui::EndChild();
 
     // Add some spacing between the sub-windows
