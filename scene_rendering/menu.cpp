@@ -47,6 +47,21 @@ namespace {
         ImGui::SetCursorPos(ImVec2((available_size.x - clamped_size.x) / 2, (available_size.y - clamped_size.y) / 2));
         ImGui::Image(texture_id, clamped_size);
 
+        // Calculate position to render the icon on top of the base image
+        ImVec2 icon_position;
+        icon_position.x = offset.x + 10; // Adjust X offset for icon placement
+        icon_position.y = offset.y + 10;  // Adjust Y offset for icon placement
+
+        // Set the new cursor position for the icon
+        ImGui::SetCursorScreenPos(icon_position);
+
+        // Set a color with transparency (RGBA) for the icon (semi-transparent, e.g., 50% opacity)
+        ImVec4 icon_tint = ImVec4(1.0f, 1.0f, 1.0f, 0.5f);  // White with 50% opacity
+
+        // Render the icon on top of the base image with semi-transparency
+        //ImGui::Image(icon_texture, ImVec2(50, 50), ImVec2(0, 0), ImVec2(1, 1), icon_tint);
+        ImGui::Button("Button", ImVec2(150, 50));
+
         ImGui::End();
         ImGui::EndGroup();
     }
