@@ -35,7 +35,8 @@ class Menu {
 
     glsl::WeatherControl weather_controls_;
 
-    ImTextureID texture_id_;
+    ImTextureID rt_texture_id_;
+    ImTextureID main_texture_id_;
 
 public:
     Menu(
@@ -48,7 +49,8 @@ public:
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const std::shared_ptr<renderer::Sampler>& sampler,
-        const std::shared_ptr<renderer::ImageView>& image_view);
+        const std::shared_ptr<renderer::ImageView>& rt_image_view,
+        const std::shared_ptr<renderer::ImageView>& main_image_view);
 
     std::vector<std::string> getToLoadGltfNamesAndClear() {
         auto result = to_load_gltf_names_;

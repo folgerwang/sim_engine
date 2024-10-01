@@ -80,7 +80,8 @@ Menu::Menu(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::Sampler>& sampler,
-    const std::shared_ptr<renderer::ImageView>& image_view) {
+    const std::shared_ptr<renderer::ImageView>& rt_image_view,
+    const std::shared_ptr<renderer::ImageView>& main_image_view) {
     std::string path = "assets";
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
         auto path_string = entry.path();
@@ -120,8 +121,15 @@ Menu::Menu(
     weather_controls_.frozen_pow_curve = 1.0f / 2.0f;
 
     // Convert the Vulkan image to an ImGui texture
-    texture_id_ =
-        renderer::Helper::addImTextureID(sampler, image_view);
+    if (rt_image_view) {
+        rt_texture_id_ =
+            renderer::Helper::addImTextureID(sampler, rt_image_view);
+    }
+
+    if (main_image_view) {
+        main_texture_id_ =
+            renderer::Helper::addImTextureID(sampler, main_image_view);
+    }
 }
 
 void Menu::init(
@@ -203,7 +211,7 @@ bool Menu::draw(
     ImGui::BeginChild("Child Window 1", child1_size, true); // 'true' enables the border
     float aspect = (float)screen_size.y / (float)screen_size.x;
     drawViewport(
-        texture_id_,
+        rt_texture_id_,
         ImVec2(0, menu_height),
         ImVec2(screen_size.x / 2.0f, screen_size.y / 2.0f),
         aspect);
