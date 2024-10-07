@@ -10,8 +10,12 @@
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 
+// gltf
 #include "tiny_gltf.h"
 #include "tiny_mtx2.h"
+
+// fbx
+#include "third_parties/fbx/ufbx.h"
 
 namespace ego = engine::game_object;
 namespace engine {
@@ -390,6 +394,171 @@ static void setupMeshes(
     drawable_object->meshes_.resize(model.meshes.size());
     for (int i_mesh = 0; i_mesh < model.meshes.size(); i_mesh++) {
         setupMesh(model, model.meshes[i_mesh], drawable_object->meshes_[i_mesh]);
+    }
+}
+
+static void setupMesh(
+    const ufbx_abi ufbx_scene* fbx_scene,
+    const ufbx_mesh* src_mesh,
+    ego::MeshInfo& mesh_info) {
+
+/*
+    for (size_t i = 0; i < src_mesh->primitives.size(); i++) {
+        const tinygltf::Primitive& primitive = src_mesh.primitives[i];
+
+        ego::PrimitiveInfo primitive_info;
+        primitive_info.tag_.restart_enable = false;
+        primitive_info.material_idx_ = primitive.material;
+
+        auto mode = renderer::PrimitiveTopology::MAX_ENUM;
+        if (primitive.mode == TINYGLTF_MODE_TRIANGLES) {
+            mode = renderer::PrimitiveTopology::TRIANGLE_LIST;
+        }
+        else if (primitive.mode == TINYGLTF_MODE_TRIANGLE_STRIP) {
+            mode = renderer::PrimitiveTopology::TRIANGLE_STRIP;
+        }
+        else if (primitive.mode == TINYGLTF_MODE_TRIANGLE_FAN) {
+            mode = renderer::PrimitiveTopology::TRIANGLE_FAN;
+        }
+        else if (primitive.mode == TINYGLTF_MODE_POINTS) {
+            mode = renderer::PrimitiveTopology::POINT_LIST;
+        }
+        else if (primitive.mode == TINYGLTF_MODE_LINE) {
+            mode = renderer::PrimitiveTopology::LINE_LIST;
+        }
+        else if (primitive.mode == TINYGLTF_MODE_LINE_LOOP) {
+            mode = renderer::PrimitiveTopology::LINE_STRIP;
+        }
+        else {
+            assert(0);
+        }
+
+        primitive_info.tag_.topology = static_cast<uint32_t>(mode);
+
+        if (primitive.indices < 0) return;
+
+        std::map<std::string, int>::const_iterator it(primitive.attributes.begin());
+        std::map<std::string, int>::const_iterator itEnd(primitive.attributes.end());
+
+        uint32_t dst_binding = 0;
+        for (; it != itEnd; it++) {
+            assert(it->second >= 0);
+            const tinygltf::Accessor& accessor = model.accessors[it->second];
+
+            assert(dst_binding < VINPUT_INSTANCE_BINDING_POINT);
+
+            engine::renderer::VertexInputBindingDescription binding = {};
+            binding.binding = dst_binding;
+            binding.stride = accessor.ByteStride(model.bufferViews[accessor.bufferView]);
+            binding.input_rate = renderer::VertexInputRate::VERTEX;
+            primitive_info.binding_descs_.push_back(binding);
+
+            engine::renderer::VertexInputAttributeDescription attribute = {};
+            attribute.buffer_view = accessor.bufferView;
+            attribute.binding = dst_binding;
+            attribute.offset = 0;
+            attribute.buffer_offset = accessor.byteOffset + model.bufferViews[accessor.bufferView].byteOffset;
+            if (it->first.compare("POSITION") == 0) {
+                attribute.location = VINPUT_POSITION;
+                primitive_info.bbox_min_ = glm::vec3(accessor.minValues[0], accessor.minValues[1], accessor.minValues[2]);
+                primitive_info.bbox_max_ = glm::vec3(accessor.maxValues[0], accessor.maxValues[1], accessor.maxValues[2]);
+                mesh_info.bbox_min_ = min(mesh_info.bbox_min_, primitive_info.bbox_min_);
+                mesh_info.bbox_max_ = max(mesh_info.bbox_max_, primitive_info.bbox_max_);
+            }
+            else if (it->first.compare("TEXCOORD_0") == 0) {
+                attribute.location = VINPUT_TEXCOORD0;
+                primitive_info.tag_.has_texcoord_0 = true;
+            }
+            else if (it->first.compare("NORMAL") == 0) {
+                attribute.location = VINPUT_NORMAL;
+                primitive_info.tag_.has_normal = true;
+            }
+            else if (it->first.compare("TANGENT") == 0) {
+                attribute.location = VINPUT_TANGENT;
+                primitive_info.tag_.has_tangent = true;
+            }
+            else if (it->first.compare("TEXCOORD_1") == 0) {
+                attribute.location = VINPUT_TEXCOORD1;
+            }
+            else if (it->first.compare("COLOR") == 0) {
+                attribute.location = VINPUT_COLOR;
+            }
+            else if (it->first.compare("JOINTS_0") == 0) {
+                attribute.location = VINPUT_JOINTS_0;
+                primitive_info.tag_.has_skin_set_0 = true;
+            }
+            else if (it->first.compare("WEIGHTS_0") == 0) {
+                attribute.location = VINPUT_WEIGHTS_0;
+                primitive_info.tag_.has_skin_set_0 = true;
+            }
+            else {
+                // add support here.
+                assert(0);
+            }
+
+            if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_FLOAT) {
+                if (accessor.type == TINYGLTF_TYPE_SCALAR) {
+                    attribute.format = engine::renderer::Format::R32_SFLOAT;
+                }
+                else if (accessor.type == TINYGLTF_TYPE_VEC2) {
+                    attribute.format = engine::renderer::Format::R32G32_SFLOAT;
+                }
+                else if (accessor.type == TINYGLTF_TYPE_VEC3) {
+                    attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
+                }
+                else if (accessor.type == TINYGLTF_TYPE_VEC4) {
+                    attribute.format = engine::renderer::Format::R32G32B32A32_SFLOAT;
+                }
+                else {
+                    assert(0);
+                }
+            }
+            else if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT) {
+                if (accessor.type == TINYGLTF_TYPE_SCALAR) {
+                    attribute.format = engine::renderer::Format::R16_UINT;
+                }
+                else if (accessor.type == TINYGLTF_TYPE_VEC2) {
+                    attribute.format = engine::renderer::Format::R16G16_UINT;
+                }
+                else if (accessor.type == TINYGLTF_TYPE_VEC3) {
+                    attribute.format = engine::renderer::Format::R16G16B16_UINT;
+                }
+                else if (accessor.type == TINYGLTF_TYPE_VEC4) {
+                    attribute.format = engine::renderer::Format::R16G16B16A16_UINT;
+                }
+                else {
+                    assert(0);
+                }
+
+            }
+            else {
+                // add support here.
+                assert(0);
+            }
+            primitive_info.attribute_descs_.push_back(attribute);
+            dst_binding++;
+        }
+
+        const auto& indexAccessor = model.accessors[primitive.indices];
+        primitive_info.index_desc_.buffer_view = indexAccessor.bufferView;
+        primitive_info.index_desc_.offset = indexAccessor.byteOffset;
+        primitive_info.index_desc_.index_type =
+            indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT ?
+            renderer::IndexType::UINT16 :
+            renderer::IndexType::UINT32;
+        primitive_info.index_desc_.index_count = indexAccessor.count;
+
+        primitive_info.generateHash();
+        mesh_info.primitives_.push_back(primitive_info);
+    }*/
+}
+
+static void setupMeshes(
+    const ufbx_abi ufbx_scene* fbx_scene,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    drawable_object->meshes_.resize(fbx_scene->meshes.count);
+    for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
+        setupMesh(fbx_scene, fbx_scene->meshes[i_mesh], drawable_object->meshes_[i_mesh]);
     }
 }
 
@@ -2098,6 +2267,37 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     drawable_object->num_prims_ = num_prims;
 
     return drawable_object;
+}
+
+std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::string& input_filename)
+{
+    ufbx_load_opts opts = { 0 };
+    ufbx_error error;
+    ufbx_abi ufbx_scene* fbx_scene =
+        ufbx_load_file(
+            input_filename.c_str(),
+            &opts, &error);
+
+    auto drawable_object = std::make_shared<ego::DrawableData>(device);
+    drawable_object->meshes_.reserve(fbx_scene->meshes.count);
+
+//    setupMeshState(device, model, drawable_object);
+    setupMeshes(fbx_scene, drawable_object);
+/*    setupAnimations(model, drawable_object);
+    setupSkins(device, model, drawable_object);
+    setupNodes(model, drawable_object);
+    setupModel(model, drawable_object);*/
+    for (auto& scene : drawable_object->scenes_) {
+        for (auto& node : scene.nodes_) {
+            calculateBbox(drawable_object, scene.nodes_[0], glm::mat4(1.0f), scene.bbox_min_, scene.bbox_max_);
+        }
+    }
+
+    ufbx_free_scene(fbx_scene);
+
+    return nullptr;
 }
 
 } // game_object

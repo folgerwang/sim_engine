@@ -307,6 +307,10 @@ public:
     static std::shared_ptr<DrawableData> loadGltfModel(
         const std::shared_ptr<renderer::Device>& device,
         const std::string& input_filename);
+
+    static std::shared_ptr<DrawableData> loadFbxModel(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::string& input_filename);
 };
 
 } // namespace game_object
