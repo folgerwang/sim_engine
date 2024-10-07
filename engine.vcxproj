@@ -24,7 +24,7 @@
     <ClCompile Include="game_object\camera.cpp" />
     <ClCompile Include="game_object\conemap_obj.cpp" />
     <ClCompile Include="game_object\debug_draw.cpp" />
-    <ClCompile Include="game_object\gltf.cpp" />
+    <ClCompile Include="game_object\drawable_object.cpp" />
     <ClCompile Include="game_object\hair_patch.cpp" />
     <ClCompile Include="game_object\hair_test.cpp" />
     <ClCompile Include="game_object\lbm_test.cpp" />
@@ -60,7 +60,7 @@
     <ClInclude Include="game_object\camera.h" />
     <ClInclude Include="game_object\conemap_obj.h" />
     <ClInclude Include="game_object\debug_draw.h" />
-    <ClInclude Include="game_object\gltf.h" />
+    <ClInclude Include="game_object\drawable_object.h" />
     <ClInclude Include="game_object\hair_patch.h" />
     <ClInclude Include="game_object\hair_test.h" />
     <ClInclude Include="game_object\lbm_test.h" />

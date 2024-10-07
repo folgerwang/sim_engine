@@ -99,7 +99,7 @@
     <ClCompile Include="game_object\debug_draw.cpp">
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
-    <ClCompile Include="game_object\gltf.cpp">
+    <ClCompile Include="game_object\drawable_object.cpp">
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
     <ClCompile Include="game_object\object_file.cpp">
@@ -224,7 +224,7 @@
     <ClInclude Include="game_object\debug_draw.h">
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
-    <ClInclude Include="game_object\gltf.h">
+    <ClInclude Include="game_object\drawable_object.h">
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
     <ClInclude Include="game_object\object_file.h">

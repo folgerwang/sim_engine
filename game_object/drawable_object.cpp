@@ -6,7 +6,7 @@
 #include <chrono>
 
 #include "engine_helper.h"
-#include "game_object/gltf.h"
+#include "game_object/drawable_object.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 
@@ -55,13 +55,13 @@ static void transformBbox(
 }
 
 static void calculateBbox(
-    std::shared_ptr<ego::GltfData>& gltf_object,
+    std::shared_ptr<ego::DrawableData>& drawable_object,
     int32_t node_idx,
     const glm::mat4& parent_matrix,
     glm::vec3& output_bbox_min,
     glm::vec3& output_bbox_max) {
     if (node_idx >= 0) {
-        const auto& node = gltf_object->nodes_[node_idx];
+        const auto& node = drawable_object->nodes_[node_idx];
         auto cur_matrix = parent_matrix;
         cur_matrix *= node.matrix_;
 
@@ -69,8 +69,8 @@ static void calculateBbox(
             glm::vec3 bbox_min, bbox_max;
             transformBbox(
                 cur_matrix,
-                gltf_object->meshes_[node.mesh_idx_].bbox_min_,
-                gltf_object->meshes_[node.mesh_idx_].bbox_max_,
+                drawable_object->meshes_[node.mesh_idx_].bbox_min_,
+                drawable_object->meshes_[node.mesh_idx_].bbox_max_,
                 bbox_min,
                 bbox_max);
             output_bbox_min = min(output_bbox_min, bbox_min);
@@ -78,7 +78,7 @@ static void calculateBbox(
         }
 
         for (auto& child_idx : node.child_idx_) {
-            calculateBbox(gltf_object, child_idx, cur_matrix, output_bbox_min, output_bbox_max);
+            calculateBbox(drawable_object, child_idx, cur_matrix, output_bbox_min, output_bbox_max);
         }
     }
 }
@@ -86,11 +86,11 @@ static void calculateBbox(
 static void setupMeshState(
     const std::shared_ptr<renderer::Device>& device,
     const tinygltf::Model& model,
-    std::shared_ptr<ego::GltfData>& gltf_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
 
     // Buffer
     {
-        gltf_object->buffers_.resize(model.buffers.size());
+        drawable_object->buffers_.resize(model.buffers.size());
         for (size_t i = 0; i < model.buffers.size(); i++) {
             auto buffer = model.buffers[i];
             renderer::Helper::createBuffer(
@@ -104,8 +104,8 @@ static void setupMeshState(
                     ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
                 SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
                 SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
-                gltf_object->buffers_[i].buffer,
-                gltf_object->buffers_[i].memory,
+                drawable_object->buffers_[i].buffer,
+                drawable_object->buffers_[i].memory,
                 std::source_location::current(),
                 buffer.data.size(),
                 buffer.data.data());
@@ -114,7 +114,7 @@ static void setupMeshState(
 
     // Buffer views.
     {
-        auto& buffer_views = gltf_object->buffer_views_;
+        auto& buffer_views = drawable_object->buffer_views_;
         buffer_views.resize(model.bufferViews.size());
 
         for (size_t i = 0; i < model.bufferViews.size(); i++) {
@@ -127,13 +127,13 @@ static void setupMeshState(
     }
 
     // allocate texture memory at first.
-    gltf_object->textures_.resize(model.textures.size());
+    drawable_object->textures_.resize(model.textures.size());
 
     // Material
     {
-        gltf_object->materials_.resize(model.materials.size());
+        drawable_object->materials_.resize(model.materials.size());
         for (size_t i_mat = 0; i_mat < model.materials.size(); i_mat++) {
-            auto& dst_material = gltf_object->materials_[i_mat];
+            auto& dst_material = drawable_object->materials_[i_mat];
             const auto& src_material = model.materials[i_mat];
 
             dst_material.base_color_idx_ = src_material.pbrMetallicRoughness.baseColorTexture.index;
@@ -143,11 +143,11 @@ static void setupMeshState(
             dst_material.occlusion_idx_ = src_material.occlusionTexture.index;
 
             if (dst_material.base_color_idx_ >= 0) {
-                gltf_object->textures_[dst_material.base_color_idx_].linear = false;
+                drawable_object->textures_[dst_material.base_color_idx_].linear = false;
             }
 
             if (dst_material.emissive_idx_ >= 0) {
-                gltf_object->textures_[dst_material.emissive_idx_].linear = false;
+                drawable_object->textures_[dst_material.emissive_idx_].linear = false;
             }
 
             device->createBuffer(
@@ -204,7 +204,7 @@ static void setupMeshState(
     // Texture
     {
         for (size_t i_tex = 0; i_tex < model.textures.size(); i_tex++) {
-            auto& dst_tex = gltf_object->textures_[i_tex];
+            auto& dst_tex = drawable_object->textures_[i_tex];
             const auto& src_tex = model.textures[i_tex];
             const auto& src_img = model.images[i_tex];
             auto format = renderer::Format::R8G8B8A8_UNORM;
@@ -386,10 +386,10 @@ static void setupMesh(
 
 static void setupMeshes(
     const tinygltf::Model& model,
-    std::shared_ptr<ego::GltfData>& gltf_object) {
-    gltf_object->meshes_.resize(model.meshes.size());
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    drawable_object->meshes_.resize(model.meshes.size());
     for (int i_mesh = 0; i_mesh < model.meshes.size(); i_mesh++) {
-        setupMesh(model, model.meshes[i_mesh], gltf_object->meshes_[i_mesh]);
+        setupMesh(model, model.meshes[i_mesh], drawable_object->meshes_[i_mesh]);
     }
 }
 
@@ -483,10 +483,10 @@ static void setupAnimation(
 
 static void setupAnimations(
     const tinygltf::Model& model,
-    std::shared_ptr<ego::GltfData>& gltf_object) {
-    gltf_object->animations_.resize(model.animations.size());
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    drawable_object->animations_.resize(model.animations.size());
     for (int i_anim = 0; i_anim < model.animations.size(); i_anim++) {
-        setupAnimation(model, model.animations[i_anim], gltf_object->animations_[i_anim]);
+        setupAnimation(model, model.animations[i_anim], drawable_object->animations_[i_anim]);
     }
 }
 
@@ -532,24 +532,24 @@ static void setupSkin(
 static void setupSkins(
     const std::shared_ptr<renderer::Device>& device,
     const tinygltf::Model& model,
-    std::shared_ptr<ego::GltfData>& gltf_object) {
-    gltf_object->skins_.resize(model.skins.size());
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    drawable_object->skins_.resize(model.skins.size());
     for (int i_skin = 0; i_skin < model.skins.size(); i_skin++) {
         setupSkin(
             device,
             model,
             model.skins[i_skin],
-            gltf_object->skins_[i_skin]);
+            drawable_object->skins_[i_skin]);
     }
 }
 
 static void setupNode(
     const tinygltf::Model& model,
     const uint32_t node_idx,
-    std::shared_ptr<ego::GltfData>& gltf_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
 
     const auto& node = model.nodes[node_idx];
-    auto& node_info = gltf_object->nodes_[node_idx];
+    auto& node_info = drawable_object->nodes_[node_idx];
     node_info.name_ = node.name;
 
     if (node.matrix.size() == 16) {
@@ -596,28 +596,28 @@ static void setupNode(
     for (size_t i = 0; i < node.children.size(); i++) {
         assert(node.children[i] < model.nodes.size());
         node_info.child_idx_[i] = node.children[i];
-        gltf_object->nodes_[node_info.child_idx_[i]].parent_idx_ = node_idx;
+        drawable_object->nodes_[node_info.child_idx_[i]].parent_idx_ = node_idx;
     }
 }
 
 static void setupNodes(
     const tinygltf::Model& model, 
-    std::shared_ptr<ego::GltfData>& gltf_object) {
-    gltf_object->nodes_.resize(model.nodes.size());
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    drawable_object->nodes_.resize(model.nodes.size());
     for (int i_node = 0; i_node < model.nodes.size(); i_node++) {
-        setupNode(model, i_node, gltf_object);
+        setupNode(model, i_node, drawable_object);
     }
 }
 
 static void setupModel(
     const tinygltf::Model& model,
-    std::shared_ptr<ego::GltfData>& gltf_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
     assert(model.scenes.size() > 0);
-    gltf_object->default_scene_ = model.defaultScene;
-    gltf_object->scenes_.resize(model.scenes.size());
+    drawable_object->default_scene_ = model.defaultScene;
+    drawable_object->scenes_.resize(model.scenes.size());
     for (uint32_t i_scene = 0; i_scene < model.scenes.size(); i_scene++) {
         const auto& src_scene = model.scenes[i_scene];
-        auto& dst_scene = gltf_object->scenes_[i_scene];
+        auto& dst_scene = drawable_object->scenes_[i_scene];
 
         dst_scene.nodes_.resize(src_scene.nodes.size());
         for (size_t i_node = 0; i_node < src_scene.nodes.size(); i_node++) {
@@ -627,9 +627,9 @@ static void setupModel(
 }
 
 static void setupRaytracing(
-    std::shared_ptr<ego::GltfData>& gltf_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
 
-    for (auto& mesh : gltf_object->meshes_) {
+    for (auto& mesh : drawable_object->meshes_) {
         for (auto& prim : mesh.primitives_) {
             prim.as_geometry = std::make_shared<renderer::AccelerationStructureGeometry>();
             prim.as_geometry->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
@@ -642,9 +642,9 @@ static void setupRaytracing(
             for (int i = 0; i < prim.attribute_descs_.size(); i++) {
                 auto& attr = prim.attribute_descs_[i];
                 auto& vertex_buffer_view =
-                    gltf_object->buffer_views_[attr.buffer_view];
+                    drawable_object->buffer_views_[attr.buffer_view];
                 auto vertex_device_address =
-                    gltf_object->buffers_[vertex_buffer_view.buffer_idx].buffer->getDeviceAddress();
+                    drawable_object->buffers_[vertex_buffer_view.buffer_idx].buffer->getDeviceAddress();
                 if (attr.location == VINPUT_POSITION) {
                     dst_prim.vertex_format = attr.format;
                     dst_prim.vertex_stride = prim.binding_descs_[i].stride;
@@ -673,8 +673,8 @@ static void setupRaytracing(
             }
             assert(has_position);
 
-            auto& index_buffer_view = gltf_object->buffer_views_[prim.index_desc_.buffer_view];
-            auto index_device_address = gltf_object->buffers_[index_buffer_view.buffer_idx].buffer->getDeviceAddress();
+            auto& index_buffer_view = drawable_object->buffer_views_[prim.index_desc_.buffer_view];
+            auto index_device_address = drawable_object->buffers_[index_buffer_view.buffer_idx].buffer->getDeviceAddress();
             auto index_offset = prim.index_desc_.offset + index_buffer_view.offset;
             dst_prim.index_type = prim.index_desc_.index_type;
             dst_prim.index_data.device_address = index_device_address + index_offset;
@@ -685,15 +685,15 @@ static void setupRaytracing(
     }
 }
 
-static renderer::WriteDescriptorList addGltfTextures(
-    const std::shared_ptr<ego::GltfData>& gltf_object,
+static renderer::WriteDescriptorList addDrawableTextures(
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
     const ego::MaterialInfo& material,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& thin_film_lut_tex) {
 
     renderer::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(11);
-    auto& textures = gltf_object->textures_;
+    auto& textures = drawable_object->textures_;
 
     auto& black_tex = renderer::Helper::getBlackTexture();
     auto& white_tex = renderer::Helper::getWhiteTexture();
@@ -779,21 +779,21 @@ static void updateDescriptorSets(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::DescriptorSetLayout>& material_desc_set_layout,
     const std::shared_ptr<renderer::DescriptorSetLayout>& skin_desc_set_layout,
-    const std::shared_ptr<ego::GltfData>& gltf_object,
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& thin_film_lut_tex)
 {
-    for (auto& material : gltf_object->materials_) {
+    for (auto& material : drawable_object->materials_) {
         material.desc_set_ = device->createDescriptorSets(
             descriptor_pool, material_desc_set_layout, 1)[0];
 
         // create a global ibl texture descriptor set.
-        auto material_descs = addGltfTextures(gltf_object, material, texture_sampler, thin_film_lut_tex);
+        auto material_descs = addDrawableTextures(drawable_object, material, texture_sampler, thin_film_lut_tex);
 
         device->updateDescriptorSets(material_descs);
     }
 
-    for (auto& skin : gltf_object->skins_) {
+    for (auto& skin : drawable_object->skins_) {
         skin.desc_set_ = device->createDescriptorSets(
             descriptor_pool, skin_desc_set_layout, 1)[0];
 
@@ -812,8 +812,8 @@ static void updateDescriptorSets(
 
 static void drawMesh(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const std::shared_ptr<ego::GltfData>& gltf_object,
-    const std::shared_ptr<renderer::PipelineLayout>& gltf_pipeline_layout,
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::shared_ptr<renderer::PipelineLayout>& drawable_pipeline_layout,
     const renderer::DescriptorSetList& desc_set_list,
     const ego::MeshInfo& mesh_info,
     const ego::SkinInfo* skin_info,
@@ -824,68 +824,72 @@ static void drawMesh(
         std::vector<std::shared_ptr<renderer::Buffer>> buffers(attrib_list.size());
         std::vector<uint64_t> offsets(attrib_list.size());
         for (int i_attrib = 0; i_attrib < attrib_list.size(); i_attrib++) {
-            const auto& buffer_view = gltf_object->buffer_views_[attrib_list[i_attrib].buffer_view];
-            buffers[i_attrib] = gltf_object->buffers_[buffer_view.buffer_idx].buffer;
+            const auto& buffer_view = drawable_object->buffer_views_[attrib_list[i_attrib].buffer_view];
+            buffers[i_attrib] = drawable_object->buffers_[buffer_view.buffer_idx].buffer;
             offsets[i_attrib] = attrib_list[i_attrib].buffer_offset;
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
-        const auto& index_buffer_view = gltf_object->buffer_views_[prim.index_desc_.buffer_view];
-        cmd_buf->bindIndexBuffer(gltf_object->buffers_[index_buffer_view.buffer_idx].buffer,
+        const auto& index_buffer_view = drawable_object->buffer_views_[prim.index_desc_.buffer_view];
+        cmd_buf->bindIndexBuffer(drawable_object->buffers_[index_buffer_view.buffer_idx].buffer,
             prim.index_desc_.offset + index_buffer_view.offset,
             prim.index_desc_.index_type);
 
         renderer::DescriptorSetList desc_sets = desc_set_list;
         if (prim.material_idx_ >= 0) {
-            const auto& material = gltf_object->materials_[prim.material_idx_];
+            const auto& material = drawable_object->materials_[prim.material_idx_];
             desc_sets.push_back(material.desc_set_);
         }
 
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::GRAPHICS,
-            gltf_pipeline_layout,
+            drawable_pipeline_layout,
             desc_sets);
 
         if (skin_info) {
             cmd_buf->bindDescriptorSets(
                 renderer::PipelineBindPoint::GRAPHICS,
-                gltf_pipeline_layout,
+                drawable_pipeline_layout,
                 {skin_info->desc_set_},
                 MODEL_PARAMS_SET);
         }
 
-        cmd_buf->pushConstants(SET_FLAG_BIT(ShaderStage, VERTEX_BIT), gltf_pipeline_layout, &model_params, sizeof(model_params));
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
+            drawable_pipeline_layout,
+            &model_params,
+            sizeof(model_params));
 
         //cmd_buf->drawIndexed(static_cast<uint32_t>(prim.index_desc_.index_count));
         cmd_buf->drawIndexedIndirect(
-            gltf_object->indirect_draw_cmd_,
+            drawable_object->indirect_draw_cmd_,
             prim.indirect_draw_cmd_ofs_);
     }
 }
 
 static void drawNodes(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const std::shared_ptr<ego::GltfData>& gltf_object,
-    const std::shared_ptr<renderer::PipelineLayout>& gltf_pipeline_layout,
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::shared_ptr<renderer::PipelineLayout>& drawable_pipeline_layout,
     const renderer::DescriptorSetList& desc_set_list,
     int32_t node_idx) {
     if (node_idx >= 0) {
-        const auto& node = gltf_object->nodes_[node_idx];
+        const auto& node = drawable_object->nodes_[node_idx];
         if (node.mesh_idx_ >= 0) {
             glsl::ModelParams model_params{};
             model_params.model_mat = node.cached_matrix_;
             drawMesh(cmd_buf,
-                gltf_object,
-                gltf_pipeline_layout,
+                drawable_object,
+                drawable_pipeline_layout,
                 desc_set_list,
-                gltf_object->meshes_[node.mesh_idx_],
-                node.skin_idx_ > -1 ? &gltf_object->skins_[node.skin_idx_] : nullptr,
+                drawable_object->meshes_[node.mesh_idx_],
+                node.skin_idx_ > -1 ? &drawable_object->skins_[node.skin_idx_] : nullptr,
                 model_params);
         }
 
         for (auto& child_idx : node.child_idx_) {
             drawNodes(cmd_buf,
-                gltf_object,
-                gltf_pipeline_layout,
+                drawable_object,
+                drawable_pipeline_layout,
                 desc_set_list,
                 child_idx);
         }
@@ -926,7 +930,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createSkinDescriptorSetLay
             renderer::DescriptorType::STORAGE_BUFFER) });
 }
 
-static std::shared_ptr<renderer::PipelineLayout> createGltfPipelineLayout(
+static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::DescriptorSetLayout>& material_desc_set_layout,
@@ -946,7 +950,7 @@ static std::shared_ptr<renderer::PipelineLayout> createGltfPipelineLayout(
         std::source_location::current());
 }
 
-static renderer::ShaderModuleList getGltfShaderModules(
+static renderer::ShaderModuleList getDrawableShaderModules(
     std::shared_ptr<renderer::Device> device,
     bool has_normals,
     bool has_tangent,
@@ -979,14 +983,14 @@ static renderer::ShaderModuleList getGltfShaderModules(
     return shader_modules;
 }
 
-static std::shared_ptr<renderer::Pipeline> createGltfPipeline(
+static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const glm::uvec2& display_size,
     const ego::PrimitiveInfo& primitive) {
-    auto shader_modules = getGltfShaderModules(
+    auto shader_modules = getDrawableShaderModules(
         device,
         primitive.tag_.has_normal,
         primitive.tag_.has_tangent,
@@ -1026,7 +1030,7 @@ static std::shared_ptr<renderer::Pipeline> createGltfPipeline(
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_pos_scale);
     attribute_descs.push_back(attr);
 
-    auto gltf_pipeline = device->createPipeline(
+    auto drawable_pipeline = device->createPipeline(
         render_pass,
         pipeline_layout,
         binding_descs,
@@ -1037,10 +1041,10 @@ static std::shared_ptr<renderer::Pipeline> createGltfPipeline(
         display_size,
         std::source_location::current());
 
-    return gltf_pipeline;
+    return drawable_pipeline;
 }
 
-renderer::WriteDescriptorList addGltfIndirectDrawBuffers(
+renderer::WriteDescriptorList addDrawableIndirectDrawBuffers(
     const std::shared_ptr<renderer::DescriptorSet>& description_set,
     const renderer::BufferInfo& buffer) {
     renderer::WriteDescriptorList descriptor_writes;
@@ -1150,7 +1154,7 @@ renderer::WriteDescriptorList addGameObjectsInfoBuffer(
     return descriptor_writes;
 }
 
-static std::shared_ptr<renderer::DescriptorSetLayout> createGltfIndirectDrawDescriptorSetLayout(
+static std::shared_ptr<renderer::DescriptorSetLayout> createDrawableIndirectDrawDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     std::vector<renderer::DescriptorSetLayoutBinding> bindings(1);
     bindings[0] = renderer::helper::getBufferDescriptionSetLayoutBinding(
@@ -1203,7 +1207,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createInstanceBufferDescri
     return device->createDescriptorSetLayout(bindings);
 }
 
-static std::shared_ptr<renderer::PipelineLayout> createGltfIndirectDrawPipelineLayout(
+static std::shared_ptr<renderer::PipelineLayout> createDrawableIndirectDrawPipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& desc_set_layouts) {
     renderer::PushConstantRange push_const_range{};
@@ -1250,24 +1254,24 @@ static std::shared_ptr<renderer::PipelineLayout> createInstanceBufferPipelineLay
 namespace game_object {
 
 // static member definition.
-uint32_t GltfObject::max_alloc_game_objects_in_buffer = kNumGltfInstance;
+uint32_t DrawableObject::max_alloc_game_objects_in_buffer = kNumDrawableInstance;
 
-std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::material_desc_set_layout_;
-std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::skin_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> GltfObject::gltf_pipeline_layout_;
-std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> GltfObject::gltf_pipeline_list_;
-std::unordered_map<std::string, std::shared_ptr<GltfData>> GltfObject::object_list_;
-std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::gltf_indirect_draw_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> GltfObject::gltf_indirect_draw_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> GltfObject::gltf_indirect_draw_pipeline_;
-std::shared_ptr<renderer::DescriptorSet> GltfObject::update_game_objects_buffer_desc_set_[2];
-std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::update_game_objects_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> GltfObject::update_game_objects_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> GltfObject::update_game_objects_pipeline_;
-std::shared_ptr<renderer::DescriptorSetLayout> GltfObject::update_instance_buffer_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> GltfObject::update_instance_buffer_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> GltfObject::update_instance_buffer_pipeline_;
-std::shared_ptr<renderer::BufferInfo> GltfObject::game_objects_buffer_;
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::material_desc_set_layout_;
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::skin_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_pipeline_layout_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_pipeline_list_;
+std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::drawable_indirect_draw_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_indirect_draw_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> DrawableObject::drawable_indirect_draw_pipeline_;
+std::shared_ptr<renderer::DescriptorSet> DrawableObject::update_game_objects_buffer_desc_set_[2];
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::update_game_objects_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> DrawableObject::update_game_objects_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> DrawableObject::update_game_objects_pipeline_;
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::update_instance_buffer_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> DrawableObject::update_instance_buffer_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> DrawableObject::update_instance_buffer_pipeline_;
+std::shared_ptr<renderer::BufferInfo> DrawableObject::game_objects_buffer_;
 
 void PrimitiveInfo::generateHash() {
     hash_ = std::hash<uint32_t>{}(tag_.data);
@@ -1287,7 +1291,7 @@ void PrimitiveInfo::generateHash() {
     }
 }
 
-void GltfData::destroy(
+void DrawableData::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     for (auto& texture : textures_) {
         texture.destroy(device);
@@ -1322,7 +1326,7 @@ struct compare {
     }
 };
 
-void AnimChannelInfo::update(GltfData* object, float time, float time_scale/* = 1.0f*/, bool repeat/* = true */ ) {
+void AnimChannelInfo::update(DrawableData* object, float time, float time_scale/* = 1.0f*/, bool repeat/* = true */ ) {
     float scaled_time = time / time_scale;
     auto& last_one = samples_.back();
     
@@ -1368,7 +1372,7 @@ glm::mat4 NodeInfo::getLocalMatrix() {
     return joint_mat * matrix_;
 }
 
-glm::mat4 GltfData::getNodeMatrix(const int32_t& node_idx) {
+glm::mat4 DrawableData::getNodeMatrix(const int32_t& node_idx) {
     if (node_idx < 0)
         return glm::mat4(1.0f);
 
@@ -1384,7 +1388,7 @@ glm::mat4 GltfData::getNodeMatrix(const int32_t& node_idx) {
     return node_matrix;
 }
 
-void GltfData::updateJoints(
+void DrawableData::updateJoints(
     const std::shared_ptr<renderer::Device>& device,
     int32_t node_idx) {
     auto& node = nodes_[node_idx];
@@ -1414,7 +1418,7 @@ void GltfData::updateJoints(
     }
 }
 
-void GltfData::update(
+void DrawableData::update(
     const std::shared_ptr<renderer::Device>& device,
     const uint32_t& active_anim_idx,
     const float& time) {
@@ -1442,7 +1446,7 @@ void GltfData::update(
     }
 }
 
-GltfObject::GltfObject(
+DrawableObject::DrawableObject(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
@@ -1454,8 +1458,8 @@ GltfObject::GltfObject(
     glm::mat4 location/* = glm::mat4(1.0f)*/)
     : location_(location){
 
-    auto result = object_list_.find(file_name);
-    if (result == object_list_.end()) {
+    auto result = drawable_object_list_.find(file_name);
+    if (result == drawable_object_list_.end()) {
         object_ = loadGltfModel(device, file_name);
 
         updateDescriptorSets(
@@ -1469,20 +1473,20 @@ GltfObject::GltfObject(
 
         const auto& primitive = object_->meshes_[0].primitives_[0];
         auto hash_value = primitive.getHash();
-        auto result = gltf_pipeline_list_.find(hash_value);
-        if (result == gltf_pipeline_list_.end()) {
-            gltf_pipeline_list_[hash_value] =
-                createGltfPipeline(
+        auto result = drawable_pipeline_list_.find(hash_value);
+        if (result == drawable_pipeline_list_.end()) {
+            drawable_pipeline_list_[hash_value] =
+                createDrawablePipeline(
                     device,
                     render_pass,
-                    gltf_pipeline_layout_,
+                    drawable_pipeline_layout_,
                     graphic_pipeline_info,
                     display_size,
                     primitive);
         }
 
         device->createBuffer(
-            kNumGltfInstance * sizeof(glsl::InstanceDataInfo),
+            kNumDrawableInstance * sizeof(glsl::InstanceDataInfo),
             SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0,
@@ -1493,30 +1497,30 @@ GltfObject::GltfObject(
         object_->generateSharedDescriptorSet(
             device,
             descriptor_pool,
-            gltf_indirect_draw_desc_set_layout_,
+            drawable_indirect_draw_desc_set_layout_,
             update_instance_buffer_desc_set_layout_,
             game_objects_buffer_);
 
-        object_list_[file_name] = object_;
+        drawable_object_list_[file_name] = object_;
     }
     else {
         object_ = result->second;
     }
 }
 
-void GltfData::generateSharedDescriptorSet(
+void DrawableData::generateSharedDescriptorSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const std::shared_ptr<renderer::DescriptorSetLayout>& gltf_indirect_draw_desc_set_layout,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& drawable_indirect_draw_desc_set_layout,
     const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout,
     const std::shared_ptr<renderer::BufferInfo>& game_objects_buffer) {
 
     // create indirect draw buffer set.
     indirect_draw_cmd_buffer_desc_set_ = device->createDescriptorSets(
-        descriptor_pool, gltf_indirect_draw_desc_set_layout, 1)[0];
+        descriptor_pool, drawable_indirect_draw_desc_set_layout, 1)[0];
 
     // create a global ibl texture descriptor set.
-    auto buffer_descs = addGltfIndirectDrawBuffers(
+    auto buffer_descs = addDrawableIndirectDrawBuffers(
         indirect_draw_cmd_buffer_desc_set_,
         indirect_draw_cmd_);
     device->updateDescriptorSets(buffer_descs);
@@ -1534,7 +1538,7 @@ void GltfData::generateSharedDescriptorSet(
     device->updateDescriptorSets(buffer_descs);
 }
 
-void GltfObject::createGameObjectUpdateDescSet(
+void DrawableObject::createGameObjectUpdateDescSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -1566,7 +1570,7 @@ void GltfObject::createGameObjectUpdateDescSet(
     }
 }
 
-void GltfObject::initGameObjectBuffer(
+void DrawableObject::initGameObjectBuffer(
     const std::shared_ptr<renderer::Device>& device) {
     if (!game_objects_buffer_) {
         game_objects_buffer_ = std::make_shared<renderer::BufferInfo>();
@@ -1581,7 +1585,7 @@ void GltfObject::initGameObjectBuffer(
     }
 }
 
-void GltfObject::initStaticMembers(
+void DrawableObject::initStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
@@ -1605,9 +1609,9 @@ void GltfObject::initStaticMembers(
             createSkinDescriptorSetLayout(device);
     }
 
-    if (gltf_indirect_draw_desc_set_layout_ == nullptr) {
-        gltf_indirect_draw_desc_set_layout_ =
-            createGltfIndirectDrawDescriptorSetLayout(device);
+    if (drawable_indirect_draw_desc_set_layout_ == nullptr) {
+        drawable_indirect_draw_desc_set_layout_ =
+            createDrawableIndirectDrawDescriptorSetLayout(device);
     }
 
     if (update_game_objects_desc_set_layout_ == nullptr) {
@@ -1634,21 +1638,21 @@ void GltfObject::initStaticMembers(
         airflow_tex);
 }
 
-void GltfObject::createStaticMembers(
+void DrawableObject::createStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
 
     {
-        if (gltf_pipeline_layout_) {
-            device->destroyPipelineLayout(gltf_pipeline_layout_);
-            gltf_pipeline_layout_ = nullptr;
+        if (drawable_pipeline_layout_) {
+            device->destroyPipelineLayout(drawable_pipeline_layout_);
+            drawable_pipeline_layout_ = nullptr;
         }
 
-        if (gltf_pipeline_layout_ == nullptr) {
+        if (drawable_pipeline_layout_ == nullptr) {
             assert(material_desc_set_layout_);
             assert(skin_desc_set_layout_);
-            gltf_pipeline_layout_ =
-                createGltfPipelineLayout(
+            drawable_pipeline_layout_ =
+                createDrawablePipelineLayout(
                     device,
                     global_desc_set_layouts,
                     material_desc_set_layout_,
@@ -1657,31 +1661,31 @@ void GltfObject::createStaticMembers(
     }
 
     {
-        if (gltf_indirect_draw_pipeline_layout_) {
-            device->destroyPipelineLayout(gltf_indirect_draw_pipeline_layout_);
-            gltf_indirect_draw_pipeline_layout_ = nullptr;
+        if (drawable_indirect_draw_pipeline_layout_) {
+            device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
+            drawable_indirect_draw_pipeline_layout_ = nullptr;
         }
 
-        if (gltf_indirect_draw_pipeline_layout_ == nullptr) {
-            gltf_indirect_draw_pipeline_layout_ =
-                createGltfIndirectDrawPipelineLayout(
+        if (drawable_indirect_draw_pipeline_layout_ == nullptr) {
+            drawable_indirect_draw_pipeline_layout_ =
+                createDrawableIndirectDrawPipelineLayout(
                     device,
-                    { gltf_indirect_draw_desc_set_layout_ });
+                    { drawable_indirect_draw_desc_set_layout_ });
         }
     }
 
     {
-        if (gltf_indirect_draw_pipeline_) {
-            device->destroyPipeline(gltf_indirect_draw_pipeline_);
-            gltf_indirect_draw_pipeline_ = nullptr;
+        if (drawable_indirect_draw_pipeline_) {
+            device->destroyPipeline(drawable_indirect_draw_pipeline_);
+            drawable_indirect_draw_pipeline_ = nullptr;
         }
 
-        if (gltf_indirect_draw_pipeline_ == nullptr) {
-            assert(gltf_indirect_draw_pipeline_layout_);
-            gltf_indirect_draw_pipeline_ =
+        if (drawable_indirect_draw_pipeline_ == nullptr) {
+            assert(drawable_indirect_draw_pipeline_layout_);
+            drawable_indirect_draw_pipeline_ =
                 renderer::helper::createComputePipeline(
                     device,
-                    gltf_indirect_draw_pipeline_layout_,
+                    drawable_indirect_draw_pipeline_layout_,
                     "update_gltf_indirect_draw_comp.spv",
                     std::source_location::current());
         }
@@ -1750,7 +1754,7 @@ void GltfObject::createStaticMembers(
     }
 }
 
-void GltfObject::recreateStaticMembers(
+void DrawableObject::recreateStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
@@ -1759,21 +1763,21 @@ void GltfObject::recreateStaticMembers(
 
     createStaticMembers(device, global_desc_set_layouts);
 
-    for (auto& pipeline : gltf_pipeline_list_) {
+    for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
-    gltf_pipeline_list_.clear();
+    drawable_pipeline_list_.clear();
 
-    for (auto& object : object_list_) {
+    for (auto& object : drawable_object_list_) {
         const auto& primitive = object.second->meshes_[0].primitives_[0];
         auto hash_value = primitive.getHash();
-        auto result = gltf_pipeline_list_.find(hash_value);
-        if (result == gltf_pipeline_list_.end()) {
-            gltf_pipeline_list_[hash_value] = 
-                createGltfPipeline(
+        auto result = drawable_pipeline_list_.find(hash_value);
+        if (result == drawable_pipeline_list_.end()) {
+            drawable_pipeline_list_[hash_value] = 
+                createDrawablePipeline(
                     device,
                     render_pass,
-                    gltf_pipeline_layout_,
+                    drawable_pipeline_layout_,
                     graphic_pipeline_info,
                     display_size,
                     primitive);
@@ -1781,7 +1785,7 @@ void GltfObject::recreateStaticMembers(
     }
 }
 
-void GltfObject::generateDescriptorSet(
+void DrawableObject::generateDescriptorSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -1793,7 +1797,7 @@ void GltfObject::generateDescriptorSet(
     const renderer::TextureInfo& water_flow,
     const std::shared_ptr<renderer::ImageView>& airflow_tex) {
 
-    for (auto& object : object_list_) {
+    for (auto& object : drawable_object_list_) {
         updateDescriptorSets(
             device,
             descriptor_pool,
@@ -1806,7 +1810,7 @@ void GltfObject::generateDescriptorSet(
         object.second->generateSharedDescriptorSet(
             device,
             descriptor_pool,
-            gltf_indirect_draw_desc_set_layout_,
+            drawable_indirect_draw_desc_set_layout_,
             update_instance_buffer_desc_set_layout_,
             game_objects_buffer_);
     }
@@ -1823,20 +1827,20 @@ void GltfObject::generateDescriptorSet(
         airflow_tex);
 }
 
-void GltfObject::destroyStaticMembers(
+void DrawableObject::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
     game_objects_buffer_->destroy(device);
     device->destroyDescriptorSetLayout(material_desc_set_layout_);
     device->destroyDescriptorSetLayout(skin_desc_set_layout_);
-    device->destroyPipelineLayout(gltf_pipeline_layout_);
-    for (auto& pipeline : gltf_pipeline_list_) {
+    device->destroyPipelineLayout(drawable_pipeline_layout_);
+    for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
-    gltf_pipeline_list_.clear();
-    object_list_.clear();
-    device->destroyDescriptorSetLayout(gltf_indirect_draw_desc_set_layout_);
-    device->destroyPipelineLayout(gltf_indirect_draw_pipeline_layout_);
-    device->destroyPipeline(gltf_indirect_draw_pipeline_);
+    drawable_pipeline_list_.clear();
+    drawable_object_list_.clear();
+    device->destroyDescriptorSetLayout(drawable_indirect_draw_desc_set_layout_);
+    device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
+    device->destroyPipeline(drawable_indirect_draw_pipeline_);
     device->destroyDescriptorSetLayout(update_game_objects_desc_set_layout_);
     device->destroyPipelineLayout(update_game_objects_pipeline_layout_);
     device->destroyPipeline(update_game_objects_pipeline_);
@@ -1845,7 +1849,7 @@ void GltfObject::destroyStaticMembers(
     device->destroyPipeline(update_instance_buffer_pipeline_);
 }
 
-void GltfObject::updateGameObjectsBuffer(
+void DrawableObject::updateGameObjectsBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glm::vec2& world_min,
     const glm::vec2& world_range,
@@ -1888,7 +1892,7 @@ void GltfObject::updateGameObjectsBuffer(
         game_objects_buffer_->buffer->getSize());
 }
 
-void GltfObject::updateInstanceBuffer(
+void DrawableObject::updateInstanceBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
 
     cmd_buf->addBufferBarrier(
@@ -1900,7 +1904,7 @@ void GltfObject::updateInstanceBuffer(
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, update_instance_buffer_pipeline_);
 
     glsl::InstanceBufferUpdateParams params;
-    params.num_instances = kNumGltfInstance;
+    params.num_instances = kNumDrawableInstance;
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         update_instance_buffer_pipeline_layout_,
@@ -1921,7 +1925,7 @@ void GltfObject::updateInstanceBuffer(
         object_->instance_buffer_.buffer->getSize());
 }
 
-void GltfObject::updateIndirectDrawBuffer(
+void DrawableObject::updateIndirectDrawBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
 
     cmd_buf->addBufferBarrier(
@@ -1930,17 +1934,19 @@ void GltfObject::updateIndirectDrawBuffer(
         { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
         object_->indirect_draw_cmd_.buffer->getSize());
 
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, gltf_indirect_draw_pipeline_);
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        drawable_indirect_draw_pipeline_);
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        gltf_indirect_draw_pipeline_layout_,
+        drawable_indirect_draw_pipeline_layout_,
         &object_->num_prims_,
         sizeof(object_->num_prims_));
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::COMPUTE,
-        gltf_indirect_draw_pipeline_layout_,
+        drawable_indirect_draw_pipeline_layout_,
         { object_->indirect_draw_cmd_buffer_desc_set_ });
 
     cmd_buf->dispatch((object_->num_prims_ + 63) / 64, 1);
@@ -1952,20 +1958,20 @@ void GltfObject::updateIndirectDrawBuffer(
         object_->indirect_draw_cmd_.buffer->getSize());
 }
 
-void GltfObject::updateBuffers(
+void DrawableObject::updateBuffers(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
     updateInstanceBuffer(cmd_buf);
     updateIndirectDrawBuffer(cmd_buf);
 }
 
-void GltfObject::draw(
+void DrawableObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_set_list) {
 
     const auto& primitive = object_->meshes_[0].primitives_[0];
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
-        gltf_pipeline_list_[primitive.getHash()]);
+        drawable_pipeline_list_[primitive.getHash()]);
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);
@@ -1978,13 +1984,13 @@ void GltfObject::draw(
         drawNodes(
             cmd_buf,
             object_,
-            gltf_pipeline_layout_,
+            drawable_pipeline_layout_,
             desc_set_list,
             node_idx);
     }
 }
 
-void GltfObject::update(
+void DrawableObject::update(
     const std::shared_ptr<renderer::Device>& device,
     const float& time) {
     if (object_) {
@@ -1992,11 +1998,11 @@ void GltfObject::update(
     }
 }
 
-std::shared_ptr<renderer::BufferInfo> GltfObject::getGameObjectsBuffer() {
+std::shared_ptr<renderer::BufferInfo> DrawableObject::getGameObjectsBuffer() {
     return game_objects_buffer_;
 }
 
-std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
+std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& input_filename)
 {
@@ -2030,28 +2036,28 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
         return nullptr;
     }
 
-    auto gltf_object = std::make_shared<ego::GltfData>(device);
-    gltf_object->meshes_.reserve(model.meshes.size());
+    auto drawable_object = std::make_shared<ego::DrawableData>(device);
+    drawable_object->meshes_.reserve(model.meshes.size());
 
-    setupMeshState(device, model, gltf_object);
-    setupMeshes(model, gltf_object);
-    setupAnimations(model, gltf_object);
-    setupSkins(device, model, gltf_object);
-    setupNodes(model, gltf_object);
-    setupModel(model, gltf_object);
-    for (auto& scene : gltf_object->scenes_) {
+    setupMeshState(device, model, drawable_object);
+    setupMeshes(model, drawable_object);
+    setupAnimations(model, drawable_object);
+    setupSkins(device, model, drawable_object);
+    setupNodes(model, drawable_object);
+    setupModel(model, drawable_object);
+    for (auto& scene : drawable_object->scenes_) {
         for (auto& node : scene.nodes_) {
-            calculateBbox(gltf_object, scene.nodes_[0], glm::mat4(1.0f), scene.bbox_min_, scene.bbox_max_);
+            calculateBbox(drawable_object, scene.nodes_[0], glm::mat4(1.0f), scene.bbox_min_, scene.bbox_max_);
         }
     }
 
-    gltf_object->update(device, 0, 0.0f);
+    drawable_object->update(device, 0, 0.0f);
 
-    setupRaytracing(gltf_object);
+    setupRaytracing(drawable_object);
 
     // init indirect draw buffer.
     uint32_t num_prims = 0;
-    for (auto& mesh : gltf_object->meshes_) {
+    for (auto& mesh : drawable_object->meshes_) {
         for (auto& prim : mesh.primitives_) {
             prim.indirect_draw_cmd_ofs_ =
                 num_prims * sizeof(renderer::DrawIndexedIndirectCommand) + INDIRECT_DRAW_BUF_OFS;
@@ -2066,7 +2072,7 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
     // clear instance count = 0;
     indirect_draw_cmd_buffer[0] = 0;
     uint32_t prim_idx = 0;
-    for (const auto& mesh : gltf_object->meshes_) {
+    for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
@@ -2083,15 +2089,15 @@ std::shared_ptr<ego::GltfData> GltfObject::loadGltfModel(
         SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT, STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         0,
-        gltf_object->indirect_draw_cmd_.buffer,
-        gltf_object->indirect_draw_cmd_.memory,
+        drawable_object->indirect_draw_cmd_.buffer,
+        drawable_object->indirect_draw_cmd_.memory,
         std::source_location::current(),
         indirect_draw_cmd_buffer.size() * sizeof(uint32_t),
         indirect_draw_cmd_buffer.data());
 
-    gltf_object->num_prims_ = num_prims;
+    drawable_object->num_prims_ = num_prims;
 
-    return gltf_object;
+    return drawable_object;
 }
 
 } // game_object

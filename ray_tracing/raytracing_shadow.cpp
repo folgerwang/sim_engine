@@ -73,7 +73,7 @@ void RayTracingShadowTest::init(
         std::reinterpret_pointer_cast<BottomLevelDataInfo>(bl_data_info_);
 
     game_object_ =
-        game_object::GltfObject::loadGltfModel(
+        game_object::DrawableObject::loadGltfModel(
             device,
             "assets/vulkanscene_shadow.gltf");
 
