@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <memory>
 #include <chrono>
+#include <unordered_map>
 
 #include "engine_helper.h"
 #include "game_object/drawable_object.h"
@@ -21,6 +22,26 @@ namespace ego = engine::game_object;
 namespace engine {
 
 namespace {
+
+size_t hashCombine(
+    size_t seed,
+    size_t value) {
+    seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+size_t hashCombine(
+    const uint32_t num_items,
+    const float* items) {
+    size_t hash = 0;
+
+    // Quantize and hash position
+    for (uint32_t i = 0; i < num_items; i++) {
+        hash = hashCombine(hash, *(uint32_t*)(&items[i]));
+    }
+    return hash;
+}
+
 static std::string getFilePathExtension(const std::string& file_name) {
     if (file_name.find_last_of(".") != std::string::npos)
         return file_name.substr(file_name.find_last_of(".") + 1);
@@ -397,10 +418,118 @@ static void setupMeshes(
     }
 }
 
+struct VertexStruct {
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
+};
+
 static void setupMesh(
+    const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
-    const ufbx_mesh* src_mesh,
-    ego::MeshInfo& mesh_info) {
+    std::shared_ptr<ego::DrawableData>& drawable_object,
+    const uint32_t& mesh_idx) {
+
+    const ufbx_mesh* src_mesh = fbx_scene->meshes[mesh_idx];
+    auto& drawable_mesh = drawable_object->meshes_[mesh_idx];
+    auto& drawable_vertex_buffer = drawable_object->buffers_[mesh_idx];
+
+    assert(src_mesh->num_faces == src_mesh->num_triangles);
+    size_t num_traingles = 0;
+    for (int i = 0; i < src_mesh->material_parts.count; i++) {
+        auto part = src_mesh->material_parts[i];
+        auto mat = src_mesh->materials[part.index];
+        num_traingles += part.num_faces;
+        int hit = 1;
+    }
+
+    int hit = 1;
+
+    for (int i = 0; i < src_mesh->num_triangles; i++) {
+        auto face = src_mesh->faces[i];
+        int hit = 1;
+    }
+
+    assert(src_mesh->num_indices == src_mesh->vertex_position.indices.count);
+    assert(src_mesh->num_indices == src_mesh->vertex_normal.indices.count);
+    assert(src_mesh->num_indices == src_mesh->vertex_uv.indices.count);
+
+    std::unordered_map<size_t, uint32_t> vertex_map;
+    std::vector<size_t> vertex_indice_hash_table;
+    std::vector<uint32_t> indices;
+    vertex_indice_hash_table.reserve(src_mesh->num_indices);
+    indices.reserve(src_mesh->num_indices);
+
+    std::vector<float> vertex_data;
+    vertex_data.reserve(10);
+    for (int i = 0; i < src_mesh->num_indices; i++) {
+        vertex_data.clear();
+        auto position_idx = src_mesh->vertex_position.indices[i];
+        const auto& position = src_mesh->vertex_position.values[position_idx];
+        vertex_data.push_back(float(position.x));
+        vertex_data.push_back(float(position.y));
+        vertex_data.push_back(float(position.z));
+        auto normal_idx = src_mesh->vertex_normal.indices[i];
+        const auto& normal = src_mesh->vertex_normal.values[normal_idx];
+        vertex_data.push_back(float(normal.x));
+        vertex_data.push_back(float(normal.y));
+        vertex_data.push_back(float(normal.z));
+        auto uv_idx = src_mesh->vertex_uv.indices[i];
+        const auto& uv = src_mesh->vertex_uv.values[uv_idx];
+        vertex_data.push_back(float(uv.x));
+        vertex_data.push_back(float(uv.y));
+        auto hash_value =
+            hashCombine(
+                static_cast<uint32_t>(vertex_data.size()),
+                vertex_data.data());
+
+        auto it = vertex_map.find(hash_value);
+        if (it != vertex_map.end()) {
+            indices.push_back(it->second);
+        }
+        else {
+            auto new_index = static_cast<uint32_t>(vertex_map.size());
+            indices.push_back(new_index);
+            vertex_indice_hash_table.push_back(hash_value);
+            vertex_map[hash_value] = static_cast<uint32_t>(i);
+        }
+    }
+
+    std::vector<VertexStruct> drawable_vertices;
+    drawable_vertices.resize(vertex_indice_hash_table.size());
+    for (int i = 0; i < vertex_indice_hash_table.size(); i++) {
+        const uint32_t& idx = vertex_map[vertex_indice_hash_table[i]];
+
+        auto& vertex = drawable_vertices[i];
+        auto position_idx = src_mesh->vertex_position.indices[idx];
+        const auto& position = src_mesh->vertex_position.values[position_idx];
+        vertex.position = glm::vec3(position.x, position.y, position.z);
+        auto normal_idx = src_mesh->vertex_normal.indices[idx];
+        const auto& normal = src_mesh->vertex_normal.values[normal_idx];
+        vertex.normal = glm::vec3(normal.x, normal.y, normal.z);
+        auto uv_idx = src_mesh->vertex_uv.indices[idx];
+        const auto& uv = src_mesh->vertex_uv.values[uv_idx];
+        vertex.uv = glm::vec2(uv.x, uv.y);
+    }
+
+    renderer::Helper::createBuffer(
+        device,
+        SET_5_FLAG_BITS(
+            BufferUsage,
+            VERTEX_BUFFER_BIT,
+            INDEX_BUFFER_BIT,
+            SHADER_DEVICE_ADDRESS_BIT,
+            STORAGE_BUFFER_BIT,
+            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        drawable_object->buffers_[mesh_idx].buffer,
+        drawable_object->buffers_[mesh_idx].memory,
+        std::source_location::current(),
+        drawable_vertices.size(),
+        drawable_vertices.data());
+
+    assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
 
 /*
     for (size_t i = 0; i < src_mesh->primitives.size(); i++) {
@@ -554,11 +683,13 @@ static void setupMesh(
 }
 
 static void setupMeshes(
+    const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
     std::shared_ptr<ego::DrawableData>& drawable_object) {
     drawable_object->meshes_.resize(fbx_scene->meshes.count);
+    drawable_object->buffers_.resize(fbx_scene->meshes.count);
     for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
-        setupMesh(fbx_scene, fbx_scene->meshes[i_mesh], drawable_object->meshes_[i_mesh]);
+        setupMesh(device, fbx_scene, drawable_object, i_mesh);
     }
 }
 
@@ -2284,7 +2415,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     drawable_object->meshes_.reserve(fbx_scene->meshes.count);
 
 //    setupMeshState(device, model, drawable_object);
-    setupMeshes(fbx_scene, drawable_object);
+    setupMeshes(device, fbx_scene, drawable_object);
 /*    setupAnimations(model, drawable_object);
     setupSkins(device, model, drawable_object);
     setupNodes(model, drawable_object);
