@@ -953,6 +953,7 @@ void VulkanDevice::updateDescriptorSets(
     std::vector<std::shared_ptr<VkDescriptorImageInfo>> desc_images;
     std::vector<std::shared_ptr<VkDescriptorBufferInfo>> desc_buffers;
     std::vector<std::unique_ptr<VkAccelerationStructureKHR[]>> desc_ases;
+    std::vector<std::shared_ptr<VkWriteDescriptorSetAccelerationStructureKHR>> desc_as_infos;
 
     for (auto i = 0; i < write_descriptors.size(); i++) {
         const auto src_write_desc = write_descriptors[i];
@@ -1022,16 +1023,17 @@ void VulkanDevice::updateDescriptorSets(
                 as_list[i] = reinterpret_cast<VkAccelerationStructureKHR>(src_as_desc->acc_structs[i]);
             }
             desc_ases.push_back(std::move(as_list));
-            VkWriteDescriptorSetAccelerationStructureKHR desc_as_info{};
-            desc_as_info.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-            desc_as_info.accelerationStructureCount = num_as;
-            desc_as_info.pAccelerationStructures = desc_ases[desc_ases.size()-1].get();
+            auto desc_as_info = std::make_shared<VkWriteDescriptorSetAccelerationStructureKHR>();
+            desc_as_infos.push_back(desc_as_info);
+            desc_as_info->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+            desc_as_info->accelerationStructureCount = num_as;
+            desc_as_info->pAccelerationStructures = desc_ases[desc_ases.size()-1].get();
 
             VkWriteDescriptorSet descriptor_write = {};
             descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptor_write.dstSet = vk_desc_set->get();
             descriptor_write.dstBinding = src_write_desc->binding;
-            descriptor_write.pNext = &desc_as_info;
+            descriptor_write.pNext = desc_as_info.get();
 
             descriptor_write.descriptorType =
                 helper::toVkDescriptorType(src_write_desc->desc_type);
