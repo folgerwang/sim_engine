@@ -432,24 +432,10 @@ static void setupMesh(
 
     const ufbx_mesh* src_mesh = fbx_scene->meshes[mesh_idx];
     auto& drawable_mesh = drawable_object->meshes_[mesh_idx];
-    auto& drawable_vertex_buffer = drawable_object->buffers_[mesh_idx];
+    auto& vertex_buffer = drawable_object->buffers_[mesh_idx * 2];
+    auto& indice_buffer = drawable_object->buffers_[mesh_idx * 2 + 1];
 
     assert(src_mesh->num_faces == src_mesh->num_triangles);
-    size_t num_traingles = 0;
-    for (int i = 0; i < src_mesh->material_parts.count; i++) {
-        auto part = src_mesh->material_parts[i];
-        auto mat = src_mesh->materials[part.index];
-        num_traingles += part.num_faces;
-        int hit = 1;
-    }
-
-    int hit = 1;
-
-    for (int i = 0; i < src_mesh->num_triangles; i++) {
-        auto face = src_mesh->faces[i];
-        int hit = 1;
-    }
-
     assert(src_mesh->num_indices == src_mesh->vertex_position.indices.count);
     assert(src_mesh->num_indices == src_mesh->vertex_normal.indices.count);
     assert(src_mesh->num_indices == src_mesh->vertex_uv.indices.count);
@@ -514,172 +500,140 @@ static void setupMesh(
 
     renderer::Helper::createBuffer(
         device,
-        SET_5_FLAG_BITS(
+        SET_2_FLAG_BITS(
             BufferUsage,
             VERTEX_BUFFER_BIT,
-            INDEX_BUFFER_BIT,
-            SHADER_DEVICE_ADDRESS_BIT,
-            STORAGE_BUFFER_BIT,
-            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+            STORAGE_BUFFER_BIT),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
-        drawable_object->buffers_[mesh_idx].buffer,
-        drawable_object->buffers_[mesh_idx].memory,
+        vertex_buffer.buffer,
+        vertex_buffer.memory,
         std::source_location::current(),
         drawable_vertices.size(),
         drawable_vertices.data());
 
     assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
 
-/*
-    for (size_t i = 0; i < src_mesh->primitives.size(); i++) {
-        const tinygltf::Primitive& primitive = src_mesh.primitives[i];
+    auto use_16bits_index = src_mesh->num_indices < 65536;
+
+    if (use_16bits_index) {
+        std::vector<uint16_t> indices_16;
+        indices_16.reserve(src_mesh->num_indices);
+        for (int i = 0; i < src_mesh->num_indices; i++) {
+            indices_16.push_back(static_cast<uint16_t>(indices[i]));
+        }
+
+        renderer::Helper::createBuffer(
+            device,
+            SET_2_FLAG_BITS(
+                BufferUsage,
+                INDEX_BUFFER_BIT,
+                STORAGE_BUFFER_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            indice_buffer.buffer,
+            indice_buffer.memory,
+            std::source_location::current(),
+            indices_16.size(),
+            indices_16.data());
+    }
+    else {
+        renderer::Helper::createBuffer(
+            device,
+            SET_2_FLAG_BITS(
+                BufferUsage,
+                INDEX_BUFFER_BIT,
+                STORAGE_BUFFER_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            indice_buffer.buffer,
+            indice_buffer.memory,
+            std::source_location::current(),
+            indices.size(),
+            indices.data());
+    }
+
+    size_t num_traingles = 0;
+    uint32_t buffer_offset = 0;
+    uint32_t dst_binding = 0;
+    for (int i = 0; i < src_mesh->material_parts.count; i++) {
+        auto part = src_mesh->material_parts[i];
+        auto mat = src_mesh->materials[part.index];
 
         ego::PrimitiveInfo primitive_info;
         primitive_info.tag_.restart_enable = false;
-        primitive_info.material_idx_ = primitive.material;
+        primitive_info.material_idx_ = part.index;
 
-        auto mode = renderer::PrimitiveTopology::MAX_ENUM;
-        if (primitive.mode == TINYGLTF_MODE_TRIANGLES) {
-            mode = renderer::PrimitiveTopology::TRIANGLE_LIST;
-        }
-        else if (primitive.mode == TINYGLTF_MODE_TRIANGLE_STRIP) {
-            mode = renderer::PrimitiveTopology::TRIANGLE_STRIP;
-        }
-        else if (primitive.mode == TINYGLTF_MODE_TRIANGLE_FAN) {
-            mode = renderer::PrimitiveTopology::TRIANGLE_FAN;
-        }
-        else if (primitive.mode == TINYGLTF_MODE_POINTS) {
-            mode = renderer::PrimitiveTopology::POINT_LIST;
-        }
-        else if (primitive.mode == TINYGLTF_MODE_LINE) {
-            mode = renderer::PrimitiveTopology::LINE_LIST;
-        }
-        else if (primitive.mode == TINYGLTF_MODE_LINE_LOOP) {
-            mode = renderer::PrimitiveTopology::LINE_STRIP;
-        }
-        else {
-            assert(0);
-        }
-
+        auto mode = renderer::PrimitiveTopology::TRIANGLE_LIST;
         primitive_info.tag_.topology = static_cast<uint32_t>(mode);
+        primitive_info.tag_.has_texcoord_0 = true;
+        primitive_info.tag_.has_normal = true;
 
-        if (primitive.indices < 0) return;
+        // position
+        engine::renderer::VertexInputBindingDescription binding = {};
+        binding.binding = dst_binding;
+        binding.stride = sizeof(VertexStruct);
+        binding.input_rate = renderer::VertexInputRate::VERTEX;
+        primitive_info.binding_descs_.push_back(binding);
 
-        std::map<std::string, int>::const_iterator it(primitive.attributes.begin());
-        std::map<std::string, int>::const_iterator itEnd(primitive.attributes.end());
+        engine::renderer::VertexInputAttributeDescription attribute = {};
+        attribute.buffer_view = mesh_idx * 2;
+        attribute.binding = dst_binding;
+        attribute.offset = 0;
+        attribute.buffer_offset = 0;
+        attribute.location = VINPUT_POSITION;
+        attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
+/*        primitive_info.bbox_min_ = glm::vec3(accessor.minValues[0], accessor.minValues[1], accessor.minValues[2]);
+        primitive_info.bbox_max_ = glm::vec3(accessor.maxValues[0], accessor.maxValues[1], accessor.maxValues[2]);
+        mesh_info.bbox_min_ = min(mesh_info.bbox_min_, primitive_info.bbox_min_);
+        mesh_info.bbox_max_ = max(mesh_info.bbox_max_, primitive_info.bbox_max_);*/
 
-        uint32_t dst_binding = 0;
-        for (; it != itEnd; it++) {
-            assert(it->second >= 0);
-            const tinygltf::Accessor& accessor = model.accessors[it->second];
+        primitive_info.attribute_descs_.push_back(attribute);
+        dst_binding++;
 
-            assert(dst_binding < VINPUT_INSTANCE_BINDING_POINT);
+        // normal
+        binding.binding = dst_binding;
+        binding.stride = sizeof(VertexStruct);
+        binding.input_rate = renderer::VertexInputRate::VERTEX;
+        primitive_info.binding_descs_.push_back(binding);
 
-            engine::renderer::VertexInputBindingDescription binding = {};
-            binding.binding = dst_binding;
-            binding.stride = accessor.ByteStride(model.bufferViews[accessor.bufferView]);
-            binding.input_rate = renderer::VertexInputRate::VERTEX;
-            primitive_info.binding_descs_.push_back(binding);
+        attribute.buffer_view = mesh_idx * 2;
+        attribute.binding = dst_binding;
+        attribute.offset = 0;
+        attribute.buffer_offset = sizeof(glm::vec3);
+        attribute.location = VINPUT_NORMAL;
+        attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
+        primitive_info.attribute_descs_.push_back(attribute);
+        dst_binding++;
 
-            engine::renderer::VertexInputAttributeDescription attribute = {};
-            attribute.buffer_view = accessor.bufferView;
-            attribute.binding = dst_binding;
-            attribute.offset = 0;
-            attribute.buffer_offset = accessor.byteOffset + model.bufferViews[accessor.bufferView].byteOffset;
-            if (it->first.compare("POSITION") == 0) {
-                attribute.location = VINPUT_POSITION;
-                primitive_info.bbox_min_ = glm::vec3(accessor.minValues[0], accessor.minValues[1], accessor.minValues[2]);
-                primitive_info.bbox_max_ = glm::vec3(accessor.maxValues[0], accessor.maxValues[1], accessor.maxValues[2]);
-                mesh_info.bbox_min_ = min(mesh_info.bbox_min_, primitive_info.bbox_min_);
-                mesh_info.bbox_max_ = max(mesh_info.bbox_max_, primitive_info.bbox_max_);
-            }
-            else if (it->first.compare("TEXCOORD_0") == 0) {
-                attribute.location = VINPUT_TEXCOORD0;
-                primitive_info.tag_.has_texcoord_0 = true;
-            }
-            else if (it->first.compare("NORMAL") == 0) {
-                attribute.location = VINPUT_NORMAL;
-                primitive_info.tag_.has_normal = true;
-            }
-            else if (it->first.compare("TANGENT") == 0) {
-                attribute.location = VINPUT_TANGENT;
-                primitive_info.tag_.has_tangent = true;
-            }
-            else if (it->first.compare("TEXCOORD_1") == 0) {
-                attribute.location = VINPUT_TEXCOORD1;
-            }
-            else if (it->first.compare("COLOR") == 0) {
-                attribute.location = VINPUT_COLOR;
-            }
-            else if (it->first.compare("JOINTS_0") == 0) {
-                attribute.location = VINPUT_JOINTS_0;
-                primitive_info.tag_.has_skin_set_0 = true;
-            }
-            else if (it->first.compare("WEIGHTS_0") == 0) {
-                attribute.location = VINPUT_WEIGHTS_0;
-                primitive_info.tag_.has_skin_set_0 = true;
-            }
-            else {
-                // add support here.
-                assert(0);
-            }
+        // uv
+        binding.binding = dst_binding;
+        binding.stride = sizeof(VertexStruct);
+        binding.input_rate = renderer::VertexInputRate::VERTEX;
+        primitive_info.binding_descs_.push_back(binding);
 
-            if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_FLOAT) {
-                if (accessor.type == TINYGLTF_TYPE_SCALAR) {
-                    attribute.format = engine::renderer::Format::R32_SFLOAT;
-                }
-                else if (accessor.type == TINYGLTF_TYPE_VEC2) {
-                    attribute.format = engine::renderer::Format::R32G32_SFLOAT;
-                }
-                else if (accessor.type == TINYGLTF_TYPE_VEC3) {
-                    attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
-                }
-                else if (accessor.type == TINYGLTF_TYPE_VEC4) {
-                    attribute.format = engine::renderer::Format::R32G32B32A32_SFLOAT;
-                }
-                else {
-                    assert(0);
-                }
-            }
-            else if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT) {
-                if (accessor.type == TINYGLTF_TYPE_SCALAR) {
-                    attribute.format = engine::renderer::Format::R16_UINT;
-                }
-                else if (accessor.type == TINYGLTF_TYPE_VEC2) {
-                    attribute.format = engine::renderer::Format::R16G16_UINT;
-                }
-                else if (accessor.type == TINYGLTF_TYPE_VEC3) {
-                    attribute.format = engine::renderer::Format::R16G16B16_UINT;
-                }
-                else if (accessor.type == TINYGLTF_TYPE_VEC4) {
-                    attribute.format = engine::renderer::Format::R16G16B16A16_UINT;
-                }
-                else {
-                    assert(0);
-                }
+        attribute.buffer_view = mesh_idx * 2;
+        attribute.binding = dst_binding;
+        attribute.offset = 0;
+        attribute.buffer_offset = 2 * sizeof(glm::vec3);
+        attribute.location = VINPUT_TEXCOORD0;
+        attribute.format = engine::renderer::Format::R32G32_SFLOAT;
+        primitive_info.attribute_descs_.push_back(attribute);
+        dst_binding++;
 
-            }
-            else {
-                // add support here.
-                assert(0);
-            }
-            primitive_info.attribute_descs_.push_back(attribute);
-            dst_binding++;
-        }
-
-        const auto& indexAccessor = model.accessors[primitive.indices];
-        primitive_info.index_desc_.buffer_view = indexAccessor.bufferView;
-        primitive_info.index_desc_.offset = indexAccessor.byteOffset;
+        primitive_info.index_desc_.buffer_view = mesh_idx * 2 + 1;
+        primitive_info.index_desc_.offset = num_traingles * 3 * (use_16bits_index ? 2 : 4);
         primitive_info.index_desc_.index_type =
-            indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT ?
+            use_16bits_index ?
             renderer::IndexType::UINT16 :
             renderer::IndexType::UINT32;
-        primitive_info.index_desc_.index_count = indexAccessor.count;
+        primitive_info.index_desc_.index_count = part.num_faces * 3;
 
         primitive_info.generateHash();
-        mesh_info.primitives_.push_back(primitive_info);
-    }*/
+        drawable_mesh.primitives_.push_back(primitive_info);
+
+        num_traingles += part.num_faces;
+    }
 }
 
 static void setupMeshes(
@@ -687,7 +641,7 @@ static void setupMeshes(
     const ufbx_abi ufbx_scene* fbx_scene,
     std::shared_ptr<ego::DrawableData>& drawable_object) {
     drawable_object->meshes_.resize(fbx_scene->meshes.count);
-    drawable_object->buffers_.resize(fbx_scene->meshes.count);
+    drawable_object->buffers_.resize(fbx_scene->meshes.count * 2);
     for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
         setupMesh(device, fbx_scene, drawable_object, i_mesh);
     }
