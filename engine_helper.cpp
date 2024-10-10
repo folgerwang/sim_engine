@@ -41,7 +41,23 @@ std::vector<uint64_t> readFile(const std::string& file_name, uint64_t& file_size
     return buffer;
 }
 
-void writeImageFile(
+void loadImageFileHeader(
+    const std::string& file_name,
+    const uint32_t& header_size,
+    void* header_data) {
+    std::ifstream file(file_name, std::ios::binary);
+
+    if (!file.is_open()) {
+        std::string error_message = std::string("failed to open file! :") + file_name;
+        throw std::runtime_error(error_message);
+    }
+
+    file.read(reinterpret_cast<char*>(header_data), header_size);
+
+    file.close();
+}
+
+void storeImageFileWithHeader(
     const std::string& file_name,
     const uint32_t& header_size,
     const void* header_data,
@@ -213,39 +229,25 @@ void loadMtx2Texture(
         mtx2_data.data());
 }
 
-void saveDdsTexture(
+void loadDdsTexture(
     const glm::uvec3& size,
     const void* image_data,
     const std::string& input_filename) {
 
-    struct DDS_PIXELFORMAT {
-        uint32_t dwSize;
-        uint32_t dwFlags;
-        uint32_t dwFourCC;
-        uint32_t dwRGBBitCount;
-        uint32_t dwRBitMask;
-        uint32_t dwGBitMask;
-        uint32_t dwBBitMask;
-        uint32_t dwABitMask;
-    };
+    DDS_HEADER dds_header;
 
-    struct DDS_HEADER {
-        uint32_t           dwNameTag;
-        uint32_t           dwSize;
-        uint32_t           dwFlags;
-        uint32_t           dwHeight;
-        uint32_t           dwWidth;
-        uint32_t           dwPitchOrLinearSize;
-        uint32_t           dwDepth;
-        uint32_t           dwMipMapCount;
-        uint32_t           dwReserved1[11];
-        DDS_PIXELFORMAT ddspf;
-        uint32_t           dwCaps;
-        uint32_t           dwCaps2;
-        uint32_t           dwCaps3;
-        uint32_t           dwCaps4;
-        uint32_t           dwReserved2;
-    };
+    loadImageFileHeader(
+        input_filename,
+        sizeof(DDS_HEADER),
+        &dds_header);
+
+    int hit = 1;
+}
+
+void saveDdsTexture(
+    const glm::uvec3& size,
+    const void* image_data,
+    const std::string& input_filename) {
 
     DDS_HEADER dds_header;
     dds_header.ddspf.dwSize = sizeof(DDS_PIXELFORMAT);
@@ -267,7 +269,7 @@ void saveDdsTexture(
     dds_header.dwCaps = 0x1000; // texture.
     dds_header.dwCaps2 = size.z > 1 ? 0x200000 : 0x00; // volume texture.
 
-    writeImageFile(
+    storeImageFileWithHeader(
         input_filename,
         sizeof(DDS_HEADER),
         &dds_header,

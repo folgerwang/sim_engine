@@ -6,11 +6,47 @@
 namespace engine {
 namespace helper {
 
+#pragma pack(push, 1)
+struct DDS_PIXELFORMAT {
+    uint32_t dwSize;
+    uint32_t dwFlags;
+    uint32_t dwFourCC;
+    uint32_t dwRGBBitCount;
+    uint32_t dwRBitMask;
+    uint32_t dwGBitMask;
+    uint32_t dwBBitMask;
+    uint32_t dwABitMask;
+};
+
+struct DDS_HEADER {
+    uint32_t           dwNameTag;
+    uint32_t           dwSize;
+    uint32_t           dwFlags;
+    uint32_t           dwHeight;
+    uint32_t           dwWidth;
+    uint32_t           dwPitchOrLinearSize;
+    uint32_t           dwDepth;
+    uint32_t           dwMipMapCount;
+    uint32_t           dwReserved1[11];
+    DDS_PIXELFORMAT    ddspf;
+    uint32_t           dwCaps;
+    uint32_t           dwCaps2;
+    uint32_t           dwCaps3;
+    uint32_t           dwCaps4;
+    uint32_t           dwReserved2;
+};
+#pragma pack(pop)
+
 std::vector<uint64_t> readFile(
     const std::string& file_name,
     uint64_t& file_size);
 
-void writeImageFile(
+void loadImageFileHeader(
+    const std::string& file_name,
+    const uint32_t& header_size,
+    void* header_data);
+
+void storeImageFileWithHeader(
     const std::string& file_name,
     const uint32_t& header_size,
     const void* header_data,

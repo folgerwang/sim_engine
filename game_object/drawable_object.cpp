@@ -418,6 +418,169 @@ static void setupMeshes(
     }
 }
 
+static void setupMeshState(
+    const std::shared_ptr<renderer::Device>& device,
+    const ufbx_abi ufbx_scene* fbx_scene,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+
+    // allocate texture memory at first.
+    drawable_object->textures_.resize(fbx_scene->textures.count);
+    for (size_t i_tex = 0; i_tex < fbx_scene->textures.count; i_tex++) {
+        auto& dst_tex = drawable_object->textures_[i_tex];
+        const auto& src_tex = fbx_scene->textures[i_tex];
+
+        helper::DDS_HEADER header;
+        helper::loadImageFileHeader(
+            src_tex->filename.data,
+            sizeof(header),
+            &header);
+
+        auto format = renderer::Format::R8G8B8A8_UNORM;
+        auto compress_format = std::string((char*)&header.ddspf.dwFourCC);
+        if (compress_format == "DXT1") {
+            format = renderer::Format::BC1_RGB_UNORM_BLOCK;
+        }
+        else if (compress_format == "DXT5") {
+            format = renderer::Format::BC3_UNORM_BLOCK;
+        }
+        else if (compress_format == "ATI2A2XY") {
+            format = renderer::Format::BC5_UNORM_BLOCK;
+        }
+        else {
+            assert(0);
+        }
+
+/*
+        auto format = renderer::Format::R8G8B8A8_UNORM;
+        helper::createTextureImage(
+            device,
+            src_tex->filename.data,
+            format,
+            dst_tex,
+            std::source_location::current());*/
+        int hit = 1;
+/*        const auto& src_img = model.images[i_tex];
+        auto format = renderer::Format::R8G8B8A8_UNORM;
+        renderer::Helper::create2DTextureImage(
+            device,
+            format,
+            src_img.width,
+            src_img.height,
+            src_img.component,
+            src_img.image.data(),
+            dst_tex.image,
+            dst_tex.memory,
+            std::source_location::current());
+
+        dst_tex.view = device->createImageView(
+            dst_tex.image,
+            renderer::ImageViewType::VIEW_2D,
+            format,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            std::source_location::current());*/
+    }
+#if 0
+    // Material
+    {
+        drawable_object->materials_.resize(model.materials.size());
+        for (size_t i_mat = 0; i_mat < model.materials.size(); i_mat++) {
+            auto& dst_material = drawable_object->materials_[i_mat];
+            const auto& src_material = model.materials[i_mat];
+
+            dst_material.base_color_idx_ = src_material.pbrMetallicRoughness.baseColorTexture.index;
+            dst_material.normal_idx_ = src_material.normalTexture.index;
+            dst_material.metallic_roughness_idx_ = src_material.pbrMetallicRoughness.metallicRoughnessTexture.index;
+            dst_material.emissive_idx_ = src_material.emissiveTexture.index;
+            dst_material.occlusion_idx_ = src_material.occlusionTexture.index;
+
+            if (dst_material.base_color_idx_ >= 0) {
+                drawable_object->textures_[dst_material.base_color_idx_].linear = false;
+            }
+
+            if (dst_material.emissive_idx_ >= 0) {
+                drawable_object->textures_[dst_material.emissive_idx_].linear = false;
+            }
+
+            device->createBuffer(
+                sizeof(glsl::PbrMaterialParams),
+                SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+                0,
+                dst_material.uniform_buffer_.buffer,
+                dst_material.uniform_buffer_.memory,
+                std::source_location::current());
+
+            glsl::PbrMaterialParams ubo{};
+            ubo.base_color_factor = glm::vec4(
+                src_material.pbrMetallicRoughness.baseColorFactor[0],
+                src_material.pbrMetallicRoughness.baseColorFactor[1],
+                src_material.pbrMetallicRoughness.baseColorFactor[2],
+                src_material.pbrMetallicRoughness.baseColorFactor[3]);
+
+            ubo.glossiness_factor = 1.0f;
+            ubo.metallic_roughness_specular_factor = 1.0f;
+            ubo.metallic_factor = static_cast<float>(src_material.pbrMetallicRoughness.metallicFactor);
+            ubo.roughness_factor = static_cast<float>(src_material.pbrMetallicRoughness.roughnessFactor);
+            ubo.alpha_cutoff = static_cast<float>(src_material.alphaCutoff);
+            ubo.mip_count = 11;
+            ubo.normal_scale = static_cast<float>(src_material.normalTexture.scale);
+            ubo.occlusion_strength = static_cast<float>(src_material.occlusionTexture.strength);
+
+            ubo.emissive_factor = glm::vec3(
+                src_material.emissiveFactor[0],
+                src_material.emissiveFactor[1],
+                src_material.emissiveFactor[2]);
+
+            ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);
+            ubo.exposure = 1.0f;
+            ubo.material_features = (src_material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
+            ubo.material_features |= (src_material.pbrMetallicRoughness.baseColorTexture.index >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0);
+            ubo.material_features |= (src_material.emissiveTexture.index >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
+            ubo.material_features |= (src_material.occlusionTexture.index >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
+            ubo.material_features |= (src_material.normalTexture.index >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
+            ubo.tonemap_type = TONEMAP_DEFAULT;
+            ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
+            for (int l = 0; l < LIGHT_COUNT; l++) {
+                ubo.lights[l].type = glsl::LightType_Directional;
+                ubo.lights[l].color = glm::vec3(1, 0, 0);
+                ubo.lights[l].direction = glm::vec3(0, 0, -1);
+                ubo.lights[l].intensity = 1.0f;
+                ubo.lights[l].position = glm::vec3(0, 0, 0);
+            }
+
+            device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
+        }
+    }
+
+    // Texture
+    {
+        for (size_t i_tex = 0; i_tex < model.textures.size(); i_tex++) {
+            auto& dst_tex = drawable_object->textures_[i_tex];
+            const auto& src_tex = model.textures[i_tex];
+            const auto& src_img = model.images[i_tex];
+            auto format = renderer::Format::R8G8B8A8_UNORM;
+            renderer::Helper::create2DTextureImage(
+                device,
+                format,
+                src_img.width,
+                src_img.height,
+                src_img.component,
+                src_img.image.data(),
+                dst_tex.image,
+                dst_tex.memory,
+                std::source_location::current());
+
+            dst_tex.view = device->createImageView(
+                dst_tex.image,
+                renderer::ImageViewType::VIEW_2D,
+                format,
+                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                std::source_location::current());
+        }
+    }
+#endif
+}
+
 struct VertexStruct {
     glm::vec3 position;
     glm::vec3 normal;
@@ -447,46 +610,68 @@ static void setupMesh(
     indices.reserve(src_mesh->num_indices);
 
     std::vector<float> vertex_data;
-    vertex_data.reserve(10);
-    for (int i = 0; i < src_mesh->num_indices; i++) {
-        vertex_data.clear();
-        auto position_idx = src_mesh->vertex_position.indices[i];
-        const auto& position = src_mesh->vertex_position.values[position_idx];
-        vertex_data.push_back(float(position.x));
-        vertex_data.push_back(float(position.y));
-        vertex_data.push_back(float(position.z));
-        auto normal_idx = src_mesh->vertex_normal.indices[i];
-        const auto& normal = src_mesh->vertex_normal.values[normal_idx];
-        vertex_data.push_back(float(normal.x));
-        vertex_data.push_back(float(normal.y));
-        vertex_data.push_back(float(normal.z));
-        auto uv_idx = src_mesh->vertex_uv.indices[i];
-        const auto& uv = src_mesh->vertex_uv.values[uv_idx];
-        vertex_data.push_back(float(uv.x));
-        vertex_data.push_back(float(uv.y));
-        auto hash_value =
-            hashCombine(
-                static_cast<uint32_t>(vertex_data.size()),
-                vertex_data.data());
+    vertex_data.reserve(20);
 
-        auto it = vertex_map.find(hash_value);
-        if (it != vertex_map.end()) {
-            indices.push_back(it->second);
+    size_t num_traingles = 0;
+    size_t num_indices = 0;
+    for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+        auto part = src_mesh->material_parts[i_part];
+        auto mat = src_mesh->materials[part.index];
+
+        ego::PrimitiveInfo primitive_info;
+        primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
+        primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+
+        for (int i_face = 0; i_face < part.num_faces * 3; i_face++) {
+            auto pos_indice = src_mesh->vertex_position.indices[num_indices];
+            const auto& position = src_mesh->vertex_position.values[pos_indice];
+            auto position_packed = glm::vec3(position.x, position.y, position.z);
+
+            primitive_info.bbox_min_ = glm::min(primitive_info.bbox_min_, position_packed);
+            primitive_info.bbox_max_ = glm::min(primitive_info.bbox_max_, position_packed);
+
+            vertex_data.clear();
+            vertex_data.push_back(float(position.x));
+            vertex_data.push_back(float(position.y));
+            vertex_data.push_back(float(position.z));
+            auto norm_indice = src_mesh->vertex_normal.indices[num_indices];
+            const auto& normal = src_mesh->vertex_normal.values[norm_indice];
+            vertex_data.push_back(float(normal.x));
+            vertex_data.push_back(float(normal.y));
+            vertex_data.push_back(float(normal.z));
+            auto uv_indice = src_mesh->vertex_uv.indices[num_indices];
+            const auto& uv = src_mesh->vertex_uv.values[uv_indice];
+            vertex_data.push_back(float(uv.x));
+            vertex_data.push_back(float(uv.y));
+            auto hash_value =
+                hashCombine(
+                    static_cast<uint32_t>(vertex_data.size()),
+                    vertex_data.data());
+
+            auto it = vertex_map.find(hash_value);
+            if (it != vertex_map.end()) {
+                indices.push_back(it->second);
+            }
+            else {
+                auto new_index = static_cast<uint32_t>(vertex_map.size());
+                indices.push_back(new_index);
+                vertex_indice_hash_table.push_back(hash_value);
+                vertex_map[hash_value] = static_cast<uint32_t>(i_face);
+            }
+
+            num_indices ++;
         }
-        else {
-            auto new_index = static_cast<uint32_t>(vertex_map.size());
-            indices.push_back(new_index);
-            vertex_indice_hash_table.push_back(hash_value);
-            vertex_map[hash_value] = static_cast<uint32_t>(i);
-        }
+        drawable_mesh.bbox_min_ = min(drawable_mesh.bbox_min_, primitive_info.bbox_min_);
+        drawable_mesh.bbox_max_ = max(drawable_mesh.bbox_max_, primitive_info.bbox_max_);
+        drawable_mesh.primitives_.push_back(primitive_info);
     }
 
     std::vector<VertexStruct> drawable_vertices;
     drawable_vertices.resize(vertex_indice_hash_table.size());
-    for (int i = 0; i < vertex_indice_hash_table.size(); i++) {
-        const uint32_t& idx = vertex_map[vertex_indice_hash_table[i]];
+    for (int i_vert = 0; i_vert < vertex_indice_hash_table.size(); i_vert++) {
+        const uint32_t& idx = vertex_map[vertex_indice_hash_table[i_vert]];
 
-        auto& vertex = drawable_vertices[i];
+        auto& vertex = drawable_vertices[i_vert];
         auto position_idx = src_mesh->vertex_position.indices[idx];
         const auto& position = src_mesh->vertex_position.values[position_idx];
         vertex.position = glm::vec3(position.x, position.y, position.z);
@@ -553,14 +738,14 @@ static void setupMesh(
             indices.data());
     }
 
-    size_t num_traingles = 0;
+    num_traingles = 0;
     uint32_t buffer_offset = 0;
     uint32_t dst_binding = 0;
-    for (int i = 0; i < src_mesh->material_parts.count; i++) {
-        auto part = src_mesh->material_parts[i];
+    for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+        auto part = src_mesh->material_parts[i_part];
         auto mat = src_mesh->materials[part.index];
 
-        ego::PrimitiveInfo primitive_info;
+        auto& primitive_info = drawable_mesh.primitives_[i_part];
         primitive_info.tag_.restart_enable = false;
         primitive_info.material_idx_ = part.index;
 
@@ -583,10 +768,6 @@ static void setupMesh(
         attribute.buffer_offset = 0;
         attribute.location = VINPUT_POSITION;
         attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
-/*        primitive_info.bbox_min_ = glm::vec3(accessor.minValues[0], accessor.minValues[1], accessor.minValues[2]);
-        primitive_info.bbox_max_ = glm::vec3(accessor.maxValues[0], accessor.maxValues[1], accessor.maxValues[2]);
-        mesh_info.bbox_min_ = min(mesh_info.bbox_min_, primitive_info.bbox_min_);
-        mesh_info.bbox_max_ = max(mesh_info.bbox_max_, primitive_info.bbox_max_);*/
 
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
@@ -630,8 +811,6 @@ static void setupMesh(
         primitive_info.index_desc_.index_count = part.num_faces * 3;
 
         primitive_info.generateHash();
-        drawable_mesh.primitives_.push_back(primitive_info);
-
         num_traingles += part.num_faces;
     }
 }
@@ -2368,7 +2547,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     auto drawable_object = std::make_shared<ego::DrawableData>(device);
     drawable_object->meshes_.reserve(fbx_scene->meshes.count);
 
-//    setupMeshState(device, model, drawable_object);
+    setupMeshState(device, fbx_scene, drawable_object);
     setupMeshes(device, fbx_scene, drawable_object);
 /*    setupAnimations(model, drawable_object);
     setupSkins(device, model, drawable_object);
@@ -2382,7 +2561,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
 
     ufbx_free_scene(fbx_scene);
 
-    return nullptr;
+    return drawable_object;
 }
 
 } // game_object
