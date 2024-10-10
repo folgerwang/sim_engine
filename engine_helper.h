@@ -37,14 +37,15 @@ struct DDS_HEADER {
 };
 #pragma pack(pop)
 
-std::vector<uint64_t> readFile(
+void readFile(
     const std::string& file_name,
-    uint64_t& file_size);
+    uint64_t& file_size,
+    std::vector<char>& buffer);
 
-void loadImageFileHeader(
-    const std::string& file_name,
-    const uint32_t& header_size,
-    void* header_data);
+void loadDdsTexture(
+    const glm::uvec3& size,
+    const void* image_data,
+    const std::string& input_filename);
 
 void storeImageFileWithHeader(
     const std::string& file_name,

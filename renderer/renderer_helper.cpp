@@ -406,10 +406,14 @@ std::shared_ptr<ShaderModule> loadShaderModule(
     std::shared_ptr<ShaderModule> result;
     if (search_result == s_shader_module_list.end()) {
         uint64_t shader_code_size;
-        auto shader_code =
-            engine::helper::readFile(path_file_name.c_str(), shader_code_size);
+        std::vector<char> shader_code;
+        engine::helper::readFile(path_file_name.c_str(), shader_code_size, shader_code);
         auto shader_module =
-            device->createShaderModule(shader_code_size, shader_code.data(), shader_stage, src_location);
+            device->createShaderModule(
+                shader_code_size,
+                shader_code.data(),
+                shader_stage,
+                src_location);
         s_shader_module_list[path_file_name] = shader_module;
         result = shader_module;
     }

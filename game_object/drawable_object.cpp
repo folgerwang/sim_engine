@@ -429,26 +429,12 @@ static void setupMeshState(
         auto& dst_tex = drawable_object->textures_[i_tex];
         const auto& src_tex = fbx_scene->textures[i_tex];
 
-        helper::DDS_HEADER header;
-        helper::loadImageFileHeader(
-            src_tex->filename.data,
-            sizeof(header),
-            &header);
-
-        auto format = renderer::Format::R8G8B8A8_UNORM;
-        auto compress_format = std::string((char*)&header.ddspf.dwFourCC);
-        if (compress_format == "DXT1") {
-            format = renderer::Format::BC1_RGB_UNORM_BLOCK;
-        }
-        else if (compress_format == "DXT5") {
-            format = renderer::Format::BC3_UNORM_BLOCK;
-        }
-        else if (compress_format == "ATI2A2XY") {
-            format = renderer::Format::BC5_UNORM_BLOCK;
-        }
-        else {
-            assert(0);
-        }
+        glm::uvec3 size;
+        void* image_data = nullptr;
+        helper::loadDdsTexture(
+            size,
+            image_data,
+            src_tex->filename.data);
 
 /*
         auto format = renderer::Format::R8G8B8A8_UNORM;

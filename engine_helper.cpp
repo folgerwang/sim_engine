@@ -23,7 +23,10 @@ static std::string s_src_shader_path;
 static std::string s_output_path;
 static std::string s_compiler_path;
 
-std::vector<uint64_t> readFile(const std::string& file_name, uint64_t& file_size) {
+void readFile(
+    const std::string& file_name,
+    uint64_t& file_size,
+    std::vector<char>& buffer) {
     std::ifstream file(file_name, std::ios::ate | std::ios::binary);
 
     if (!file.is_open()) {
@@ -32,27 +35,10 @@ std::vector<uint64_t> readFile(const std::string& file_name, uint64_t& file_size
     }
 
     file_size = (uint64_t)file.tellg();
-    std::vector<uint64_t> buffer((file_size + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    buffer.resize(file_size);
 
     file.seekg(0);
     file.read(reinterpret_cast<char*>(buffer.data()), file_size);
-
-    file.close();
-    return buffer;
-}
-
-void loadImageFileHeader(
-    const std::string& file_name,
-    const uint32_t& header_size,
-    void* header_data) {
-    std::ifstream file(file_name, std::ios::binary);
-
-    if (!file.is_open()) {
-        std::string error_message = std::string("failed to open file! :") + file_name;
-        throw std::runtime_error(error_message);
-    }
-
-    file.read(reinterpret_cast<char*>(header_data), header_size);
 
     file.close();
 }
@@ -159,7 +145,8 @@ void loadMtx2Texture(
     renderer::TextureInfo& texture,
     const std::source_location& src_location) {
     uint64_t buffer_size;
-    auto mtx2_data = engine::helper::readFile(input_filename, buffer_size);
+    std::vector<char> mtx2_data;
+    engine::helper::readFile(input_filename, buffer_size, mtx2_data);
     auto src_data = (char*)mtx2_data.data();
 
     // header block
@@ -234,12 +221,49 @@ void loadDdsTexture(
     const void* image_data,
     const std::string& input_filename) {
 
-    DDS_HEADER dds_header;
-
-    loadImageFileHeader(
+    uint64_t file_size = 0;
+    std::vector<char> buffer_data;
+    readFile(
         input_filename,
-        sizeof(DDS_HEADER),
-        &dds_header);
+        file_size,
+        buffer_data);
+
+    DDS_HEADER* dds_header =
+        (DDS_HEADER*)buffer_data.data();
+
+    auto format = renderer::Format::R8G8B8A8_UNORM;
+    auto compress_format = std::string((char*)&dds_header->ddspf.dwFourCC);
+    if (compress_format == "DXT1") {
+        format = renderer::Format::BC1_RGB_UNORM_BLOCK;
+    }
+    else if (compress_format == "DXT5") {
+        format = renderer::Format::BC3_UNORM_BLOCK;
+    }
+    else if (compress_format == "ATI2A2XY") {
+        format = renderer::Format::BC5_UNORM_BLOCK;
+    }
+    else {
+        assert(0);
+    }
+
+    // Calculate data size
+    uint32_t data_size = 0;
+    if (/*compressed*/true) {
+        uint32_t blockSize = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
+        data_size = ((dds_header->dwWidth + 3) / 4) * ((dds_header->dwHeight + 3) / 4) * blockSize;
+    }
+    else {
+        data_size =
+            dds_header->dwWidth *
+            dds_header->dwHeight *
+            (dds_header->ddspf.dwRGBBitCount / 8);
+    }
+
+    uint32_t total_size = 0;
+    for (int i = 0; i < dds_header->dwMipMapCount; i++) {
+        total_size += data_size;
+        data_size = std::max(8u, data_size / 4);
+    }
 
     int hit = 1;
 }
