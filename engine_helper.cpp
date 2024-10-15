@@ -231,41 +231,53 @@ void loadDdsTexture(
     DDS_HEADER* dds_header =
         (DDS_HEADER*)buffer_data.data();
 
-    auto format = renderer::Format::R8G8B8A8_UNORM;
-    auto compress_format = std::string((char*)&dds_header->ddspf.dwFourCC);
-    if (compress_format == "DXT1") {
-        format = renderer::Format::BC1_RGB_UNORM_BLOCK;
-    }
-    else if (compress_format == "DXT5") {
-        format = renderer::Format::BC3_UNORM_BLOCK;
-    }
-    else if (compress_format == "ATI2A2XY") {
-        format = renderer::Format::BC5_UNORM_BLOCK;
-    }
-    else {
-        assert(0);
-    }
+    // Extract width, height, and pixel format
+    uint32_t width = dds_header->dwWidth;
+    uint32_t height = dds_header->dwHeight;
+    uint32_t rgbBitCount = dds_header->ddspf.dwRGBBitCount;
+    uint32_t fourCC = dds_header->ddspf.dwFourCC;
 
-    // Calculate data size
+    const uint32_t DDPF_FOURCC = 0x00000004;
+    bool compressed = (dds_header->ddspf.dwFlags & DDPF_FOURCC) != 0;
+
+    auto format = renderer::Format::R8G8B8A8_UNORM;
     uint32_t data_size = 0;
-    if (/*compressed*/true) {
+    if (compressed) {
+        auto compress_format =
+            std::string((char*)&dds_header->ddspf.dwFourCC);
+        if (compress_format == "DXT1") {
+            format = renderer::Format::BC1_RGB_UNORM_BLOCK;
+        }
+        else if (compress_format == "DXT5") {
+            format = renderer::Format::BC3_UNORM_BLOCK;
+        }
+        else if (compress_format == "ATI2A2XY") {
+            format = renderer::Format::BC5_UNORM_BLOCK;
+        }
+        else {
+            assert(0);
+        }
         uint32_t blockSize = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
         data_size = ((dds_header->dwWidth + 3) / 4) * ((dds_header->dwHeight + 3) / 4) * blockSize;
     }
     else {
+        if (rgbBitCount == 32) {
+            format = renderer::Format::R8G8B8A8_UNORM;
+        }
+        else if (rgbBitCount == 24) {
+            format = renderer::Format::R8G8B8_UNORM;
+        }
+        else {
+            assert(0);
+        }
         data_size =
             dds_header->dwWidth *
             dds_header->dwHeight *
             (dds_header->ddspf.dwRGBBitCount / 8);
     }
 
-    uint32_t total_size = 0;
-    for (int i = 0; i < dds_header->dwMipMapCount; i++) {
-        total_size += data_size;
-        data_size = std::max(8u, data_size / 4);
-    }
+    auto total_data_size = file_size - sizeof(DDS_HEADER);
 
-    int hit = 1;
 }
 
 void saveDdsTexture(

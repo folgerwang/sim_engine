@@ -2291,6 +2291,7 @@ void DrawableObject::updateGameObjectsBuffer(
     params.enble_airflow = enble_airflow ? 1 : 0;
     params.air_flow_strength = air_flow_strength;
     params.water_flow_strength = water_flow_strength;
+
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         update_game_objects_pipeline_layout_,
