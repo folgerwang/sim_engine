@@ -308,10 +308,13 @@ void ObjectMesh::loadObjectFile(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const glm::uvec2& display_size) {
-    uint64_t buffer_size = 0;
     std::vector<char> buffer_data;
-    engine::helper::readFile(object_name, buffer_size, buffer_data);
-    std::string obj_string(buffer_data.data(), buffer_size);
+    engine::helper::readFile(
+        object_name,
+        buffer_data);
+    std::string obj_string(
+        buffer_data.data(),
+        buffer_data.size());
     std::stringstream obj_stream(std::move(obj_string));
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;

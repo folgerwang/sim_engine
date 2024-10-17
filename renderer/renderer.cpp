@@ -369,7 +369,6 @@ void Helper::create2DTextureImage(
     Format format,
     int tex_width,
     int tex_height,
-    int tex_channels,
     const void* pixels,
     std::shared_ptr<Image>& texture_image,
     std::shared_ptr<DeviceMemory>& texture_image_memory,
@@ -377,6 +376,71 @@ void Helper::create2DTextureImage(
 
     VkDeviceSize image_size =
         static_cast<VkDeviceSize>(tex_width * tex_height * (format == Format::R16_UNORM ? 2 : 4));
+
+    std::shared_ptr<Buffer> staging_buffer;
+    std::shared_ptr<DeviceMemory> staging_buffer_memory;
+    device->createBuffer(
+        image_size,
+        SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
+        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        0,
+        staging_buffer,
+        staging_buffer_memory,
+        src_location);
+
+    device->updateBufferMemory(
+        staging_buffer_memory,
+        image_size,
+        pixels);
+
+    vk::helper::createTextureImage(
+        device,
+        glm::vec3(tex_width, tex_height, 1),
+        format,
+        ImageTiling::OPTIMAL,
+        SET_2_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, SAMPLED_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        texture_image,
+        texture_image_memory,
+        src_location);
+
+    auto cmd_buf = device->setupTransientCommandBuffer();
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        texture_image,
+        format,
+        ImageLayout::UNDEFINED,
+        ImageLayout::TRANSFER_DST_OPTIMAL);
+    vk::helper::copyBufferToImage(
+        cmd_buf,
+        staging_buffer,
+        texture_image,
+        glm::uvec3(tex_width, tex_height, 1));
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        texture_image,
+        format,
+        ImageLayout::TRANSFER_DST_OPTIMAL,
+        ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    device->submitAndWaitTransientCommandBuffer();
+
+    device->destroyBuffer(staging_buffer);
+    device->freeMemory(staging_buffer_memory);
+}
+
+void Helper::create2DTextureImage(
+    const std::shared_ptr<renderer::Device>& device,
+    Format format,
+    int tex_width,
+    int tex_height,
+    uint64_t buffer_size,
+    const void* pixels,
+    std::shared_ptr<Image>& texture_image,
+    std::shared_ptr<DeviceMemory>& texture_image_memory,
+    const std::source_location& src_location) {
+
+    VkDeviceSize image_size = buffer_size;
 
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;

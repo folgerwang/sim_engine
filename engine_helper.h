@@ -39,12 +39,12 @@ struct DDS_HEADER {
 
 void readFile(
     const std::string& file_name,
-    uint64_t& file_size,
     std::vector<char>& buffer);
 
 void loadDdsTexture(
-    const glm::uvec3& size,
-    const void* image_data,
+    renderer::Format& format,
+    glm::uvec3& image_size,
+    std::vector<char>& buffer_data,
     const std::string& input_filename);
 
 void storeImageFileWithHeader(

@@ -25,7 +25,6 @@ static std::string s_compiler_path;
 
 void readFile(
     const std::string& file_name,
-    uint64_t& file_size,
     std::vector<char>& buffer) {
     std::ifstream file(file_name, std::ios::ate | std::ios::binary);
 
@@ -34,7 +33,7 @@ void readFile(
         throw std::runtime_error(error_message);
     }
 
-    file_size = (uint64_t)file.tellg();
+    auto file_size = (uint64_t)file.tellg();
     buffer.resize(file_size);
 
     file.seekg(0);
@@ -68,46 +67,88 @@ void createTextureImage(
     renderer::Format format,
     renderer::TextureInfo& texture,
     const std::source_location& src_location) {
-    int tex_width, tex_height, tex_channels;
+
+    // Create a path object
+    std::filesystem::path file_path(file_name);
+
+    // Get the file extension
+    auto extension = file_path.extension().string();
+
+    int tex_width = 1, tex_height = 1, tex_channels = 1;
     void* void_pixels = nullptr;
-    if (format == engine::renderer::Format::R16_UNORM) {
-        stbi_us* pixels =
-            stbi_load_16(
-                file_name.c_str(),
-                &tex_width,
-                &tex_height,
-                &tex_channels,
-                STBI_grey);
-        void_pixels = pixels;
+
+    bool is_dds =
+        extension == ".dds";
+
+    std::vector<char> buffer_data;
+    if (is_dds) {
+        loadDdsTexture(
+            format,
+            texture.size,
+            buffer_data,
+            file_name);
+
+        void_pixels =
+            buffer_data.data() +
+            sizeof(helper::DDS_HEADER);
+
+        tex_width = texture.size.x;
+        tex_height = texture.size.y;
     }
     else {
-        stbi_uc* pixels =
-            stbi_load(
-                file_name.c_str(),
-                &tex_width,
-                &tex_height,
-                &tex_channels,
-                STBI_rgb_alpha);
-        void_pixels = pixels;
+        if (format == engine::renderer::Format::R16_UNORM) {
+            stbi_us* pixels =
+                stbi_load_16(
+                    file_name.c_str(),
+                    &tex_width,
+                    &tex_height,
+                    &tex_channels,
+                    STBI_grey);
+            void_pixels = pixels;
+        }
+        else {
+            stbi_uc* pixels =
+                stbi_load(
+                    file_name.c_str(),
+                    &tex_width,
+                    &tex_height,
+                    &tex_channels,
+                    STBI_rgb_alpha);
+            void_pixels = pixels;
+        }
+
+        if (!void_pixels) {
+            throw std::runtime_error("failed to load texture image!");
+        }
     }
 
-    if (!void_pixels) {
-        throw std::runtime_error("failed to load texture image!");
+    if (is_dds) {
+        renderer::Helper::create2DTextureImage(
+            device,
+            format,
+            tex_width,
+            tex_height,
+            buffer_data.size() - sizeof(helper::DDS_HEADER),
+            void_pixels,
+            texture.image,
+            texture.memory,
+            src_location);
     }
-    renderer::Helper::create2DTextureImage(
-        device,
-        format,
-        tex_width,
-        tex_height,
-        tex_channels,
-        void_pixels,
-        texture.image,
-        texture.memory,
-        src_location);
+    else {
+        renderer::Helper::create2DTextureImage(
+            device,
+            format,
+            tex_width,
+            tex_height,
+            void_pixels,
+            texture.image,
+            texture.memory,
+            src_location);
+
+        stbi_image_free(void_pixels);
+    }
 
     texture.size = { tex_width, tex_height, 1.0f };
-
-    stbi_image_free(void_pixels);
 
     texture.view = device->createImageView(
         texture.image,
@@ -144,9 +185,8 @@ void loadMtx2Texture(
     const std::string& input_filename,
     renderer::TextureInfo& texture,
     const std::source_location& src_location) {
-    uint64_t buffer_size;
     std::vector<char> mtx2_data;
-    engine::helper::readFile(input_filename, buffer_size, mtx2_data);
+    engine::helper::readFile(input_filename, mtx2_data);
     auto src_data = (char*)mtx2_data.data();
 
     // header block
@@ -212,20 +252,19 @@ void loadMtx2Texture(
         copy_regions,
         texture,
         src_location,
-        buffer_size,
+        mtx2_data.size(),
         mtx2_data.data());
 }
 
 void loadDdsTexture(
-    const glm::uvec3& size,
-    const void* image_data,
+    renderer::Format& format,
+    glm::uvec3& image_size,
+    std::vector<char>& buffer_data,
     const std::string& input_filename) {
 
     uint64_t file_size = 0;
-    std::vector<char> buffer_data;
     readFile(
         input_filename,
-        file_size,
         buffer_data);
 
     DDS_HEADER* dds_header =
@@ -240,7 +279,7 @@ void loadDdsTexture(
     const uint32_t DDPF_FOURCC = 0x00000004;
     bool compressed = (dds_header->ddspf.dwFlags & DDPF_FOURCC) != 0;
 
-    auto format = renderer::Format::R8G8B8A8_UNORM;
+    format = renderer::Format::R8G8B8A8_UNORM;
     uint32_t data_size = 0;
     if (compressed) {
         auto compress_format =
@@ -278,6 +317,7 @@ void loadDdsTexture(
 
     auto total_data_size = file_size - sizeof(DDS_HEADER);
 
+    image_size = glm::uvec3(width, height, 1);
 }
 
 void saveDdsTexture(

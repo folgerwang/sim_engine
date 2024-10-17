@@ -388,7 +388,17 @@ public:
         Format format,
         int tex_width,
         int tex_height,
-        int tex_channels,
+        const void* pixels,
+        std::shared_ptr<Image>& texture_image,
+        std::shared_ptr<DeviceMemory>& texture_image_memory,
+        const std::source_location& src_location);
+
+    static void create2DTextureImage(
+        const std::shared_ptr<renderer::Device>& device,
+        Format format,
+        int tex_width,
+        int tex_height,
+        uint64_t buffer_size,
         const void* pixels,
         std::shared_ptr<Image>& texture_image,
         std::shared_ptr<DeviceMemory>& texture_image_memory,

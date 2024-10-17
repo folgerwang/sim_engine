@@ -1,4 +1,5 @@
 #include <string>
+#include <functional>
 #include "raytracing_callable.h"
 #include "renderer/renderer_helper.h"
 

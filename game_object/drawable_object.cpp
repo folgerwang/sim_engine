@@ -238,7 +238,7 @@ static void setupMeshState(
                 format,
                 src_img.width,
                 src_img.height,
-                src_img.component,
+//                src_img.component,
                 src_img.image.data(),
                 dst_tex.image,
                 dst_tex.memory,
@@ -418,66 +418,79 @@ static void setupMeshes(
     }
 }
 
+std::hash<std::string> str_hash;
 static void setupMeshState(
     const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
     std::shared_ptr<ego::DrawableData>& drawable_object) {
 
     // allocate texture memory at first.
+    std::vector<size_t> texture_hash_table;
+    std::unordered_map<size_t, uint32_t> texture_map;
     drawable_object->textures_.resize(fbx_scene->textures.count);
+
     for (size_t i_tex = 0; i_tex < fbx_scene->textures.count; i_tex++) {
         auto& dst_tex = drawable_object->textures_[i_tex];
         const auto& src_tex = fbx_scene->textures[i_tex];
+        texture_map[str_hash(src_tex->name.data)] = uint32_t(i_tex);
 
-        glm::uvec3 size;
+        glm::uvec3 size(0);
         void* image_data = nullptr;
-        helper::loadDdsTexture(
-            size,
-            image_data,
-            src_tex->filename.data);
-
-/*
         auto format = renderer::Format::R8G8B8A8_UNORM;
         helper::createTextureImage(
-            device,
+            device, 
             src_tex->filename.data,
             format,
             dst_tex,
-            std::source_location::current());*/
-        int hit = 1;
-/*        const auto& src_img = model.images[i_tex];
-        auto format = renderer::Format::R8G8B8A8_UNORM;
-        renderer::Helper::create2DTextureImage(
-            device,
-            format,
-            src_img.width,
-            src_img.height,
-            src_img.component,
-            src_img.image.data(),
-            dst_tex.image,
-            dst_tex.memory,
             std::source_location::current());
 
-        dst_tex.view = device->createImageView(
-            dst_tex.image,
-            renderer::ImageViewType::VIEW_2D,
-            format,
-            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
-            std::source_location::current());*/
+        dst_tex.view =
+            device->createImageView(
+                dst_tex.image,
+                renderer::ImageViewType::VIEW_2D,
+                format,
+                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                std::source_location::current());
     }
-#if 0
+
     // Material
     {
-        drawable_object->materials_.resize(model.materials.size());
-        for (size_t i_mat = 0; i_mat < model.materials.size(); i_mat++) {
+        drawable_object->materials_.resize(fbx_scene->materials.count);
+        for (size_t i_mat = 0; i_mat < fbx_scene->materials.count; i_mat++) {
             auto& dst_material = drawable_object->materials_[i_mat];
-            const auto& src_material = model.materials[i_mat];
+            const auto& src_material = fbx_scene->materials[i_mat];
 
-            dst_material.base_color_idx_ = src_material.pbrMetallicRoughness.baseColorTexture.index;
-            dst_material.normal_idx_ = src_material.normalTexture.index;
-            dst_material.metallic_roughness_idx_ = src_material.pbrMetallicRoughness.metallicRoughnessTexture.index;
-            dst_material.emissive_idx_ = src_material.emissiveTexture.index;
-            dst_material.occlusion_idx_ = src_material.occlusionTexture.index;
+            for (int i = 0; i < src_material->textures.count; i++) {
+                auto tex = src_material->textures[i];
+                const auto& texture_string =
+                    std::string(tex.material_prop.data);
+                const auto& texture_name = 
+                    std::string(tex.texture->name.data);
+
+                auto tex_id = texture_map[str_hash(texture_name)];
+
+                if (texture_string == "DiffuseColor") {
+                    dst_material.base_color_idx_ = tex_id;
+                }
+                else if (texture_string == "SpecularColor") {
+                    dst_material.metallic_roughness_idx_ = tex_id;
+                }
+                else if (texture_string == "NormalMap") {
+                    dst_material.normal_idx_ = tex_id;
+                }
+                else if (texture_string == "MetallicRoughness") {
+                    assert(0);
+                }
+                else if (texture_string == "EmissiveColor") {
+                    dst_material.emissive_idx_ = tex_id;
+                }
+                else if (texture_string == "Occlusion") {
+                    dst_material.occlusion_idx_ = tex_id;
+                }
+                else {
+                    assert(0);
+                }
+            }
 
             if (dst_material.base_color_idx_ >= 0) {
                 drawable_object->textures_[dst_material.base_color_idx_].linear = false;
@@ -497,74 +510,97 @@ static void setupMeshState(
                 std::source_location::current());
 
             glsl::PbrMaterialParams ubo{};
-            ubo.base_color_factor = glm::vec4(
-                src_material.pbrMetallicRoughness.baseColorFactor[0],
-                src_material.pbrMetallicRoughness.baseColorFactor[1],
-                src_material.pbrMetallicRoughness.baseColorFactor[2],
-                src_material.pbrMetallicRoughness.baseColorFactor[3]);
+            auto base_factor = src_material->pbr.base_factor;
+            ubo.base_color_factor = glm::vec4(1.0f);
+            if (base_factor.has_value) {
+                ubo.base_color_factor =
+                    glm::vec4(float(src_material->pbr.base_factor.value_vec4.x));
+                if (base_factor.value_components > 1) {
+                    ubo.base_color_factor.y =
+                        float(src_material->pbr.base_factor.value_vec4.y);
+                }
+                if (base_factor.value_components > 2) {
+                    ubo.base_color_factor.z =
+                        float(src_material->pbr.base_factor.value_vec4.z);
+                }
+                if (base_factor.value_components > 3) {
+                    ubo.base_color_factor.w =
+                        float(src_material->pbr.base_factor.value_vec4.w);
+                }
+            }
 
-            ubo.glossiness_factor = 1.0f;
-            ubo.metallic_roughness_specular_factor = 1.0f;
-            ubo.metallic_factor = static_cast<float>(src_material.pbrMetallicRoughness.metallicFactor);
-            ubo.roughness_factor = static_cast<float>(src_material.pbrMetallicRoughness.roughnessFactor);
-            ubo.alpha_cutoff = static_cast<float>(src_material.alphaCutoff);
+            auto emission_factor = src_material->pbr.emission_factor;
+            ubo.emissive_factor = glm::vec3(1.0f);
+            if (emission_factor.has_value) {
+                ubo.emissive_factor =
+                    glm::vec4(float(src_material->pbr.emission_factor.value_vec4.x));
+                if (emission_factor.value_components > 1) {
+                    ubo.emissive_factor.y =
+                        float(src_material->pbr.emission_factor.value_vec4.y);
+                }
+                if (emission_factor.value_components > 2) {
+                    ubo.emissive_factor.z =
+                        float(src_material->pbr.emission_factor.value_vec4.z);
+                }
+            }
+
+            auto specular_factor = src_material->pbr.specular_factor;
+            ubo.specular_factor = glm::vec3(1.0f);
+            if (specular_factor.has_value) {
+                ubo.specular_factor =
+                    glm::vec4(float(src_material->pbr.specular_factor.value_vec4.x));
+                if (specular_factor.value_components > 1) {
+                    ubo.specular_factor.y =
+                        float(src_material->pbr.specular_factor.value_vec4.y);
+                }
+                if (specular_factor.value_components > 2) {
+                    ubo.specular_factor.z =
+                        float(src_material->pbr.specular_factor.value_vec4.z);
+                }
+            }
+
+            ubo.glossiness_factor =
+                src_material->pbr.glossiness.has_value ?
+                float(src_material->pbr.glossiness.value_real) : 
+                1.0f;
+
+            ubo.metallic_roughness_specular_factor =
+                src_material->pbr.specular_factor.has_value ?
+                float(src_material->pbr.specular_factor.value_real) :
+                1.0f;
+
+            ubo.metallic_factor =
+                src_material->pbr.metalness.has_value ?
+                float(src_material->pbr.metalness.value_real) :
+                0.0f;
+
+            ubo.roughness_factor =
+                src_material->pbr.roughness.has_value ?
+                float(src_material->pbr.roughness.value_real) :
+                1.0f;
+
+            ubo.metallic_roughness_specular_factor =
+                src_material->pbr.specular_factor.has_value ?
+                float(src_material->pbr.specular_factor.value_real) :
+                1.0f;
+
+            ubo.alpha_cutoff = 0.5f;
             ubo.mip_count = 11;
-            ubo.normal_scale = static_cast<float>(src_material.normalTexture.scale);
-            ubo.occlusion_strength = static_cast<float>(src_material.occlusionTexture.strength);
-
-            ubo.emissive_factor = glm::vec3(
-                src_material.emissiveFactor[0],
-                src_material.emissiveFactor[1],
-                src_material.emissiveFactor[2]);
-
+            ubo.normal_scale = 1.0f;
             ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);
             ubo.exposure = 1.0f;
-            ubo.material_features = (src_material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
-            ubo.material_features |= (src_material.pbrMetallicRoughness.baseColorTexture.index >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0);
-            ubo.material_features |= (src_material.emissiveTexture.index >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
-            ubo.material_features |= (src_material.occlusionTexture.index >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
-            ubo.material_features |= (src_material.normalTexture.index >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
+            ubo.occlusion_strength = 1.0f;
             ubo.tonemap_type = TONEMAP_DEFAULT;
-            ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
-            for (int l = 0; l < LIGHT_COUNT; l++) {
-                ubo.lights[l].type = glsl::LightType_Directional;
-                ubo.lights[l].color = glm::vec3(1, 0, 0);
-                ubo.lights[l].direction = glm::vec3(0, 0, -1);
-                ubo.lights[l].intensity = 1.0f;
-                ubo.lights[l].position = glm::vec3(0, 0, 0);
-            }
+
+            ubo.material_features = (dst_material.metallic_roughness_idx_ >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
+            ubo.material_features |= (dst_material.base_color_idx_ >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0);
+            ubo.material_features |= (dst_material.emissive_idx_ >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
+            ubo.material_features |= (dst_material.occlusion_idx_ >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
+            ubo.material_features |= (dst_material.normal_idx_ >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
 
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
         }
     }
-
-    // Texture
-    {
-        for (size_t i_tex = 0; i_tex < model.textures.size(); i_tex++) {
-            auto& dst_tex = drawable_object->textures_[i_tex];
-            const auto& src_tex = model.textures[i_tex];
-            const auto& src_img = model.images[i_tex];
-            auto format = renderer::Format::R8G8B8A8_UNORM;
-            renderer::Helper::create2DTextureImage(
-                device,
-                format,
-                src_img.width,
-                src_img.height,
-                src_img.component,
-                src_img.image.data(),
-                dst_tex.image,
-                dst_tex.memory,
-                std::source_location::current());
-
-            dst_tex.view = device->createImageView(
-                dst_tex.image,
-                renderer::ImageViewType::VIEW_2D,
-                format,
-                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
-                std::source_location::current());
-        }
-    }
-#endif
 }
 
 struct VertexStruct {
