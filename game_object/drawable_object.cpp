@@ -48,6 +48,20 @@ static std::string getFilePathExtension(const std::string& file_name) {
     return "";
 }
 
+static glm::quat eulerToQuaternion(float roll, float pitch, float yaw) {
+    // Convert degrees to radians
+    roll = glm::radians(roll);
+    pitch = glm::radians(pitch);
+    yaw = glm::radians(yaw);
+
+    // Create quaternion from Euler angles
+    // GLM uses the yaw (Z), pitch (Y), and roll (X) order
+    glm::quat quaternion = glm::quat(glm::vec3(pitch, yaw, roll));
+
+    // Normalize the quaternion (optional, as GLM's constructor returns a normalized quaternion)
+    return glm::normalize(quaternion);
+}
+
 static void transformBbox(
     const glm::mat4& mat,
     const glm::vec3& bbox_min,
@@ -1079,6 +1093,99 @@ static void setupModel(
             dst_scene.nodes_[i_node] = src_scene.nodes[i_node];
         }
     }
+}
+
+static void setupNode(
+    const ufbx_abi ufbx_scene* fbx_scene,
+    const uint32_t node_idx,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+
+    const auto& node = fbx_scene->nodes[node_idx];
+    auto& node_info = drawable_object->nodes_[node_idx];
+    node_info.name_ = node->name.data;
+
+    auto& to_parent = node->node_to_parent;
+
+    node_info.matrix_ =
+        glm::mat4(
+            to_parent.m00, to_parent.m10, to_parent.m20, 0,
+            to_parent.m01, to_parent.m11, to_parent.m21, 0,
+            to_parent.m02, to_parent.m12, to_parent.m22, 0,
+            to_parent.m03, to_parent.m13, to_parent.m23, 1.0f);
+
+    node_info.scale_ =
+        glm::vec3(
+            node->local_transform.scale.x,
+            node->local_transform.scale.y,
+            node->local_transform.scale.z);
+
+    node_info.rotation_ =
+        glm::quat(
+            float(node->local_transform.rotation.x),
+            float(node->local_transform.rotation.y),
+            float(node->local_transform.rotation.z),
+            float(node->local_transform.rotation.w));
+
+    node_info.translation_ =
+        glm::vec3(
+            node->local_transform.translation.x,
+            node->local_transform.translation.y,
+            node->local_transform.translation.z);
+
+    if (node->mesh) {
+        for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
+            if (fbx_scene->meshes[i_mesh]->element_id == node->mesh->element_id) {
+                node_info.mesh_idx_ = i_mesh;
+                break;
+            }
+        }
+    }
+
+//    node_info.skin_idx_ = node.skin;
+
+    node_info.parent_idx_ = -1;
+    if (node->parent) {
+        for (size_t i = 0; i < fbx_scene->nodes.count; i++) {
+            if (node->parent->element_id == fbx_scene->nodes[i]->element_id) {
+                node_info.parent_idx_ = int32_t(i);
+                break;
+            }
+        }
+    }
+
+    // Draw child nodes.
+    node_info.child_idx_.resize(node->children.count);
+    for (size_t i_node = 0; i_node < node->children.count; i_node++) {
+        node_info.child_idx_[i_node] = -1;
+        for (size_t i = 0; i < fbx_scene->nodes.count; i++) {
+            if (node->children[i_node]->element_id == fbx_scene->nodes[i]->element_id) {
+                node_info.child_idx_[i_node] = int32_t(i);
+                break;
+            }
+        }
+        drawable_object->nodes_[node_info.child_idx_[i_node]].parent_idx_ = node_idx;
+    }
+}
+
+static void setupNodes(
+    const ufbx_abi ufbx_scene* fbx_scene,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    drawable_object->nodes_.resize(fbx_scene->nodes.count);
+    for (int i_node = 0; i_node < fbx_scene->nodes.count; i_node++) {
+        setupNode(fbx_scene, i_node, drawable_object);
+    }
+}
+
+static void setupModel(
+    const ufbx_abi ufbx_scene* fbx_scene,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+
+    drawable_object->default_scene_ = 0;
+    drawable_object->scenes_.resize(1);
+    auto& dst_scene = drawable_object->scenes_[0];
+
+    dst_scene.nodes_.resize(1);
+    dst_scene.nodes_[0] = 0;
 }
 
 static void setupRaytracing(
@@ -2572,10 +2679,10 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
 
     setupMeshState(device, fbx_scene, drawable_object);
     setupMeshes(device, fbx_scene, drawable_object);
-/*    setupAnimations(model, drawable_object);
-    setupSkins(device, model, drawable_object);
-    setupNodes(model, drawable_object);
-    setupModel(model, drawable_object);*/
+//    setupAnimations(model, drawable_object);
+//    setupSkins(device, model, drawable_object);
+    setupNodes(fbx_scene, drawable_object);
+    setupModel(fbx_scene, drawable_object);
     for (auto& scene : drawable_object->scenes_) {
         for (auto& node : scene.nodes_) {
             calculateBbox(drawable_object, scene.nodes_[0], glm::mat4(1.0f), scene.bbox_min_, scene.bbox_max_);
