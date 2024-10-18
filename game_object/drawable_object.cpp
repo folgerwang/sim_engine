@@ -5,6 +5,7 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
+#include <filesystem>
 
 #include "engine_helper.h"
 #include "game_object/drawable_object.h"
@@ -2042,9 +2043,20 @@ DrawableObject::DrawableObject(
     glm::mat4 location/* = glm::mat4(1.0f)*/)
     : location_(location){
 
+    // Create a path object
+    std::filesystem::path file_path(file_name);
+
+    // Get the file extension
+    auto extension = file_path.extension().string();
+
     auto result = drawable_object_list_.find(file_name);
     if (result == drawable_object_list_.end()) {
-        object_ = loadGltfModel(device, file_name);
+        if (extension == ".fbx") {
+            object_ = loadFbxModel(device, file_name);
+        }
+        else if (extension == ".gltf") {
+            object_ = loadGltfModel(device, file_name);
+        }
 
         updateDescriptorSets(
             device,
