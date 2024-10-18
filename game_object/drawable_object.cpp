@@ -798,7 +798,7 @@ static void setupMesh(
         primitive_info.binding_descs_.push_back(binding);
 
         engine::renderer::VertexInputAttributeDescription attribute = {};
-        attribute.buffer_view = mesh_idx * 2;
+        attribute.buffer_view = mesh_idx * 4;
         attribute.binding = dst_binding;
         attribute.offset = 0;
         attribute.buffer_offset = 0;
@@ -808,13 +808,18 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
+        drawable_object->buffer_views_[mesh_idx * 4].buffer_idx = mesh_idx * 2;
+        drawable_object->buffer_views_[mesh_idx * 4].offset = 0;
+        drawable_object->buffer_views_[mesh_idx * 4].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[mesh_idx * 4].stride = sizeof(VertexStruct);
+
         // normal
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 
-        attribute.buffer_view = mesh_idx * 2;
+        attribute.buffer_view = mesh_idx * 4 + 1;
         attribute.binding = dst_binding;
         attribute.offset = 0;
         attribute.buffer_offset = sizeof(glm::vec3);
@@ -823,13 +828,18 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
+        drawable_object->buffer_views_[mesh_idx * 4 + 1].buffer_idx = mesh_idx * 2;
+        drawable_object->buffer_views_[mesh_idx * 4 + 1].offset = sizeof(glm::vec3);
+        drawable_object->buffer_views_[mesh_idx * 4 + 1].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[mesh_idx * 4 + 1].stride = sizeof(VertexStruct);
+
         // uv
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 
-        attribute.buffer_view = mesh_idx * 2;
+        attribute.buffer_view = mesh_idx * 4 + 2;
         attribute.binding = dst_binding;
         attribute.offset = 0;
         attribute.buffer_offset = 2 * sizeof(glm::vec3);
@@ -838,13 +848,24 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        primitive_info.index_desc_.buffer_view = mesh_idx * 2 + 1;
+        drawable_object->buffer_views_[mesh_idx * 4 + 2].buffer_idx = mesh_idx * 2;
+        drawable_object->buffer_views_[mesh_idx * 4 + 2].offset = sizeof(glm::vec3) * 2;
+        drawable_object->buffer_views_[mesh_idx * 4 + 2].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[mesh_idx * 4 + 2].stride = sizeof(VertexStruct);
+
+        primitive_info.index_desc_.buffer_view = mesh_idx * 4 + 3;
         primitive_info.index_desc_.offset = num_traingles * 3 * (use_16bits_index ? 2 : 4);
         primitive_info.index_desc_.index_type =
             use_16bits_index ?
             renderer::IndexType::UINT16 :
             renderer::IndexType::UINT32;
         primitive_info.index_desc_.index_count = part.num_faces * 3;
+
+        drawable_object->buffer_views_[mesh_idx * 4 + 3].buffer_idx = mesh_idx * 2 + 1;
+        drawable_object->buffer_views_[mesh_idx * 4 + 3].offset = 0;
+        drawable_object->buffer_views_[mesh_idx * 4 + 3].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[mesh_idx * 4 + 3].stride = sizeof(VertexStruct);
+
 
         primitive_info.generateHash();
         num_traingles += part.num_faces;
@@ -857,6 +878,7 @@ static void setupMeshes(
     std::shared_ptr<ego::DrawableData>& drawable_object) {
     drawable_object->meshes_.resize(fbx_scene->meshes.count);
     drawable_object->buffers_.resize(fbx_scene->meshes.count * 2);
+    drawable_object->buffer_views_.resize(fbx_scene->meshes.count * 4);
     for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
         setupMesh(device, fbx_scene, drawable_object, i_mesh);
     }
@@ -2690,6 +2712,52 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     }
 
     ufbx_free_scene(fbx_scene);
+
+    drawable_object->update(device, 0, 0.0f);
+
+    setupRaytracing(drawable_object);
+
+    // init indirect draw buffer.
+    uint32_t num_prims = 0;
+    for (auto& mesh : drawable_object->meshes_) {
+        for (auto& prim : mesh.primitives_) {
+            prim.indirect_draw_cmd_ofs_ =
+                num_prims * sizeof(renderer::DrawIndexedIndirectCommand) + INDIRECT_DRAW_BUF_OFS;
+            num_prims++;
+        }
+    }
+
+    std::vector<uint32_t> indirect_draw_cmd_buffer(
+        sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) * num_prims + 1);
+    auto indirect_draw_buf = reinterpret_cast<renderer::DrawIndexedIndirectCommand*>(indirect_draw_cmd_buffer.data() + 1);
+
+    // clear instance count = 0;
+    indirect_draw_cmd_buffer[0] = 0;
+    uint32_t prim_idx = 0;
+    for (const auto& mesh : drawable_object->meshes_) {
+        for (const auto& prim : mesh.primitives_) {
+            indirect_draw_buf[prim_idx].first_index = 0;
+            indirect_draw_buf[prim_idx].first_instance = 0;
+            indirect_draw_buf[prim_idx].index_count =
+                static_cast<uint32_t>(prim.index_desc_.index_count);
+            indirect_draw_buf[prim_idx].instance_count = 0;
+            indirect_draw_buf[prim_idx].vertex_offset = 0;
+            prim_idx++;
+        }
+    }
+
+    renderer::Helper::createBuffer(
+        device,
+        SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT, STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        0,
+        drawable_object->indirect_draw_cmd_.buffer,
+        drawable_object->indirect_draw_cmd_.memory,
+        std::source_location::current(),
+        indirect_draw_cmd_buffer.size() * sizeof(uint32_t),
+        indirect_draw_cmd_buffer.data());
+
+    drawable_object->num_prims_ = num_prims;
 
     return drawable_object;
 }
