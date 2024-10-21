@@ -19,6 +19,8 @@
 // fbx
 #include "third_parties/fbx/ufbx.h"
 
+static uint32_t num_draw_meshes = 0;
+
 namespace ego = engine::game_object;
 namespace engine {
 
@@ -630,10 +632,13 @@ static void setupMesh(
     std::shared_ptr<ego::DrawableData>& drawable_object,
     const uint32_t& mesh_idx) {
 
+    auto vertex_buffer_idx = mesh_idx * 2;
+    auto indice_buffer_idx = mesh_idx * 2 + 1;
+
     const ufbx_mesh* src_mesh = fbx_scene->meshes[mesh_idx];
     auto& drawable_mesh = drawable_object->meshes_[mesh_idx];
-    auto& vertex_buffer = drawable_object->buffers_[mesh_idx * 2];
-    auto& indice_buffer = drawable_object->buffers_[mesh_idx * 2 + 1];
+    auto& vertex_buffer = drawable_object->buffers_[vertex_buffer_idx];
+    auto& indice_buffer = drawable_object->buffers_[indice_buffer_idx];
 
     assert(src_mesh->num_faces == src_mesh->num_triangles);
     assert(src_mesh->num_indices == src_mesh->vertex_position.indices.count);
@@ -737,6 +742,8 @@ static void setupMesh(
     assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
 
     auto use_16bits_index = src_mesh->num_indices < 65536;
+    auto index_bytes_count = 2;
+    auto index_type = renderer::IndexType::UINT16;
 
     if (use_16bits_index) {
         std::vector<uint16_t> indices_16;
@@ -773,11 +780,16 @@ static void setupMesh(
             std::source_location::current(),
             indices.size(),
             indices.data());
+
+        index_bytes_count = 4;
+        index_type = renderer::IndexType::UINT32;
     }
 
     num_traingles = 0;
     uint32_t buffer_offset = 0;
+    uint32_t indices_buffer_offset = 0;
     uint32_t dst_binding = 0;
+
     for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
         auto part = src_mesh->material_parts[i_part];
         auto mat = src_mesh->materials[part.index];
@@ -792,6 +804,7 @@ static void setupMesh(
         primitive_info.tag_.has_normal = true;
 
         // position
+        auto pos_view_idx = mesh_idx * 4;
         engine::renderer::VertexInputBindingDescription binding = {};
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
@@ -799,7 +812,7 @@ static void setupMesh(
         primitive_info.binding_descs_.push_back(binding);
 
         engine::renderer::VertexInputAttributeDescription attribute = {};
-        attribute.buffer_view = mesh_idx * 4;
+        attribute.buffer_view = pos_view_idx;
         attribute.binding = dst_binding;
         attribute.offset = 0;
         attribute.buffer_offset = 0;
@@ -809,18 +822,19 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        drawable_object->buffer_views_[mesh_idx * 4].buffer_idx = mesh_idx * 2;
-        drawable_object->buffer_views_[mesh_idx * 4].offset = 0;
-        drawable_object->buffer_views_[mesh_idx * 4].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[mesh_idx * 4].stride = sizeof(VertexStruct);
+        drawable_object->buffer_views_[pos_view_idx].buffer_idx = vertex_buffer_idx;
+        drawable_object->buffer_views_[pos_view_idx].offset = 0;
+        drawable_object->buffer_views_[pos_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[pos_view_idx].stride = sizeof(VertexStruct);
 
         // normal
+        auto normal_view_idx = mesh_idx * 4 + 1;
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 
-        attribute.buffer_view = mesh_idx * 4 + 1;
+        attribute.buffer_view = normal_view_idx;
         attribute.binding = dst_binding;
         attribute.offset = 0;
         attribute.buffer_offset = sizeof(glm::vec3);
@@ -829,18 +843,19 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        drawable_object->buffer_views_[mesh_idx * 4 + 1].buffer_idx = mesh_idx * 2;
-        drawable_object->buffer_views_[mesh_idx * 4 + 1].offset = sizeof(glm::vec3);
-        drawable_object->buffer_views_[mesh_idx * 4 + 1].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[mesh_idx * 4 + 1].stride = sizeof(VertexStruct);
+        drawable_object->buffer_views_[normal_view_idx].buffer_idx = vertex_buffer_idx;
+        drawable_object->buffer_views_[normal_view_idx].offset = sizeof(glm::vec3);
+        drawable_object->buffer_views_[normal_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[normal_view_idx].stride = sizeof(VertexStruct);
 
         // uv
+        auto uv_view_idx = mesh_idx * 4 + 2;
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 
-        attribute.buffer_view = mesh_idx * 4 + 2;
+        attribute.buffer_view = uv_view_idx;
         attribute.binding = dst_binding;
         attribute.offset = 0;
         attribute.buffer_offset = 2 * sizeof(glm::vec3);
@@ -849,27 +864,27 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        drawable_object->buffer_views_[mesh_idx * 4 + 2].buffer_idx = mesh_idx * 2;
-        drawable_object->buffer_views_[mesh_idx * 4 + 2].offset = sizeof(glm::vec3) * 2;
-        drawable_object->buffer_views_[mesh_idx * 4 + 2].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[mesh_idx * 4 + 2].stride = sizeof(VertexStruct);
+        drawable_object->buffer_views_[uv_view_idx].buffer_idx = vertex_buffer_idx;
+        drawable_object->buffer_views_[uv_view_idx].offset = sizeof(glm::vec3) * 2;
+        drawable_object->buffer_views_[uv_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
+        drawable_object->buffer_views_[uv_view_idx].stride = sizeof(VertexStruct);
 
-        primitive_info.index_desc_.buffer_view = mesh_idx * 4 + 3;
-        primitive_info.index_desc_.offset = num_traingles * 3 * (use_16bits_index ? 2 : 4);
-        primitive_info.index_desc_.index_type =
-            use_16bits_index ?
-            renderer::IndexType::UINT16 :
-            renderer::IndexType::UINT32;
+        // indices
+        auto indice_view_idx = mesh_idx * 4 + 3;
+        primitive_info.index_desc_.buffer_view = indice_view_idx;
+        primitive_info.index_desc_.offset = indices_buffer_offset;
+        primitive_info.index_desc_.index_type = index_type;
         primitive_info.index_desc_.index_count = part.num_faces * 3;
 
-        drawable_object->buffer_views_[mesh_idx * 4 + 3].buffer_idx = mesh_idx * 2 + 1;
-        drawable_object->buffer_views_[mesh_idx * 4 + 3].offset = 0;
-        drawable_object->buffer_views_[mesh_idx * 4 + 3].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[mesh_idx * 4 + 3].stride = sizeof(VertexStruct);
-
+        drawable_object->buffer_views_[indice_view_idx].buffer_idx = indice_buffer_idx;
+        drawable_object->buffer_views_[indice_view_idx].offset = 0;
+        drawable_object->buffer_views_[indice_view_idx].range = src_mesh->num_indices * index_bytes_count;
+        drawable_object->buffer_views_[indice_view_idx].stride = index_bytes_count;
 
         primitive_info.generateHash();
         num_traingles += part.num_faces;
+        indices_buffer_offset += (uint32_t)(part.num_faces * 3 * index_bytes_count);
+        assert(indices_buffer_offset <= src_mesh->num_indices * index_bytes_count);
     }
 }
 
@@ -1403,6 +1418,7 @@ static void drawMesh(
     const ego::MeshInfo& mesh_info,
     const ego::SkinInfo* skin_info,
     const glsl::ModelParams& model_params) {
+
     for (const auto& prim : mesh_info.primitives_) {
         const auto& attrib_list = prim.attribute_descs_;
 
@@ -1414,12 +1430,16 @@ static void drawMesh(
             offsets[i_attrib] = attrib_list[i_attrib].buffer_offset;
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
-        const auto& index_buffer_view = drawable_object->buffer_views_[prim.index_desc_.buffer_view];
-        cmd_buf->bindIndexBuffer(drawable_object->buffers_[index_buffer_view.buffer_idx].buffer,
+
+        const auto& index_buffer_view =
+            drawable_object->buffer_views_[prim.index_desc_.buffer_view];
+
+        cmd_buf->bindIndexBuffer(
+            drawable_object->buffers_[index_buffer_view.buffer_idx].buffer,
             prim.index_desc_.offset + index_buffer_view.offset,
             prim.index_desc_.index_type);
 
-        renderer::DescriptorSetList desc_sets = desc_set_list;
+/*        renderer::DescriptorSetList desc_sets = desc_set_list;
         if (prim.material_idx_ >= 0) {
             const auto& material = drawable_object->materials_[prim.material_idx_];
             desc_sets.push_back(material.desc_set_);
@@ -1447,7 +1467,7 @@ static void drawMesh(
         //cmd_buf->drawIndexed(static_cast<uint32_t>(prim.index_desc_.index_count));
         cmd_buf->drawIndexedIndirect(
             drawable_object->indirect_draw_cmd_,
-            prim.indirect_draw_cmd_ofs_);
+            prim.indirect_draw_cmd_ofs_);*/
     }
 }
 
@@ -1462,13 +1482,18 @@ static void drawNodes(
         if (node.mesh_idx_ >= 0) {
             glsl::ModelParams model_params{};
             model_params.model_mat = node.cached_matrix_;
-            drawMesh(cmd_buf,
-                drawable_object,
-                drawable_pipeline_layout,
-                desc_set_list,
-                drawable_object->meshes_[node.mesh_idx_],
-                node.skin_idx_ > -1 ? &drawable_object->skins_[node.skin_idx_] : nullptr,
-                model_params);
+
+            if (num_draw_meshes < 1) {
+                drawMesh(cmd_buf,
+                    drawable_object,
+                    drawable_pipeline_layout,
+                    desc_set_list,
+                    drawable_object->meshes_[node.mesh_idx_],
+                    node.skin_idx_ > -1 ? &drawable_object->skins_[node.skin_idx_] : nullptr,
+                    model_params);
+            }
+
+            num_draw_meshes++;
         }
 
         for (auto& child_idx : node.child_idx_) {
@@ -2575,6 +2600,8 @@ void DrawableObject::draw(
     buffers[0] = object_->instance_buffer_.buffer;
     offsets[0] = 0;
     cmd_buf->bindVertexBuffers(VINPUT_INSTANCE_BINDING_POINT, buffers, offsets);
+
+    num_draw_meshes = 0;
 
     int32_t root_node = object_->default_scene_ >= 0 ? object_->default_scene_ : 0;
     for (auto node_idx : object_->scenes_[root_node].nodes_) {
