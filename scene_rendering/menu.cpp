@@ -203,7 +203,8 @@ bool Menu::draw(
     ImGui::EndChild();
     ImGui::End();
 
-#if 1
+// turn off ray tracing view window.
+#if 0
     // Define the rectangle's position and size
 
      // Set up the size for the first child window
