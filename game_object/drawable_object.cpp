@@ -727,16 +727,18 @@ static void setupMesh(
 
     renderer::Helper::createBuffer(
         device,
-        SET_2_FLAG_BITS(
+        SET_4_FLAG_BITS(
             BufferUsage,
             VERTEX_BUFFER_BIT,
-            STORAGE_BUFFER_BIT),
+            STORAGE_BUFFER_BIT,
+            SHADER_DEVICE_ADDRESS_BIT,
+            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
         SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
         SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
         vertex_buffer.buffer,
         vertex_buffer.memory,
         std::source_location::current(),
-        drawable_vertices.size(),
+        drawable_vertices.size() * sizeof(VertexStruct),
         drawable_vertices.data());
 
     assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
@@ -747,38 +749,42 @@ static void setupMesh(
 
     if (use_16bits_index) {
         std::vector<uint16_t> indices_16;
-        indices_16.reserve(src_mesh->num_indices);
-        for (int i = 0; i < src_mesh->num_indices; i++) {
-            indices_16.push_back(static_cast<uint16_t>(indices[i]));
+        indices_16.resize(src_mesh->num_indices);
+        for (int i_idx = 0; i_idx < src_mesh->num_indices; i_idx++) {
+            indices_16[i_idx] = static_cast<uint16_t>(indices[i_idx]);
         }
 
         renderer::Helper::createBuffer(
             device,
-            SET_2_FLAG_BITS(
+            SET_4_FLAG_BITS(
                 BufferUsage,
                 INDEX_BUFFER_BIT,
-                STORAGE_BUFFER_BIT),
+                STORAGE_BUFFER_BIT,
+                SHADER_DEVICE_ADDRESS_BIT,
+                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
             indice_buffer.buffer,
             indice_buffer.memory,
             std::source_location::current(),
-            indices_16.size(),
+            indices_16.size() * 2,
             indices_16.data());
     }
     else {
         renderer::Helper::createBuffer(
             device,
-            SET_2_FLAG_BITS(
+            SET_4_FLAG_BITS(
                 BufferUsage,
                 INDEX_BUFFER_BIT,
-                STORAGE_BUFFER_BIT),
+                STORAGE_BUFFER_BIT,
+                SHADER_DEVICE_ADDRESS_BIT,
+                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
             indice_buffer.buffer,
             indice_buffer.memory,
             std::source_location::current(),
-            indices.size(),
+            indices.size() * 4,
             indices.data());
 
         index_bytes_count = 4;
@@ -789,6 +795,29 @@ static void setupMesh(
     uint32_t buffer_offset = 0;
     uint32_t indices_buffer_offset = 0;
     uint32_t dst_binding = 0;
+    auto pos_view_idx = mesh_idx * 4;
+    drawable_object->buffer_views_[pos_view_idx].buffer_idx = vertex_buffer_idx;
+    drawable_object->buffer_views_[pos_view_idx].offset = 0;
+    drawable_object->buffer_views_[pos_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
+    drawable_object->buffer_views_[pos_view_idx].stride = sizeof(VertexStruct);
+
+    auto normal_view_idx = mesh_idx * 4 + 1;
+    drawable_object->buffer_views_[normal_view_idx].buffer_idx = vertex_buffer_idx;
+    drawable_object->buffer_views_[normal_view_idx].offset = sizeof(glm::vec3);
+    drawable_object->buffer_views_[normal_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
+    drawable_object->buffer_views_[normal_view_idx].stride = sizeof(VertexStruct);
+
+    auto uv_view_idx = mesh_idx * 4 + 2;
+    drawable_object->buffer_views_[uv_view_idx].buffer_idx = vertex_buffer_idx;
+    drawable_object->buffer_views_[uv_view_idx].offset = sizeof(glm::vec3) * 2;
+    drawable_object->buffer_views_[uv_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
+    drawable_object->buffer_views_[uv_view_idx].stride = sizeof(VertexStruct);
+
+    auto indice_view_idx = mesh_idx * 4 + 3;
+    drawable_object->buffer_views_[indice_view_idx].buffer_idx = indice_buffer_idx;
+    drawable_object->buffer_views_[indice_view_idx].offset = 0;
+    drawable_object->buffer_views_[indice_view_idx].range = src_mesh->num_indices * index_bytes_count;
+    drawable_object->buffer_views_[indice_view_idx].stride = index_bytes_count;
 
     for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
         auto part = src_mesh->material_parts[i_part];
@@ -804,7 +833,6 @@ static void setupMesh(
         primitive_info.tag_.has_normal = true;
 
         // position
-        auto pos_view_idx = mesh_idx * 4;
         engine::renderer::VertexInputBindingDescription binding = {};
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
@@ -822,13 +850,7 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        drawable_object->buffer_views_[pos_view_idx].buffer_idx = vertex_buffer_idx;
-        drawable_object->buffer_views_[pos_view_idx].offset = 0;
-        drawable_object->buffer_views_[pos_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[pos_view_idx].stride = sizeof(VertexStruct);
-
         // normal
-        auto normal_view_idx = mesh_idx * 4 + 1;
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
@@ -843,13 +865,7 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        drawable_object->buffer_views_[normal_view_idx].buffer_idx = vertex_buffer_idx;
-        drawable_object->buffer_views_[normal_view_idx].offset = sizeof(glm::vec3);
-        drawable_object->buffer_views_[normal_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[normal_view_idx].stride = sizeof(VertexStruct);
-
         // uv
-        auto uv_view_idx = mesh_idx * 4 + 2;
         binding.binding = dst_binding;
         binding.stride = sizeof(VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
@@ -864,26 +880,16 @@ static void setupMesh(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        drawable_object->buffer_views_[uv_view_idx].buffer_idx = vertex_buffer_idx;
-        drawable_object->buffer_views_[uv_view_idx].offset = sizeof(glm::vec3) * 2;
-        drawable_object->buffer_views_[uv_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
-        drawable_object->buffer_views_[uv_view_idx].stride = sizeof(VertexStruct);
-
         // indices
-        auto indice_view_idx = mesh_idx * 4 + 3;
+        auto index_count = part.num_faces * 3;
         primitive_info.index_desc_.buffer_view = indice_view_idx;
         primitive_info.index_desc_.offset = indices_buffer_offset;
         primitive_info.index_desc_.index_type = index_type;
-        primitive_info.index_desc_.index_count = part.num_faces * 3;
-
-        drawable_object->buffer_views_[indice_view_idx].buffer_idx = indice_buffer_idx;
-        drawable_object->buffer_views_[indice_view_idx].offset = 0;
-        drawable_object->buffer_views_[indice_view_idx].range = src_mesh->num_indices * index_bytes_count;
-        drawable_object->buffer_views_[indice_view_idx].stride = index_bytes_count;
+        primitive_info.index_desc_.index_count = index_count;
 
         primitive_info.generateHash();
         num_traingles += part.num_faces;
-        indices_buffer_offset += (uint32_t)(part.num_faces * 3 * index_bytes_count);
+        indices_buffer_offset += (uint32_t)(index_count * index_bytes_count);
         assert(indices_buffer_offset <= src_mesh->num_indices * index_bytes_count);
     }
 }
@@ -1439,7 +1445,7 @@ static void drawMesh(
             prim.index_desc_.offset + index_buffer_view.offset,
             prim.index_desc_.index_type);
 
-/*        renderer::DescriptorSetList desc_sets = desc_set_list;
+        renderer::DescriptorSetList desc_sets = desc_set_list;
         if (prim.material_idx_ >= 0) {
             const auto& material = drawable_object->materials_[prim.material_idx_];
             desc_sets.push_back(material.desc_set_);
@@ -1467,7 +1473,7 @@ static void drawMesh(
         //cmd_buf->drawIndexed(static_cast<uint32_t>(prim.index_desc_.index_count));
         cmd_buf->drawIndexedIndirect(
             drawable_object->indirect_draw_cmd_,
-            prim.indirect_draw_cmd_ofs_);*/
+            prim.indirect_draw_cmd_ofs_);
     }
 }
 
@@ -1483,15 +1489,13 @@ static void drawNodes(
             glsl::ModelParams model_params{};
             model_params.model_mat = node.cached_matrix_;
 
-            if (num_draw_meshes < 1) {
-                drawMesh(cmd_buf,
-                    drawable_object,
-                    drawable_pipeline_layout,
-                    desc_set_list,
-                    drawable_object->meshes_[node.mesh_idx_],
-                    node.skin_idx_ > -1 ? &drawable_object->skins_[node.skin_idx_] : nullptr,
-                    model_params);
-            }
+            drawMesh(cmd_buf,
+                drawable_object,
+                drawable_pipeline_layout,
+                desc_set_list,
+                drawable_object->meshes_[node.mesh_idx_],
+                node.skin_idx_ > -1 ? &drawable_object->skins_[node.skin_idx_] : nullptr,
+                model_params);
 
             num_draw_meshes++;
         }
