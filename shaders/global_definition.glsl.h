@@ -699,7 +699,7 @@ struct GameObjectInfo {
     uint            pad[2];
 };
 
-struct GameCameraParams {
+struct ViewCameraParams {
     vec2            world_min;
     vec2            inv_world_range;
     vec3            init_camera_pos;
@@ -725,7 +725,7 @@ struct GameCameraParams {
 };
 
 // could be updated from frame to frame.
-struct GameCameraInfo {
+struct ViewCameraInfo {
     mat4            view;
     mat4            proj;
     mat4            view_proj;

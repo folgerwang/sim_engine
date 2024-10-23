@@ -36,6 +36,7 @@
     <ClCompile Include="game_object\shape_base.cpp" />
     <ClCompile Include="game_object\sphere.cpp" />
     <ClCompile Include="game_object\terrain.cpp" />
+    <ClCompile Include="game_object\view_object.cpp" />
     <ClCompile Include="ray_tracing\raytracing_callable.cpp" />
     <ClCompile Include="ray_tracing\raytracing_shadow.cpp" />
     <ClCompile Include="renderer\renderer.cpp" />
@@ -72,6 +73,7 @@
     <ClInclude Include="game_object\shape_base.h" />
     <ClInclude Include="game_object\sphere.h" />
     <ClInclude Include="game_object\terrain.h" />
+    <ClInclude Include="game_object\view_object.h" />
     <ClInclude Include="ray_tracing\raytracing_base.h" />
     <ClInclude Include="ray_tracing\raytracing_callable.h" />
     <ClInclude Include="ray_tracing\raytracing_shadow.h" />

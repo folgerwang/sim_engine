@@ -171,6 +171,9 @@
     <ClCompile Include="third_parties\fbx\ufbx.c">
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\view_object.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -339,6 +342,9 @@
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
     <ClInclude Include="third_parties\fbx\ufbx.h">
+      <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\view_object.h">
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>

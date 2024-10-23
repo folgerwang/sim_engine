@@ -1705,7 +1705,7 @@ renderer::WriteDescriptorList addGameObjectsInfoBuffer(
     const std::shared_ptr<renderer::DescriptorSet>& description_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::BufferInfo& game_object_buffer,
-    const renderer::BufferInfo& game_camera_buffer,
+//    const renderer::BufferInfo& game_camera_buffer,
     const renderer::TextureInfo& rock_layer,
     const renderer::TextureInfo& soil_water_layer,
     const renderer::TextureInfo& water_flow,
@@ -1721,13 +1721,13 @@ renderer::WriteDescriptorList addGameObjectsInfoBuffer(
         game_object_buffer.buffer,
         game_object_buffer.buffer->getSize());
 
-    renderer::Helper::addOneBuffer(
+/*    renderer::Helper::addOneBuffer(
         descriptor_writes,
         description_set,
         engine::renderer::DescriptorType::STORAGE_BUFFER,
         CAMERA_OBJECT_BUFFER_INDEX,
         game_camera_buffer.buffer,
-        game_camera_buffer.buffer->getSize());
+        game_camera_buffer.buffer->getSize());*/
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -2167,7 +2167,7 @@ void DrawableObject::createGameObjectUpdateDescSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
+//    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
     const renderer::TextureInfo& rock_layer,
     const renderer::TextureInfo& soil_water_layer_0,
     const renderer::TextureInfo& soil_water_layer_1,
@@ -2185,7 +2185,7 @@ void DrawableObject::createGameObjectUpdateDescSet(
             update_game_objects_buffer_desc_set_[soil_water],
             texture_sampler,
             *game_objects_buffer_,
-            *game_camera_buffer,
+//            *game_camera_buffer,
             rock_layer,
             soil_water == 0 ? soil_water_layer_0 : soil_water_layer_1,
             water_flow,
@@ -2215,7 +2215,7 @@ void DrawableObject::initStaticMembers(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
+//    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
     const renderer::TextureInfo& rock_layer,
     const renderer::TextureInfo& soil_water_layer_0,
     const renderer::TextureInfo& soil_water_layer_1,
@@ -2255,7 +2255,7 @@ void DrawableObject::initStaticMembers(
         device,
         descriptor_pool,
         texture_sampler,
-        game_camera_buffer,
+//        game_camera_buffer,
         rock_layer,
         soil_water_layer_0,
         soil_water_layer_1,
@@ -2414,7 +2414,7 @@ void DrawableObject::generateDescriptorSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
+//    const std::shared_ptr<renderer::BufferInfo>& game_camera_buffer,
     const renderer::TextureInfo& thin_film_lut_tex,
     const renderer::TextureInfo& rock_layer,
     const renderer::TextureInfo& soil_water_layer_0,
@@ -2444,7 +2444,7 @@ void DrawableObject::generateDescriptorSet(
         device,
         descriptor_pool,
         texture_sampler,
-        game_camera_buffer,
+//        game_camera_buffer,
         rock_layer,
         soil_water_layer_0,
         soil_water_layer_1,
