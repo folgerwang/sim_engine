@@ -46,7 +46,12 @@ void ViewObject::updateCamera(
 
 void ViewObject::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const renderer::DescriptorSetList& desc_set_list) {
+    const renderer::DescriptorSetList& desc_set_list,
+    int dbuf_idx,
+    float delta_t,
+    float cur_time) {
+
+    // Draw all visible tiles
     for (auto& tile : visible_tiles_) {
         tile->draw(
             cmd_buf,
@@ -55,13 +60,13 @@ void ViewObject::draw(
             dbuf_idx,
             delta_t,
             cur_time,
-            is_base_pass);
+            base_pass_);
 
-        if (is_base_pass && render_grass_) {
+        if (base_pass_ && render_grass_) {
             tile->drawGrass(
                 cmd_buf,
                 desc_set_list,
-                camera_pos,
+                camera_pos_,
                 buffer_size_,
                 dbuf_idx,
                 delta_t,

@@ -19,6 +19,7 @@ class ViewObject {
     er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
     glm::uvec2 buffer_size_ = glm::uvec2(1280, 720);
+    glm::vec3 camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
 
     er::TextureInfo hdr_color_buffer_;
     er::TextureInfo hdr_color_buffer_copy_;
@@ -26,6 +27,7 @@ class ViewObject {
     er::TextureInfo depth_buffer_copy_;
 
     bool render_grass_ = false;
+    bool base_pass_ = false;
 
 public:
     ViewObject(
@@ -44,7 +46,10 @@ public:
 
     void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list);
+        const renderer::DescriptorSetList& desc_set_list,
+        int dbuf_idx,
+        float delta_t,
+        float cur_time);
 
     void destroy(
         const std::shared_ptr<renderer::Device>& device);
