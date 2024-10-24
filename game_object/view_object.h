@@ -1,6 +1,7 @@
 #pragma once
 #include "renderer/renderer.h"
 #include "game_object/camera.h"
+#include "game_object/terrain.h"
 #include "patch.h"
 
 namespace er = engine::renderer;
@@ -13,9 +14,22 @@ class ViewObject {
     std::shared_ptr<ego::ViewCamera> view_camera_;
     const std::shared_ptr<renderer::Device>& device_;
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
+    std::vector<std::shared_ptr<TileObject>> visible_tiles_;
+
+    er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
+    er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
+    glm::uvec2 buffer_size_ = glm::uvec2(1280, 720);
+
+    er::TextureInfo hdr_color_buffer_;
+    er::TextureInfo hdr_color_buffer_copy_;
+    er::TextureInfo depth_buffer_;
+    er::TextureInfo depth_buffer_copy_;
+
+    bool render_grass_ = false;
 
 public:
-    ViewObject(const std::shared_ptr<renderer::Device>& device,
+    ViewObject(
+        const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
 
     void createCameraDescSetWithTerrain(
@@ -28,9 +42,12 @@ public:
     void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);
 
-    void draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+    void draw(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_set_list);
 
-    void destroy(const std::shared_ptr<renderer::Device>& device);
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device);
 };
 
 } // game_object

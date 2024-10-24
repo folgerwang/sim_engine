@@ -44,7 +44,30 @@ void ViewObject::updateCamera(
 
 }
 
-void ViewObject::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
+void ViewObject::draw(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_set_list) {
+    for (auto& tile : visible_tiles_) {
+        tile->draw(
+            cmd_buf,
+            desc_set_list,
+            buffer_size_,
+            dbuf_idx,
+            delta_t,
+            cur_time,
+            is_base_pass);
+
+        if (is_base_pass && render_grass_) {
+            tile->drawGrass(
+                cmd_buf,
+                desc_set_list,
+                camera_pos,
+                buffer_size_,
+                dbuf_idx,
+                delta_t,
+                cur_time);
+        }
+    }
 }
 
 void ViewObject::destroy(const std::shared_ptr<renderer::Device>& device) {
