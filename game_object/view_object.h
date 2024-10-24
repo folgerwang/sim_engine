@@ -2,6 +2,7 @@
 #include "renderer/renderer.h"
 #include "game_object/camera.h"
 #include "game_object/terrain.h"
+#include "game_object/drawable_object.h"
 #include "patch.h"
 
 namespace er = engine::renderer;
@@ -15,6 +16,7 @@ class ViewObject {
     const std::shared_ptr<renderer::Device>& device_;
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
     std::vector<std::shared_ptr<TileObject>> visible_tiles_;
+    std::vector<std::shared_ptr<ego::DrawableObject>> visible_object_;
 
     er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
