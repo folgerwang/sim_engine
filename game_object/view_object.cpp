@@ -42,8 +42,15 @@ glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
 
 ViewObject::ViewObject(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
-    device_(device), descriptor_pool_(descriptor_pool) {
+    const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<er::TextureInfo>& color_buffer,
+    const std::shared_ptr<er::TextureInfo>& depth_buffer) :
+        device_(device),
+        descriptor_pool_(descriptor_pool),
+        color_buffer_(color_buffer),
+        depth_buffer_(depth_buffer) {
+
+    AllocRenderBuffers();
 
     view_camera_params_.init_camera_pos = glm::vec3(0, 5.0f, 0);
     view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
@@ -76,9 +83,87 @@ ViewObject::ViewObject(
     device_->updateDescriptorSets(buffer_descs);
 }
 
+void ViewObject::AllocRenderBuffers() {
+    if (color_buffer_ == nullptr) {
+        color_buffer_ = std::make_shared<er::TextureInfo>();
+        er::Helper::create2DTextureImage(
+            device_,
+            hdr_format_,
+            buffer_size_,
+            *color_buffer_,
+            SET_4_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT, COLOR_ATTACHMENT_BIT, TRANSFER_SRC_BIT),
+            er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            std::source_location::current());
+    }
+
+    if (make_color_buffer_copy_) {
+        color_buffer_copy_ = std::make_shared<er::TextureInfo>();
+        er::Helper::create2DTextureImage(
+            device_,
+            hdr_format_,
+            buffer_size_,
+            *color_buffer_copy_,
+            SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, TRANSFER_DST_BIT),
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
+    }
+
+    if (depth_buffer_ == nullptr) {
+        depth_buffer_ = std::make_shared<er::TextureInfo>();
+        er::Helper::createDepthResources(
+            device_,
+            depth_format_,
+            buffer_size_,
+            *depth_buffer_,
+            std::source_location::current());
+    }
+
+    if (make_depth_buffer_copy_) {
+        depth_buffer_copy_ = std::make_shared<er::TextureInfo>();
+        er::Helper::create2DTextureImage(
+            device_,
+            er::Format::D32_SFLOAT,
+            buffer_size_,
+            *depth_buffer_copy_,
+            SET_3_FLAG_BITS(ImageUsage, SAMPLED_BIT, DEPTH_STENCIL_ATTACHMENT_BIT, TRANSFER_DST_BIT),
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            std::source_location::current());
+    }
+}
+
 void ViewObject::updateCamera(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
 
+}
+
+void ViewObject::resize(const glm::uvec2& new_buffer_size) {
+    if (buffer_size_ == new_buffer_size) {
+        return;
+    }
+
+    buffer_size_ = new_buffer_size;
+
+    if (color_buffer_) {
+        color_buffer_->destroy(device_);
+        color_buffer_.reset();
+    }
+
+    if (color_buffer_copy_) {
+        color_buffer_copy_->destroy(device_);
+        color_buffer_copy_.reset();
+    }
+
+    if (depth_buffer_) {
+        depth_buffer_->destroy(device_);
+        depth_buffer_.reset();
+    }
+
+    if (depth_buffer_copy_) {
+        depth_buffer_copy_->destroy(device_);
+        depth_buffer_copy_.reset();
+    }
+
+    AllocRenderBuffers();
 }
 
 void ViewObject::draw(

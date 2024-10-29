@@ -26,19 +26,29 @@ protected:
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
     glm::uvec2 buffer_size_ = glm::uvec2(1280, 720);
     glm::vec3 camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
+    std::vector<er::ClearValue> clear_values_;
 
-    er::TextureInfo hdr_color_buffer_;
-    er::TextureInfo hdr_color_buffer_copy_;
-    er::TextureInfo depth_buffer_;
-    er::TextureInfo depth_buffer_copy_;
+    bool make_color_buffer_copy_ = false;
+    bool make_depth_buffer_copy_ = false;
+
+    std::shared_ptr<er::TextureInfo> color_buffer_;
+    std::shared_ptr<er::TextureInfo> color_buffer_copy_;
+    std::shared_ptr<er::TextureInfo> depth_buffer_;
+    std::shared_ptr<er::TextureInfo> depth_buffer_copy_;
 
 public:
     ViewObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<er::TextureInfo>& color_buffer,
+        const std::shared_ptr<er::TextureInfo>& depth_buffer);
+
+    void AllocRenderBuffers();
 
     void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+
+    void resize(const glm::uvec2& new_buffer_size);
 
     void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,

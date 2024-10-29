@@ -13,6 +13,11 @@ namespace engine {
 namespace scene_rendering {
 
 class TerrainSceneView : public ego::ViewObject {
+    std::shared_ptr<er::Framebuffer> frame_buffer_;
+    std::shared_ptr<er::Framebuffer> blend_frame_buffer_;
+    std::shared_ptr<er::RenderPass> render_pass_;
+    std::shared_ptr<er::RenderPass> blend_render_pass_;
+
     std::vector<std::shared_ptr<ego::TileObject>> visible_tiles_;
     std::vector<std::shared_ptr<ego::DrawableObject>> visible_object_;
     std::vector<std::shared_ptr<ego::DrawableObject>> drawable_objects_;
@@ -24,7 +29,9 @@ class TerrainSceneView : public ego::ViewObject {
 public:
     TerrainSceneView(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
+        const std::shared_ptr<er::TextureInfo>& depth_buffer/* = nullptr*/);
 
     void createCameraDescSetWithTerrain(
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
