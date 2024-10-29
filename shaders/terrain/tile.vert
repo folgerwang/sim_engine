@@ -3,7 +3,7 @@
 #include "..\global_definition.glsl.h"
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 layout(push_constant) uniform TileUniformBufferObject {

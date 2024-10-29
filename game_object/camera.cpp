@@ -158,12 +158,7 @@ void ViewCamera::initViewCameraBuffer(
 void ViewCamera::initStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const renderer::TextureInfo& rock_layer,
-    const renderer::TextureInfo& soil_water_layer_0,
-    const renderer::TextureInfo& soil_water_layer_1,
-    const renderer::BufferInfo& game_objects_buffer) {
+    const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
 
     if (update_view_camera_desc_set_layout_ == nullptr) {
         update_view_camera_desc_set_layout_ =

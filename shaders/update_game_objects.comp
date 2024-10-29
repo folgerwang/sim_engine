@@ -13,7 +13,7 @@ layout(std430, set = 0, binding = GAME_OBJECTS_BUFFER_INDEX) buffer GameObjectsB
 };
 
 layout(std430, set = 0, binding = CAMERA_OBJECT_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
@@ -106,7 +106,7 @@ void main()
     vec3 contact_normal = terrainNormal(info.position.xz, 0.00025f, 2000.0f);
 
     if (info.status == 0 || params.frame_count == 0) {
-#if kNumGltfInstance == 1
+#if kNumDrawableInstance == 1
         info.position = camera_info.position;
 #else
         info.position = camera_info.position +

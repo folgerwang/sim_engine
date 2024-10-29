@@ -11,7 +11,7 @@ layout(push_constant) uniform PrtLightUniformBufferObject {
 };
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 #ifndef NO_MTL

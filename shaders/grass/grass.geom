@@ -11,7 +11,7 @@ layout(location = 0) in VsPsData {
 } in_data[];
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 void main() {

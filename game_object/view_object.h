@@ -11,12 +11,16 @@ namespace ego = engine::game_object;
 namespace engine {
 namespace game_object {
 
+extern glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch);
+
 class ViewObject {
+protected:
+    glsl::ViewCameraParams view_camera_params_;
     std::shared_ptr<ego::ViewCamera> view_camera_;
     const std::shared_ptr<renderer::Device>& device_;
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
-    std::vector<std::shared_ptr<TileObject>> visible_tiles_;
-    std::vector<std::shared_ptr<ego::DrawableObject>> visible_object_;
+    std::shared_ptr<er::DescriptorSet> view_camera_desc_set_;
+    std::shared_ptr<er::DescriptorSetLayout> view_camera_desc_set_layout_;
 
     er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
@@ -28,20 +32,10 @@ class ViewObject {
     er::TextureInfo depth_buffer_;
     er::TextureInfo depth_buffer_copy_;
 
-    bool render_grass_ = false;
-    bool base_pass_ = false;
-
 public:
     ViewObject(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
-
-    void createCameraDescSetWithTerrain(
-        const std::shared_ptr<renderer::Sampler>& texture_sampler,
-        const renderer::TextureInfo& rock_layer,
-        const renderer::TextureInfo& soil_water_layer_0,
-        const renderer::TextureInfo& soil_water_layer_1,
-        const renderer::BufferInfo& game_objects_buffer);
 
     void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);
@@ -52,6 +46,20 @@ public:
         int dbuf_idx,
         float delta_t,
         float cur_time);
+
+    std::shared_ptr<er::DescriptorSetLayout>
+        getViewCameraDescriptorSetLayout() {
+        return view_camera_desc_set_layout_;
+    }
+
+    std::shared_ptr<er::DescriptorSet>
+        getViewCameraDescriptorSet() {
+        return view_camera_desc_set_;
+    }
+
+    std::shared_ptr<er::BufferInfo> getViewCameraBuffer() {
+        return view_camera_->getViewCameraBuffer();
+    }
 
     void destroy(
         const std::shared_ptr<renderer::Device>& device);

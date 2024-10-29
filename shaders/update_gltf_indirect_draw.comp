@@ -15,7 +15,7 @@ void main()
 {
   // get index in global work group i.e x,y position
   uint prim_index = gl_GlobalInvocationID.x;
-  uint num_instances = kNumGltfInstance;
+  uint num_instances = kNumDrawableInstance;
   if (prim_index < num_prims) {
     items[prim_index * 5 + 2] = num_instances;
   }

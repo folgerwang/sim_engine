@@ -8,7 +8,7 @@ layout(push_constant) uniform DebugDrawUniformBufferObject {
 };
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 layout(location = 0) out VsPsData {

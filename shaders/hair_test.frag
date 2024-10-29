@@ -7,7 +7,7 @@
 #include "noise.glsl.h"
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D src_color_img;

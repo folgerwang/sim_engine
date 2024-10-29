@@ -5,11 +5,11 @@
 #include "functions.glsl.h"
 
 layout(push_constant) uniform CameraUniformBufferObject {
-    GameCameraParams params;
+    ViewCameraParams params;
 };
 
 layout(std430, set = 0, binding = CAMERA_OBJECT_BUFFER_INDEX) buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 layout(std430, set = 0, binding = GAME_OBJECTS_BUFFER_INDEX) readonly buffer GameObjectsBuffer {
@@ -124,7 +124,7 @@ void main()
         normalize(cross(camera_info.facing_dir, camera_info.up_vector));
 
     vec3 eye_pos, target_pos, up_dir;
-    if (params.num_game_objs > 0 && params.game_obj_idx >= 0 && params.game_obj_idx < kNumGltfInstance) {
+    if (params.num_game_objs > 0 && params.game_obj_idx >= 0 && params.game_obj_idx < kNumDrawableInstance) {
         UnpackedGameObjectInfo game_obj_info = unpackGameObjectInfo(items[params.game_obj_idx]);
 
         vec2 world_map_uv = (game_obj_info.position.xz - params.world_min) * params.inv_world_range;

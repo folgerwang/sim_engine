@@ -7,7 +7,7 @@ layout(push_constant) uniform ModelUniformBufferObject {
 };
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
-	GameCameraInfo camera_info;
+	ViewCameraInfo camera_info;
 };
 
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
