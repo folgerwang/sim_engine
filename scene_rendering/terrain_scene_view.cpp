@@ -13,13 +13,20 @@ namespace scene_rendering {
 TerrainSceneView::TerrainSceneView(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<er::TextureInfo>& color_buffer = nullptr,
     const std::shared_ptr<er::TextureInfo>& depth_buffer = nullptr) :
     ViewObject(device, descriptor_pool, color_buffer, depth_buffer) {
 
     clear_values_.resize(2);
-    clear_values_[0].color = { 50.0f / 255.0f, 50.0f / 255.0f, 50.0f / 255.0f, 1.0f };
-    clear_values_[1].depth_stencil = { 1.0f, 0 };
+    clear_values_[0].color =
+        { 50.0f / 255.0f,
+          50.0f / 255.0f,
+          50.0f / 255.0f,
+          1.0f };
+    clear_values_[1].depth_stencil =
+        { 1.0f,
+          0 };
 
     render_pass_ =
         er::helper::createRenderPass(
@@ -60,6 +67,99 @@ TerrainSceneView::TerrainSceneView(
     view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
     view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
     view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
+
+    auto color_no_blend_attachment =
+        er::helper::fillPipelineColorBlendAttachmentState();
+
+    std::vector<er::PipelineColorBlendAttachmentState>
+        color_no_blend_attachments(1, color_no_blend_attachment);
+
+    auto single_no_blend_state_info =
+        std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+            er::helper::fillPipelineColorBlendStateCreateInfo(color_no_blend_attachments));
+
+    auto cull_rasterization_info =
+        std::make_shared<er::PipelineRasterizationStateCreateInfo>(
+            er::helper::fillPipelineRasterizationStateCreateInfo());
+
+    auto no_cull_rasterization_info =
+        std::make_shared<er::PipelineRasterizationStateCreateInfo>(
+            er::helper::fillPipelineRasterizationStateCreateInfo(
+                false,
+                false,
+                er::PolygonMode::FILL,
+                SET_FLAG_BIT(CullMode, NONE)));
+
+    auto ms_info = std::make_shared<er::PipelineMultisampleStateCreateInfo>(
+        er::helper::fillPipelineMultisampleStateCreateInfo());
+
+    auto depth_stencil_info =
+        std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+            er::helper::fillPipelineDepthStencilStateCreateInfo());
+
+    er::GraphicPipelineInfo graphic_pipeline_info;
+    graphic_pipeline_info.blend_state_info = single_no_blend_state_info;
+    graphic_pipeline_info.rasterization_info = cull_rasterization_info;
+    graphic_pipeline_info.ms_info = ms_info;
+    graphic_pipeline_info.depth_stencil_info = depth_stencil_info;
+
+    er::GraphicPipelineInfo graphic_double_face_pipeline_info;
+    graphic_double_face_pipeline_info.blend_state_info = single_no_blend_state_info;
+    graphic_double_face_pipeline_info.rasterization_info = no_cull_rasterization_info;
+    graphic_double_face_pipeline_info.ms_info = ms_info;
+    graphic_double_face_pipeline_info.depth_stencil_info = depth_stencil_info;
+
+    auto desc_set_layouts = global_desc_set_layouts;
+    desc_set_layouts.push_back(ego::TileObject::getTileResDescSetLayout());
+
+    if (tile_pipeline_layout_ == nullptr) {
+        tile_pipeline_layout_ =
+            ego::TileObject::createTilePipelineLayout(
+                device,
+                desc_set_layouts);
+    }
+
+
+    if (tile_grass_pipeline_layout_ == nullptr) {
+        tile_grass_pipeline_layout_ =
+            ego::TileObject::createTileGrassPipelineLayout(
+                device,
+                desc_set_layouts);
+    }
+
+    if (tile_pipeline_ == nullptr) {
+        tile_pipeline_ =
+            ego::TileObject::createTilePipeline(
+                device,
+                render_pass_,
+                tile_pipeline_layout_,
+                graphic_pipeline_info,
+                buffer_size_,
+                "terrain/tile_soil_vert.spv",
+                "terrain/tile_frag.spv");
+    }
+
+    if (tile_water_pipeline_ == nullptr) {
+        tile_water_pipeline_ =
+            ego::TileObject::createTilePipeline(
+                device,
+                blend_render_pass_,
+                tile_pipeline_layout_,
+                graphic_pipeline_info,
+                buffer_size_,
+                "terrain/tile_water_vert.spv",
+                "terrain/tile_water_frag.spv");
+    }
+
+    if (tile_grass_pipeline_ == nullptr) {
+        tile_grass_pipeline_ =
+            ego::TileObject::createGrassPipeline(
+                device,
+                render_pass_,
+                tile_grass_pipeline_layout_,
+                graphic_double_face_pipeline_info,
+                buffer_size_);
+    }
 }
 
 void TerrainSceneView::createCameraDescSetWithTerrain(
@@ -142,16 +242,19 @@ void TerrainSceneView::draw(
         for (auto& tile : visible_tiles_) {
             tile->draw(
                 cmd_buf,
+                tile_pipeline_layout_,
+                is_base_pass_ ? tile_pipeline_ : tile_water_pipeline_,
                 desc_set_list,
                 buffer_size_,
                 dbuf_idx,
                 delta_t,
-                cur_time,
-                is_base_pass_);
+                cur_time);
 
             if (is_base_pass_ && b_render_grass_) {
                 tile->drawGrass(
                     cmd_buf,
+                    tile_grass_pipeline_layout_,
+                    tile_grass_pipeline_,
                     desc_set_list,
                     camera_pos_,
                     buffer_size_,
@@ -166,7 +269,30 @@ void TerrainSceneView::draw(
 }
 
 void TerrainSceneView::destroy(const std::shared_ptr<renderer::Device>& device) {
+    if (tile_pipeline_layout_) {
+        device->destroyPipelineLayout(tile_pipeline_layout_);
+        tile_pipeline_layout_ = nullptr;
+    }
 
+    if (tile_grass_pipeline_layout_) {
+        device->destroyPipelineLayout(tile_grass_pipeline_layout_);
+        tile_grass_pipeline_layout_ = nullptr;
+    }
+
+    if (tile_pipeline_) {
+        device->destroyPipeline(tile_pipeline_);
+        tile_pipeline_ = nullptr;
+    }
+
+    if (tile_water_pipeline_) {
+        device->destroyPipeline(tile_water_pipeline_);
+        tile_water_pipeline_ = nullptr;
+    }
+
+    if (tile_grass_pipeline_) {
+        device->destroyPipeline(tile_grass_pipeline_);
+        tile_grass_pipeline_ = nullptr;
+    }
 };
 
 } // game_object

@@ -18,18 +18,25 @@ class TerrainSceneView : public ego::ViewObject {
     std::shared_ptr<er::RenderPass> render_pass_;
     std::shared_ptr<er::RenderPass> blend_render_pass_;
 
+    std::shared_ptr<renderer::PipelineLayout> tile_pipeline_layout_;
+    std::shared_ptr<renderer::PipelineLayout> tile_grass_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline> tile_pipeline_;
+    std::shared_ptr<renderer::Pipeline> tile_water_pipeline_;
+    std::shared_ptr<renderer::Pipeline> tile_grass_pipeline_;
+
     std::vector<std::shared_ptr<ego::TileObject>> visible_tiles_;
     std::vector<std::shared_ptr<ego::DrawableObject>> visible_object_;
     std::vector<std::shared_ptr<ego::DrawableObject>> drawable_objects_;
 
     bool b_render_grass_ = false;
-    bool b_render_terrain_ = false;
+    bool b_render_terrain_ = true;
     bool is_base_pass_ = false;
 
 public:
     TerrainSceneView(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
         const std::shared_ptr<er::TextureInfo>& depth_buffer/* = nullptr*/);
 
@@ -39,6 +46,10 @@ public:
         const renderer::TextureInfo& soil_water_layer_0,
         const renderer::TextureInfo& soil_water_layer_1,
         const renderer::BufferInfo& game_objects_buffer);
+
+    void setVisibleTiles(const std::vector<std::shared_ptr<ego::TileObject>>& visible_tiles) {
+        visible_tiles_ = visible_tiles;
+    }
 
     void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,

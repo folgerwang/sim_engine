@@ -14,13 +14,15 @@ namespace game_object {
 extern glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch);
 
 class ViewObject {
+public:
+    static std::shared_ptr<er::DescriptorSetLayout> view_camera_desc_set_layout_;
+
 protected:
     glsl::ViewCameraParams view_camera_params_;
     std::shared_ptr<ego::ViewCamera> view_camera_;
     const std::shared_ptr<renderer::Device>& device_;
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
     std::shared_ptr<er::DescriptorSet> view_camera_desc_set_;
-    std::shared_ptr<er::DescriptorSetLayout> view_camera_desc_set_layout_;
 
     er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
@@ -43,6 +45,12 @@ public:
         const std::shared_ptr<er::TextureInfo>& color_buffer,
         const std::shared_ptr<er::TextureInfo>& depth_buffer);
 
+    static std::shared_ptr<er::DescriptorSetLayout>
+        getViewCameraDescriptorSetLayout();
+
+    static void createViewCameraDescriptorSetLayout(
+        const std::shared_ptr<er::Device>& device);
+
     void AllocRenderBuffers();
 
     void updateCamera(
@@ -56,11 +64,6 @@ public:
         int dbuf_idx,
         float delta_t,
         float cur_time);
-
-    std::shared_ptr<er::DescriptorSetLayout>
-        getViewCameraDescriptorSetLayout() {
-        return view_camera_desc_set_layout_;
-    }
 
     std::shared_ptr<er::DescriptorSet>
         getViewCameraDescriptorSet() {

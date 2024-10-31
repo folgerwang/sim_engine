@@ -1961,7 +1961,65 @@ static std::shared_ptr<renderer::PipelineLayout> createTileFlowUpdatePipelineLay
         std::source_location::current());
 }
 
-static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
+size_t generateHash(
+    const glm::vec2& min,
+    const glm::vec2& max,
+    const uint32_t& segment_count) {
+    size_t hash;
+    hash = std::hash<float>{}(min.x);
+    hash_combine(hash, min.y);
+    hash_combine(hash, max.x);
+    hash_combine(hash, max.y);
+    hash_combine(hash, segment_count);
+    return hash;
+}
+
+} // namespace
+
+// static member definition.
+std::unordered_map<size_t, std::shared_ptr<TileObject>> TileObject::tile_meshes_;
+//std::vector<std::shared_ptr<TileObject>> TileObject::visible_tiles_;
+std::vector<uint32_t> TileObject::available_block_indexes_;
+renderer::TextureInfo TileObject::rock_layer_;
+renderer::TextureInfo TileObject::soil_water_layer_[2];
+renderer::TextureInfo TileObject::grass_snow_layer_;
+renderer::TextureInfo TileObject::water_normal_;
+renderer::TextureInfo TileObject::water_flow_;
+std::shared_ptr<renderer::DescriptorSet> TileObject::creator_buffer_desc_set_;
+std::shared_ptr<renderer::DescriptorSet> TileObject::tile_update_buffer_desc_set_[2];
+std::shared_ptr<renderer::DescriptorSet> TileObject::tile_flow_update_buffer_desc_set_[2];
+std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_creator_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> TileObject::tile_creator_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> TileObject::tile_creator_pipeline_;
+std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_update_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> TileObject::tile_update_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> TileObject::tile_update_pipeline_;
+std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_flow_update_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> TileObject::tile_flow_update_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> TileObject::tile_flow_update_pipeline_;
+std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_res_desc_set_layout_;
+std::shared_ptr<renderer::DescriptorSet> TileObject::tile_res_desc_set_[2];
+
+TileObject::TileObject(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
+    const glm::vec2& min,
+    const glm::vec2& max,
+    const size_t& hash_value,
+    const uint32_t& block_idx) :
+    min_(min),
+    max_(max),
+    hash_(hash_value),
+    block_idx_(block_idx){
+    createMeshBuffers(device);
+    createGrassBuffers(device);
+    assert(tile_creator_desc_set_layout_);
+    assert(tile_update_desc_set_layout_);
+    assert(tile_flow_update_desc_set_layout_);
+    assert(tile_res_desc_set_layout_);
+}
+
+std::shared_ptr<renderer::PipelineLayout> TileObject::createTilePipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& desc_set_layouts) {
     renderer::PushConstantRange push_const_range{};
@@ -1976,7 +2034,7 @@ static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
         std::source_location::current());
 }
 
-static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
+std::shared_ptr<renderer::PipelineLayout> TileObject::createTileGrassPipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& desc_set_layouts) {
     renderer::PushConstantRange push_const_range{};
@@ -1995,7 +2053,7 @@ static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
         std::source_location::current());
 }
 
-static std::shared_ptr<renderer::Pipeline> createTilePipeline(
+std::shared_ptr<renderer::Pipeline> TileObject::createTilePipeline(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
@@ -2023,20 +2081,7 @@ static std::shared_ptr<renderer::Pipeline> createTilePipeline(
     return pipeline;
 }
 
-size_t generateHash(
-    const glm::vec2& min,
-    const glm::vec2& max,
-    const uint32_t& segment_count) {
-    size_t hash;
-    hash = std::hash<float>{}(min.x);
-    hash_combine(hash, min.y);
-    hash_combine(hash, max.x);
-    hash_combine(hash, max.y);
-    hash_combine(hash, segment_count);
-    return hash;
-}
-
-static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
+std::shared_ptr<renderer::Pipeline> TileObject::createGrassPipeline(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
@@ -2119,57 +2164,6 @@ static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
     return grass_pipeline;
 }
 
-
-} // namespace
-
-// static member definition.
-std::unordered_map<size_t, std::shared_ptr<TileObject>> TileObject::tile_meshes_;
-std::vector<std::shared_ptr<TileObject>> TileObject::visible_tiles_;
-std::vector<uint32_t> TileObject::available_block_indexes_;
-renderer::TextureInfo TileObject::rock_layer_;
-renderer::TextureInfo TileObject::soil_water_layer_[2];
-renderer::TextureInfo TileObject::grass_snow_layer_;
-renderer::TextureInfo TileObject::water_normal_;
-renderer::TextureInfo TileObject::water_flow_;
-std::shared_ptr<renderer::DescriptorSet> TileObject::creator_buffer_desc_set_;
-std::shared_ptr<renderer::DescriptorSet> TileObject::tile_update_buffer_desc_set_[2];
-std::shared_ptr<renderer::DescriptorSet> TileObject::tile_flow_update_buffer_desc_set_[2];
-std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_creator_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> TileObject::tile_creator_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> TileObject::tile_creator_pipeline_;
-std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_update_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> TileObject::tile_update_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> TileObject::tile_update_pipeline_;
-std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_flow_update_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> TileObject::tile_flow_update_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> TileObject::tile_flow_update_pipeline_;
-std::shared_ptr<renderer::PipelineLayout> TileObject::tile_pipeline_layout_;
-std::shared_ptr<renderer::PipelineLayout> TileObject::tile_grass_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> TileObject::tile_pipeline_;
-std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_res_desc_set_layout_;
-std::shared_ptr<renderer::DescriptorSet> TileObject::tile_res_desc_set_[2];
-std::shared_ptr<renderer::Pipeline> TileObject::tile_water_pipeline_;
-std::shared_ptr<renderer::Pipeline> TileObject::tile_grass_pipeline_;
-
-TileObject::TileObject(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
-    const glm::vec2& min,
-    const glm::vec2& max,
-    const size_t& hash_value,
-    const uint32_t& block_idx) :
-    min_(min),
-    max_(max),
-    hash_(hash_value),
-    block_idx_(block_idx){
-    createMeshBuffers(device);
-    createGrassBuffers(device);
-    assert(tile_creator_desc_set_layout_);
-    assert(tile_update_desc_set_layout_);
-    assert(tile_flow_update_desc_set_layout_);
-    assert(tile_res_desc_set_layout_);
-}
-
 void TileObject::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     index_buffer_.destroy(device);
@@ -2227,6 +2221,10 @@ const renderer::TextureInfo& TileObject::getWaterFlow() {
     return water_flow_;
 }
 
+std::shared_ptr<renderer::DescriptorSetLayout> TileObject::getTileResDescSetLayout() {
+    return tile_res_desc_set_layout_;
+}
+
 glm::vec2 TileObject::getWorldMin() {
     return glm::vec2(-kWorldMapSize / 2.0f);
 }
@@ -2240,13 +2238,7 @@ float TileObject::getMinDistToCamera(const glm::vec2& camera_pos) {
 }
 
 void TileObject::createStaticMembers(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
-    const std::shared_ptr<renderer::RenderPass>& water_render_pass,
-    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
-    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const glm::uvec2& display_size) {
+    const std::shared_ptr<renderer::Device>& device) {
     if (tile_creator_pipeline_layout_ == nullptr) {
         assert(tile_creator_desc_set_layout_);
         tile_creator_pipeline_layout_ =
@@ -2300,70 +2292,10 @@ void TileObject::createStaticMembers(
                 "terrain/tile_flow_update_comp.spv",
                 std::source_location::current());
     }
-
-    auto desc_set_layouts = global_desc_set_layouts;
-    desc_set_layouts.push_back(tile_res_desc_set_layout_);
-
-    if (tile_pipeline_layout_ == nullptr) {
-        tile_pipeline_layout_ =
-            createTilePipelineLayout(
-                device,
-                desc_set_layouts);
-    }
-
-    if (tile_pipeline_ == nullptr) {
-        assert(tile_pipeline_layout_);
-        tile_pipeline_ =
-            createTilePipeline(
-                device,
-                render_pass,
-                tile_pipeline_layout_,
-                graphic_pipeline_info,
-                display_size,
-                "terrain/tile_soil_vert.spv",
-                "terrain/tile_frag.spv");
-    }
-
-    if (tile_water_pipeline_ == nullptr) {
-        assert(tile_pipeline_layout_);
-        tile_water_pipeline_ =
-            createTilePipeline(
-                device,
-                water_render_pass,
-                tile_pipeline_layout_,
-                graphic_pipeline_info,
-                display_size,
-                "terrain/tile_water_vert.spv",
-                "terrain/tile_water_frag.spv");
-    }
-
-    if (tile_grass_pipeline_layout_ == nullptr) {
-        tile_grass_pipeline_layout_ =
-            createTileGrassPipelineLayout(
-                device,
-                desc_set_layouts);
-    }
-
-    if (tile_grass_pipeline_ == nullptr) {
-        assert(tile_grass_pipeline_layout_);
-        tile_grass_pipeline_ =
-            createGrassPipeline(
-                device,
-                render_pass,
-                tile_grass_pipeline_layout_,
-                graphic_double_face_pipeline_info,
-                display_size);
-    }
 }
 
 void TileObject::initStaticMembers(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
-    const std::shared_ptr<renderer::RenderPass>& water_render_pass,
-    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
-    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const glm::uvec2& display_size) {
+    const std::shared_ptr<renderer::Device>& device) {
 
     renderer::Helper::create2DTextureImage(
         device,
@@ -2438,24 +2370,11 @@ void TileObject::initStaticMembers(
             CreateTileResourceDescriptorSetLayout(device);
     }
 
-    createStaticMembers(
-        device,
-        render_pass,
-        water_render_pass,
-        graphic_pipeline_info,
-        graphic_double_face_pipeline_info,
-        global_desc_set_layouts,
-        display_size);
+    createStaticMembers(device);
 }
 
 void TileObject::recreateStaticMembers(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
-    const std::shared_ptr<renderer::RenderPass>& water_render_pass,
-    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
-    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const glm::uvec2& display_size) {
+    const std::shared_ptr<renderer::Device>& device) {
     if (tile_creator_pipeline_layout_) {
         device->destroyPipelineLayout(tile_creator_pipeline_layout_);
         tile_creator_pipeline_layout_ = nullptr;
@@ -2486,39 +2405,7 @@ void TileObject::recreateStaticMembers(
         tile_flow_update_pipeline_ = nullptr;
     }
 
-    if (tile_pipeline_layout_) {
-        device->destroyPipelineLayout(tile_pipeline_layout_);
-        tile_pipeline_layout_ = nullptr;
-    }
-
-    if (tile_grass_pipeline_layout_) {
-        device->destroyPipelineLayout(tile_grass_pipeline_layout_);
-        tile_grass_pipeline_layout_ = nullptr;
-    }
-
-    if (tile_pipeline_) {
-        device->destroyPipeline(tile_pipeline_);
-        tile_pipeline_ = nullptr;
-    }
-
-    if (tile_water_pipeline_) {
-        device->destroyPipeline(tile_water_pipeline_);
-        tile_water_pipeline_ = nullptr;
-    }
-
-    if (tile_grass_pipeline_) {
-        device->destroyPipeline(tile_grass_pipeline_);
-        tile_grass_pipeline_ = nullptr;
-    }
-
-    createStaticMembers(
-        device,
-        render_pass,
-        water_render_pass,
-        graphic_pipeline_info,
-        graphic_double_face_pipeline_info,
-        global_desc_set_layouts,
-        display_size);
+    createStaticMembers(device);
 }
 
 void TileObject::destroyStaticMembers(
@@ -2533,11 +2420,6 @@ void TileObject::destroyStaticMembers(
     device->destroyPipeline(tile_creator_pipeline_);
     device->destroyPipeline(tile_update_pipeline_);
     device->destroyPipeline(tile_flow_update_pipeline_);
-    device->destroyPipelineLayout(tile_pipeline_layout_);
-    device->destroyPipelineLayout(tile_grass_pipeline_layout_);
-    device->destroyPipeline(tile_pipeline_);
-    device->destroyPipeline(tile_water_pipeline_);
-    device->destroyPipeline(tile_grass_pipeline_);
     rock_layer_.destroy(device);
     soil_water_layer_[0].destroy(device);
     soil_water_layer_[1].destroy(device);
@@ -2865,17 +2747,18 @@ void TileObject::updateTileFlowBuffers(
 
 void TileObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<renderer::PipelineLayout>& tile_pipeline_layout,
+    const std::shared_ptr<renderer::Pipeline>& tile_pipeline,
     const renderer::DescriptorSetList& desc_set_list,
     const glm::uvec2 display_size,
     int dbuf_idx,
     float delta_t,
-    float cur_time,
-    bool is_base_pass) {
+    float cur_time) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
-        is_base_pass ? tile_pipeline_ : tile_water_pipeline_);
+        tile_pipeline);
     cmd_buf->bindIndexBuffer(index_buffer_.buffer, 0, renderer::IndexType::UINT32);
 
     glsl::TileParams tile_params = {};
@@ -2892,7 +2775,7 @@ void TileObject::draw(
     tile_params.tile_index = block_idx_;
     cmd_buf->pushConstants(
         SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
-        tile_pipeline_layout_, 
+        tile_pipeline_layout,
         &tile_params, 
         sizeof(tile_params));
 
@@ -2901,7 +2784,7 @@ void TileObject::draw(
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
-        tile_pipeline_layout_, 
+        tile_pipeline_layout,
         new_desc_sets);
 
     cmd_buf->drawIndexed(segment_count * segment_count * 6);
@@ -2909,6 +2792,8 @@ void TileObject::draw(
 
 void TileObject::drawGrass(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<renderer::PipelineLayout>& grass_pipeline_layout,
+    const std::shared_ptr<renderer::Pipeline>& grass_pipeline,
     const renderer::DescriptorSetList& desc_set_list,
     const glm::vec2& camera_pos,
     const glm::uvec2& display_size,
@@ -2922,7 +2807,7 @@ void TileObject::drawGrass(
     auto max_num_grass = static_cast<float>(TileConst::kMaxNumGrass);
     auto num_grass = max_num_grass * (1.0f - ratio) + min_num_grass * ratio;
 
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, tile_grass_pipeline_);
+    cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, grass_pipeline);
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);
     buffers[0] = grass_instance_buffer_.buffer;
@@ -2952,7 +2837,7 @@ void TileObject::drawGrass(
 #else
         SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT, GEOMETRY_BIT),
 #endif
-        tile_grass_pipeline_layout_,
+        grass_pipeline_layout,
         &tile_params,
         sizeof(tile_params));
 
@@ -2961,7 +2846,7 @@ void TileObject::drawGrass(
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
-        tile_grass_pipeline_layout_,
+        grass_pipeline_layout,
         new_desc_sets);
 
 #if    USE_MESH_SHADER
@@ -2996,7 +2881,7 @@ void TileObject::drawAllVisibleTiles(
     float cur_time,
     bool is_base_pass,
     bool render_grass) {
-
+/*
     for (auto& tile : visible_tiles_) {
         tile->draw(
             cmd_buf,
@@ -3017,10 +2902,10 @@ void TileObject::drawAllVisibleTiles(
                 delta_t,
                 cur_time);
         }
-    }
+    }*/
 }
 
-void TileObject::updateAllTiles(
+std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
     const float& tile_size,
@@ -3037,7 +2922,7 @@ void TileObject::updateAllTiles(
     glm::ivec2 min_visi_tile_idx = center_tile_index - glm::ivec2(visible_tile_size);
     glm::ivec2 max_visi_tile_idx = center_tile_index + glm::ivec2(visible_tile_size);
 
-    visible_tiles_.clear();
+    std::vector<std::shared_ptr<TileObject>> visible_tiles;
 
     std::vector<size_t> to_delete_tiles;
     // remove all the tiles outside of cache zone.
@@ -3100,12 +2985,12 @@ void TileObject::updateAllTiles(
                 tile_size);
 
             if (inside) {
-                visible_tiles_.push_back(tile.second);
+                visible_tiles.push_back(tile.second);
             }
         }
     }
 
-    for (auto& tile : visible_tiles_) {
+    for (auto& tile : visible_tiles) {
         renderer::DrawIndexedIndirectCommand indirect_draw_cmd_buffer;
         auto ratio = glm::clamp((tile->getMinDistToCamera(camera_pos) - 256.0f) / 1024.0f, 0.0f, 1.0f);
         auto min_num_grass = static_cast<float>(TileConst::kMinNumGrass);
@@ -3122,6 +3007,8 @@ void TileObject::updateAllTiles(
             sizeof(renderer::DrawIndexedIndirectCommand),
             &indirect_draw_cmd_buffer);
     }
+
+    return visible_tiles;
 }
 
 void TileObject::destroyAllTiles(
@@ -3130,7 +3017,7 @@ void TileObject::destroyAllTiles(
         tile_mesh.second->destroy(device);
     }
     tile_meshes_.clear();
-    visible_tiles_.clear();
+    //visible_tiles_.clear();
 }
 
 } // namespace game_object

@@ -34,7 +34,7 @@ class TileObject {
     renderer::BufferInfo grass_instance_buffer_;
 
     static std::unordered_map<size_t, std::shared_ptr<TileObject>> tile_meshes_;
-    static std::vector<std::shared_ptr<TileObject>> visible_tiles_;
+//    static std::vector<std::shared_ptr<TileObject>> visible_tiles_;
     static std::vector<uint32_t> available_block_indexes_;
     static renderer::TextureInfo rock_layer_;
     static renderer::TextureInfo soil_water_layer_[2];
@@ -53,13 +53,8 @@ class TileObject {
     static std::shared_ptr<renderer::DescriptorSetLayout> tile_flow_update_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> tile_flow_update_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline> tile_flow_update_pipeline_;
-    static std::shared_ptr<renderer::PipelineLayout> tile_pipeline_layout_;
-    static std::shared_ptr<renderer::PipelineLayout> tile_grass_pipeline_layout_;
-    static std::shared_ptr<renderer::Pipeline> tile_pipeline_;
     static std::shared_ptr<renderer::DescriptorSetLayout> tile_res_desc_set_layout_;
     static std::shared_ptr<renderer::DescriptorSet> tile_res_desc_set_[2];
-    static std::shared_ptr<renderer::Pipeline> tile_water_pipeline_;
-    static std::shared_ptr<renderer::Pipeline> tile_grass_pipeline_;
 
 public:
     TileObject() = delete;
@@ -97,31 +92,13 @@ public:
         const glm::vec2& max);
 
     static void initStaticMembers(
-        const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
-        const std::shared_ptr<renderer::RenderPass>& water_render_pass,
-        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
-        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const glm::uvec2& display_size);
+        const std::shared_ptr<renderer::Device>& device);
 
     static void createStaticMembers(
-        const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
-        const std::shared_ptr<renderer::RenderPass>& water_render_pass,
-        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
-        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const glm::uvec2& display_size);
+        const std::shared_ptr<renderer::Device>& device);
 
     static void recreateStaticMembers(
-        const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
-        const std::shared_ptr<renderer::RenderPass>& water_render_pass,
-        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::GraphicPipelineInfo& graphic_double_face_pipeline_info,
-        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const glm::uvec2& display_size);
+        const std::shared_ptr<renderer::Device>& device);
 
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
@@ -175,7 +152,7 @@ public:
         bool is_base_pass,
         bool render_grass = false);
 
-    static void updateAllTiles(
+    static std::vector<std::shared_ptr<TileObject>> updateAllTiles(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
         const float& tile_size,
@@ -183,6 +160,32 @@ public:
 
     static void destroyAllTiles(
         const std::shared_ptr<renderer::Device>& device);
+
+    static std::shared_ptr<renderer::DescriptorSetLayout> getTileResDescSetLayout();
+
+    static std::shared_ptr<renderer::PipelineLayout> createTilePipelineLayout(
+        const std::shared_ptr<renderer::Device>& device,
+        const renderer::DescriptorSetLayoutList& desc_set_layouts);
+
+    static std::shared_ptr<renderer::PipelineLayout> createTileGrassPipelineLayout(
+        const std::shared_ptr<renderer::Device>& device,
+        const renderer::DescriptorSetLayoutList& desc_set_layouts);
+
+    static std::shared_ptr<renderer::Pipeline> createTilePipeline(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const glm::uvec2& display_size,
+        const std::string& vs_name,
+        const std::string& ps_name);
+
+    static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const glm::uvec2& display_size);
 
     bool validTileBySize(
         const glm::ivec2& min_tile_idx,
@@ -196,15 +199,18 @@ public:
         const std::shared_ptr<renderer::Device>& device);
         
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const std::shared_ptr<renderer::PipelineLayout>& tile_pipeline_layout,
+        const std::shared_ptr<renderer::Pipeline>& tile_pipeline,
         const renderer::DescriptorSetList& desc_set_list,
         const glm::uvec2 display_size,
         int dbuf_idx,
         float delta_t,
-        float cur_time,
-        bool is_base_pass);
+        float cur_time);
 
     void drawGrass(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const std::shared_ptr<renderer::PipelineLayout>& grass_pipeline_layout,
+        const std::shared_ptr<renderer::Pipeline>& grass_pipeline,
         const renderer::DescriptorSetList& desc_set_list,
         const glm::vec2& camera_pos,
         const glm::uvec2& display_size,

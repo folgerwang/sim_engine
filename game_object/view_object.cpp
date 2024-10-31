@@ -9,7 +9,7 @@
 namespace engine {
 namespace {
 static std::shared_ptr<er::DescriptorSetLayout>
-createViewCameraDescriptorSetLayout(
+createViewCameraDescSetLayout(
     const std::shared_ptr<er::Device>& device) {
     std::vector<er::DescriptorSetLayoutBinding> bindings(1);
     bindings[0].binding = VIEW_CAMERA_BUFFER_INDEX;
@@ -31,6 +31,22 @@ createViewCameraDescriptorSetLayout(
 } // 
 
 namespace game_object {
+
+std::shared_ptr<er::DescriptorSetLayout> ViewObject::view_camera_desc_set_layout_;
+
+std::shared_ptr<er::DescriptorSetLayout>
+ViewObject::getViewCameraDescriptorSetLayout() {
+    assert(view_camera_desc_set_layout_ != nullptr);
+    return view_camera_desc_set_layout_;
+}
+
+void ViewObject::createViewCameraDescriptorSetLayout(
+    const std::shared_ptr<er::Device>& device) {
+    if (view_camera_desc_set_layout_ == nullptr) {
+        view_camera_desc_set_layout_ =
+            createViewCameraDescSetLayout(device);
+    }
+}
 
 glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
     glm::vec3 direction;
@@ -64,9 +80,7 @@ ViewObject::ViewObject(
 
     view_camera_->initViewCameraBuffer(device_);
 
-    view_camera_desc_set_layout_ =
-        createViewCameraDescriptorSetLayout(device_);
-
+    assert(view_camera_desc_set_layout_ != nullptr);
     view_camera_desc_set_ =
         device_->createDescriptorSets(
             descriptor_pool_,
