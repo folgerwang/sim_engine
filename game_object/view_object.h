@@ -15,7 +15,8 @@ extern glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch);
 
 class ViewObject {
 public:
-    static std::shared_ptr<er::DescriptorSetLayout> view_camera_desc_set_layout_;
+    static std::shared_ptr<er::DescriptorSetLayout>
+        s_view_camera_desc_set_layout_;
 
 protected:
     glsl::ViewCameraParams view_camera_params_;
@@ -23,6 +24,7 @@ protected:
     const std::shared_ptr<renderer::Device>& device_;
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
     std::shared_ptr<er::DescriptorSet> view_camera_desc_set_;
+    std::vector<std::shared_ptr<renderer::DescriptorSet>> tile_res_desc_sets_;
 
     er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
@@ -30,8 +32,8 @@ protected:
     glm::vec3 camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
     std::vector<er::ClearValue> clear_values_;
 
-    bool make_color_buffer_copy_ = false;
-    bool make_depth_buffer_copy_ = false;
+    bool make_color_buffer_copy_ = true;
+    bool make_depth_buffer_copy_ = true;
 
     std::shared_ptr<er::TextureInfo> color_buffer_;
     std::shared_ptr<er::TextureInfo> color_buffer_copy_;

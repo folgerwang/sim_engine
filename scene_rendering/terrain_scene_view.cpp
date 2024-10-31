@@ -116,6 +116,39 @@ TerrainSceneView::TerrainSceneView(
                 graphic_double_face_pipeline_info,
                 buffer_size_);
     }
+
+    // tile params set.
+    tile_res_desc_sets_.resize(2);
+    for (int idx = 0; idx < 2; idx++) {
+        tile_res_desc_sets_[idx] =
+            device->createDescriptorSets(
+                descriptor_pool,
+                ego::TileObject::getTileResDescSetLayout(),
+                1)[0];
+    }
+}
+
+void TerrainSceneView::updateTileResDescriptorSet(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::Sampler>& clamp_texture_sampler,
+    const std::shared_ptr<renderer::Sampler>& repeat_texture_sampler,
+    const std::vector<std::shared_ptr<renderer::ImageView>>& temp_tex,
+    const std::shared_ptr<renderer::ImageView>& map_mask_tex,
+    const std::shared_ptr<renderer::ImageView>& detail_volume_noise_tex,
+    const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex) {
+        ego::TileObject::updateTileResDescriptorSet(
+            device,
+            descriptor_pool,
+            tile_res_desc_sets_,
+            clamp_texture_sampler,
+            repeat_texture_sampler,
+            color_buffer_copy_->view,
+            depth_buffer_copy_->view,
+            temp_tex,
+            map_mask_tex,
+            detail_volume_noise_tex,
+            rough_volume_noise_tex);
 }
 
 void TerrainSceneView::createCameraDescSetWithTerrain(
@@ -180,12 +213,65 @@ void TerrainSceneView::updateCamera(
         dbuf_idx);
 }
 
+void TerrainSceneView::duplicateColorAndDepthBuffer(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
+    er::ImageResourceInfo color_src_info = {
+        er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT) };
+
+    er::ImageResourceInfo color_dst_info = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
+
+    er::ImageResourceInfo depth_src_info = {
+        er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        SET_FLAG_BIT(Access, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, EARLY_FRAGMENT_TESTS_BIT) };
+
+    er::ImageResourceInfo depth_dst_info = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
+
+    er::Helper::blitImage(
+        cmd_buf,
+        color_buffer_->image,
+        color_buffer_copy_->image,
+        color_src_info,
+        color_src_info,
+        color_dst_info,
+        color_dst_info,
+        SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+        SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+        color_buffer_->size,
+        color_buffer_copy_->size);
+
+    er::Helper::blitImage(
+        cmd_buf,
+        depth_buffer_->image,
+        depth_buffer_copy_->image,
+        depth_src_info,
+        depth_src_info,
+        depth_dst_info,
+        depth_dst_info,
+        SET_FLAG_BIT(ImageAspect, DEPTH_BIT),
+        SET_FLAG_BIT(ImageAspect, DEPTH_BIT),
+        depth_buffer_->size,
+        depth_buffer_copy_->size);
+}
+
 void TerrainSceneView::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
     int dbuf_idx,
     float delta_t,
     float cur_time) {
+
+    auto tile_desc_set_list = desc_set_list;
+    tile_desc_set_list.push_back(
+        tile_res_desc_sets_[dbuf_idx]);
 
     cmd_buf->beginRenderPass(
         render_pass_,
@@ -199,22 +285,20 @@ void TerrainSceneView::draw(
             tile->draw(
                 cmd_buf,
                 tile_pipeline_layout_,
-                is_base_pass_ ? tile_pipeline_ : tile_water_pipeline_,
-                desc_set_list,
+                tile_pipeline_,
+                tile_desc_set_list,
                 buffer_size_,
-                dbuf_idx,
                 delta_t,
                 cur_time);
 
-            if (is_base_pass_ && b_render_grass_) {
+            if (b_render_grass_) {
                 tile->drawGrass(
                     cmd_buf,
                     tile_grass_pipeline_layout_,
                     tile_grass_pipeline_,
-                    desc_set_list,
+                    tile_desc_set_list,
                     camera_pos_,
                     buffer_size_,
-                    dbuf_idx,
                     delta_t,
                     cur_time);
             }
@@ -222,6 +306,30 @@ void TerrainSceneView::draw(
     }
 
     cmd_buf->endRenderPass();
+
+    if (b_render_terrain_ && b_render_water_) {
+        duplicateColorAndDepthBuffer(cmd_buf);
+
+        cmd_buf->beginRenderPass(
+            blend_render_pass_,
+            frame_buffer_,
+            buffer_size_,
+            clear_values_);
+
+        // Draw all visible tiles
+        for (auto& tile : visible_tiles_) {
+            tile->draw(
+                cmd_buf,
+                tile_pipeline_layout_,
+                tile_water_pipeline_,
+                tile_desc_set_list,
+                buffer_size_,
+                delta_t,
+                cur_time);
+        }
+
+        cmd_buf->endRenderPass();
+    }
 }
 
 void TerrainSceneView::destroy(const std::shared_ptr<renderer::Device>& device) {

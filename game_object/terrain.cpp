@@ -1977,14 +1977,13 @@ size_t generateHash(
 } // namespace
 
 // static member definition.
-std::unordered_map<size_t, std::shared_ptr<TileObject>> TileObject::tile_meshes_;
-//std::vector<std::shared_ptr<TileObject>> TileObject::visible_tiles_;
-std::vector<uint32_t> TileObject::available_block_indexes_;
-renderer::TextureInfo TileObject::rock_layer_;
-renderer::TextureInfo TileObject::soil_water_layer_[2];
-renderer::TextureInfo TileObject::grass_snow_layer_;
-renderer::TextureInfo TileObject::water_normal_;
-renderer::TextureInfo TileObject::water_flow_;
+std::unordered_map<size_t, std::shared_ptr<TileObject>> TileObject::s_tile_meshes_;
+std::vector<uint32_t> TileObject::s_available_block_indexes_;
+renderer::TextureInfo TileObject::s_rock_layer_;
+renderer::TextureInfo TileObject::s_soil_water_layer_[2];
+renderer::TextureInfo TileObject::s_grass_snow_layer_;
+renderer::TextureInfo TileObject::s_water_normal_;
+renderer::TextureInfo TileObject::s_water_flow_;
 std::shared_ptr<renderer::DescriptorSet> TileObject::creator_buffer_desc_set_;
 std::shared_ptr<renderer::DescriptorSet> TileObject::tile_update_buffer_desc_set_[2];
 std::shared_ptr<renderer::DescriptorSet> TileObject::tile_flow_update_buffer_desc_set_[2];
@@ -1997,8 +1996,7 @@ std::shared_ptr<renderer::Pipeline> TileObject::tile_update_pipeline_;
 std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_flow_update_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> TileObject::tile_flow_update_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline> TileObject::tile_flow_update_pipeline_;
-std::shared_ptr<renderer::DescriptorSetLayout> TileObject::tile_res_desc_set_layout_;
-std::shared_ptr<renderer::DescriptorSet> TileObject::tile_res_desc_set_[2];
+std::shared_ptr<renderer::DescriptorSetLayout> TileObject::s_tile_res_desc_set_layout_;
 
 TileObject::TileObject(
     const std::shared_ptr<renderer::Device>& device,
@@ -2016,7 +2014,7 @@ TileObject::TileObject(
     assert(tile_creator_desc_set_layout_);
     assert(tile_update_desc_set_layout_);
     assert(tile_flow_update_desc_set_layout_);
-    assert(tile_res_desc_set_layout_);
+    assert(s_tile_res_desc_set_layout_);
 }
 
 std::shared_ptr<renderer::PipelineLayout> TileObject::createTilePipelineLayout(
@@ -2180,12 +2178,12 @@ std::shared_ptr<TileObject> TileObject::addOneTile(
     const glm::vec2& max) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
     auto hash_value = generateHash(min, max, segment_count);
-    auto result = tile_meshes_.find(hash_value);
-    if (result == tile_meshes_.end()) {
-        if (available_block_indexes_.size() > 0) {
-            auto block_index = available_block_indexes_.back();
-            available_block_indexes_.pop_back();
-            tile_meshes_[hash_value] =
+    auto result = s_tile_meshes_.find(hash_value);
+    if (result == s_tile_meshes_.end()) {
+        if (s_available_block_indexes_.size() > 0) {
+            auto block_index = s_available_block_indexes_.back();
+            s_available_block_indexes_.pop_back();
+            s_tile_meshes_[hash_value] =
                 std::make_shared<TileObject>(
                     device,
                     descriptor_pool,
@@ -2205,24 +2203,24 @@ std::shared_ptr<TileObject> TileObject::addOneTile(
         assert(min_t.x == min.x && min_t.y == min.y && max_t.x == max.x && max_t.y == max.y);
     }
 
-    return tile_meshes_[hash_value];
+    return s_tile_meshes_[hash_value];
 }
 
 
 const renderer::TextureInfo& TileObject::getRockLayer() {
-    return rock_layer_;
+    return s_rock_layer_;
 }
 
 const renderer::TextureInfo& TileObject::getSoilWaterLayer(int idx) {
-    return soil_water_layer_[idx];
+    return s_soil_water_layer_[idx];
 }
 
 const renderer::TextureInfo& TileObject::getWaterFlow() {
-    return water_flow_;
+    return s_water_flow_;
 }
 
 std::shared_ptr<renderer::DescriptorSetLayout> TileObject::getTileResDescSetLayout() {
-    return tile_res_desc_set_layout_;
+    return s_tile_res_desc_set_layout_;
 }
 
 glm::vec2 TileObject::getWorldMin() {
@@ -2301,7 +2299,7 @@ void TileObject::initStaticMembers(
         device,
         renderer::Format::R16_SFLOAT,
         glm::uvec2(static_cast<uint32_t>(TileConst::kRockLayerSize)),
-        rock_layer_,
+        s_rock_layer_,
         SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
@@ -2311,7 +2309,7 @@ void TileObject::initStaticMembers(
             device,
             renderer::Format::R16G16_UNORM,
             glm::uvec2(static_cast<uint32_t>(TileConst::kSoilLayerSize)),
-            soil_water_layer_[i],
+            s_soil_water_layer_[i],
             SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             std::source_location::current());
@@ -2321,7 +2319,7 @@ void TileObject::initStaticMembers(
         device,
         renderer::Format::R8G8_UNORM,
         glm::uvec2(static_cast<uint32_t>(TileConst::kGrassSnowLayerSize)),
-        grass_snow_layer_,
+        s_grass_snow_layer_,
         SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
@@ -2330,7 +2328,7 @@ void TileObject::initStaticMembers(
         device,
         renderer::Format::R8G8_SNORM,
         glm::uvec2(static_cast<uint32_t>(TileConst::kWaterlayerSize)),
-        water_normal_,
+        s_water_normal_,
         SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
@@ -2339,15 +2337,15 @@ void TileObject::initStaticMembers(
         device,
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(static_cast<uint32_t>(TileConst::kWaterlayerSize)),
-        water_flow_,
+        s_water_flow_,
         SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         std::source_location::current());
 
     auto num_cache_blocks = static_cast<uint32_t>(TileConst::kNumCachedBlocks);
-    available_block_indexes_.resize(num_cache_blocks);
+    s_available_block_indexes_.resize(num_cache_blocks);
     for (uint32_t i = 0; i < num_cache_blocks; i++) {
-        available_block_indexes_[i] = i;
+        s_available_block_indexes_[i] = i;
     }
 
     if (tile_creator_desc_set_layout_ == nullptr) {
@@ -2365,8 +2363,8 @@ void TileObject::initStaticMembers(
             createTileFlowUpdateDescriptorSetLayout(device);
     }
 
-    if (tile_res_desc_set_layout_ == nullptr) {
-        tile_res_desc_set_layout_ =
+    if (s_tile_res_desc_set_layout_ == nullptr) {
+        s_tile_res_desc_set_layout_ =
             CreateTileResourceDescriptorSetLayout(device);
     }
 
@@ -2413,19 +2411,19 @@ void TileObject::destroyStaticMembers(
     device->destroyDescriptorSetLayout(tile_creator_desc_set_layout_);
     device->destroyDescriptorSetLayout(tile_update_desc_set_layout_);
     device->destroyDescriptorSetLayout(tile_flow_update_desc_set_layout_);
-    device->destroyDescriptorSetLayout(tile_res_desc_set_layout_);
+    device->destroyDescriptorSetLayout(s_tile_res_desc_set_layout_);
     device->destroyPipelineLayout(tile_creator_pipeline_layout_);
     device->destroyPipelineLayout(tile_update_pipeline_layout_);
     device->destroyPipelineLayout(tile_flow_update_pipeline_layout_);
     device->destroyPipeline(tile_creator_pipeline_);
     device->destroyPipeline(tile_update_pipeline_);
     device->destroyPipeline(tile_flow_update_pipeline_);
-    rock_layer_.destroy(device);
-    soil_water_layer_[0].destroy(device);
-    soil_water_layer_[1].destroy(device);
-    grass_snow_layer_.destroy(device);
-    water_normal_.destroy(device);
-    water_flow_.destroy(device);
+    s_rock_layer_.destroy(device);
+    s_soil_water_layer_[0].destroy(device);
+    s_soil_water_layer_[1].destroy(device);
+    s_grass_snow_layer_.destroy(device);
+    s_water_normal_.destroy(device);
+    s_water_flow_.destroy(device);
 }
 
 void TileObject::createMeshBuffers(
@@ -2530,9 +2528,9 @@ void TileObject::generateStaticDescriptorSet(
         creator_buffer_desc_set_,
         texture_sampler,
         heightmap_tex,
-        rock_layer_,
-        soil_water_layer_[0], 
-        grass_snow_layer_);
+        s_rock_layer_,
+        s_soil_water_layer_[0], 
+        s_grass_snow_layer_);
     device->updateDescriptorSets(texture_descs);
 
     // tile creator buffer set.
@@ -2544,9 +2542,9 @@ void TileObject::generateStaticDescriptorSet(
         texture_descs = addTileUpdateBuffers(
             tile_update_buffer_desc_set_[dbuf_idx],
             texture_sampler,
-            rock_layer_,
-            soil_water_layer_[dbuf_idx],
-            water_normal_);
+            s_rock_layer_,
+            s_soil_water_layer_[dbuf_idx],
+            s_water_normal_);
         device->updateDescriptorSets(texture_descs);
 
         tile_flow_update_buffer_desc_set_[dbuf_idx] = device->createDescriptorSets(
@@ -2556,15 +2554,11 @@ void TileObject::generateStaticDescriptorSet(
         texture_descs = addTileFlowUpdateBuffers(
             tile_flow_update_buffer_desc_set_[dbuf_idx],
             texture_sampler,
-            rock_layer_,
-            soil_water_layer_[1 - dbuf_idx],
-            soil_water_layer_[dbuf_idx],
-            water_flow_);
+            s_rock_layer_,
+            s_soil_water_layer_[1 - dbuf_idx],
+            s_soil_water_layer_[dbuf_idx],
+            s_water_flow_);
         device->updateDescriptorSets(texture_descs);
-
-        // tile params set.
-        tile_res_desc_set_[dbuf_idx] = device->createDescriptorSets(
-            descriptor_pool, tile_res_desc_set_layout_, 1)[0];
     }
 }
 
@@ -2572,36 +2566,41 @@ void TileObject::updateStaticDescriptorSet(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<renderer::Sampler>& clamp_texture_sampler,
+    const std::shared_ptr<renderer::ImageView>& heightmap_tex) {
+
+    generateStaticDescriptorSet(
+        device,
+        descriptor_pool,
+        clamp_texture_sampler,
+        heightmap_tex);
+}
+
+void TileObject::updateTileResDescriptorSet(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    std::vector<std::shared_ptr<renderer::DescriptorSet>>& tile_res_desc_sets,
+    const std::shared_ptr<renderer::Sampler>& clamp_texture_sampler,
     const std::shared_ptr<renderer::Sampler>& repeat_texture_sampler,
     const std::shared_ptr<renderer::ImageView>& src_texture,
     const std::shared_ptr<renderer::ImageView>& src_depth,
     const std::vector<std::shared_ptr<renderer::ImageView>>& temp_tex,
-    const std::shared_ptr<renderer::ImageView>& heightmap_tex,
     const std::shared_ptr<renderer::ImageView>& map_mask_tex,
     const std::shared_ptr<renderer::ImageView>& detail_volume_noise_tex,
     const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex) {
 
-    if (tile_res_desc_set_[0] == nullptr) {
-        generateStaticDescriptorSet(
-            device,
-            descriptor_pool,
-            clamp_texture_sampler,
-            heightmap_tex);
-    }
-
     for (int dbuf_idx = 0; dbuf_idx < 2; dbuf_idx++) {
         // create a global ibl texture descriptor set.
         auto tile_res_descs = addTileResourceTextures(
-            tile_res_desc_set_[dbuf_idx],
+            tile_res_desc_sets[dbuf_idx],
             clamp_texture_sampler,
             repeat_texture_sampler,
             src_texture,
             src_depth,
-            rock_layer_.view,
-            soil_water_layer_[dbuf_idx].view,
-            grass_snow_layer_.view,
-            water_normal_.view,
-            water_flow_.view,
+            s_rock_layer_.view,
+            s_soil_water_layer_[dbuf_idx].view,
+            s_grass_snow_layer_.view,
+            s_water_normal_.view,
+            s_water_flow_.view,
             temp_tex[dbuf_idx],
             map_mask_tex,
             detail_volume_noise_tex,
@@ -2628,9 +2627,9 @@ void TileObject::generateTileBuffers(
 
     renderer::helper::transitMapTextureToStoreImage(
         cmd_buf,
-        {rock_layer_.image,
-         soil_water_layer_[0].image,
-         grass_snow_layer_.image});
+        {s_rock_layer_.image,
+         s_soil_water_layer_[0].image,
+         s_grass_snow_layer_.image});
 
     auto dispatch_count = static_cast<uint32_t>(TileConst::kWaterlayerSize);
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, tile_creator_pipeline_);
@@ -2655,9 +2654,9 @@ void TileObject::generateTileBuffers(
 
     renderer::helper::transitMapTextureFromStoreImage(
         cmd_buf,
-        { rock_layer_.image,
-         soil_water_layer_[0].image,
-         grass_snow_layer_.image });
+        { s_rock_layer_.image,
+          s_soil_water_layer_[0].image,
+          s_grass_snow_layer_.image });
 }
 
 void TileObject::updateTileBuffers(
@@ -2667,8 +2666,8 @@ void TileObject::updateTileBuffers(
 
     renderer::helper::transitMapTextureToStoreImage(
         cmd_buf,
-        {soil_water_layer_[dbuf_idx].image,
-         water_normal_.image});
+        {s_soil_water_layer_[dbuf_idx].image,
+         s_water_normal_.image});
 
     auto dispatch_count = static_cast<uint32_t>(TileConst::kWaterlayerSize);
 
@@ -2697,8 +2696,8 @@ void TileObject::updateTileBuffers(
 
     renderer::helper::transitMapTextureFromStoreImage(
         cmd_buf,
-        {soil_water_layer_[dbuf_idx].image,
-         water_normal_.image});
+        { s_soil_water_layer_[dbuf_idx].image,
+          s_water_normal_.image} );
 }
 
 void TileObject::updateTileFlowBuffers(
@@ -2708,9 +2707,9 @@ void TileObject::updateTileFlowBuffers(
 
     renderer::helper::transitMapTextureToStoreImage(
         cmd_buf,
-        {soil_water_layer_[dbuf_idx].image,
-         soil_water_layer_[1 - dbuf_idx].image,
-         water_flow_.image});
+        { s_soil_water_layer_[dbuf_idx].image,
+          s_soil_water_layer_[1 - dbuf_idx].image,
+          s_water_flow_.image} );
 
     auto dispatch_count = static_cast<uint32_t>(TileConst::kWaterlayerSize);
 
@@ -2740,9 +2739,9 @@ void TileObject::updateTileFlowBuffers(
 
     renderer::helper::transitMapTextureFromStoreImage(
         cmd_buf,
-        {soil_water_layer_[dbuf_idx].image,
-         soil_water_layer_[1 - dbuf_idx].image,
-         water_flow_.image });
+        { s_soil_water_layer_[dbuf_idx].image,
+          s_soil_water_layer_[1 - dbuf_idx].image,
+          s_water_flow_.image } );
 }
 
 void TileObject::draw(
@@ -2751,7 +2750,6 @@ void TileObject::draw(
     const std::shared_ptr<renderer::Pipeline>& tile_pipeline,
     const renderer::DescriptorSetList& desc_set_list,
     const glm::uvec2 display_size,
-    int dbuf_idx,
     float delta_t,
     float cur_time) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
@@ -2779,13 +2777,10 @@ void TileObject::draw(
         &tile_params, 
         sizeof(tile_params));
 
-    auto new_desc_sets = desc_set_list;
-    new_desc_sets.push_back(tile_res_desc_set_[dbuf_idx]);
-
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
         tile_pipeline_layout,
-        new_desc_sets);
+        desc_set_list);
 
     cmd_buf->drawIndexed(segment_count * segment_count * 6);
 }
@@ -2797,7 +2792,6 @@ void TileObject::drawGrass(
     const renderer::DescriptorSetList& desc_set_list,
     const glm::vec2& camera_pos,
     const glm::uvec2& display_size,
-    int dbuf_idx,
     float delta_t,
     float cur_time) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
@@ -2841,13 +2835,10 @@ void TileObject::drawGrass(
         &tile_params,
         sizeof(tile_params));
 
-    auto new_desc_sets = desc_set_list;
-    new_desc_sets.push_back(tile_res_desc_set_[dbuf_idx]);
-
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
         grass_pipeline_layout,
-        new_desc_sets);
+        desc_set_list);
 
 #if    USE_MESH_SHADER
     cmd_buf->drawMeshTasks(
@@ -2926,7 +2917,7 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
 
     std::vector<size_t> to_delete_tiles;
     // remove all the tiles outside of cache zone.
-    for (auto& tile : tile_meshes_) {
+    for (auto& tile : s_tile_meshes_) {
         if (tile.second) {
             bool inside = tile.second->validTileBySize(
                 min_cache_tile_idx,
@@ -2940,11 +2931,11 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
     }
 
     for (auto& hash_value : to_delete_tiles) {
-        available_block_indexes_.push_back(tile_meshes_[hash_value]->block_idx_);
-        auto search_result = tile_meshes_.find(hash_value);
-        assert(search_result != tile_meshes_.end());
+        s_available_block_indexes_.push_back(s_tile_meshes_[hash_value]->block_idx_);
+        auto search_result = s_tile_meshes_.find(hash_value);
+        assert(search_result != s_tile_meshes_.end());
         search_result->second->destroy(device);
-        tile_meshes_.erase(hash_value);
+        s_tile_meshes_.erase(hash_value);
     }
 
     // add (kCacheTileSize * 2 + 1) x (kCacheTileSize * 2 + 1) tiles for caching.
@@ -2977,7 +2968,7 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
         }
     }
 
-    for (auto& tile : tile_meshes_) {
+    for (auto& tile : s_tile_meshes_) {
         if (tile.second) {
             bool inside = tile.second->validTileBySize(
                 min_visi_tile_idx,
@@ -3013,10 +3004,10 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
 
 void TileObject::destroyAllTiles(
     const std::shared_ptr<renderer::Device>& device) {
-    for (auto& tile_mesh : tile_meshes_) {
+    for (auto& tile_mesh : s_tile_meshes_) {
         tile_mesh.second->destroy(device);
     }
-    tile_meshes_.clear();
+    s_tile_meshes_.clear();
     //visible_tiles_.clear();
 }
 

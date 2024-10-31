@@ -23,9 +23,9 @@ class TerrainSceneView : public ego::ViewObject {
     std::vector<std::shared_ptr<ego::DrawableObject>> visible_object_;
     std::vector<std::shared_ptr<ego::DrawableObject>> drawable_objects_;
 
-    bool b_render_grass_ = false;
     bool b_render_terrain_ = true;
-    bool is_base_pass_ = false;
+    bool b_render_grass_ = false;
+    bool b_render_water_ = false;
 
 public:
     TerrainSceneView(
@@ -34,6 +34,16 @@ public:
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
         const std::shared_ptr<er::TextureInfo>& depth_buffer/* = nullptr*/);
+
+    void updateTileResDescriptorSet(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::Sampler>& clamp_texture_sampler,
+        const std::shared_ptr<renderer::Sampler>& repeat_texture_sampler,
+        const std::vector<std::shared_ptr<renderer::ImageView>>& temp_tex,
+        const std::shared_ptr<renderer::ImageView>& map_mask_tex,
+        const std::shared_ptr<renderer::ImageView>& detail_volume_noise_tex,
+        const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex);
 
     void createCameraDescSetWithTerrain(
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -45,6 +55,9 @@ public:
     void setVisibleTiles(const std::vector<std::shared_ptr<ego::TileObject>>& visible_tiles) {
         visible_tiles_ = visible_tiles;
     }
+
+    void duplicateColorAndDepthBuffer(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf);
 
     void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,

@@ -32,18 +32,19 @@ createViewCameraDescSetLayout(
 
 namespace game_object {
 
-std::shared_ptr<er::DescriptorSetLayout> ViewObject::view_camera_desc_set_layout_;
+std::shared_ptr<er::DescriptorSetLayout>
+    ViewObject::s_view_camera_desc_set_layout_;
 
 std::shared_ptr<er::DescriptorSetLayout>
 ViewObject::getViewCameraDescriptorSetLayout() {
-    assert(view_camera_desc_set_layout_ != nullptr);
-    return view_camera_desc_set_layout_;
+    assert(s_view_camera_desc_set_layout_ != nullptr);
+    return s_view_camera_desc_set_layout_;
 }
 
 void ViewObject::createViewCameraDescriptorSetLayout(
     const std::shared_ptr<er::Device>& device) {
-    if (view_camera_desc_set_layout_ == nullptr) {
-        view_camera_desc_set_layout_ =
+    if (s_view_camera_desc_set_layout_ == nullptr) {
+        s_view_camera_desc_set_layout_ =
             createViewCameraDescSetLayout(device);
     }
 }
@@ -124,11 +125,11 @@ ViewObject::ViewObject(
 
     view_camera_->initViewCameraBuffer(device_);
 
-    assert(view_camera_desc_set_layout_ != nullptr);
+    assert(s_view_camera_desc_set_layout_ != nullptr);
     view_camera_desc_set_ =
         device_->createDescriptorSets(
             descriptor_pool_,
-            view_camera_desc_set_layout_, 1)[0];
+            s_view_camera_desc_set_layout_, 1)[0];
     er::WriteDescriptorList buffer_descs;
     buffer_descs.reserve(1);
     er::Helper::addOneBuffer(
@@ -235,7 +236,7 @@ void ViewObject::draw(
 
 void ViewObject::destroy(const std::shared_ptr<renderer::Device>& device) {
     device_->destroyDescriptorSetLayout(
-        view_camera_desc_set_layout_);
+        s_view_camera_desc_set_layout_);
 
 };
 
