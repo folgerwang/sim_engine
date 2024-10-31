@@ -25,6 +25,7 @@ protected:
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
     std::shared_ptr<er::DescriptorSet> view_camera_desc_set_;
     std::vector<std::shared_ptr<renderer::DescriptorSet>> tile_res_desc_sets_;
+    glsl::ViewCameraInfo gpu_game_camera_info_;
 
     er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
@@ -58,6 +59,12 @@ public:
         const std::shared_ptr<er::Device>& device);
 
     void AllocRenderBuffers();
+
+    void readCameraInfo();
+
+    glm::vec3 getCameraPosition() const {
+        return gpu_game_camera_info_.position;
+    }
 
     void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);

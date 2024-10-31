@@ -268,11 +268,13 @@ void ViewCamera::updateViewCameraBuffer(
 }
 
 glsl::ViewCameraInfo ViewCamera::readCameraInfo(
-    const std::shared_ptr<renderer::Device>& device,
-    const uint32_t& idx) {
+    const std::shared_ptr<renderer::Device>& device) {
 
     glsl::ViewCameraInfo camera_info;
-    device->dumpBufferMemory(view_camera_buffer_->memory, sizeof(glsl::ViewCameraInfo), &camera_info);
+    device->dumpBufferMemory(
+        view_camera_buffer_->memory,
+        sizeof(glsl::ViewCameraInfo),
+        &camera_info);
 
     return camera_info;
 }

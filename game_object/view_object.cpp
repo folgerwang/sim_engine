@@ -118,6 +118,9 @@ ViewObject::ViewObject(
     view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
     view_camera_params_.camera_speed = 0.01f;
 
+    gpu_game_camera_info_.position =
+        view_camera_params_.init_camera_pos;
+
     view_camera_ =
         std::make_shared<ego::ViewCamera>(
             device,
@@ -193,6 +196,11 @@ void ViewObject::AllocRenderBuffers() {
 void ViewObject::updateCamera(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
 
+}
+
+void ViewObject::readCameraInfo() {
+    gpu_game_camera_info_ =
+        view_camera_->readCameraInfo(device_);
 }
 
 void ViewObject::resize(const glm::uvec2& new_buffer_size) {

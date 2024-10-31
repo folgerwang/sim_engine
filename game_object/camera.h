@@ -66,8 +66,7 @@ public:
         int soil_water);
 
     glsl::ViewCameraInfo readCameraInfo(
-        const std::shared_ptr<renderer::Device>& device,
-        const uint32_t& idx);
+        const std::shared_ptr<renderer::Device>& device);
 
     std::shared_ptr<renderer::BufferInfo> getViewCameraBuffer();
 };
