@@ -147,11 +147,18 @@ void ViewCamera::initViewCameraBuffer(
         device->createBuffer(
             sizeof(glsl::ViewCameraInfo),
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT),
+            SET_3_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT, HOST_COHERENT_BIT),
             0,
             view_camera_buffer_->buffer,
             view_camera_buffer_->memory,
             std::source_location::current());
+
+        glsl::ViewCameraInfo camera_info;
+        camera_info.position = glm::vec3(0.0f, 0.0f, 0.0f);
+        device->updateBufferMemory(
+            view_camera_buffer_->memory,
+            sizeof(camera_info),
+            &camera_info);
     }
 }
 

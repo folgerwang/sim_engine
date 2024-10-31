@@ -57,7 +57,7 @@ void storeImageFileWithHeader(
 void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
-    renderer::Format format,
+    renderer::Format& format,
     renderer::TextureInfo& texture,
     const std::source_location& src_location);
 
