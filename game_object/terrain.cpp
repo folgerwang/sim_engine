@@ -2862,40 +2862,6 @@ void TileObject::generateAllDescriptorSets(
         heightmap_tex);
 }
 
-void TileObject::drawAllVisibleTiles(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const renderer::DescriptorSetList& desc_set_list,
-    const glm::vec2& camera_pos,
-    const glm::uvec2& display_size,
-    int dbuf_idx,
-    float delta_t,
-    float cur_time,
-    bool is_base_pass,
-    bool render_grass) {
-/*
-    for (auto& tile : visible_tiles_) {
-        tile->draw(
-            cmd_buf,
-            desc_set_list,
-            display_size,
-            dbuf_idx,
-            delta_t,
-            cur_time,
-            is_base_pass);
-
-        if (is_base_pass && render_grass) {
-            tile->drawGrass(
-                cmd_buf,
-                desc_set_list,
-                camera_pos,
-                display_size,
-                dbuf_idx,
-                delta_t,
-                cur_time);
-        }
-    }*/
-}
-
 std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,

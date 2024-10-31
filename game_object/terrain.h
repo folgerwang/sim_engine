@@ -147,17 +147,6 @@ public:
         float current_time,
         int dbuf_idx);
 
-    static void drawAllVisibleTiles(
-        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list,
-        const glm::vec2& camera_pos,
-        const glm::uvec2& display_size,
-        int dbuf_idx,
-        float delta_t,
-        float cur_time,
-        bool is_base_pass,
-        bool render_grass = false);
-
     static std::vector<std::shared_ptr<TileObject>> updateAllTiles(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
