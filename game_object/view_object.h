@@ -37,6 +37,10 @@ protected:
     std::shared_ptr<er::TextureInfo> color_buffer_copy_;
     std::shared_ptr<er::TextureInfo> depth_buffer_;
     std::shared_ptr<er::TextureInfo> depth_buffer_copy_;
+    std::shared_ptr<er::Framebuffer> frame_buffer_;
+    std::shared_ptr<er::Framebuffer> blend_frame_buffer_;
+    std::shared_ptr<er::RenderPass> render_pass_;
+    std::shared_ptr<er::RenderPass> blend_render_pass_;
 
 public:
     ViewObject(
@@ -72,6 +76,10 @@ public:
 
     std::shared_ptr<er::BufferInfo> getViewCameraBuffer() {
         return view_camera_->getViewCameraBuffer();
+    }
+
+    std::shared_ptr<er::TextureInfo> getColorBuffer() const {
+        return color_buffer_;
     }
 
     void destroy(

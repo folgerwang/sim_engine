@@ -13,11 +13,6 @@ namespace engine {
 namespace scene_rendering {
 
 class TerrainSceneView : public ego::ViewObject {
-    std::shared_ptr<er::Framebuffer> frame_buffer_;
-    std::shared_ptr<er::Framebuffer> blend_frame_buffer_;
-    std::shared_ptr<er::RenderPass> render_pass_;
-    std::shared_ptr<er::RenderPass> blend_render_pass_;
-
     std::shared_ptr<renderer::PipelineLayout> tile_pipeline_layout_;
     std::shared_ptr<renderer::PipelineLayout> tile_grass_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> tile_pipeline_;

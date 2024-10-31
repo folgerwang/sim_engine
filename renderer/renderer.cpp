@@ -807,7 +807,8 @@ void Helper::blitImage(
     const ImageResourceInfo& dst_new_info,
     const ImageAspectFlags& src_aspect_flags,
     const ImageAspectFlags& dst_aspect_flags,
-    const glm::ivec3& buffer_size) {
+    const glm::ivec3& src_buffer_size,
+    const glm::ivec3& dst_buffer_size) {
     BarrierList barrier_list;
     barrier_list.image_barriers.reserve(2);
 
@@ -845,9 +846,9 @@ void Helper::blitImage(
 
     ImageBlitInfo copy_region;
     copy_region.src_offsets[0] = glm::ivec3(0, 0, 0);
-    copy_region.src_offsets[1] = buffer_size;
+    copy_region.src_offsets[1] = src_buffer_size;
     copy_region.dst_offsets[0] = glm::ivec3(0, 0, 0);
-    copy_region.dst_offsets[1] = buffer_size;
+    copy_region.dst_offsets[1] = dst_buffer_size;
     copy_region.src_subresource.aspect_mask = src_aspect_mask;
     copy_region.dst_subresource.aspect_mask = dst_aspect_mask;
 

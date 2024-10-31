@@ -512,7 +512,8 @@ public:
         const ImageResourceInfo& dst_new_info,
         const ImageAspectFlags& src_aspect_flags,
         const ImageAspectFlags& dst_aspect_flags,
-        const glm::ivec3& buffer_size);
+        const glm::ivec3& src_buffer_size,
+        const glm::ivec3& dst_buffer_size);
 
     static bool acquireNextImage(
         const std::shared_ptr<Device>& device,

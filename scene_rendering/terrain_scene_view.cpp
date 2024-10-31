@@ -18,50 +18,6 @@ TerrainSceneView::TerrainSceneView(
     const std::shared_ptr<er::TextureInfo>& depth_buffer = nullptr) :
     ViewObject(device, descriptor_pool, color_buffer, depth_buffer) {
 
-    clear_values_.resize(2);
-    clear_values_[0].color =
-        { 50.0f / 255.0f,
-          50.0f / 255.0f,
-          50.0f / 255.0f,
-          1.0f };
-    clear_values_[1].depth_stencil =
-        { 1.0f,
-          0 };
-
-    render_pass_ =
-        er::helper::createRenderPass(
-            device_,
-            hdr_format_,
-            depth_format_,
-            std::source_location::current(),
-            true);
-    blend_render_pass_ =
-        er::helper::createRenderPass(
-            device_,
-            hdr_format_,
-            depth_format_,
-            std::source_location::current(),
-            false);
-
-    std::vector<std::shared_ptr<er::ImageView>> attachments(2);
-    attachments[0] = color_buffer_->view;
-    attachments[1] = depth_buffer_->view;
-
-    frame_buffer_ =
-        device_->createFrameBuffer(
-            render_pass_,
-            attachments,
-            buffer_size_,
-            std::source_location::current());
-
-    assert(blend_render_pass_);
-    blend_frame_buffer_ =
-        device_->createFrameBuffer(
-            blend_render_pass_,
-            attachments,
-            buffer_size_,
-            std::source_location::current());
-
     view_camera_params_.world_min = ego::TileObject::getWorldMin();
     view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
     view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
