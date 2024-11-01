@@ -6,20 +6,26 @@
 namespace engine {
 namespace game_object {
 
+extern glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch);
+
 class ViewCamera {
+    const std::shared_ptr<renderer::Device>& m_device_;
+    const std::shared_ptr<renderer::DescriptorPool>& m_descriptor_pool_;
+
     static std::shared_ptr<renderer::DescriptorSetLayout> s_update_view_camera_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> s_update_view_camera_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline> s_update_view_camera_pipeline_;
 
     std::shared_ptr<renderer::DescriptorSet> m_update_view_camera_desc_set_[2];
     std::shared_ptr<renderer::BufferInfo> m_view_camera_buffer_;
-    glsl::ViewCameraInfo m_camera_info;
+    glsl::ViewCameraInfo m_camera_info_;
 
 public:
     ViewCamera() = delete;
     ViewCamera(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const glsl::ViewCameraParams& view_camera_params);
 
     void update(const std::shared_ptr<renderer::Device>& device, const float& time);
 
@@ -33,7 +39,8 @@ public:
         const renderer::BufferInfo& game_objects_buffer);
 
     void initViewCameraBuffer(
-        const std::shared_ptr<renderer::Device>& device);
+        const std::shared_ptr<renderer::Device>& device,
+        const glsl::ViewCameraParams& view_camera_params);
 
     static void initStaticMembers(
         const std::shared_ptr<renderer::Device>& device,
@@ -58,8 +65,8 @@ public:
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
-    void destroy(
-        const std::shared_ptr<renderer::Device>& device);
+    void updateViewCameraInfo(
+        const glsl::ViewCameraParams& view_camera_params);
 
     void updateViewCameraBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
@@ -69,7 +76,14 @@ public:
     glsl::ViewCameraInfo readCameraInfo(
         const std::shared_ptr<renderer::Device>& device);
 
+    glsl::ViewCameraInfo readCameraInfo() {
+        return m_camera_info_;
+    }
+
     std::shared_ptr<renderer::BufferInfo> getViewCameraBuffer();
+
+    void destroy(
+        const std::shared_ptr<renderer::Device>& device);
 };
 
 } // namespace game_object

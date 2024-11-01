@@ -124,9 +124,12 @@ ViewObject::ViewObject(
     m_view_camera_ =
         std::make_shared<ego::ViewCamera>(
             device,
-            descriptor_pool);
+            descriptor_pool,
+            m_view_camera_params_);
 
-    m_view_camera_->initViewCameraBuffer(m_device_);
+    m_view_camera_->initViewCameraBuffer(
+        m_device_,
+        m_view_camera_params_);
 
     assert(s_view_camera_desc_set_layout_ != nullptr);
     m_view_camera_desc_set_ =

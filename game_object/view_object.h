@@ -60,7 +60,7 @@ public:
 
     void AllocRenderBuffers();
 
-    void readCameraInfo();
+    virtual void readCameraInfo();
 
     glm::vec3 getCameraPosition() const {
         return m_gpu_game_camera_info_.position;
