@@ -13,19 +13,19 @@ namespace engine {
 namespace scene_rendering {
 
 class TerrainSceneView : public ego::ViewObject {
-    std::shared_ptr<renderer::PipelineLayout> tile_pipeline_layout_;
-    std::shared_ptr<renderer::PipelineLayout> tile_grass_pipeline_layout_;
-    std::shared_ptr<renderer::Pipeline> tile_pipeline_;
-    std::shared_ptr<renderer::Pipeline> tile_water_pipeline_;
-    std::shared_ptr<renderer::Pipeline> tile_grass_pipeline_;
+    std::shared_ptr<renderer::PipelineLayout> m_tile_pipeline_layout_;
+    std::shared_ptr<renderer::PipelineLayout> m_tile_grass_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline> m_tile_pipeline_;
+    std::shared_ptr<renderer::Pipeline> m_tile_water_pipeline_;
+    std::shared_ptr<renderer::Pipeline> m_tile_grass_pipeline_;
 
-    std::vector<std::shared_ptr<ego::TileObject>> visible_tiles_;
-    std::vector<std::shared_ptr<ego::DrawableObject>> visible_object_;
-    std::vector<std::shared_ptr<ego::DrawableObject>> drawable_objects_;
+    std::vector<std::shared_ptr<ego::TileObject>> m_visible_tiles_;
+    std::vector<std::shared_ptr<ego::DrawableObject>> m_visible_object_;
+    std::vector<std::shared_ptr<ego::DrawableObject>> m_drawable_objects_;
 
-    bool b_render_terrain_ = true;
-    bool b_render_grass_ = false;
-    bool b_render_water_ = false;
+    bool m_b_render_terrain_ = true;
+    bool m_b_render_grass_ = false;
+    bool m_b_render_water_ = false;
 
 public:
     TerrainSceneView(
@@ -53,7 +53,7 @@ public:
         const renderer::BufferInfo& game_objects_buffer);
 
     void setVisibleTiles(const std::vector<std::shared_ptr<ego::TileObject>>& visible_tiles) {
-        visible_tiles_ = visible_tiles;
+        m_visible_tiles_ = visible_tiles;
     }
 
     void duplicateColorAndDepthBuffer(

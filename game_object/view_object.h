@@ -19,31 +19,31 @@ public:
         s_view_camera_desc_set_layout_;
 
 protected:
-    glsl::ViewCameraParams view_camera_params_;
-    std::shared_ptr<ego::ViewCamera> view_camera_;
-    const std::shared_ptr<renderer::Device>& device_;
-    const std::shared_ptr<er::DescriptorPool>& descriptor_pool_;
-    std::shared_ptr<er::DescriptorSet> view_camera_desc_set_;
-    std::vector<std::shared_ptr<renderer::DescriptorSet>> tile_res_desc_sets_;
-    glsl::ViewCameraInfo gpu_game_camera_info_;
+    const std::shared_ptr<renderer::Device>& m_device_;
+    const std::shared_ptr<er::DescriptorPool>& m_descriptor_pool_;
+    glsl::ViewCameraParams m_view_camera_params_;
+    std::shared_ptr<ego::ViewCamera> m_view_camera_;
+    std::shared_ptr<er::DescriptorSet> m_view_camera_desc_set_;
+    std::vector<std::shared_ptr<renderer::DescriptorSet>> m_tile_res_desc_sets_;
+    glsl::ViewCameraInfo m_gpu_game_camera_info_;
 
-    er::Format hdr_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
-    er::Format depth_format_ = er::Format::D24_UNORM_S8_UINT;
-    glm::uvec2 buffer_size_ = glm::uvec2(1280, 720);
-    glm::vec3 camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
-    std::vector<er::ClearValue> clear_values_;
+    er::Format m_color_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
+    er::Format m_depth_format_ = er::Format::D24_UNORM_S8_UINT;
+    glm::uvec2 m_buffer_size_ = glm::uvec2(1280, 720);
+    glm::vec3 m_camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
+    std::vector<er::ClearValue> m_clear_values_;
 
-    bool make_color_buffer_copy_ = true;
-    bool make_depth_buffer_copy_ = true;
+    bool m_make_color_buffer_copy_ = true;
+    bool m_make_depth_buffer_copy_ = true;
 
-    std::shared_ptr<er::TextureInfo> color_buffer_;
-    std::shared_ptr<er::TextureInfo> color_buffer_copy_;
-    std::shared_ptr<er::TextureInfo> depth_buffer_;
-    std::shared_ptr<er::TextureInfo> depth_buffer_copy_;
-    std::shared_ptr<er::Framebuffer> frame_buffer_;
-    std::shared_ptr<er::Framebuffer> blend_frame_buffer_;
-    std::shared_ptr<er::RenderPass> render_pass_;
-    std::shared_ptr<er::RenderPass> blend_render_pass_;
+    std::shared_ptr<er::TextureInfo> m_color_buffer_;
+    std::shared_ptr<er::TextureInfo> m_color_buffer_copy_;
+    std::shared_ptr<er::TextureInfo> m_depth_buffer_;
+    std::shared_ptr<er::TextureInfo> m_depth_buffer_copy_;
+    std::shared_ptr<er::Framebuffer> m_frame_buffer_;
+    std::shared_ptr<er::Framebuffer> m_blend_frame_buffer_;
+    std::shared_ptr<er::RenderPass> m_render_pass_;
+    std::shared_ptr<er::RenderPass> m_blend_render_pass_;
 
 public:
     ViewObject(
@@ -63,7 +63,7 @@ public:
     void readCameraInfo();
 
     glm::vec3 getCameraPosition() const {
-        return gpu_game_camera_info_.position;
+        return m_gpu_game_camera_info_.position;
     }
 
     void updateCamera(
@@ -80,15 +80,15 @@ public:
 
     std::shared_ptr<er::DescriptorSet>
         getViewCameraDescriptorSet() {
-        return view_camera_desc_set_;
+        return m_view_camera_desc_set_;
     }
 
     std::shared_ptr<er::BufferInfo> getViewCameraBuffer() {
-        return view_camera_->getViewCameraBuffer();
+        return m_view_camera_->getViewCameraBuffer();
     }
 
     std::shared_ptr<er::TextureInfo> getColorBuffer() const {
-        return color_buffer_;
+        return m_color_buffer_;
     }
 
     void destroy(

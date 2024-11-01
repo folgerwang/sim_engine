@@ -64,7 +64,7 @@ void storeImageFileWithHeader(
 void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
-    renderer::Format& format,
+    const renderer::Format& input_format,
     renderer::TextureInfo& texture,
     const std::source_location& src_location) {
 
@@ -80,10 +80,13 @@ void createTextureImage(
     bool is_dds =
         extension == ".dds";
 
+    auto format = input_format;
     std::vector<char> buffer_data;
     if (is_dds) {
+        renderer::Format actual_format =
+            renderer::Format::R8G8B8A8_UNORM;
         loadDdsTexture(
-            format,
+            actual_format,
             texture.size,
             buffer_data,
             file_name);
@@ -94,6 +97,8 @@ void createTextureImage(
 
         tex_width = texture.size.x;
         tex_height = texture.size.y;
+
+        format = actual_format;
     }
     else {
         if (format == engine::renderer::Format::R16_UNORM) {
