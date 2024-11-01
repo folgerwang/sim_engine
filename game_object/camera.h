@@ -7,12 +7,13 @@ namespace engine {
 namespace game_object {
 
 class ViewCamera {
-    static std::shared_ptr<renderer::DescriptorSetLayout> update_view_camera_desc_set_layout_;
-    static std::shared_ptr<renderer::PipelineLayout> update_view_camera_pipeline_layout_;
-    static std::shared_ptr<renderer::Pipeline> update_view_camera_pipeline_;
+    static std::shared_ptr<renderer::DescriptorSetLayout> s_update_view_camera_desc_set_layout_;
+    static std::shared_ptr<renderer::PipelineLayout> s_update_view_camera_pipeline_layout_;
+    static std::shared_ptr<renderer::Pipeline> s_update_view_camera_pipeline_;
 
-    std::shared_ptr<renderer::DescriptorSet> update_view_camera_desc_set_[2];
-    std::shared_ptr<renderer::BufferInfo> view_camera_buffer_;
+    std::shared_ptr<renderer::DescriptorSet> m_update_view_camera_desc_set_[2];
+    std::shared_ptr<renderer::BufferInfo> m_view_camera_buffer_;
+    glsl::ViewCameraInfo m_camera_info;
 
 public:
     ViewCamera() = delete;

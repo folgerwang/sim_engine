@@ -246,6 +246,31 @@ void ViewObject::destroy(const std::shared_ptr<renderer::Device>& device) {
     device_->destroyDescriptorSetLayout(
         s_view_camera_desc_set_layout_);
 
+    view_camera_->destroy(device);
+
+    if (color_buffer_)
+        color_buffer_->destroy(device);
+
+    if (color_buffer_copy_)
+        color_buffer_copy_->destroy(device);
+
+    if (depth_buffer_)
+        depth_buffer_->destroy(device);
+
+    if (depth_buffer_copy_)
+        depth_buffer_copy_->destroy(device);
+
+    if (frame_buffer_)
+        device_->destroyFramebuffer(frame_buffer_);
+
+    if (blend_frame_buffer_)
+        device_->destroyFramebuffer(blend_frame_buffer_);
+
+    if (render_pass_)
+        device_->destroyRenderPass(render_pass_);
+
+    if (blend_render_pass_)
+        device_->destroyRenderPass(blend_render_pass_);
 };
 
 } // game_object

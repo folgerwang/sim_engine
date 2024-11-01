@@ -460,14 +460,6 @@ static void setupMeshState(
             format,
             dst_tex,
             std::source_location::current());
-
-        dst_tex.view =
-            device->createImageView(
-                dst_tex.image,
-                renderer::ImageViewType::VIEW_2D,
-                format,
-                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
-                std::source_location::current());
     }
 
     // Material

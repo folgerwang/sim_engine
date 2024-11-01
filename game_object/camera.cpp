@@ -103,9 +103,9 @@ static std::shared_ptr<renderer::PipelineLayout> createViewCameraPipelineLayout(
 namespace game_object {
 
 // static member definition.
-std::shared_ptr<renderer::DescriptorSetLayout> ViewCamera::update_view_camera_desc_set_layout_;
-std::shared_ptr<renderer::PipelineLayout> ViewCamera::update_view_camera_pipeline_layout_;
-std::shared_ptr<renderer::Pipeline> ViewCamera::update_view_camera_pipeline_;
+std::shared_ptr<renderer::DescriptorSetLayout> ViewCamera::s_update_view_camera_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout> ViewCamera::s_update_view_camera_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline> ViewCamera::s_update_view_camera_pipeline_;
 
 ViewCamera::ViewCamera(
     const std::shared_ptr<renderer::Device>& device,
@@ -123,16 +123,16 @@ void ViewCamera::createViewCameraUpdateDescSet(
     // create a global ibl texture descriptor set.
     for (int soil_water = 0; soil_water < 2; soil_water++) {
         // game objects buffer update set.
-        update_view_camera_desc_set_[soil_water] =
+        m_update_view_camera_desc_set_[soil_water] =
             device->createDescriptorSets(
-                descriptor_pool, update_view_camera_desc_set_layout_, 1)[0];
+                descriptor_pool, s_update_view_camera_desc_set_layout_, 1)[0];
 
-        assert(view_camera_buffer_);
+        assert(m_view_camera_buffer_);
         auto write_descs = addViewCameraInfoBuffer(
-            update_view_camera_desc_set_[soil_water],
+            m_update_view_camera_desc_set_[soil_water],
             texture_sampler,
             game_objects_buffer,
-            *view_camera_buffer_,
+            *m_view_camera_buffer_,
             rock_layer,
             soil_water == 0 ? soil_water_layer_0 : soil_water_layer_1);
 
@@ -142,21 +142,21 @@ void ViewCamera::createViewCameraUpdateDescSet(
 
 void ViewCamera::initViewCameraBuffer(
     const std::shared_ptr<renderer::Device>& device) {
-    if (!view_camera_buffer_) {
-        view_camera_buffer_ = std::make_shared<renderer::BufferInfo>();
+    if (!m_view_camera_buffer_) {
+        m_view_camera_buffer_ = std::make_shared<renderer::BufferInfo>();
         device->createBuffer(
             sizeof(glsl::ViewCameraInfo),
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
             SET_3_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT, HOST_COHERENT_BIT),
             0,
-            view_camera_buffer_->buffer,
-            view_camera_buffer_->memory,
+            m_view_camera_buffer_->buffer,
+            m_view_camera_buffer_->memory,
             std::source_location::current());
 
         glsl::ViewCameraInfo camera_info;
         camera_info.position = glm::vec3(0.0f, 0.0f, 0.0f);
         device->updateBufferMemory(
-            view_camera_buffer_->memory,
+            m_view_camera_buffer_->memory,
             sizeof(camera_info),
             &camera_info);
     }
@@ -167,8 +167,8 @@ void ViewCamera::initStaticMembers(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
 
-    if (update_view_camera_desc_set_layout_ == nullptr) {
-        update_view_camera_desc_set_layout_ =
+    if (s_update_view_camera_desc_set_layout_ == nullptr) {
+        s_update_view_camera_desc_set_layout_ =
             createUpdateViewCameraDescriptorSetLayout(device);
     }
 
@@ -179,31 +179,31 @@ void ViewCamera::createStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
 
     {
-        if (update_view_camera_pipeline_layout_) {
-            device->destroyPipelineLayout(update_view_camera_pipeline_layout_);
-            update_view_camera_pipeline_layout_ = nullptr;
+        if (s_update_view_camera_pipeline_layout_) {
+            device->destroyPipelineLayout(s_update_view_camera_pipeline_layout_);
+            s_update_view_camera_pipeline_layout_ = nullptr;
         }
 
-        if (update_view_camera_pipeline_layout_ == nullptr) {
-            update_view_camera_pipeline_layout_ =
+        if (s_update_view_camera_pipeline_layout_ == nullptr) {
+            s_update_view_camera_pipeline_layout_ =
                 createViewCameraPipelineLayout(
                     device,
-                    { update_view_camera_desc_set_layout_ });
+                    { s_update_view_camera_desc_set_layout_ });
         }
     }
 
     {
-        if (update_view_camera_pipeline_) {
-            device->destroyPipeline(update_view_camera_pipeline_);
-            update_view_camera_pipeline_ = nullptr;
+        if (s_update_view_camera_pipeline_) {
+            device->destroyPipeline(s_update_view_camera_pipeline_);
+            s_update_view_camera_pipeline_ = nullptr;
         }
 
-        if (update_view_camera_pipeline_ == nullptr) {
-            assert(update_view_camera_pipeline_layout_);
-            update_view_camera_pipeline_ =
+        if (s_update_view_camera_pipeline_ == nullptr) {
+            assert(s_update_view_camera_pipeline_layout_);
+            s_update_view_camera_pipeline_ =
                 renderer::helper::createComputePipeline(
                     device,
-                    update_view_camera_pipeline_layout_,
+                    s_update_view_camera_pipeline_layout_,
                     "update_camera_comp.spv",
                     std::source_location::current());
         }
@@ -237,14 +237,14 @@ void ViewCamera::generateDescriptorSet(
 
 void ViewCamera::destroyStaticMembers(
     const std::shared_ptr<renderer::Device>& device) {
-    device->destroyDescriptorSetLayout(update_view_camera_desc_set_layout_);
-    device->destroyPipelineLayout(update_view_camera_pipeline_layout_);
-    device->destroyPipeline(update_view_camera_pipeline_);
+    device->destroyDescriptorSetLayout(s_update_view_camera_desc_set_layout_);
+    device->destroyPipelineLayout(s_update_view_camera_pipeline_layout_);
+    device->destroyPipeline(s_update_view_camera_pipeline_);
 }
 
 void ViewCamera::destroy(
     const std::shared_ptr<renderer::Device>& device) {
-    view_camera_buffer_->destroy(device);
+    m_view_camera_buffer_->destroy(device);
 }
 
 void ViewCamera::updateViewCameraBuffer(
@@ -252,26 +252,28 @@ void ViewCamera::updateViewCameraBuffer(
     const glsl::ViewCameraParams& view_camera_params,
     int soil_water) {
 
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, update_view_camera_pipeline_);
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        s_update_view_camera_pipeline_);
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        update_view_camera_pipeline_layout_,
+        s_update_view_camera_pipeline_layout_,
         &view_camera_params,
         sizeof(view_camera_params));
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::COMPUTE,
-        update_view_camera_pipeline_layout_,
-        { update_view_camera_desc_set_[soil_water] });
+        s_update_view_camera_pipeline_layout_,
+        { m_update_view_camera_desc_set_[soil_water] });
 
     cmd_buf->dispatch(1, 1);
 
     cmd_buf->addBufferBarrier(
-        view_camera_buffer_->buffer,
+        m_view_camera_buffer_->buffer,
         { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
         { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
-        view_camera_buffer_->buffer->getSize());
+        m_view_camera_buffer_->buffer->getSize());
 }
 
 glsl::ViewCameraInfo ViewCamera::readCameraInfo(
@@ -279,7 +281,7 @@ glsl::ViewCameraInfo ViewCamera::readCameraInfo(
 
     glsl::ViewCameraInfo camera_info;
     device->dumpBufferMemory(
-        view_camera_buffer_->memory,
+        m_view_camera_buffer_->memory,
         sizeof(glsl::ViewCameraInfo),
         &camera_info);
 
@@ -292,7 +294,7 @@ void ViewCamera::update(
 }
 
 std::shared_ptr<renderer::BufferInfo> ViewCamera::getViewCameraBuffer() {
-    return view_camera_buffer_;
+    return m_view_camera_buffer_;
 }
 
 } // game_object

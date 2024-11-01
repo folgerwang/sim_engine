@@ -357,6 +357,8 @@ void TerrainSceneView::destroy(const std::shared_ptr<renderer::Device>& device) 
         device->destroyPipeline(tile_grass_pipeline_);
         tile_grass_pipeline_ = nullptr;
     }
+
+    ViewObject::destroy(device);
 };
 
 } // game_object
