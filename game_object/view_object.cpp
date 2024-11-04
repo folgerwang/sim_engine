@@ -196,11 +196,6 @@ void ViewObject::AllocRenderBuffers() {
     }
 }
 
-void ViewObject::updateCamera(
-    std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
-
-}
-
 void ViewObject::readCameraInfo() {
     m_gpu_game_camera_info_ =
         m_view_camera_->readCameraInfo(m_device_);
@@ -234,15 +229,6 @@ void ViewObject::resize(const glm::uvec2& new_buffer_size) {
     }
 
     AllocRenderBuffers();
-}
-
-void ViewObject::draw(
-    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const renderer::DescriptorSetList& desc_set_list,
-    int dbuf_idx,
-    float delta_t,
-    float cur_time) {
-
 }
 
 void ViewObject::destroy(const std::shared_ptr<renderer::Device>& device) {

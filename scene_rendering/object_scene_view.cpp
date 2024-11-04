@@ -179,15 +179,15 @@ void ObjectSceneView::draw(
     float delta_t,
     float cur_time) {
 
-    auto tile_desc_set_list = desc_set_list;
-    tile_desc_set_list.push_back(
-        m_tile_res_desc_sets_[dbuf_idx]);
-
     cmd_buf->beginRenderPass(
         m_render_pass_,
         m_frame_buffer_,
         m_buffer_size_,
         m_clear_values_);
+
+    for (auto& drawable_obj : m_drawable_objects_) {
+        drawable_obj->draw(cmd_buf, desc_set_list);
+    }
 
     cmd_buf->endRenderPass();
 

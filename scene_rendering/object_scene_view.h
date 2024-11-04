@@ -25,10 +25,15 @@ public:
         const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
         const std::shared_ptr<er::TextureInfo>& depth_buffer/* = nullptr*/);
 
+    void addDrawableObject(
+        const std::shared_ptr<ego::DrawableObject>& drawable_object) {
+        m_drawable_objects_.push_back(drawable_object);
+    }
+
     void duplicateColorAndDepthBuffer(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);
 
-    void updateCamera(
+    virtual void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const uint32_t& dbuf_idx,
         const int& input_key,
@@ -38,7 +43,7 @@ public:
         const float& mouse_wheel_offset,
         const bool& camera_rot_update);
 
-    void draw(
+    virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
         int dbuf_idx,
