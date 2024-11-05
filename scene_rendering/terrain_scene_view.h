@@ -71,7 +71,7 @@ public:
 
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list,
+        const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
         int dbuf_idx,
         float delta_t,
         float cur_time);

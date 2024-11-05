@@ -264,14 +264,15 @@ void TerrainSceneView::duplicateColorAndDepthBuffer(
 
 void TerrainSceneView::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const renderer::DescriptorSetList& desc_set_list,
+    const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
     int dbuf_idx,
     float delta_t,
     float cur_time) {
 
-    auto tile_desc_set_list = desc_set_list;
-    tile_desc_set_list.push_back(
-        m_tile_res_desc_sets_[dbuf_idx]);
+    const renderer::DescriptorSetList& tile_desc_set_list =
+        { prt_desc_set,
+          getViewCameraDescriptorSet(),
+          m_tile_res_desc_sets_[dbuf_idx] };
 
     cmd_buf->beginRenderPass(
         m_render_pass_,

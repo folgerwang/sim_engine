@@ -25,7 +25,6 @@ protected:
     std::shared_ptr<ego::ViewCamera> m_view_camera_;
     std::shared_ptr<er::DescriptorSet> m_view_camera_desc_set_;
     std::vector<std::shared_ptr<renderer::DescriptorSet>> m_tile_res_desc_sets_;
-    glsl::ViewCameraInfo m_gpu_game_camera_info_;
 
     er::Format m_color_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format m_depth_format_ = er::Format::D24_UNORM_S8_UINT;
@@ -60,10 +59,10 @@ public:
 
     void AllocRenderBuffers();
 
-    virtual void readCameraInfo();
+    virtual void readGpuCameraInfo();
 
     glm::vec3 getCameraPosition() const {
-        return m_gpu_game_camera_info_.position;
+        return m_view_camera_->getCameraInfo().position;
     }
 
     virtual void updateCamera(
@@ -81,7 +80,7 @@ public:
 
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list,
+        const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
         int dbuf_idx,
         float delta_t,
         float cur_time) {

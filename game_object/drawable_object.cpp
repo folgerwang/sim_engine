@@ -2519,7 +2519,9 @@ void DrawableObject::updateInstanceBuffer(
         { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
         object_->instance_buffer_.buffer->getSize());
 
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, update_instance_buffer_pipeline_);
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        update_instance_buffer_pipeline_);
 
     glsl::InstanceBufferUpdateParams params;
     params.num_instances = kNumDrawableInstance;

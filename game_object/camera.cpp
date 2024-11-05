@@ -368,25 +368,18 @@ void ViewCamera::updateViewCameraInfo(
         &m_camera_info_);
 }
 
-glsl::ViewCameraInfo ViewCamera::readCameraInfo(
+void ViewCamera::readGpuCameraInfo(
     const std::shared_ptr<renderer::Device>& device) {
 
-    glsl::ViewCameraInfo m_camera_info_;
     device->dumpBufferMemory(
         m_view_camera_buffer_->memory,
         sizeof(glsl::ViewCameraInfo),
         &m_camera_info_);
-
-    return m_camera_info_;
 }
 
 void ViewCamera::update(
     const std::shared_ptr<renderer::Device>& device,
     const float& time) {
-}
-
-std::shared_ptr<renderer::BufferInfo> ViewCamera::getViewCameraBuffer() {
-    return m_view_camera_buffer_;
 }
 
 } // game_object

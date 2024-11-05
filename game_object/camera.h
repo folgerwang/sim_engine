@@ -73,14 +73,16 @@ public:
         const glsl::ViewCameraParams& game_camera_params,
         int soil_water);
 
-    glsl::ViewCameraInfo readCameraInfo(
+    void readGpuCameraInfo(
         const std::shared_ptr<renderer::Device>& device);
 
-    glsl::ViewCameraInfo readCameraInfo() {
+    const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;
     }
 
-    std::shared_ptr<renderer::BufferInfo> getViewCameraBuffer();
+    std::shared_ptr<renderer::BufferInfo> getViewCameraBuffer() {
+        return m_view_camera_buffer_;
+    }
 
     void destroy(
         const std::shared_ptr<renderer::Device>& device);
