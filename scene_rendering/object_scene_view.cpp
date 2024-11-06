@@ -20,9 +20,9 @@ ObjectSceneView::ObjectSceneView(
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
     m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
-    m_view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
-    m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
+    m_view_camera_params_.init_camera_pos = glm::vec3(0, 5000.0f, 0);
+    m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
+    m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
 
     auto color_no_blend_attachment =
         er::helper::fillPipelineColorBlendAttachmentState();

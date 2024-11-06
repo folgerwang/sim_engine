@@ -638,10 +638,10 @@ static void setupMesh(
     assert(src_mesh->num_indices == src_mesh->vertex_uv.indices.count);
 
     std::unordered_map<size_t, uint32_t> vertex_map;
-    std::vector<size_t> vertex_indice_hash_table;
-    std::vector<uint32_t> indices;
-    vertex_indice_hash_table.reserve(src_mesh->num_indices);
-    indices.reserve(src_mesh->num_indices);
+    std::vector<uint32_t> new_indices;
+    std::vector<uint32_t> indice_match_table;
+    new_indices.reserve(src_mesh->num_indices);
+    indice_match_table.reserve(src_mesh->num_indices);
 
     std::vector<float> vertex_data;
     vertex_data.reserve(20);
@@ -656,63 +656,72 @@ static void setupMesh(
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
         primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
 
-        for (int i_face = 0; i_face < part.num_faces * 3; i_face++) {
-            auto pos_indice = src_mesh->vertex_position.indices[num_indices];
-            const auto& position = src_mesh->vertex_position.values[pos_indice];
-            auto position_packed = glm::vec3(position.x, position.y, position.z);
+        for (int i_face = 0; i_face < part.num_faces; i_face++) {
+            const auto& face_indice = part.face_indices[i_face];
+            const auto& face = src_mesh->faces[face_indice];
+            assert(face.num_indices == 3);
+            for (uint32_t i_vert = 0; i_vert < face.num_indices; i_vert++) {
+                const auto src_vert_index = face.index_begin + i_vert;
+                auto pos_indice = src_mesh->vertex_position.indices[src_vert_index];
+                const auto& position = src_mesh->vertex_position.values[pos_indice];
+                auto position_packed = glm::vec3(position.x, position.y, position.z);
 
-            primitive_info.bbox_min_ = glm::min(primitive_info.bbox_min_, position_packed);
-            primitive_info.bbox_max_ = glm::min(primitive_info.bbox_max_, position_packed);
+                primitive_info.bbox_min_ = glm::min(primitive_info.bbox_min_, position_packed);
+                primitive_info.bbox_max_ = glm::max(primitive_info.bbox_max_, position_packed);
 
-            vertex_data.clear();
-            vertex_data.push_back(float(position.x));
-            vertex_data.push_back(float(position.y));
-            vertex_data.push_back(float(position.z));
-            auto norm_indice = src_mesh->vertex_normal.indices[num_indices];
-            const auto& normal = src_mesh->vertex_normal.values[norm_indice];
-            vertex_data.push_back(float(normal.x));
-            vertex_data.push_back(float(normal.y));
-            vertex_data.push_back(float(normal.z));
-            auto uv_indice = src_mesh->vertex_uv.indices[num_indices];
-            const auto& uv = src_mesh->vertex_uv.values[uv_indice];
-            vertex_data.push_back(float(uv.x));
-            vertex_data.push_back(float(uv.y));
-            auto hash_value =
-                hashCombine(
-                    static_cast<uint32_t>(vertex_data.size()),
-                    vertex_data.data());
+                vertex_data.clear();
+                vertex_data.push_back(float(position.x));
+                vertex_data.push_back(float(position.y));
+                vertex_data.push_back(float(position.z));
+                auto norm_indice = src_mesh->vertex_normal.indices[src_vert_index];
+                const auto& normal = src_mesh->vertex_normal.values[norm_indice];
+                vertex_data.push_back(float(normal.x));
+                vertex_data.push_back(float(normal.y));
+                vertex_data.push_back(float(normal.z));
+                auto uv_indice = src_mesh->vertex_uv.indices[src_vert_index];
+                const auto& uv = src_mesh->vertex_uv.values[uv_indice];
+                vertex_data.push_back(float(uv.x));
+                vertex_data.push_back(float(uv.y));
+                auto hash_value =
+                    hashCombine(
+                        static_cast<uint32_t>(vertex_data.size()),
+                        vertex_data.data());
 
-            auto it = vertex_map.find(hash_value);
-            if (it != vertex_map.end()) {
-                indices.push_back(it->second);
+                auto it = vertex_map.find(hash_value);
+                if (it != vertex_map.end()) {
+                    new_indices.push_back(it->second);
+                }
+                else {
+                    auto new_index =
+                        static_cast<uint32_t>(indice_match_table.size());
+                    new_indices.push_back(new_index);
+                    indice_match_table.push_back(src_vert_index);
+
+                    vertex_map[hash_value] =
+                        static_cast<uint32_t>(new_index);
+                }
             }
-            else {
-                auto new_index = static_cast<uint32_t>(vertex_map.size());
-                indices.push_back(new_index);
-                vertex_indice_hash_table.push_back(hash_value);
-                vertex_map[hash_value] = static_cast<uint32_t>(i_face);
-            }
-
-            num_indices ++;
         }
-        drawable_mesh.bbox_min_ = min(drawable_mesh.bbox_min_, primitive_info.bbox_min_);
-        drawable_mesh.bbox_max_ = max(drawable_mesh.bbox_max_, primitive_info.bbox_max_);
+        drawable_mesh.bbox_min_ =
+            min(drawable_mesh.bbox_min_, primitive_info.bbox_min_);
+        drawable_mesh.bbox_max_ =
+            max(drawable_mesh.bbox_max_, primitive_info.bbox_max_);
         drawable_mesh.primitives_.push_back(primitive_info);
     }
 
     std::vector<VertexStruct> drawable_vertices;
-    drawable_vertices.resize(vertex_indice_hash_table.size());
-    for (int i_vert = 0; i_vert < vertex_indice_hash_table.size(); i_vert++) {
-        const uint32_t& idx = vertex_map[vertex_indice_hash_table[i_vert]];
+    drawable_vertices.resize(indice_match_table.size());
+    for (int i_vert = 0; i_vert < indice_match_table.size(); i_vert++) {
+        const uint32_t& src_vert_idx = indice_match_table[i_vert];
 
         auto& vertex = drawable_vertices[i_vert];
-        auto position_idx = src_mesh->vertex_position.indices[idx];
+        auto position_idx = src_mesh->vertex_position.indices[src_vert_idx];
         const auto& position = src_mesh->vertex_position.values[position_idx];
         vertex.position = glm::vec3(position.x, position.y, position.z);
-        auto normal_idx = src_mesh->vertex_normal.indices[idx];
+        auto normal_idx = src_mesh->vertex_normal.indices[src_vert_idx];
         const auto& normal = src_mesh->vertex_normal.values[normal_idx];
         vertex.normal = glm::vec3(normal.x, normal.y, normal.z);
-        auto uv_idx = src_mesh->vertex_uv.indices[idx];
+        auto uv_idx = src_mesh->vertex_uv.indices[src_vert_idx];
         const auto& uv = src_mesh->vertex_uv.values[uv_idx];
         vertex.uv = glm::vec2(uv.x, uv.y);
     }
@@ -743,7 +752,7 @@ static void setupMesh(
         std::vector<uint16_t> indices_16;
         indices_16.resize(src_mesh->num_indices);
         for (int i_idx = 0; i_idx < src_mesh->num_indices; i_idx++) {
-            indices_16[i_idx] = static_cast<uint16_t>(indices[i_idx]);
+            indices_16[i_idx] = static_cast<uint16_t>(new_indices[i_idx]);
         }
 
         renderer::Helper::createBuffer(
@@ -776,8 +785,8 @@ static void setupMesh(
             indice_buffer.buffer,
             indice_buffer.memory,
             std::source_location::current(),
-            indices.size() * 4,
-            indices.data());
+            new_indices.size() * 4,
+            new_indices.data());
 
         index_bytes_count = 4;
         index_type = renderer::IndexType::UINT32;
