@@ -28,7 +28,7 @@ protected:
 
     er::Format m_color_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
     er::Format m_depth_format_ = er::Format::D24_UNORM_S8_UINT;
-    glm::uvec2 m_buffer_size_ = glm::uvec2(1280, 720);
+    glm::uvec2 m_buffer_size_ = glm::uvec2(2560, 1440);
     glm::vec3 m_camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
     std::vector<er::ClearValue> m_clear_values_;
 

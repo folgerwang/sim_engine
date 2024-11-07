@@ -108,6 +108,4 @@ void main() {
 #else
     outColor = baseColor;
 #endif // NO_MTL
-
-    outColor = vec4(1, 0, 0, 1); // red for testing purposes
 }

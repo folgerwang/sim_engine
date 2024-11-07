@@ -115,7 +115,7 @@ struct NodeInfo {
     glm::mat4                   matrix_ = glm::mat4(1.0f);
 
     glm::mat4                   cached_matrix_ = glm::mat4(1.0f);
-    glm::mat4 getLocalMatrix();
+    glm::mat4 getLocalMatrix(bool use_local_matrix_only);
     const glm::mat4& getCachedMatrix() const {
         return cached_matrix_;
     }
@@ -129,6 +129,8 @@ struct SceneInfo {
 
 struct DrawableData {
     const std::shared_ptr<renderer::Device>& device_;
+    bool m_use_local_matrix_only_ = false;
+
     int32_t                     default_scene_ = 0;
     std::vector<SceneInfo>      scenes_;
     std::vector<NodeInfo>       nodes_;
@@ -155,9 +157,12 @@ public:
     void update(
         const std::shared_ptr<renderer::Device>& device,
         const uint32_t& active_anim_idx,
-        const float& time);
+        const float& time,
+        bool use_local_matrix_only);
 
-    glm::mat4 getNodeMatrix(const int32_t& node_idx);
+    glm::mat4 getNodeMatrix(
+        const int32_t& node_idx,
+        bool use_local_matrix_only);
 
     void updateJoints(
         const std::shared_ptr<renderer::Device>& device,

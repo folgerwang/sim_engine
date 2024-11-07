@@ -1177,6 +1177,11 @@ static void setupNode(
             node->local_transform.translation.y,
             node->local_transform.translation.z);
 
+    auto joint_mat =
+        glm::translate(glm::mat4(1.0f), node_info.translation_) *
+        glm::mat4(node_info.rotation_) *
+        glm::scale(glm::mat4(1.0f), node_info.scale_);
+
     if (node->mesh) {
         for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
             if (fbx_scene->meshes[i_mesh]->element_id == node->mesh->element_id) {
@@ -1978,25 +1983,33 @@ void AnimChannelInfo::update(DrawableData* object, float time, float time_scale/
     }
 }
 
-glm::mat4 NodeInfo::getLocalMatrix() {
+glm::mat4 NodeInfo::getLocalMatrix(
+    bool use_local_matrix_only) {
     auto joint_mat =
         glm::translate(glm::mat4(1.0f), translation_) *
         glm::mat4(rotation_) *
         glm::scale(glm::mat4(1.0f), scale_);
 
-    return joint_mat * matrix_;
+    if (use_local_matrix_only)
+        return matrix_;
+    else 
+        return joint_mat * matrix_;
 }
 
-glm::mat4 DrawableData::getNodeMatrix(const int32_t& node_idx) {
+glm::mat4 DrawableData::getNodeMatrix(
+    const int32_t& node_idx,
+    bool use_local_matrix_only) {
     if (node_idx < 0)
         return glm::mat4(1.0f);
 
     auto& node = nodes_[node_idx];
-    glm::mat4 node_matrix = node.getLocalMatrix();
+    glm::mat4 node_matrix =
+        node.getLocalMatrix(use_local_matrix_only);
     auto parent_idx = node.parent_idx_;
     while (parent_idx >= 0) {
         auto& parent_node = nodes_[parent_idx];
-        node_matrix = parent_node.getLocalMatrix() * node_matrix;
+        node_matrix =
+            parent_node.getLocalMatrix(use_local_matrix_only) * node_matrix;
         parent_idx = parent_node.parent_idx_;
     }
 
@@ -2036,7 +2049,8 @@ void DrawableData::updateJoints(
 void DrawableData::update(
     const std::shared_ptr<renderer::Device>& device,
     const uint32_t& active_anim_idx,
-    const float& time) {
+    const float& time,
+    bool use_local_matrix_only) {
     // update all animations
     if (animations_.size() > 0) {
         assert(active_anim_idx < animations_.size());
@@ -2048,7 +2062,8 @@ void DrawableData::update(
 
     // update hierarchy matrix
     for (auto i_node = 0; i_node < nodes_.size(); i_node++) {
-        nodes_[i_node].cached_matrix_ = getNodeMatrix(i_node);
+        nodes_[i_node].cached_matrix_ =
+            getNodeMatrix(i_node, use_local_matrix_only);
     }
 
         // update joints
@@ -2625,7 +2640,11 @@ void DrawableObject::update(
     const std::shared_ptr<renderer::Device>& device,
     const float& time) {
     if (object_) {
-        object_->update(device, 0, time);
+        object_->update(
+            device,
+            0,
+            time,
+            object_->m_use_local_matrix_only_);
     }
 }
 
@@ -2682,7 +2701,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
         }
     }
 
-    drawable_object->update(device, 0, 0.0f);
+    drawable_object->m_use_local_matrix_only_ = false;
+
+    drawable_object->update(
+        device,
+        0,
+        0.0f,
+        drawable_object->m_use_local_matrix_only_);
 
     setupRaytracing(drawable_object);
 
@@ -2759,7 +2784,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
 
     ufbx_free_scene(fbx_scene);
 
-    drawable_object->update(device, 0, 0.0f);
+    drawable_object->m_use_local_matrix_only_ = true;
+
+    drawable_object->update(
+        device,
+        0,
+        0.0f,
+        drawable_object->m_use_local_matrix_only_);
 
     setupRaytracing(drawable_object);
 
