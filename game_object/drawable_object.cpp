@@ -449,7 +449,8 @@ static void setupMeshState(
     for (size_t i_tex = 0; i_tex < fbx_scene->textures.count; i_tex++) {
         auto& dst_tex = drawable_object->textures_[i_tex];
         const auto& src_tex = fbx_scene->textures[i_tex];
-        texture_map[str_hash(src_tex->name.data)] = uint32_t(i_tex);
+        auto hash_value = str_hash(src_tex->filename.data);
+        texture_map[hash_value] = uint32_t(i_tex);
 
         glm::uvec3 size(0);
         void* image_data = nullptr;
@@ -474,7 +475,7 @@ static void setupMeshState(
                 const auto& texture_string =
                     std::string(tex.material_prop.data);
                 const auto& texture_name = 
-                    std::string(tex.texture->name.data);
+                    std::string(tex.texture->filename.data);
 
                 auto tex_id = texture_map[str_hash(texture_name)];
 
@@ -826,7 +827,7 @@ static void setupMesh(
 
         auto& primitive_info = drawable_mesh.primitives_[i_part];
         primitive_info.tag_.restart_enable = false;
-        primitive_info.material_idx_ = part.index;
+        primitive_info.material_idx_ = mat->typed_id;
 
         auto mode = renderer::PrimitiveTopology::TRIANGLE_LIST;
         primitive_info.tag_.topology = static_cast<uint32_t>(mode);
@@ -1311,7 +1312,11 @@ static renderer::WriteDescriptorList addDrawableTextures(
     auto& white_tex = renderer::Helper::getWhiteTexture();
 
     // base color.
-    auto& base_color_tex_view = material.base_color_idx_ < 0 ? black_tex : textures[material.base_color_idx_];
+    auto& base_color_tex_view =
+        material.base_color_idx_ < 0 ?
+        black_tex :
+        textures[material.base_color_idx_];
+
     renderer::Helper::addOneTexture(
         descriptor_writes,
         material.desc_set_,
@@ -1322,7 +1327,11 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // normal.
-    auto& normal_tex_view = material.normal_idx_ < 0 ? black_tex : textures[material.normal_idx_];
+    auto& normal_tex_view =
+        material.normal_idx_ < 0 ?
+        black_tex :
+        textures[material.normal_idx_];
+
     renderer::Helper::addOneTexture(
         descriptor_writes,
         material.desc_set_,
@@ -1333,7 +1342,11 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // metallic roughness.
-    auto& metallic_roughness_tex = material.metallic_roughness_idx_ < 0 ? black_tex : textures[material.metallic_roughness_idx_];
+    auto& metallic_roughness_tex =
+        material.metallic_roughness_idx_ < 0 ?
+        black_tex :
+        textures[material.metallic_roughness_idx_];
+
     renderer::Helper::addOneTexture(
         descriptor_writes,
         material.desc_set_,
@@ -1344,7 +1357,12 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // emisive.
-    auto& emissive_tex = material.emissive_idx_ < 0 ? black_tex : textures[material.emissive_idx_];
+    auto& emissive_tex =
+        material.emissive_idx_ < 0 ?
+        black_tex :
+        textures[material.emissive_idx_];
+
+
     renderer::Helper::addOneTexture(
         descriptor_writes,
         material.desc_set_,
@@ -1355,7 +1373,11 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // occlusion.
-    auto& occlusion_tex = material.occlusion_idx_ < 0 ? white_tex : textures[material.occlusion_idx_];
+    auto& occlusion_tex =
+        material.occlusion_idx_ < 0 ?
+        white_tex :
+        textures[material.occlusion_idx_];
+
     renderer::Helper::addOneTexture(
         descriptor_writes,
         material.desc_set_,
@@ -1457,7 +1479,8 @@ static void drawMesh(
 
         renderer::DescriptorSetList desc_sets = desc_set_list;
         if (prim.material_idx_ >= 0) {
-            const auto& material = drawable_object->materials_[prim.material_idx_];
+            const auto& material =
+                drawable_object->materials_[prim.material_idx_];
             desc_sets.push_back(material.desc_set_);
         }
 

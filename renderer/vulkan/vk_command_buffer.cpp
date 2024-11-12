@@ -148,7 +148,13 @@ void VulkanCommandBuffer::copyBufferToImage(
     }
     auto vk_src_buf = RENDER_TYPE_CAST(Buffer, src_buf);
     auto vk_dst_image = RENDER_TYPE_CAST(Image, dst_image);
-    vkCmdCopyBufferToImage(cmd_buf_, vk_src_buf->get(), vk_dst_image->get(), helper::toVkImageLayout(layout), static_cast<uint32_t>(vk_copy_regions.size()), vk_copy_regions.data());
+    vkCmdCopyBufferToImage(
+        cmd_buf_,
+        vk_src_buf->get(),
+        vk_dst_image->get(),
+        helper::toVkImageLayout(layout),
+        static_cast<uint32_t>(vk_copy_regions.size()),
+        vk_copy_regions.data());
 }
 
 void VulkanCommandBuffer::copyImageToBuffer(

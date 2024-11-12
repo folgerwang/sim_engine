@@ -267,10 +267,11 @@ void loadDdsTexture(
     std::vector<char>& buffer_data,
     const std::string& input_filename) {
 
-    uint64_t file_size = 0;
     readFile(
         input_filename,
         buffer_data);
+    uint64_t file_size =
+        buffer_data.size();
 
     DDS_HEADER* dds_header =
         (DDS_HEADER*)buffer_data.data();
@@ -301,8 +302,9 @@ void loadDdsTexture(
         else {
             assert(0);
         }
-        uint32_t blockSize = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
-        data_size = ((dds_header->dwWidth + 3) / 4) * ((dds_header->dwHeight + 3) / 4) * blockSize;
+        uint32_t block_size = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
+        auto pitch = ((dds_header->dwWidth + 3) / 4) * block_size;
+        data_size = pitch * ((dds_header->dwHeight + 3) / 4);
     }
     else {
         if (rgbBitCount == 32) {
