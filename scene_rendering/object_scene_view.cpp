@@ -89,7 +89,7 @@ void ObjectSceneView::updateCamera(
     const float& mouse_wheel_offset,
     const bool& camera_rot_update) {
 
-    const float s_camera_speed = 0.2f;
+    const float s_camera_speed = 1.0f;
 
     m_view_camera_params_.camera_speed = s_camera_speed;
 

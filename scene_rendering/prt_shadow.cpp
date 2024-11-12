@@ -139,6 +139,7 @@ PrtShadow::PrtShadow(
         device,
         renderer::Format::R32G32B32A32_SFLOAT,
         temp_buffer_size,
+        1,
         *prt_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -154,6 +155,7 @@ PrtShadow::PrtShadow(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         prt_shadow_cache_tex_size,
+        1,
         *prt_shadow_cache_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -168,6 +170,7 @@ PrtShadow::PrtShadow(
         device,
         renderer::Format::R32G32B32A32_SFLOAT,
         temp_ds_buffer_size,
+        1,
         *prt_ds_texes_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),

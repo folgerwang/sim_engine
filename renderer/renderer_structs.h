@@ -369,6 +369,7 @@ struct QueueFamilyList {
 struct TextureInfo {
     bool                               linear = true;
     glm::uvec3                         size = glm::uvec3(0);
+    uint32_t                           mip_levels = 1; 
     std::shared_ptr<Image>             image;
     std::shared_ptr<DeviceMemory>      memory;
     std::shared_ptr<ImageView>         view;

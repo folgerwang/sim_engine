@@ -361,6 +361,7 @@ void VolumeCloud::recreate(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         display_size,
+        1,
         fog_cloud_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -371,6 +372,7 @@ void VolumeCloud::recreate(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         display_size,
+        1,
         blurred_fog_cloud_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),

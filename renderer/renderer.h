@@ -398,6 +398,7 @@ public:
         Format format,
         int tex_width,
         int tex_height,
+        int mip_levels,
         uint64_t buffer_size,
         const void* pixels,
         std::shared_ptr<Image>& texture_image,
@@ -408,13 +409,13 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         Format depth_format,
         const glm::uvec2& size,
+        const uint32_t& mip_levels,
         TextureInfo& texture_info,
         const renderer::ImageUsageFlags& usage,
         const renderer::ImageLayout& image_layout,
         const std::source_location& src_location,
         const renderer::ImageTiling image_tiling = renderer::ImageTiling::OPTIMAL,
-        const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-        bool with_mips = false);
+        const uint32_t memory_property = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
     static void dumpTextureImage(
         const std::shared_ptr<renderer::Device>& device,

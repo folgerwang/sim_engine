@@ -2279,16 +2279,23 @@ VkWriteDescriptorSet addDescriptWrite(
 void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const glm::vec3& tex_size,
+    const uint32_t& mip_levels,
     const renderer::Format& format,
     const renderer::ImageTiling& tiling,
     const renderer::ImageUsageFlags& usage,
     const renderer::MemoryPropertyFlags& properties,
     std::shared_ptr<renderer::Image>& image,
     std::shared_ptr<renderer::DeviceMemory>& image_memory,
-    const std::source_location& src_location,
-    bool with_mips/* = false*/) {
-    uint32_t mip_count =
-        with_mips ? uint32_t(std::log2(std::max(tex_size.x, tex_size.y))) : 1;
+    const std::source_location& src_location) {
+
+    bool mip_count = 1;
+    if (mip_levels == (uint32_t)-1) {
+        mip_count = uint32_t(std::log2(std::max(tex_size.x, tex_size.y))) + 1;
+    }
+    else {
+        mip_count = std::max(mip_levels, 1u);
+    }
+
     image = device->createImage(
         tex_size.z > 1 ?
             renderer::ImageType::TYPE_3D :

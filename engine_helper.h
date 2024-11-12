@@ -44,6 +44,7 @@ void readFile(
 void loadDdsTexture(
     renderer::Format& format,
     glm::uvec3& image_size,
+    uint32_t& mip_levels,
     std::vector<char>& buffer_data,
     const std::string& input_filename);
 

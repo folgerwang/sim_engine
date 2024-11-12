@@ -522,6 +522,7 @@ void RayTracingCallableTest::createRtResources(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         rt_size_,
+        1,
         rt_render_info->result_image,
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),

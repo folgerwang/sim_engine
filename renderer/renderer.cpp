@@ -394,9 +394,11 @@ void Helper::create2DTextureImage(
         image_size,
         pixels);
 
+    const uint32_t mip_levels = 0;
     vk::helper::createTextureImage(
         device,
         glm::vec3(tex_width, tex_height, 1),
+        mip_levels,
         format,
         ImageTiling::OPTIMAL,
         SET_2_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, SAMPLED_BIT),
@@ -434,6 +436,7 @@ void Helper::create2DTextureImage(
     Format format,
     int tex_width,
     int tex_height,
+    int mip_levels,
     uint64_t buffer_size,
     const void* pixels,
     std::shared_ptr<Image>& texture_image,
@@ -462,6 +465,7 @@ void Helper::create2DTextureImage(
     vk::helper::createTextureImage(
         device,
         glm::vec3(tex_width, tex_height, 1),
+        mip_levels,
         format,
         ImageTiling::OPTIMAL,
         SET_2_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, SAMPLED_BIT),
@@ -498,25 +502,25 @@ void Helper::create2DTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     Format format,
     const glm::uvec2& size,
+    const uint32_t& mip_levels,
     TextureInfo& texture_2d,
     const renderer::ImageUsageFlags& usage,
     const renderer::ImageLayout& image_layout,
     const std::source_location& src_location,
     const renderer::ImageTiling image_tiling/* = renderer::ImageTiling::OPTIMAL*/,
-    const uint32_t memory_property/* = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT) */,
-    bool with_mips/* = false*/) {
+    const uint32_t memory_property/* = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT) */) {
     auto is_depth = vk::helper::isDepthFormat(format);
     vk::helper::createTextureImage(
         device,
         glm::uvec3(size, 1),
+        mip_levels,
         format,
         image_tiling,
         usage,
         memory_property,
         texture_2d.image,
         texture_2d.memory,
-        src_location,
-        with_mips);
+        src_location);
 
     texture_2d.view =
         device->createImageView(
@@ -599,9 +603,11 @@ void Helper::create3DTextureImage(
     const renderer::ImageTiling image_tiling/* = renderer::ImageTiling::OPTIMAL*/,
     const uint32_t memory_property/* = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT)*/) {
     auto is_depth = vk::helper::isDepthFormat(format);
+    const uint32_t mip_levels = 0;
     vk::helper::createTextureImage(
         device,
         size,
+        mip_levels,
         format,
         image_tiling,
         usage,
@@ -639,6 +645,7 @@ void Helper::createDepthResources(
         device,
         format,
         size,
+        1,
         texture_2d,
         SET_FLAG_BIT(ImageUsage, DEPTH_STENCIL_ATTACHMENT_BIT) |
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT),

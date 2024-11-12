@@ -88,6 +88,7 @@ void createTextureImage(
         loadDdsTexture(
             actual_format,
             texture.size,
+            texture.mip_levels,
             buffer_data,
             file_name);
 
@@ -133,6 +134,7 @@ void createTextureImage(
             format,
             tex_width,
             tex_height,
+            texture.mip_levels,
             buffer_data.size() - sizeof(helper::DDS_HEADER),
             void_pixels,
             texture.image,
@@ -160,7 +162,9 @@ void createTextureImage(
         renderer::ImageViewType::VIEW_2D,
         format,
         SET_FLAG_BIT(ImageAspect, COLOR_BIT),
-        src_location);
+        src_location,
+        0,
+        texture.mip_levels);
 }
 
 std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
@@ -264,6 +268,7 @@ void loadMtx2Texture(
 void loadDdsTexture(
     renderer::Format& format,
     glm::uvec3& image_size,
+    uint32_t& mip_levels,
     std::vector<char>& buffer_data,
     const std::string& input_filename) {
 
@@ -276,6 +281,9 @@ void loadDdsTexture(
     DDS_HEADER* dds_header =
         (DDS_HEADER*)buffer_data.data();
 
+    assert(dds_header->dwSize == 124);
+    assert(dds_header->ddspf.dwSize == 32);
+
     // Extract width, height, and pixel format
     uint32_t width = dds_header->dwWidth;
     uint32_t height = dds_header->dwHeight;
@@ -283,13 +291,22 @@ void loadDdsTexture(
     uint32_t fourCC = dds_header->ddspf.dwFourCC;
 
     const uint32_t DDPF_FOURCC = 0x00000004;
-    bool compressed = (dds_header->ddspf.dwFlags & DDPF_FOURCC) != 0;
+    bool compressed =
+        (dds_header->ddspf.dwFlags & DDPF_FOURCC) != 0;
+    auto compress_format =
+        std::string((char*)&dds_header->ddspf.dwFourCC);
+
+#define FOURCC_DX10 0x30315844 
+    bool has_DX10_header =
+        compressed &&
+        compress_format == "DX10";
+    assert(!has_DX10_header);
+
+    mip_levels = dds_header->dwMipMapCount;
 
     format = renderer::Format::R8G8B8A8_UNORM;
     uint32_t data_size = 0;
     if (compressed) {
-        auto compress_format =
-            std::string((char*)&dds_header->ddspf.dwFourCC);
         if (compress_format == "DXT1") {
             format = renderer::Format::BC1_RGB_UNORM_BLOCK;
         }

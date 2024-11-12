@@ -512,6 +512,7 @@ void RayTracingShadowTest::createRtResources(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         rt_size_,
+        1,
         rt_render_info->result_image,
         SET_3_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT, TRANSFER_SRC_BIT),
         renderer::ImageLayout::GENERAL,

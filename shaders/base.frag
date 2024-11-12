@@ -108,4 +108,5 @@ void main() {
 #else
     outColor = baseColor;
 #endif // NO_MTL
+    outColor = baseColor;
 }

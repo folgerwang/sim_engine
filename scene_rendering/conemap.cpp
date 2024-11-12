@@ -194,6 +194,7 @@ Conemap::Conemap(
         device,
         renderer::Format::R32_SINT,
         glm::uvec2(kConemapGenBlockSizeX, kConemapGenBlockSizeY),
+        1,
         *conemap_temp_tex_[0],
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -204,6 +205,7 @@ Conemap::Conemap(
         device,
         renderer::Format::R32_SINT,
         glm::uvec2(kConemapGenBlockSizeX, kConemapGenBlockSizeY),
+        1,
         *conemap_temp_tex_[1],
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),

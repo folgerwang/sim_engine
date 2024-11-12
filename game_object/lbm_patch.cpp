@@ -107,13 +107,13 @@ LbmPatch::LbmPatch(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
         patch_size,
+        (uint32_t)-1,
         *lbm_patch_tex_,
         SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT),
         renderer::ImageLayout::GENERAL,
         std::source_location::current(),
         renderer::ImageTiling::OPTIMAL,
-        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-        true);
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT));
 
     lbm_patch_desc_set_layout_ =
         createLbmPatchDescriptorSetLayout(

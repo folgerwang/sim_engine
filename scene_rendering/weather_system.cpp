@@ -369,6 +369,7 @@ WeatherSystem::WeatherSystem(
         glm::uvec2(
             kAirflowBufferWidth * 8,
             kAirflowBufferWidth * 8),
+        1,
         temp_ground_airflow_info_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -381,6 +382,7 @@ WeatherSystem::WeatherSystem(
         glm::uvec2(
             kAirflowBufferWidth,
             kAirflowBufferWidth),
+        1,
         ground_airflow_info_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),

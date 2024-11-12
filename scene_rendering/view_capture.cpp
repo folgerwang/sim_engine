@@ -24,6 +24,7 @@ ViewCapture::ViewCapture(
         device,
         color_format_,
         view_size,
+        1,
         color_buffer_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT) |
@@ -37,6 +38,7 @@ ViewCapture::ViewCapture(
             device,
             color_format_,
             view_size,
+            1,
             color_buffer_copy_,
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, TRANSFER_DST_BIT),
@@ -57,6 +59,7 @@ ViewCapture::ViewCapture(
             device,
             renderer::Format::D32_SFLOAT,
             view_size,
+            1,
             depth_buffer_copy_,
             SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
             SET_FLAG_BIT(ImageUsage, DEPTH_STENCIL_ATTACHMENT_BIT) |

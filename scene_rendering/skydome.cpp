@@ -341,6 +341,7 @@ Skydome::Skydome(
         device,
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(kAtmosphereScatteringLutWidth, kAtmosphereScatteringLutHeight),
+        1,
         sky_scattering_lut_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),
@@ -351,6 +352,7 @@ Skydome::Skydome(
         device,
         renderer::Format::R16G16_SFLOAT,
         glm::uvec2(kAtmosphereScatteringLutWidth, kAtmosphereScatteringLutHeight / 64),
+        1,
         sky_scattering_lut_sum_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, STORAGE_BIT),

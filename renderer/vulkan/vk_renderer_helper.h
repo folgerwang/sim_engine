@@ -189,14 +189,14 @@ VkWriteDescriptorSet addDescriptWrite(
 void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const glm::vec3& tex_size,
+    const uint32_t& mip_levels,
     const renderer::Format& format,
     const renderer::ImageTiling& tiling,
     const renderer::ImageUsageFlags& usage,
     const renderer::MemoryPropertyFlags& properties,
     std::shared_ptr<renderer::Image>& image,
     std::shared_ptr<renderer::DeviceMemory>& image_memory,
-    const std::source_location& src_location,
-    bool with_mips = false);
+    const std::source_location& src_location);
 
 void copyBuffer(
     const std::shared_ptr<renderer::Device>& device,
