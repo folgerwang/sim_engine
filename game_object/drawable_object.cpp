@@ -1400,7 +1400,11 @@ static void updateDescriptorSets(
             descriptor_pool, material_desc_set_layout, 1)[0];
 
         // create a global ibl texture descriptor set.
-        auto material_descs = addDrawableTextures(drawable_object, material, texture_sampler, thin_film_lut_tex);
+        auto material_descs = addDrawableTextures(
+            drawable_object,
+            material,
+            texture_sampler,
+            thin_film_lut_tex);
 
         device->updateDescriptorSets(material_descs);
     }
