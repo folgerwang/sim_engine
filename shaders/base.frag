@@ -108,7 +108,6 @@ void main() {
 #else
     outColor = baseColor;
 #endif // NO_MTL
-    outColor = baseColor;
 
     if (baseColor.a < 0.1) {
 		discard;

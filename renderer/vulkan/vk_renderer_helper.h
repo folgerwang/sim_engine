@@ -238,7 +238,9 @@ void copyBufferToImage(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::shared_ptr<renderer::Image>& image,
-    const glm::uvec3& tex_size);
+    const renderer::Format& format,
+    const glm::uvec3& tex_size,
+    const uint32_t& mip_levels);
 
 void copyImageToBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

@@ -2288,7 +2288,7 @@ void createTextureImage(
     std::shared_ptr<renderer::DeviceMemory>& image_memory,
     const std::source_location& src_location) {
 
-    bool mip_count = 1;
+    uint32_t mip_count = 1;
     if (mip_levels == (uint32_t)-1) {
         mip_count = uint32_t(std::log2(std::max(tex_size.x, tex_size.y))) + 1;
     }
@@ -2521,20 +2521,39 @@ void copyBufferToImage(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::Buffer>& buffer,
     const std::shared_ptr<renderer::Image>& image,
-    const glm::uvec3& tex_size) {
-    std::vector<renderer::BufferImageCopyInfo> copy_regions(1);
-    auto& region = copy_regions[0];
-    region.buffer_offset = 0;
-    region.buffer_row_length = 0;
-    region.buffer_image_height = 0;
+    const renderer::Format& format,
+    const glm::uvec3& tex_size,
+    const uint32_t& mip_levels) {
+    std::vector<renderer::BufferImageCopyInfo> copy_regions;
+    auto mip_count = std::max(mip_levels, 1u);
+    copy_regions.resize(mip_count);
 
-    region.image_subresource.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
-    region.image_subresource.mip_level = 0;
-    region.image_subresource.base_array_layer = 0;
-    region.image_subresource.layer_count = 1;
+    size_t offset = 0;
+    for (uint32_t i_mip = 0; i_mip < mip_count; i_mip++) {
+        auto& region = copy_regions[i_mip];
 
-    region.image_offset = glm::ivec3(0, 0, 0);
-    region.image_extent = tex_size;
+        int32_t mip_width = std::max(tex_size.x >> i_mip, 1u);
+        int32_t mip_height = std::max(tex_size.y >> i_mip, 1u);
+
+        // Calculate the size of the current mip level in blocks
+        uint32_t block_width = (mip_width + 3) / 4;
+        uint32_t block_height = (mip_height + 3) / 4;
+        uint32_t block_size = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
+        size_t mip_size = block_width * block_height * block_size;
+
+        region.buffer_offset = offset;
+        region.buffer_row_length = 0;
+        region.buffer_image_height = 0;
+
+        region.image_subresource.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
+        region.image_subresource.mip_level = i_mip;
+        region.image_subresource.base_array_layer = 0;
+        region.image_subresource.layer_count = 1;
+
+        region.image_offset = glm::ivec3(0, 0, 0);
+        region.image_extent = glm::ivec3(mip_width, mip_height, 1);
+        offset += mip_size;
+    }
 
     copyBufferToImageWithMips(cmd_buf, buffer, image, copy_regions);
 }

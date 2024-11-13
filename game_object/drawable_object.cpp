@@ -453,7 +453,6 @@ static void setupMeshState(
         texture_map[hash_value] = uint32_t(i_tex);
 
         glm::uvec3 size(0);
-        void* image_data = nullptr;
         auto format = renderer::Format::R8G8B8A8_UNORM;
         helper::createTextureImage(
             device, 

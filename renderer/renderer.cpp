@@ -414,11 +414,15 @@ void Helper::create2DTextureImage(
         format,
         ImageLayout::UNDEFINED,
         ImageLayout::TRANSFER_DST_OPTIMAL);
+
     vk::helper::copyBufferToImage(
         cmd_buf,
         staging_buffer,
         texture_image,
-        glm::uvec3(tex_width, tex_height, 1));
+        format,
+        glm::uvec3(tex_width, tex_height, 1),
+        mip_levels);
+
     vk::helper::transitionImageLayout(
         cmd_buf,
         texture_image,
@@ -481,11 +485,15 @@ void Helper::create2DTextureImage(
         format,
         ImageLayout::UNDEFINED,
         ImageLayout::TRANSFER_DST_OPTIMAL);
+
     vk::helper::copyBufferToImage(
         cmd_buf,
         staging_buffer,
         texture_image,
-        glm::uvec3(tex_width, tex_height, 1));
+        format,
+        glm::uvec3(tex_width, tex_height, 1),
+        mip_levels);
+
     vk::helper::transitionImageLayout(
         cmd_buf,
         texture_image,
