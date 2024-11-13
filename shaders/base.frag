@@ -5,6 +5,9 @@
 #include "brdf.glsl.h"
 #include "punctual.glsl.h"
 
+#define DEBUG_BASE_COLOR 1
+#define DEBUG_MIP_LEVEL 0
+
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	ViewCameraInfo camera_info;
 };
@@ -112,4 +115,14 @@ void main() {
     if (baseColor.a < 0.1) {
 		discard;
 	}
+#if DEBUG_BASE_COLOR
+    outColor = baseColor;
+#endif
+
+#if DEBUG_MIP_LEVEL
+#ifndef NO_MTL// Debugging: show mip level
+    float lod = textureQueryLod(albedo_tex, ps_in_data.vertex_tex_coord.xy).x;
+    outColor.xyz = vec3(lod / 10.0f);
+#endif
+#endif
 }
