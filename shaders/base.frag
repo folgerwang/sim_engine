@@ -116,7 +116,7 @@ void main() {
 		discard;
 	}
 #if DEBUG_BASE_COLOR
-    outColor = baseColor;
+    outColor.xyz = baseColor.xyz;
 #endif
 
 #if DEBUG_MIP_LEVEL

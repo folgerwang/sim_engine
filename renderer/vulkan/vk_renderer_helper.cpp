@@ -2538,7 +2538,9 @@ void copyBufferToImage(
         // Calculate the size of the current mip level in blocks
         uint32_t block_width = (mip_width + 3) / 4;
         uint32_t block_height = (mip_height + 3) / 4;
-        uint32_t block_size = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
+        uint32_t block_size =
+            (format == renderer::Format::BC1_RGB_UNORM_BLOCK ||
+             format == renderer::Format::BC1_RGB_SRGB_BLOCK) ? 8 : 16;
         size_t mip_size = block_width * block_height * block_size;
 
         region.buffer_offset = offset;

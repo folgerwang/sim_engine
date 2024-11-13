@@ -319,7 +319,9 @@ void loadDdsTexture(
         else {
             assert(0);
         }
-        uint32_t block_size = (format == renderer::Format::BC1_RGB_UNORM_BLOCK) ? 8 : 16;
+        uint32_t block_size =
+            (format == renderer::Format::BC1_RGB_UNORM_BLOCK ||
+             format == renderer::Format::BC1_RGB_SRGB_BLOCK) ? 8 : 16;
         auto pitch = ((dds_header->dwWidth + 3) / 4) * block_size;
         data_size = pitch * ((dds_header->dwHeight + 3) / 4);
     }
