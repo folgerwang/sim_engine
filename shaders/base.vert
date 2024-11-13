@@ -126,7 +126,11 @@ void main() {
     out_data.vertex_position = position_ws;
     out_data.vertex_tex_coord = vec4(0);
 #ifdef HAS_UV_SET0
-    out_data.vertex_tex_coord.xy = in_tex_coord;
+    out_data.vertex_tex_coord.xy = in_tex_coord.xy;
+    if ((model_params.flip_uv_coord & 0x01) != 0)
+        out_data.vertex_tex_coord.x = 1.0f - in_tex_coord.x;
+    if ((model_params.flip_uv_coord & 0x02) != 0)
+        out_data.vertex_tex_coord.y = 1.0f - in_tex_coord.y;
 #endif
 #ifdef HAS_UV_SET1
     out_data.vertex_tex_coord.zw = in_tex_coord;

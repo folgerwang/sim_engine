@@ -1521,6 +1521,9 @@ static void drawNodes(
         if (node.mesh_idx_ >= 0) {
             glsl::ModelParams model_params{};
             model_params.model_mat = node.cached_matrix_;
+            model_params.flip_uv_coord =
+                (drawable_object->m_flip_u_ ? 0x01 : 0x00) |
+                (drawable_object->m_flip_v_ ? 0x02 : 0x00);
 
             drawMesh(cmd_buf,
                 drawable_object,
@@ -2796,6 +2799,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
 
     auto drawable_object = std::make_shared<ego::DrawableData>(device);
     drawable_object->meshes_.reserve(fbx_scene->meshes.count);
+
+    drawable_object->m_flip_v_ = true;
 
     setupMeshState(device, fbx_scene, drawable_object);
     setupMeshes(device, fbx_scene, drawable_object);

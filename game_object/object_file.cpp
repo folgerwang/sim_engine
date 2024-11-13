@@ -514,6 +514,7 @@ void ObjectMesh::draw(
             glm::vec4(0, 0, 1, 0),
             glm::vec4(0, -1, 0, 0),
             glm::vec4(0, 0, 0, 1));
+    model_params.flip_uv_coord = 0;
 
     cmd_buf->pushConstants(
         SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),

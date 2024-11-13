@@ -130,6 +130,8 @@ struct SceneInfo {
 struct DrawableData {
     const std::shared_ptr<renderer::Device>& device_;
     bool m_use_local_matrix_only_ = false;
+    bool m_flip_u_ = false;
+    bool m_flip_v_ = false;
 
     int32_t                     default_scene_ = 0;
     std::vector<SceneInfo>      scenes_;

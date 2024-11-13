@@ -282,6 +282,8 @@ struct ViewParams {
 
 struct ModelParams {
     mat4 model_mat;
+    uint flip_uv_coord;
+    vec3 pad;
 };
 
 struct PrtLightParams {
