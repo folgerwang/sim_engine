@@ -222,6 +222,8 @@ static void setupMeshState(
                 src_material.emissiveFactor[1],
                 src_material.emissiveFactor[2]);
 
+            ubo.emissive_color = glm::vec3(1.0f);
+
             ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);
             ubo.exposure = 1.0f;
             ubo.material_features = (src_material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
@@ -444,13 +446,41 @@ static void setupMeshState(
     // allocate texture memory at first.
     std::vector<size_t> texture_hash_table;
     std::unordered_map<size_t, uint32_t> texture_map;
+    std::vector<bool> texture_is_srgb;
     drawable_object->textures_.resize(fbx_scene->textures.count);
+    texture_is_srgb.resize(fbx_scene->textures.count);
+
+    // create texture name hash table.
+    for (size_t i_tex = 0; i_tex < fbx_scene->textures.count; i_tex++) {
+        const auto& src_tex = fbx_scene->textures[i_tex];
+        auto hash_value = str_hash(src_tex->filename.data);
+        texture_map[hash_value] = uint32_t(i_tex);
+        texture_is_srgb[i_tex] = false;
+    }
+
+    // mark texture as srgb.
+    for (size_t i_mat = 0; i_mat < fbx_scene->materials.count; i_mat++) {
+        const auto& src_material = fbx_scene->materials[i_mat];
+
+        for (int i = 0; i < src_material->textures.count; i++) {
+            auto tex = src_material->textures[i];
+            const auto& texture_string =
+                std::string(tex.material_prop.data);
+            const auto& texture_name =
+                std::string(tex.texture->filename.data);
+
+            auto tex_id = texture_map[str_hash(texture_name)];
+
+            if (texture_string == "DiffuseColor" ||
+                texture_string == "EmissiveColor") {
+                texture_is_srgb[tex_id] = true;
+            }
+        }
+    }
 
     for (size_t i_tex = 0; i_tex < fbx_scene->textures.count; i_tex++) {
         auto& dst_tex = drawable_object->textures_[i_tex];
         const auto& src_tex = fbx_scene->textures[i_tex];
-        auto hash_value = str_hash(src_tex->filename.data);
-        texture_map[hash_value] = uint32_t(i_tex);
 
         glm::uvec3 size(0);
         auto format = renderer::Format::R8G8B8A8_UNORM;
@@ -458,6 +488,7 @@ static void setupMeshState(
             device, 
             src_tex->filename.data,
             format,
+            texture_is_srgb[i_tex],
             dst_tex,
             std::source_location::current());
     }
@@ -519,52 +550,67 @@ static void setupMeshState(
                 std::source_location::current());
 
             glsl::PbrMaterialParams ubo{};
-            auto base_factor = src_material->pbr.base_factor;
-            ubo.base_color_factor = glm::vec4(1.0f);
+            const auto& base_factor = src_material->pbr.base_factor;
+            ubo.base_color_factor = glm::vec4(0.0f);
             if (base_factor.has_value) {
                 ubo.base_color_factor =
-                    glm::vec4(float(src_material->pbr.base_factor.value_vec4.x));
+                    glm::vec4(float(base_factor.value_vec4.x));
                 if (base_factor.value_components > 1) {
                     ubo.base_color_factor.y =
-                        float(src_material->pbr.base_factor.value_vec4.y);
+                        float(base_factor.value_vec4.y);
                 }
                 if (base_factor.value_components > 2) {
                     ubo.base_color_factor.z =
-                        float(src_material->pbr.base_factor.value_vec4.z);
+                        float(base_factor.value_vec4.z);
                 }
                 if (base_factor.value_components > 3) {
                     ubo.base_color_factor.w =
-                        float(src_material->pbr.base_factor.value_vec4.w);
+                        float(base_factor.value_vec4.w);
                 }
             }
 
-            auto emission_factor = src_material->pbr.emission_factor;
-            ubo.emissive_factor = glm::vec3(1.0f);
+            const auto& emission_factor = src_material->pbr.emission_factor;
+            ubo.emissive_factor = glm::vec3(0.0f);
             if (emission_factor.has_value) {
                 ubo.emissive_factor =
-                    glm::vec4(float(src_material->pbr.emission_factor.value_vec4.x));
+                    glm::vec4(float(emission_factor.value_vec4.x));
                 if (emission_factor.value_components > 1) {
                     ubo.emissive_factor.y =
-                        float(src_material->pbr.emission_factor.value_vec4.y);
+                        float(emission_factor.value_vec4.y);
                 }
                 if (emission_factor.value_components > 2) {
                     ubo.emissive_factor.z =
-                        float(src_material->pbr.emission_factor.value_vec4.z);
+                        float(emission_factor.value_vec4.z);
                 }
             }
 
-            auto specular_factor = src_material->pbr.specular_factor;
+            const auto& emission_color = src_material->pbr.emission_color;
+            ubo.emissive_color = glm::vec3(0.0f);
+            if (emission_color.has_value) {
+                ubo.emissive_color =
+                    glm::vec4(float(emission_color.value_vec4.x));
+                if (emission_color.value_components > 1) {
+                    ubo.emissive_color.y =
+                        float(emission_color.value_vec4.y);
+                }
+                if (emission_color.value_components > 2) {
+                    ubo.emissive_color.z =
+                        float(emission_color.value_vec4.z);
+                }
+            }
+
+            const auto& specular_factor = src_material->pbr.specular_factor;
             ubo.specular_factor = glm::vec3(1.0f);
             if (specular_factor.has_value) {
                 ubo.specular_factor =
-                    glm::vec4(float(src_material->pbr.specular_factor.value_vec4.x));
+                    glm::vec4(float(specular_factor.value_vec4.x));
                 if (specular_factor.value_components > 1) {
                     ubo.specular_factor.y =
-                        float(src_material->pbr.specular_factor.value_vec4.y);
+                        float(specular_factor.value_vec4.y);
                 }
                 if (specular_factor.value_components > 2) {
                     ubo.specular_factor.z =
-                        float(src_material->pbr.specular_factor.value_vec4.z);
+                        float(specular_factor.value_vec4.z);
                 }
             }
 
@@ -593,7 +639,7 @@ static void setupMeshState(
                 float(src_material->pbr.specular_factor.value_real) :
                 1.0f;
 
-            ubo.alpha_cutoff = 0.5f;
+            ubo.alpha_cutoff = 0.1f;
             ubo.mip_count = 11;
             ubo.normal_scale = 1.0f;
             ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);

@@ -849,6 +849,10 @@ void layerBlending(
             sRGBToLinear(texture(emissive_tex, getEmissiveUV(in_data, in_material))).rgb;
 #endif
     }
+    else {
+        color_info.f_emissive *=
+            in_material.emissive_color;
+    }
 
     ///
     /// Layer blending
@@ -896,11 +900,11 @@ vec3 getFinalColor(
                 clampedDot(in_material_info.clearcoatNormal, view_dir));
     }
 
-    vec3 color = 
+    vec3 color =
         (in_color_info.f_emissive +
          in_color_info.f_diffuse +
          in_color_info.f_specular +
-         in_color_info.f_subsurface +
+         //in_color_info.f_subsurface +
          (1.0 - in_material_info.reflectance) * in_color_info.f_sheen) * (1.0 - clearcoatFactor * clearcoatFresnel) +
         in_color_info.f_clearcoat * clearcoatFactor;
 

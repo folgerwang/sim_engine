@@ -618,6 +618,9 @@ struct PbrMaterialParams {
     vec3            emissive_factor;
     uint            tonemap_type;
 
+    vec3            emissive_color;
+    uint            pad_2;
+
     Light           lights[LIGHT_COUNT];
 
     mat3            base_color_uv_transform;

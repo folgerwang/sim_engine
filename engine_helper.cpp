@@ -10,6 +10,7 @@
 
 #include "engine_helper.h"
 #include "renderer/renderer.h"
+#include "dds.h"
 
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
@@ -65,6 +66,7 @@ void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     const renderer::Format& input_format,
+    bool is_srgb_texture,
     renderer::TextureInfo& texture,
     const std::source_location& src_location) {
 
@@ -87,6 +89,7 @@ void createTextureImage(
             renderer::Format::R8G8B8A8_UNORM;
         loadDdsTexture(
             actual_format,
+            is_srgb_texture,
             texture.size,
             texture.mip_levels,
             buffer_data,
@@ -267,6 +270,7 @@ void loadMtx2Texture(
 
 void loadDdsTexture(
     renderer::Format& format,
+    bool is_srgb_texture,
     glm::uvec3& image_size,
     uint32_t& mip_levels,
     std::vector<char>& buffer_data,
@@ -308,10 +312,14 @@ void loadDdsTexture(
     uint32_t data_size = 0;
     if (compressed) {
         if (compress_format == "DXT1") {
-            format = renderer::Format::BC1_RGB_UNORM_BLOCK;
+            format = is_srgb_texture ?
+                renderer::Format::BC1_RGB_SRGB_BLOCK :
+                renderer::Format::BC1_RGB_UNORM_BLOCK;
         }
         else if (compress_format == "DXT5") {
-            format = renderer::Format::BC3_UNORM_BLOCK;
+            format = is_srgb_texture ?
+                renderer::Format::BC3_SRGB_BLOCK :
+                renderer::Format::BC3_UNORM_BLOCK;
         }
         else if (compress_format == "ATI2A2XY") {
             format = renderer::Format::BC5_UNORM_BLOCK;

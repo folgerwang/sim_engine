@@ -333,24 +333,28 @@ void ObjectMesh::loadObjectFile(
         device,
         "assets/lungs/lungs_default_Diffuse.png",
         format,
+        true,
         *diffuse_tex_,
         std::source_location::current());
     engine::helper::createTextureImage(
         device,
         "assets/lungs/lungs_default_Normal.png",
         format,
+        false,
         *normal_tex_,
         std::source_location::current());
     engine::helper::createTextureImage(
         device,
         "assets/lungs/lungs_default_Glossiness.png",
         format,
+        false,
         *glossiness_tex_,
         std::source_location::current());
     engine::helper::createTextureImage(
         device,
         "assets/lungs/lungs_default_Specular.png",
         format,
+        false,
         *specular_tex_,
         std::source_location::current());
 

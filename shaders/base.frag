@@ -5,7 +5,9 @@
 #include "brdf.glsl.h"
 #include "punctual.glsl.h"
 
-#define DEBUG_BASE_COLOR 1
+#define ALPHAMODE_MASK 1
+
+#define DEBUG_BASE_COLOR 0
 #define DEBUG_MIP_LEVEL 0
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
@@ -29,16 +31,15 @@ layout(location = 0) out vec4 outColor;
 void main() {
 #ifndef NO_MTL
     vec4 baseColor = getBaseColor(ps_in_data, material);
+#ifdef ALPHAMODE_OPAQUE
+    baseColor.a = 1.0;
+#endif // ALPHAMODE_OPAQUE
 #else
     vec4 baseColor = vec4(0);
 #endif
     
 
 #ifndef NO_MTL
-#ifdef ALPHAMODE_OPAQUE
-    baseColor.a = 1.0;
-#endif // ALPHAMODE_OPAQUE
-
 #ifdef MATERIAL_UNLIT
     outColor = (vec4(linearTosRGB(baseColor.rgb), baseColor.a));
     return;
@@ -97,8 +98,9 @@ void main() {
             material_info,
             v);
 
+
 #ifdef ALPHAMODE_MASK
-    // Late discard to avaoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
+    // Late discard to avoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
     if(baseColor.a < material.alpha_cutoff)
     {
         discard;
@@ -112,9 +114,6 @@ void main() {
     outColor = baseColor;
 #endif // NO_MTL
 
-    if (baseColor.a < 0.1) {
-		discard;
-	}
 #if DEBUG_BASE_COLOR
     outColor.xyz = baseColor.xyz;
 #endif

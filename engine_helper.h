@@ -43,6 +43,7 @@ void readFile(
 
 void loadDdsTexture(
     renderer::Format& format,
+    bool is_srgb_texture,
     glm::uvec3& image_size,
     uint32_t& mip_levels,
     std::vector<char>& buffer_data,
@@ -59,6 +60,7 @@ void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     const renderer::Format& format,
+    bool is_srgb_texture,
     renderer::TextureInfo& texture,
     const std::source_location& src_location);
 

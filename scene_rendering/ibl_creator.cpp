@@ -171,6 +171,7 @@ IblCreator::IblCreator(
         device,
         "assets/environments/doge2.hdr",
         format,
+        false,
         panorama_tex_,
         std::source_location::current());
 
