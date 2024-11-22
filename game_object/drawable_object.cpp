@@ -233,6 +233,8 @@ static void setupMeshState(
             ubo.material_features |= (src_material.normalTexture.index >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
+            ubo.specular_color = glm::vec3(1.0f, 1.0f, 1.0f);
+            ubo.specular_exponent = 1.0f;
             for (int l = 0; l < LIGHT_COUNT; l++) {
                 ubo.lights[l].type = glsl::LightType_Directional;
                 ubo.lights[l].color = glm::vec3(1, 0, 0);
@@ -599,7 +601,7 @@ static void setupMeshState(
                 }
             }
 
-            const auto& specular_factor = src_material->pbr.specular_factor;
+            const auto& specular_factor = src_material->fbx.specular_factor;
             ubo.specular_factor = glm::vec3(1.0f);
             if (specular_factor.has_value) {
                 ubo.specular_factor =
@@ -613,6 +615,23 @@ static void setupMeshState(
                         float(specular_factor.value_vec4.z);
                 }
             }
+
+            const auto& specular_color = src_material->fbx.specular_color;
+            ubo.specular_color = glm::vec3(1.0f);
+            if (specular_color.has_value) {
+                ubo.specular_color =
+                    glm::vec4(float(specular_color.value_vec4.x));
+                if (specular_color.value_components > 1) {
+                    ubo.specular_color.y =
+                        float(specular_color.value_vec4.y);
+                }
+                if (specular_color.value_components > 2) {
+                    ubo.specular_color.z =
+                        float(specular_color.value_vec4.z);
+                }
+            }
+
+            const auto& specular_exponent = src_material->fbx.specular_exponent;
 
             ubo.glossiness_factor =
                 src_material->pbr.glossiness.has_value ?

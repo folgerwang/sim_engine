@@ -582,6 +582,9 @@ struct PbrMaterialParams {
     vec3            specular_factor;
     float           sheen_intensity_factor;
 
+    vec3            specular_color;
+    float           specular_exponent;
+
     vec3            sheen_color_factor;
     float           sheen_roughness;
 
@@ -611,7 +614,7 @@ struct PbrMaterialParams {
     uvec4           uv_set_flags;
 
     uint            material_features;
-    uint            pad_1;
+    uint            pad_2;
     float           normal_scale;
     float           occlusion_strength;
 
@@ -619,7 +622,7 @@ struct PbrMaterialParams {
     uint            tonemap_type;
 
     vec3            emissive_color;
-    uint            pad_2;
+    uint            pad_3;
 
     Light           lights[LIGHT_COUNT];
 
