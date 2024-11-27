@@ -1,5 +1,6 @@
 #ifndef NO_MTL
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D albedo_tex;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = SPECULAR_TEX_INDEX) uniform sampler2D specular_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = NORMAL_TEX_INDEX) uniform sampler2D normal_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = METAL_ROUGHNESS_TEX_INDEX) uniform sampler2D metallic_roughness_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = EMISSIVE_TEX_INDEX) uniform sampler2D emissive_tex;

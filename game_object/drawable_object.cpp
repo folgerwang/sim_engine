@@ -515,7 +515,7 @@ static void setupMeshState(
                     dst_material.base_color_idx_ = tex_id;
                 }
                 else if (texture_string == "SpecularColor") {
-                    dst_material.metallic_roughness_idx_ = tex_id;
+                    dst_material.specular_color_idx_ = tex_id;
                 }
                 else if (texture_string == "NormalMap") {
                     dst_material.normal_idx_ = tex_id;
@@ -671,6 +671,7 @@ static void setupMeshState(
             ubo.material_features |= (dst_material.emissive_idx_ >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
             ubo.material_features |= (dst_material.occlusion_idx_ >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
             ubo.material_features |= (dst_material.normal_idx_ >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
+            ubo.material_features |= (dst_material.specular_color_idx_ >= 0 ? FEATURE_MATERIAL_SPECULARGLOSSINESS : 0);
 
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
         }
@@ -1369,7 +1370,7 @@ static renderer::WriteDescriptorList addDrawableTextures(
     const renderer::TextureInfo& thin_film_lut_tex) {
 
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(11);
+    descriptor_writes.reserve(12);
     auto& textures = drawable_object->textures_;
 
     auto& black_tex = renderer::Helper::getBlackTexture();
@@ -1388,6 +1389,21 @@ static renderer::WriteDescriptorList addDrawableTextures(
         ALBEDO_TEX_INDEX,
         texture_sampler,
         base_color_tex_view.view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // normal.
+    auto& specular_tex_view =
+        material.specular_color_idx_ < 0 ?
+        black_tex :
+        textures[material.specular_color_idx_];
+
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        material.desc_set_,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        SPECULAR_TEX_INDEX,
+        texture_sampler,
+        specular_tex_view.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // normal.
@@ -1625,6 +1641,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createMaterialDescriptorSe
     bindings.push_back(ubo_pbr_layout_binding);
 
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALBEDO_TEX_INDEX));
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(SPECULAR_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(NORMAL_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(METAL_ROUGHNESS_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(EMISSIVE_TEX_INDEX));

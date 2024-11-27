@@ -9,6 +9,7 @@ struct MaterialInfo {
     int32_t                base_color_idx_ = -1;
     int32_t                normal_idx_ = -1;
     int32_t                metallic_roughness_idx_ = -1;
+    int32_t                specular_color_idx_ = -1;
     int32_t                emissive_idx_ = -1;
     int32_t                occlusion_idx_ = -1;
 

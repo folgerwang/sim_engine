@@ -124,4 +124,8 @@ void main() {
     outColor.xyz = vec3(lod / 10.0f);
 #endif
 #endif
+
+#ifndef NO_MTL
+    outColor.rgb = texture(specular_tex, ps_in_data.vertex_tex_coord.xy).rgb;
+#endif
 }
