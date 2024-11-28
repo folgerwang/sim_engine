@@ -515,7 +515,7 @@ static void setupMeshState(
                     dst_material.base_color_idx_ = tex_id;
                 }
                 else if (texture_string == "SpecularColor") {
-                    dst_material.specular_color_idx_ = tex_id;
+                    dst_material.metallic_roughness_idx_ = tex_id;
                 }
                 else if (texture_string == "NormalMap") {
                     dst_material.normal_idx_ = tex_id;

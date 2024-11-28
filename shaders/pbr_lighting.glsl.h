@@ -257,12 +257,12 @@ void getMetallicRoughnessInfo(
         // Roughness is stored in the 'g' channel, metallic is stored in the 'b' channel.
         // This layout intentionally reserves the 'r' channel for (optional) occlusion map data
         vec4 mrSample = texture(metallic_roughness_tex, getMetallicRoughnessUV(in_data, in_mat));
-        info.perceptualRoughness *= mrSample.g;
+        info.perceptualRoughness = mrSample.g;
         if (has_metallic_channel) {
-            info.metallic *= mrSample.b;
+            info.metallic = mrSample.b;
         }
         else {
-            info.metallic *= (1.0f - mrSample.g);
+            info.metallic = (1.0f - mrSample.g);
         }
     }
 
