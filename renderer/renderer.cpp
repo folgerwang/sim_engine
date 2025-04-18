@@ -980,7 +980,7 @@ ImTextureID Helper::addImTextureID(
     auto vk_sampler = RENDER_TYPE_CAST(Sampler, sampler) -> get();
     auto vk_image_view = RENDER_TYPE_CAST(ImageView, image_View)->get();
     
-    return ImGui_ImplVulkan_AddTexture(vk_sampler, vk_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return (ImTextureID)ImGui_ImplVulkan_AddTexture(vk_sampler, vk_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void Helper::submitQueue(
@@ -1129,7 +1129,7 @@ void Helper::initImgui(
     ImFontConfig config;
     config.OversampleH = 2;
     config.OversampleV = 1;
-    config.GlyphExtraSpacing.x = 1.0f;
+    config.GlyphExtraAdvanceX = 1.0f;
 
     const auto& font_path =
         std::string("src/sim_engine/third_parties/imgui/misc/fonts/");
