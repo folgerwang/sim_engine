@@ -13,16 +13,11 @@ namespace scene_rendering {
 TerrainSceneView::TerrainSceneView(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<ego::CameraObject>& camera_object,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<er::TextureInfo>& color_buffer = nullptr,
     const std::shared_ptr<er::TextureInfo>& depth_buffer = nullptr) :
-    ViewObject(device, descriptor_pool, color_buffer, depth_buffer) {
-
-    m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
-    m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
-    m_view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
-    m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
+    ViewObject(device, descriptor_pool, camera_object, color_buffer, depth_buffer) {
 
     auto color_no_blend_attachment =
         er::helper::fillPipelineColorBlendAttachmentState();
@@ -151,68 +146,6 @@ void TerrainSceneView::updateTileResDescriptorSet(
             rough_volume_noise_tex);
 }
 
-void TerrainSceneView::createCameraDescSetWithTerrain(
-    const std::shared_ptr<renderer::Sampler>& texture_sampler,
-    const renderer::TextureInfo& rock_layer,
-    const renderer::TextureInfo& soil_water_layer_0,
-    const renderer::TextureInfo& soil_water_layer_1,
-    const renderer::BufferInfo& game_objects_buffer) {
-    m_view_camera_->createViewCameraUpdateDescSet(
-        m_device_,
-        m_descriptor_pool_,
-        texture_sampler,
-        rock_layer,
-        soil_water_layer_0,
-        soil_water_layer_1,
-        game_objects_buffer);
-}
-
-void TerrainSceneView::updateCamera(
-    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const uint32_t& dbuf_idx,
-    const int& input_key,
-    const int& frame_count,
-    const float& delta_t,
-    const glm::vec2& last_mouse_pos,
-    const float& mouse_wheel_offset,
-    const bool& camera_rot_update) {
-
-    const float s_camera_speed = 10.0f;
-
-    m_view_camera_params_.camera_speed = s_camera_speed;
-
-    m_view_camera_params_.yaw = 0.0f;
-    m_view_camera_params_.pitch = -90.0f;
-    m_view_camera_params_.init_camera_dir =
-        normalize(ego::getDirectionByYawAndPitch(
-            m_view_camera_params_.yaw,
-            m_view_camera_params_.pitch));
-    m_view_camera_params_.init_camera_up =
-        abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
-        vec3(0, 1, 0) :
-        vec3(1, 0, 0);
-
-    m_view_camera_params_.z_near = 0.1f;
-    m_view_camera_params_.z_far = 40000.0f;
-    m_view_camera_params_.camera_follow_dist = 5.0f;
-    m_view_camera_params_.key = input_key;
-    m_view_camera_params_.frame_count = frame_count;
-    m_view_camera_params_.delta_t = delta_t;
-    m_view_camera_params_.mouse_pos = last_mouse_pos;
-    m_view_camera_params_.fov = glm::radians(45.0f);
-    m_view_camera_params_.aspect = m_buffer_size_.x / (float)m_buffer_size_.y;
-    m_view_camera_params_.sensitivity = 0.2f;
-    m_view_camera_params_.num_game_objs = static_cast<int32_t>(m_drawable_objects_.size());
-    m_view_camera_params_.game_obj_idx = 0;
-    m_view_camera_params_.camera_rot_update = camera_rot_update ? 1 : 0;
-    m_view_camera_params_.mouse_wheel_offset = mouse_wheel_offset;
-
-    m_view_camera_->updateViewCameraBuffer(
-        cmd_buf,
-        m_view_camera_params_,
-        dbuf_idx);
-}
-
 void TerrainSceneView::duplicateColorAndDepthBuffer(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
     er::ImageResourceInfo color_src_info = {
@@ -271,7 +204,7 @@ void TerrainSceneView::draw(
 
     const renderer::DescriptorSetList& tile_desc_set_list =
         { prt_desc_set,
-          getViewCameraDescriptorSet(),
+          m_camera_object_->getViewCameraDescriptorSet(),
           m_tile_res_desc_sets_[dbuf_idx] };
 
     cmd_buf->beginRenderPass(
@@ -298,7 +231,7 @@ void TerrainSceneView::draw(
                     m_tile_grass_pipeline_layout_,
                     m_tile_grass_pipeline_,
                     tile_desc_set_list,
-                    m_camera_pos_,
+                    m_camera_object_->getCameraPosition(),
                     m_buffer_size_,
                     delta_t,
                     cur_time);

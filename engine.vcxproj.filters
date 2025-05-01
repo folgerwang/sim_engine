@@ -180,6 +180,9 @@
     <ClCompile Include="scene_rendering\object_scene_view.cpp">
       <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\camera_object.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -358,6 +361,9 @@
     </ClInclude>
     <ClInclude Include="scene_rendering\object_scene_view.h">
       <Filter>Header Files\engine\scene_rendering</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\camera_object.h">
+      <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

@@ -32,38 +32,15 @@ createViewCameraDescSetLayout(
 
 namespace game_object {
 
-std::shared_ptr<er::DescriptorSetLayout>
-    ViewObject::s_view_camera_desc_set_layout_;
-
-std::shared_ptr<er::DescriptorSetLayout>
-ViewObject::getViewCameraDescriptorSetLayout() {
-    assert(s_view_camera_desc_set_layout_ != nullptr);
-    return s_view_camera_desc_set_layout_;
-}
-
-void ViewObject::createViewCameraDescriptorSetLayout(
-    const std::shared_ptr<er::Device>& device) {
-    if (s_view_camera_desc_set_layout_ == nullptr) {
-        s_view_camera_desc_set_layout_ =
-            createViewCameraDescSetLayout(device);
-    }
-}
-
-glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
-    glm::vec3 direction;
-    direction.x = cos(radians(-yaw)) * cos(radians(pitch));
-    direction.y = sin(radians(pitch));
-    direction.z = sin(radians(-yaw)) * cos(radians(pitch));
-    return normalize(direction);
-}
-
 ViewObject::ViewObject(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<CameraObject>& camera_object,
     const std::shared_ptr<er::TextureInfo>& color_buffer,
     const std::shared_ptr<er::TextureInfo>& depth_buffer) :
         m_device_(device),
         m_descriptor_pool_(descriptor_pool),
+        m_camera_object_(camera_object),
         m_color_buffer_(color_buffer),
         m_depth_buffer_(depth_buffer) {
 
@@ -112,37 +89,6 @@ ViewObject::ViewObject(
             attachments,
             m_buffer_size_,
             std::source_location::current());
-
-    m_view_camera_params_.init_camera_pos = glm::vec3(0, 5.0f, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
-    m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
-    m_view_camera_params_.camera_speed = 0.01f;
-
-    m_view_camera_ =
-        std::make_shared<ego::ViewCamera>(
-            device,
-            descriptor_pool,
-            m_view_camera_params_);
-
-    m_view_camera_->initViewCameraBuffer(
-        m_device_,
-        m_view_camera_params_);
-
-    assert(s_view_camera_desc_set_layout_ != nullptr);
-    m_view_camera_desc_set_ =
-        m_device_->createDescriptorSets(
-            m_descriptor_pool_,
-            s_view_camera_desc_set_layout_, 1)[0];
-    er::WriteDescriptorList buffer_descs;
-    buffer_descs.reserve(1);
-    er::Helper::addOneBuffer(
-        buffer_descs,
-        m_view_camera_desc_set_,
-        er::DescriptorType::STORAGE_BUFFER,
-        VIEW_CAMERA_BUFFER_INDEX,
-        m_view_camera_->getViewCameraBuffer()->buffer,
-        sizeof(glsl::ViewCameraInfo));
-    m_device_->updateDescriptorSets(buffer_descs);
 }
 
 void ViewObject::AllocRenderBuffers() {
@@ -196,10 +142,6 @@ void ViewObject::AllocRenderBuffers() {
     }
 }
 
-void ViewObject::readGpuCameraInfo() {
-    m_view_camera_->readGpuCameraInfo(m_device_);
-}
-
 void ViewObject::resize(const glm::uvec2& new_buffer_size) {
     if (m_buffer_size_ == new_buffer_size) {
         return;
@@ -231,11 +173,6 @@ void ViewObject::resize(const glm::uvec2& new_buffer_size) {
 }
 
 void ViewObject::destroy(const std::shared_ptr<renderer::Device>& device) {
-    m_device_->destroyDescriptorSetLayout(
-        s_view_camera_desc_set_layout_);
-
-    m_view_camera_->destroy(m_device_);
-
     if (m_color_buffer_)
         m_color_buffer_->destroy(m_device_);
 

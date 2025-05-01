@@ -21,6 +21,7 @@ public:
     ObjectSceneView(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<ego::CameraObject>& camera_object,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
         const std::shared_ptr<er::TextureInfo>& depth_buffer/* = nullptr*/);
@@ -32,16 +33,6 @@ public:
 
     void duplicateColorAndDepthBuffer(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);
-
-    virtual void updateCamera(
-        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const uint32_t& dbuf_idx,
-        const int& input_key,
-        const int& frame_count,
-        const float& delta_t,
-        const glm::vec2& last_mouse_pos,
-        const float& mouse_wheel_offset,
-        const bool& camera_rot_update);
 
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
