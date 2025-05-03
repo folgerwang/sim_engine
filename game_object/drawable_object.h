@@ -39,6 +39,7 @@ union PrimitiveHashTag {
 struct PrimitiveInfo {
 private:
     size_t hash_ = 0;
+    size_t depthonly_hash_ = 0;
 public:
     int32_t                 material_idx_;
     int32_t                 indirect_draw_cmd_ofs_;
@@ -53,6 +54,7 @@ public:
 
     void generateHash();
     size_t getHash() const { return hash_; }
+    size_t getDepthonlyHash() const { return depthonly_hash_; }
 };
 
 struct BufferViewInfo {
@@ -196,6 +198,7 @@ class DrawableObject {
     static std::shared_ptr<renderer::DescriptorSetLayout> skin_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> drawable_pipeline_layout_;
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_pipeline_list_;
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_depthonly_pipeline_list_;
     static std::unordered_map<std::string, std::shared_ptr<DrawableData>> drawable_object_list_;
     static std::shared_ptr<renderer::DescriptorSetLayout> drawable_indirect_draw_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> drawable_indirect_draw_pipeline_layout_;
@@ -220,7 +223,7 @@ public:
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& thin_film_lut_tex,
         const std::string& file_name,
-        const glm::uvec2& display_size,
+        const glm::uvec2& buffer_size,
         glm::mat4 location = glm::mat4(1.0f));
 
     void updateInstanceBuffer(
@@ -233,7 +236,8 @@ public:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const renderer::DescriptorSetList& desc_set_list);
+        const renderer::DescriptorSetList& desc_set_list,
+        bool depth_only = false);
 
     void update(
         const std::shared_ptr<renderer::Device>& device,
@@ -281,7 +285,7 @@ public:
         const std::shared_ptr<renderer::RenderPass>& render_pass,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const glm::uvec2& display_size);
+        const glm::uvec2& buffer_size);
 
     static void generateDescriptorSet(
         const std::shared_ptr<renderer::Device>& device,

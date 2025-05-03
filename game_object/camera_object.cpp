@@ -38,14 +38,14 @@ std::shared_ptr<er::DescriptorSetLayout>
 
 std::shared_ptr<er::DescriptorSetLayout>
 CameraObject::getViewCameraDescriptorSetLayout() {
-    assert(s_view_camera_desc_set_layout_ != nullptr);
-    return s_view_camera_desc_set_layout_;
+    assert(CameraObject::s_view_camera_desc_set_layout_ != nullptr);
+    return CameraObject::s_view_camera_desc_set_layout_;
 }
 
 void CameraObject::createViewCameraDescriptorSetLayout(
     const std::shared_ptr<er::Device>& device) {
-    if (s_view_camera_desc_set_layout_ == nullptr) {
-        s_view_camera_desc_set_layout_ =
+    if (CameraObject::s_view_camera_desc_set_layout_ == nullptr) {
+        CameraObject::s_view_camera_desc_set_layout_ =
             createViewCameraDescSetLayout(device);
     }
 }
@@ -69,20 +69,6 @@ CameraObject::CameraObject(
     m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
     m_view_camera_params_.camera_speed = 0.01f;
 
-    m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
-    m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
-    m_view_camera_params_.init_camera_pos = glm::vec3(0, 100.0f, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
-    m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
-
-#if 0
-    m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
-    m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
-    m_view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
-    m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
-#endif
-
     m_view_camera_ =
         std::make_shared<ego::ViewCamera>(
             device,
@@ -93,11 +79,11 @@ CameraObject::CameraObject(
         m_device_,
         m_view_camera_params_);
 
-    assert(s_view_camera_desc_set_layout_ != nullptr);
+    assert(CameraObject::s_view_camera_desc_set_layout_ != nullptr);
     m_view_camera_desc_set_ =
         m_device_->createDescriptorSets(
             m_descriptor_pool_,
-            s_view_camera_desc_set_layout_, 1)[0];
+            CameraObject::s_view_camera_desc_set_layout_, 1)[0];
     er::WriteDescriptorList buffer_descs;
     buffer_descs.reserve(1);
     er::Helper::addOneBuffer(
@@ -224,10 +210,40 @@ void CameraObject::readGpuCameraInfo() {
 
 void CameraObject::destroy(const std::shared_ptr<renderer::Device>& device) {
     m_device_->destroyDescriptorSetLayout(
-        s_view_camera_desc_set_layout_);
+        CameraObject::s_view_camera_desc_set_layout_);
 
     m_view_camera_->destroy(m_device_);
 };
+
+ObjectViewCameraObject::ObjectViewCameraObject(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+    CameraObject(device, descriptor_pool){
+
+    m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
+    m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
+    m_view_camera_params_.init_camera_pos = glm::vec3(0, 100.0f, 0);
+    m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
+    m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
+}
+
+TerrainViewCameraObject::TerrainViewCameraObject(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+    CameraObject(device, descriptor_pool) {
+
+    m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
+    m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
+    m_view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
+    m_view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
+    m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
+}
+
+ShadowViewCameraObject::ShadowViewCameraObject(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+    CameraObject(device, descriptor_pool) {
+}
 
 } // game_object
 } // engine

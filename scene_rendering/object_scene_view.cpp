@@ -15,9 +15,18 @@ ObjectSceneView::ObjectSceneView(
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<ego::CameraObject>& camera_object,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const std::shared_ptr<er::TextureInfo>& color_buffer = nullptr,
-    const std::shared_ptr<er::TextureInfo>& depth_buffer = nullptr) :
-    ViewObject(device, descriptor_pool, camera_object, color_buffer, depth_buffer) {
+    const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
+    const std::shared_ptr<er::TextureInfo>& depth_buffer/* = nullptr*/,
+    const glm::uvec2& buffer_size/* = glm::uvec2(2560, 1440)*/,
+    bool depth_only/* = false*/) :
+    ViewObject(
+        device,
+        descriptor_pool,
+        camera_object,
+        color_buffer,
+        depth_buffer,
+        buffer_size,
+        depth_only) {
 
     auto color_no_blend_attachment =
         er::helper::fillPipelineColorBlendAttachmentState();
@@ -128,7 +137,8 @@ void ObjectSceneView::draw(
     const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
     int dbuf_idx,
     float delta_t,
-    float cur_time) {
+    float cur_time,
+    bool depth_only/* = false */) {
 
     const renderer::DescriptorSetList& desc_set_list =
         { prt_desc_set,
@@ -141,7 +151,10 @@ void ObjectSceneView::draw(
         m_clear_values_);
 
     for (auto& drawable_obj : m_drawable_objects_) {
-        drawable_obj->draw(cmd_buf, desc_set_list);
+        drawable_obj->draw(
+            cmd_buf,
+            desc_set_list,
+            depth_only);
     }
 
     cmd_buf->endRenderPass();

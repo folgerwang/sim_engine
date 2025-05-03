@@ -31,6 +31,8 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
 
+    virtual ~CameraObject() = default;
+
     static std::shared_ptr<er::DescriptorSetLayout>
         getViewCameraDescriptorSetLayout();
 
@@ -39,7 +41,7 @@ public:
 
     virtual void readGpuCameraInfo();
 
-    glm::vec3 getCameraPosition() const {
+    virtual glm::vec3 getCameraPosition() const {
         return m_view_camera_->getCameraInfo().position;
     }
 
@@ -60,17 +62,38 @@ public:
         const renderer::TextureInfo& soil_water_layer_1,
         const renderer::BufferInfo& game_objects_buffer);
 
-    std::shared_ptr<er::DescriptorSet>
+    virtual std::shared_ptr<er::DescriptorSet>
         getViewCameraDescriptorSet() const{
         return m_view_camera_desc_set_;
     }
 
-    std::shared_ptr<er::BufferInfo> getViewCameraBuffer() {
+    virtual std::shared_ptr<er::BufferInfo> getViewCameraBuffer() {
         return m_view_camera_->getViewCameraBuffer();
     }
 
-    void destroy(
+    virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);
+};
+
+class ObjectViewCameraObject : public CameraObject{
+public:
+    ObjectViewCameraObject(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+};
+
+class TerrainViewCameraObject : public CameraObject{
+public:
+    TerrainViewCameraObject(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+};
+
+class ShadowViewCameraObject : public CameraObject {
+public:
+    ShadowViewCameraObject(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
 };
 
 } // game_object

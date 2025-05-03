@@ -80,48 +80,79 @@ std::shared_ptr<RenderPass> createRenderPass(
     bool clear/* = false */ ,
     SampleCountFlagBits sample_count/* = SampleCountFlagBits::SC_1_BIT*/,
     ImageLayout color_image_layout/* = ImageLayout::COLOR_ATTACHMENT_OPTIMAL*/) {
-    auto color_attachment = FillAttachmentDescription(
-        format,
-        sample_count,
-        clear ? ImageLayout::UNDEFINED : color_image_layout,
-        color_image_layout,
-        clear ? AttachmentLoadOp::CLEAR : AttachmentLoadOp::LOAD);
 
-    AttachmentReference color_attachment_ref(
-        0,
-        ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    uint32_t attachment_idx = 0;
+    std::vector<AttachmentReference> color_attachment_references;
+
+    if (format != Format::UNDEFINED) {
+        AttachmentReference color_attachment_ref(
+            attachment_idx,
+            ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        color_attachment_references.push_back(color_attachment_ref);
+        attachment_idx++;
+    }
 
     auto depth_attachment = FillAttachmentDescription(
         depth_format,
         sample_count,
         clear ? ImageLayout::UNDEFINED : ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        format != Format::UNDEFINED ? ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL : ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
         clear ? AttachmentLoadOp::CLEAR : AttachmentLoadOp::LOAD);
 
     AttachmentReference depth_attachment_ref(
-        1,
+        attachment_idx,
         ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    attachment_idx++;
 
     auto subpass = FillSubpassDescription(
         PipelineBindPoint::GRAPHICS,
-        { color_attachment_ref },
+        color_attachment_references,
         &depth_attachment_ref);
 
-    auto depency = FillSubpassDependency(~0U, 0,
-        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT),
-        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT),
-        0,
-        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT) |
-        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_READ_BIT));
+    std::vector<SubpassDependency> dependencies;
+    dependencies.reserve(2);
+    if (format != Format::UNDEFINED) {
+        auto depency = FillSubpassDependency(~0U, 0,
+            SET_2_FLAG_BITS(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT, EARLY_FRAGMENT_TESTS_BIT),
+            SET_2_FLAG_BITS(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT, EARLY_FRAGMENT_TESTS_BIT),
+            0,
+            SET_2_FLAG_BITS(Access, COLOR_ATTACHMENT_WRITE_BIT, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT));
+        dependencies.push_back(depency);
+    }
+    else {
+        auto depency = FillSubpassDependency(~0U, 0,
+            SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT),
+            SET_2_FLAG_BITS(PipelineStage, EARLY_FRAGMENT_TESTS_BIT, LATE_FRAGMENT_TESTS_BIT),
+            SET_FLAG_BIT(Access, SHADER_READ_BIT),
+            SET_2_FLAG_BITS(Access, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, DEPTH_STENCIL_ATTACHMENT_READ_BIT));
+        dependencies.push_back(depency);
+        depency = FillSubpassDependency(0, ~0U,
+            SET_2_FLAG_BITS(PipelineStage, EARLY_FRAGMENT_TESTS_BIT, LATE_FRAGMENT_TESTS_BIT),
+            SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT),
+            SET_FLAG_BIT(Access, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT),
+            SET_FLAG_BIT(Access, SHADER_READ_BIT));
+        dependencies.push_back(depency);
+    }
 
-    std::vector<AttachmentDescription> attachments(2);
-    attachments[0] = color_attachment;
-    attachments[1] = depth_attachment;
+
+    std::vector<AttachmentDescription> attachments;
+    attachments.reserve(2);
+    if (format != Format::UNDEFINED) {
+        auto color_attachment = FillAttachmentDescription(
+            format,
+            sample_count,
+            clear ? ImageLayout::UNDEFINED : color_image_layout,
+            color_image_layout,
+            clear ? AttachmentLoadOp::CLEAR : AttachmentLoadOp::LOAD);
+        attachments.push_back(color_attachment);
+
+    }
+    attachments.push_back(depth_attachment);
 
     return device->createRenderPass(
         attachments,
         { subpass },
-        { depency },
+        { dependencies },
         src_location);
 }
 

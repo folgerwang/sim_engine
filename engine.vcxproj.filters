@@ -571,5 +571,11 @@
     <None Include="shaders\lbm_patch.comp">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\base_depthonly.frag">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\base_depthonly.vert">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

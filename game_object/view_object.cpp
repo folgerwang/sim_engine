@@ -33,16 +33,20 @@ createViewCameraDescSetLayout(
 namespace game_object {
 
 ViewObject::ViewObject(
-    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<er::Device>& device,
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
     const std::shared_ptr<CameraObject>& camera_object,
     const std::shared_ptr<er::TextureInfo>& color_buffer,
-    const std::shared_ptr<er::TextureInfo>& depth_buffer) :
+    const std::shared_ptr<er::TextureInfo>& depth_buffer,
+    const glm::uvec2& buffer_size/* = glm::uvec2(2560, 1440)*/,
+    bool depth_only/* = false*/) :
         m_device_(device),
         m_descriptor_pool_(descriptor_pool),
         m_camera_object_(camera_object),
         m_color_buffer_(color_buffer),
-        m_depth_buffer_(depth_buffer) {
+        m_depth_buffer_(depth_buffer),
+        m_buffer_size_(buffer_size),
+        m_depth_only_(depth_only){
 
     AllocRenderBuffers();
 
@@ -56,24 +60,41 @@ ViewObject::ViewObject(
     { 1.0f,
       0 };
 
-    m_render_pass_ =
-        er::helper::createRenderPass(
-            m_device_,
-            m_color_format_,
-            m_depth_format_,
-            std::source_location::current(),
-            true);
-    m_blend_render_pass_ =
-        er::helper::createRenderPass(
-            m_device_,
-            m_color_format_,
-            m_depth_format_,
-            std::source_location::current(),
-            false);
+    if (m_depth_only_) {
+        m_render_pass_ =
+            er::helper::createRenderPass(
+                m_device_,
+                er::Format::UNDEFINED,
+                m_depth_format_,
+                std::source_location::current(),
+                true);
+    }
+    else {
+        m_render_pass_ =
+            er::helper::createRenderPass(
+                m_device_,
+                m_color_format_,
+                m_depth_format_,
+                std::source_location::current(),
+                true);
+        m_blend_render_pass_ =
+            er::helper::createRenderPass(
+                m_device_,
+                m_color_format_,
+                m_depth_format_,
+                std::source_location::current(),
+                false);
+    }
 
-    std::vector<std::shared_ptr<er::ImageView>> attachments(2);
-    attachments[0] = m_color_buffer_->view;
-    attachments[1] = m_depth_buffer_->view;
+    std::vector<std::shared_ptr<er::ImageView>> attachments;
+    attachments.reserve(2);
+    if (m_color_buffer_) {
+        attachments.push_back(m_color_buffer_->view);
+    }
+
+    if (m_depth_buffer_) {
+        attachments.push_back(m_depth_buffer_->view);
+    }
 
     m_frame_buffer_ =
         m_device_->createFrameBuffer(
@@ -82,40 +103,48 @@ ViewObject::ViewObject(
             m_buffer_size_,
             std::source_location::current());
 
-    assert(m_blend_render_pass_);
-    m_blend_frame_buffer_ =
-        m_device_->createFrameBuffer(
-            m_blend_render_pass_,
-            attachments,
-            m_buffer_size_,
-            std::source_location::current());
+    if (!m_depth_only_) {
+        assert(m_blend_render_pass_);
+        m_blend_frame_buffer_ =
+            m_device_->createFrameBuffer(
+                m_blend_render_pass_,
+                attachments,
+                m_buffer_size_,
+                std::source_location::current());
+    }
 }
 
 void ViewObject::AllocRenderBuffers() {
-    if (m_color_buffer_ == nullptr) {
-        m_color_buffer_ = std::make_shared<er::TextureInfo>();
-        er::Helper::create2DTextureImage(
-            m_device_,
-            m_color_format_,
-            m_buffer_size_,
-            1,
-            *m_color_buffer_,
-            SET_4_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT, COLOR_ATTACHMENT_BIT, TRANSFER_SRC_BIT),
-            er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            std::source_location::current());
+    if (m_depth_only_) {
+        m_color_buffer_ = nullptr;
+        m_color_buffer_copy_ = nullptr;
     }
+    else {
+        if (m_color_buffer_ == nullptr) {
+            m_color_buffer_ = std::make_shared<er::TextureInfo>();
+            er::Helper::create2DTextureImage(
+                m_device_,
+                m_color_format_,
+                m_buffer_size_,
+                1,
+                *m_color_buffer_,
+                SET_4_FLAG_BITS(ImageUsage, SAMPLED_BIT, STORAGE_BIT, COLOR_ATTACHMENT_BIT, TRANSFER_SRC_BIT),
+                er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                std::source_location::current());
+        }
 
-    if (m_make_color_buffer_copy_) {
-        m_color_buffer_copy_ = std::make_shared<er::TextureInfo>();
-        er::Helper::create2DTextureImage(
-            m_device_,
-            m_color_format_,
-            m_buffer_size_,
-            1,
-            *m_color_buffer_copy_,
-            SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, TRANSFER_DST_BIT),
-            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            std::source_location::current());
+        if (m_make_color_buffer_copy_) {
+            m_color_buffer_copy_ = std::make_shared<er::TextureInfo>();
+            er::Helper::create2DTextureImage(
+                m_device_,
+                m_color_format_,
+                m_buffer_size_,
+                1,
+                *m_color_buffer_copy_,
+                SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, TRANSFER_DST_BIT),
+                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                std::source_location::current());
+        }
     }
 
     if (m_depth_buffer_ == nullptr) {
@@ -172,7 +201,7 @@ void ViewObject::resize(const glm::uvec2& new_buffer_size) {
     AllocRenderBuffers();
 }
 
-void ViewObject::destroy(const std::shared_ptr<renderer::Device>& device) {
+void ViewObject::destroy(const std::shared_ptr<er::Device>& device) {
     if (m_color_buffer_)
         m_color_buffer_->destroy(m_device_);
 

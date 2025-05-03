@@ -121,6 +121,8 @@
     <ClInclude Include="tiny_mtx2.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="shaders\base_depthonly.frag" />
+    <None Include="shaders\base_depthonly.vert" />
     <None Include="shaders\base.frag" />
     <None Include="shaders\base.vert" />
     <None Include="shaders\blur_image_x.comp" />

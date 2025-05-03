@@ -1856,6 +1856,82 @@ void initMeshShader(const VkPhysicalDevice& device)
     vkGetPhysicalDeviceFeatures2(device, &device_features2);
 }
 
+//--------------------------------------------------------------------------------------------------
+// Initialize Vulkan mesh shader
+void initVulkan13Features(const VkPhysicalDevice& device)
+{
+    // 1. Prepare the struct for Vulkan 1.3 features
+    VkPhysicalDeviceVulkan13Features features13 = {};
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    // features13.pNext can be left null or point to other feature structs if needed
+
+    // 2. Prepare the main VkPhysicalDeviceFeatures2 struct
+    VkPhysicalDeviceFeatures2 features2 = {};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+
+    // 3. Chain the 1.3 features struct to the main features struct's pNext
+    features2.pNext = &features13;
+
+    // 4. Query the features
+    vkGetPhysicalDeviceFeatures2(device, &features2);
+
+    // 5. Now check the specific members of the populated features13 struct
+    std::cout << "Checking Vulkan 1.3 Core Features:\n";
+
+    std::cout << "  Dynamic Rendering Supported: "
+        << (features13.dynamicRendering ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Synchronization2 Supported: "
+        << (features13.synchronization2 ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Shader Zero Initialize Workgroup Memory Supported: "
+        << (features13.shaderZeroInitializeWorkgroupMemory ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Pipeline Creation Cache Control Supported: "
+        << (features13.pipelineCreationCacheControl ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Subgroup Size Control Supported: "
+        << (features13.subgroupSizeControl ? "Yes" : "No") << std::endl;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Initialize Vulkan mesh shader
+void checkVulkan13Features(const VkPhysicalDevice& device)
+{
+    // 1. Prepare the struct for Vulkan 1.3 features
+    VkPhysicalDeviceVulkan13Features features13 = {};
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    // features13.pNext can be left null or point to other feature structs if needed
+
+    // 2. Prepare the main VkPhysicalDeviceFeatures2 struct
+    VkPhysicalDeviceFeatures2 features2 = {};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+
+    // 3. Chain the 1.3 features struct to the main features struct's pNext
+    features2.pNext = &features13;
+
+    // 4. Query the features
+    vkGetPhysicalDeviceFeatures2(device, &features2);
+
+    // 5. Now check the specific members of the populated features13 struct
+    std::cout << "Checking Vulkan 1.3 Core Features:\n";
+
+    std::cout << "  Dynamic Rendering Supported: "
+        << (features13.dynamicRendering ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Synchronization2 Supported: "
+        << (features13.synchronization2 ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Shader Zero Initialize Workgroup Memory Supported: "
+        << (features13.shaderZeroInitializeWorkgroupMemory ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Pipeline Creation Cache Control Supported: "
+        << (features13.pipelineCreationCacheControl ? "Yes" : "No") << std::endl;
+
+    std::cout << "  Subgroup Size Control Supported: "
+        << (features13.subgroupSizeControl ? "Yes" : "No") << std::endl;
+}
+
 bool isDeviceSuitable(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface) {
@@ -1924,6 +2000,7 @@ std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
     const auto& vk_physical_device =
         RENDER_TYPE_CAST(PhysicalDevice, picked_device)->get();
 
+    checkVulkan13Features(vk_physical_device);
     initRayTracing(vk_physical_device);
     initMeshShader(vk_physical_device);
 
