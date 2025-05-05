@@ -198,7 +198,7 @@ class DrawableObject {
     static std::shared_ptr<renderer::DescriptorSetLayout> skin_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> drawable_pipeline_layout_;
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_pipeline_list_;
-    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_depthonly_pipeline_list_;
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_shadow_pipeline_list_;
     static std::unordered_map<std::string, std::shared_ptr<DrawableData>> drawable_object_list_;
     static std::shared_ptr<renderer::DescriptorSetLayout> drawable_indirect_draw_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> drawable_indirect_draw_pipeline_layout_;
@@ -218,12 +218,11 @@ public:
     DrawableObject(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& thin_film_lut_tex,
         const std::string& file_name,
-        const glm::uvec2& buffer_size,
         glm::mat4 location = glm::mat4(1.0f));
 
     void updateInstanceBuffer(
@@ -236,6 +235,8 @@ public:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        std::vector<renderer::Viewport> viewports,
+        std::vector<renderer::Scissor> scissors,
         const renderer::DescriptorSetList& desc_set_list,
         bool depth_only = false);
 
@@ -282,10 +283,9 @@ public:
 
     static void recreateStaticMembers(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-        const glm::uvec2& buffer_size);
+        const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
 
     static void generateDescriptorSet(
         const std::shared_ptr<renderer::Device>& device,

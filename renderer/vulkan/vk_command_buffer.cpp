@@ -318,6 +318,91 @@ void VulkanCommandBuffer::traceRays(
         size.z);
 }
 
+void VulkanCommandBuffer::setViewports(
+    const std::vector<Viewport>& viewports,
+    uint32_t start_viewport/* = 0*/,
+    uint32_t num_viewports/* = 1*/) {
+
+    std::vector<VkViewport> vk_viewports;
+    vk_viewports.resize(viewports.size());
+    for (int i = 0; i < viewports.size(); i++) {
+        vk_viewports[i].x = viewports[i].x;
+        vk_viewports[i].y = viewports[i].y;
+        vk_viewports[i].width = viewports[i].width;
+        vk_viewports[i].height = viewports[i].height;
+        vk_viewports[i].minDepth = viewports[i].min_depth;
+        vk_viewports[i].maxDepth = viewports[i].max_depth;
+    }
+
+    vkCmdSetViewport(cmd_buf_, start_viewport, num_viewports, vk_viewports.data());
+}
+void VulkanCommandBuffer::setScissors(
+    const std::vector<Scissor>& scissors,
+    uint32_t start_scissor/* = 0*/,
+    uint32_t num_scissors/* = 1*/) {
+
+    std::vector<VkRect2D> vk_scissors;
+    vk_scissors.resize(scissors.size());
+    for (int i = 0; i < scissors.size(); i++) {
+        vk_scissors[i].offset = { int(scissors[i].offset.x), int(scissors[i].offset.y) };
+        vk_scissors[i].extent = { scissors[i].extent.x, scissors[i].extent.y };
+    }
+    vkCmdSetScissor(cmd_buf_, start_scissor, num_scissors, vk_scissors.data());
+}
+
+void VulkanCommandBuffer::beginDynamicRendering(
+    const RenderingInfo& rendering_info) {
+    std::vector<VkRenderingAttachmentInfoKHR> color_attachments;
+    color_attachments.reserve(rendering_info.color_attachments.size());
+    for (int i = 0; i < rendering_info.color_attachments.size(); i++) {
+        auto color_attachment =
+            helper::toVkRenderingAttachmentInfo(rendering_info.color_attachments[i]);
+        color_attachments.push_back(color_attachment);
+    }
+
+    std::vector<VkRenderingAttachmentInfoKHR> depth_attachments;
+    depth_attachments.reserve(rendering_info.depth_attachments.size());
+    for (int i = 0; i < rendering_info.depth_attachments.size(); i++) {
+        auto depth_attachment =
+            helper::toVkRenderingAttachmentInfo(rendering_info.depth_attachments[i]);
+        depth_attachments.push_back(depth_attachment);
+    }
+
+    std::vector<VkRenderingAttachmentInfoKHR> stencil_attachments;
+    stencil_attachments.reserve(rendering_info.stencil_attachments.size());
+    for (int i = 0; i < rendering_info.stencil_attachments.size(); i++) {
+        auto stencil_attachment =
+            helper::toVkRenderingAttachmentInfo(rendering_info.stencil_attachments[i]);
+        stencil_attachments.push_back(stencil_attachment);
+    }
+
+    VkRenderingInfoKHR vk_rendering_info = {};
+    vk_rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
+    vk_rendering_info.renderArea.offset =
+        { int(rendering_info.render_area_offset.x),
+          int(rendering_info.render_area_offset.y) };
+    vk_rendering_info.renderArea.extent =
+        { rendering_info.render_area_extent.x,
+          rendering_info.render_area_extent.y };
+    vk_rendering_info.layerCount = rendering_info.layer_count;
+    vk_rendering_info.viewMask = rendering_info.view_mask;
+    vk_rendering_info.colorAttachmentCount =
+        uint32_t(color_attachments.size());
+    vk_rendering_info.pColorAttachments =
+        color_attachments.data();
+    vk_rendering_info.pDepthAttachment =
+        depth_attachments.size() > 0 ? depth_attachments.data() : nullptr;
+    vk_rendering_info.pStencilAttachment =
+        stencil_attachments.size() > 0 ? stencil_attachments.data() : nullptr;
+
+    vkCmdBeginRendering(cmd_buf_, &vk_rendering_info);
+}
+
+void VulkanCommandBuffer::endDynamicRendering() {
+
+    vkCmdEndRendering(cmd_buf_);
+}
+
 void VulkanCommandBuffer::beginRenderPass(
     std::shared_ptr<RenderPass> render_pass,
     std::shared_ptr<Framebuffer> frame_buffer,

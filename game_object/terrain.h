@@ -168,19 +168,17 @@ public:
 
     static std::shared_ptr<renderer::Pipeline> createTilePipeline(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
         const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const glm::uvec2& display_size,
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
         const std::string& vs_name,
         const std::string& ps_name);
 
     static std::shared_ptr<renderer::Pipeline> createGrassPipeline(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
         const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const glm::uvec2& display_size);
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats);
 
     bool validTileBySize(
         const glm::ivec2& min_tile_idx,

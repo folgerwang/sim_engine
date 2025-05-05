@@ -21,8 +21,6 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform Mate
 
 layout(location = 0) in ObjectVsPsData ps_in_data;
 
-layout(location = 0) out vec4 outColor;
-
 #include "pbr_lighting.glsl.h"
 
 void main() {
@@ -39,6 +37,4 @@ void main() {
     }
 #endif // ALPHAMODE_MASK
 #endif
-
-    outColor = vec4(0, 0, 0, 1);
 }

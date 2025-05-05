@@ -13,6 +13,7 @@ namespace scene_rendering {
 TerrainSceneView::TerrainSceneView(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
     const std::shared_ptr<ego::CameraObject>& camera_object,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<er::TextureInfo>& color_buffer/*= nullptr */ ,
@@ -22,6 +23,7 @@ TerrainSceneView::TerrainSceneView(
     ViewObject(
         device,
         descriptor_pool,
+        renderbuffer_formats[int(er::RenderPasses::kForward)],
         camera_object,
         color_buffer,
         depth_buffer,
@@ -91,10 +93,9 @@ TerrainSceneView::TerrainSceneView(
         m_tile_pipeline_ =
             ego::TileObject::createTilePipeline(
                 device,
-                m_render_pass_,
                 m_tile_pipeline_layout_,
                 graphic_pipeline_info,
-                m_buffer_size_,
+                renderbuffer_formats[int(renderer::RenderPasses::kForward)],
                 "terrain/tile_soil_vert.spv",
                 "terrain/tile_frag.spv");
     }
@@ -103,10 +104,9 @@ TerrainSceneView::TerrainSceneView(
         m_tile_water_pipeline_ =
             ego::TileObject::createTilePipeline(
                 device,
-                m_blend_render_pass_,
                 m_tile_pipeline_layout_,
                 graphic_pipeline_info,
-                m_buffer_size_,
+                renderbuffer_formats[int(renderer::RenderPasses::kForward)],
                 "terrain/tile_water_vert.spv",
                 "terrain/tile_water_frag.spv");
     }
@@ -115,10 +115,9 @@ TerrainSceneView::TerrainSceneView(
         m_tile_grass_pipeline_ =
             ego::TileObject::createGrassPipeline(
                 device,
-                m_render_pass_,
                 m_tile_grass_pipeline_layout_,
                 graphic_double_face_pipeline_info,
-                m_buffer_size_);
+                renderbuffer_formats[int(renderer::RenderPasses::kForward)]);
     }
 
     // tile params set.
@@ -217,11 +216,48 @@ void TerrainSceneView::draw(
           m_camera_object_->getViewCameraDescriptorSet(),
           m_tile_res_desc_sets_[dbuf_idx] };
 
-    cmd_buf->beginRenderPass(
-        m_render_pass_,
-        m_frame_buffer_,
-        m_buffer_size_,
-        m_clear_values_);
+    {
+        std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+        color_attachment_infos.reserve(1);
+        if (!depth_only) {
+            er::RenderingAttachmentInfo attachment_info;
+            attachment_info.image_view = m_color_buffer_->view;
+            attachment_info.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+            attachment_info.store_op = er::AttachmentStoreOp::STORE;
+            color_attachment_infos.push_back(attachment_info);
+        }
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = m_depth_buffer_->view;
+        depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+        depth_attachment_info.clear_value.depth_stencil = { 1.0f, 0 };
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = color_attachment_infos;
+        renderingInfo.depth_attachments = { depth_attachment_info }; // Or nullptr if no depth
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(m_buffer_size_.x);
+    viewports[0].height = float(m_buffer_size_.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = m_buffer_size_;
+    cmd_buf->setViewports(viewports, 0, 1);
+    cmd_buf->setScissors(scissors, 0, 1);
 
     // Draw all visible tiles
     if (m_b_render_terrain_) {
@@ -249,16 +285,39 @@ void TerrainSceneView::draw(
         }
     }
 
-    cmd_buf->endRenderPass();
+    cmd_buf->endDynamicRendering();
 
     if (m_b_render_terrain_ && m_b_render_water_) {
         duplicateColorAndDepthBuffer(cmd_buf);
 
-        cmd_buf->beginRenderPass(
-            m_blend_render_pass_,
-            m_frame_buffer_,
-            m_buffer_size_,
-            m_clear_values_);
+        {
+            std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+            color_attachment_infos.reserve(1);
+            if (!depth_only) {
+                er::RenderingAttachmentInfo attachment_info;
+                attachment_info.image_view = m_color_buffer_->view;
+                attachment_info.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                attachment_info.load_op = er::AttachmentLoadOp::DONT_CARE;
+                attachment_info.store_op = er::AttachmentStoreOp::STORE;
+                color_attachment_infos.push_back(attachment_info);
+            }
+            er::RenderingAttachmentInfo depth_attachment_info;
+            depth_attachment_info.image_view = m_depth_buffer_->view;
+            depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+            depth_attachment_info.store_op = er::AttachmentStoreOp::DONT_CARE;
+
+            er::RenderingInfo renderingInfo = {};
+            renderingInfo.render_area_offset = { 0, 0 };
+            renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
+            renderingInfo.layer_count = 1;
+            renderingInfo.view_mask = 0;
+            renderingInfo.color_attachments = color_attachment_infos;
+            renderingInfo.depth_attachments = { depth_attachment_info }; // Or nullptr if no depth
+            renderingInfo.stencil_attachments = {};
+
+            cmd_buf->beginDynamicRendering(renderingInfo);
+        }
 
         // Draw all visible tiles
         for (auto& tile : m_visible_tiles_) {
@@ -272,7 +331,7 @@ void TerrainSceneView::draw(
                 cur_time);
         }
 
-        cmd_buf->endRenderPass();
+        cmd_buf->endDynamicRendering();
     }
 }
 

@@ -20,8 +20,6 @@ protected:
     std::shared_ptr<CameraObject> m_camera_object_;
     std::vector<std::shared_ptr<er::DescriptorSet>> m_tile_res_desc_sets_;
 
-    er::Format m_color_format_ = er::Format::B10G11R11_UFLOAT_PACK32;
-    er::Format m_depth_format_ = er::Format::D24_UNORM_S8_UINT;
     glm::uvec2 m_buffer_size_ = glm::uvec2(2560, 1440);
     std::vector<er::ClearValue> m_clear_values_;
 
@@ -33,24 +31,24 @@ protected:
     std::shared_ptr<er::TextureInfo> m_color_buffer_copy_;
     std::shared_ptr<er::TextureInfo> m_depth_buffer_;
     std::shared_ptr<er::TextureInfo> m_depth_buffer_copy_;
-    std::shared_ptr<er::Framebuffer> m_frame_buffer_;
-    std::shared_ptr<er::Framebuffer> m_blend_frame_buffer_;
-    std::shared_ptr<er::RenderPass> m_render_pass_;
-    std::shared_ptr<er::RenderPass> m_blend_render_pass_;
 
 public:
     ViewObject(
         const std::shared_ptr<er::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
         const std::shared_ptr<CameraObject>& camera_object,
         const std::shared_ptr<er::TextureInfo>& color_buffer,
         const std::shared_ptr<er::TextureInfo>& depth_buffer,
         const glm::uvec2& buffer_size = glm::uvec2(2560, 1440),
         bool depth_only = false);
 
-    void AllocRenderBuffers();
+    void AllocRenderBuffers(
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats);
 
-    void resize(const glm::uvec2& new_buffer_size);
+    void resize(
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+        const glm::uvec2& new_buffer_size);
 
     virtual void draw(
         std::shared_ptr<er::CommandBuffer> cmd_buf,

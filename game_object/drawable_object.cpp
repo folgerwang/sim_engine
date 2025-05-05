@@ -1746,10 +1746,9 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
 
 static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const glm::uvec2& buffer_size,
     const ego::PrimitiveInfo& primitive) {
     auto shader_modules = getDrawableShaderModules(
         device,
@@ -1792,25 +1791,24 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     attribute_descs.push_back(attr);
 
     auto drawable_pipeline = device->createPipeline(
-        render_pass,
         pipeline_layout,
         binding_descs,
         attribute_descs,
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        buffer_size,
+        renderbuffer_formats.color_formats,
+        renderbuffer_formats.depth_format,
         std::source_location::current());
 
     return drawable_pipeline;
 }
 
-static std::shared_ptr<renderer::Pipeline> createDrawableDepthonlyPipeline(
+static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const glm::uvec2& buffer_size,
     const ego::PrimitiveInfo& primitive) {
     auto shader_modules = getDrawableDepthonlyShaderModules(
         device,
@@ -1851,14 +1849,14 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDepthonlyPipeline(
     attribute_descs.push_back(attr);
 
     auto drawable_pipeline = device->createPipeline(
-        render_pass,
         pipeline_layout,
         binding_descs,
         attribute_descs,
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        buffer_size,
+        renderbuffer_formats.color_formats,
+        renderbuffer_formats.depth_format,
         std::source_location::current());
 
     return drawable_pipeline;
@@ -2080,7 +2078,7 @@ std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::material_desc_set
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::skin_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_pipeline_layout_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_pipeline_list_;
-std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_depthonly_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_shadow_pipeline_list_;
 std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::drawable_indirect_draw_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_indirect_draw_pipeline_layout_;
@@ -2305,12 +2303,11 @@ void DrawableData::update(
 DrawableObject::DrawableObject(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& thin_film_lut_tex,
     const std::string& file_name,
-    const glm::uvec2& buffer_size,
     glm::mat4 location/* = glm::mat4(1.0f)*/)
     : location_(location){
 
@@ -2346,25 +2343,23 @@ DrawableObject::DrawableObject(
                 drawable_pipeline_list_[hash_value] =
                     createDrawablePipeline(
                         device,
-                        render_pass,
+                        renderbuffer_formats[int(renderer::RenderPasses::kForward)],
                         drawable_pipeline_layout_,
                         graphic_pipeline_info,
-                        buffer_size,
                         primitive);
             }
         }
 
         {
             auto hash_value = primitive.getDepthonlyHash();
-            auto result = drawable_depthonly_pipeline_list_.find(hash_value);
-            if (result == drawable_depthonly_pipeline_list_.end()) {
-                drawable_depthonly_pipeline_list_[hash_value] =
-                    createDrawableDepthonlyPipeline(
+            auto result = drawable_shadow_pipeline_list_.find(hash_value);
+            if (result == drawable_shadow_pipeline_list_.end()) {
+                drawable_shadow_pipeline_list_[hash_value] =
+                    createDrawableShadowPipeline(
                         device,
-                        render_pass,
+                        renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                         drawable_pipeline_layout_,
                         graphic_pipeline_info,
-                        buffer_size,
                         primitive);
             }
         }
@@ -2640,10 +2635,9 @@ void DrawableObject::createStaticMembers(
 
 void DrawableObject::recreateStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
-    const glm::uvec2& buffer_size) {
+    const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
 
     createStaticMembers(device, global_desc_set_layouts);
 
@@ -2660,31 +2654,29 @@ void DrawableObject::recreateStaticMembers(
             drawable_pipeline_list_[hash_value] = 
                 createDrawablePipeline(
                     device,
-                    render_pass,
+                    renderbuffer_formats[int(renderer::RenderPasses::kForward)],
                     drawable_pipeline_layout_,
                     graphic_pipeline_info,
-                    buffer_size,
                     primitive);
         }
     }
 
-    for (auto& pipeline : drawable_depthonly_pipeline_list_) {
+    for (auto& pipeline : drawable_shadow_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
-    drawable_depthonly_pipeline_list_.clear();
+    drawable_shadow_pipeline_list_.clear();
 
     for (auto& object : drawable_object_list_) {
         const auto& primitive = object.second->meshes_[0].primitives_[0];
         auto hash_value = primitive.getDepthonlyHash();
-        auto result = drawable_depthonly_pipeline_list_.find(hash_value);
-        if (result == drawable_depthonly_pipeline_list_.end()) {
-            drawable_depthonly_pipeline_list_[hash_value] =
-                createDrawableDepthonlyPipeline(
+        auto result = drawable_shadow_pipeline_list_.find(hash_value);
+        if (result == drawable_shadow_pipeline_list_.end()) {
+            drawable_shadow_pipeline_list_[hash_value] =
+                createDrawableShadowPipeline(
                     device,
-                    render_pass,
+                    renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                     drawable_pipeline_layout_,
                     graphic_pipeline_info,
-                    buffer_size,
                     primitive);
         }
     }
@@ -2742,10 +2734,10 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_pipeline_list_.clear();
-    for (auto& pipeline : drawable_depthonly_pipeline_list_) {
+    for (auto& pipeline : drawable_shadow_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
-    drawable_depthonly_pipeline_list_.clear();
+    drawable_shadow_pipeline_list_.clear();
     drawable_object_list_.clear();
     device->destroyDescriptorSetLayout(drawable_indirect_draw_desc_set_layout_);
     device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
@@ -2878,6 +2870,8 @@ void DrawableObject::updateBuffers(
 
 void DrawableObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    std::vector<renderer::Viewport> viewports,
+    std::vector<renderer::Scissor> scissors,
     const renderer::DescriptorSetList& desc_set_list,
     bool depth_only/* = false */ ) {
 
@@ -2885,13 +2879,16 @@ void DrawableObject::draw(
     if (depth_only) {
         cmd_buf->bindPipeline(
             renderer::PipelineBindPoint::GRAPHICS,
-            drawable_depthonly_pipeline_list_[primitive.getDepthonlyHash()]);
+            drawable_shadow_pipeline_list_[primitive.getDepthonlyHash()]);
     }
     else {
         cmd_buf->bindPipeline(
             renderer::PipelineBindPoint::GRAPHICS,
             drawable_pipeline_list_[primitive.getHash()]);
     }
+
+    cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+    cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);

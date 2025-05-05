@@ -79,6 +79,16 @@ public:
         const std::source_location& src_location) final;
     virtual std::shared_ptr<Pipeline> createPipeline(
         const std::shared_ptr<PipelineLayout>& pipeline_layout,
+        const std::vector<VertexInputBindingDescription>& binding_descs,
+        const std::vector<VertexInputAttributeDescription>& attribute_descs,
+        const PipelineInputAssemblyStateCreateInfo& topology_info,
+        const GraphicPipelineInfo& graphic_pipeline_info,
+        const ShaderModuleList& shader_modules,
+        const std::vector<Format>& color_formats,
+        const Format depth_format,
+        const std::source_location& src_location) final;
+    virtual std::shared_ptr<Pipeline> createPipeline(
+        const std::shared_ptr<PipelineLayout>& pipeline_layout,
         const std::shared_ptr<renderer::ShaderModule>& shader_module,
         const std::source_location& src_location) final;
     virtual std::shared_ptr<Pipeline> createPipeline(

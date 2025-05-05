@@ -11,6 +11,7 @@ class ObjectMesh {
     std::shared_ptr<renderer::DescriptorSetLayout> object_desc_set_layout_;
     std::shared_ptr<renderer::PipelineLayout> object_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> object_pipeline_;
+    std::shared_ptr<renderer::Pipeline> object_depthonly_pipeline_;
     std::shared_ptr<renderer::TextureInfo> diffuse_tex_;
     std::shared_ptr<renderer::TextureInfo> normal_tex_;
     std::shared_ptr<renderer::TextureInfo> glossiness_tex_;
@@ -25,7 +26,7 @@ public:
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const std::string& object_name,
         const std::string& shader_name,
-        const std::shared_ptr<renderer::RenderPass>& render_pass,
+        const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const glm::uvec2& display_size);

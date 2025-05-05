@@ -1447,6 +1447,22 @@ enum class PipelineStageFlagBits {
 };
 typedef uint32_t PipelineStageFlags;
 
+enum class ResolveModeFlagBits {
+    NONE = 0,
+    SAMPLE_ZERO_BIT = 0x00000001,
+    AVERAGE_BIT = 0x00000002,
+    MIN_BIT = 0x00000004,
+    MAX_BIT = 0x00000008,
+    EXTERNAL_FORMAT_DOWNSAMPLE_ANDROID = 0x00000010,
+    NONE_KHR = NONE,
+    SAMPLE_ZERO_BIT_KHR = SAMPLE_ZERO_BIT,
+    AVERAGE_BIT_KHR = AVERAGE_BIT,
+    MIN_BIT_KHR = MIN_BIT,
+    MAX_BIT_KHR = MAX_BIT,
+    FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
+};
+typedef uint32_t ResolveModeFlags;
+
 enum class BlendFactor {
     ZERO = 0,
     ONE = 1,

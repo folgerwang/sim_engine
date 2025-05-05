@@ -2053,10 +2053,9 @@ std::shared_ptr<renderer::PipelineLayout> TileObject::createTileGrassPipelineLay
 
 std::shared_ptr<renderer::Pipeline> TileObject::createTilePipeline(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const glm::uvec2& display_size,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::string& vs_name,
     const std::string& ps_name) {
     renderer::PipelineInputAssemblyStateCreateInfo input_assembly;
@@ -2066,14 +2065,14 @@ std::shared_ptr<renderer::Pipeline> TileObject::createTilePipeline(
     auto shader_modules =
         getTileShaderModules(device, vs_name, ps_name);
     auto pipeline = device->createPipeline(
-        render_pass,
         pipeline_layout,
         {},
         {},
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        display_size,
+        renderbuffer_formats.color_formats,
+        renderbuffer_formats.depth_format,
         std::source_location::current());
 
     return pipeline;
@@ -2081,10 +2080,9 @@ std::shared_ptr<renderer::Pipeline> TileObject::createTilePipeline(
 
 std::shared_ptr<renderer::Pipeline> TileObject::createGrassPipeline(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const glm::uvec2& display_size) {
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats) {
 
 #if    USE_MESH_SHADER
     auto shader_modules =
@@ -2149,14 +2147,14 @@ std::shared_ptr<renderer::Pipeline> TileObject::createGrassPipeline(
     attribute_descs.push_back(attr);
 
     auto grass_pipeline = device->createPipeline(
-        render_pass,
         pipeline_layout,
         binding_descs,
         attribute_descs,
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        display_size,
+        renderbuffer_formats.color_formats,
+        renderbuffer_formats.depth_format,
         std::source_location::current());
 
     return grass_pipeline;

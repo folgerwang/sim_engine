@@ -304,7 +304,7 @@ void ObjectMesh::loadObjectFile(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::string& object_name,
     const std::string& shader_name,
-    const std::shared_ptr<renderer::RenderPass>& render_pass,
+    const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const glm::uvec2& display_size) {
@@ -485,14 +485,25 @@ void ObjectMesh::loadObjectFile(
             std::source_location::current());
 
     object_pipeline_ = device->createPipeline(
-        render_pass,
         object_pipeline_layout_,
         patches_[0]->getBindingDescs(),
         patches_[0]->getAttribDescs(),
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        display_size,
+        renderbuffer_formats[int(renderer::RenderPasses::kForward)].color_formats,
+        renderbuffer_formats[int(renderer::RenderPasses::kForward)].depth_format,
+        std::source_location::current());
+
+    object_depthonly_pipeline_ = device->createPipeline(
+        object_pipeline_layout_,
+        patches_[0]->getBindingDescs(),
+        patches_[0]->getAttribDescs(),
+        input_assembly,
+        graphic_pipeline_info,
+        shader_modules,
+        renderbuffer_formats[int(renderer::RenderPasses::kShadow)].color_formats,
+        renderbuffer_formats[int(renderer::RenderPasses::kShadow)].depth_format,
         std::source_location::current());
 }
 

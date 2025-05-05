@@ -13,6 +13,7 @@ namespace scene_rendering {
 ObjectSceneView::ObjectSceneView(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<ego::CameraObject>& camera_object,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<er::TextureInfo>& color_buffer/* = nullptr*/,
@@ -22,6 +23,7 @@ ObjectSceneView::ObjectSceneView(
     ViewObject(
         device,
         descriptor_pool,
+        renderbuffer_formats,
         camera_object,
         color_buffer,
         depth_buffer,
@@ -144,31 +146,92 @@ void ObjectSceneView::draw(
         { prt_desc_set,
           m_camera_object_->getViewCameraDescriptorSet() };
 
-    cmd_buf->beginRenderPass(
-        m_render_pass_,
-        m_frame_buffer_,
-        m_buffer_size_,
-        m_clear_values_);
+    {
+        std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+        color_attachment_infos.reserve(1);
+        if (!depth_only) {
+            er::RenderingAttachmentInfo attachment_info;
+            attachment_info.image_view = m_color_buffer_->view;
+            attachment_info.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+            attachment_info.store_op = er::AttachmentStoreOp::STORE;
+            attachment_info.clear_value.color = { {0.3f, 0.3f, 0.3f, 1.0f} };
+            color_attachment_infos.push_back(attachment_info);
+        }
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = m_depth_buffer_->view;
+        depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+        depth_attachment_info.clear_value.depth_stencil = { 1.0f, 0 };
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = color_attachment_infos;
+        renderingInfo.depth_attachments = { depth_attachment_info }; // Or nullptr if no depth
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(m_buffer_size_.x);
+    viewports[0].height = float(m_buffer_size_.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = m_buffer_size_;
 
     for (auto& drawable_obj : m_drawable_objects_) {
         drawable_obj->draw(
             cmd_buf,
+            viewports,
+            scissors,
             desc_set_list,
             depth_only);
     }
 
-    cmd_buf->endRenderPass();
+    cmd_buf->endDynamicRendering();
 
     if (m_b_render_blend_) {
         duplicateColorAndDepthBuffer(cmd_buf);
 
-        cmd_buf->beginRenderPass(
-            m_blend_render_pass_,
-            m_frame_buffer_,
-            m_buffer_size_,
-            m_clear_values_);
+        {
+            std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+            color_attachment_infos.reserve(1);
+            if (!depth_only) {
+                er::RenderingAttachmentInfo attachment_info;
+                attachment_info.image_view = m_color_buffer_->view;
+                attachment_info.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                attachment_info.load_op = er::AttachmentLoadOp::DONT_CARE;
+                attachment_info.store_op = er::AttachmentStoreOp::STORE;
+                color_attachment_infos.push_back(attachment_info);
+            }
+            er::RenderingAttachmentInfo depth_attachment_info;
+            depth_attachment_info.image_view = m_depth_buffer_->view;
+            depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+            depth_attachment_info.store_op = er::AttachmentStoreOp::DONT_CARE;
 
-        cmd_buf->endRenderPass();
+            er::RenderingInfo renderingInfo = {};
+            renderingInfo.render_area_offset = { 0, 0 };
+            renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
+            renderingInfo.layer_count = 1;
+            renderingInfo.view_mask = 0;
+            renderingInfo.color_attachments = color_attachment_infos;
+            renderingInfo.depth_attachments = { depth_attachment_info }; // Or nullptr if no depth
+            renderingInfo.stencil_attachments = {};
+
+            cmd_buf->beginDynamicRendering(renderingInfo);
+            
+        }
+        cmd_buf->endDynamicRendering();
     }
 }
 

@@ -31,6 +31,7 @@ public:
     TerrainSceneView(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const std::shared_ptr<ego::CameraObject>& camera_object,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<er::TextureInfo>& color_buffer = nullptr,

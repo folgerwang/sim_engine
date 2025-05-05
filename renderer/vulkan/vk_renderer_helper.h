@@ -23,6 +23,7 @@ extern PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT;
 extern PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT;
 extern PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
 extern PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
+extern PFN_vkCmdBeginRenderingKHR vkCmdBeginRenderingKHR;
 
 namespace helper {
 
@@ -49,6 +50,8 @@ VkImageType toVkImageType(renderer::ImageType view_type);
 VkImageViewType toVkImageViewType(renderer::ImageViewType view_type);
 VkImageAspectFlags toVkImageAspectFlags(renderer::ImageAspectFlags flags);
 VkAccessFlags toVkAccessFlags(renderer::AccessFlags flags);
+VkResolveModeFlags toVkResolveModeFlags(renderer::ResolveModeFlags flags);
+VkRenderingAttachmentInfoKHR toVkRenderingAttachmentInfo(const renderer::RenderingAttachmentInfo& attachment_info);
 VkPipelineStageFlags toVkPipelineStageFlags(renderer::PipelineStageFlags flags);
 VkShaderStageFlags toVkShaderStageFlags(renderer::ShaderStageFlags flags);
 VkPipelineBindPoint toVkPipelineBindPoint(renderer::PipelineBindPoint bind);

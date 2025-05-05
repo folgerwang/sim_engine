@@ -27,6 +27,7 @@ PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT;
 PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT;
 PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
 PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
+PFN_vkCmdBeginRenderingKHR vkCmdBeginRenderingKHR;
 
 namespace helper {
 
@@ -774,6 +775,22 @@ VkAccessFlags toVkAccessFlags(renderer::AccessFlags flags) {
     return result;
 }
 
+VkResolveModeFlags toVkResolveModeFlags(renderer::ResolveModeFlags flags) {
+    VkResolveModeFlags result = 0;
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, NONE);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, SAMPLE_ZERO_BIT);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, AVERAGE_BIT);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, MIN_BIT);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, MAX_BIT);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, EXTERNAL_FORMAT_DOWNSAMPLE_ANDROID);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, NONE_KHR);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, SAMPLE_ZERO_BIT_KHR);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, AVERAGE_BIT_KHR);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, MIN_BIT_KHR);
+    ADD_FLAG_BIT(ResolveMode, RESOLVE_MODE, MAX_BIT_KHR);
+    return result;
+}
+
 VkPipelineStageFlags toVkPipelineStageFlags(renderer::PipelineStageFlags flags) {
     VkPipelineStageFlags result = 0;
     ADD_FLAG_BIT(PipelineStage, PIPELINE_STAGE, TOP_OF_PIPE_BIT);
@@ -1365,7 +1382,8 @@ std::vector<VkVertexInputBindingDescription> toVkVertexInputBindingDescription(
     return binding_description;
 }
 
-std::vector<VkVertexInputAttributeDescription> toVkVertexInputAttributeDescription(
+std::vector<VkVertexInputAttributeDescription>
+toVkVertexInputAttributeDescription(
     const std::vector<renderer::VertexInputAttributeDescription>& description) {
     std::vector<VkVertexInputAttributeDescription> result(description.size());
     for (int i = 0; i < description.size(); i++) {
@@ -1375,6 +1393,33 @@ std::vector<VkVertexInputAttributeDescription> toVkVertexInputAttributeDescripti
         result[i].format = toVkFormat(description[i].format);
     }
 
+    return result;
+}
+
+VkRenderingAttachmentInfoKHR
+toVkRenderingAttachmentInfo(
+    const renderer::RenderingAttachmentInfo& attachment_info) {
+    VkRenderingAttachmentInfoKHR result = {};
+    if (attachment_info.image_view) {
+        result.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+        auto vk_image_view = RENDER_TYPE_CAST(ImageView, attachment_info.image_view);
+        result.imageView = vk_image_view->get();
+        result.imageLayout = toVkImageLayout(attachment_info.image_layout);
+        result.resolveMode = VkResolveModeFlagBits(toVkResolveModeFlags(attachment_info.resolve_mode));
+        result.loadOp = toVkAttachmentLoadOp(attachment_info.load_op);
+        result.storeOp = toVkAttachmentStoreOp(attachment_info.store_op);
+        if (result.imageLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)  {
+            for (int i = 0; i < 4; i++) {
+                result.clearValue.color.uint32[i] =
+                    attachment_info.clear_value.color.uint32[i];
+            }
+        }
+        else {
+            result.clearValue.depthStencil =
+            { attachment_info.clear_value.depth_stencil.depth,
+              attachment_info.clear_value.depth_stencil.stencil };
+        }
+    }
     return result;
 }
 
@@ -1858,44 +1903,6 @@ void initMeshShader(const VkPhysicalDevice& device)
 
 //--------------------------------------------------------------------------------------------------
 // Initialize Vulkan mesh shader
-void initVulkan13Features(const VkPhysicalDevice& device)
-{
-    // 1. Prepare the struct for Vulkan 1.3 features
-    VkPhysicalDeviceVulkan13Features features13 = {};
-    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-    // features13.pNext can be left null or point to other feature structs if needed
-
-    // 2. Prepare the main VkPhysicalDeviceFeatures2 struct
-    VkPhysicalDeviceFeatures2 features2 = {};
-    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-
-    // 3. Chain the 1.3 features struct to the main features struct's pNext
-    features2.pNext = &features13;
-
-    // 4. Query the features
-    vkGetPhysicalDeviceFeatures2(device, &features2);
-
-    // 5. Now check the specific members of the populated features13 struct
-    std::cout << "Checking Vulkan 1.3 Core Features:\n";
-
-    std::cout << "  Dynamic Rendering Supported: "
-        << (features13.dynamicRendering ? "Yes" : "No") << std::endl;
-
-    std::cout << "  Synchronization2 Supported: "
-        << (features13.synchronization2 ? "Yes" : "No") << std::endl;
-
-    std::cout << "  Shader Zero Initialize Workgroup Memory Supported: "
-        << (features13.shaderZeroInitializeWorkgroupMemory ? "Yes" : "No") << std::endl;
-
-    std::cout << "  Pipeline Creation Cache Control Supported: "
-        << (features13.pipelineCreationCacheControl ? "Yes" : "No") << std::endl;
-
-    std::cout << "  Subgroup Size Control Supported: "
-        << (features13.subgroupSizeControl ? "Yes" : "No") << std::endl;
-}
-
-//--------------------------------------------------------------------------------------------------
-// Initialize Vulkan mesh shader
 void checkVulkan13Features(const VkPhysicalDevice& device)
 {
     // 1. Prepare the struct for Vulkan 1.3 features
@@ -2066,6 +2073,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     VkPhysicalDeviceMeshShaderFeaturesEXT enabled_mesh_shader_features{};
     VkPhysicalDeviceMaintenance4Features enabled_maintenance4_features{};
     VkPhysicalDeviceFloat16Int8FeaturesKHR enabled_float16_int8_features{};
+    VkPhysicalDeviceVulkan13Features  enabled_vulkan13_features{};
 
     // Enable features required for ray tracing using feature chaining via pNext		
     enabled_buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
@@ -2084,20 +2092,22 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_mesh_shader_features.taskShader = VK_TRUE;
     enabled_mesh_shader_features.pNext = &enabled_acceleration_structure_features;
 
-    enabled_maintenance4_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES;
-    enabled_maintenance4_features.maintenance4 = VK_TRUE;
-    enabled_maintenance4_features.pNext = &enabled_mesh_shader_features;
-
     enabled_float16_int8_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
     enabled_float16_int8_features.shaderFloat16 = VK_TRUE;
     enabled_float16_int8_features.shaderInt8 = VK_TRUE;
-    enabled_float16_int8_features.pNext = &enabled_maintenance4_features;
+    enabled_float16_int8_features.pNext = &enabled_mesh_shader_features;
+
+    enabled_vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    enabled_vulkan13_features.dynamicRendering = VK_TRUE;
+    enabled_vulkan13_features.synchronization2 = VK_TRUE;
+    enabled_vulkan13_features.maintenance4 = VK_TRUE;
+    enabled_vulkan13_features.pNext = &enabled_float16_int8_features;
 
     // If a pNext(Chain) has been passed, we need to add it to the device creation info
     VkPhysicalDeviceFeatures2 physical_device_features2{};
     physical_device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     physical_device_features2.features = device_features;
-    physical_device_features2.pNext = &enabled_float16_int8_features;
+    physical_device_features2.pNext = &enabled_vulkan13_features;
     create_info.pEnabledFeatures = nullptr;
     create_info.pNext = &physical_device_features2;
 
@@ -2143,6 +2153,7 @@ void initRayTracingProperties(
     vkCmdDrawMeshTasksIndirectCountEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksIndirectCountEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdDrawMeshTasksIndirectCountEXT"));
     vkCmdBeginDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdBeginDebugUtilsLabelEXT"));
     vkCmdEndDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdEndDebugUtilsLabelEXT"));
+    vkCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(vkGetDeviceProcAddr(vk_device, "vkCmdBeginRenderingKHR"));
 
     // Get ray tracing pipeline properties, which will be used later on in the sample
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR  ray_tracing_pipeline_properties{};

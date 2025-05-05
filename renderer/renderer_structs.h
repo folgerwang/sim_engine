@@ -101,6 +101,20 @@ struct ImageResolveInfo {
     glm::uvec3                extent;
 };
 
+struct Viewport {
+    float    x;
+    float    y;
+    float    width;
+    float    height;
+    float    min_depth;
+    float    max_depth;
+};
+
+struct Scissor {
+    glm::ivec2   offset;
+    glm::uvec2   extent;
+};
+
 union ClearColorValue {
     float       float32[4];
     int32_t     int32[4];
@@ -121,6 +135,29 @@ struct VertexInputBindingDescription {
     uint32_t            binding;
     uint32_t            stride;
     VertexInputRate     input_rate;
+};
+
+struct RenderingAttachmentInfo {
+    std::shared_ptr<ImageView>  image_view;
+    ImageLayout                 image_layout;
+    ResolveModeFlags            resolve_mode =
+        uint32_t(ResolveModeFlagBits::NONE);
+    std::shared_ptr<ImageView>  resolve_image_view;
+    ImageLayout                 resolve_image_layout;
+    AttachmentLoadOp            load_op;
+    AttachmentStoreOp           store_op;
+    ClearValue                  clear_value;
+};
+
+struct RenderingInfo {
+    uint32_t                flags;
+    glm::uvec2              render_area_offset;
+    glm::uvec2              render_area_extent;
+    uint32_t                layer_count;
+    uint32_t                view_mask;
+    std::vector<RenderingAttachmentInfo>    color_attachments;
+    std::vector<RenderingAttachmentInfo>    depth_attachments;
+    std::vector<RenderingAttachmentInfo>    stencil_attachments;
 };
 
 struct VertexInputAttributeDescription {
@@ -570,6 +607,18 @@ struct RayTracingShaderGroupCreateInfo {
     uint32_t                          any_hit_shader = (uint32_t)-1;
     uint32_t                          intersection_shader = (uint32_t)-1;
     const void*                       p_shader_group_capture_replay_handle = nullptr;
+};
+
+enum class RenderPasses {
+    kDepthOnly = 0,
+    kForward,
+    kShadow,
+    kNumRenderPasses
+};
+
+struct PipelineRenderbufferFormats {
+    std::vector<Format> color_formats;
+    Format depth_format;
 };
 
 struct StridedDeviceAddressRegion {

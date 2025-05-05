@@ -137,7 +137,7 @@ void createTextureImage(
             format,
             tex_width,
             tex_height,
-            texture.mip_levels,
+            std::max(texture.mip_levels, 1u),
             buffer_data.size() - sizeof(helper::DDS_HEADER),
             void_pixels,
             texture.image,
@@ -167,7 +167,7 @@ void createTextureImage(
         SET_FLAG_BIT(ImageAspect, COLOR_BIT),
         src_location,
         0,
-        texture.mip_levels);
+        std::max(texture.mip_levels, 1u));
 }
 
 std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(

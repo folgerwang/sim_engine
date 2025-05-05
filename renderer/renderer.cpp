@@ -484,7 +484,8 @@ void Helper::create2DTextureImage(
         texture_image,
         format,
         ImageLayout::UNDEFINED,
-        ImageLayout::TRANSFER_DST_OPTIMAL);
+        ImageLayout::TRANSFER_DST_OPTIMAL,
+        0, mip_levels);
 
     vk::helper::copyBufferToImage(
         cmd_buf,
@@ -499,7 +500,8 @@ void Helper::create2DTextureImage(
         texture_image,
         format,
         ImageLayout::TRANSFER_DST_OPTIMAL,
-        ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        0, mip_levels);
     device->submitAndWaitTransientCommandBuffer();
 
     device->destroyBuffer(staging_buffer);

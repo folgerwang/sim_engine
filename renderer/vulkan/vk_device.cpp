@@ -229,6 +229,7 @@ std::shared_ptr<ImageView> VulkanDevice::createImageView(
     view_info.format = helper::toVkFormat(format);
     view_info.subresourceRange.aspectMask = helper::toVkImageAspectFlags(aspect_flags);
     view_info.subresourceRange.baseMipLevel = base_mip;
+    assert(mip_count > 0);
     view_info.subresourceRange.levelCount = mip_count;
     view_info.subresourceRange.baseArrayLayer = base_layer;
     view_info.subresourceRange.layerCount = layer_count;
@@ -675,9 +676,6 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     auto vk_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
     assert(vk_pipeline_layout);
 
-    auto vk_render_pass = RENDER_TYPE_CAST(RenderPass, render_pass);
-    assert(vk_render_pass);
-
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipeline_info.stageCount = static_cast<uint32_t>(shader_stages.size());
     pipeline_info.pStages = shader_stages.data();
@@ -690,10 +688,107 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipeline_info.pColorBlendState = &vk_color_blending;
     //    pipeline_info.pDynamicState = nullptr; // Optional
     pipeline_info.layout = vk_pipeline_layout->get();
-    pipeline_info.renderPass = vk_render_pass->get();
+    if (render_pass) {
+        auto vk_render_pass = RENDER_TYPE_CAST(RenderPass, render_pass);
+        assert(vk_render_pass);
+        pipeline_info.renderPass = vk_render_pass->get();
+    }
     pipeline_info.subpass = 0;
     pipeline_info.basePipelineHandle = VK_NULL_HANDLE; // Optional
     pipeline_info.basePipelineIndex = -1; // Optional
+
+    VkPipeline graphics_pipeline;
+    auto result =
+        vkCreateGraphicsPipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &pipeline_info,
+            nullptr,
+            &graphics_pipeline);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create graphics pipeline! : ") +
+            VkResultToString(result));
+    }
+
+    auto vk_pipeline =
+        std::make_shared<VulkanPipeline>(graphics_pipeline);
+    vk_pipeline->set_source_location(src_location);
+    pipeline_list_.push_back(vk_pipeline);
+
+    return vk_pipeline;
+}
+
+std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
+    const std::shared_ptr<PipelineLayout>& pipeline_layout,
+    const std::vector<VertexInputBindingDescription>& binding_descs,
+    const std::vector<VertexInputAttributeDescription>& attribute_descs,
+    const PipelineInputAssemblyStateCreateInfo& topology_info,
+    const GraphicPipelineInfo& graphic_pipeline_info,
+    const ShaderModuleList& shader_modules,
+    const std::vector<Format>& color_formats,
+    const Format depth_format,
+    const std::source_location& src_location) {
+
+    VkGraphicsPipelineCreateInfo pipeline_info{};
+
+    auto viewport = helper::fillViewport(glm::uvec2(1));
+    auto scissor = helper::fillScissor(glm::uvec2(1));
+
+    auto vk_blend_attachments = helper::fillVkPipelineColorBlendAttachments(*graphic_pipeline_info.blend_state_info);
+    auto vk_color_blending = helper::fillVkPipelineColorBlendStateCreateInfo(*graphic_pipeline_info.blend_state_info, vk_blend_attachments);
+    auto vk_rasterizer = helper::fillVkPipelineRasterizationStateCreateInfo(*graphic_pipeline_info.rasterization_info);
+    auto vk_multisampling = helper::fillVkPipelineMultisampleStateCreateInfo(*graphic_pipeline_info.ms_info);
+    auto vk_depth_stencil = helper::fillVkPipelineDepthStencilStateCreateInfo(*graphic_pipeline_info.depth_stencil_info);
+
+    auto viewport_state = helper::fillVkPipelineViewportStateCreateInfo(&viewport, &scissor);
+
+    auto vk_binding_descs = helper::toVkVertexInputBindingDescription(binding_descs);
+    auto vk_attribute_descs = helper::toVkVertexInputAttributeDescription(attribute_descs);
+    auto vk_vertex_input_info = helper::fillVkPipelineVertexInputStateCreateInfo(vk_binding_descs, vk_attribute_descs);
+    auto vk_input_assembly = helper::fillVkPipelineInputAssemblyStateCreateInfo(topology_info);
+    auto shader_stages = helper::getShaderStages(shader_modules);
+
+    auto vk_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
+    assert(vk_pipeline_layout);
+
+    VkFormat vk_depth_format = helper::toVkFormat(depth_format);
+
+    VkPipelineRenderingCreateInfoKHR pipelineRenderingCreateInfo = {};
+    pipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+    pipelineRenderingCreateInfo.viewMask = 0; // Set for multiview if used, otherwise 0
+
+    std::vector<VkFormat> vk_color_formats(color_formats.size());
+    for (int i = 0; i < color_formats.size(); i++) {
+        vk_color_formats[i] = helper::toVkFormat(color_formats[i]);
+    }
+
+    // Describe color attachments
+    pipelineRenderingCreateInfo.colorAttachmentCount = uint32_t(color_formats.size()); // Number of color attachments
+    pipelineRenderingCreateInfo.pColorAttachmentFormats = vk_color_formats.data(); // Pointer to array of formats
+
+    pipelineRenderingCreateInfo.depthAttachmentFormat = vk_depth_format;
+    pipelineRenderingCreateInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED; // Or your stencil format
+
+
+    pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeline_info.stageCount = static_cast<uint32_t>(shader_stages.size());
+    pipeline_info.pStages = shader_stages.data();
+    pipeline_info.pVertexInputState = &vk_vertex_input_info;
+    pipeline_info.pInputAssemblyState = &vk_input_assembly;
+    pipeline_info.pRasterizationState = &vk_rasterizer;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pMultisampleState = &vk_multisampling;
+    pipeline_info.pDepthStencilState = &vk_depth_stencil;
+    pipeline_info.pColorBlendState = &vk_color_blending;
+    //    pipeline_info.pDynamicState = nullptr; // Optional
+    pipeline_info.layout = vk_pipeline_layout->get();
+    pipeline_info.subpass = 0;
+    pipeline_info.basePipelineHandle = VK_NULL_HANDLE; // Optional
+    pipeline_info.basePipelineIndex = -1; // Optional
+    pipeline_info.pNext = &pipelineRenderingCreateInfo;
 
     VkPipeline graphics_pipeline;
     auto result =

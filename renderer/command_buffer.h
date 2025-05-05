@@ -97,6 +97,17 @@ public:
         const StridedDeviceAddressRegion& hit_shader_entry,
         const StridedDeviceAddressRegion& callable_shader_entry,
         const glm::uvec3& size) = 0;
+    virtual void setViewports(
+        const std::vector<Viewport>& viewports,
+        uint32_t start_viewport = 0,
+        uint32_t num_viewports = 1) = 0;
+    virtual void setScissors(
+        const std::vector<Scissor>& scissors,
+        uint32_t start_scissor = 0,
+        uint32_t num_scissors = 1) = 0;
+    virtual void beginDynamicRendering(
+        const RenderingInfo& rendering_info) = 0;
+    virtual void endDynamicRendering() = 0;
     virtual void beginRenderPass(
         std::shared_ptr<RenderPass> render_pass,
         std::shared_ptr<Framebuffer> frame_buffer,
