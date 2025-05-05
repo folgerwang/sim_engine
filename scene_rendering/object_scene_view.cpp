@@ -30,50 +30,6 @@ ObjectSceneView::ObjectSceneView(
         buffer_size,
         depth_only) {
 
-    auto color_no_blend_attachment =
-        er::helper::fillPipelineColorBlendAttachmentState();
-
-    std::vector<er::PipelineColorBlendAttachmentState>
-        color_no_blend_attachments(1, color_no_blend_attachment);
-
-    auto single_no_blend_state_info =
-        std::make_shared<er::PipelineColorBlendStateCreateInfo>(
-            er::helper::fillPipelineColorBlendStateCreateInfo(color_no_blend_attachments));
-
-    auto cull_rasterization_info =
-        std::make_shared<er::PipelineRasterizationStateCreateInfo>(
-            er::helper::fillPipelineRasterizationStateCreateInfo());
-
-    auto no_cull_rasterization_info =
-        std::make_shared<er::PipelineRasterizationStateCreateInfo>(
-            er::helper::fillPipelineRasterizationStateCreateInfo(
-                false,
-                false,
-                er::PolygonMode::FILL,
-                SET_FLAG_BIT(CullMode, NONE)));
-
-    auto ms_info = std::make_shared<er::PipelineMultisampleStateCreateInfo>(
-        er::helper::fillPipelineMultisampleStateCreateInfo());
-
-    auto depth_stencil_info =
-        std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
-            er::helper::fillPipelineDepthStencilStateCreateInfo());
-
-    er::GraphicPipelineInfo graphic_pipeline_info;
-    graphic_pipeline_info.blend_state_info = single_no_blend_state_info;
-    graphic_pipeline_info.rasterization_info = cull_rasterization_info;
-    graphic_pipeline_info.ms_info = ms_info;
-    graphic_pipeline_info.depth_stencil_info = depth_stencil_info;
-
-    er::GraphicPipelineInfo graphic_double_face_pipeline_info;
-    graphic_double_face_pipeline_info.blend_state_info = single_no_blend_state_info;
-    graphic_double_face_pipeline_info.rasterization_info = no_cull_rasterization_info;
-    graphic_double_face_pipeline_info.ms_info = ms_info;
-    graphic_double_face_pipeline_info.depth_stencil_info = depth_stencil_info;
-
-    auto desc_set_layouts = global_desc_set_layouts;
-    desc_set_layouts.push_back(ego::TileObject::getTileResDescSetLayout());
-
     // tile params set.
     m_tile_res_desc_sets_.resize(2);
     for (int idx = 0; idx < 2; idx++) {
