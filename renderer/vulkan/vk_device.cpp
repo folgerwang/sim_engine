@@ -276,7 +276,7 @@ VulkanDevice::createSampler(
     sampler_info.addressModeW = vk_address_mode;
     sampler_info.anisotropyEnable = anisotropy > 0 ? VK_TRUE : VK_FALSE;
     sampler_info.maxAnisotropy = anisotropy;
-    sampler_info.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    sampler_info.borderColor = VK_BORDER_COLOR_INT_OPAQUE_WHITE;
     sampler_info.unnormalizedCoordinates = VK_FALSE;
     sampler_info.compareEnable = VK_FALSE;
     sampler_info.compareOp = VK_COMPARE_OP_ALWAYS;

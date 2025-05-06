@@ -668,6 +668,7 @@ void Helper::createDepthResources(
         1,
         texture_2d,
         SET_FLAG_BIT(ImageUsage, DEPTH_STENCIL_ATTACHMENT_BIT) |
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
         SET_FLAG_BIT(ImageUsage, TRANSFER_SRC_BIT),
         ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         src_location);
