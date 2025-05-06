@@ -3,6 +3,7 @@ layout(set = PBR_GLOBAL_PARAMS_SET, binding = GGX_ENV_TEX_INDEX) uniform sampler
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = LAMBERTIAN_ENV_TEX_INDEX) uniform samplerCube lambertian_env_sampler;
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = CHARLIE_LUT_INDEX) uniform sampler2D charlie_lut;
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = CHARLIE_ENV_TEX_INDEX) uniform samplerCube charlie_env_sampler;
+layout(set = PBR_GLOBAL_PARAMS_SET, binding = DIRECT_SHADOW_INDEX) uniform sampler2D direct_shadow_sampler;
 
 vec3 getIBLRadianceGGX(vec3 n, vec3 v, float perceptualRoughness, vec3 specularColor, float mip_count)
 {

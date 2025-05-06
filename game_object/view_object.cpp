@@ -60,16 +60,6 @@ ViewObject::ViewObject(
     m_clear_values_[1].depth_stencil =
     { 1.0f,
       0 };
-
-    std::vector<std::shared_ptr<er::ImageView>> attachments;
-    attachments.reserve(2);
-    if (m_color_buffer_) {
-        attachments.push_back(m_color_buffer_->view);
-    }
-
-    if (m_depth_buffer_) {
-        attachments.push_back(m_depth_buffer_->view);
-    }
 }
 
 void ViewObject::AllocRenderBuffers(

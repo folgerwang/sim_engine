@@ -70,8 +70,10 @@ void VulkanQueue::waitIdle() {
 
 ImageResourceInfo Helper::image_source_info_;
 ImageResourceInfo Helper::image_as_color_attachement_;
+ImageResourceInfo Helper::image_as_depth_attachement_;
 ImageResourceInfo Helper::image_as_store_;
 ImageResourceInfo Helper::image_as_shader_sampler_;
+ImageResourceInfo Helper::depth_as_shader_sampler_;
 TextureInfo Helper::white_tex_;
 TextureInfo Helper::black_tex_;
 TextureInfo Helper::permutation_tex_;
@@ -101,17 +103,25 @@ void Helper::init(const std::shared_ptr<Device>& device) {
         SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT),
         SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT) };
 
+    image_as_depth_attachement_ = {
+        ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+        SET_2_FLAG_BITS(Access, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, DEPTH_STENCIL_ATTACHMENT_READ_BIT),
+        SET_2_FLAG_BITS(PipelineStage, EARLY_FRAGMENT_TESTS_BIT , LATE_FRAGMENT_TESTS_BIT) };
+
     image_as_store_ = {
         ImageLayout::GENERAL,
         SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
-        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) |
-        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+        SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
 
     image_as_shader_sampler_ = {
         ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         SET_FLAG_BIT(Access, SHADER_READ_BIT),
-        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) |
-        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+        SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
+
+    depth_as_shader_sampler_ = {
+        ImageLayout::DEPTH_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
 }
 
 void Helper::destroy(const std::shared_ptr<Device>& device) {

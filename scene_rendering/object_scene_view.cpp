@@ -119,7 +119,7 @@ void ObjectSceneView::draw(
         depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
         depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
-        depth_attachment_info.clear_value.depth_stencil = { 1.0f, 0 };
+        depth_attachment_info.clear_value.depth_stencil = { depth_only ? 0 : 1.0f, 0 };
 
         er::RenderingInfo renderingInfo = {};
         renderingInfo.render_area_offset = { 0, 0 };
@@ -144,6 +144,7 @@ void ObjectSceneView::draw(
     scissors[0].offset = glm::ivec2(0);
     scissors[0].extent = m_buffer_size_;
 
+    if (!depth_only)
     for (auto& drawable_obj : m_drawable_objects_) {
         drawable_obj->draw(
             cmd_buf,

@@ -494,6 +494,12 @@ void VulkanCommandBuffer::addImageBarrier(
     uint32_t layer_count/* = 1*/) {
     auto vk_image = RENDER_TYPE_CAST(Image, image);
 
+    bool is_depth_buffer =
+        src_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+        src_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL ||
+        dst_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+        dst_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = helper::toVkImageLayout(src_info.image_layout);
@@ -501,7 +507,8 @@ void VulkanCommandBuffer::addImageBarrier(
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = vk_image->get();
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.aspectMask =
+        is_depth_buffer ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     barrier.subresourceRange.baseMipLevel = base_mip;
     barrier.subresourceRange.levelCount = mip_count;
     barrier.subresourceRange.baseArrayLayer = base_layer;

@@ -67,6 +67,10 @@ public:
         return m_color_buffer_;
     }
 
+    std::shared_ptr<er::TextureInfo> getDepthBuffer() const {
+        return m_depth_buffer_;
+    }
+
     void destroy(
         const std::shared_ptr<er::Device>& device);
 };

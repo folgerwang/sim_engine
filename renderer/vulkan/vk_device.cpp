@@ -772,6 +772,14 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipelineRenderingCreateInfo.depthAttachmentFormat = vk_depth_format;
     pipelineRenderingCreateInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED; // Or your stencil format
 
+    std::vector<VkDynamicState> dynamicStates = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR };
+
+    VkPipelineDynamicStateCreateInfo dynamicStateInfo = {};
+    dynamicStateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicStateInfo.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicStateInfo.pDynamicStates = dynamicStates.data();
 
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipeline_info.stageCount = static_cast<uint32_t>(shader_stages.size());
@@ -783,7 +791,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipeline_info.pMultisampleState = &vk_multisampling;
     pipeline_info.pDepthStencilState = &vk_depth_stencil;
     pipeline_info.pColorBlendState = &vk_color_blending;
-    //    pipeline_info.pDynamicState = nullptr; // Optional
+    pipeline_info.pDynamicState = &dynamicStateInfo;
     pipeline_info.layout = vk_pipeline_layout->get();
     pipeline_info.subpass = 0;
     pipeline_info.basePipelineHandle = VK_NULL_HANDLE; // Optional

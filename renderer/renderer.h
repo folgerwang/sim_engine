@@ -311,8 +311,10 @@ public:
 
     static ImageResourceInfo getImageAsSource() { return image_source_info_; }
     static ImageResourceInfo getImageAsColorAttachment() { return image_as_color_attachement_; }
+    static ImageResourceInfo getImageAsDepthAttachment() { return image_as_depth_attachement_; }
     static ImageResourceInfo getImageAsStore() { return image_as_store_; }
     static ImageResourceInfo getImageAsShaderSampler() { return image_as_shader_sampler_; }
+    static ImageResourceInfo getDepthAsShaderSampler() { return depth_as_shader_sampler_; }
 
     static std::shared_ptr<Instance> createInstance();
 
@@ -586,8 +588,10 @@ public:
     static TextureInfo grad_4d_tex_;
     static ImageResourceInfo image_source_info_;
     static ImageResourceInfo image_as_color_attachement_;
+    static ImageResourceInfo image_as_depth_attachement_;
     static ImageResourceInfo image_as_store_;
     static ImageResourceInfo image_as_shader_sampler_;
+    static ImageResourceInfo depth_as_shader_sampler_;
 };
 
 } // namespace renderer
