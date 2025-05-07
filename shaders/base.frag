@@ -20,6 +20,10 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform Mate
 };
 #endif
 
+layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX) uniform RuntimeLightsUniformBufferObject {
+    RuntimeLightsParams runtime_lights;
+};
+
 #include "ibl.glsl.h"
 
 layout(location = 0) in ObjectVsPsData ps_in_data;
@@ -27,6 +31,27 @@ layout(location = 0) in ObjectVsPsData ps_in_data;
 layout(location = 0) out vec4 outColor;
 
 #include "pbr_lighting.glsl.h"
+
+const float SHADOW_BIAS = 0.005;
+float calculateShadowFactor(vec3 position_world) {
+    vec4 position_light_clip = runtime_lights.light_view_proj * vec4(position_world, 1.0);
+
+    vec3 position_light_NDC = position_light_clip.xyz / position_light_clip.w;
+
+    vec2 shadow_map_texcoord = position_light_NDC.xy * 0.5f + 0.5f;
+    shadow_map_texcoord.y = 1.0 - shadow_map_texcoord.y;
+
+    float current_depth = position_light_NDC.z;
+
+    float closest_depth = texture(direct_shadow_sampler, shadow_map_texcoord).r;
+
+    float shadow = 1.0;
+    if (closest_depth < 1.0 && current_depth > closest_depth + SHADOW_BIAS) {
+        shadow = 0.0;
+    }
+
+    return shadow;
+}
 
 void main() {
 #ifndef NO_MTL
@@ -124,4 +149,7 @@ void main() {
     outColor.xyz = vec3(lod / 10.0f);
 #endif
 #endif
+
+    float shadow = calculateShadowFactor(ps_in_data.vertex_position);
+    outColor.xyz = vec3(shadow);
 }

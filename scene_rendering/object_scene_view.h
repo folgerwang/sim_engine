@@ -23,7 +23,6 @@ public:
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
         const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
         const std::shared_ptr<ego::CameraObject>& camera_object,
-        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const std::shared_ptr<er::TextureInfo>& color_buffer = nullptr,
         const std::shared_ptr<er::TextureInfo>& depth_buffer = nullptr,
         const glm::uvec2& buffer_size = glm::uvec2(2560, 1440),
@@ -39,7 +38,7 @@ public:
 
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
+        const renderer::DescriptorSetList& desc_sets,
         int dbuf_idx,
         float delta_t,
         float cur_time,

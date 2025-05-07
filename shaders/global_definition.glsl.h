@@ -35,6 +35,9 @@
 #define PBR_MATERIAL_PARAMS_SET     2
 #define TILE_PARAMS_SET             2
 #define MODEL_PARAMS_SET            3
+#define RUNTIME_LIGHTS_PARAMS_SET   4
+
+#define RUNTIME_LIGHTS_CONSTANT_INDEX     0
 
 // MODEL_PARAMS_SET.
 #define JOINT_CONSTANT_INDEX        0
@@ -752,6 +755,10 @@ struct ViewCameraInfo {
     vec2            mouse_pos;
     float           camera_follow_dist;
     float           pad;
+};
+
+struct RuntimeLightsParams {
+    mat4            light_view_proj;
 };
 
 struct VertexBufferInfo {

@@ -207,19 +207,34 @@ void VulkanCommandBuffer::bindDescriptorSets(
     const DescriptorSetList& desc_sets,
     const uint32_t first_set_idx/* = 0 */ ) {
     std::vector<VkDescriptorSet> vk_desc_sets;
-    auto vk_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
-    for (auto i = 0; i < desc_sets.size(); i++) {
-        vk_desc_sets.push_back(RENDER_TYPE_CAST(DescriptorSet, desc_sets[i])->get());
+    vk_desc_sets.reserve(desc_sets.size());
+    auto vk_pipeline_layout =
+        RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
+
+    uint32_t i = 0;
+    uint32_t start_set_idx = 0;
+    while (i <= desc_sets.size()) {
+        if (i < desc_sets.size() && desc_sets[i]) {
+            if (vk_desc_sets.size() == 0) {
+                start_set_idx = first_set_idx + i;
+            }
+            vk_desc_sets.push_back(RENDER_TYPE_CAST(DescriptorSet, desc_sets[i])->get());
+        }
+        else {
+            vkCmdBindDescriptorSets(
+                cmd_buf_,
+                helper::toVkPipelineBindPoint(bind_point),
+                vk_pipeline_layout->get(),
+                start_set_idx,
+                static_cast<uint32_t>(vk_desc_sets.size()),
+                vk_desc_sets.data(),
+                0,
+                nullptr);
+            vk_desc_sets.clear();
+        }
+
+        i++;
     }
-    vkCmdBindDescriptorSets(
-        cmd_buf_,
-        helper::toVkPipelineBindPoint(bind_point),
-        vk_pipeline_layout->get(),
-        first_set_idx,
-        static_cast<uint32_t>(vk_desc_sets.size()),
-        vk_desc_sets.data(),
-        0,
-        nullptr);
 }
 
 void VulkanCommandBuffer::pushConstants(

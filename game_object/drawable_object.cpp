@@ -1561,7 +1561,7 @@ static void drawMesh(
         if (prim.material_idx_ >= 0) {
             const auto& material =
                 drawable_object->materials_[prim.material_idx_];
-            desc_sets.push_back(material.desc_set_);
+            desc_sets[MODEL_PARAMS_SET] = material.desc_set_;
         }
 
         cmd_buf->bindDescriptorSets(
