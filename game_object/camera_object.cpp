@@ -145,6 +145,15 @@ void CameraObject::updateCamera(
         m_view_camera_params_);
 }
 
+void CameraObject::updateCamera(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const glm::vec3& camera_pos) {
+
+    m_view_camera_params_.init_camera_pos = camera_pos;
+    m_view_camera_->updateViewCameraInfo(
+        m_view_camera_params_);
+}
+
 void CameraObject::createCameraDescSetWithTerrain(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& rock_layer,

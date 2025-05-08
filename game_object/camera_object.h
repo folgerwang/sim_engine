@@ -24,7 +24,6 @@ protected:
     glsl::ViewCameraParams m_view_camera_params_;
     std::shared_ptr<ego::ViewCamera> m_view_camera_;
     std::shared_ptr<er::DescriptorSet> m_view_camera_desc_set_;
-    glm::vec3 m_camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
     bool m_is_ortho_ = false;
 
 public:
@@ -57,6 +56,10 @@ public:
         const float& mouse_wheel_offset,
         const bool& camera_rot_update);
 
+    virtual void updateCamera(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const glm::vec3& camera_pos);
+
     void createCameraDescSetWithTerrain(
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& rock_layer,
@@ -76,6 +79,11 @@ public:
     virtual glm::mat4 getViewProjMatrix() {
         return m_view_camera_->getCameraInfo().view_proj;
     }
+
+    virtual glm::vec3 getCameraPos() {
+        return m_view_camera_->getCameraInfo().position;
+    }
+
 
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);

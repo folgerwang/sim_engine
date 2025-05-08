@@ -310,13 +310,10 @@ void ViewCamera::updateViewCameraInfo(
         m_camera_info_.up_vector =
             normalize(cross(camera_right, m_camera_info_.facing_dir));
 
-        glm::vec3 lightPos = -m_camera_info_.facing_dir * frustum_size;
-        glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-
         float near_plane = 1.0f;
         float far_plane = frustum_size * 2.0f;
         auto eye_pos = m_camera_info_.position - m_camera_info_.facing_dir * frustum_size;
-        auto target_pos = glm::vec3(0.0f);
+        auto target_pos = m_camera_info_.position;
         auto up_dir = m_camera_info_.up_vector;
 
         m_camera_info_.position = eye_pos;
@@ -331,7 +328,7 @@ void ViewCamera::updateViewCameraInfo(
                 frustum_size,
                 near_plane,
                 far_plane);
-        m_camera_info_.proj[1].y *= -1.0f;
+        m_camera_info_.proj[1].y *= 1.0f;
         m_camera_info_.view_proj = m_camera_info_.proj * m_camera_info_.view;
         m_camera_info_.inv_view_proj = inverse(m_camera_info_.view_proj);
         m_camera_info_.inv_view = inverse(m_camera_info_.view);
