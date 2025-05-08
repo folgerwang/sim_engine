@@ -112,9 +112,11 @@ std::shared_ptr<renderer::Pipeline> ViewCamera::s_update_view_camera_pipeline_;
 ViewCamera::ViewCamera(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-    const glsl::ViewCameraParams& view_camera_params) :
+    const glsl::ViewCameraParams& view_camera_params,
+    bool is_ortho) :
     m_device_(device),
-    m_descriptor_pool_(descriptor_pool) {
+    m_descriptor_pool_(descriptor_pool),
+    m_is_ortho_(is_ortho){
 
     m_camera_info_.position = view_camera_params.init_camera_pos;
     m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
@@ -122,13 +124,6 @@ ViewCamera::ViewCamera(
     m_camera_info_.pitch = view_camera_params.pitch;
     m_camera_info_.camera_follow_dist = view_camera_params.camera_follow_dist;
     m_camera_info_.status |= 0x00000001;
-
-    m_shadow_camera_info_.position = view_camera_params.init_camera_pos;
-    m_shadow_camera_info_.mouse_pos = view_camera_params.mouse_pos;
-    m_shadow_camera_info_.yaw = view_camera_params.yaw;
-    m_shadow_camera_info_.pitch = view_camera_params.pitch;
-    m_shadow_camera_info_.camera_follow_dist = view_camera_params.camera_follow_dist;
-    m_shadow_camera_info_.status |= 0x00000001;
 }
 
 void ViewCamera::createViewCameraUpdateDescSet(
@@ -183,28 +178,6 @@ void ViewCamera::initViewCameraBuffer(
             m_view_camera_buffer_->memory,
             sizeof(m_camera_info_),
             &m_camera_info_);
-    }
-
-    if (!m_direct_shadow_camera_buffer_) {
-        m_direct_shadow_camera_buffer_ = std::make_shared<renderer::BufferInfo>();
-        device->createBuffer(
-            sizeof(glsl::ViewCameraInfo),
-            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-            SET_3_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT, HOST_COHERENT_BIT),
-            0,
-            m_direct_shadow_camera_buffer_->buffer,
-            m_direct_shadow_camera_buffer_->memory,
-            std::source_location::current());
-
-        m_shadow_camera_info_.position = view_camera_params.init_camera_pos;
-        m_shadow_camera_info_.yaw = view_camera_params.yaw;
-        m_shadow_camera_info_.pitch = view_camera_params.pitch;
-        m_shadow_camera_info_.camera_follow_dist = view_camera_params.camera_follow_dist;
-        m_shadow_camera_info_.status |= 0x00000001;
-        device->updateBufferMemory(
-            m_direct_shadow_camera_buffer_->memory,
-            sizeof(m_shadow_camera_info_),
-            &m_shadow_camera_info_);
     }
 }
 
@@ -291,7 +264,6 @@ void ViewCamera::destroyStaticMembers(
 void ViewCamera::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     m_view_camera_buffer_->destroy(device);
-    m_direct_shadow_camera_buffer_->destroy(device);
 }
 
 void ViewCamera::updateViewCameraBuffer(
@@ -326,134 +298,130 @@ void ViewCamera::updateViewCameraBuffer(
 void ViewCamera::updateViewCameraInfo(
     const glsl::ViewCameraParams& view_camera_params) {
 
-    auto& camera_info = m_camera_info_;
+    if (m_is_ortho_) {
+        m_camera_info_.position = view_camera_params.init_camera_pos;
 
-    if (camera_info.status == 0 || view_camera_params.frame_count == 0) {
-        camera_info.position = view_camera_params.init_camera_pos;
-        camera_info.mouse_pos = view_camera_params.mouse_pos;
-        camera_info.yaw = view_camera_params.yaw;
-        camera_info.pitch = view_camera_params.pitch;
-        camera_info.camera_follow_dist = view_camera_params.camera_follow_dist;
-        camera_info.status |= 0x00000001;
+        float frustum_size = 100.0f;
+
+        m_camera_info_.facing_dir = normalize(view_camera_params.init_camera_dir);
+        m_camera_info_.up_vector = view_camera_params.init_camera_up;
+        vec3 camera_right =
+            normalize(cross(m_camera_info_.facing_dir, m_camera_info_.up_vector));
+        m_camera_info_.up_vector =
+            normalize(cross(camera_right, m_camera_info_.facing_dir));
+
+        glm::vec3 lightPos = -m_camera_info_.facing_dir * frustum_size;
+        glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+
+        float near_plane = 1.0f;
+        float far_plane = frustum_size * 2.0f;
+        auto eye_pos = m_camera_info_.position - m_camera_info_.facing_dir * frustum_size;
+        auto target_pos = glm::vec3(0.0f);
+        auto up_dir = m_camera_info_.up_vector;
+
+        m_camera_info_.position = eye_pos;
+
+        m_camera_info_.view =
+            lookAt(eye_pos, target_pos, up_dir);
+        m_camera_info_.proj =
+            glm::ortho(
+                -frustum_size,
+                frustum_size,
+                -frustum_size,
+                frustum_size,
+                near_plane,
+                far_plane);
+        m_camera_info_.proj[1].y *= -1.0f;
+        m_camera_info_.view_proj = m_camera_info_.proj * m_camera_info_.view;
+        m_camera_info_.inv_view_proj = inverse(m_camera_info_.view_proj);
+        m_camera_info_.inv_view = inverse(m_camera_info_.view);
+        m_camera_info_.inv_proj = inverse(m_camera_info_.proj);
+
+        mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
+        m_camera_info_.inv_view_proj_relative = inverse(m_camera_info_.proj * view_relative);
+        m_camera_info_.depth_params = vec4(
+            m_camera_info_.proj[2].z,
+            m_camera_info_.proj[3].z,
+            1.0f / m_camera_info_.proj[0].x,
+            1.0f / m_camera_info_.proj[1].y);
     }
-    vec2 mouse_offset = view_camera_params.mouse_pos - camera_info.mouse_pos;
-    mouse_offset *= view_camera_params.sensitivity;
+    else {
+        if (m_camera_info_.status == 0 || view_camera_params.frame_count == 0) {
+            m_camera_info_.position = view_camera_params.init_camera_pos;
+            m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
+            m_camera_info_.yaw = view_camera_params.yaw;
+            m_camera_info_.pitch = view_camera_params.pitch;
+            m_camera_info_.camera_follow_dist = view_camera_params.camera_follow_dist;
+            m_camera_info_.status |= 0x00000001;
+        }
+        vec2 mouse_offset = view_camera_params.mouse_pos - m_camera_info_.mouse_pos;
+        mouse_offset *= view_camera_params.sensitivity;
 
-    if (view_camera_params.camera_rot_update != 0) {
-        camera_info.yaw += mouse_offset.x;
-        camera_info.pitch = clamp(camera_info.pitch + mouse_offset.y, -89.0f, 89.0f);
+        if (view_camera_params.camera_rot_update != 0) {
+            m_camera_info_.yaw += mouse_offset.x;
+            m_camera_info_.pitch = clamp(m_camera_info_.pitch + mouse_offset.y, -89.0f, 89.0f);
+        }
+
+        m_camera_info_.facing_dir =
+            getDirectionByYawAndPitch(m_camera_info_.yaw, m_camera_info_.pitch);
+        m_camera_info_.up_vector =
+            abs(m_camera_info_.facing_dir.y) < 0.99f ?
+            vec3(0, 1, 0) :
+            vec3(1, 0, 0);
+        vec3 camera_right =
+            normalize(cross(m_camera_info_.facing_dir, m_camera_info_.up_vector));
+        m_camera_info_.up_vector =
+            normalize(cross(camera_right, m_camera_info_.facing_dir));
+
+        auto move_forward_vec =
+            view_camera_params.camera_speed * m_camera_info_.facing_dir;
+
+        auto move_right_vec =
+            view_camera_params.camera_speed * camera_right;
+
+        if (view_camera_params.key == GLFW_KEY_W)
+            m_camera_info_.position += move_forward_vec;
+        if (view_camera_params.key == GLFW_KEY_S)
+            m_camera_info_.position -= move_forward_vec;
+        if (view_camera_params.key == GLFW_KEY_A)
+            m_camera_info_.position -= move_right_vec;
+        if (view_camera_params.key == GLFW_KEY_D)
+            m_camera_info_.position += move_right_vec;
+
+        auto eye_pos = m_camera_info_.position;
+        auto target_pos = eye_pos + m_camera_info_.facing_dir;
+        auto up_dir = m_camera_info_.up_vector;
+
+        m_camera_info_.position = eye_pos;
+
+        m_camera_info_.view =
+            lookAt(eye_pos, target_pos, up_dir);
+        m_camera_info_.proj =
+            perspective(
+                view_camera_params.fov,
+                view_camera_params.aspect,
+                view_camera_params.z_near,
+                view_camera_params.z_far);
+        m_camera_info_.proj[1].y *= -1.0f;
+        m_camera_info_.view_proj = m_camera_info_.proj * m_camera_info_.view;
+        m_camera_info_.inv_view_proj = inverse(m_camera_info_.view_proj);
+        m_camera_info_.inv_view = inverse(m_camera_info_.view);
+        m_camera_info_.inv_proj = inverse(m_camera_info_.proj);
+
+        mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
+        m_camera_info_.inv_view_proj_relative = inverse(m_camera_info_.proj * view_relative);
+        m_camera_info_.depth_params = vec4(
+            m_camera_info_.proj[2].z,
+            m_camera_info_.proj[3].z,
+            1.0f / m_camera_info_.proj[0].x,
+            1.0f / m_camera_info_.proj[1].y);
+        m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
     }
-
-    camera_info.facing_dir =
-        getDirectionByYawAndPitch(camera_info.yaw, camera_info.pitch);
-    camera_info.up_vector =
-        abs(camera_info.facing_dir.y) < 0.99f ?
-        vec3(0, 1, 0) :
-        vec3(1, 0, 0);
-    vec3 camera_right =
-        normalize(cross(camera_info.facing_dir, camera_info.up_vector));
-
-    auto move_forward_vec =
-        view_camera_params.camera_speed * camera_info.facing_dir;
-
-    auto move_right_vec =
-        view_camera_params.camera_speed * camera_right;
-    
-    if (view_camera_params.key == GLFW_KEY_W)
-        camera_info.position += move_forward_vec;
-    if (view_camera_params.key == GLFW_KEY_S)
-        camera_info.position -= move_forward_vec;
-    if (view_camera_params.key == GLFW_KEY_A)
-        camera_info.position -= move_right_vec;
-    if (view_camera_params.key == GLFW_KEY_D)
-        camera_info.position += move_right_vec;
-
-    auto eye_pos = camera_info.position;
-    auto target_pos = eye_pos + camera_info.facing_dir;
-    auto up_dir = camera_info.up_vector;
-
-    camera_info.position = eye_pos;
-
-    camera_info.view =
-        lookAt(eye_pos, target_pos, up_dir);
-    camera_info.proj =
-        perspective(
-            view_camera_params.fov,
-            view_camera_params.aspect,
-            view_camera_params.z_near,
-            view_camera_params.z_far);
-    camera_info.proj[1].y *= -1.0f;
-    camera_info.view_proj = camera_info.proj * camera_info.view;
-    camera_info.inv_view_proj = inverse(camera_info.view_proj);
-    camera_info.inv_view = inverse(camera_info.view);
-    camera_info.inv_proj = inverse(camera_info.proj);
-
-    mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
-    camera_info.inv_view_proj_relative = inverse(camera_info.proj * view_relative);
-    camera_info.depth_params = vec4(
-        camera_info.proj[2].z,
-        camera_info.proj[3].z,
-        1.0f / camera_info.proj[0].x,
-        1.0f / camera_info.proj[1].y);
-    camera_info.mouse_pos = view_camera_params.mouse_pos;
 
     m_device_->updateBufferMemory(
         m_view_camera_buffer_->memory,
-        sizeof(camera_info),
-        &camera_info);
-}
-
-void ViewCamera::updateShadowViewInfo(
-    const glsl::ViewCameraParams& view_camera_params,
-    const vec3& light_dir) {
-
-    auto& camera_info = m_shadow_camera_info_;
-
-    camera_info.facing_dir =
-        light_dir;
-    camera_info.up_vector =
-        vec3(1, 0, 0);
-    vec3 camera_right =
-        normalize(cross(camera_info.facing_dir, camera_info.up_vector));
-    camera_info.up_vector =
-        normalize(cross(camera_right, camera_info.facing_dir));
-
-    const auto& eye_pos = m_camera_info_.position;
-    const auto target_pos = eye_pos + camera_info.facing_dir;
-    const auto& up_dir = camera_info.up_vector;
-
-    camera_info.position = eye_pos;
-
-    camera_info.view =
-        lookAt(eye_pos, target_pos, up_dir);
-    camera_info.proj =
-        ortho(
-            -s_half_shadow_size,
-            s_half_shadow_size,
-            -s_half_shadow_size,
-            s_half_shadow_size,
-            view_camera_params.z_near,
-            view_camera_params.z_far);
-
-    camera_info.proj[1].y *= -1.0f;
-    camera_info.view_proj = camera_info.proj * camera_info.view;
-    camera_info.inv_view_proj = inverse(camera_info.view_proj);
-    camera_info.inv_view = inverse(camera_info.view);
-    camera_info.inv_proj = inverse(camera_info.proj);
-
-    mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
-    camera_info.inv_view_proj_relative = inverse(camera_info.proj * view_relative);
-    camera_info.depth_params = vec4(
-        camera_info.proj[2].z,
-        camera_info.proj[3].z,
-        1.0f / camera_info.proj[0].x,
-        1.0f / camera_info.proj[1].y);
-    camera_info.mouse_pos = view_camera_params.mouse_pos;
-
-    m_device_->updateBufferMemory(
-        m_direct_shadow_camera_buffer_->memory,
-        sizeof(camera_info),
-        &camera_info);
+        sizeof(m_camera_info_),
+        &m_camera_info_);
 }
 
 void ViewCamera::readGpuCameraInfo(

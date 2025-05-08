@@ -60,9 +60,11 @@ glm::vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
 
 CameraObject::CameraObject(
     const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+    const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+    bool is_ortho) :
         m_device_(device),
-        m_descriptor_pool_(descriptor_pool) {
+        m_descriptor_pool_(descriptor_pool),
+        m_is_ortho_(is_ortho){
 
     m_view_camera_params_.init_camera_pos = glm::vec3(0, 5.0f, 0);
     m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
@@ -73,7 +75,8 @@ CameraObject::CameraObject(
         std::make_shared<ego::ViewCamera>(
             device,
             descriptor_pool,
-            m_view_camera_params_);
+            m_view_camera_params_,
+            m_is_ortho_);
 
     m_view_camera_->initViewCameraBuffer(
         m_device_,
@@ -106,87 +109,41 @@ void CameraObject::updateCamera(
     const float& mouse_wheel_offset,
     const bool& camera_rot_update) {
 
-    const float s_camera_speed = 2.0f;
+    if (!m_is_ortho_) {
+        const float s_camera_speed = 2.0f;
 
-    m_view_camera_params_.camera_speed = s_camera_speed;
+        m_view_camera_params_.camera_speed = s_camera_speed;
 
-    m_view_camera_params_.yaw = 0.0f;
-    m_view_camera_params_.pitch = -90.0f;
-    m_view_camera_params_.init_camera_dir =
-        normalize(ego::getDirectionByYawAndPitch(
-            m_view_camera_params_.yaw,
-            m_view_camera_params_.pitch));
-    m_view_camera_params_.init_camera_up =
-        abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
-        vec3(0, 1, 0) :
-        vec3(1, 0, 0);
+        m_view_camera_params_.yaw = 0.0f;
+        m_view_camera_params_.pitch = -90.0f;
+        m_view_camera_params_.init_camera_dir =
+            normalize(ego::getDirectionByYawAndPitch(
+                m_view_camera_params_.yaw,
+                m_view_camera_params_.pitch));
+        m_view_camera_params_.init_camera_up =
+            abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
+            vec3(0, 1, 0) :
+            vec3(1, 0, 0);
 
-    m_view_camera_params_.z_near = 0.1f;
-    m_view_camera_params_.z_far = 40000.0f;
-    m_view_camera_params_.camera_follow_dist = 5.0f;
-    m_view_camera_params_.key = input_key;
-    m_view_camera_params_.frame_count = frame_count;
-    m_view_camera_params_.delta_t = delta_t;
-    m_view_camera_params_.mouse_pos = last_mouse_pos;
-    m_view_camera_params_.fov = glm::radians(45.0f);
-    m_view_camera_params_.aspect = 16.0f / 9.0f;// m_buffer_size_.x / (float)m_buffer_size_.y;
-    m_view_camera_params_.sensitivity = 0.2f;
-    m_view_camera_params_.num_game_objs = 1;// static_cast<int32_t>(m_drawable_objects_.size());
-    m_view_camera_params_.game_obj_idx = 0;
-    m_view_camera_params_.camera_rot_update = camera_rot_update ? 1 : 0;
-    m_view_camera_params_.mouse_wheel_offset = mouse_wheel_offset;
+        m_view_camera_params_.z_near = 0.1f;
+        m_view_camera_params_.z_far = 40000.0f;
+        m_view_camera_params_.camera_follow_dist = 5.0f;
+        m_view_camera_params_.key = input_key;
+        m_view_camera_params_.frame_count = frame_count;
+        m_view_camera_params_.delta_t = delta_t;
+        m_view_camera_params_.mouse_pos = last_mouse_pos;
+        m_view_camera_params_.fov = glm::radians(45.0f);
+        m_view_camera_params_.aspect = 16.0f / 9.0f;// m_buffer_size_.x / (float)m_buffer_size_.y;
+        m_view_camera_params_.sensitivity = 0.2f;
+        m_view_camera_params_.num_game_objs = 1;// static_cast<int32_t>(m_drawable_objects_.size());
+        m_view_camera_params_.game_obj_idx = 0;
+        m_view_camera_params_.camera_rot_update = camera_rot_update ? 1 : 0;
+        m_view_camera_params_.mouse_wheel_offset = mouse_wheel_offset;
+    }
 
     m_view_camera_->updateViewCameraInfo(
         m_view_camera_params_);
 }
-
-#if 0
-void TerrainSceneView::updateCamera(
-    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const uint32_t& dbuf_idx,
-    const int& input_key,
-    const int& frame_count,
-    const float& delta_t,
-    const glm::vec2& last_mouse_pos,
-    const float& mouse_wheel_offset,
-    const bool& camera_rot_update) {
-
-    const float s_camera_speed = 10.0f;
-
-    m_view_camera_params_.camera_speed = s_camera_speed;
-
-    m_view_camera_params_.yaw = 0.0f;
-    m_view_camera_params_.pitch = -90.0f;
-    m_view_camera_params_.init_camera_dir =
-        normalize(ego::getDirectionByYawAndPitch(
-            m_view_camera_params_.yaw,
-            m_view_camera_params_.pitch));
-    m_view_camera_params_.init_camera_up =
-        abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
-        vec3(0, 1, 0) :
-        vec3(1, 0, 0);
-
-    m_view_camera_params_.z_near = 0.1f;
-    m_view_camera_params_.z_far = 40000.0f;
-    m_view_camera_params_.camera_follow_dist = 5.0f;
-    m_view_camera_params_.key = input_key;
-    m_view_camera_params_.frame_count = frame_count;
-    m_view_camera_params_.delta_t = delta_t;
-    m_view_camera_params_.mouse_pos = last_mouse_pos;
-    m_view_camera_params_.fov = glm::radians(45.0f);
-    m_view_camera_params_.aspect = m_buffer_size_.x / (float)m_buffer_size_.y;
-    m_view_camera_params_.sensitivity = 0.2f;
-    m_view_camera_params_.num_game_objs = static_cast<int32_t>(m_drawable_objects_.size());
-    m_view_camera_params_.game_obj_idx = 0;
-    m_view_camera_params_.camera_rot_update = camera_rot_update ? 1 : 0;
-    m_view_camera_params_.mouse_wheel_offset = mouse_wheel_offset;
-
-    m_view_camera_->updateViewCameraBuffer(
-        cmd_buf,
-        m_view_camera_params_,
-        dbuf_idx);
-}
-#endif
 
 void CameraObject::createCameraDescSetWithTerrain(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
@@ -218,7 +175,7 @@ void CameraObject::destroy(const std::shared_ptr<renderer::Device>& device) {
 ObjectViewCameraObject::ObjectViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
-    CameraObject(device, descriptor_pool){
+    CameraObject(device, descriptor_pool, false){
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
     m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
@@ -230,7 +187,7 @@ ObjectViewCameraObject::ObjectViewCameraObject(
 TerrainViewCameraObject::TerrainViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
-    CameraObject(device, descriptor_pool) {
+    CameraObject(device, descriptor_pool, false) {
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
     m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
@@ -242,13 +199,13 @@ TerrainViewCameraObject::TerrainViewCameraObject(
 ShadowViewCameraObject::ShadowViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
-    CameraObject(device, descriptor_pool) {
+    CameraObject(device, descriptor_pool, true) {
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
     m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
-    m_view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
-    m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
+    m_view_camera_params_.init_camera_pos = glm::vec3(0, 0, 0);
+    m_view_camera_params_.init_camera_dir = glm::vec3(0.3f, 0.8f, 0.0f);
+    m_view_camera_params_.init_camera_up = glm::vec3(1.0f, 0, 0);
 }
 
 } // game_object

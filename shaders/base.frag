@@ -83,6 +83,8 @@ void main() {
     // LIGHTING
     PbrLightsColorInfo color_info = initColorInfo();
 
+    float shadow = calculateShadowFactor(ps_in_data.vertex_position);
+
     // Calculate lighting contribution from image based lighting source (IBL)
 #ifdef USE_IBL
     iblLighting(
@@ -121,7 +123,8 @@ void main() {
             ps_in_data,
             material,
             material_info,
-            v);
+            v,
+            0.6f + 0.4f * shadow);
 
 
 #ifdef ALPHAMODE_MASK
@@ -149,7 +152,4 @@ void main() {
     outColor.xyz = vec3(lod / 10.0f);
 #endif
 #endif
-
-    float shadow = calculateShadowFactor(ps_in_data.vertex_position);
-    outColor.xyz = vec3(shadow);
 }

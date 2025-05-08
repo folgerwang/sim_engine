@@ -1561,7 +1561,7 @@ static void drawMesh(
         if (prim.material_idx_ >= 0) {
             const auto& material =
                 drawable_object->materials_[prim.material_idx_];
-            desc_sets[MODEL_PARAMS_SET] = material.desc_set_;
+            desc_sets[PBR_MATERIAL_PARAMS_SET] = material.desc_set_;
         }
 
         cmd_buf->bindDescriptorSets(
@@ -1574,7 +1574,7 @@ static void drawMesh(
                 renderer::PipelineBindPoint::GRAPHICS,
                 drawable_pipeline_layout,
                 {skin_info->desc_set_},
-                MODEL_PARAMS_SET);
+                SKINL_PARAMS_SET);
         }
 
         cmd_buf->pushConstants(
@@ -1672,8 +1672,8 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
     push_const_range.size = sizeof(glsl::ModelParams);
 
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
-    desc_set_layouts.push_back(material_desc_set_layout);
-    desc_set_layouts.push_back(skin_desc_set_layout);
+    desc_set_layouts[PBR_MATERIAL_PARAMS_SET] = material_desc_set_layout;
+    desc_set_layouts[SKINL_PARAMS_SET] = skin_desc_set_layout;
 
     return device->createPipelineLayout(
         desc_set_layouts,

@@ -883,7 +883,8 @@ vec3 getFinalColor(
     in ObjectVsPsData in_data,
     in PbrMaterialParams in_material,
     in MaterialInfo in_material_info,
-    in vec3 view_dir)
+    in vec3 view_dir,
+    in float shadow)
 {
     uint material_features = in_material.material_features;
     bool enable_clearcoat = (material_features & FEATURE_MATERIAL_CLEARCOAT) != 0;
@@ -903,8 +904,8 @@ vec3 getFinalColor(
 
     vec3 color =
         (in_color_info.f_emissive +
-         in_color_info.f_diffuse +
-         in_color_info.f_specular +
+         in_color_info.f_diffuse * shadow +
+         in_color_info.f_specular * shadow +
          //in_color_info.f_subsurface +
          (1.0 - in_material_info.reflectance) * in_color_info.f_sheen) * (1.0 - clearcoatFactor * clearcoatFresnel) +
         in_color_info.f_clearcoat * clearcoatFactor;

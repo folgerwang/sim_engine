@@ -18,16 +18,16 @@ class ViewCamera {
 
     std::shared_ptr<renderer::DescriptorSet> m_update_view_camera_desc_set_[2];
     std::shared_ptr<renderer::BufferInfo> m_view_camera_buffer_;
-    std::shared_ptr<renderer::BufferInfo> m_direct_shadow_camera_buffer_;
     glsl::ViewCameraInfo m_camera_info_;
-    glsl::ViewCameraInfo m_shadow_camera_info_;
+    bool m_is_ortho_ = false;
 
 public:
     ViewCamera() = delete;
     ViewCamera(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-        const glsl::ViewCameraParams& view_camera_params);
+        const glsl::ViewCameraParams& view_camera_params,
+        bool is_ortho);
 
     void update(const std::shared_ptr<renderer::Device>& device, const float& time);
 
@@ -70,10 +70,6 @@ public:
     void updateViewCameraInfo(
         const glsl::ViewCameraParams& view_camera_params);
 
-    void updateShadowViewInfo(
-        const glsl::ViewCameraParams& view_camera_params,
-        const vec3& light_dir);
-
     void updateViewCameraBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const glsl::ViewCameraParams& game_camera_params,
@@ -88,10 +84,6 @@ public:
 
     std::shared_ptr<renderer::BufferInfo> getViewCameraBuffer() {
         return m_view_camera_buffer_;
-    }
-
-    std::shared_ptr<renderer::BufferInfo> getDirectShadowCameraBuffer() {
-        return m_direct_shadow_camera_buffer_;
     }
 
     void destroy(

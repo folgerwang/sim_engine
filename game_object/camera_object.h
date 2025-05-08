@@ -25,11 +25,13 @@ protected:
     std::shared_ptr<ego::ViewCamera> m_view_camera_;
     std::shared_ptr<er::DescriptorSet> m_view_camera_desc_set_;
     glm::vec3 m_camera_pos_ = glm::vec3(0.0f, 0.0f, 0.0f);
+    bool m_is_ortho_ = false;
 
 public:
     CameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        bool is_ortho);
 
     virtual ~CameraObject() = default;
 
@@ -69,6 +71,10 @@ public:
 
     virtual std::shared_ptr<er::BufferInfo> getViewCameraBuffer() {
         return m_view_camera_->getViewCameraBuffer();
+    }
+
+    virtual glm::mat4 getViewProjMatrix() {
+        return m_view_camera_->getCameraInfo().view_proj;
     }
 
     virtual void destroy(
