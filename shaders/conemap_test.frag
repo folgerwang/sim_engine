@@ -248,7 +248,8 @@ void main() {
             ps_in_data,
             material,
             material_info,
-            v);
+            v,
+            1.0f);
 
 
     //outColor = vec4(vec3(sum_visi), 1.0f);
