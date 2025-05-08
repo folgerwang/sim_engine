@@ -204,7 +204,7 @@ ShadowViewCameraObject::ShadowViewCameraObject(
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
     m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
     m_view_camera_params_.init_camera_pos = glm::vec3(0, 0, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(0.3f, 0.8f, 0.0f);
+    m_view_camera_params_.init_camera_dir = glm::vec3(0.3f, -0.8f, 0.0f);
     m_view_camera_params_.init_camera_up = glm::vec3(1.0f, 0, 0);
 }
 

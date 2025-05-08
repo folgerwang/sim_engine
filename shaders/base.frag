@@ -39,7 +39,7 @@ float calculateShadowFactor(vec3 position_world) {
     vec3 position_light_NDC = position_light_clip.xyz / position_light_clip.w;
 
     vec2 shadow_map_texcoord = position_light_NDC.xy * 0.5f + 0.5f;
-    shadow_map_texcoord.y = 1.0 - shadow_map_texcoord.y;
+    shadow_map_texcoord.y = shadow_map_texcoord.y;
 
     float current_depth = position_light_NDC.z;
 
