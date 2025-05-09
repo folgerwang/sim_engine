@@ -93,14 +93,18 @@ class ObjectViewCameraObject : public CameraObject{
 public:
     ObjectViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        float fov,
+        float aspect);
 };
 
 class TerrainViewCameraObject : public CameraObject{
 public:
     TerrainViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        float fov,
+        float aspect);
 };
 
 class ShadowViewCameraObject : public CameraObject {

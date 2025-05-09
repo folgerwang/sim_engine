@@ -68,7 +68,8 @@ public:
         const std::shared_ptr<renderer::Device>& device);
 
     void updateViewCameraInfo(
-        const glsl::ViewCameraParams& view_camera_params);
+        const glsl::ViewCameraParams& view_camera_params,
+        std::shared_ptr<glm::vec3> input_camera_pos);
 
     void updateViewCameraBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

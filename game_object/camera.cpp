@@ -296,10 +296,12 @@ void ViewCamera::updateViewCameraBuffer(
 }
 
 void ViewCamera::updateViewCameraInfo(
-    const glsl::ViewCameraParams& view_camera_params) {
+    const glsl::ViewCameraParams& view_camera_params,
+    std::shared_ptr<glm::vec3> input_camera_pos) {
 
     if (m_is_ortho_) {
-        m_camera_info_.position = view_camera_params.init_camera_pos;
+        if (input_camera_pos) 
+            m_camera_info_.position = *input_camera_pos;
 
         float frustum_size = 100.0f;
 

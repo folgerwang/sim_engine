@@ -132,8 +132,6 @@ void CameraObject::updateCamera(
         m_view_camera_params_.frame_count = frame_count;
         m_view_camera_params_.delta_t = delta_t;
         m_view_camera_params_.mouse_pos = last_mouse_pos;
-        m_view_camera_params_.fov = glm::radians(45.0f);
-        m_view_camera_params_.aspect = 16.0f / 9.0f;// m_buffer_size_.x / (float)m_buffer_size_.y;
         m_view_camera_params_.sensitivity = 0.2f;
         m_view_camera_params_.num_game_objs = 1;// static_cast<int32_t>(m_drawable_objects_.size());
         m_view_camera_params_.game_obj_idx = 0;
@@ -142,16 +140,20 @@ void CameraObject::updateCamera(
     }
 
     m_view_camera_->updateViewCameraInfo(
-        m_view_camera_params_);
+        m_view_camera_params_,
+        nullptr);
 }
 
 void CameraObject::updateCamera(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const glm::vec3& camera_pos) {
 
+    std::shared_ptr<glm::vec3> input_camera_pos =
+        std::make_shared<glm::vec3>(camera_pos);
     m_view_camera_params_.init_camera_pos = camera_pos;
     m_view_camera_->updateViewCameraInfo(
-        m_view_camera_params_);
+        m_view_camera_params_,
+        input_camera_pos);
 }
 
 void CameraObject::createCameraDescSetWithTerrain(
@@ -183,7 +185,9 @@ void CameraObject::destroy(const std::shared_ptr<renderer::Device>& device) {
 
 ObjectViewCameraObject::ObjectViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        float fov,
+        float aspect) :
     CameraObject(device, descriptor_pool, false){
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
@@ -191,11 +195,15 @@ ObjectViewCameraObject::ObjectViewCameraObject(
     m_view_camera_params_.init_camera_pos = glm::vec3(0, 100.0f, 0);
     m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
     m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
+    m_view_camera_params_.fov = fov;
+    m_view_camera_params_.aspect = aspect;
 }
 
 TerrainViewCameraObject::TerrainViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        float fov,
+        float aspect) :
     CameraObject(device, descriptor_pool, false) {
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
@@ -203,6 +211,8 @@ TerrainViewCameraObject::TerrainViewCameraObject(
     m_view_camera_params_.init_camera_pos = glm::vec3(0, 500.0f, 0);
     m_view_camera_params_.init_camera_dir = glm::vec3(1.0f, 0.0f, 0.0f);
     m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
+    m_view_camera_params_.fov = fov;
+    m_view_camera_params_.aspect = aspect;
 }
 
 ShadowViewCameraObject::ShadowViewCameraObject(
@@ -215,6 +225,8 @@ ShadowViewCameraObject::ShadowViewCameraObject(
     m_view_camera_params_.init_camera_pos = glm::vec3(0, 0, 0);
     m_view_camera_params_.init_camera_dir = glm::vec3(0.3f, -0.8f, 0.0f);
     m_view_camera_params_.init_camera_up = glm::vec3(1.0f, 0, 0);
+    m_view_camera_params_.fov = 0.0f;
+    m_view_camera_params_.aspect = 1.0f;
 }
 
 } // game_object
