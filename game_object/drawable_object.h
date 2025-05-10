@@ -285,6 +285,7 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const renderer::GraphicPipelineInfo& direct_shadow_graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
 
     static void generateDescriptorSet(

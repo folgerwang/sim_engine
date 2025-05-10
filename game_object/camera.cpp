@@ -318,8 +318,6 @@ void ViewCamera::updateViewCameraInfo(
         auto target_pos = m_camera_info_.position;
         auto up_dir = m_camera_info_.up_vector;
 
-        m_camera_info_.position = eye_pos;
-
         m_camera_info_.view =
             lookAt(eye_pos, target_pos, up_dir);
         m_camera_info_.proj =
