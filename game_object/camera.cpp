@@ -304,6 +304,7 @@ void ViewCamera::updateViewCameraInfo(
             m_camera_info_.position = *input_camera_pos;
 
         float frustum_size = 100.0f;
+        float cast_dist = 50.0f;
 
         m_camera_info_.facing_dir = normalize(view_camera_params.init_camera_dir);
         m_camera_info_.up_vector = view_camera_params.init_camera_up;
@@ -313,8 +314,8 @@ void ViewCamera::updateViewCameraInfo(
             normalize(cross(camera_right, m_camera_info_.facing_dir));
 
         float near_plane = 1.0f;
-        float far_plane = frustum_size * 2.0f;
-        auto eye_pos = m_camera_info_.position - m_camera_info_.facing_dir * frustum_size;
+        float far_plane = cast_dist * 2.0f;
+        auto eye_pos = m_camera_info_.position - m_camera_info_.facing_dir * cast_dist;
         auto target_pos = m_camera_info_.position;
         auto up_dir = m_camera_info_.up_vector;
 

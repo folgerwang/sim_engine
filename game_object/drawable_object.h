@@ -220,6 +220,7 @@ public:
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const renderer::GraphicPipelineInfo& direct_shadow_graphic_pipeline_info,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& thin_film_lut_tex,
         const std::string& file_name,

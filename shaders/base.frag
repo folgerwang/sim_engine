@@ -32,7 +32,7 @@ layout(location = 0) out vec4 outColor;
 
 #include "pbr_lighting.glsl.h"
 
-const float SHADOW_BIAS = 0.005;
+const float SHADOW_BIAS = 0.001;
 float calculateShadowFactor(vec3 position_world) {
     vec4 position_light_clip = runtime_lights.light_view_proj * vec4(position_world, 1.0);
 
