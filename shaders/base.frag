@@ -102,10 +102,10 @@ void main() {
             ps_in_data,
             material,
             material_info,
-            material.lights[i],
+            runtime_lights.lights[i],
             normal_info,
             v,
-            1.0f);
+            shadow);
     }
 #endif // !USE_PUNCTUAL
 
@@ -124,7 +124,7 @@ void main() {
             material,
             material_info,
             v,
-            0.6f + 0.4f * shadow);
+            1.0f);
 
 
 #ifdef ALPHAMODE_MASK

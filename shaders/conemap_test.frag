@@ -219,6 +219,7 @@ void main() {
     sum_visi += dot(coeffs[5], vec4(params.coeffs[20], params.coeffs[21], params.coeffs[22], params.coeffs[23]));
     sum_visi += coeffs_6 * params.coeffs[24];
 
+/*
 	// Calculate lighting contribution from punctual light sources
 #ifdef USE_PUNCTUAL
     for (int i = 0; i < LIGHT_COUNT; ++i) {
@@ -227,12 +228,13 @@ void main() {
             ps_in_data,
             material,
             material_info,
-            material.lights[i],
+            runtime_lights.lights[i],
             normal_info,
             v,
             sum_visi);
     }
 #endif // !USE_PUNCTUAL
+*/
 
     layerBlending(
         color_info,

@@ -629,8 +629,6 @@ struct PbrMaterialParams {
     vec3            emissive_color;
     uint            pad_3;
 
-    Light           lights[LIGHT_COUNT];
-
     mat3            base_color_uv_transform;
     mat3            normal_uv_transform;
     mat3            metallic_roughness_uv_transform;
@@ -760,6 +758,7 @@ struct ViewCameraInfo {
 
 struct RuntimeLightsParams {
     mat4            light_view_proj;
+    Light           lights[LIGHT_COUNT];
 };
 
 struct VertexBufferInfo {

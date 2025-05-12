@@ -438,11 +438,6 @@ void ConemapTest::draw(
     
     fillYVauleTablle(y_value, std::acosf(ray_2d.y), s_phi);
 
-    glm::vec3 light_ray =
-        glm::vec3(std::sin(s_theta) * std::cos(s_phi),
-            std::cos(s_theta),
-            std::sin(s_theta) * std::sin(s_phi));
-
     for (int i = 0; i < 25; i++) {
         params.coeffs[i] = y_value[i];
     }
@@ -480,13 +475,6 @@ void ConemapTest::draw(
         ubo.material_features |= FEATURE_HAS_NORMAL_MAP;
         ubo.tonemap_type = TONEMAP_DEFAULT;
         ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
-        for (int l = 0; l < LIGHT_COUNT; l++) {
-            ubo.lights[l].type = glsl::LightType_Directional;
-            ubo.lights[l].color = glm::vec3(1, 0, 0);
-            ubo.lights[l].direction = light_ray;
-            ubo.lights[l].intensity = 100.0f;
-            ubo.lights[l].position = glm::vec3(0, 0, 0);
-        }
 
         device->updateBufferMemory(
             uniform_buffer_->memory,

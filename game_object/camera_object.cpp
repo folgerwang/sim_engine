@@ -70,6 +70,10 @@ CameraObject::CameraObject(
     m_view_camera_params_.init_camera_dir = glm::vec3(0.0f, -1.0f, 0.0f);
     m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
     m_view_camera_params_.camera_speed = 0.01f;
+    m_view_camera_params_.yaw = 0.0f;
+    m_view_camera_params_.pitch = -90.0f;
+    m_view_camera_params_.z_near = 0.1f;
+    m_view_camera_params_.z_far = 4000.0f;
 
     m_view_camera_ =
         std::make_shared<ego::ViewCamera>(
@@ -114,19 +118,6 @@ void CameraObject::updateCamera(
 
         m_view_camera_params_.camera_speed = s_camera_speed;
 
-        m_view_camera_params_.yaw = 0.0f;
-        m_view_camera_params_.pitch = -90.0f;
-        m_view_camera_params_.init_camera_dir =
-            normalize(ego::getDirectionByYawAndPitch(
-                m_view_camera_params_.yaw,
-                m_view_camera_params_.pitch));
-        m_view_camera_params_.init_camera_up =
-            abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
-            vec3(0, 1, 0) :
-            vec3(1, 0, 0);
-
-        m_view_camera_params_.z_near = 0.1f;
-        m_view_camera_params_.z_far = 40000.0f;
         m_view_camera_params_.camera_follow_dist = 5.0f;
         m_view_camera_params_.key = input_key;
         m_view_camera_params_.frame_count = frame_count;
@@ -197,6 +188,19 @@ ObjectViewCameraObject::ObjectViewCameraObject(
     m_view_camera_params_.init_camera_up = glm::vec3(1, 0, 0);
     m_view_camera_params_.fov = fov;
     m_view_camera_params_.aspect = aspect;
+    m_view_camera_params_.yaw = -125.800003f;
+    m_view_camera_params_.pitch = 0.599997461f;
+    m_view_camera_params_.init_camera_pos =
+        glm::vec3(-1.70988739f, 2.48692441f, -13.6786499f);
+
+    m_view_camera_params_.init_camera_dir =
+        normalize(ego::getDirectionByYawAndPitch(
+            m_view_camera_params_.yaw,
+            m_view_camera_params_.pitch));
+    m_view_camera_params_.init_camera_up =
+        abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
+        vec3(0, 1, 0) :
+        vec3(1, 0, 0);
 }
 
 TerrainViewCameraObject::TerrainViewCameraObject(
@@ -213,17 +217,27 @@ TerrainViewCameraObject::TerrainViewCameraObject(
     m_view_camera_params_.init_camera_up = glm::vec3(0, 1, 0);
     m_view_camera_params_.fov = fov;
     m_view_camera_params_.aspect = aspect;
+
+    m_view_camera_params_.init_camera_dir =
+        normalize(ego::getDirectionByYawAndPitch(
+            m_view_camera_params_.yaw,
+            m_view_camera_params_.pitch));
+    m_view_camera_params_.init_camera_up =
+        abs(m_view_camera_params_.init_camera_dir.y) < 0.99f ?
+        vec3(0, 1, 0) :
+        vec3(1, 0, 0);
 }
 
 ShadowViewCameraObject::ShadowViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool) :
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const glm::vec3& light_dir) :
     CameraObject(device, descriptor_pool, true) {
 
     m_view_camera_params_.world_min = ego::TileObject::getWorldMin();
     m_view_camera_params_.inv_world_range = 1.0f / ego::TileObject::getWorldRange();
     m_view_camera_params_.init_camera_pos = glm::vec3(0, 0, 0);
-    m_view_camera_params_.init_camera_dir = glm::vec3(0.3f, -0.8f, 0.0f);
+    m_view_camera_params_.init_camera_dir = light_dir;
     m_view_camera_params_.init_camera_up = glm::vec3(1.0f, 0, 0);
     m_view_camera_params_.fov = 0.0f;
     m_view_camera_params_.aspect = 1.0f;

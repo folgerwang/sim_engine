@@ -111,7 +111,12 @@ class ShadowViewCameraObject : public CameraObject {
 public:
     ShadowViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<er::DescriptorPool>& descriptor_pool);
+        const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
+        const glm::vec3& light_dir);
+
+    const glm::vec3& getLightDir() {
+        return m_view_camera_params_.init_camera_dir;
+    }
 };
 
 } // game_object
