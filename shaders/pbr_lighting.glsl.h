@@ -166,7 +166,11 @@ NormalInfo getNormalInfo(
 
     // Compute pertubed normals:
     if (has_normal_map) {
-        n = texture(normal_tex, uv).rgb * 2.0 - vec3(1.0);
+        n = texture(normal_tex, uv).rgb;
+        float n_sign = n.z >= 0.0 ? 1.0f : -1.0f;
+        n.xy = n.xy * 2.0 - 1.0;
+        n.y = -n.y;
+        n.z = sqrt(max(1.0f - dot(n.xy, n.xy), 0.0)) * n_sign;
         n *= vec3(in_mat.normal_scale, in_mat.normal_scale, 1.0);
         n = mat3(t, b, ng) * normalize(n);
     }
