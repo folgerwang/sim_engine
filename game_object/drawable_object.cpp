@@ -1547,7 +1547,7 @@ static void drawMesh(
     for (const auto& prim : mesh_info.primitives_) {
         const auto& attrib_list = prim.attribute_descs_;
 
-#if 0
+#if 1
         auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
         if (cur_hash != last_hash) {
             cmd_buf->bindPipeline(
@@ -2929,7 +2929,7 @@ void DrawableObject::draw(
     bool depth_only/* = false */ ) {
 
     auto& pipeline_list = depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_;
-
+/*
     auto prim = object_->meshes_[0].primitives_[0];
     auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
     cmd_buf->bindPipeline(
@@ -2937,7 +2937,7 @@ void DrawableObject::draw(
         pipeline_list[cur_hash]);
 
     cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
-    cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
+    cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));*/
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);

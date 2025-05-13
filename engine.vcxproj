@@ -56,6 +56,7 @@
     <ClCompile Include="scene_rendering\volume_noise.cpp" />
     <ClCompile Include="scene_rendering\weather_system.cpp" />
     <ClCompile Include="third_parties\fbx\ufbx.c" />
+    <ClCompile Include="ui\chat_box.cpp" />
     <ClCompile Include="ui\menu.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -118,6 +119,7 @@
     <ClInclude Include="shaders\weather\weather_common.glsl.h" />
     <ClInclude Include="third_parties\fbx\ufbx.h" />
     <ClInclude Include="tiny_mtx2.h" />
+    <ClInclude Include="ui\chat_box.h" />
     <ClInclude Include="ui\menu.h" />
   </ItemGroup>
   <ItemGroup>

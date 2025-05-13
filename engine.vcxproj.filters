@@ -189,6 +189,9 @@
     <ClCompile Include="ui\menu.cpp">
       <Filter>Source Files\engine\ui</Filter>
     </ClCompile>
+    <ClCompile Include="ui\chat_box.cpp">
+      <Filter>Source Files\engine\ui</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -369,6 +372,9 @@
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
     <ClInclude Include="ui\menu.h">
+      <Filter>Header Files\engine\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="ui\chat_box.h">
       <Filter>Header Files\engine\ui</Filter>
     </ClInclude>
   </ItemGroup>

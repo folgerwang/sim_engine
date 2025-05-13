@@ -68,7 +68,7 @@ namespace {
 }
 
 namespace engine {
-namespace scene_rendering {
+namespace ui {
 
 Menu::Menu(
     GLFWwindow* window,
@@ -130,6 +130,8 @@ Menu::Menu(
         main_texture_id_ =
             renderer::Helper::addImTextureID(sampler, main_image_view);
     }
+
+    chat_box_ = std::make_shared<ChatBox>();
 }
 
 void Menu::init(
@@ -420,6 +422,8 @@ bool Menu::draw(
         ImGui::End();
     }
 
+    chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
+
     renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
 
     cmd_buf->endRenderPass();
@@ -433,5 +437,5 @@ void Menu::destroy() {
     ImGui::DestroyContext();
 }
 
-}//namespace scene_rendering
+}//namespace ui
 }//namespace engine

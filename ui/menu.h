@@ -2,9 +2,10 @@
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
+#include "chat_box.h"
 
 namespace engine {
-namespace scene_rendering {
+namespace ui {
 
 class Menu {
     std::vector<std::string> gltf_file_names_;
@@ -37,6 +38,8 @@ class Menu {
 
     ImTextureID rt_texture_id_;
     ImTextureID main_texture_id_;
+
+    std::shared_ptr<ChatBox> chat_box_;
 
 public:
     Menu(
@@ -174,5 +177,5 @@ public:
     void destroy();
 };
 
-}// namespace scene_rendering
+}// namespace ui
 }// namespace engine
