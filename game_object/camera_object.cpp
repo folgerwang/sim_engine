@@ -114,10 +114,6 @@ void CameraObject::updateCamera(
     const bool& camera_rot_update) {
 
     if (!m_is_ortho_) {
-        const float s_camera_speed = 2.0f;
-
-        m_view_camera_params_.camera_speed = s_camera_speed;
-
         m_view_camera_params_.camera_follow_dist = 5.0f;
         m_view_camera_params_.key = input_key;
         m_view_camera_params_.frame_count = frame_count;
@@ -192,6 +188,9 @@ ObjectViewCameraObject::ObjectViewCameraObject(
     m_view_camera_params_.pitch = 0.599997461f;
     m_view_camera_params_.init_camera_pos =
         glm::vec3(-1.70988739f, 2.48692441f, -13.6786499f);
+
+    const float s_camera_speed = 0.1f;
+    m_view_camera_params_.camera_speed = s_camera_speed;
 
     m_view_camera_params_.init_camera_dir =
         normalize(ego::getDirectionByYawAndPitch(
