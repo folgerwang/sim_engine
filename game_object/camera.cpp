@@ -303,8 +303,8 @@ void ViewCamera::updateViewCameraInfo(
         if (input_camera_pos) 
             m_camera_info_.position = *input_camera_pos;
 
-        float frustum_size = 100.0f;
-        float cast_dist = 50.0f;
+        float frustum_size = 50.0f;
+        float cast_dist = 25.0f;
 
         m_camera_info_.facing_dir = normalize(view_camera_params.init_camera_dir);
         m_camera_info_.up_vector = view_camera_params.init_camera_up;
@@ -371,11 +371,14 @@ void ViewCamera::updateViewCameraInfo(
         m_camera_info_.up_vector =
             normalize(cross(camera_right, m_camera_info_.facing_dir));
 
+        auto camera_speed =
+            view_camera_params.camera_speed * view_camera_params.delta_t / 0.033f;
+
         auto move_forward_vec =
-            view_camera_params.camera_speed * m_camera_info_.facing_dir;
+            camera_speed * m_camera_info_.facing_dir;
 
         auto move_right_vec =
-            view_camera_params.camera_speed * camera_right;
+            camera_speed * camera_right;
 
         if (view_camera_params.key == GLFW_KEY_W)
             m_camera_info_.position += move_forward_vec;
