@@ -47,7 +47,6 @@
     <ClCompile Include="renderer\vulkan\vk_renderer_helper.cpp" />
     <ClCompile Include="scene_rendering\conemap.cpp" />
     <ClCompile Include="scene_rendering\ibl_creator.cpp" />
-    <ClCompile Include="scene_rendering\menu.cpp" />
     <ClCompile Include="scene_rendering\object_scene_view.cpp" />
     <ClCompile Include="scene_rendering\prt_shadow.cpp" />
     <ClCompile Include="scene_rendering\skydome.cpp" />
@@ -57,6 +56,7 @@
     <ClCompile Include="scene_rendering\volume_noise.cpp" />
     <ClCompile Include="scene_rendering\weather_system.cpp" />
     <ClCompile Include="third_parties\fbx\ufbx.c" />
+    <ClCompile Include="ui\menu.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h" />
@@ -94,7 +94,6 @@
     <ClInclude Include="renderer\vulkan\vk_renderer_helper.h" />
     <ClInclude Include="scene_rendering\conemap.h" />
     <ClInclude Include="scene_rendering\ibl_creator.h" />
-    <ClInclude Include="scene_rendering\menu.h" />
     <ClInclude Include="scene_rendering\object_scene_view.h" />
     <ClInclude Include="scene_rendering\prt_shadow.h" />
     <ClInclude Include="scene_rendering\skydome.h" />
@@ -119,6 +118,7 @@
     <ClInclude Include="shaders\weather\weather_common.glsl.h" />
     <ClInclude Include="third_parties\fbx\ufbx.h" />
     <ClInclude Include="tiny_mtx2.h" />
+    <ClInclude Include="ui\menu.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\base_depthonly.frag" />

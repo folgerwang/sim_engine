@@ -67,6 +67,12 @@
     <Filter Include="Resource Files\weather">
       <UniqueIdentifier>{01f5ba18-90a7-43e8-9abf-7a117cbd4fa7}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\engine\ui">
+      <UniqueIdentifier>{0e8486b3-6cdb-48a3-ab27-c7a9456b87f6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\engine\ui">
+      <UniqueIdentifier>{ff9e3b1a-7910-4849-9cb7-38e3f206d6e3}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="engine_helper.cpp">
@@ -115,9 +121,6 @@
       <Filter>Source Files\engine\game_object</Filter>
     </ClCompile>
     <ClCompile Include="scene_rendering\ibl_creator.cpp">
-      <Filter>Source Files\engine\scene_rendering</Filter>
-    </ClCompile>
-    <ClCompile Include="scene_rendering\menu.cpp">
       <Filter>Source Files\engine\scene_rendering</Filter>
     </ClCompile>
     <ClCompile Include="scene_rendering\skydome.cpp">
@@ -182,6 +185,9 @@
     </ClCompile>
     <ClCompile Include="game_object\camera_object.cpp">
       <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
+    <ClCompile Include="ui\menu.cpp">
+      <Filter>Source Files\engine\ui</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -252,9 +258,6 @@
       <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
     <ClInclude Include="scene_rendering\ibl_creator.h">
-      <Filter>Header Files\engine\scene_rendering</Filter>
-    </ClInclude>
-    <ClInclude Include="scene_rendering\menu.h">
       <Filter>Header Files\engine\scene_rendering</Filter>
     </ClInclude>
     <ClInclude Include="scene_rendering\weather_system.h">
@@ -364,6 +367,9 @@
     </ClInclude>
     <ClInclude Include="game_object\camera_object.h">
       <Filter>Header Files\engine\game_object</Filter>
+    </ClInclude>
+    <ClInclude Include="ui\menu.h">
+      <Filter>Header Files\engine\ui</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
