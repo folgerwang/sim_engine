@@ -493,6 +493,7 @@ void ObjectMesh::loadObjectFile(
         shader_modules,
         renderbuffer_formats[int(renderer::RenderPasses::kForward)].color_formats,
         renderbuffer_formats[int(renderer::RenderPasses::kForward)].depth_format,
+        {},
         std::source_location::current());
 
     object_depthonly_pipeline_ = device->createPipeline(
@@ -504,6 +505,7 @@ void ObjectMesh::loadObjectFile(
         shader_modules,
         renderbuffer_formats[int(renderer::RenderPasses::kShadow)].color_formats,
         renderbuffer_formats[int(renderer::RenderPasses::kShadow)].depth_format,
+        {},
         std::source_location::current());
 }
 

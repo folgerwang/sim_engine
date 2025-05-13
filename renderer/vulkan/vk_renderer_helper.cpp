@@ -3151,14 +3151,22 @@ VkPipelineColorBlendStateCreateInfo fillVkPipelineColorBlendStateCreateInfo(
 }
 
 VkPipelineRasterizationStateCreateInfo fillVkPipelineRasterizationStateCreateInfo(
-    const renderer::PipelineRasterizationStateCreateInfo& rasterization_info) {
+    const renderer::PipelineRasterizationStateCreateInfo& rasterization_info,
+    const renderer::RasterizationStateOverride& rasterization_state_override) {
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.depthClampEnable = rasterization_info.depth_clamp_enable ? VK_TRUE : VK_FALSE;
+    if (rasterization_state_override.override_depth_clamp_enable) {
+        rasterizer.depthClampEnable =
+            rasterization_state_override.depth_clamp_enable ? VK_TRUE : VK_FALSE;
+    }
     rasterizer.rasterizerDiscardEnable = rasterization_info.rasterizer_discard_enable ? VK_TRUE : VK_FALSE;
     rasterizer.polygonMode = toVkPolygonMode(rasterization_info.polygon_mode);
     rasterizer.lineWidth = rasterization_info.line_width;
     rasterizer.cullMode = toVkCullModeFlags(rasterization_info.cull_mode);
+    if (rasterization_state_override.override_double_sided && rasterization_state_override.double_sided) {
+        rasterizer.cullMode = SET_FLAG_BIT(CullMode, NONE);
+    }
     rasterizer.frontFace = toVkFrontFace(rasterization_info.front_face);
     rasterizer.depthBiasEnable = rasterization_info.depth_bias_enable ? VK_TRUE : VK_FALSE;
     rasterizer.depthBiasConstantFactor = rasterization_info.depth_bias_constant_factor; // Optional

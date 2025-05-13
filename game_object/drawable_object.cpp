@@ -278,6 +278,7 @@ static void setupMesh(
 
         ego::PrimitiveInfo primitive_info;
         primitive_info.tag_.restart_enable = false;
+        primitive_info.tag_.double_sided = model.materials[primitive.material].doubleSided;
         primitive_info.material_idx_ = primitive.material;
 
         auto mode = renderer::PrimitiveTopology::MAX_ENUM;
@@ -891,6 +892,14 @@ static void setupMesh(
         primitive_info.tag_.topology = static_cast<uint32_t>(mode);
         primitive_info.tag_.has_texcoord_0 = true;
         primitive_info.tag_.has_normal = true;
+        primitive_info.tag_.double_sided = mat->features.double_sided.enabled;
+
+        std::string name_string(mat->name.data);
+
+        size_t found_pos = name_string.find("DoubleSided");
+        if (found_pos != std::string::npos) {
+            primitive_info.tag_.double_sided = true;
+        }
 
         // position
         engine::renderer::VertexInputBindingDescription binding = {};
@@ -1528,10 +1537,28 @@ static void drawMesh(
     const renderer::DescriptorSetList& desc_set_list,
     const ego::MeshInfo& mesh_info,
     const ego::SkinInfo* skin_info,
-    const glsl::ModelParams& model_params) {
+    const glsl::ModelParams& model_params,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipelines,
+    std::vector<renderer::Viewport> viewports,
+    std::vector<renderer::Scissor> scissors,
+    bool depth_only,
+    size_t& last_hash) {
 
     for (const auto& prim : mesh_info.primitives_) {
         const auto& attrib_list = prim.attribute_descs_;
+
+#if 0
+        auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
+        if (cur_hash != last_hash) {
+            cmd_buf->bindPipeline(
+                renderer::PipelineBindPoint::GRAPHICS,
+                pipelines[cur_hash]);
+
+            cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+            cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
+            last_hash = cur_hash;
+        }
+#endif
 
         std::vector<std::shared_ptr<renderer::Buffer>> buffers(attrib_list.size());
         std::vector<uint64_t> offsets(attrib_list.size());
@@ -1567,7 +1594,7 @@ static void drawMesh(
                 renderer::PipelineBindPoint::GRAPHICS,
                 drawable_pipeline_layout,
                 {skin_info->desc_set_},
-                SKINL_PARAMS_SET);
+                SKIN_PARAMS_SET);
         }
 
         cmd_buf->pushConstants(
@@ -1588,7 +1615,12 @@ static void drawNodes(
     const std::shared_ptr<ego::DrawableData>& drawable_object,
     const std::shared_ptr<renderer::PipelineLayout>& drawable_pipeline_layout,
     const renderer::DescriptorSetList& desc_set_list,
-    int32_t node_idx) {
+    int32_t node_idx,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipelines,
+    std::vector<renderer::Viewport> viewports,
+    std::vector<renderer::Scissor> scissors,
+    bool depth_only,
+    size_t& last_hash) {
     if (node_idx >= 0) {
         const auto& node = drawable_object->nodes_[node_idx];
         if (node.mesh_idx_ >= 0) {
@@ -1604,7 +1636,12 @@ static void drawNodes(
                 desc_set_list,
                 drawable_object->meshes_[node.mesh_idx_],
                 node.skin_idx_ > -1 ? &drawable_object->skins_[node.skin_idx_] : nullptr,
-                model_params);
+                model_params,
+                pipelines,
+                viewports,
+                scissors,
+                depth_only,
+                last_hash);
 
             num_draw_meshes++;
         }
@@ -1614,7 +1651,12 @@ static void drawNodes(
                 drawable_object,
                 drawable_pipeline_layout,
                 desc_set_list,
-                child_idx);
+                child_idx,
+                pipelines,
+                viewports,
+                scissors,
+                depth_only,
+                last_hash);
         }
     }
 }
@@ -1666,7 +1708,7 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
 
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
     desc_set_layouts[PBR_MATERIAL_PARAMS_SET] = material_desc_set_layout;
-    desc_set_layouts[SKINL_PARAMS_SET] = skin_desc_set_layout;
+    desc_set_layouts[SKIN_PARAMS_SET] = skin_desc_set_layout;
 
     return device->createPipelineLayout(
         desc_set_layouts,
@@ -1783,6 +1825,10 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_pos_scale);
     attribute_descs.push_back(attr);
 
+    renderer::RasterizationStateOverride rasterization_state_override;
+    rasterization_state_override.override_double_sided = true;
+    rasterization_state_override.double_sided = primitive.tag_.double_sided;
+
     auto drawable_pipeline = device->createPipeline(
         pipeline_layout,
         binding_descs,
@@ -1792,6 +1838,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
         shader_modules,
         renderbuffer_formats.color_formats,
         renderbuffer_formats.depth_format,
+        rasterization_state_override,
         std::source_location::current());
 
     return drawable_pipeline;
@@ -1840,7 +1887,11 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
     attr.location = IINPUT_MAT_POS_SCALE;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_pos_scale);
     attribute_descs.push_back(attr);
-
+    renderer::RasterizationStateOverride rasterization_state_override;
+    rasterization_state_override.override_depth_clamp_enable = true;
+    rasterization_state_override.depth_clamp_enable = true;
+    rasterization_state_override.override_double_sided = true;
+    rasterization_state_override.double_sided = primitive.tag_.double_sided;
     auto drawable_pipeline = device->createPipeline(
         pipeline_layout,
         binding_descs,
@@ -1850,6 +1901,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
         shader_modules,
         renderbuffer_formats.color_formats,
         renderbuffer_formats.depth_format,
+        rasterization_state_override,
         std::source_location::current());
 
     return drawable_pipeline;
@@ -2095,8 +2147,6 @@ void PrimitiveInfo::generateHash() {
     }
     for (auto& item : attribute_descs_) {
         hash_combine(hash_, item.binding);
-        hash_combine(hash_, item.buffer_offset);
-        hash_combine(hash_, item.buffer_view);
         hash_combine(hash_, item.format);
         hash_combine(hash_, item.location);
         hash_combine(hash_, item.offset);
@@ -2120,8 +2170,6 @@ void PrimitiveInfo::generateHash() {
             item.location != VINPUT_COLOR &&
             item.location != VINPUT_TEXCOORD1)
         hash_combine(depthonly_hash_, item.binding);
-        hash_combine(depthonly_hash_, item.buffer_offset);
-        hash_combine(depthonly_hash_, item.buffer_view);
         hash_combine(depthonly_hash_, item.format);
         hash_combine(depthonly_hash_, item.location);
         hash_combine(depthonly_hash_, item.offset);
@@ -2298,7 +2346,6 @@ DrawableObject::DrawableObject(
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const renderer::GraphicPipelineInfo& direct_shadow_graphic_pipeline_info,
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& thin_film_lut_tex,
     const std::string& file_name,
@@ -2316,7 +2363,7 @@ DrawableObject::DrawableObject(
         if (extension == ".fbx") {
             object_ = loadFbxModel(device, file_name);
         }
-        else if (extension == ".gltf") {
+        else if (extension == ".gltf" || extension == ".glb") {
             object_ = loadGltfModel(device, file_name);
         }
 
@@ -2329,32 +2376,36 @@ DrawableObject::DrawableObject(
             texture_sampler,
             thin_film_lut_tex);
 
-        const auto& primitive = object_->meshes_[0].primitives_[0];
-        {
-            auto hash_value = primitive.getHash();
-            auto result = drawable_pipeline_list_.find(hash_value);
-            if (result == drawable_pipeline_list_.end()) {
-                drawable_pipeline_list_[hash_value] =
-                    createDrawablePipeline(
-                        device,
-                        renderbuffer_formats[int(renderer::RenderPasses::kForward)],
-                        drawable_pipeline_layout_,
-                        graphic_pipeline_info,
-                        primitive);
-            }
-        }
+        for (int i_mesh = 0; i_mesh < object_->meshes_.size(); i_mesh++) {
+            for (int i_prim = 0; i_prim < object_->meshes_[i_mesh].primitives_.size(); i_prim++) {
+                const auto& primitive = object_->meshes_[i_mesh].primitives_[i_prim];
+                {
+                    auto hash_value = primitive.getHash();
+                    auto result = drawable_pipeline_list_.find(hash_value);
+                    if (result == drawable_pipeline_list_.end()) {
+                        drawable_pipeline_list_[hash_value] =
+                            createDrawablePipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
+                }
 
-        {
-            auto hash_value = primitive.getDepthonlyHash();
-            auto result = drawable_shadow_pipeline_list_.find(hash_value);
-            if (result == drawable_shadow_pipeline_list_.end()) {
-                drawable_shadow_pipeline_list_[hash_value] =
-                    createDrawableShadowPipeline(
-                        device,
-                        renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
-                        drawable_pipeline_layout_,
-                        direct_shadow_graphic_pipeline_info,
-                        primitive);
+                {
+                    auto hash_value = primitive.getDepthonlyHash();
+                    auto result = drawable_shadow_pipeline_list_.find(hash_value);
+                    if (result == drawable_shadow_pipeline_list_.end()) {
+                        drawable_shadow_pipeline_list_[hash_value] =
+                            createDrawableShadowPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
+                }
             }
         }
 
@@ -2631,7 +2682,6 @@ void DrawableObject::recreateStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const renderer::GraphicPipelineInfo& direct_shadow_graphic_pipeline_info,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
 
     createStaticMembers(device, global_desc_set_layouts);
@@ -2642,17 +2692,21 @@ void DrawableObject::recreateStaticMembers(
     drawable_pipeline_list_.clear();
 
     for (auto& object : drawable_object_list_) {
-        const auto& primitive = object.second->meshes_[0].primitives_[0];
-        auto hash_value = primitive.getHash();
-        auto result = drawable_pipeline_list_.find(hash_value);
-        if (result == drawable_pipeline_list_.end()) {
-            drawable_pipeline_list_[hash_value] = 
-                createDrawablePipeline(
-                    device,
-                    renderbuffer_formats[int(renderer::RenderPasses::kForward)],
-                    drawable_pipeline_layout_,
-                    graphic_pipeline_info,
-                    primitive);
+        for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
+            for (int i_prim = 0; i_prim < object.second->meshes_[i_mesh].primitives_.size(); i_prim++) {
+                const auto& primitive = object.second->meshes_[i_mesh].primitives_[i_prim];
+                auto hash_value = primitive.getHash();
+                auto result = drawable_pipeline_list_.find(hash_value);
+                if (result == drawable_pipeline_list_.end()) {
+                    drawable_pipeline_list_[hash_value] =
+                        createDrawablePipeline(
+                            device,
+                            renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                            drawable_pipeline_layout_,
+                            graphic_pipeline_info,
+                            primitive);
+                }
+            }
         }
     }
 
@@ -2662,17 +2716,21 @@ void DrawableObject::recreateStaticMembers(
     drawable_shadow_pipeline_list_.clear();
 
     for (auto& object : drawable_object_list_) {
-        const auto& primitive = object.second->meshes_[0].primitives_[0];
-        auto hash_value = primitive.getDepthonlyHash();
-        auto result = drawable_shadow_pipeline_list_.find(hash_value);
-        if (result == drawable_shadow_pipeline_list_.end()) {
-            drawable_shadow_pipeline_list_[hash_value] =
-                createDrawableShadowPipeline(
-                    device,
-                    renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
-                    drawable_pipeline_layout_,
-                    direct_shadow_graphic_pipeline_info,
-                    primitive);
+        for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
+            for (int i_prim = 0; i_prim < object.second->meshes_[i_mesh].primitives_.size(); i_prim++) {
+                const auto& primitive = object.second->meshes_[i_mesh].primitives_[i_prim];
+                auto hash_value = primitive.getDepthonlyHash();
+                auto result = drawable_shadow_pipeline_list_.find(hash_value);
+                if (result == drawable_shadow_pipeline_list_.end()) {
+                    drawable_shadow_pipeline_list_[hash_value] =
+                        createDrawableShadowPipeline(
+                            device,
+                            renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                            drawable_pipeline_layout_,
+                            graphic_pipeline_info,
+                            primitive);
+                }
+            }
         }
     }
 }
@@ -2865,22 +2923,18 @@ void DrawableObject::updateBuffers(
 
 void DrawableObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_set_list,
     std::vector<renderer::Viewport> viewports,
     std::vector<renderer::Scissor> scissors,
-    const renderer::DescriptorSetList& desc_set_list,
     bool depth_only/* = false */ ) {
 
-    const auto& primitive = object_->meshes_[0].primitives_[0];
-    if (depth_only) {
-        cmd_buf->bindPipeline(
-            renderer::PipelineBindPoint::GRAPHICS,
-            drawable_shadow_pipeline_list_[primitive.getDepthonlyHash()]);
-    }
-    else {
-        cmd_buf->bindPipeline(
-            renderer::PipelineBindPoint::GRAPHICS,
-            drawable_pipeline_list_[primitive.getHash()]);
-    }
+    auto& pipeline_list = depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_;
+
+    auto prim = object_->meshes_[0].primitives_[0];
+    auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::GRAPHICS,
+        pipeline_list[cur_hash]);
 
     cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
     cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
@@ -2892,6 +2946,7 @@ void DrawableObject::draw(
     cmd_buf->bindVertexBuffers(VINPUT_INSTANCE_BINDING_POINT, buffers, offsets);
 
     num_draw_meshes = 0;
+    size_t last_hash = 0;
 
     int32_t root_node =
         object_->default_scene_ >= 0 ? object_->default_scene_ : 0;
@@ -2901,7 +2956,12 @@ void DrawableObject::draw(
             object_,
             drawable_pipeline_layout_,
             desc_set_list,
-            node_idx);
+            node_idx,
+            depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_,
+            viewports,
+            scissors,
+            depth_only,
+            last_hash);
     }
 }
 

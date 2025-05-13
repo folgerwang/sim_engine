@@ -661,7 +661,8 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
     auto vk_blend_attachments = helper::fillVkPipelineColorBlendAttachments(*graphic_pipeline_info.blend_state_info);
     auto vk_color_blending = helper::fillVkPipelineColorBlendStateCreateInfo(*graphic_pipeline_info.blend_state_info, vk_blend_attachments);
-    auto vk_rasterizer = helper::fillVkPipelineRasterizationStateCreateInfo(*graphic_pipeline_info.rasterization_info);
+    RasterizationStateOverride rasterization_state_override;
+    auto vk_rasterizer = helper::fillVkPipelineRasterizationStateCreateInfo(*graphic_pipeline_info.rasterization_info, rasterization_state_override);
     auto vk_multisampling = helper::fillVkPipelineMultisampleStateCreateInfo(*graphic_pipeline_info.ms_info);
     auto vk_depth_stencil = helper::fillVkPipelineDepthStencilStateCreateInfo(*graphic_pipeline_info.depth_stencil_info);
 
@@ -730,6 +731,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     const ShaderModuleList& shader_modules,
     const std::vector<Format>& color_formats,
     const Format depth_format,
+    const RasterizationStateOverride& rasterization_state_override,
     const std::source_location& src_location) {
 
     VkGraphicsPipelineCreateInfo pipeline_info{};
@@ -739,7 +741,9 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
     auto vk_blend_attachments = helper::fillVkPipelineColorBlendAttachments(*graphic_pipeline_info.blend_state_info);
     auto vk_color_blending = helper::fillVkPipelineColorBlendStateCreateInfo(*graphic_pipeline_info.blend_state_info, vk_blend_attachments);
-    auto vk_rasterizer = helper::fillVkPipelineRasterizationStateCreateInfo(*graphic_pipeline_info.rasterization_info);
+    auto vk_rasterizer = helper::fillVkPipelineRasterizationStateCreateInfo(
+        *graphic_pipeline_info.rasterization_info,
+        rasterization_state_override);
     auto vk_multisampling = helper::fillVkPipelineMultisampleStateCreateInfo(*graphic_pipeline_info.ms_info);
     auto vk_depth_stencil = helper::fillVkPipelineDepthStencilStateCreateInfo(*graphic_pipeline_info.depth_stencil_info);
 

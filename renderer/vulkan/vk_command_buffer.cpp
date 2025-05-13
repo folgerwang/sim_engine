@@ -173,7 +173,7 @@ void VulkanCommandBuffer::copyImageToBuffer(
 
 void VulkanCommandBuffer::bindPipeline(
     PipelineBindPoint bind,
-    std::shared_ptr< Pipeline> pipeline) {
+    const std::shared_ptr< Pipeline>& pipeline) {
     auto vk_pipeline = RENDER_TYPE_CAST(Pipeline, pipeline);
     vkCmdBindPipeline(cmd_buf_, helper::toVkPipelineBindPoint(bind), vk_pipeline->get());
 }

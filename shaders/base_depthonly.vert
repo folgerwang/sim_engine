@@ -11,7 +11,7 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 };
 
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
-layout(std430, set = SKINL_PARAMS_SET, binding = JOINT_CONSTANT_INDEX) readonly buffer JointMatrices {
+layout(std430, set = SKIN_PARAMS_SET, binding = JOINT_CONSTANT_INDEX) readonly buffer JointMatrices {
 	mat4 joint_matrices[];
 };
 #endif

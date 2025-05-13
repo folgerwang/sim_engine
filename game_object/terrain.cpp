@@ -2073,6 +2073,7 @@ std::shared_ptr<renderer::Pipeline> TileObject::createTilePipeline(
         shader_modules,
         renderbuffer_formats.color_formats,
         renderbuffer_formats.depth_format,
+        {},
         std::source_location::current());
 
     return pipeline;
@@ -2155,6 +2156,7 @@ std::shared_ptr<renderer::Pipeline> TileObject::createGrassPipeline(
         shader_modules,
         renderbuffer_formats.color_formats,
         renderbuffer_formats.depth_format,
+        {},
         std::source_location::current());
 
     return grass_pipeline;

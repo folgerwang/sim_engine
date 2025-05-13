@@ -313,7 +313,8 @@ VkPipelineColorBlendStateCreateInfo fillVkPipelineColorBlendStateCreateInfo(
     const std::vector<VkPipelineColorBlendAttachmentState>& attachments);
 
 VkPipelineRasterizationStateCreateInfo fillVkPipelineRasterizationStateCreateInfo(
-    const renderer::PipelineRasterizationStateCreateInfo& rasterization_info);
+    const renderer::PipelineRasterizationStateCreateInfo& rasterization_info,
+    const renderer::RasterizationStateOverride& rasterization_state_override);
 
 VkPipelineMultisampleStateCreateInfo fillVkPipelineMultisampleStateCreateInfo(
     const renderer::PipelineMultisampleStateCreateInfo& ms_info);

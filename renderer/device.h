@@ -53,6 +53,7 @@ public:
         const ShaderModuleList& shader_modules,
         const std::vector<Format>& color_formats,
         const Format depth_format,
+        const RasterizationStateOverride& rasterization_state_override,
         const std::source_location& src_location) = 0;
     virtual std::shared_ptr<Pipeline> createPipeline(
         const std::shared_ptr<PipelineLayout>& pipeline_layout,

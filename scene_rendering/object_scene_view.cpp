@@ -146,9 +146,9 @@ void ObjectSceneView::draw(
     for (auto& drawable_obj : m_drawable_objects_) {
         drawable_obj->draw(
             cmd_buf,
+            desc_set_list,
             viewports,
             scissors,
-            desc_set_list,
             depth_only);
     }
 

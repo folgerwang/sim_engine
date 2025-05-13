@@ -32,6 +32,7 @@ union PrimitiveHashTag {
         uint32_t                has_texcoord_0 : 1;
         uint32_t                has_skin_set_0 : 1;
         uint32_t                restart_enable : 1;
+        uint32_t                double_sided : 1;
         uint32_t                topology : 16;
     };
 };
@@ -220,7 +221,6 @@ public:
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::GraphicPipelineInfo& direct_shadow_graphic_pipeline_info,
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& thin_film_lut_tex,
         const std::string& file_name,
@@ -236,9 +236,9 @@ public:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_set_list,
         std::vector<renderer::Viewport> viewports,
         std::vector<renderer::Scissor> scissors,
-        const renderer::DescriptorSetList& desc_set_list,
         bool depth_only = false);
 
     void update(
@@ -286,7 +286,6 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::GraphicPipelineInfo& direct_shadow_graphic_pipeline_info,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
 
     static void generateDescriptorSet(

@@ -635,6 +635,13 @@ struct GraphicPipelineInfo {
     std::shared_ptr<PipelineDepthStencilStateCreateInfo> depth_stencil_info;
 };
 
+struct RasterizationStateOverride {
+    bool override_double_sided = false;
+    bool double_sided = false;
+    bool override_depth_clamp_enable = false;
+    bool depth_clamp_enable = false;
+};
+
 typedef std::vector<std::shared_ptr<PhysicalDevice>> PhysicalDeviceList;
 typedef std::vector<std::shared_ptr<DescriptorSetLayout>> DescriptorSetLayoutList;
 typedef std::vector<std::shared_ptr<DescriptorSet>> DescriptorSetList;
