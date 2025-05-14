@@ -83,6 +83,12 @@ void main() {
 
     float shadow = calculateShadowFactor(ps_in_data.vertex_position);
 
+    bool light_from_back = false;
+#ifdef USE_PUNCTUAL    
+    if (dot(normal_info.ng, runtime_lights.lights[0].direction) > 0)
+        light_from_back = true;
+#endif
+
 #ifdef DOUBLE_SIDED
     // LIGHTING
     PbrLightsColorInfo back_color_info = initColorInfo();
@@ -141,6 +147,11 @@ void main() {
             shadow);
     }
 #endif // !USE_PUNCTUAL
+
+#ifdef DOUBLE_SIDED
+    color_info.f_diffuse += back_color_info.f_diffuse;
+    color_info.f_specular += back_color_info.f_specular;
+#endif
 
     layerBlending(
         color_info,
