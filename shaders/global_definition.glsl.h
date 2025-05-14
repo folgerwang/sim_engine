@@ -544,35 +544,34 @@ struct MaterialInfo
     float metallic;
 
     float ior;
-    vec3 n;
-    float reflectance;
     vec3 baseColor;                 // getBaseColor()
 
-    float sheenIntensity;
+    float reflectance;
     vec3 sheenColor;
+
+    float sheenIntensity;
+    vec3 clearcoatF0;
+
     float sheenRoughness;
+    vec3 clearcoatF90;
 
     float anisotropy;
-
-    vec3 clearcoatF0;
-    vec3 clearcoatF90;
-    float clearcoatFactor;
     vec3 clearcoatNormal;
+
+    float clearcoatFactor;
+    vec3 subsurfaceColor;
+
     float clearcoatRoughness;
+    vec3 absorption;
 
     float subsurfaceScale;
     float subsurfaceDistortion;
     float subsurfacePower;
-    vec3 subsurfaceColor;
     float subsurfaceThickness;
 
     float thinFilmFactor;
     float thinFilmThickness;
-
     float thickness;
-
-    vec3 absorption;
-
     float transmission;
 };
 

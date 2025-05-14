@@ -1721,7 +1721,8 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     bool has_tangent,
     bool has_texcoord_0,
     bool has_skin_set_0,
-    bool has_material) {
+    bool has_material,
+    bool has_double_sided) {
     renderer::ShaderModuleList shader_modules(2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "") +
         (has_tangent ? "_TN" : (has_normals ? "_N" : ""));
@@ -1729,6 +1730,9 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     auto frag_feature_str = vert_feature_str;
     if (has_skin_set_0) {
         vert_feature_str += "_SKIN";
+    }
+    if (has_double_sided) {
+        frag_feature_str += "_DS";
     }
     
     shader_modules[0] =
@@ -1790,7 +1794,8 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
         primitive.tag_.has_tangent,
         primitive.tag_.has_texcoord_0,
         primitive.tag_.has_skin_set_0,
-        primitive.material_idx_ >= 0);
+        primitive.material_idx_ >= 0,
+        primitive.tag_.double_sided);
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;

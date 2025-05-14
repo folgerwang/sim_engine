@@ -54,6 +54,7 @@ float calculateShadowFactor(vec3 position_world) {
 }
 
 void main() {
+    bool is_front_face = gl_FrontFacing;
 #ifndef NO_MTL
     vec4 baseColor = getBaseColor(ps_in_data, material);
 #ifdef ALPHAMODE_OPAQUE
@@ -70,7 +71,7 @@ void main() {
     return;
 #endif // MATERIAL_UNLIT
     vec3 v = normalize(camera_info.position.xyz - ps_in_data.vertex_position);
-    NormalInfo normal_info = getNormalInfo(ps_in_data, material, v);
+    NormalInfo normal_info = getNormalInfo(ps_in_data, material, v, is_front_face);
 
     MaterialInfo material_info =
         setupMaterialInfo(
@@ -80,10 +81,42 @@ void main() {
             v,
             baseColor.xyz);
 
+    float shadow = calculateShadowFactor(ps_in_data.vertex_position);
+
+#ifdef DOUBLE_SIDED
+    // LIGHTING
+    PbrLightsColorInfo back_color_info = initColorInfo();
+    NormalInfo back_normal_info = normal_info;
+    back_normal_info.ng = -normal_info.ng;
+    back_normal_info.n = -normal_info.n;
+
+    // Calculate lighting contribution from image based lighting source (IBL)
+#ifdef USE_IBL
+    iblLighting(
+        back_color_info,
+        material,
+        material_info,
+        back_normal_info, v);
+#endif // USE_IBL
+
+	// Calculate lighting contribution from punctual light sources
+#ifdef USE_PUNCTUAL
+    for (int i = 0; i < LIGHT_COUNT; ++i) {
+        punctualLighting(
+            back_color_info,
+            ps_in_data,
+            material,
+            material_info,
+            runtime_lights.lights[i],
+            back_normal_info,
+            v,
+            shadow);
+    }
+#endif // !USE_PUNCTUAL
+#endif
+
     // LIGHTING
     PbrLightsColorInfo color_info = initColorInfo();
-
-    float shadow = calculateShadowFactor(ps_in_data.vertex_position);
 
     // Calculate lighting contribution from image based lighting source (IBL)
 #ifdef USE_IBL

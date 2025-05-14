@@ -108,6 +108,7 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     ObjectVsPsData ps_in_data = in_data;
+    bool is_front_face = gl_FrontFacing;
     mat3 world2local =
         mat3(
             ps_in_data.vertex_tangent,
@@ -126,7 +127,7 @@ void main() {
     vec4 baseColor = getBaseColor(ps_in_data, material);
 
     v = normalize(camera_info.position.xyz - ps_in_data.vertex_position);
-    NormalInfo normal_info = getNormalInfo(ps_in_data, material, v);
+    NormalInfo normal_info = getNormalInfo(ps_in_data, material, v, is_front_face);
 
     MaterialInfo material_info =
         setupMaterialInfo(

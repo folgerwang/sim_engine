@@ -111,7 +111,8 @@ vec2 getOcclusionUV(
 NormalInfo getNormalInfo(
     in ObjectVsPsData in_data,
     in PbrMaterialParams in_mat,
-    in vec3 v) {
+    in vec3 v,
+    in bool is_front_face) {
 #ifndef NO_MTL
     vec2 uv = getNormalUV(in_data, in_mat);
     vec3 uv_dx = dFdx(vec3(uv, 0.0));
@@ -145,7 +146,7 @@ NormalInfo getNormalInfo(
 #endif
 
     // For a back-facing surface, the tangential basis vectors are negated.
-    float facing = step(0.0, dot(v, ng)) * 2.0 - 1.0;
+    float facing = is_front_face ? 1.0f : -1.0f;
     t *= facing;
     b *= facing;
     ng *= facing;
@@ -578,8 +579,6 @@ MaterialInfo setupMaterialInfo(
     // Anything less than 2% is physically impossible and is instead considered to be shadowing. Compare to "Real-Time-Rendering" 4th editon on page 325.
     material_info.f90 = vec3(clamp(material_info.reflectance * 50.0, 0.0, 1.0));
 
-    material_info.n = normal_info.n;
-
     if (enable_thin_film) {
         material_info.f0 = getThinFilmF0(material_info.f0, material_info.f90, clampedDot(normal_info.n, view_dir),
             material_info.thinFilmFactor, material_info.thinFilmThickness);
@@ -627,6 +626,7 @@ void iblLighting(
             normal_info.n,
             in_material_info.albedoColor);
 
+#ifdef DOUBLE_SIDED
     if (enable_clearcoat) {
         color_info.f_clearcoat +=
             getIBLRadianceGGX(
@@ -670,6 +670,7 @@ void iblLighting(
                 in_material_info.baseColor,
                 in_material.mip_count);
     }
+#endif
 }
 
 void punctualLighting(
@@ -717,9 +718,9 @@ void punctualLighting(
 
     vec3 l = normalize(pointToLight);   // Direction from surface point to light
     vec3 h = normalize(l + v);          // Direction of the vector between l and v, called halfway vector
-    float n_dot_l = clampedDot(in_material_info.n, l);
-    float n_dot_v = clampedDot(in_material_info.n, v);
-    float n_dot_h = clampedDot(in_material_info.n, h);
+    float n_dot_l = clampedDot(n, l);
+    float n_dot_v = clampedDot(n, v);
+    float n_dot_h = clampedDot(n, h);
     float l_dot_h = clampedDot(l, h);
     float v_dot_h = clampedDot(v, h);
 
@@ -779,7 +780,7 @@ void punctualLighting(
                     n_dot_h);
             color_info.f_specular += intensity * n_dot_l * specular;
         }
-
+#ifdef DOUBLE_SIDED
         if (enable_sheen) {
             vec3 sheen =
                 getPunctualRadianceSheen(
@@ -805,8 +806,9 @@ void punctualLighting(
                     in_material_info.clearcoatRoughness);
             color_info.f_clearcoat += intensity * clearcoat;
         }
+#endif
     }
-
+#ifdef DOUBLE_SIDED
     if (enable_subsurface) {
         vec3 subsurface =
             getPunctualRadianceSubsurface(
@@ -832,6 +834,7 @@ void punctualLighting(
                 in_material_info.f0);
         color_info.f_transmission += intensity * transmission;
     }
+#endif
 }
 
 void layerBlending(
