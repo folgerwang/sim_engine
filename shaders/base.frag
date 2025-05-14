@@ -149,8 +149,9 @@ void main() {
 #endif // !USE_PUNCTUAL
 
 #ifdef DOUBLE_SIDED
-    color_info.f_diffuse += back_color_info.f_diffuse;
-    color_info.f_specular += back_color_info.f_specular;
+    float translucent_ratio = 0.2f;
+    color_info.f_diffuse += back_color_info.f_diffuse * translucent_ratio;
+    color_info.f_specular += back_color_info.f_specular * translucent_ratio * 0.1f;
 #endif
 
     layerBlending(
