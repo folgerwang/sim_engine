@@ -301,7 +301,7 @@ void ViewCamera::updateViewCameraInfo(
 
     if (m_is_ortho_) {
         if (input_camera_pos) 
-            m_camera_info_.position = *input_camera_pos;
+            m_camera_info_.position = glm::ivec3(*input_camera_pos);
 
         float frustum_size = 50.0f;
         float cast_dist = 25.0f;

@@ -855,7 +855,6 @@ static void setupMesh(
     num_traingles = 0;
     uint32_t buffer_offset = 0;
     uint32_t indices_buffer_offset = 0;
-    uint32_t dst_binding = 0;
     auto pos_view_idx = mesh_idx * 4;
     drawable_object->buffer_views_[pos_view_idx].buffer_idx = vertex_buffer_idx;
     drawable_object->buffer_views_[pos_view_idx].offset = 0;
@@ -881,6 +880,8 @@ static void setupMesh(
     drawable_object->buffer_views_[indice_view_idx].stride = index_bytes_count;
 
     for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+        uint32_t dst_binding = 0;
+
         auto part = src_mesh->material_parts[i_part];
         auto mat = src_mesh->materials[part.index];
 
@@ -1547,7 +1548,6 @@ static void drawMesh(
     for (const auto& prim : mesh_info.primitives_) {
         const auto& attrib_list = prim.attribute_descs_;
 
-#if 1
         auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
         if (cur_hash != last_hash) {
             cmd_buf->bindPipeline(
@@ -1558,7 +1558,6 @@ static void drawMesh(
             cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
             last_hash = cur_hash;
         }
-#endif
 
         std::vector<std::shared_ptr<renderer::Buffer>> buffers(attrib_list.size());
         std::vector<uint64_t> offsets(attrib_list.size());
@@ -2141,13 +2140,14 @@ void PrimitiveInfo::generateHash() {
     hash_ = std::hash<uint32_t>{}(tag_.data);
     hash_combine(hash_, material_idx_ >= 0 ? 0x0 : 0xffffffff);
     for (auto& item : binding_descs_) {
-        hash_combine(hash_, item.binding);
-        hash_combine(hash_, item.input_rate);
-        hash_combine(hash_, item.stride);
+        uint64_t tmp_value = item.binding;
+        tmp_value = (tmp_value << 32) | item.stride | (uint64_t(item.input_rate) << 31);
+        hash_combine(hash_, tmp_value);
     }
     for (auto& item : attribute_descs_) {
-        hash_combine(hash_, item.binding);
-        hash_combine(hash_, item.format);
+        uint64_t tmp_value = item.binding;
+        tmp_value = (tmp_value << 32) | uint64_t(item.format);
+        hash_combine(hash_, tmp_value);
         hash_combine(hash_, item.location);
         hash_combine(hash_, item.offset);
     }
@@ -2160,19 +2160,21 @@ void PrimitiveInfo::generateHash() {
     hash_combine(depthonly_hash_, material_idx_ >= 0 ? 0x0 : 0xffffffff);
 
     for (auto& item : binding_descs_) {
-        hash_combine(depthonly_hash_, item.binding);
-        hash_combine(depthonly_hash_, item.input_rate);
-        hash_combine(depthonly_hash_, item.stride);
+        uint64_t tmp_value = item.binding;
+        tmp_value = (tmp_value << 32) | item.stride | (uint64_t(item.input_rate) << 31);
+        hash_combine(depthonly_hash_, tmp_value);
     }
     for (auto& item : attribute_descs_) {
         if (item.location != VINPUT_NORMAL &&
             item.location != VINPUT_TANGENT &&
             item.location != VINPUT_COLOR &&
-            item.location != VINPUT_TEXCOORD1)
-        hash_combine(depthonly_hash_, item.binding);
-        hash_combine(depthonly_hash_, item.format);
-        hash_combine(depthonly_hash_, item.location);
-        hash_combine(depthonly_hash_, item.offset);
+            item.location != VINPUT_TEXCOORD1) {
+            uint64_t tmp_value = item.binding;
+            tmp_value = (tmp_value << 32) | uint64_t(item.format);
+            hash_combine(depthonly_hash_, tmp_value);
+            hash_combine(depthonly_hash_, item.location);
+            hash_combine(depthonly_hash_, item.offset);
+        }
     }
 }
 
@@ -2928,16 +2930,8 @@ void DrawableObject::draw(
     std::vector<renderer::Scissor> scissors,
     bool depth_only/* = false */ ) {
 
-    auto& pipeline_list = depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_;
-/*
-    auto prim = object_->meshes_[0].primitives_[0];
-    auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
-    cmd_buf->bindPipeline(
-        renderer::PipelineBindPoint::GRAPHICS,
-        pipeline_list[cur_hash]);
-
-    cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
-    cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));*/
+    auto& pipeline_list =
+        depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_;
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);
@@ -2957,7 +2951,7 @@ void DrawableObject::draw(
             drawable_pipeline_layout_,
             desc_set_list,
             node_idx,
-            depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_,
+            pipeline_list,
             viewports,
             scissors,
             depth_only,
