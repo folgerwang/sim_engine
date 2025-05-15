@@ -303,7 +303,7 @@ void ViewCamera::updateViewCameraInfo(
         if (input_camera_pos) 
             m_camera_info_.position = glm::ivec3(*input_camera_pos);
 
-        float frustum_size = 50.0f;
+        float frustum_size = 100.0f;
         float cast_dist = 25.0f;
 
         m_camera_info_.facing_dir = normalize(view_camera_params.init_camera_dir);
