@@ -53,11 +53,13 @@ static void generateIcosphere(
     // --- 1. Create an Icosahedron (20 triangular faces, 12 vertices) ---
     // Golden ratio
     float t = (1.0f + std::sqrt(5.0f)) / 2.0f;
+    auto reserve_vertices_size = int32_t(12 + 20 * pow(3, subdivisions));
+    auto reserve_triangle_size = int32_t(20 * pow(4, subdivisions));
 
     std::vector<glm::uvec3> tris[2];
-    ov.reserve(int32_t(12 + 20 * pow(3, subdivisions) / 2));
-    tris[0].reserve(int32_t(20 * pow(4, subdivisions)));
-    tris[1].reserve(int32_t(20 * pow(4, subdivisions)));
+    ov.reserve(reserve_vertices_size);
+    tris[0].reserve(reserve_triangle_size);
+    tris[1].reserve(reserve_triangle_size);
 
     // Add icosahedron vertices (normalized to unit sphere)
     ov.push_back(normalize(glm::vec3(-1, t, 0)));
@@ -131,14 +133,14 @@ static void generateIcosphere(
     }
 
     auto& src_tris = tris[src_index];
-    ot.reserve(src_tris.size());
+    ot.resize(src_tris.size());
     for (int i = 0; i < src_tris.size(); i++) {
         ot[i] = src_tris[i];
     }
 }
 
 void calculateNormalAndTangent(
-    std::vector<glm::vec3>& tangents,
+    std::vector<glm::vec4>& tangents,
     std::vector<glm::vec2>& uvs,
     const std::vector<glm::vec3>& vertices,
     const std::vector<glm::uvec3>& triangles) {
@@ -148,54 +150,72 @@ void calculateNormalAndTangent(
     uint32_t num_faces =
         static_cast<uint32_t>(triangles.size());
 
-    tangents.resize(num_vertex);
+    // --- Calculate UVs and Normals (on unit sphere) ---
+    uvs.resize(num_vertex);
+    for (size_t i = 0; i < num_vertex; ++i) {
+        const glm::vec3& unit_v = vertices[i]; // Vertices are already normalized (on unit sphere)
 
-    for (uint32_t n = 0; n < num_vertex; n++) {
-        tangents[n] = glm::vec3(0, 0, 0);
+        // Spherical UV mapping
+        // atan2 returns angle in radians from -PI to PI
+        // acos returns angle in radians from 0 to PI
+        float phi = std::atan2(unit_v.z, unit_v.x); // Azimuthal angle (longitude)
+        float theta = std::acos(unit_v.y);          // Polar angle (colatitude)
+
+        uvs[i].x = (phi + static_cast<float>(glm::pi<float>())) / (2.0f * static_cast<float>(glm::pi<float>())); // Normalize phi to [0, 1]
+        uvs[i].y = theta / static_cast<float>(glm::pi<float>());                                 // Normalize theta to [0, 1]
     }
 
-    for (uint32_t f = 0; f < num_faces; f++) {
-        auto& triangle = triangles[f];
-        auto& v0 = vertices[triangle[0]];
-        auto& v1 = vertices[triangle[1]];
-        auto& v2 = vertices[triangle[2]];
+    // --- Calculate Tangents ---
+    tangents.resize(num_vertex, glm::vec4(0, 0, 0, 0));
+    std::vector<glm::vec3> tan1Accumulator(num_vertex, glm::vec3(0, 0, 0));
+    std::vector<glm::vec3> tan2Accumulator(num_vertex, glm::vec3(0, 0, 0)); // For bitangents
 
-        auto& uv0 = uvs[triangle[0]];
-        auto& uv1 = uvs[triangle[1]];
-        auto& uv2 = uvs[triangle[2]];
+    for (const auto& tri : triangles) {
+        const glm::vec3& v0_pos = vertices[tri.x];
+        const glm::vec3& v1_pos = vertices[tri.y];
+        const glm::vec3& v2_pos = vertices[tri.z];
 
-        auto edge10 = normalize(v1 - v0);
-        auto edge20 = normalize(v2 - v0);
-        auto edge21 = normalize(v2 - v1);
+        const glm::vec2& uv0 = uvs[tri.x];
+        const glm::vec2& uv1 = uvs[tri.y];
+        const glm::vec2& uv2 = uvs[tri.z];
 
-        float angle0 = acos(dot(edge10, edge20));
-        float angle1 = acos(-dot(edge10, edge21));
-        float angle2 = acos(dot(edge20, edge21));
+        glm::vec3 delta_pos1 = v1_pos - v0_pos;
+        glm::vec3 delta_pos2 = v2_pos - v0_pos;
 
-        auto edge_uv10 = uv1 - uv0;
-        auto edge_uv20 = uv2 - uv0;
-        auto edge_uv21 = uv2 - uv1;
+        glm::vec2 delta_uv1 = uv1 - uv0;
+        glm::vec2 delta_uv2 = uv2 - uv0;
 
-        glm::vec3 normal = cross(edge10, edge20);
+        float r = 1.0f / (delta_uv1.x * delta_uv2.y - delta_uv1.y * delta_uv2.x);
+        if (std::isinf(r) || std::isnan(r)) { // Check for degenerate UVs
+            r = 0.0f; // Avoid issues, tangent will be zero
+        }
 
-        float r0 = 1.0f / (edge_uv10.x * edge_uv20.y - edge_uv10.y * edge_uv20.x);
-        float r1 = 1.0f / (edge_uv10.x * edge_uv21.y - edge_uv10.y * edge_uv21.x);
-        float r2 = 1.0f / (edge_uv20.x * edge_uv21.y - edge_uv20.y * edge_uv21.x);
-        auto t0 = (edge10 * edge_uv20.y - edge20 * edge_uv10.y) * r0;
-        auto t1 = (edge10 * edge_uv21.y - edge21 * edge_uv10.y) * r1;
-        auto t2 = (edge20 * edge_uv21.y - edge21 * edge_uv20.y) * r2;
 
-        auto b0 = (edge20 * edge_uv10.x - edge10 * edge_uv20.x) * r0;
-        auto b1 = (edge21 * edge_uv10.x - edge10 * edge_uv21.x) * r1;
-        auto b2 = (edge21 * edge_uv20.x - edge20 * edge_uv21.x) * r2;
+        glm::vec3 tangent = (delta_pos1 * delta_uv2.y - delta_pos2 * delta_uv1.y) * r;
+        glm::vec3 bitangent = (delta_pos2 * delta_uv1.x - delta_pos1 * delta_uv2.x) * r;
 
-        tangents[triangle[0]] += t0 * angle0;
-        tangents[triangle[1]] += t1 * angle1;
-        tangents[triangle[2]] += t2 * angle2;
+        // Accumulate for each vertex of the triangle
+        tan1Accumulator[tri.x] = tan1Accumulator[tri.x] + tangent;
+        tan1Accumulator[tri.y] = tan1Accumulator[tri.y] + tangent;
+        tan1Accumulator[tri.z] = tan1Accumulator[tri.z] + tangent;
+
+        tan2Accumulator[tri.x] = tan2Accumulator[tri.x] + bitangent;
+        tan2Accumulator[tri.y] = tan2Accumulator[tri.y] + bitangent;
+        tan2Accumulator[tri.z] = tan2Accumulator[tri.z] + bitangent;
     }
 
-    for (uint32_t n = 0; n < num_vertex; n++) {
-        tangents[n] = normalize(tangents[n]);
+    for (size_t i = 0; i < num_vertex; ++i) {
+        const glm::vec3& N = vertices[i];
+        const glm::vec3& T_acc = tan1Accumulator[i];
+        const glm::vec3& B_acc = tan2Accumulator[i];
+
+        // Gram-Schmidt orthogonalize T_acc with respect to N
+        glm::vec3 tangent = normalize(T_acc - N * dot(N, T_acc));
+
+        // Calculate handedness (direction of B_acc relative to cross(N, T_acc))
+        float handedness = (dot(cross(N, T_acc), B_acc) < 0.0f) ? -1.0f : 1.0f;
+
+        tangents[i] = glm::vec4(tangent, handedness);
     }
 }
 
@@ -210,7 +230,7 @@ Sphere::Sphere(
     const std::source_location& src_location) {
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;
-    std::vector<glm::vec3> tangents;
+    std::vector<glm::vec4> tangents;
     std::vector<glm::vec2> uvs;
     std::vector<glm::uvec3> faces;
 
@@ -225,11 +245,6 @@ Sphere::Sphere(
         vertices,
         faces);
 
-    renderer::VertexInputBindingDescription binding_desc;
-    renderer::VertexInputAttributeDescription attribute_desc;
-    std::vector<renderer::VertexInputBindingDescription> binding_descs;
-    std::vector<renderer::VertexInputAttributeDescription> attribute_descs;
-
     setPositionBuffer(
         helper::createUnifiedMeshBuffer(
             device,
@@ -237,37 +252,14 @@ Sphere::Sphere(
             vertices.size() * sizeof(vertices[0]),
             vertices.data(),
             src_location));
-    uint32_t binding_idx = 0;
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(vertices[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_POSITION;
-    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
 
     setNormalBuffer(
         helper::createUnifiedMeshBuffer(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-            normals.size() * sizeof(normals[0]),
-            normals.data(),
+            vertices.size() * sizeof(vertices[0]),
+            vertices.data(),
             src_location));
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(normals[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_NORMAL;
-    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
 
     setTangentBuffer(
         helper::createUnifiedMeshBuffer(
@@ -276,17 +268,6 @@ Sphere::Sphere(
             tangents.size() * sizeof(tangents[0]),
             tangents.data(),
             src_location));
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(tangents[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_TANGENT;
-    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
 
     setUvBuffer(
         helper::createUnifiedMeshBuffer(
@@ -295,20 +276,6 @@ Sphere::Sphere(
             uvs.size() * sizeof(uvs[0]),
             uvs.data(),
             src_location));
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(uvs[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_TEXCOORD0;
-    attribute_desc.format = renderer::Format::R32G32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
-
-    setBindingDescs(binding_descs);
-    setAttribDescs(attribute_descs);
 
     setIndexBuffer(
         helper::createUnifiedMeshBuffer(
@@ -320,7 +287,18 @@ Sphere::Sphere(
 }
 
 void Sphere::draw(
-    std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_set_list,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::GRAPHICS,
+        s_base_shape_pipeline_);
+
+    cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+    cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
+
     std::vector<std::shared_ptr<renderer::Buffer>> buffers;
     std::vector<uint64_t> offsets;
     if (getPositionBuffer()) {
@@ -344,6 +322,25 @@ void Sphere::draw(
     }
 
     cmd_buf->bindVertexBuffers(0, buffers, offsets);
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::GRAPHICS,
+        s_base_shape_pipeline_layout_,
+        desc_set_list);
+
+    glsl::BaseShapeDrawParams params;
+    params.transform =
+        glm::mat4(
+            glm::vec4(0.5f, 0, 0, 0),
+            glm::vec4(0, 0.5f, 0, 0),
+            glm::vec4(0, 0, 0.5f, 0),
+            glm::vec4(-1.70988739f, 2.48692441f, -13.6786499f, 1));
+
+    cmd_buf->pushConstants(
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
+        s_base_shape_pipeline_layout_,
+        &params,
+        sizeof(params));
 
     cmd_buf->bindIndexBuffer(
         getIndexBuffer()->buffer,

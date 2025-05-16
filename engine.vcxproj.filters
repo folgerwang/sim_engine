@@ -589,5 +589,11 @@
     <None Include="shaders\base_depthonly.vert">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="shaders\base_shape_draw.frag">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="shaders\base_shape_draw.vert">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

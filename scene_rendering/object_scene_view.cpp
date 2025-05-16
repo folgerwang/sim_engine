@@ -92,6 +92,7 @@ void ObjectSceneView::duplicateColorAndDepthBuffer(
 void ObjectSceneView::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_sets,
+    std::shared_ptr<ego::Sphere> sphere,
     int dbuf_idx,
     float delta_t,
     float cur_time,
@@ -150,6 +151,15 @@ void ObjectSceneView::draw(
             viewports,
             scissors,
             depth_only);
+    }
+
+    if (sphere) {
+        sphere->draw(
+            cmd_buf,
+            { desc_set_list[PBR_GLOBAL_PARAMS_SET],
+              desc_set_list[VIEW_PARAMS_SET] },
+            viewports,
+            scissors);
     }
 
     cmd_buf->endDynamicRendering();

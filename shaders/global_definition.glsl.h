@@ -418,6 +418,10 @@ struct DebugDrawParams {
     uint            pad3;
 };
 
+struct BaseShapeDrawParams {
+    mat4            transform;
+};
+
 struct VolumeMoistrueParams {
     vec2            world_min;
     vec2            inv_world_range;
@@ -649,6 +653,14 @@ struct ObjectVsPsData {
 #ifdef HAS_VERTEX_COLOR_VEC4
     vec4 vertex_color;
 #endif
+};
+
+struct BaseShapeVsPsData {
+    vec3 vertex_position;
+    vec2 vertex_tex_coord;
+    vec3 vertex_normal;
+    vec3 vertex_tangent;
+    vec3 vertex_binormal;
 };
 
 struct HairVsPsData {

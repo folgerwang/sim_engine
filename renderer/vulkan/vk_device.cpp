@@ -729,8 +729,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     const PipelineInputAssemblyStateCreateInfo& topology_info,
     const GraphicPipelineInfo& graphic_pipeline_info,
     const ShaderModuleList& shader_modules,
-    const std::vector<Format>& color_formats,
-    const Format depth_format,
+    const PipelineRenderbufferFormats& frame_buffer_format,
     const RasterizationStateOverride& rasterization_state_override,
     const std::source_location& src_location) {
 
@@ -758,19 +757,21 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     auto vk_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
     assert(vk_pipeline_layout);
 
-    VkFormat vk_depth_format = helper::toVkFormat(depth_format);
+    VkFormat vk_depth_format = helper::toVkFormat(frame_buffer_format.depth_format);
 
     VkPipelineRenderingCreateInfoKHR pipelineRenderingCreateInfo = {};
     pipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
     pipelineRenderingCreateInfo.viewMask = 0; // Set for multiview if used, otherwise 0
 
-    std::vector<VkFormat> vk_color_formats(color_formats.size());
-    for (int i = 0; i < color_formats.size(); i++) {
-        vk_color_formats[i] = helper::toVkFormat(color_formats[i]);
+    uint32_t num_color_buffers = frame_buffer_format.color_formats.size();
+    std::vector<VkFormat> vk_color_formats(num_color_buffers);
+    for (int i = 0; i < num_color_buffers; i++) {
+        vk_color_formats[i] =
+            helper::toVkFormat(frame_buffer_format.color_formats[i]);
     }
 
     // Describe color attachments
-    pipelineRenderingCreateInfo.colorAttachmentCount = uint32_t(color_formats.size()); // Number of color attachments
+    pipelineRenderingCreateInfo.colorAttachmentCount = num_color_buffers; // Number of color attachments
     pipelineRenderingCreateInfo.pColorAttachmentFormats = vk_color_formats.data(); // Pointer to array of formats
 
     pipelineRenderingCreateInfo.depthAttachmentFormat = vk_depth_format;

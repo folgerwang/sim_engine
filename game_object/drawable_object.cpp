@@ -1540,8 +1540,8 @@ static void drawMesh(
     const ego::SkinInfo* skin_info,
     const glsl::ModelParams& model_params,
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipelines,
-    std::vector<renderer::Viewport> viewports,
-    std::vector<renderer::Scissor> scissors,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
     bool depth_only,
     size_t& last_hash) {
 
@@ -1616,8 +1616,8 @@ static void drawNodes(
     const renderer::DescriptorSetList& desc_set_list,
     int32_t node_idx,
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipelines,
-    std::vector<renderer::Viewport> viewports,
-    std::vector<renderer::Scissor> scissors,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
     bool depth_only,
     size_t& last_hash) {
     if (node_idx >= 0) {
@@ -1840,8 +1840,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        renderbuffer_formats.color_formats,
-        renderbuffer_formats.depth_format,
+        renderbuffer_formats,
         rasterization_state_override,
         std::source_location::current());
 
@@ -1903,8 +1902,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        renderbuffer_formats.color_formats,
-        renderbuffer_formats.depth_format,
+        renderbuffer_formats,
         rasterization_state_override,
         std::source_location::current());
 
@@ -2931,8 +2929,8 @@ void DrawableObject::updateBuffers(
 void DrawableObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
-    std::vector<renderer::Viewport> viewports,
-    std::vector<renderer::Scissor> scissors,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
     bool depth_only/* = false */ ) {
 
     auto& pipeline_list =

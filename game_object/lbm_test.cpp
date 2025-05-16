@@ -136,7 +136,9 @@ void LbmTest::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
     std::shared_ptr<Plane> unit_plane,
-    std::shared_ptr<Box> unit_box) {
+    std::shared_ptr<Box> unit_box,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
@@ -165,7 +167,10 @@ void LbmTest::draw(
         sizeof(params));
 
     if (unit_plane) {
-        unit_plane->draw(cmd_buf);
+        unit_plane->draw(
+            cmd_buf,
+            viewports,
+            scissors);
     }
 
 /*    if (unit_box) {

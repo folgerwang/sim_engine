@@ -58,7 +58,7 @@ static void generatePlaneMesh(
 
 void calculateNormalAndTangent(
     std::vector<glm::vec3>& normals,
-    std::vector<glm::vec3>& tangents,
+    std::vector<glm::vec4>& tangents,
     const std::vector<glm::vec3>& vertices,
     const std::vector<glm::vec2>& uvs,
     const std::vector<glm::uvec3>& triangles) {
@@ -72,8 +72,8 @@ void calculateNormalAndTangent(
     tangents.resize(num_vertex);
 
     for (uint32_t n = 0; n < num_vertex; n++) {
-        normals[n] = glm::vec3(0, 0, 0);
-        tangents[n] = glm::vec3(0, 0, 0);
+        normals[n] = glm::vec3(0);
+        tangents[n] = glm::vec4(0);
     }
 
     for (uint32_t f = 0; f < num_faces; f++) {
@@ -115,14 +115,14 @@ void calculateNormalAndTangent(
         normals[triangle[1]] += normal * angle1;
         normals[triangle[2]] += normal * angle2;
 
-        tangents[triangle[0]] += t0 * angle0;
-        tangents[triangle[1]] += t1 * angle1;
-        tangents[triangle[2]] += t2 * angle2;
+        tangents[triangle[0]] += glm::vec4(t0 * angle0, 0.0f);
+        tangents[triangle[1]] += glm::vec4(t1 * angle1, 0.0f);
+        tangents[triangle[2]] += glm::vec4(t2 * angle2, 0.0f);
     }
 
     for (uint32_t n = 0; n < num_vertex; n++) {
         normals[n] = normalize(normals[n]);
-        tangents[n] = normalize(tangents[n]);
+        tangents[n] = glm::vec4(normalize(glm::vec3(tangents[n])), 1.0f);
     }
 }
 
@@ -138,7 +138,7 @@ Plane::Plane(
     const std::source_location& src_location) {
     std::vector<glm::vec3> vertices;
     std::vector<glm::vec3> normals;
-    std::vector<glm::vec3> tangents;
+    std::vector<glm::vec4> tangents;
     std::vector<glm::vec2> uvs;
     std::vector<glm::uvec3> faces;
 
@@ -166,11 +166,6 @@ Plane::Plane(
         uvs,
         faces);
 
-    renderer::VertexInputBindingDescription binding_desc;
-    renderer::VertexInputAttributeDescription attribute_desc;
-    std::vector<renderer::VertexInputBindingDescription> binding_descs;
-    std::vector<renderer::VertexInputAttributeDescription> attribute_descs;
-
     setPositionBuffer(
         helper::createUnifiedMeshBuffer(
             device,
@@ -178,18 +173,6 @@ Plane::Plane(
             vertices.size() * sizeof(vertices[0]),
             vertices.data(),
             src_location));
-    uint32_t binding_idx = 0;
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(vertices[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_POSITION;
-    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
 
     setNormalBuffer(
         helper::createUnifiedMeshBuffer(
@@ -198,17 +181,6 @@ Plane::Plane(
             normals.size() * sizeof(normals[0]),
             normals.data(),
             src_location));
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(normals[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_NORMAL;
-    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
 
     setTangentBuffer(
         helper::createUnifiedMeshBuffer(
@@ -217,17 +189,6 @@ Plane::Plane(
             tangents.size() * sizeof(tangents[0]),
             tangents.data(),
             src_location));
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(tangents[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_TANGENT;
-    attribute_desc.format = renderer::Format::R32G32B32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
 
     setUvBuffer(
         helper::createUnifiedMeshBuffer(
@@ -236,20 +197,6 @@ Plane::Plane(
             uvs.size() * sizeof(uvs[0]),
             uvs.data(),
             src_location));
-    binding_desc.binding = binding_idx;
-    binding_desc.stride = sizeof(uvs[0]);
-    binding_desc.input_rate = renderer::VertexInputRate::VERTEX;
-    binding_descs.push_back(binding_desc);
-
-    attribute_desc.binding = binding_idx;
-    attribute_desc.location = VINPUT_TEXCOORD0;
-    attribute_desc.format = renderer::Format::R32G32_SFLOAT;
-    attribute_desc.offset = 0;
-    attribute_descs.push_back(attribute_desc);
-    binding_idx++;
-
-    setBindingDescs(binding_descs);
-    setAttribDescs(attribute_descs);
 
     setIndexBuffer(
         helper::createUnifiedMeshBuffer(
@@ -260,7 +207,18 @@ Plane::Plane(
             src_location));
 }
 
-void Plane::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
+void Plane::draw(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::GRAPHICS,
+        s_base_shape_pipeline_);
+
+    cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+    cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
+
     std::vector<std::shared_ptr<renderer::Buffer>> buffers;
     std::vector<uint64_t> offsets;
     if (getPositionBuffer()) {

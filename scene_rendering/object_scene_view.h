@@ -4,6 +4,7 @@
 #include "game_object/terrain.h"
 #include "game_object/drawable_object.h"
 #include "game_object/patch.h"
+#include "game_object/sphere.h"
 #include "game_object/view_object.h"
 
 namespace er = engine::renderer;
@@ -39,6 +40,7 @@ public:
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_sets,
+        std::shared_ptr<ego::Sphere> sphere,
         int dbuf_idx,
         float delta_t,
         float cur_time,

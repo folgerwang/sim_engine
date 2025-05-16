@@ -156,9 +156,6 @@ static std::shared_ptr<game_object::Patch> createPatch(
         binding_idx++;
     }
 
-    patch->setBindingDescs(binding_descs);
-    patch->setAttribDescs(attribute_descs);
-
     assert(new_faces.size() > 0);
     patch->setIndexBuffer(
         helper::createUnifiedMeshBuffer(
@@ -491,8 +488,7 @@ void ObjectMesh::loadObjectFile(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        renderbuffer_formats[int(renderer::RenderPasses::kForward)].color_formats,
-        renderbuffer_formats[int(renderer::RenderPasses::kForward)].depth_format,
+        renderbuffer_formats[int(renderer::RenderPasses::kForward)],
         {},
         std::source_location::current());
 
@@ -503,8 +499,7 @@ void ObjectMesh::loadObjectFile(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        renderbuffer_formats[int(renderer::RenderPasses::kShadow)].color_formats,
-        renderbuffer_formats[int(renderer::RenderPasses::kShadow)].depth_format,
+        renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
         {},
         std::source_location::current());
 }

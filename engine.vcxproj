@@ -127,6 +127,8 @@
     <None Include="shaders\base_depthonly.vert" />
     <None Include="shaders\base.frag" />
     <None Include="shaders\base.vert" />
+    <None Include="shaders\base_shape_draw.frag" />
+    <None Include="shaders\base_shape_draw.vert" />
     <None Include="shaders\blur_image_x.comp" />
     <None Include="shaders\blur_image_y_merge.comp" />
     <None Include="shaders\conemap_gen.comp" />

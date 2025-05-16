@@ -33,7 +33,9 @@ public:
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
         std::shared_ptr<Plane> unit_plane,
-        const std::shared_ptr<game_object::ConemapObj>& conemap_obj);
+        const std::shared_ptr<game_object::ConemapObj>& conemap_obj,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

@@ -2071,8 +2071,7 @@ std::shared_ptr<renderer::Pipeline> TileObject::createTilePipeline(
         input_assembly,
         graphic_pipeline_info,
         shader_modules,
-        renderbuffer_formats.color_formats,
-        renderbuffer_formats.depth_format,
+        renderbuffer_formats,
         {},
         std::source_location::current());
 
@@ -2154,8 +2153,7 @@ std::shared_ptr<renderer::Pipeline> TileObject::createGrassPipeline(
         topology_info,
         graphic_pipeline_info,
         shader_modules,
-        renderbuffer_formats.color_formats,
-        renderbuffer_formats.depth_format,
+        renderbuffer_formats,
         {},
         std::source_location::current());
 

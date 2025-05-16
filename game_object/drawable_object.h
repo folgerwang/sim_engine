@@ -237,8 +237,8 @@ public:
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
-        std::vector<renderer::Viewport> viewports,
-        std::vector<renderer::Scissor> scissors,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors,
         bool depth_only = false);
 
     void update(

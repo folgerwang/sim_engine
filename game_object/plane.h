@@ -14,7 +14,9 @@ public:
         uint32_t split_num_y,
         const std::source_location& src_location);
     void draw(
-        std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
 };
 
 } // game_object

@@ -408,12 +408,16 @@ void ConemapTest::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
     std::shared_ptr<Plane> unit_plane,
-    const std::shared_ptr<game_object::ConemapObj>& conemap_obj) {
+    const std::shared_ptr<game_object::ConemapObj>& conemap_obj,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
 
     const auto buffer_size =
         glm::uvec2(conemap_obj->getPackTexture()->size);
 
-    cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, prt_pipeline_);
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::GRAPHICS,
+        prt_pipeline_);
 
     renderer::DescriptorSetList desc_sets = desc_set_list;
     desc_sets.push_back(prt_desc_set_);
@@ -484,7 +488,10 @@ void ConemapTest::draw(
 
 
     if (unit_plane) {
-        unit_plane->draw(cmd_buf);
+        unit_plane->draw(
+            cmd_buf,
+            viewports,
+            scissors);
     }
 }
 

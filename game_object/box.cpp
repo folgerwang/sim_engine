@@ -75,9 +75,12 @@ Box::Box(
             src_location);
 }
 
-void Box::draw(std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
+void Box::draw(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
     for (auto& plane : planes_) {
-        plane->draw(cmd_buf);
+        plane->draw(cmd_buf, viewports, scissors);
     }
 }
 

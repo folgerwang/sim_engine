@@ -6,16 +6,28 @@ namespace engine {
 namespace game_object {
 
 class ShapeBase {
+protected:
     std::shared_ptr<renderer::BufferInfo> position_buffer_;
     std::shared_ptr<renderer::BufferInfo> uv_buffer_;
     std::shared_ptr<renderer::BufferInfo> normal_buffer_;
     std::shared_ptr<renderer::BufferInfo> tangent_buffer_;
     std::shared_ptr<renderer::BufferInfo> index_buffer_;
-    std::vector<renderer::VertexInputBindingDescription> binding_descs_;
-    std::vector<renderer::VertexInputAttributeDescription> attrib_descs_;
+    static std::vector<renderer::VertexInputBindingDescription> s_binding_descs_;
+    static std::vector<renderer::VertexInputAttributeDescription> s_attrib_descs_;
+    static std::shared_ptr<renderer::PipelineLayout> s_base_shape_pipeline_layout_;
+    static std::shared_ptr<renderer::Pipeline> s_base_shape_pipeline_;
 
 public:
     ShapeBase() {}
+
+    static void initStaticMembers(
+        const std::shared_ptr<renderer::Device>& device,
+        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const renderer::PipelineRenderbufferFormats& frame_buffer_format);
+
+    static void destroyStaticMembers(
+        const std::shared_ptr<renderer::Device>& device);
 
     void setPositionBuffer(const std::shared_ptr<renderer::BufferInfo>& buffer) {
         position_buffer_ = buffer;
@@ -31,14 +43,6 @@ public:
 
     void setTangentBuffer(const std::shared_ptr<renderer::BufferInfo>& buffer) {
         tangent_buffer_ = buffer;
-    }
-
-    void setBindingDescs(const std::vector<renderer::VertexInputBindingDescription>& binding_descs) {
-        binding_descs_ = binding_descs;
-    }
-
-    void setAttribDescs(const std::vector<renderer::VertexInputAttributeDescription>& attrib_descs) {
-        attrib_descs_ = attrib_descs;
     }
 
     void setIndexBuffer(const std::shared_ptr<renderer::BufferInfo>& buffer) {
@@ -61,12 +65,12 @@ public:
         return tangent_buffer_;
     }
 
-    const std::vector<renderer::VertexInputBindingDescription>& getBindingDescs() {
-        return binding_descs_;
+    static const std::vector<renderer::VertexInputBindingDescription>& getBindingDescs() {
+        return s_binding_descs_;
     }
 
-    const std::vector<renderer::VertexInputAttributeDescription>& getAttribDescs() {
-        return attrib_descs_;
+    static const std::vector<renderer::VertexInputAttributeDescription>& getAttribDescs() {
+        return s_attrib_descs_;
     }
 
     const std::shared_ptr<renderer::BufferInfo>& getIndexBuffer() {

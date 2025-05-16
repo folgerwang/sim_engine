@@ -84,8 +84,7 @@ public:
         const PipelineInputAssemblyStateCreateInfo& topology_info,
         const GraphicPipelineInfo& graphic_pipeline_info,
         const ShaderModuleList& shader_modules,
-        const std::vector<Format>& color_formats,
-        const Format depth_format,
+        const PipelineRenderbufferFormats& frame_buffer_format,
         const RasterizationStateOverride& rasterization_state_override,
         const std::source_location& src_location) final;
     virtual std::shared_ptr<Pipeline> createPipeline(
