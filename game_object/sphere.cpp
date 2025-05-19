@@ -334,7 +334,7 @@ void Sphere::draw(
             glm::vec4(0.5f, 0, 0, 0),
             glm::vec4(0, 0.5f, 0, 0),
             glm::vec4(0, 0, 0.5f, 0),
-            glm::vec4(-1.70988739f, 2.48692441f, -13.6786499f, 1));
+            glm::vec4(-3.70988739f, 2.48692441f, -10.6786499f, 1));
 
     cmd_buf->pushConstants(
         SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
