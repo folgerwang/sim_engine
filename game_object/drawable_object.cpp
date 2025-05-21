@@ -712,6 +712,30 @@ static void setupMesh(
         auto part = src_mesh->material_parts[i_part];
         auto mat = src_mesh->materials[part.index];
 
+        std::string mat_name_string(mat->name.data);
+        if (mat_name_string.find("light") == std::string::npos &&
+            mat_name_string.find("Light") == std::string::npos &&
+            mat_name_string.find("BLENDSHADER") == std::string::npos &&
+            mat_name_string.find("MASTER") == std::string::npos &&
+            mat_name_string.find("Emissive") == std::string::npos &&
+            mat_name_string.find("Banner") == std::string::npos &&
+            mat_name_string.find("Sign") == std::string::npos &&
+            mat_name_string.find("Pivot") == std::string::npos &&
+            mat_name_string.find("Antenna") == std::string::npos &&
+            mat_name_string.find("sign") == std::string::npos &&
+            mat_name_string.find("NapkinHolder") == std::string::npos &&
+            mat_name_string.find("Bottle") == std::string::npos &&
+            mat_name_string.find("Flowers") == std::string::npos &&
+            mat_name_string.find("ElectricBox") == std::string::npos &&
+            mat_name_string.find("Fabric") == std::string::npos &&
+            mat_name_string.find("Beams") == std::string::npos &&
+            mat_name_string.find("Ashtray") == std::string::npos &&
+            mat_name_string.find("Leaves") == std::string::npos &&
+            mat_name_string.find("leaf") == std::string::npos &&
+            mat_name_string.find("Foliage") == std::string::npos) {
+            int hit = 1;
+        }
+
         ego::PrimitiveInfo primitive_info;
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
         primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());

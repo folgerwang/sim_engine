@@ -192,6 +192,9 @@
     <ClCompile Include="ui\chat_box.cpp">
       <Filter>Source Files\engine\ui</Filter>
     </ClCompile>
+    <ClCompile Include="game_object\bvh.cpp">
+      <Filter>Source Files\engine\game_object</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="engine_helper.h">
@@ -376,6 +379,9 @@
     </ClInclude>
     <ClInclude Include="ui\chat_box.h">
       <Filter>Header Files\engine\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="game_object\bvh.h">
+      <Filter>Header Files\engine\game_object</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

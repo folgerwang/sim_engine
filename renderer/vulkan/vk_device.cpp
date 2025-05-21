@@ -763,9 +763,10 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     pipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
     pipelineRenderingCreateInfo.viewMask = 0; // Set for multiview if used, otherwise 0
 
-    uint32_t num_color_buffers = frame_buffer_format.color_formats.size();
+    uint32_t num_color_buffers =
+        uint32_t(frame_buffer_format.color_formats.size());
     std::vector<VkFormat> vk_color_formats(num_color_buffers);
-    for (int i = 0; i < num_color_buffers; i++) {
+    for (auto i = 0; i < num_color_buffers; i++) {
         vk_color_formats[i] =
             helper::toVkFormat(frame_buffer_format.color_formats[i]);
     }

@@ -21,6 +21,7 @@
   <ItemGroup>
     <ClCompile Include="engine_helper.cpp" />
     <ClCompile Include="game_object\box.cpp" />
+    <ClCompile Include="game_object\bvh.cpp" />
     <ClCompile Include="game_object\camera.cpp" />
     <ClCompile Include="game_object\camera_object.cpp" />
     <ClCompile Include="game_object\conemap_obj.cpp" />
@@ -62,6 +63,7 @@
   <ItemGroup>
     <ClInclude Include="engine_helper.h" />
     <ClInclude Include="game_object\box.h" />
+    <ClInclude Include="game_object\bvh.h" />
     <ClInclude Include="game_object\camera.h" />
     <ClInclude Include="game_object\camera_object.h" />
     <ClInclude Include="game_object\conemap_obj.h" />
