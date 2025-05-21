@@ -1,7 +1,7 @@
 #include <vector>
 
 #include "renderer/renderer_helper.h"
-#include "engine_helper.h"
+#include "helper/engine_helper.h"
 #include "game_object/terrain.h"
 #include "weather_system.h"
 #include "shaders/weather/weather_common.glsl.h"

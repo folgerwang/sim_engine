@@ -3,7 +3,7 @@
 #include <unordered_map>
 #include "camera_object.h"
 #include "terrain.h"
-#include "engine_helper.h"
+#include "helper/engine_helper.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 

@@ -2,7 +2,7 @@
 #include <sstream>
 #include <unordered_map>
 #include "object_scene_view.h"
-#include "engine_helper.h"
+#include "helper/engine_helper.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 

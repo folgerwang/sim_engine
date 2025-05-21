@@ -19,9 +19,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="engine_helper.cpp" />
     <ClCompile Include="game_object\box.cpp" />
-    <ClCompile Include="game_object\bvh.cpp" />
     <ClCompile Include="game_object\camera.cpp" />
     <ClCompile Include="game_object\camera_object.cpp" />
     <ClCompile Include="game_object\conemap_obj.cpp" />
@@ -39,6 +37,8 @@
     <ClCompile Include="game_object\sphere.cpp" />
     <ClCompile Include="game_object\terrain.cpp" />
     <ClCompile Include="game_object\view_object.cpp" />
+    <ClCompile Include="helper\bvh.cpp" />
+    <ClCompile Include="helper\engine_helper.cpp" />
     <ClCompile Include="ray_tracing\raytracing_callable.cpp" />
     <ClCompile Include="ray_tracing\raytracing_shadow.cpp" />
     <ClCompile Include="renderer\renderer.cpp" />
@@ -61,9 +61,7 @@
     <ClCompile Include="ui\menu.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="engine_helper.h" />
     <ClInclude Include="game_object\box.h" />
-    <ClInclude Include="game_object\bvh.h" />
     <ClInclude Include="game_object\camera.h" />
     <ClInclude Include="game_object\camera_object.h" />
     <ClInclude Include="game_object\conemap_obj.h" />
@@ -81,6 +79,10 @@
     <ClInclude Include="game_object\sphere.h" />
     <ClInclude Include="game_object\terrain.h" />
     <ClInclude Include="game_object\view_object.h" />
+    <ClInclude Include="helper\bvh.h" />
+    <ClInclude Include="helper\dds.h" />
+    <ClInclude Include="helper\engine_helper.h" />
+    <ClInclude Include="helper\tiny_mtx2.h" />
     <ClInclude Include="ray_tracing\raytracing_base.h" />
     <ClInclude Include="ray_tracing\raytracing_callable.h" />
     <ClInclude Include="ray_tracing\raytracing_shadow.h" />
@@ -120,7 +122,6 @@
     <ClInclude Include="shaders\terrain\tile_common.glsl.h" />
     <ClInclude Include="shaders\weather\weather_common.glsl.h" />
     <ClInclude Include="third_parties\fbx\ufbx.h" />
-    <ClInclude Include="tiny_mtx2.h" />
     <ClInclude Include="ui\chat_box.h" />
     <ClInclude Include="ui\menu.h" />
   </ItemGroup>

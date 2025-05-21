@@ -7,14 +7,14 @@
 #include <unordered_map>
 #include <filesystem>
 
-#include "engine_helper.h"
+#include "helper/engine_helper.h"
 #include "game_object/drawable_object.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 
 // gltf
 #include "tiny_gltf.h"
-#include "tiny_mtx2.h"
+#include "helper/tiny_mtx2.h"
 
 // fbx
 #include "third_parties/fbx/ufbx.h"

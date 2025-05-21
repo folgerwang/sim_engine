@@ -1,6 +1,6 @@
 #pragma once
 #include "renderer/renderer.h"
-#include "engine_helper.h"
+#include "helper/engine_helper.h"
 
 namespace engine {
 namespace game_object {

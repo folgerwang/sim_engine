@@ -5,12 +5,12 @@
 #include <memory>
 #include <chrono>
 
-#include "engine_helper.h"
+#include "helper/engine_helper.h"
 #include "game_object/camera.h"
 #include "renderer/renderer_helper.h"
 
 #include "tiny_gltf.h"
-#include "tiny_mtx2.h"
+#include "helper/tiny_mtx2.h"
 
 constexpr float s_half_shadow_size = 256.0f;
 
