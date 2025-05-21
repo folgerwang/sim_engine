@@ -8,6 +8,7 @@
 #include <filesystem>
 
 #include "helper/engine_helper.h"
+#include "helper/bvh.h"
 #include "game_object/drawable_object.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
@@ -733,6 +734,22 @@ static void setupMesh(
             mat_name_string.find("Leaves") == std::string::npos &&
             mat_name_string.find("leaf") == std::string::npos &&
             mat_name_string.find("Foliage") == std::string::npos) {
+            
+            std::vector<glm::vec3> vertex_position(src_mesh->num_vertices);
+            for (auto i = 0; i < src_mesh->num_vertices; i++) {
+                vertex_position[i].x = float_t(src_mesh->vertex_position[i].x);
+                vertex_position[i].y = float_t(src_mesh->vertex_position[i].y);
+                vertex_position[i].z = float_t(src_mesh->vertex_position[i].z);
+            }
+
+            std::vector<int32_t> vertex_indices(src_mesh->num_indices);
+            for (auto i = 0; i < src_mesh->num_indices; i++) {
+                vertex_indices[i] = int32_t(src_mesh->vertex_indices[i]);
+            }
+
+            std::shared_ptr<helper::BVHBuilder> builder =
+                std::make_shared<helper::BVHBuilder>(vertex_position, vertex_indices);
+
             int hit = 1;
         }
 

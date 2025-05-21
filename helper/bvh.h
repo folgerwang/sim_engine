@@ -35,6 +35,121 @@ struct AABB {
     }
 };
 
+struct Ray {
+    glm::vec3 origin;
+    glm::vec3 direction; };
+
+inline bool rayAABBIntersect(const Ray& ray, const AABB& box, float& t_near_hit, float& t_far_hit) {
+    // It's often useful to compute 1.0f / ray.direction once
+    glm::vec3 inv_dir =
+        { 1.0f / ray.direction.x,
+          1.0f / ray.direction.y,
+          1.0f / ray.direction.z };
+
+    float tx1 = (box.min_bounds.x - ray.origin.x) * inv_dir.x;
+    float tx2 = (box.max_bounds.x - ray.origin.x) * inv_dir.x;
+
+    float tmin = std::min(tx1, tx2);
+    float tmax = std::max(tx1, tx2);
+
+    float ty1 = (box.min_bounds.y - ray.origin.y) * inv_dir.y;
+    float ty2 = (box.max_bounds.y - ray.origin.y) * inv_dir.y;
+
+    tmin = std::max(tmin, std::min(ty1, ty2));
+    tmax = std::min(tmax, std::max(ty1, ty2));
+
+    float tz1 = (box.min_bounds.z - ray.origin.z) * inv_dir.z;
+    float tz2 = (box.max_bounds.z - ray.origin.z) * inv_dir.z;
+
+    tmin = std::max(tmin, std::min(tz1, tz2));
+    tmax = std::min(tmax, std::max(tz1, tz2));
+
+    // t_near_hit and t_far_hit are the intersection distances with the AABB itself
+    t_near_hit = tmin;
+    t_far_hit = tmax;
+
+    // The ray intersects if tmax >= tmin AND tmax > 0 (intersection is in front)
+    // We also need to consider the ray's maximum travel distance if it has one.
+    return tmax >= tmin && tmax > 1e-6f; // tmax > 0 ensures it's in front
+}
+
+/**
+ * @brief Checks if a ray intersects a triangle using the Möller–Trumbore algorithm.
+ *
+ * @param ray The ray to test.
+ * @param v0 The first vertex of the triangle.
+ * @param v1 The second vertex of the triangle.
+ * @param v2 The third vertex of the triangle.
+ * @param out_t Output parameter for the distance 't' along the ray to the intersection point.
+ * @param out_u Output parameter for the barycentric coordinate 'u'.
+ * @param out_v Output parameter for the barycentric coordinate 'v'.
+ * @return true if the ray intersects the triangle within its bounds, false otherwise.
+ */
+inline bool rayTriangleIntersect(
+    const Ray& ray,
+    const glm::vec3& v0,
+    const glm::vec3& v1,
+    const glm::vec3& v2,
+    float& out_t,        // Output: distance t along the ray
+    float& out_u,        // Output: barycentric u
+    float& out_v         // Output: barycentric v
+) {
+    // A small epsilon value for floating-point comparisons to avoid issues with
+    // rays parallel to the triangle plane or hitting edges precisely.
+    const float EPSILON = 1e-6f; // Adjust if needed based on your scene's scale
+
+    glm::vec3 edge1 = v1 - v0;
+    glm::vec3 edge2 = v2 - v0;
+
+    // Calculate determinant part 1: P = D x E2
+    glm::vec3 pvec = cross(ray.direction, edge2);
+
+    // Calculate determinant: det = E1 · P
+    // If determinant is near zero, ray lies in plane of triangle or is parallel.
+    float det = dot(edge1, pvec);
+
+    // Culling check (optional): if determinant is negative, triangle is back-facing.
+    // if (det < EPSILON) return false; // For culling back-faces
+    // For double-sided intersection (no back-face culling):
+    if (std::fabs(det) < EPSILON) { // Use fabs for double-sided
+        return false; // Ray is parallel to the triangle or lies in its plane (missing)
+    }
+
+    float inv_det = 1.0f / det;
+
+    // Calculate distance from V0 to ray origin: T = O - V0
+    glm::vec3 tvec = ray.origin - v0;
+
+    // Calculate u parameter and test bound: u = (T · P) * inv_det
+    out_u = dot(tvec, pvec) * inv_det;
+    if (out_u < 0.0f || out_u > 1.0f) {
+        return false; // Intersection point is outside the V0-V1-V2_edge1 side
+    }
+
+    // Prepare to test v parameter: Q = T x E1
+    glm::vec3 qvec = cross(tvec, edge1);
+
+    // Calculate v parameter and test bound: v = (D · Q) * inv_det
+    out_v = dot(ray.direction, qvec) * inv_det;
+    if (out_v < 0.0f || out_u + out_v > 1.0f) {
+        return false; // Intersection point is outside the V0-V1-V2_edge2 side or V1-V2 edge
+    }
+
+    // Calculate t, the distance along the ray to the intersection point: t = (E2 · Q) * inv_det
+    out_t = dot(edge2, qvec) * inv_det;
+
+    // Check if the intersection point is in front of the ray's origin
+    // (and not practically at the origin if t is extremely small).
+    if (out_t > EPSILON) {
+        return true; // Ray intersects the triangle
+    }
+    else {
+        // Line intersection but not a ray intersection (behind the origin)
+        // or too close to be considered a valid hit.
+        return false;
+    }
+}
+
 // This structure holds precomputed info for each triangle
 struct PrimitiveInfo {
     int original_triangle_index; // Index i, for triangle (indices[3*i], indices[3*i+1], indices[3*i+2])
@@ -57,10 +172,18 @@ struct PrimitiveInfo {
     const glm::vec3& centroid() const { return centroid_val; }
 };
 
+struct HitInfo {
+    bool hit = false;
+    float t = std::numeric_limits<float>::max(); // Distance to intersection
+    int triangle_index = -1;                     // Original index of the hit triangle
+    float u, v;                                  // Barycentric coordinates
+    glm::vec3 intersection_point; // Can be computed from ray.origin + ray.direction * t
+};
+
 struct BVHNode {
     AABB bounds;
-    BVHNode* left = nullptr;
-    BVHNode* right = nullptr;
+    std::shared_ptr<BVHNode> left;
+    std::shared_ptr<BVHNode> right;
     // Stores indices into the 'primitive_info_list' (see BVHBuilder)
     // OR directly stores 'original_triangle_index' from PrimitiveInfo
     std::vector<int> primitive_ref_indices;
@@ -70,9 +193,93 @@ struct BVHNode {
     }
 };
 
+// Forward declaration if rayTriangleIntersect is in another file/scope
+// bool rayTriangleIntersect(const Ray& ray, const Vec3& v0, const Vec3& v1, const Vec3& v2, float& out_t, float& out_u, float& out_v);
+
+inline void intersectBVHRecursive(
+    const Ray& ray,
+    const std::shared_ptr<BVHNode>& node,
+    const std::vector<glm::vec3>& vertices,      // Your global vertex stream
+    const std::vector<int>& indices,        // Your global index stream
+    HitInfo& closest_hit                     // Passed by reference to update
+) {
+    if (!node) {
+        return;
+    }
+
+    // 1. Check if ray intersects the current node's AABB
+    float t_aabb_near, t_aabb_far; // We might not need t_aabb_far here for basic traversal
+    if (!rayAABBIntersect(ray, node->bounds, t_aabb_near, t_aabb_far)) {
+        return; // Ray misses this node's entire volume
+    }
+
+    // Optimization: If the closest possible hit within this AABB (t_aabb_near)
+    // is already further than a known hit, we can prune this branch.
+    if (t_aabb_near >= closest_hit.t) {
+        return;
+    }
+
+    // 2. If it's a Leaf Node
+    if (node->isLeaf()) {
+        for (int original_tri_idx : node->primitive_ref_indices) {
+            // Get triangle vertices using original_tri_idx
+            const glm::vec3& v0 = vertices[indices[3 * original_tri_idx + 0]];
+            const glm::vec3& v1 = vertices[indices[3 * original_tri_idx + 1]];
+            const glm::vec3& v2 = vertices[indices[3 * original_tri_idx + 2]];
+
+            float current_t, current_u, current_v;
+            if (rayTriangleIntersect(ray, v0, v1, v2, current_t, current_u, current_v)) {
+                if (current_t < closest_hit.t && current_t > 1e-6f) { // Check if this hit is closer
+                    closest_hit.hit = true;
+                    closest_hit.t = current_t;
+                    closest_hit.triangle_index = original_tri_idx;
+                    closest_hit.u = current_u;
+                    closest_hit.v = current_v;
+                }
+            }
+        }
+    }
+    // 3. If it's an Internal Node
+    else {
+        // Recursively check children.
+        // Optional Optimization: Check the child whose AABB is closer to the ray first.
+        // This can lead to finding a closer hit sooner, allowing more pruning.
+        float t_left_near, t_left_far, t_right_near, t_right_far;
+        bool hit_left_aabb = node->left ? rayAABBIntersect(ray, node->left->bounds, t_left_near, t_left_far) : false;
+        bool hit_right_aabb = node->right ? rayAABBIntersect(ray, node->right->bounds, t_right_near, t_right_far) : false;
+
+        if (hit_left_aabb && hit_right_aabb) {
+            if (t_left_near < t_right_near) {
+                intersectBVHRecursive(ray, node->left, vertices, indices, closest_hit);
+                // Only check right if it can still contain a closer hit
+                if (t_right_near < closest_hit.t) {
+                    intersectBVHRecursive(ray, node->right, vertices, indices, closest_hit);
+                }
+            }
+            else {
+                intersectBVHRecursive(ray, node->right, vertices, indices, closest_hit);
+                // Only check left if it can still contain a closer hit
+                if (t_left_near < closest_hit.t) {
+                    intersectBVHRecursive(ray, node->left, vertices, indices, closest_hit);
+                }
+            }
+        }
+        else if (hit_left_aabb) {
+            if (t_left_near < closest_hit.t) { // Only check if it can contain a closer hit
+                intersectBVHRecursive(ray, node->left, vertices, indices, closest_hit);
+            }
+        }
+        else if (hit_right_aabb) {
+            if (t_right_near < closest_hit.t) { // Only check if it can contain a closer hit
+                intersectBVHRecursive(ray, node->right, vertices, indices, closest_hit);
+            }
+        }
+    }
+}
+
 class BVHBuilder {
 public:
-    BVHNode* root = nullptr;
+    std::shared_ptr<BVHNode> root;
     std::vector<PrimitiveInfo> primitive_info_list; // Stores AABB & centroid for each tri
     std::vector<int> build_indices; // Indices into 'primitive_info_list' used during build
 
@@ -107,15 +314,15 @@ public:
     }
 
 private:
-    void deleteNodeRecursive(BVHNode* node) {
+    void deleteNodeRecursive(std::shared_ptr<BVHNode>& node) {
         if (!node) return;
         deleteNodeRecursive(node->left);
         deleteNodeRecursive(node->right);
-        delete node;
+        node = nullptr;
     }
 
-    BVHNode* buildRecursive(int start_index, int end_index) {
-        BVHNode* node = new BVHNode();
+    std::shared_ptr<BVHNode> buildRecursive(int start_index, int end_index) {
+        std::shared_ptr<BVHNode> node = std::make_shared<BVHNode>();
         int num_primitives_in_node = end_index - start_index;
 
         // Calculate bounds for all primitives in this node
@@ -254,8 +461,8 @@ private:
     }
 
 public:
-    void printBVH(BVHNode* node, int depth = 0) const {
-        if (!node) return;
+    void printBVH(std::shared_ptr<BVHNode>& node, int depth = 0) const {
+        if (node == nullptr) return;
         for (int i = 0; i < depth; ++i) std::cout << "  ";
         std::cout << "Node (Refs: " << node->primitive_ref_indices.size();
         if (!node->isLeaf()) {
@@ -268,13 +475,28 @@ public:
             printBVH(node->right, depth + 1);
         }
         else {
-            for (int i = 0; i < depth + 1; ++i) std::cout << "  ";
+            for (int i = 0; i < depth + 1; ++i)
+                std::cout << "  ";
             std::cout << "Leaf Original Triangle Indices: ";
-            for (int original_idx : node->primitive_ref_indices) std::cout << original_idx << " ";
+            for (int original_idx : node->primitive_ref_indices)
+                std::cout << original_idx << " ";
             std::cout << std::endl;
         }
     }
 };
+
+// --- Main function to start the process ---
+inline HitInfo findClosestHit(
+    const Ray& ray,
+    const BVHBuilder& bvh, // Assuming BVHBuilder holds the root and prim info
+    const std::vector<glm::vec3>& vertices,
+    const std::vector<int>& indices) {
+    HitInfo closest_hit; // Initialized with hit = false, t = infinity
+    if (bvh.root) {
+        intersectBVHRecursive(ray, bvh.root, vertices, indices, closest_hit);
+    }
+    return closest_hit;
+}
 
 } // game_object
 } // engine
