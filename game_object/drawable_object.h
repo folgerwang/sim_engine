@@ -1,6 +1,7 @@
 #pragma once
 #include <unordered_map>
 #include "renderer/renderer.h"
+#include "helper/bvh.h"
 
 namespace engine {
 namespace game_object {
@@ -48,6 +49,8 @@ public:
     glm::vec3               bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
     glm::vec3               bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
     std::shared_ptr<renderer::AccelerationStructureGeometry>  as_geometry;
+    std::shared_ptr<std::vector<int32_t>> vertex_indices_;
+    std::shared_ptr<helper::BVHNode> bvh_root_;
 
     renderer::IndexInputBindingDescription  index_desc_ = { 0 };
     std::vector<renderer::VertexInputBindingDescription> binding_descs_;
@@ -101,6 +104,7 @@ struct SkinInfo {
 
 struct MeshInfo {
     std::vector<PrimitiveInfo>  primitives_;
+    std::shared_ptr<std::vector<glm::vec3>> vertex_position_;
     glm::vec3                   bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
     glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
 };

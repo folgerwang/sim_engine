@@ -483,6 +483,10 @@ public:
             std::cout << std::endl;
         }
     }
+
+    std::shared_ptr<BVHNode> getBvhNodeRoot() {
+        return root;
+    }
 };
 
 // --- Main function to start the process ---

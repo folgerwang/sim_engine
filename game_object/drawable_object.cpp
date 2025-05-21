@@ -698,6 +698,13 @@ static void setupMesh(
     assert(src_mesh->num_indices == src_mesh->vertex_normal.indices.count);
     assert(src_mesh->num_indices == src_mesh->vertex_uv.indices.count);
 
+    std::vector<glm::vec3> vertex_position(src_mesh->num_vertices);
+    for (auto i = 0; i < src_mesh->num_vertices; i++) {
+        vertex_position[i].x = float_t(src_mesh->vertex_position[i].x);
+        vertex_position[i].y = float_t(src_mesh->vertex_position[i].y);
+        vertex_position[i].z = float_t(src_mesh->vertex_position[i].z);
+    }
+
     std::unordered_map<size_t, uint32_t> vertex_map;
     std::vector<uint32_t> new_indices;
     std::vector<uint32_t> indice_match_table;
@@ -709,10 +716,12 @@ static void setupMesh(
 
     size_t num_traingles = 0;
     size_t num_indices = 0;
+    bool has_bvh_trees = false;
     for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
         auto part = src_mesh->material_parts[i_part];
         auto mat = src_mesh->materials[part.index];
 
+        bool create_bvh_tree = false;
         std::string mat_name_string(mat->name.data);
         if (mat_name_string.find("light") == std::string::npos &&
             mat_name_string.find("Light") == std::string::npos &&
@@ -734,28 +743,16 @@ static void setupMesh(
             mat_name_string.find("Leaves") == std::string::npos &&
             mat_name_string.find("leaf") == std::string::npos &&
             mat_name_string.find("Foliage") == std::string::npos) {
-            
-            std::vector<glm::vec3> vertex_position(src_mesh->num_vertices);
-            for (auto i = 0; i < src_mesh->num_vertices; i++) {
-                vertex_position[i].x = float_t(src_mesh->vertex_position[i].x);
-                vertex_position[i].y = float_t(src_mesh->vertex_position[i].y);
-                vertex_position[i].z = float_t(src_mesh->vertex_position[i].z);
-            }
-
-            std::vector<int32_t> vertex_indices(src_mesh->num_indices);
-            for (auto i = 0; i < src_mesh->num_indices; i++) {
-                vertex_indices[i] = int32_t(src_mesh->vertex_indices[i]);
-            }
-
-            std::shared_ptr<helper::BVHBuilder> builder =
-                std::make_shared<helper::BVHBuilder>(vertex_position, vertex_indices);
-
-            int hit = 1;
+            create_bvh_tree = true;
+            has_bvh_trees = true;
         }
 
         ego::PrimitiveInfo primitive_info;
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
         primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+
+        std::vector<int32_t> vertex_indices;
+        vertex_indices.reserve(part.num_faces * 3);
 
         for (int i_face = 0; i_face < part.num_faces; i_face++) {
             const auto& face_indice = part.face_indices[i_face];
@@ -764,6 +761,7 @@ static void setupMesh(
             for (uint32_t i_vert = 0; i_vert < face.num_indices; i_vert++) {
                 const auto src_vert_index = face.index_begin + i_vert;
                 auto pos_indice = src_mesh->vertex_position.indices[src_vert_index];
+                vertex_indices.push_back(pos_indice);
                 const auto& position = src_mesh->vertex_position.values[pos_indice];
                 auto position_packed = glm::vec3(position.x, position.y, position.z);
 
@@ -803,6 +801,16 @@ static void setupMesh(
                 }
             }
         }
+
+        if (create_bvh_tree) {
+            primitive_info.vertex_indices_ =
+                std::make_shared<std::vector<int32_t>>(vertex_indices);
+            std::shared_ptr<helper::BVHBuilder> builder =
+                std::make_shared<helper::BVHBuilder>(vertex_position, vertex_indices);
+
+            primitive_info.bvh_root_ = builder->getBvhNodeRoot();
+        }
+
         drawable_mesh.bbox_min_ =
             min(drawable_mesh.bbox_min_, primitive_info.bbox_min_);
         drawable_mesh.bbox_max_ =
@@ -891,6 +899,11 @@ static void setupMesh(
 
         index_bytes_count = 4;
         index_type = renderer::IndexType::UINT32;
+    }
+
+    if (has_bvh_trees) {
+        drawable_mesh.vertex_position_ =
+            std::make_shared<std::vector<glm::vec3>>(vertex_position);
     }
 
     num_traingles = 0;
