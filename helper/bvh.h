@@ -14,6 +14,16 @@ struct AABB {
         max_bounds(-std::numeric_limits<float>::max()) {
     }
 
+    AABB(const glm::vec3& p) {
+        min_bounds = p;
+        max_bounds = p;
+    }
+
+    AABB(const glm::vec3& v_min, const glm::vec3& v_max) {
+        min_bounds = min(v_min, v_max);
+        max_bounds = max(v_min, v_max);
+    }
+
     void extend(const glm::vec3& p) {
         min_bounds = min(min_bounds, p);
         max_bounds = max(max_bounds, p);
@@ -279,9 +289,9 @@ inline void intersectBVHRecursive(
 
 class BVHBuilder {
 public:
-    std::shared_ptr<BVHNode> root;
-    std::vector<PrimitiveInfo> primitive_info_list; // Stores AABB & centroid for each tri
-    std::vector<int> build_indices; // Indices into 'primitive_info_list' used during build
+    std::shared_ptr<BVHNode> root_;
+    std::vector<PrimitiveInfo> primitive_info_list_; // Stores AABB & centroid for each tri
+    std::vector<int> build_indices_; // Indices into 'primitive_info_list' used during build
 
     const int MAX_PRIMS_IN_NODE = 4;
     const int SAH_BUCKET_COUNT = 12;
@@ -292,25 +302,25 @@ public:
         if (indices.empty() || vertices.empty()) return;
 
         size_t num_triangles = indices.size() / 3;
-        primitive_info_list.reserve(num_triangles);
+        primitive_info_list_.reserve(num_triangles);
 
         for (size_t i = 0; i < num_triangles; ++i) {
             const glm::vec3& v0 = vertices[indices[3 * i + 0]];
             const glm::vec3& v1 = vertices[indices[3 * i + 1]];
             const glm::vec3& v2 = vertices[indices[3 * i + 2]];
-            primitive_info_list.emplace_back(static_cast<int>(i), v0, v1, v2);
+            primitive_info_list_.emplace_back(static_cast<int>(i), v0, v1, v2);
         }
 
-        build_indices.resize(primitive_info_list.size());
-        for (size_t i = 0; i < primitive_info_list.size(); ++i) {
-            build_indices[i] = static_cast<int>(i);
+        build_indices_.resize(primitive_info_list_.size());
+        for (size_t i = 0; i < primitive_info_list_.size(); ++i) {
+            build_indices_[i] = static_cast<int>(i);
         }
 
-        root = buildRecursive(0, static_cast<int>(primitive_info_list.size()));
+        root_ = buildRecursive(build_indices_);
     }
 
     ~BVHBuilder() {
-        deleteNodeRecursive(root);
+        deleteNodeRecursive(root_);
     }
 
 private:
@@ -321,31 +331,31 @@ private:
         node = nullptr;
     }
 
-    std::shared_ptr<BVHNode> buildRecursive(int start_index, int end_index) {
+    std::shared_ptr<BVHNode> buildRecursive(std::vector<int> build_indices) {
         std::shared_ptr<BVHNode> node = std::make_shared<BVHNode>();
-        int num_primitives_in_node = end_index - start_index;
+        int num_primitives_in_node = build_indices.size();
 
         // Calculate bounds for all primitives in this node
-        for (int i = start_index; i < end_index; ++i) {
+        for (int i = 0; i < num_primitives_in_node; ++i) {
             // build_indices[i] is an index into primitive_info_list
-            node->bounds.extend(primitive_info_list[build_indices[i]].getAABB());
+            node->bounds.extend(primitive_info_list_[build_indices[i]].getAABB());
         }
 
         // Base case: if few primitives, create a leaf node
         if (num_primitives_in_node <= MAX_PRIMS_IN_NODE) {
-            for (int i = start_index; i < end_index; ++i) {
+            for (int i = 0; i < num_primitives_in_node; ++i) {
                 // Store the original triangle index directly, or the index into primitive_info_list
                 node->primitive_ref_indices.push_back(
-                    primitive_info_list[build_indices[i]].original_triangle_index
-                );
+                    primitive_info_list_[build_indices[i]].original_triangle_index);
             }
             return node;
         }
 
         // --- Find the best split (SAH or other heuristic) ---
         AABB centroid_bounds;
-        for (int i = start_index; i < end_index; ++i) {
-            centroid_bounds.extend(primitive_info_list[build_indices[i]].centroid());
+        for (int i = 0; i < num_primitives_in_node; ++i) {
+            centroid_bounds.extend(
+                primitive_info_list_[build_indices[i]].centroid());
         }
 
         int split_axis = 0;
@@ -365,9 +375,7 @@ private:
         }
 
         if (use_midpoint_fallback || num_primitives_in_node < SAH_BUCKET_COUNT * 2) {
-            split_coord_val = (split_axis == 0) ? centroid_bounds.centroid().x :
-                (split_axis == 1) ? centroid_bounds.centroid().y :
-                centroid_bounds.centroid().z;
+            split_coord_val = centroid_bounds.centroid()[split_axis];
         }
         else {
             // --- SAH Bucketing (Simplified) ---
@@ -376,8 +384,8 @@ private:
                 AABB bounds;
             };
             std::vector<BucketInfo> buckets(SAH_BUCKET_COUNT);
-            float min_c_axis = (split_axis == 0) ? centroid_bounds.min_bounds.x : (split_axis == 1) ? centroid_bounds.min_bounds.y : centroid_bounds.min_bounds.z;
-            float max_c_axis = (split_axis == 0) ? centroid_bounds.max_bounds.x : (split_axis == 1) ? centroid_bounds.max_bounds.y : centroid_bounds.max_bounds.z;
+            float min_c_axis = centroid_bounds.min_bounds[split_axis];
+            float max_c_axis = centroid_bounds.max_bounds[split_axis];
             float extent_c_axis = max_c_axis - min_c_axis;
 
             if (extent_c_axis < 1e-6f) { // All centroids are basically at the same spot on this axis
@@ -385,11 +393,9 @@ private:
                 split_coord_val = min_c_axis; // or centroid_bounds.centroid().coord(split_axis)
             }
             else {
-                for (int i = start_index; i < end_index; ++i) {
-                    const PrimitiveInfo& p_info = primitive_info_list[build_indices[i]];
-                    float centroid_coord = (split_axis == 0) ? p_info.centroid().x :
-                        (split_axis == 1) ? p_info.centroid().y :
-                        p_info.centroid().z;
+                for (int i = 0; i < num_primitives_in_node; ++i) {
+                    const PrimitiveInfo& p_info = primitive_info_list_[build_indices[i]];
+                    float centroid_coord = p_info.centroid()[split_axis];
                     int b = static_cast<int>(SAH_BUCKET_COUNT * ((centroid_coord - min_c_axis) / extent_c_axis));
                     b = std::max(0, std::min(SAH_BUCKET_COUNT - 1, b));
                     buckets[b].count++;
@@ -401,12 +407,16 @@ private:
                     AABB b0, b1;
                     int count0 = 0, count1 = 0;
                     for (int j = 0; j <= i; ++j) {
-                        b0.extend(buckets[j].bounds);
-                        count0 += buckets[j].count;
+                        if (buckets[j].count > 0) {
+                            b0.extend(buckets[j].bounds);
+                            count0 += buckets[j].count;
+                        }
                     }
                     for (int j = i + 1; j < SAH_BUCKET_COUNT; ++j) {
-                        b1.extend(buckets[j].bounds);
-                        count1 += buckets[j].count;
+                        if (buckets[j].count) {
+                            b1.extend(buckets[j].bounds);
+                            count1 += buckets[j].count;
+                        }
                     }
                     cost[i] = 0.125f + ((count0 > 0 ? count0 * b0.surfaceArea() : 0.0f) +
                         (count1 > 0 ? count1 * b1.surfaceArea() : 0.0f))
@@ -428,8 +438,9 @@ private:
                     split_coord_val = min_c_axis + extent_c_axis * (min_cost_split_bucket + 1) / SAH_BUCKET_COUNT;
                 }
                 else {
-                    for (int i = start_index; i < end_index; ++i) {
-                        node->primitive_ref_indices.push_back(primitive_info_list[build_indices[i]].original_triangle_index);
+                    for (int i = 0; i < num_primitives_in_node; ++i) {
+                        node->primitive_ref_indices.push_back(
+                            primitive_info_list_[build_indices[i]].original_triangle_index);
                     }
                     return node; // Make leaf
                 }
@@ -437,21 +448,19 @@ private:
         }
 
         // Partition build_indices based on the split
-        auto* p_mid = std::partition(&build_indices[start_index],
-            &build_indices[end_index - 1] + 1,
+        auto* p_mid = std::partition(&build_indices[0],
+            &build_indices[num_primitives_in_node - 1] + 1,
             [&](int p_info_idx) {
-                const PrimitiveInfo& current_prim_info = primitive_info_list[p_info_idx];
-                float centroid_coord = (split_axis == 0) ? current_prim_info.centroid().x :
-                    (split_axis == 1) ? current_prim_info.centroid().y :
-                    current_prim_info.centroid().z;
+                const PrimitiveInfo& current_prim_info = primitive_info_list_[p_info_idx];
+                float centroid_coord = current_prim_info.centroid()[split_axis];
                 return centroid_coord < split_coord_val;
             });
 
         int mid_point_offset = static_cast<int>(p_mid - &build_indices[0]);
 
-        if (mid_point_offset == start_index || mid_point_offset == end_index) {
+        if (mid_point_offset == 0 || mid_point_offset == num_primitives_in_node) {
             // Fallback if partitioning failed, just split in the middle of the current range
-            mid_point_offset = start_index + num_primitives_in_node / 2;
+            mid_point_offset = 0 + num_primitives_in_node / 2;
         }
 
         node->left = buildRecursive(start_index, mid_point_offset);

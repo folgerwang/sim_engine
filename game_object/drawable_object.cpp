@@ -809,6 +809,7 @@ static void setupMesh(
                 std::make_shared<helper::BVHBuilder>(vertex_position, vertex_indices);
 
             primitive_info.bvh_root_ = builder->getBvhNodeRoot();
+            int hit = 1;
         }
 
         drawable_mesh.bbox_min_ =
