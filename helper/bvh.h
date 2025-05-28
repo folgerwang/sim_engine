@@ -333,7 +333,7 @@ private:
 
     std::shared_ptr<BVHNode> buildRecursive(std::vector<int> build_indices) {
         std::shared_ptr<BVHNode> node = std::make_shared<BVHNode>();
-        int num_primitives_in_node = build_indices.size();
+        int32_t num_primitives_in_node = int32_t(build_indices.size());
 
         // Calculate bounds for all primitives in this node
         for (int i = 0; i < num_primitives_in_node; ++i) {
@@ -462,9 +462,21 @@ private:
             // Fallback if partitioning failed, just split in the middle of the current range
             mid_point_offset = 0 + num_primitives_in_node / 2;
         }
-
-        node->left = buildRecursive(start_index, mid_point_offset);
-        node->right = buildRecursive(mid_point_offset, end_index);
+        {
+            std::vector<int32_t> split_build_indices(mid_point_offset);
+            for (auto i = 0; i < mid_point_offset; i++) {
+                split_build_indices[i] = build_indices[i];
+            }
+            node->left = buildRecursive(split_build_indices);
+        }
+        {
+            auto num_split_indices = num_primitives_in_node - mid_point_offset;
+            std::vector<int32_t> split_build_indices(num_split_indices);
+            for (auto i = 0; i < num_split_indices; i++) {
+                split_build_indices[i] = build_indices[mid_point_offset + i];
+            }
+            node->right = buildRecursive(split_build_indices);
+        }
 
         return node;
     }
@@ -494,7 +506,7 @@ public:
     }
 
     std::shared_ptr<BVHNode> getBvhNodeRoot() {
-        return root;
+        return root_;
     }
 };
 
@@ -505,8 +517,8 @@ inline HitInfo findClosestHit(
     const std::vector<glm::vec3>& vertices,
     const std::vector<int>& indices) {
     HitInfo closest_hit; // Initialized with hit = false, t = infinity
-    if (bvh.root) {
-        intersectBVHRecursive(ray, bvh.root, vertices, indices, closest_hit);
+    if (bvh.root_) {
+        intersectBVHRecursive(ray, bvh.root_, vertices, indices, closest_hit);
     }
     return closest_hit;
 }
