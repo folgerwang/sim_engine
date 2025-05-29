@@ -162,23 +162,72 @@ inline bool rayTriangleIntersect(
 
 // This structure holds precomputed info for each triangle
 struct PrimitiveInfo {
-    int original_triangle_index; // Index i, for triangle (indices[3*i], indices[3*i+1], indices[3*i+2])
+    // Index i, for triangle (indices[3*i], indices[3*i+1], indices[3*i+2])
+    int original_triangle_index;
     AABB bounds;
     glm::vec3 centroid_val;
+    std::vector<glm::vec3> vertex_list;
 
     PrimitiveInfo(
         int tri_idx,
-        const glm::vec3& v0,
-        const glm::vec3& v1,
-        const glm::vec3& v2)
-        : original_triangle_index(tri_idx) {
-        bounds.extend(v0);
-        bounds.extend(v1);
-        bounds.extend(v2);
-        centroid_val = (v0 + v1 + v2) * (1.0f / 3.0f); // Or use AABB centroid: bounds.centroid();
+        const std::vector<glm::vec3>& v_list)
+        : original_triangle_index(tri_idx),
+          vertex_list(v_list){
+        glm::vec3 sum_v(0);
+        for (const auto& v : v_list) {
+            bounds.extend(v);
+            sum_v += v;
+        }
+        centroid_val = sum_v / float_t(v_list.size());
+    }
+
+    std::vector<glm::vec3> splitWithPlane(
+        const glm::vec4& clip_plane,
+        float clip_back = 1.0f) const {
+        const uint32_t num_vertex = uint32_t(vertex_list.size());
+        std::vector<float_t> dist_to_plane(num_vertex);
+        for (uint32_t i = 0; i < num_vertex; i++) {
+            dist_to_plane[i] =
+                clip_back * dot(glm::vec4(vertex_list[i], 1.0f), clip_plane);
+        }
+
+        std::vector<glm::vec3> clipped_vertex_list;
+        clipped_vertex_list.reserve(9);
+        auto v0 = vertex_list[num_vertex - 1];
+        auto d0 = dist_to_plane[num_vertex - 1];
+        for (uint32_t i = 0; i < num_vertex; i++) {
+            auto v1 = vertex_list[i];
+            auto d1 = dist_to_plane[i];
+
+            if (d1 > 0) {
+                if (d0 > 0) {
+                    clipped_vertex_list.push_back(v1);
+                }
+                else if (d0 < 0) {
+                    float t = -d0 / (d1 - d0);
+                    clipped_vertex_list.push_back(v0 + t * (v1 - v0));
+                    clipped_vertex_list.push_back(v1);
+                }
+            }
+            else if (d1 < 0) {
+                if (d0 > 0) {
+                    float t = -d0 / (d1 - d0);
+                    clipped_vertex_list.push_back(v0 + t * (v1 - v0));
+                }
+            }
+            else {
+                clipped_vertex_list.push_back(v1);
+            }
+
+            v0 = v1;
+            d0 = d1;
+        }
+
+        return clipped_vertex_list;
     }
 
     const AABB& getAABB() const { return bounds; }
+
     const glm::vec3& centroid() const { return centroid_val; }
 };
 
@@ -305,10 +354,12 @@ public:
         primitive_info_list_.reserve(num_triangles);
 
         for (size_t i = 0; i < num_triangles; ++i) {
-            const glm::vec3& v0 = vertices[indices[3 * i + 0]];
-            const glm::vec3& v1 = vertices[indices[3 * i + 1]];
-            const glm::vec3& v2 = vertices[indices[3 * i + 2]];
-            primitive_info_list_.emplace_back(static_cast<int>(i), v0, v1, v2);
+            primitive_info_list_.emplace_back(
+                PrimitiveInfo(static_cast<int>(i),
+                    {
+                        vertices[indices[3 * i + 0]],
+                        vertices[indices[3 * i + 1]],
+                        vertices[indices[3 * i + 2]] }));
         }
 
         build_indices_.resize(primitive_info_list_.size());
@@ -316,7 +367,7 @@ public:
             build_indices_[i] = static_cast<int>(i);
         }
 
-        root_ = buildRecursive(build_indices_);
+        root_ = buildRecursive(0, build_indices_);
     }
 
     ~BVHBuilder() {
@@ -331,7 +382,7 @@ private:
         node = nullptr;
     }
 
-    std::shared_ptr<BVHNode> buildRecursive(std::vector<int> build_indices) {
+    std::shared_ptr<BVHNode> buildRecursive(int level, const std::vector<int>& build_indices) {
         std::shared_ptr<BVHNode> node = std::make_shared<BVHNode>();
         int32_t num_primitives_in_node = int32_t(build_indices.size());
 
@@ -373,6 +424,10 @@ private:
             (split_axis == 2 && extent.z < 1e-5f)) {
             use_midpoint_fallback = true;
         }
+
+        glm::vec4 clip_plane(0);
+        clip_plane[split_axis] = 1.0f;
+        float split_ratio = 0.0f;
 
         if (use_midpoint_fallback || num_primitives_in_node < SAH_BUCKET_COUNT * 2) {
             split_coord_val = centroid_bounds.centroid()[split_axis];
@@ -435,7 +490,9 @@ private:
 
                 float leaf_cost = static_cast<float>(num_primitives_in_node);
                 if (min_cost < leaf_cost && min_cost != std::numeric_limits<float>::max()) {
-                    split_coord_val = min_c_axis + extent_c_axis * (min_cost_split_bucket + 1) / SAH_BUCKET_COUNT;
+                    split_ratio = float_t(min_cost_split_bucket + 1) / float_t(SAH_BUCKET_COUNT);
+                    split_coord_val = min_c_axis + extent_c_axis * split_ratio;
+                    clip_plane[3] = -split_coord_val;
                 }
                 else {
                     for (int i = 0; i < num_primitives_in_node; ++i) {
@@ -447,36 +504,42 @@ private:
             }
         }
 
-        // Partition build_indices based on the split
-        auto* p_mid = std::partition(&build_indices[0],
-            &build_indices[num_primitives_in_node - 1] + 1,
-            [&](int p_info_idx) {
-                const PrimitiveInfo& current_prim_info = primitive_info_list_[p_info_idx];
-                float centroid_coord = current_prim_info.centroid()[split_axis];
-                return centroid_coord < split_coord_val;
-            });
+        std::shared_ptr<std::vector<int32_t>> build_indices_left, build_indices_right;
+        build_indices_left = std::make_shared<std::vector<int32_t>>();
+        build_indices_right = std::make_shared<std::vector<int32_t>>();
+        
+        build_indices_left->reserve(num_primitives_in_node);
+        build_indices_right->reserve(num_primitives_in_node);
+        for (int32_t i = 0; i < num_primitives_in_node; i++) {
+            const auto prim = primitive_info_list_[build_indices[i]];
+            const auto& aabb = prim.getAABB();
 
-        int mid_point_offset = static_cast<int>(p_mid - &build_indices[0]);
+            if (split_coord_val >= aabb.max_bounds[split_axis]) {
+                build_indices_left->push_back(build_indices[i]);
+            }
+            else if (split_coord_val <= aabb.min_bounds[split_axis]) {
+                build_indices_right->push_back(build_indices[i]);
+            }
+            else {
+                auto left_tri_list = prim.splitWithPlane(clip_plane, -1.0f);
+                if (left_tri_list.size() > 2) {
+                    build_indices_left->push_back(static_cast<int32_t>(primitive_info_list_.size()));
+                    primitive_info_list_.push_back(
+                        PrimitiveInfo(prim.original_triangle_index, left_tri_list));
+                }
+                auto right_tri_list = prim.splitWithPlane(clip_plane, 1.0f);
+                if (right_tri_list.size() > 2) {
+                    build_indices_right->push_back(static_cast<int32_t>(primitive_info_list_.size()));
+                    primitive_info_list_.push_back(
+                        PrimitiveInfo(prim.original_triangle_index, right_tri_list));
+                }
+            }
+        }
 
-        if (mid_point_offset == 0 || mid_point_offset == num_primitives_in_node) {
-            // Fallback if partitioning failed, just split in the middle of the current range
-            mid_point_offset = 0 + num_primitives_in_node / 2;
-        }
-        {
-            std::vector<int32_t> split_build_indices(mid_point_offset);
-            for (auto i = 0; i < mid_point_offset; i++) {
-                split_build_indices[i] = build_indices[i];
-            }
-            node->left = buildRecursive(split_build_indices);
-        }
-        {
-            auto num_split_indices = num_primitives_in_node - mid_point_offset;
-            std::vector<int32_t> split_build_indices(num_split_indices);
-            for (auto i = 0; i < num_split_indices; i++) {
-                split_build_indices[i] = build_indices[mid_point_offset + i];
-            }
-            node->right = buildRecursive(split_build_indices);
-        }
+        std::cout << "level: " << level << ", split ratio: " << split_ratio << ", left: " << build_indices_left->size() << ", right: " << build_indices_right->size() << std::endl;
+
+        node->left = buildRecursive(level + 1, *build_indices_left);
+        node->right = buildRecursive(level + 1, *build_indices_right);
 
         return node;
     }

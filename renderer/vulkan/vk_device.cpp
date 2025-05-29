@@ -766,7 +766,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     uint32_t num_color_buffers =
         uint32_t(frame_buffer_format.color_formats.size());
     std::vector<VkFormat> vk_color_formats(num_color_buffers);
-    for (auto i = 0; i < num_color_buffers; i++) {
+    for (uint32_t i = 0; i < num_color_buffers; i++) {
         vk_color_formats[i] =
             helper::toVkFormat(frame_buffer_format.color_formats[i]);
     }
