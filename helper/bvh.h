@@ -367,7 +367,7 @@ public:
             build_indices_[i] = static_cast<int>(i);
         }
 
-        root_ = buildRecursive(0, build_indices_);
+        root_ = buildRecursive(0, {}, build_indices_);
     }
 
     ~BVHBuilder() {
@@ -382,7 +382,10 @@ private:
         node = nullptr;
     }
 
-    std::shared_ptr<BVHNode> buildRecursive(int level, const std::vector<int>& build_indices) {
+    std::shared_ptr<BVHNode> buildRecursive(
+        int level,
+        const std::vector<uint32_t>& tested_axises,
+        const std::vector<int>& build_indices) {
         std::shared_ptr<BVHNode> node = std::make_shared<BVHNode>();
         int32_t num_primitives_in_node = int32_t(build_indices.size());
 
@@ -393,7 +396,7 @@ private:
         }
 
         // Base case: if few primitives, create a leaf node
-        if (num_primitives_in_node <= MAX_PRIMS_IN_NODE) {
+        if (num_primitives_in_node <= MAX_PRIMS_IN_NODE || tested_axises.size() == 3) {
             for (int i = 0; i < num_primitives_in_node; ++i) {
                 // Store the original triangle index directly, or the index into primitive_info_list
                 node->primitive_ref_indices.push_back(
@@ -414,20 +417,25 @@ private:
             centroid_bounds.max_bounds -
             centroid_bounds.min_bounds;
 
-        if (extent.y > extent.x && extent.y > extent.z) split_axis = 1;
-        else if (extent.z > extent.x && extent.z > extent.y) split_axis = 2;
+        glm::vec3 masked_extent = extent;
+        for (auto axis : tested_axises) {
+            masked_extent[axis] = -std::numeric_limits<float>::max();
+        }
+
+        if (masked_extent.y > masked_extent.x && masked_extent.y > masked_extent.z) split_axis = 1;
+        else if (masked_extent.z > masked_extent.x && masked_extent.z > masked_extent.y) split_axis = 2;
 
         float split_coord_val;
         bool use_midpoint_fallback = false;
-        if ((split_axis == 0 && extent.x < 1e-5f) ||
-            (split_axis == 1 && extent.y < 1e-5f) ||
-            (split_axis == 2 && extent.z < 1e-5f)) {
+        if (extent[split_axis] < 1e-5f) {
             use_midpoint_fallback = true;
         }
 
         glm::vec4 clip_plane(0);
         clip_plane[split_axis] = 1.0f;
         float split_ratio = 0.0f;
+        auto updated_tested_axises = tested_axises;
+        updated_tested_axises.push_back(split_axis);
 
         if (use_midpoint_fallback || num_primitives_in_node < SAH_BUCKET_COUNT * 2) {
             split_coord_val = centroid_bounds.centroid()[split_axis];
@@ -504,42 +512,47 @@ private:
             }
         }
 
-        std::shared_ptr<std::vector<int32_t>> build_indices_left, build_indices_right;
-        build_indices_left = std::make_shared<std::vector<int32_t>>();
-        build_indices_right = std::make_shared<std::vector<int32_t>>();
-        
-        build_indices_left->reserve(num_primitives_in_node);
-        build_indices_right->reserve(num_primitives_in_node);
+        std::vector<int32_t> build_indices_left, build_indices_right;
+        build_indices_left.reserve(num_primitives_in_node);
+        build_indices_right.reserve(num_primitives_in_node);
         for (int32_t i = 0; i < num_primitives_in_node; i++) {
             const auto prim = primitive_info_list_[build_indices[i]];
             const auto& aabb = prim.getAABB();
 
             if (split_coord_val >= aabb.max_bounds[split_axis]) {
-                build_indices_left->push_back(build_indices[i]);
+                build_indices_left.push_back(build_indices[i]);
             }
             else if (split_coord_val <= aabb.min_bounds[split_axis]) {
-                build_indices_right->push_back(build_indices[i]);
+                build_indices_right.push_back(build_indices[i]);
             }
             else {
                 auto left_tri_list = prim.splitWithPlane(clip_plane, -1.0f);
                 if (left_tri_list.size() > 2) {
-                    build_indices_left->push_back(static_cast<int32_t>(primitive_info_list_.size()));
+                    build_indices_left.push_back(static_cast<int32_t>(primitive_info_list_.size()));
                     primitive_info_list_.push_back(
                         PrimitiveInfo(prim.original_triangle_index, left_tri_list));
                 }
                 auto right_tri_list = prim.splitWithPlane(clip_plane, 1.0f);
                 if (right_tri_list.size() > 2) {
-                    build_indices_right->push_back(static_cast<int32_t>(primitive_info_list_.size()));
+                    build_indices_right.push_back(static_cast<int32_t>(primitive_info_list_.size()));
                     primitive_info_list_.push_back(
                         PrimitiveInfo(prim.original_triangle_index, right_tri_list));
                 }
             }
         }
 
-        std::cout << "level: " << level << ", split ratio: " << split_ratio << ", left: " << build_indices_left->size() << ", right: " << build_indices_right->size() << std::endl;
+        //std::cout << "level: " << level << ", used_axis: " << updated_tested_axises.size() << ", left: " << build_indices_left.size() << ", right: " << build_indices_right.size() << std::endl;
 
-        node->left = buildRecursive(level + 1, *build_indices_left);
-        node->right = buildRecursive(level + 1, *build_indices_right);
+        if (build_indices_left.size() == 0 ||
+            build_indices_left.size() == num_primitives_in_node ||
+            build_indices_right.size() == 0 ||
+            build_indices_right.size() == num_primitives_in_node) {
+            return buildRecursive(level, updated_tested_axises, build_indices);
+        }
+        else {
+            node->left = buildRecursive(level + 1, {}, build_indices_left);
+            node->right = buildRecursive(level + 1, {}, build_indices_right);
+        }
 
         return node;
     }
