@@ -1,6 +1,12 @@
 #pragma once
 #include <algorithm>
 #include <iostream>
+#include <stack>
+#include <limits>    // For std::numeric_limits
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include "renderer/renderer_structs.h"
 
 namespace engine {
@@ -43,6 +49,16 @@ struct AABB {
     glm::vec3 centroid() const {
         return (min_bounds + max_bounds) * 0.5f;
     }
+
+    glm::vec3 getExtent() const {
+        return max_bounds - min_bounds;
+    }
+
+    // For printing
+    friend std::ostream& operator<<(std::ostream& os, const AABB& box) {
+        //os << "Min" << box.min_bounds << ", Max" << box.max_bounds;
+        return os;
+    }
 };
 
 struct Ray {
@@ -50,33 +66,23 @@ struct Ray {
     glm::vec3 direction;
 };
 
-// This structure holds precomputed info for each triangle
 struct PrimitiveInfo {
-    // Index i, for triangle (indices[3*i], indices[3*i+1], indices[3*i+2])
     int original_triangle_index;
-    AABB bounds;
+    std::vector<glm::vec3> vertex_list; // Store vertices directly for splitting
+    AABB bounds_val;
     glm::vec3 centroid_val;
-    std::vector<glm::vec3> vertex_list;
 
-    PrimitiveInfo(
-        int tri_idx,
-        const std::vector<glm::vec3>& v_list);
+    PrimitiveInfo(int tri_idx, const std::vector<glm::vec3>& v_list);
+    const AABB& getAABB() const { return bounds_val; } // Kept as is, common getter style
+    const glm::vec3& centroid() const { return centroid_val; } // Kept as is
 
-    std::vector<glm::vec3> splitWithPlane(
-        const glm::vec4& clip_plane,
-        float clip_back = 1.0f) const;
-
-    const AABB& getAABB() const { return bounds; }
-
-    const glm::vec3& centroid() const { return centroid_val; }
+    std::vector<glm::vec3> splitWithPlane(const glm::vec4& clip_plane, float clip_back = 1.0f) const;
 };
 
 struct BVHNode {
     AABB bounds;
-    std::shared_ptr<BVHNode> left;
-    std::shared_ptr<BVHNode> right;
-    // Stores indices into the 'primitive_info_list' (see BVHBuilder)
-    // OR directly stores 'original_triangle_index' from PrimitiveInfo
+    std::shared_ptr<BVHNode> left = nullptr;
+    std::shared_ptr<BVHNode> right = nullptr;
     std::vector<int> primitive_ref_indices;
 
     bool isLeaf() const {
@@ -84,41 +90,81 @@ struct BVHNode {
     }
 };
 
+struct NodeTask {
+    std::shared_ptr<BVHNode> node;
+    std::shared_ptr<std::vector<int32_t>> build_indices;
+    int level;
+};
+
 class BVHBuilder {
 public:
-    std::shared_ptr<BVHNode> root_;
-    std::vector<PrimitiveInfo> primitive_info_list_; // Stores AABB & centroid for each tri
-    std::vector<int> build_indices_; // Indices into 'primitive_info_list' used during build
-
-    const int MAX_PRIMS_IN_NODE = 4;
-    const int SAH_BUCKET_COUNT = 12;
+    static const int MAX_PRIMS_IN_NODE = 8;
+    static const int SAH_BUCKET_COUNT = 16;
 
     BVHBuilder(
         const std::vector<glm::vec3>& vertices,
-        const std::vector<int>& indices);
+        const std::vector<int>& indices,
+        bool debug_mode = false);
 
-    ~BVHBuilder() {
-        deleteNodeRecursive(root_);
-    }
+    ~BVHBuilder();
+
+    void build(); // Changed from build
+    std::shared_ptr<BVHNode> getRoot() const { return root_; } // Changed from getRoot
 
 private:
-    void deleteNodeRecursive(std::shared_ptr<BVHNode>& node) {
-        if (!node) return;
-        deleteNodeRecursive(node->left);
-        deleteNodeRecursive(node->right);
-        node = nullptr;
+    std::shared_ptr<BVHNode> root_;
+    std::vector<PrimitiveInfo> primitive_info_list_;
+    std::vector<int32_t> initial_build_indices_;
+
+    bool debug_mode_;
+
+    std::vector<std::thread> thread_pool_;
+    std::stack<NodeTask> task_queue_;
+    std::mutex queue_mutex_;
+    std::mutex prim_list_mutex_;
+    std::mutex debug_mutex_; // Mutex for protecting std::cout
+    std::condition_variable tasks_cv_;
+    std::atomic<int> active_tasks_count_;
+    std::atomic<bool> shutdown_threads_;
+
+    void workerThreadLoop();
+    void processNodeTask(NodeTask current_task);
+
+    void fillNodeBounds(
+        std::shared_ptr<BVHNode>& node,
+        const std::vector<int>& task_build_indices);
+
+    AABB getCentroidBounds(
+        const std::vector<int>& task_build_indices);
+
+    void fillLeafNode(
+        std::shared_ptr<BVHNode>& leaf_node,
+        const std::vector<int>& task_build_indices);
+
+    uint32_t getSplitAxis(
+        const glm::vec3& extent,
+        const std::vector<uint32_t>& tested_axises);
+
+    float calculateSahSplitCoord(
+        int32_t split_axis,
+        const glm::vec3& extent,
+        const AABB& centroid_bounds,
+        float_t node_surface_area,
+        const std::vector<int>& task_build_indices);
+
+    // Helper for thread-safe printing
+    template<typename T>
+    void printDebug(const T& message) {
+        if (debug_mode_) {
+            std::lock_guard<std::mutex> lock(debug_mutex_);
+            std::cout << "[Thr:" << std::this_thread::get_id() << "] " << message << std::endl;
+        }
     }
-
-    std::shared_ptr<BVHNode> buildRecursive(
-        int level,
-        const std::vector<uint32_t>& tested_axises,
-        const std::vector<int>& build_indices);
-
-public:
-    void printBVH(std::shared_ptr<BVHNode>& node, int depth = 0);
-
-    std::shared_ptr<BVHNode> getBvhNodeRoot() {
-        return root_;
+    void printDebug(const std::string& message) { // Overload for string literals
+        if (debug_mode_) {
+            std::lock_guard<std::mutex> lock(debug_mutex_);
+            std::cout << "[Thr:" << std::this_thread::get_id() << "] " << message << std::endl;
+        }
     }
 };
 

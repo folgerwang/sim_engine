@@ -9,6 +9,7 @@
 
 #include "helper/engine_helper.h"
 #include "helper/bvh.h"
+#include "helper/mesh_tool.h"
 #include "game_object/drawable_object.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
@@ -673,12 +674,6 @@ static void setupMeshState(
     }
 }
 
-struct VertexStruct {
-    glm::vec3 position;
-    glm::vec3 normal;
-    glm::vec2 uv;
-};
-
 static void setupMesh(
     const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
@@ -803,13 +798,26 @@ static void setupMesh(
         }
 
         if (create_bvh_tree) {
+            bool debug_mode = false;
+#if 0
+            std::cout << "mesh idx : " << mesh_idx
+                << "/" << fbx_scene->meshes.count
+                << ", mat part : " << i_part <<
+                ", num tris : " << vertex_indices.size() / 3
+                << std::endl;
+#endif
             primitive_info.vertex_indices_ =
                 std::make_shared<std::vector<int32_t>>(vertex_indices);
-            std::shared_ptr<helper::BVHBuilder> builder =
-                std::make_shared<helper::BVHBuilder>(vertex_position, vertex_indices);
 
-            primitive_info.bvh_root_ = builder->getBvhNodeRoot();
-            int hit = 1;
+            std::shared_ptr<helper::BVHBuilder> builder =
+                std::make_shared<helper::BVHBuilder>(
+                    vertex_position,
+                    vertex_indices,
+                    debug_mode);
+
+            //builder->build();
+
+            primitive_info.bvh_root_ = builder->getRoot();
         }
 
         drawable_mesh.bbox_min_ =
@@ -819,12 +827,13 @@ static void setupMesh(
         drawable_mesh.primitives_.push_back(primitive_info);
     }
 
-    std::vector<VertexStruct> drawable_vertices;
-    drawable_vertices.resize(indice_match_table.size());
+    auto drawable_vertices =
+        std::make_shared<std::vector<helper::VertexStruct>>();
+    drawable_vertices->resize(indice_match_table.size());
     for (int i_vert = 0; i_vert < indice_match_table.size(); i_vert++) {
         const uint32_t& src_vert_idx = indice_match_table[i_vert];
 
-        auto& vertex = drawable_vertices[i_vert];
+        auto& vertex = (*drawable_vertices)[i_vert];
         auto position_idx = src_mesh->vertex_position.indices[src_vert_idx];
         const auto& position = src_mesh->vertex_position.values[position_idx];
         vertex.position = glm::vec3(position.x, position.y, position.z);
@@ -849,8 +858,8 @@ static void setupMesh(
         vertex_buffer.buffer,
         vertex_buffer.memory,
         std::source_location::current(),
-        drawable_vertices.size() * sizeof(VertexStruct),
-        drawable_vertices.data());
+        drawable_vertices->size() * sizeof(helper::VertexStruct),
+        drawable_vertices->data());
 
     assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
 
@@ -907,26 +916,54 @@ static void setupMesh(
             std::make_shared<std::vector<glm::vec3>>(vertex_position);
     }
 
+    int32_t target_face_count =
+        int32_t((new_indices.size() / 3) / 4);
+
+    helper::Mesh input_mesh_const;
+    input_mesh_const.vertices = drawable_vertices;
+    input_mesh_const.faces.resize(new_indices.size() / 3);
+    for (int32_t i = 0; i < int32_t(new_indices.size() / 3); i++) {
+        input_mesh_const.faces[i] =
+            helper::FaceInfo(
+                new_indices[i * 3 + 0],
+                new_indices[i * 3 + 1],
+                new_indices[i * 3 + 2]);
+    }
+
+    std::cout << "====================" << std::endl;
+    std::cout << "mesh idx : " << mesh_idx
+        << "/" << fbx_scene->meshes.count
+        << ", num tris : " << new_indices.size() / 3
+        << std::endl;
+    
+    helper::Mesh mesh_lod =
+        helper::simplifyMeshActualButVeryBasic(
+            input_mesh_const,
+            target_face_count,
+            helper::c_sharp_edge_angle_threshold_degrees,
+            helper::c_normal_weight,
+            helper::c_uv_weight);
+
     num_traingles = 0;
     uint32_t buffer_offset = 0;
     uint32_t indices_buffer_offset = 0;
     auto pos_view_idx = mesh_idx * 4;
     drawable_object->buffer_views_[pos_view_idx].buffer_idx = vertex_buffer_idx;
     drawable_object->buffer_views_[pos_view_idx].offset = 0;
-    drawable_object->buffer_views_[pos_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
-    drawable_object->buffer_views_[pos_view_idx].stride = sizeof(VertexStruct);
+    drawable_object->buffer_views_[pos_view_idx].range = drawable_vertices->size() * sizeof(helper::VertexStruct);
+    drawable_object->buffer_views_[pos_view_idx].stride = sizeof(helper::VertexStruct);
 
     auto normal_view_idx = mesh_idx * 4 + 1;
     drawable_object->buffer_views_[normal_view_idx].buffer_idx = vertex_buffer_idx;
     drawable_object->buffer_views_[normal_view_idx].offset = sizeof(glm::vec3);
-    drawable_object->buffer_views_[normal_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
-    drawable_object->buffer_views_[normal_view_idx].stride = sizeof(VertexStruct);
+    drawable_object->buffer_views_[normal_view_idx].range = drawable_vertices->size() * sizeof(helper::VertexStruct);
+    drawable_object->buffer_views_[normal_view_idx].stride = sizeof(helper::VertexStruct);
 
     auto uv_view_idx = mesh_idx * 4 + 2;
     drawable_object->buffer_views_[uv_view_idx].buffer_idx = vertex_buffer_idx;
     drawable_object->buffer_views_[uv_view_idx].offset = sizeof(glm::vec3) * 2;
-    drawable_object->buffer_views_[uv_view_idx].range = drawable_vertices.size() * sizeof(VertexStruct);
-    drawable_object->buffer_views_[uv_view_idx].stride = sizeof(VertexStruct);
+    drawable_object->buffer_views_[uv_view_idx].range = drawable_vertices->size() * sizeof(helper::VertexStruct);
+    drawable_object->buffer_views_[uv_view_idx].stride = sizeof(helper::VertexStruct);
 
     auto indice_view_idx = mesh_idx * 4 + 3;
     drawable_object->buffer_views_[indice_view_idx].buffer_idx = indice_buffer_idx;
@@ -960,7 +997,7 @@ static void setupMesh(
         // position
         engine::renderer::VertexInputBindingDescription binding = {};
         binding.binding = dst_binding;
-        binding.stride = sizeof(VertexStruct);
+        binding.stride = sizeof(helper::VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 
@@ -977,7 +1014,7 @@ static void setupMesh(
 
         // normal
         binding.binding = dst_binding;
-        binding.stride = sizeof(VertexStruct);
+        binding.stride = sizeof(helper::VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 
@@ -992,7 +1029,7 @@ static void setupMesh(
 
         // uv
         binding.binding = dst_binding;
-        binding.stride = sizeof(VertexStruct);
+        binding.stride = sizeof(helper::VertexStruct);
         binding.input_rate = renderer::VertexInputRate::VERTEX;
         primitive_info.binding_descs_.push_back(binding);
 

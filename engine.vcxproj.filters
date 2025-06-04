@@ -201,6 +201,9 @@
     <ClCompile Include="helper\engine_helper.cpp">
       <Filter>Source Files\engine\helper</Filter>
     </ClCompile>
+    <ClCompile Include="helper\mesh_tool.cpp">
+      <Filter>Source Files\engine\helper</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="renderer\command_buffer.h">
@@ -390,6 +393,9 @@
       <Filter>Header Files\engine\helper</Filter>
     </ClInclude>
     <ClInclude Include="helper\tiny_mtx2.h">
+      <Filter>Header Files\engine\helper</Filter>
+    </ClInclude>
+    <ClInclude Include="helper\mesh_tool.h">
       <Filter>Header Files\engine\helper</Filter>
     </ClInclude>
   </ItemGroup>
