@@ -17,87 +17,59 @@ const float c_sharp_edge_angle_threshold_degrees = 75.0f;
 const float c_normal_weight = 10.0f; // How much dissimilarity in normals contributes to cost
 const float c_uv_weight = 5.0f;    // How much distance in UVs contributes to cost
 
+// --- Vertex Structure ---
 struct VertexStruct {
     glm::vec3 position;
     glm::vec3 normal;
     glm::vec2 uv;
 };
 
-// --- Data Structures ---
-class FaceInfo {
-    uint32_t v_indices_[3]; 
-    bool active_ = false;
-
-public:
-    FaceInfo(
-        uint32_t v0 = 0,
-        uint32_t v1 = 0,
-        uint32_t v2 = 0) :
-        active_(true) {
-        v_indices_[0] = v0;
-        v_indices_[1] = v1;
-        v_indices_[2] = v2;
+// --- Face Structure ---
+struct Face {
+    unsigned int v_indices[3];
+    bool active = true;
+    Face(unsigned int v0 = 0, unsigned int v1 = 0, unsigned int v2 = 0) : active(true) {
+        v_indices[0] = v0; v_indices[1] = v1; v_indices[2] = v2;
     }
-
+    // RENAMED
     bool isDegenerate() const {
-        return v_indices_[0] == v_indices_[1] ||
-            v_indices_[1] == v_indices_[2] ||
-            v_indices_[0] == v_indices_[2];
-    }
-
-    inline void setActive(bool active) {
-        active_ = active;
-    }
-
-    inline bool isActive() const {
-        return active_;
-    }
-
-    inline uint32_t getIndice(int order) const {
-        return v_indices_[order % 3];
-    }
-
-    inline void setIndice(int order, uint32_t idx) {
-        v_indices_[order % 3] = idx;
+        return v_indices[0] == v_indices[1] || v_indices[1] == v_indices[2] || v_indices[0] == v_indices[2];
     }
 };
 
+// --- Mesh Struct ---
 struct Mesh {
-    std::shared_ptr<std::vector<VertexStruct>> vertices;
-    std::vector<FaceInfo> faces;
+    std::shared_ptr<std::vector<VertexStruct>> vertex_data_ptr;
+    std::shared_ptr<std::vector<Face>> faces_ptr;
+
+    Mesh() : vertex_data_ptr(std::make_shared<std::vector<VertexStruct>>()),
+        faces_ptr(std::make_shared<std::vector<Face>>()) {
+    }
+
+    size_t getVertexCount() const { return vertex_data_ptr ? vertex_data_ptr->size() : 0; }
+    size_t getFaceCount() const { return faces_ptr ? faces_ptr->size() : 0; }
+    bool isValid() const { return vertex_data_ptr && faces_ptr; }
 };
 
 // --- Edge Structure for Simplification ---
-class EdgeInternal {
-    uint32_t v1_idx, v2_idx;
-    float cost; // Combined cost
-    // For debugging/understanding:
+struct EdgeInternal {
+    unsigned int v1_idx, v2_idx;
+    float cost;
     float length_sq_contrib;
     float normal_penalty_contrib;
     float uv_penalty_contrib;
     bool is_sharp;
 
-public:
-    EdgeInternal(uint32_t u, uint32_t v,
-        const std::shared_ptr<std::vector<VertexStruct>>& vertices_list,
+    EdgeInternal(unsigned int u_param, unsigned int v_param,
+        const std::vector<VertexStruct>& all_vertex_data,
         float normal_weight, float uv_weight);
 
-    bool operator<(const EdgeInternal& other) const;
-    inline void setSharp(bool sharp) {
-        is_sharp = sharp;
-    }
-
-    inline uint32_t getV1Index() const {
-        return v1_idx;
-    }
-
-    inline uint32_t getV2Index() const {
-        return v2_idx;
-    }
+    bool operator<(const EdgeInternal& other_edge) const;
 };
 
+// --- Forward declarations ---
 extern Mesh simplifyMeshActualButVeryBasic(
-    const Mesh& input_mesh_const,
+    const Mesh& input_mesh,
     int target_face_count,
     float sharp_edge_angle_degrees,
     float normal_similarity_weight,

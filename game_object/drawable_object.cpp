@@ -920,11 +920,12 @@ static void setupMesh(
         int32_t((new_indices.size() / 3) / 4);
 
     helper::Mesh input_mesh_const;
-    input_mesh_const.vertices = drawable_vertices;
-    input_mesh_const.faces.resize(new_indices.size() / 3);
+    input_mesh_const.vertex_data_ptr = drawable_vertices;
+    input_mesh_const.faces_ptr = std::make_shared<std::vector<helper::Face>>();
+    input_mesh_const.faces_ptr->resize(new_indices.size() / 3);
     for (int32_t i = 0; i < int32_t(new_indices.size() / 3); i++) {
-        input_mesh_const.faces[i] =
-            helper::FaceInfo(
+        input_mesh_const.faces_ptr->at(i) =
+            helper::Face(
                 new_indices[i * 3 + 0],
                 new_indices[i * 3 + 1],
                 new_indices[i * 3 + 2]);

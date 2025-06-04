@@ -4,555 +4,368 @@
 namespace engine {
 namespace helper {
 
-EdgeInternal::EdgeInternal(
-    uint32_t u, uint32_t v,
-    const std::shared_ptr<std::vector<VertexStruct>>& vertices_list,
-    float normal_weight, float uv_weight) :
-    is_sharp(false),
-    cost(0.0f),
-    length_sq_contrib(0.0f),
-    normal_penalty_contrib(0.0f),
-    uv_penalty_contrib(0.0f) {
+EdgeInternal::EdgeInternal(uint32_t u_param, uint32_t v_param,
+    const std::vector<VertexStruct>& all_vertex_data,
+    float normal_weight, float uv_weight)
+    : is_sharp(false), cost(0.0f), length_sq_contrib(0.0f), normal_penalty_contrib(0.0f), uv_penalty_contrib(0.0f) {
+    v1_idx = std::min(u_param, v_param);
+    v2_idx = std::max(u_param, v_param);
+    if (v1_idx < all_vertex_data.size() && v2_idx < all_vertex_data.size() && v1_idx != v2_idx) {
+        const VertexStruct& vert1_data = all_vertex_data[v1_idx];
+        const VertexStruct& vert2_data = all_vertex_data[v2_idx];
+        glm::vec3 pos_diff = vert1_data.position - vert2_data.position;
+        length_sq_contrib = glm::dot(pos_diff, pos_diff);
+        cost += length_sq_contrib;
 
-    if (vertices_list == nullptr)
-        return;
-
-    uint32_t num_vertices = uint32_t(vertices_list->size());
-
-    v1_idx = std::min(u, v);
-    v2_idx = std::max(u, v);
-
-    if (v1_idx < num_vertices && v2_idx < num_vertices && v1_idx != v2_idx) {
-        glm::vec3 diff = (*vertices_list)[v1_idx].position - (*vertices_list)[v2_idx].position;
-        length_sq_contrib = dot(diff, diff);
-        cost += length_sq_contrib; // Base cost is geometric length
-
-        // Normal similarity penalty (0 for same direction, up to 2 for opposite)
-        glm::vec3 n1 = normalize((*vertices_list)[v1_idx].normal);
-        glm::vec3 n2 = normalize((*vertices_list)[v2_idx].normal);
-        if (length(n1) > 0.5f && length(n2) > 0.5f) { // Basic check if normals are somewhat valid
-            normal_penalty_contrib = (1.0f - dot(n1, n2)); // Penalize dissimilarity
+        glm::vec3 norm1 = glm::normalize(vert1_data.normal);
+        glm::vec3 norm2 = glm::normalize(vert2_data.normal);
+        if (glm::length(norm1) > 0.5f && glm::length(norm2) > 0.5f) {
+            normal_penalty_contrib = (1.0f - glm::dot(norm1, norm2));
             cost += normal_penalty_contrib * normal_weight;
         }
-        else { // If normals are zero, treat as max penalty to avoid collapsing bad data
+        else {
             normal_penalty_contrib = 2.0f;
             cost += normal_penalty_contrib * normal_weight;
         }
 
-        // UV distance penalty
-        uv_penalty_contrib =
-            distance((*vertices_list)[v1_idx].uv, (*vertices_list)[v2_idx].uv);
+        uv_penalty_contrib = glm::distance(vert1_data.uv, vert2_data.uv);
         cost += uv_penalty_contrib * uv_weight;
-
     }
     else {
         cost = length_sq_contrib = std::numeric_limits<float>::max();
     }
 }
 
-// Sort operator: non-sharp first, then by overall cost.
-bool EdgeInternal::operator<(
-    const EdgeInternal& other) const {
-    if (is_sharp != other.is_sharp)
-        return !is_sharp; // non-sharp (false) comes before sharp (true)
-    if (cost != other.cost)
-        return cost < other.cost;
-    // Tie-breaking for consistent sort order
-    if (v1_idx != other.v1_idx)
-        return v1_idx < other.v1_idx;
-    return v2_idx < other.v2_idx;
+bool EdgeInternal::operator<(const EdgeInternal& other_edge) const {
+    if (is_sharp != other_edge.is_sharp) return !is_sharp;
+    if (cost != other_edge.cost) return cost < other_edge.cost;
+    if (v1_idx != other_edge.v1_idx) return v1_idx < other_edge.v1_idx;
+    return v2_idx < other_edge.v2_idx;
 }
 
 // --- Geometric Helper Functions ---
-glm::vec3 calculateFaceNormal(
-    const glm::vec3& p0,
-    const glm::vec3& p1,
-    const glm::vec3& p2) {
-    if (p0 == p1 || p1 == p2 || p0 == p2)
-        return glm::vec3(0.0f); 
+glm::vec3 calculateFaceNormal(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2) {
+    if (p0 == p1 || p1 == p2 || p0 == p2) return glm::vec3(0.0f);
     glm::vec3 edge1 = p1 - p0;
     glm::vec3 edge2 = p2 - p0;
-    glm::vec3 normal = cross(edge1, edge2);
-    if (length(normal) < 0.000001f) {
-        return glm::vec3(0.0f);
-    }
-    return normalize(normal);
+    glm::vec3 calculated_normal = glm::cross(edge1, edge2);
+    if (glm::length(calculated_normal) < 0.000001f) return glm::vec3(0.0f);
+    return glm::normalize(calculated_normal);
+}
+float calculateDihedralAngleFromNormals(glm::vec3 n1, glm::vec3 n2) {
+    if (glm::length(n1) < 0.000001f || glm::length(n2) < 0.000001f) return 180.0f;
+    n1 = glm::normalize(n1);
+    n2 = glm::normalize(n2);
+    float dot_product_val = glm::dot(n1, n2);
+    dot_product_val = std::max(-1.0f, std::min(1.0f, dot_product_val));
+    float angle_radians = std::acos(dot_product_val);
+    return angle_radians * (180.0f / glm::pi<float>());
 }
 
-float calculateDihedralAngleFromNormals(
-    glm::vec3 n1,
-    glm::vec3 n2) {
-    if (length(n1) < 0.000001f ||
-        length(n2) < 0.000001f) {
-        return 180.0f;
-    }
-    n1 = normalize(n1); 
-    n2 = normalize(n2); 
-    float dot_product = dot(n1, n2);
-    dot_product = std::max(-1.0f, std::min(1.0f, dot_product)); 
-    float angle_rad = std::acos(dot_product);
-    return angle_rad * (180.0f / glm::pi<float>()); 
-}
-
-// --- Simplification Core (VERY BASIC - now with normal/uv consideration) ---
+// --- Simplification Core ---
 Mesh simplifyMeshActualButVeryBasic(
-    const Mesh& input_mesh_const,
+    const Mesh& input_mesh,
     int target_face_count,
     float sharp_edge_angle_degrees,
-    float normal_similarity_weight, 
-    float uv_distance_weight)
-{
-    std::cout << "\n[Actual (But VERY BASIC) Simplification" << std::endl;
-    std::cout << "  Normal Weight: " << normal_similarity_weight << ", UV Weight: " << uv_distance_weight << std::endl;
-
-    if (input_mesh_const.vertices == nullptr ||
-        input_mesh_const.vertices->empty()) {
-        return Mesh();
+    float normal_similarity_weight,
+    float uv_distance_weight) {
+    std::cout << "\n[Actual (But VERY BASIC) Simplification - Using VertexStruct, camelCase Funcs]" << std::endl;
+    if (!input_mesh.isValid()) { return Mesh(); }
+    if (input_mesh.getVertexCount() == 0) { return Mesh(); }
+    if (input_mesh.getFaceCount() == 0 || target_face_count >= static_cast<int>(input_mesh.getFaceCount())) {
+        Mesh result_mesh;
+        if (input_mesh.vertex_data_ptr) *(result_mesh.vertex_data_ptr) = *(input_mesh.vertex_data_ptr);
+        if (input_mesh.faces_ptr) *(result_mesh.faces_ptr) = *(input_mesh.faces_ptr);
+        if (result_mesh.faces_ptr) for (Face& f_ref : *(result_mesh.faces_ptr)) f_ref.active = true;
+        return result_mesh;
     }
+    if (target_face_count < 0) target_face_count = 0;
 
-    if (input_mesh_const.faces.empty() ||
-        target_face_count >= static_cast<int>(input_mesh_const.faces.size())) {
-        Mesh resultMesh = input_mesh_const;
-        for (FaceInfo& f : resultMesh.faces) {
-            f.setActive(true);
-        }
-        return resultMesh;
-    }
+    std::vector<VertexStruct> current_vertex_data = *(input_mesh.vertex_data_ptr);
+    std::vector<Face> current_faces_vector = *(input_mesh.faces_ptr);
+    for (Face& f_ref : current_faces_vector) { f_ref.active = true; }
 
-    if (target_face_count < 0)
-        target_face_count = 0;
+    int active_face_count_val = 0;
+    for (const auto& f_const_ref : current_faces_vector) { if (f_const_ref.active && !f_const_ref.isDegenerate()) active_face_count_val++; } // CALL UPDATED NAME
 
-    auto current_vertices = *input_mesh_const.vertices;
-    auto current_faces = input_mesh_const.faces;
-    for (auto& f : current_faces) {
-        f.setActive(true);
-    }
+    int outer_iterations = 0;
+    const int max_outer_iterations_const = int(current_faces_vector.size()) + 10;
+    uint32_t remained_faces_count = uint32_t(input_mesh.faces_ptr->size());
+    uint32_t max_collapses_per_pass = remained_faces_count / 10;
 
-    int active_face_count = 0;
-    for (const auto& f : current_faces) {
-        if (f.isActive() && !f.isDegenerate()) {
-            active_face_count++;
-        }
-    }
-
-    int iterations = 0;
-    const int MAX_ITERATIONS = int(current_faces.size()) * 3; // Increased safety break slightly
-
-    while (active_face_count > target_face_count &&
-        iterations < MAX_ITERATIONS) {
-        iterations++;
+    while (active_face_count_val > target_face_count && outer_iterations < max_outer_iterations_const) {
+        outer_iterations++;
         std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_to_face_map;
-        std::vector<EdgeInternal> current_edges;
+        std::vector<EdgeInternal> candidate_edges_list;
 
-        for (uint32_t face_idx = 0; face_idx < current_faces.size(); ++face_idx) {
-            if (!current_faces[face_idx].isActive() ||
-                current_faces[face_idx].isDegenerate())
-                continue;
-
-            const auto& f = current_faces[face_idx];
-            for (int i = 0; i < 3; ++i) {
-                uint32_t u = f.getIndice(i);
-                uint32_t v = f.getIndice(i + 1);
-                if (u == v) continue; 
-                std::pair<uint32_t, uint32_t> edge_key = {
-                    std::min(u, v),
-                    std::max(u, v) };
-                edge_to_face_map[edge_key].push_back(face_idx);
+        for (uint32_t face_idx = 0; face_idx < current_faces_vector.size(); ++face_idx) {
+            if (!current_faces_vector[face_idx].active || current_faces_vector[face_idx].isDegenerate()) continue; // CALL UPDATED NAME
+            const Face& current_f = current_faces_vector[face_idx];
+            for (int i_loop = 0; i_loop < 3; ++i_loop) {
+                uint32_t u_vert = current_f.v_indices[i_loop];
+                uint32_t v_vert = current_f.v_indices[(i_loop + 1) % 3];
+                if (u_vert == v_vert) continue;
+                std::pair<uint32_t, uint32_t> current_edge_key = { std::min(u_vert, v_vert), std::max(u_vert, v_vert) };
+                edge_to_face_map[current_edge_key].push_back(face_idx);
             }
         }
 
-        if (edge_to_face_map.empty()) {
-            break;
+        if (edge_to_face_map.empty()) { break; }
+
+        for (const auto& map_entry : edge_to_face_map) {
+            const auto& edge_key_val = map_entry.first;
+            const auto& incident_face_indices_list = map_entry.second;
+            if (edge_key_val.first >= current_vertex_data.size() || edge_key_val.second >= current_vertex_data.size()) continue;
+            EdgeInternal current_edge(edge_key_val.first, edge_key_val.second, current_vertex_data, normal_similarity_weight, uv_distance_weight);
+            if (incident_face_indices_list.size() == 2) {
+                const Face& f1_face_data = current_faces_vector[incident_face_indices_list[0]];
+                const Face& f2_face_data = current_faces_vector[incident_face_indices_list[1]];
+                glm::vec3 n_geom1_val = calculateFaceNormal(current_vertex_data[f1_face_data.v_indices[0]].position, current_vertex_data[f1_face_data.v_indices[1]].position, current_vertex_data[f1_face_data.v_indices[2]].position);
+                glm::vec3 n_geom2_val = calculateFaceNormal(current_vertex_data[f2_face_data.v_indices[0]].position, current_vertex_data[f2_face_data.v_indices[1]].position, current_vertex_data[f2_face_data.v_indices[2]].position);
+                if (glm::length(n_geom1_val) > 0.0001f && glm::length(n_geom2_val) > 0.0001f) {
+                    if (calculateDihedralAngleFromNormals(n_geom1_val, n_geom2_val) > (180.0f - sharp_edge_angle_degrees + 0.01f)) current_edge.is_sharp = true;
+                }
+            }
+            candidate_edges_list.push_back(current_edge);
         }
 
-        for (const auto& entry : edge_to_face_map) {
-            const auto& edge_key = entry.first;
-            const auto& incident_faces_indices = entry.second;
-            if (edge_key.first >= current_vertices.size() ||
-                edge_key.second >= current_vertices.size()) {
-                continue;
+        if (candidate_edges_list.empty()) { break; }
+        std::sort(candidate_edges_list.begin(), candidate_edges_list.end());
+
+        std::vector<EdgeInternal> independent_set_to_collapse;
+        std::vector<bool> vertex_locked_this_pass(current_vertex_data.size(), false);
+        for (const EdgeInternal& edge_candidate : candidate_edges_list) {
+            if (independent_set_to_collapse.size() >= max_collapses_per_pass) break;
+            if (edge_candidate.v1_idx >= vertex_locked_this_pass.size() || edge_candidate.v2_idx >= vertex_locked_this_pass.size()) continue;
+            if (!vertex_locked_this_pass[edge_candidate.v1_idx] && !vertex_locked_this_pass[edge_candidate.v2_idx]) {
+                independent_set_to_collapse.push_back(edge_candidate);
+                vertex_locked_this_pass[edge_candidate.v1_idx] = true;
+                vertex_locked_this_pass[edge_candidate.v2_idx] = true;
             }
+        }
+        if (independent_set_to_collapse.empty()) { break; }
 
-            EdgeInternal edge(
-                edge_key.first,
-                edge_key.second,
-                input_mesh_const.vertices,
-                normal_similarity_weight,
-                uv_distance_weight);
+        int total_faces_removed_this_pass = 0;
+        for (const EdgeInternal& edge_to_collapse_val : independent_set_to_collapse) {
+            if (active_face_count_val <= target_face_count) break;
+            uint32_t v_idx_remove = edge_to_collapse_val.v2_idx;
+            uint32_t v_idx_keep = edge_to_collapse_val.v1_idx;
+            if (v_idx_keep >= current_vertex_data.size() || v_idx_remove >= current_vertex_data.size()) continue;
 
-            if (incident_faces_indices.size() == 2) { 
-                const FaceInfo& f1_data = current_faces[incident_faces_indices[0]];
-                const FaceInfo& f2_data = current_faces[incident_faces_indices[1]];
-                glm::vec3 n_geom1 = calculateFaceNormal(
-                    current_vertices[f1_data.getIndice(0)].position,
-                    current_vertices[f1_data.getIndice(1)].position,
-                    current_vertices[f1_data.getIndice(2)].position);
-                glm::vec3 n_geom2 = calculateFaceNormal(
-                    current_vertices[f2_data.getIndice(0)].position,
-                    current_vertices[f2_data.getIndice(1)].position,
-                    current_vertices[f2_data.getIndice(2)].position);
+            VertexStruct& vert_to_keep = current_vertex_data[v_idx_keep];
+            const VertexStruct& vert_to_remove = current_vertex_data[v_idx_remove];
 
-                if (glm::length(n_geom1) > 0.0001f && glm::length(n_geom2) > 0.0001f) { 
-                    float angle_between_normals = calculateDihedralAngleFromNormals(n_geom1, n_geom2);
-                    if (angle_between_normals > (180.0f - sharp_edge_angle_degrees + 0.01f) ) {
-                         edge.setSharp(true);
+            vert_to_keep.position = (vert_to_keep.position + vert_to_remove.position) * 0.5f;
+            if (glm::length(vert_to_keep.normal) > 0.5f && glm::length(vert_to_remove.normal) > 0.5f) { vert_to_keep.normal = glm::normalize(vert_to_keep.normal + vert_to_remove.normal); }
+            else if (glm::length(vert_to_remove.normal) > 0.5f) { vert_to_keep.normal = glm::normalize(vert_to_remove.normal); }
+            vert_to_keep.uv = (vert_to_keep.uv + vert_to_remove.uv) * 0.5f;
+
+            int faces_removed_this_single_collapse = 0;
+            for (uint32_t face_idx = 0; face_idx < current_faces_vector.size(); ++face_idx) {
+                if (!current_faces_vector[face_idx].active) continue;
+                Face& f_ref = current_faces_vector[face_idx];
+                for (int i_loop = 0; i_loop < 3; ++i_loop) { if (f_ref.v_indices[i_loop] == v_idx_remove) f_ref.v_indices[i_loop] = v_idx_keep; }
+                if (f_ref.isDegenerate()) { // CALL UPDATED NAME
+                    if (current_faces_vector[face_idx].active) {
+                        faces_removed_this_single_collapse++;
                     }
+                    f_ref.active = false;
                 }
             }
-            // Add additional sharpness criteria based on attribute discontinuities if desired
-            // For example, if dot(vertex_normal1, vertex_normal2) < threshold, or distance(uv1, uv2) > threshold.
-            // This would make the edge.is_sharp = true; or heavily increase its cost.
-            // For now, is_sharp is purely geometric. The attribute differences are in the cost.
-            current_edges.push_back(edge);
+            active_face_count_val -= faces_removed_this_single_collapse;
+            total_faces_removed_this_pass += faces_removed_this_single_collapse;
         }
-        
-        if (current_edges.empty()) {
-            break;
-        }
-        std::sort(current_edges.begin(), current_edges.end()); 
-        EdgeInternal* best_edge_to_collapse = nullptr;
-        for(EdgeInternal& edge : current_edges) {
-            if (edge.getV1Index() == edge.getV2Index()) {
-                continue;
-            }
-                
-            best_edge_to_collapse = &edge;
-            break;
-        }
-
-        if (!best_edge_to_collapse) {
-            break;
-        }
-
-        uint32_t v_remove = best_edge_to_collapse->getV2Index();
-        uint32_t v_keep = best_edge_to_collapse->getV1Index();
-
-        // Update attributes for v_keep (naive averaging)
-        current_vertices[v_keep].position =
-            (current_vertices[v_keep].position + current_vertices[v_remove].position) * 0.5f;
-        if (v_keep < current_vertices.size() && v_remove < current_vertices.size()) { // Check bounds before access
-            current_vertices[v_keep].normal =
-                normalize(current_vertices[v_keep].normal + current_vertices[v_remove].normal);
-        } else if (v_keep < current_vertices.size()) {
-            // v_remove has no normal, v_keep keeps its normal (already normalized or should be)
-            current_vertices[v_keep].normal =
-                normalize(current_vertices[v_keep].normal);
-        }
-
-        if (v_keep < current_vertices.size() && v_remove < current_vertices.size()) { // Check bounds
-            current_vertices[v_keep].uv =
-                (current_vertices[v_keep].uv + current_vertices[v_remove].uv) * 0.5f;
-        }
-
-        // If one UV is missing, the other is kept. If both missing, UV at v_keep remains whatever it was.
-        int faces_removed_this_iteration = 0;
-        for (uint32_t face_idx = 0; face_idx < current_faces.size(); ++face_idx) {
-            if (!current_faces[face_idx].isActive())
-                continue;
-            auto& f = current_faces[face_idx];
-            for(int i=0; i<3; ++i) {
-                if (f.getIndice(i) == v_remove) {
-                    f.setIndice(i, v_keep);
-                }
-            }
-            if (f.isDegenerate()) {
-                if (current_faces[face_idx].isActive()) {
-                    faces_removed_this_iteration++;
-                }
-                
-                f.setActive(false);
-            }
-        }
-        active_face_count -= faces_removed_this_iteration;
-        
-        if (faces_removed_this_iteration == 0 && active_face_count > target_face_count) { /* ... stall handling ... */
-            // (Stall handling from previous code, slightly simplified for brevity)
-            std::cout << "  Stalled in iteration " << iterations << ". Attempting basic recovery." << std::endl;
-            const auto& incident_faces_it = edge_to_face_map.find({v_keep, v_remove});
-            int extra_removed = 0;
-            if (incident_faces_it != edge_to_face_map.end()) {
-                for (uint32_t fi : incident_faces_it->second) {
-                    if(current_faces[fi].isActive()) {
-                        current_faces[fi].setActive(false);
-                        extra_removed++;
-                    }
-                }
-            }
-            if(extra_removed > 0) {
-                active_face_count -= extra_removed;
-            } 
-            else {
-                std::cout << "    Stall unrecoverable. Stopping." << std::endl; break;
-            }
-        }
-        if (active_face_count <= 0 && target_face_count > 0) {
-            break;
-        }
+        if (total_faces_removed_this_pass == 0 && active_face_count_val > target_face_count) { break; }
+        if (active_face_count_val <= 0 && target_face_count > 0) { break; }
+        remained_faces_count -= total_faces_removed_this_pass;
+        max_collapses_per_pass = std::max(remained_faces_count / 10, 10U);
     }
-     // ... (rest of loop and max iteration check from previous version) ...
-    if (iterations >= MAX_ITERATIONS) {
-        std::cout << "  Reached max iterations (" << MAX_ITERATIONS << "). Stopping." << std::endl;
-    }
-    std::cout << "  Finished iterative collapse. Active faces: " << active_face_count << std::endl;
+    if (outer_iterations >= max_outer_iterations_const) { std::cout << "  Reached max outer iterations. Stopping." << std::endl; }
+    std::cout << "  Finished iterative collapse. Target: " << target_face_count << ", Actual active faces: " << active_face_count_val << std::endl;
 
-
-    Mesh simplified_mesh;
-    std::map<uint32_t, uint32_t> old_to_new_vertex_indices;
-    uint32_t new_idx_counter = 0;
-
-    simplified_mesh.vertices =
-        std::make_shared<std::vector<VertexStruct>>();
-    simplified_mesh.vertices->reserve(current_vertices.size());
-
-    std::vector<bool> final_vertex_is_referenced(current_vertices.size(), false);
-    for (const auto& face : current_faces) {
-        if (face.isActive() && !face.isDegenerate()) {
-            for (int i=0; i<3; ++i) {
-                if (face.getIndice(i) < current_vertices.size()) {
-                    final_vertex_is_referenced[face.getIndice(i)] = true;
+    Mesh simplified_mesh_result;
+    std::map<uint32_t, uint32_t> old_to_new_vertex_indices_map;
+    uint32_t new_vertex_idx_counter = 0;
+    std::vector<bool> final_vertex_is_referenced(current_vertex_data.size(), false);
+    for (const auto& face_const_ref : current_faces_vector) {
+        if (face_const_ref.active && !face_const_ref.isDegenerate()) { // CALL UPDATED NAME
+            for (int i_loop = 0; i_loop < 3; ++i_loop) {
+                if (face_const_ref.v_indices[i_loop] < current_vertex_data.size()) {
+                    final_vertex_is_referenced[face_const_ref.v_indices[i_loop]] = true;
                 }
             }
         }
     }
-    
-    for (uint32_t old_idx = 0; old_idx < current_vertices.size(); ++old_idx) {
-        if (final_vertex_is_referenced[old_idx]) {
-            simplified_mesh.vertices->push_back(current_vertices[old_idx]);
-            old_to_new_vertex_indices[old_idx] = new_idx_counter++;
+
+    for (uint32_t old_vertex_idx = 0; old_vertex_idx < current_vertex_data.size(); ++old_vertex_idx) {
+        if (final_vertex_is_referenced[old_vertex_idx]) {
+            simplified_mesh_result.vertex_data_ptr->push_back(current_vertex_data[old_vertex_idx]);
+            old_to_new_vertex_indices_map[old_vertex_idx] = new_vertex_idx_counter++;
         }
     }
-
-    for (const auto& face : current_faces) {
-        if (face.isActive() && !face.isDegenerate()) {
-            FaceInfo new_face_data; 
-            bool all_indices_mapped_and_valid = true;
-            uint32_t temp_indices[3];
-            for(int i=0; i<3; ++i) {
-                auto it = old_to_new_vertex_indices.find(face.getIndice(i));
-                if (it != old_to_new_vertex_indices.end()) {
-                    temp_indices[i] = it->second;
-                } 
+    for (const auto& face_const_ref : current_faces_vector) {
+        if (face_const_ref.active && !face_const_ref.isDegenerate()) { // CALL UPDATED NAME
+            Face new_built_face;
+            bool all_indices_ok = true;
+            uint32_t temp_face_indices[3];
+            for (int i_loop = 0; i_loop < 3; ++i_loop) {
+                auto map_iterator = old_to_new_vertex_indices_map.find(face_const_ref.v_indices[i_loop]);
+                if (map_iterator != old_to_new_vertex_indices_map.end()) {
+                    temp_face_indices[i_loop] = map_iterator->second;
+                }
                 else {
-                    all_indices_mapped_and_valid = false;
+                    all_indices_ok = false;
                     break;
                 }
             }
-            if (all_indices_mapped_and_valid) {
-                new_face_data.setIndice(0, temp_indices[0]);
-                new_face_data.setIndice(1, temp_indices[1]);
-                new_face_data.setIndice(2, temp_indices[2]);
-                if (!new_face_data.isDegenerate()) {
-                    simplified_mesh.faces.push_back(new_face_data);
+            if (all_indices_ok) {
+                new_built_face.v_indices[0] = temp_face_indices[0];
+                new_built_face.v_indices[1] = temp_face_indices[1];
+                new_built_face.v_indices[2] = temp_face_indices[2];
+                if (!new_built_face.isDegenerate()) { // CALL UPDATED NAME (final check after re-indexing)
+                    simplified_mesh_result.faces_ptr->push_back(new_built_face);
                 }
             }
         }
     }
-    std::cout << "  Final simplified mesh: " << simplified_mesh.vertices->size() << " vertices, "
-              << simplified_mesh.faces.size() << " faces." << std::endl;
-    return simplified_mesh;
+    std::cout << "  Final simplified mesh: " << simplified_mesh_result.getVertexCount() << " Vertices, "
+        << simplified_mesh_result.getFaceCount() << " Faces." << std::endl;
+    return simplified_mesh_result;
 }
 
-
 // --- printMesh Function ---
-void printMesh(
-    const Mesh& mesh,
-    const std::string& name) { 
-    std::cout << "--- " << name << " ---" << std::endl;
-    if (mesh.vertices == nullptr || mesh.vertices->empty()) {
-        std::cout << "  (No vertices)" << std::endl;
+void printMesh(const Mesh& mesh_to_print, const std::string& mesh_name) {
+    if (!mesh_to_print.isValid()) {
+        std::cout << "--- " << mesh_name << " (Mesh data pointers are null) ---" << std::endl;
+        return;
     }
-    auto& current_vertices = *mesh.vertices;
-    std::cout << "Vertices (" << current_vertices.size() << std::endl;
-    for (size_t i = 0; i < current_vertices.size(); ++i) {
-        std::cout << "  V " << i << ": P(" << current_vertices[i].position.x << "," << current_vertices[i].position.y << "," << current_vertices[i].position.z << ")";
-        std::cout << " N(" << current_vertices[i].normal.x << "," << current_vertices[i].normal.y << "," << current_vertices[i].normal.z << ")";
-        std::cout << " UV(" << current_vertices[i].uv.x << "," << current_vertices[i].uv.y << ")";
-        std::cout << std::endl;
+    std::cout << "--- " << mesh_name << " ---" << std::endl;
+    std::cout << "Vertex Data entries (" << mesh_to_print.getVertexCount() << ")" << std::endl;
+    if (mesh_to_print.getVertexCount() == 0) { std::cout << "  (No vertex data)" << std::endl; }
+    for (size_t i_idx = 0; i_idx < mesh_to_print.getVertexCount(); ++i_idx) {
+        const auto& current_vert = (*mesh_to_print.vertex_data_ptr)[i_idx];
+        std::cout << "  V " << i_idx << ": P(" << current_vert.position.x << "," << current_vert.position.y << "," << current_vert.position.z << ")"
+            << " N(" << current_vert.normal.x << "," << current_vert.normal.y << "," << current_vert.normal.z << ")"
+            << " UV(" << current_vert.uv.x << "," << current_vert.uv.y << ")" << std::endl;
     }
-    std::cout << "Faces (" << mesh.faces.size() << "):" << std::endl;
-    if (mesh.faces.empty()) { std::cout << "  (No faces)" << std::endl; }
-    for (size_t i = 0; i < mesh.faces.size(); ++i) {
-        const auto& f = mesh.faces[i]; 
-        std::cout << "  F " << i << ": (" << f.getIndice(0) << ", " << f.getIndice(1) << ", " << f.getIndice(2) << ")" << std::endl;
+    std::cout << "Faces (" << mesh_to_print.getFaceCount() << "):" << std::endl;
+    if (mesh_to_print.getFaceCount() == 0) { std::cout << "  (No faces)" << std::endl; }
+    for (size_t i_idx = 0; i_idx < mesh_to_print.getFaceCount(); ++i_idx) {
+        const Face& current_f = (*mesh_to_print.faces_ptr)[i_idx];
+        std::cout << "  F " << i_idx << ": (" << current_f.v_indices[0] << ", " << current_f.v_indices[1] << ", " << current_f.v_indices[2] << ")" << std::endl;
     }
     std::cout << "--------------------" << std::endl << std::endl;
 }
 
-
 // --- Multi-threaded Mesh Combining Function ---
-struct MeshCombineTaskArgs {
-    const Mesh* input_mesh_ptr;
-    Mesh* output_mesh_ptr;
-    uint32_t vertex_write_start_idx;
-    uint32_t face_write_start_idx;
-    uint32_t base_vertex_idx_offset;
-};
+struct MeshCombineTaskArgs { const Mesh* input_mesh_ptr; Mesh* output_mesh_ptr; uint32_t vertex_data_write_start_idx; uint32_t face_write_start_idx; uint32_t base_vertex_idx_offset; };
 
-void processSingleMeshForCombine(const MeshCombineTaskArgs& args) { 
-    if (args.input_mesh_ptr->vertices == nullptr ||
-        args.output_mesh_ptr->vertices == nullptr) {
-        return;
+void processSingleMeshForCombine(const MeshCombineTaskArgs& task_args) {
+    if (!task_args.input_mesh_ptr->isValid() || !task_args.output_mesh_ptr->isValid()) return;
+    const auto& input_vertex_data_vec = *(task_args.input_mesh_ptr->vertex_data_ptr);
+    auto& output_vertex_data_vec = *(task_args.output_mesh_ptr->vertex_data_ptr);
+    for (size_t i_loop = 0; i_loop < input_vertex_data_vec.size(); ++i_loop) {
+        if (task_args.vertex_data_write_start_idx + i_loop < output_vertex_data_vec.size()) { output_vertex_data_vec[task_args.vertex_data_write_start_idx + i_loop] = input_vertex_data_vec[i_loop]; }
     }
-    for (size_t i = 0; i < (*args.input_mesh_ptr->vertices).size(); ++i) {
-        (*args.output_mesh_ptr->vertices)[args.vertex_write_start_idx + i] = (*args.input_mesh_ptr->vertices)[i];
-    }
-    for (size_t i = 0; i < args.input_mesh_ptr->faces.size(); ++i) {
-        const auto& original_face = args.input_mesh_ptr->faces[i];
-        FaceInfo new_face_data(
-            original_face.getIndice(0) + args.base_vertex_idx_offset,
-            original_face.getIndice(1) + args.base_vertex_idx_offset,
-            original_face.getIndice(2) + args.base_vertex_idx_offset);
-        new_face_data.setActive(original_face.isActive());
-        args.output_mesh_ptr->faces[args.face_write_start_idx + i] = new_face_data;
+    const auto& input_faces_vec = *(task_args.input_mesh_ptr->faces_ptr);
+    auto& output_faces_vec = *(task_args.output_mesh_ptr->faces_ptr);
+    for (size_t i_loop = 0; i_loop < input_faces_vec.size(); ++i_loop) {
+        const auto& original_face = input_faces_vec[i_loop];
+        Face new_built_face(original_face.v_indices[0] + task_args.base_vertex_idx_offset, original_face.v_indices[1] + task_args.base_vertex_idx_offset, original_face.v_indices[2] + task_args.base_vertex_idx_offset);
+        new_built_face.active = original_face.active;
+        if (task_args.face_write_start_idx + i_loop < output_faces_vec.size()) { output_faces_vec[task_args.face_write_start_idx + i_loop] = new_built_face; }
     }
 }
 
-Mesh combineMeshesMultithreaded(
-    const std::vector<Mesh>& meshes_to_combine,
-    uint32_t num_threads_hint = 0) { 
-    if (meshes_to_combine.empty()) { return Mesh(); }
-    // ... (thread count logic from before) ...
-    uint32_t actual_num_threads = num_threads_hint;
-    if (actual_num_threads == 0) {
-        actual_num_threads = std::thread::hardware_concurrency();
-        if (actual_num_threads == 0)
-            actual_num_threads = 2;
+Mesh combineMeshesMultithreaded(const std::vector<Mesh>& meshes_to_combine_list, uint32_t num_threads_hint_val = 0) {
+    if (meshes_to_combine_list.empty()) { return Mesh(); }
+    uint32_t actual_num_threads_to_use = num_threads_hint_val;
+    if (actual_num_threads_to_use == 0) { actual_num_threads_to_use = std::thread::hardware_concurrency(); if (actual_num_threads_to_use == 0) actual_num_threads_to_use = 2; }
+    actual_num_threads_to_use = std::max(1u, std::min(actual_num_threads_to_use, static_cast<uint32_t>(meshes_to_combine_list.size())));
+    Mesh combined_mesh_result;
+    uint32_t total_vertex_data_items = 0; uint32_t total_face_items = 0;
+    std::vector<uint32_t> vertex_data_write_starts(meshes_to_combine_list.size());
+    std::vector<uint32_t> face_write_starts(meshes_to_combine_list.size());
+    std::vector<uint32_t> base_vertex_idx_offsets_list(meshes_to_combine_list.size());
+    uint32_t current_vertex_data_item_count = 0; uint32_t current_face_item_count = 0;
+    for (size_t i_idx = 0; i_idx < meshes_to_combine_list.size(); ++i_idx) {
+        if (!meshes_to_combine_list[i_idx].isValid()) continue;
+        vertex_data_write_starts[i_idx] = current_vertex_data_item_count; face_write_starts[i_idx] = current_face_item_count; base_vertex_idx_offsets_list[i_idx] = current_vertex_data_item_count;
+        total_vertex_data_items += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getVertexCount()); total_face_items += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getFaceCount());
+        current_vertex_data_item_count += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getVertexCount()); current_face_item_count += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getFaceCount());
     }
-    actual_num_threads =
-        std::max(
-            1u,
-            std::min(
-                actual_num_threads,
-                static_cast<uint32_t>(meshes_to_combine.size())));
-
-    Mesh combined_mesh; 
-    uint32_t total_vertices = 0; uint32_t total_faces = 0;
-
-    std::vector<uint32_t> vertex_write_start_indices(meshes_to_combine.size());
-    std::vector<uint32_t> face_write_start_indices(meshes_to_combine.size());
-    std::vector<uint32_t> base_vertex_index_offsets(meshes_to_combine.size());
-    uint32_t current_vertex_count = 0;
-    uint32_t current_face_count = 0;
-
-    for (size_t i = 0; i < meshes_to_combine.size(); ++i) {
-        vertex_write_start_indices[i] = current_vertex_count;
-        face_write_start_indices[i] = current_face_count;
-        base_vertex_index_offsets[i] = current_vertex_count;
-
-        if (meshes_to_combine[i].vertices == nullptr) {
-            continue;
+    combined_mesh_result.vertex_data_ptr->resize(total_vertex_data_items); combined_mesh_result.faces_ptr->resize(total_face_items);
+    if (meshes_to_combine_list.empty() || (total_vertex_data_items == 0 && total_face_items == 0)) return combined_mesh_result;
+    if (actual_num_threads_to_use == 1 || meshes_to_combine_list.size() <= 1) {
+        for (size_t i_idx = 0; i_idx < meshes_to_combine_list.size(); ++i_idx) {
+            if (!meshes_to_combine_list[i_idx].isValid()) continue;
+            MeshCombineTaskArgs current_task_args = { &meshes_to_combine_list[i_idx],&combined_mesh_result,vertex_data_write_starts[i_idx],face_write_starts[i_idx],base_vertex_idx_offsets_list[i_idx] };
+            processSingleMeshForCombine(current_task_args);
         }
-        
-        total_vertices += static_cast<uint32_t>(meshes_to_combine[i].vertices->size());
-        total_faces += static_cast<uint32_t>(meshes_to_combine[i].faces.size());
-
-        current_vertex_count += static_cast<uint32_t>(meshes_to_combine[i].vertices->size());
-        current_face_count += static_cast<uint32_t>(meshes_to_combine[i].faces.size());
     }
-    
-    if (combined_mesh.vertices == nullptr) {
-        combined_mesh.vertices->resize(total_vertices);
-    }
-    combined_mesh.faces.resize(total_faces);
-
-    if (meshes_to_combine.empty() || (total_vertices == 0 && total_faces == 0))
-        return combined_mesh;
-
-    if (actual_num_threads == 1 || meshes_to_combine.size() <= 1) {
-        for (size_t i = 0; i < meshes_to_combine.size(); ++i) {
-            MeshCombineTaskArgs args = {
-                &meshes_to_combine[i],
-                &combined_mesh,
-                vertex_write_start_indices[i],
-                face_write_start_indices[i],
-                base_vertex_index_offsets[i]};
-            processSingleMeshForCombine(args);
-        }
-    } else {
-        std::vector<std::thread> threads; threads.reserve(actual_num_threads);
-        for (uint32_t i = 0; i < actual_num_threads; ++i) {
-            threads.emplace_back([&, i, actual_num_threads]() {
-                for (size_t k = i; k < meshes_to_combine.size(); k += actual_num_threads) {
-                     MeshCombineTaskArgs args = {
-                         &meshes_to_combine[k],
-                         &combined_mesh,
-                         vertex_write_start_indices[k],
-                         face_write_start_indices[k],
-                         base_vertex_index_offsets[k]};
-                    processSingleMeshForCombine(args);
+    else {
+        std::vector<std::thread> worker_threads; worker_threads.reserve(actual_num_threads_to_use);
+        for (uint32_t i_thread_idx = 0; i_thread_idx < actual_num_threads_to_use; ++i_thread_idx) {
+            worker_threads.emplace_back([&, i_thread_idx, actual_num_threads_to_use]() {
+                for (size_t k_mesh_idx = i_thread_idx; k_mesh_idx < meshes_to_combine_list.size(); k_mesh_idx += actual_num_threads_to_use) {
+                    if (!meshes_to_combine_list[k_mesh_idx].isValid()) continue;
+                    MeshCombineTaskArgs current_task_args = { &meshes_to_combine_list[k_mesh_idx],&combined_mesh_result,vertex_data_write_starts[k_mesh_idx],face_write_starts[k_mesh_idx],base_vertex_idx_offsets_list[k_mesh_idx] };
+                    processSingleMeshForCombine(current_task_args);
                 }
-            });
+                });
         }
-        for (auto& t : threads) { if (t.joinable()) { t.join(); } }
+        for (auto& current_thread_ref : worker_threads) if (current_thread_ref.joinable()) current_thread_ref.join();
     }
-    return combined_mesh;
+    return combined_mesh_result;
 }
 
 #if 0
-// --- Main Function (Now defines and uses meshes with normals and uvs) ---
+// --- Main Function ---
 int main() {
-    Mesh cubeMesh; 
-    // Define a cube with distinct normals per face (requires vertex duplication for attributes)
-    // For this simple Mesh struct (attributes per vertex), we'll define smooth normals for shared vertices.
-    // For distinct face normals, you'd typically have more vertices than geometric positions.
-    // Let's define a cube with some example normals and UVs (assuming shared vertices where appropriate)
-    cubeMesh.vertices = { // 8 vertices
-        {0,0,0}, {1,0,0}, {1,1,0}, {0,1,0}, 
-        {0,0,1}, {1,0,1}, {1,1,1}, {0,1,1}  
-    };
-    // Example: Simple normals (can be refined for cube-like appearance if vertices were duplicated for hard edges)
-    // For this example, let's just assign normalized position as normal (sphere-like normals for the cube corners)
-    // or a generic up normal for all. Let's use distinct-ish normals for testing.
-    cubeMesh.normals.resize(8);
-    cubeMesh.normals[0] = glm::normalize(glm::vec3(-1,-1,-1)); cubeMesh.normals[1] = glm::normalize(glm::vec3( 1,-1,-1));
-    cubeMesh.normals[2] = glm::normalize(glm::vec3( 1, 1,-1)); cubeMesh.normals[3] = glm::normalize(glm::vec3(-1, 1,-1));
-    cubeMesh.normals[4] = glm::normalize(glm::vec3(-1,-1, 1)); cubeMesh.normals[5] = glm::normalize(glm::vec3( 1,-1, 1));
-    cubeMesh.normals[6] = glm::normalize(glm::vec3( 1, 1, 1)); cubeMesh.normals[7] = glm::normalize(glm::vec3(-1, 1, 1));
+    Mesh cube_mesh_data;
+    cube_mesh_data.vertex_data_ptr->assign({
+        {{0,0,0}, glm::normalize(glm::vec3(-1,-1,-1)), {0,0}}, {{1,0,0}, glm::normalize(glm::vec3(1,-1,-1)), {1,0}},
+        {{1,1,0}, glm::normalize(glm::vec3(1, 1,-1)), {1,1}}, {{0,1,0}, glm::normalize(glm::vec3(-1, 1,-1)), {0,1}},
+        {{0,0,1}, glm::normalize(glm::vec3(-1,-1, 1)), {0,1}}, {{1,0,1}, glm::normalize(glm::vec3(1,-1, 1)), {1,1}},
+        {{1,1,1}, glm::normalize(glm::vec3(1, 1, 1)), {1,0}}, {{0,1,1}, glm::normalize(glm::vec3(-1, 1, 1)), {0,0}} });
+    cube_mesh_data.faces_ptr->assign({
+        Face(0,1,2),Face(0,2,3),Face(4,5,6),Face(4,6,7), Face(0,1,5),Face(0,5,4),
+        Face(1,2,6),Face(1,6,5),Face(2,3,7),Face(2,7,6),Face(3,0,4),Face(3,4,7) });
+    printMesh(cube_mesh_data, "Test Mesh (Cube with VertexStruct, camelCase Funcs)");
 
-    // Example UVs (very basic box mapping, might need duplication for proper unwrap)
-    cubeMesh.uvs.resize(8);
-    cubeMesh.uvs[0] = {0,0}; cubeMesh.uvs[1] = {1,0}; cubeMesh.uvs[2] = {1,1}; cubeMesh.uvs[3] = {0,1};
-    cubeMesh.uvs[4] = {0,0}; cubeMesh.uvs[5] = {1,0}; cubeMesh.uvs[6] = {1,1}; cubeMesh.uvs[7] = {0,1}; // Top face UVs same as bottom for this simple example
+    std::vector<Mesh> all_meshes_list; all_meshes_list.push_back(cube_mesh_data);
 
-    cubeMesh.faces = { // 12 faces
-        Face(0,1,2), Face(0,2,3), Face(4,5,6), Face(4,6,7), 
-        Face(0,1,5), Face(0,5,4), Face(1,2,6), Face(1,6,5), 
-        Face(2,3,7), Face(2,7,6), Face(3,0,4), Face(3,4,7)  
-    };
-    printMesh(cubeMesh, "Test Mesh (Cube with attributes)");
-    
-    std::vector<Mesh> allMeshes;
-    allMeshes.push_back(cubeMesh); 
+    auto start_time_combine_val = std::chrono::high_resolution_clock::now();
+    Mesh merged_mesh_data = combineMeshesMultithreaded(all_meshes_list, 0);
+    auto end_time_combine_val = std::chrono::high_resolution_clock::now();
+    std::cout << "\nMesh combining took: " << std::chrono::duration_cast<std::chrono::microseconds>(end_time_combine_val - start_time_combine_val).count() << " microseconds." << std::endl;
+    printMesh(merged_mesh_data, "Mesh to be Simplified");
 
-    // ... (Combine meshes - though only one here for simplicity)
-    Mesh mergedMesh = combineMeshesMultithreaded(allMeshes, 0); 
-    printMesh(mergedMesh, "Mesh to be Simplified (with attributes)");
+    std::cout << "\n--- Actual (BUT VERY BASIC) HLOD Simplification ---" << std::endl;
+    float sharp_edge_angle_thresh_degrees = 75.0f;
+    float normal_attr_weight = 20.0f;
+    float uv_attr_weight = 10.0f;
+    size_t collapses_per_pass_count = std::max(1UL, merged_mesh_data.getFaceCount() / 100);
+    collapses_per_pass_count = std::min(collapses_per_pass_count, static_cast<size_t>(20));
 
-    std::cout << "\n--- Actual (BUT VERY BASIC) HLOD Simplification (with attribute consideration) ---" << std::endl;
-    float sharpEdgeAngleThresholdDegrees = 75.0f; 
-    float normalWeight = 10.0f; // How much dissimilarity in normals contributes to cost
-    float uvWeight = 5.0f;    // How much distance in UVs contributes to cost
+    int original_face_count_val = merged_mesh_data.getFaceCount();
+    int target_simplification_face_count = std::max(2, original_face_count_val / 4);
+    if (original_face_count_val <= 4 && original_face_count_val > 0) target_simplification_face_count = std::max(1, original_face_count_val - 1);
+    if (target_simplification_face_count == original_face_count_val && original_face_count_val > 0) target_simplification_face_count--;
 
-    int originalFaceCount = mergedMesh.faces.size();
-    int targetSimplificationFaceCount = std::max(2, originalFaceCount / 3); 
-    if (originalFaceCount <=2) targetSimplificationFaceCount = originalFaceCount;
+    auto start_time_simplify_val = std::chrono::high_resolution_clock::now();
+    Mesh hlod_proxy_mesh = simplifyMeshActualButVeryBasic(
+        merged_mesh_data,
+        target_simplification_face_count,
+        sharp_edge_angle_thresh_degrees,
+        normal_attr_weight,
+        uv_attr_weight,
+        collapses_per_pass_count);
+    auto end_time_simplify_val = std::chrono::high_resolution_clock::now();
+    std::cout << "\nActual (VERY BASIC) mesh simplification took: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time_simplify_val - start_time_simplify_val).count() << " milliseconds." << std::endl;
+    printMesh(hlod_proxy_mesh, "Simplified HLOD Proxy");
 
-    auto start_time_simplify = std::chrono::high_resolution_clock::now();
-    Mesh hlodProxy = simplifyMeshActualButVeryBasic(
-        mergedMesh,
-        targetSimplificationFaceCount,
-        sharpEdgeAngleThresholdDegrees,
-        normalWeight,
-        uvWeight
-    );
-    auto end_time_simplify = std::chrono::high_resolution_clock::now();
-    std::cout << "\nActual (VERY BASIC) mesh simplification took: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time_simplify - start_time_simplify).count() << " milliseconds." << std::endl;
-    printMesh(hlodProxy, "Simplified HLOD Proxy (Attributes Considered)");
-
-    std::cout << "\nREMINDER: The simplification shown is a TOY IMPLEMENTATION." << std::endl;
-    std::cout << "Attribute handling (normals, UVs) is very naive and will likely cause issues" << std::endl;
-    std::cout << "like smoothed hard edges or distorted textures. UV seam preservation is NOT handled." << std::endl;
-
+    std::cout << "\nREMINDER: This is a TOY IMPLEMENTATION. Quality and robustness are limited." << std::endl;
     return 0;
 }
 #endif
