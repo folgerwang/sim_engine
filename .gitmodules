@@ -16,3 +16,6 @@
 [submodule "third_parties/libigl"]
 	path = third_parties/libigl
 	url = git@github.com:libigl/libigl.git
+[submodule "third_parties/OpenMesh"]
+	path = third_parties/OpenMesh
+	url = https://gitlab.vci.rwth-aachen.de:9000/OpenMesh/OpenMesh.git
