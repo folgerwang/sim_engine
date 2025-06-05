@@ -16,6 +16,8 @@ namespace helper {
 const float c_sharp_edge_angle_threshold_degrees = 75.0f; 
 const float c_normal_weight = 10.0f; // How much dissimilarity in normals contributes to cost
 const float c_uv_weight = 5.0f;    // How much distance in UVs contributes to cost
+const uint32_t c_num_lods = 5;
+const float c_target_lod_ratio = 0.3f;
 
 // --- Vertex Structure ---
 struct VertexStruct {
@@ -26,7 +28,7 @@ struct VertexStruct {
 
 // --- Face Structure ---
 struct Face {
-    unsigned int v_indices[3];
+    uint32_t v_indices[3];
     bool active = true;
     Face(unsigned int v0 = 0, unsigned int v1 = 0, unsigned int v2 = 0) : active(true) {
         v_indices[0] = v0; v_indices[1] = v1; v_indices[2] = v2;
@@ -53,16 +55,19 @@ struct Mesh {
 
 // --- Edge Structure for Simplification ---
 struct EdgeInternal {
-    unsigned int v1_idx, v2_idx;
+    uint32_t v1_idx, v2_idx;
     float cost;
     float length_sq_contrib;
     float normal_penalty_contrib;
     float uv_penalty_contrib;
     bool is_sharp;
 
-    EdgeInternal(unsigned int u_param, unsigned int v_param,
+    EdgeInternal(
+        uint32_t u_param,
+        uint32_t v_param,
         const std::vector<VertexStruct>& all_vertex_data,
-        float normal_weight, float uv_weight);
+        float normal_weight,
+        float uv_weight);
 
     bool operator<(const EdgeInternal& other_edge) const;
 };

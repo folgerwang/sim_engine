@@ -52,7 +52,7 @@ public:
     std::shared_ptr<std::vector<int32_t>> vertex_indices_;
     std::shared_ptr<helper::BVHNode> bvh_root_;
 
-    renderer::IndexInputBindingDescription  index_desc_ = { 0 };
+    std::vector<renderer::IndexInputBindingDescription>  index_desc_;
     std::vector<renderer::VertexInputBindingDescription> binding_descs_;
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs_;
 

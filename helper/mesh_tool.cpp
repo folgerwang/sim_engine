@@ -4,13 +4,22 @@
 namespace engine {
 namespace helper {
 
-EdgeInternal::EdgeInternal(uint32_t u_param, uint32_t v_param,
+EdgeInternal::EdgeInternal(
+    uint32_t u_param,
+    uint32_t v_param,
     const std::vector<VertexStruct>& all_vertex_data,
-    float normal_weight, float uv_weight)
-    : is_sharp(false), cost(0.0f), length_sq_contrib(0.0f), normal_penalty_contrib(0.0f), uv_penalty_contrib(0.0f) {
+    float normal_weight,
+    float uv_weight) :
+    is_sharp(false),
+    cost(0.0f),
+    length_sq_contrib(0.0f),
+    normal_penalty_contrib(0.0f),
+    uv_penalty_contrib(0.0f) {
     v1_idx = std::min(u_param, v_param);
     v2_idx = std::max(u_param, v_param);
-    if (v1_idx < all_vertex_data.size() && v2_idx < all_vertex_data.size() && v1_idx != v2_idx) {
+    if (v1_idx < all_vertex_data.size() &&
+        v2_idx < all_vertex_data.size() &&
+        v1_idx != v2_idx) {
         const VertexStruct& vert1_data = all_vertex_data[v1_idx];
         const VertexStruct& vert2_data = all_vertex_data[v2_idx];
         glm::vec3 pos_diff = vert1_data.position - vert2_data.position;
@@ -36,24 +45,43 @@ EdgeInternal::EdgeInternal(uint32_t u_param, uint32_t v_param,
     }
 }
 
-bool EdgeInternal::operator<(const EdgeInternal& other_edge) const {
-    if (is_sharp != other_edge.is_sharp) return !is_sharp;
-    if (cost != other_edge.cost) return cost < other_edge.cost;
-    if (v1_idx != other_edge.v1_idx) return v1_idx < other_edge.v1_idx;
+bool EdgeInternal::operator<(
+    const EdgeInternal& other_edge) const {
+    if (is_sharp != other_edge.is_sharp) {
+        return !is_sharp;
+    }
+    if (cost != other_edge.cost) {
+        return cost < other_edge.cost;
+    }
+    if (v1_idx != other_edge.v1_idx) {
+        return v1_idx < other_edge.v1_idx;
+    }
     return v2_idx < other_edge.v2_idx;
 }
 
 // --- Geometric Helper Functions ---
-glm::vec3 calculateFaceNormal(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2) {
-    if (p0 == p1 || p1 == p2 || p0 == p2) return glm::vec3(0.0f);
+glm::vec3 calculateFaceNormal(
+    const glm::vec3& p0,
+    const glm::vec3& p1,
+    const glm::vec3& p2) {
+    if (p0 == p1 || p1 == p2 || p0 == p2) {
+        return glm::vec3(0.0f);
+    }
     glm::vec3 edge1 = p1 - p0;
     glm::vec3 edge2 = p2 - p0;
     glm::vec3 calculated_normal = glm::cross(edge1, edge2);
-    if (glm::length(calculated_normal) < 0.000001f) return glm::vec3(0.0f);
+    if (glm::length(calculated_normal) < 0.000001f) {
+        return glm::vec3(0.0f);
+    }
     return glm::normalize(calculated_normal);
 }
-float calculateDihedralAngleFromNormals(glm::vec3 n1, glm::vec3 n2) {
-    if (glm::length(n1) < 0.000001f || glm::length(n2) < 0.000001f) return 180.0f;
+float calculateDihedralAngleFromNormals(
+    glm::vec3 n1,
+    glm::vec3 n2) {
+    if (glm::length(n1) < 0.000001f ||
+        glm::length(n2) < 0.000001f) {
+        return 180.0f;
+    }
     n1 = glm::normalize(n1);
     n2 = glm::normalize(n2);
     float dot_product_val = glm::dot(n1, n2);
@@ -69,7 +97,7 @@ Mesh simplifyMeshActualButVeryBasic(
     float sharp_edge_angle_degrees,
     float normal_similarity_weight,
     float uv_distance_weight) {
-    std::cout << "\n[Actual (But VERY BASIC) Simplification - Using VertexStruct, camelCase Funcs]" << std::endl;
+    //std::cout << "\n[Actual (But VERY BASIC) Simplification - Using VertexStruct, camelCase Funcs]" << std::endl;
     if (!input_mesh.isValid()) {
         return Mesh();
     }

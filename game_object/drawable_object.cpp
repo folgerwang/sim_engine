@@ -413,13 +413,14 @@ static void setupMesh(
         }
 
         const auto& indexAccessor = model.accessors[primitive.indices];
-        primitive_info.index_desc_.buffer_view = indexAccessor.bufferView;
-        primitive_info.index_desc_.offset = indexAccessor.byteOffset;
-        primitive_info.index_desc_.index_type = 
+        primitive_info.index_desc_.emplace_back();
+        primitive_info.index_desc_.back().buffer_view = indexAccessor.bufferView;
+        primitive_info.index_desc_.back().offset = indexAccessor.byteOffset;
+        primitive_info.index_desc_.back().index_type =
             indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT ? 
             renderer::IndexType::UINT16 : 
             renderer::IndexType::UINT32;
-        primitive_info.index_desc_.index_count = indexAccessor.count;
+        primitive_info.index_desc_.back().index_count = indexAccessor.count;
 
         primitive_info.generateHash();
         mesh_info.primitives_.push_back(primitive_info);
@@ -703,7 +704,7 @@ static void setupMesh(
     std::unordered_map<size_t, uint32_t> vertex_map;
     std::vector<uint32_t> new_indices;
     std::vector<uint32_t> indice_match_table;
-    new_indices.reserve(src_mesh->num_indices);
+    new_indices.reserve(src_mesh->num_indices * 3);
     indice_match_table.reserve(src_mesh->num_indices);
 
     std::vector<float> vertex_data;
@@ -829,11 +830,11 @@ static void setupMesh(
 
     auto drawable_vertices =
         std::make_shared<std::vector<helper::VertexStruct>>();
-    drawable_vertices->resize(indice_match_table.size());
+    drawable_vertices->reserve(indice_match_table.size() * 3);
     for (int i_vert = 0; i_vert < indice_match_table.size(); i_vert++) {
         const uint32_t& src_vert_idx = indice_match_table[i_vert];
-
-        auto& vertex = (*drawable_vertices)[i_vert];
+        drawable_vertices->emplace_back();
+        auto& vertex = drawable_vertices->back();
         auto position_idx = src_mesh->vertex_position.indices[src_vert_idx];
         const auto& position = src_mesh->vertex_position.values[position_idx];
         vertex.position = glm::vec3(position.x, position.y, position.z);
@@ -843,6 +844,79 @@ static void setupMesh(
         auto uv_idx = src_mesh->vertex_uv.indices[src_vert_idx];
         const auto& uv = src_mesh->vertex_uv.values[uv_idx];
         vertex.uv = glm::vec2(uv.x, uv.y);
+    }
+
+    assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
+
+    // create HLOD
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
+        lod_indice_info(helper::c_num_lods + 1);
+    {
+        std::cout << "====================" << std::endl;
+        std::cout << "mesh idx : " << mesh_idx
+            << "/" << fbx_scene->meshes.count
+            << ", num tris : " << new_indices.size() / 3
+            << std::endl;
+
+        uint32_t face_idx_offset = 0;
+        lod_indice_info[0].resize(src_mesh->material_parts.count);
+        for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+            auto part = src_mesh->material_parts[i_part];
+            lod_indice_info[0][i_part].first = face_idx_offset;
+            lod_indice_info[0][i_part].second = uint32_t(part.num_faces);
+            face_idx_offset += uint32_t(part.num_faces);
+        }
+        for (int i_lod = 0; i_lod < helper::c_num_lods; i_lod++) {
+            std::cout << "start lod : " << i_lod + 1 << std::endl;
+            const auto& src_lod_indice_info = lod_indice_info[i_lod];
+            auto& dst_lod_indice_info = lod_indice_info[i_lod + 1];
+            dst_lod_indice_info.resize(src_mesh->material_parts.count);
+            for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+                int32_t src_face_start = src_lod_indice_info[i_part].first;
+                int32_t src_face_count = src_lod_indice_info[i_part].second;
+                int32_t target_face_count = std::max(int32_t(src_face_count * helper::c_target_lod_ratio), 1);
+
+                helper::Mesh input_mesh_const;
+                input_mesh_const.vertex_data_ptr = drawable_vertices;
+                input_mesh_const.faces_ptr = std::make_shared<std::vector<helper::Face>>();
+                input_mesh_const.faces_ptr->resize(src_face_count);
+                for (int32_t i = 0; i < src_face_count; i++) {
+                    int32_t src_face_idx = src_face_start + i;
+                    input_mesh_const.faces_ptr->at(i) =
+                        helper::Face(
+                            new_indices[src_face_idx * 3 + 0],
+                            new_indices[src_face_idx * 3 + 1],
+                            new_indices[src_face_idx * 3 + 2]);
+                }
+
+                helper::Mesh mesh_lod =
+                    helper::simplifyMeshActualButVeryBasic(
+                        input_mesh_const,
+                        target_face_count,
+                        helper::c_sharp_edge_angle_threshold_degrees,
+                        helper::c_normal_weight,
+                        helper::c_uv_weight);
+
+                uint32_t num_lod_vertex = mesh_lod.vertex_data_ptr->size();
+                uint32_t vertex_index_offset = uint32_t(drawable_vertices->size());
+                for (int32_t i = 0; i < num_lod_vertex; i++) {
+                    drawable_vertices->push_back(mesh_lod.vertex_data_ptr->at(i));
+                }
+                
+                for (int32_t i = 0; i < mesh_lod.faces_ptr->size(); i++) {
+                    assert(mesh_lod.faces_ptr->at(i).v_indices[0] < num_lod_vertex);
+                    assert(mesh_lod.faces_ptr->at(i).v_indices[1] < num_lod_vertex);
+                    assert(mesh_lod.faces_ptr->at(i).v_indices[2] < num_lod_vertex);
+                    new_indices.push_back(vertex_index_offset + mesh_lod.faces_ptr->at(i).v_indices[0]);
+                    new_indices.push_back(vertex_index_offset + mesh_lod.faces_ptr->at(i).v_indices[1]);
+                    new_indices.push_back(vertex_index_offset + mesh_lod.faces_ptr->at(i).v_indices[2]);
+                }
+
+                dst_lod_indice_info[i_part].first = face_idx_offset;
+                dst_lod_indice_info[i_part].second = uint32_t(mesh_lod.faces_ptr->size());
+                face_idx_offset += uint32_t(mesh_lod.faces_ptr->size());
+            }
+        }
     }
 
     renderer::Helper::createBuffer(
@@ -860,8 +934,6 @@ static void setupMesh(
         std::source_location::current(),
         drawable_vertices->size() * sizeof(helper::VertexStruct),
         drawable_vertices->data());
-
-    assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
 
     auto use_16bits_index = src_mesh->num_indices < 65536;
     auto index_bytes_count = 2;
@@ -916,38 +988,8 @@ static void setupMesh(
             std::make_shared<std::vector<glm::vec3>>(vertex_position);
     }
 
-    int32_t target_face_count =
-        int32_t((new_indices.size() / 3) / 4);
-
-    helper::Mesh input_mesh_const;
-    input_mesh_const.vertex_data_ptr = drawable_vertices;
-    input_mesh_const.faces_ptr = std::make_shared<std::vector<helper::Face>>();
-    input_mesh_const.faces_ptr->resize(new_indices.size() / 3);
-    for (int32_t i = 0; i < int32_t(new_indices.size() / 3); i++) {
-        input_mesh_const.faces_ptr->at(i) =
-            helper::Face(
-                new_indices[i * 3 + 0],
-                new_indices[i * 3 + 1],
-                new_indices[i * 3 + 2]);
-    }
-
-    std::cout << "====================" << std::endl;
-    std::cout << "mesh idx : " << mesh_idx
-        << "/" << fbx_scene->meshes.count
-        << ", num tris : " << new_indices.size() / 3
-        << std::endl;
-    
-    helper::Mesh mesh_lod =
-        helper::simplifyMeshActualButVeryBasic(
-            input_mesh_const,
-            target_face_count,
-            helper::c_sharp_edge_angle_threshold_degrees,
-            helper::c_normal_weight,
-            helper::c_uv_weight);
-
     num_traingles = 0;
     uint32_t buffer_offset = 0;
-    uint32_t indices_buffer_offset = 0;
     auto pos_view_idx = mesh_idx * 4;
     drawable_object->buffer_views_[pos_view_idx].buffer_idx = vertex_buffer_idx;
     drawable_object->buffer_views_[pos_view_idx].offset = 0;
@@ -1044,16 +1086,18 @@ static void setupMesh(
         dst_binding++;
 
         // indices
-        auto index_count = part.num_faces * 3;
-        primitive_info.index_desc_.buffer_view = indice_view_idx;
-        primitive_info.index_desc_.offset = indices_buffer_offset;
-        primitive_info.index_desc_.index_type = index_type;
-        primitive_info.index_desc_.index_count = index_count;
+        primitive_info.index_desc_.resize(helper::c_num_lods + 1);
+        for (int32_t i_lod = 0; i_lod < helper::c_num_lods + 1; i_lod++) {
+            primitive_info.index_desc_[i_lod].buffer_view = indice_view_idx;
+            primitive_info.index_desc_[i_lod].offset =
+                lod_indice_info[i_lod][i_part].first * 3 * index_bytes_count;
+            primitive_info.index_desc_[i_lod].index_type = index_type;
+            primitive_info.index_desc_[i_lod].index_count =
+                lod_indice_info[i_lod][i_part].second * 3;
+        }
 
         primitive_info.generateHash();
         num_traingles += part.num_faces;
-        indices_buffer_offset += (uint32_t)(index_count * index_bytes_count);
-        assert(indices_buffer_offset <= src_mesh->num_indices * index_bytes_count);
     }
 }
 
@@ -1447,12 +1491,13 @@ static void setupRaytracing(
             }
             assert(has_position);
 
-            auto& index_buffer_view = drawable_object->buffer_views_[prim.index_desc_.buffer_view];
+            uint32_t cur_lod = 0;
+            auto& index_buffer_view = drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
             auto index_device_address = drawable_object->buffers_[index_buffer_view.buffer_idx].buffer->getDeviceAddress();
-            auto index_offset = prim.index_desc_.offset + index_buffer_view.offset;
-            dst_prim.index_type = prim.index_desc_.index_type;
+            auto index_offset = prim.index_desc_[cur_lod].offset + index_buffer_view.offset;
+            dst_prim.index_type = prim.index_desc_[cur_lod].index_type;
             dst_prim.index_data.device_address = index_device_address + index_offset;
-            prim.as_geometry->max_primitive_count = static_cast<uint32_t>(prim.index_desc_.index_count) / 3;
+            prim.as_geometry->max_primitive_count = static_cast<uint32_t>(prim.index_desc_[cur_lod].index_count) / 3;
             prim.as_geometry->index_base = static_cast<uint32_t>(index_offset / sizeof(uint16_t));
             prim.as_geometry->index_by_bytes = 2;
         }
@@ -1661,13 +1706,14 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
+        uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
-            drawable_object->buffer_views_[prim.index_desc_.buffer_view];
+            drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
         cmd_buf->bindIndexBuffer(
             drawable_object->buffers_[index_buffer_view.buffer_idx].buffer,
-            prim.index_desc_.offset + index_buffer_view.offset,
-            prim.index_desc_.index_type);
+            prim.index_desc_[cur_lod].offset + index_buffer_view.offset,
+            prim.index_desc_[cur_lod].index_type);
 
         renderer::DescriptorSetList desc_sets = desc_set_list;
         if (prim.material_idx_ >= 0) {
@@ -3147,12 +3193,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     // clear instance count = 0;
     indirect_draw_cmd_buffer[0] = 0;
     uint32_t prim_idx = 0;
+    uint32_t cur_lod = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =
-                static_cast<uint32_t>(prim.index_desc_.index_count);
+                static_cast<uint32_t>(prim.index_desc_[cur_lod].index_count);
             indirect_draw_buf[prim_idx].instance_count = 0;
             indirect_draw_buf[prim_idx].vertex_offset = 0;
             prim_idx++;
@@ -3234,10 +3281,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
+            uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =
-                static_cast<uint32_t>(prim.index_desc_.index_count);
+                static_cast<uint32_t>(prim.index_desc_[cur_lod].index_count);
             indirect_draw_buf[prim_idx].instance_count = 0;
             indirect_draw_buf[prim_idx].vertex_offset = 0;
             prim_idx++;
