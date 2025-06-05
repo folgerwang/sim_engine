@@ -903,18 +903,22 @@ static void setupMesh(
                     drawable_vertices->push_back(mesh_lod.vertex_data_ptr->at(i));
                 }
                 
-                for (int32_t i = 0; i < mesh_lod.faces_ptr->size(); i++) {
-                    assert(mesh_lod.faces_ptr->at(i).v_indices[0] < num_lod_vertex);
-                    assert(mesh_lod.faces_ptr->at(i).v_indices[1] < num_lod_vertex);
-                    assert(mesh_lod.faces_ptr->at(i).v_indices[2] < num_lod_vertex);
-                    new_indices.push_back(vertex_index_offset + mesh_lod.faces_ptr->at(i).v_indices[0]);
-                    new_indices.push_back(vertex_index_offset + mesh_lod.faces_ptr->at(i).v_indices[1]);
-                    new_indices.push_back(vertex_index_offset + mesh_lod.faces_ptr->at(i).v_indices[2]);
+                auto num_faces = uint32_t(mesh_lod.faces_ptr->size());
+                for (int32_t i = 0; i < num_faces; i++) {
+                    auto idx0 = mesh_lod.faces_ptr->at(i).v_indices[0];
+                    auto idx1 = mesh_lod.faces_ptr->at(i).v_indices[1];
+                    auto idx2 = mesh_lod.faces_ptr->at(i).v_indices[2];
+                    assert(idx0 < num_lod_vertex);
+                    assert(idx1 < num_lod_vertex);
+                    assert(idx2 < num_lod_vertex);
+                    new_indices.push_back(vertex_index_offset + idx0);
+                    new_indices.push_back(vertex_index_offset + idx1);
+                    new_indices.push_back(vertex_index_offset + idx2);
                 }
 
                 dst_lod_indice_info[i_part].first = face_idx_offset;
-                dst_lod_indice_info[i_part].second = uint32_t(mesh_lod.faces_ptr->size());
-                face_idx_offset += uint32_t(mesh_lod.faces_ptr->size());
+                dst_lod_indice_info[i_part].second = num_faces;
+                face_idx_offset += num_faces;
             }
         }
     }
@@ -935,14 +939,15 @@ static void setupMesh(
         drawable_vertices->size() * sizeof(helper::VertexStruct),
         drawable_vertices->data());
 
-    auto use_16bits_index = src_mesh->num_indices < 65536;
+    auto total_num_indices = new_indices.size();
+    auto use_16bits_index = total_num_indices < 65536;
     auto index_bytes_count = 2;
     auto index_type = renderer::IndexType::UINT16;
 
     if (use_16bits_index) {
         std::vector<uint16_t> indices_16;
-        indices_16.resize(src_mesh->num_indices);
-        for (int i_idx = 0; i_idx < src_mesh->num_indices; i_idx++) {
+        indices_16.resize(total_num_indices);
+        for (int i_idx = 0; i_idx < total_num_indices; i_idx++) {
             indices_16[i_idx] = static_cast<uint16_t>(new_indices[i_idx]);
         }
 
