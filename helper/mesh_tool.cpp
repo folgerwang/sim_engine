@@ -70,101 +70,181 @@ Mesh simplifyMeshActualButVeryBasic(
     float normal_similarity_weight,
     float uv_distance_weight) {
     std::cout << "\n[Actual (But VERY BASIC) Simplification - Using VertexStruct, camelCase Funcs]" << std::endl;
-    if (!input_mesh.isValid()) { return Mesh(); }
-    if (input_mesh.getVertexCount() == 0) { return Mesh(); }
-    if (input_mesh.getFaceCount() == 0 || target_face_count >= static_cast<int>(input_mesh.getFaceCount())) {
+    if (!input_mesh.isValid()) {
+        return Mesh();
+    }
+    if (input_mesh.getVertexCount() == 0) {
+        return Mesh();
+    }
+    if (input_mesh.getFaceCount() == 0 ||
+        target_face_count >= static_cast<int>(input_mesh.getFaceCount())) {
         Mesh result_mesh;
-        if (input_mesh.vertex_data_ptr) *(result_mesh.vertex_data_ptr) = *(input_mesh.vertex_data_ptr);
-        if (input_mesh.faces_ptr) *(result_mesh.faces_ptr) = *(input_mesh.faces_ptr);
-        if (result_mesh.faces_ptr) for (Face& f_ref : *(result_mesh.faces_ptr)) f_ref.active = true;
+        if (input_mesh.vertex_data_ptr) {
+            *(result_mesh.vertex_data_ptr) = *(input_mesh.vertex_data_ptr);
+        }
+        if (input_mesh.faces_ptr) {
+            *(result_mesh.faces_ptr) = *(input_mesh.faces_ptr);
+        }
+        if (result_mesh.faces_ptr) {
+            for (Face& f_ref : *(result_mesh.faces_ptr)) {
+                f_ref.active = true;
+            }
+        }
         return result_mesh;
     }
-    if (target_face_count < 0) target_face_count = 0;
+    if (target_face_count < 0) {
+        target_face_count = 0;
+    }
 
     std::vector<VertexStruct> current_vertex_data = *(input_mesh.vertex_data_ptr);
     std::vector<Face> current_faces_vector = *(input_mesh.faces_ptr);
-    for (Face& f_ref : current_faces_vector) { f_ref.active = true; }
+    for (Face& f_ref : current_faces_vector) {
+        f_ref.active = true;
+    }
 
     int active_face_count_val = 0;
-    for (const auto& f_const_ref : current_faces_vector) { if (f_const_ref.active && !f_const_ref.isDegenerate()) active_face_count_val++; } // CALL UPDATED NAME
+    for (const auto& f_const_ref : current_faces_vector) {
+        if (f_const_ref.active && !f_const_ref.isDegenerate()) {
+            active_face_count_val++;
+        }
+    } // CALL UPDATED NAME
 
     int outer_iterations = 0;
     const int max_outer_iterations_const = int(current_faces_vector.size()) + 10;
     uint32_t remained_faces_count = uint32_t(input_mesh.faces_ptr->size());
     uint32_t max_collapses_per_pass = remained_faces_count / 10;
 
-    while (active_face_count_val > target_face_count && outer_iterations < max_outer_iterations_const) {
+    while (active_face_count_val > target_face_count &&
+        outer_iterations < max_outer_iterations_const) {
         outer_iterations++;
         std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_to_face_map;
         std::vector<EdgeInternal> candidate_edges_list;
 
         for (uint32_t face_idx = 0; face_idx < current_faces_vector.size(); ++face_idx) {
-            if (!current_faces_vector[face_idx].active || current_faces_vector[face_idx].isDegenerate()) continue; // CALL UPDATED NAME
+            if (!current_faces_vector[face_idx].active ||
+                current_faces_vector[face_idx].isDegenerate()) {
+                continue; // CALL UPDATED NAME
+            }
             const Face& current_f = current_faces_vector[face_idx];
             for (int i_loop = 0; i_loop < 3; ++i_loop) {
                 uint32_t u_vert = current_f.v_indices[i_loop];
                 uint32_t v_vert = current_f.v_indices[(i_loop + 1) % 3];
-                if (u_vert == v_vert) continue;
-                std::pair<uint32_t, uint32_t> current_edge_key = { std::min(u_vert, v_vert), std::max(u_vert, v_vert) };
+                if (u_vert == v_vert) {
+                    continue;
+                }
+                std::pair<uint32_t, uint32_t> current_edge_key = {
+                    std::min(u_vert, v_vert),
+                    std::max(u_vert, v_vert)
+                };
                 edge_to_face_map[current_edge_key].push_back(face_idx);
             }
         }
 
-        if (edge_to_face_map.empty()) { break; }
+        if (edge_to_face_map.empty()) {
+            break;
+        }
 
         for (const auto& map_entry : edge_to_face_map) {
             const auto& edge_key_val = map_entry.first;
             const auto& incident_face_indices_list = map_entry.second;
-            if (edge_key_val.first >= current_vertex_data.size() || edge_key_val.second >= current_vertex_data.size()) continue;
-            EdgeInternal current_edge(edge_key_val.first, edge_key_val.second, current_vertex_data, normal_similarity_weight, uv_distance_weight);
+            if (edge_key_val.first >= current_vertex_data.size() ||
+                edge_key_val.second >= current_vertex_data.size()) {
+                continue;
+            }
+
+            EdgeInternal current_edge(
+                edge_key_val.first,
+                edge_key_val.second,
+                current_vertex_data,
+                normal_similarity_weight,
+                uv_distance_weight);
+
             if (incident_face_indices_list.size() == 2) {
                 const Face& f1_face_data = current_faces_vector[incident_face_indices_list[0]];
                 const Face& f2_face_data = current_faces_vector[incident_face_indices_list[1]];
-                glm::vec3 n_geom1_val = calculateFaceNormal(current_vertex_data[f1_face_data.v_indices[0]].position, current_vertex_data[f1_face_data.v_indices[1]].position, current_vertex_data[f1_face_data.v_indices[2]].position);
-                glm::vec3 n_geom2_val = calculateFaceNormal(current_vertex_data[f2_face_data.v_indices[0]].position, current_vertex_data[f2_face_data.v_indices[1]].position, current_vertex_data[f2_face_data.v_indices[2]].position);
+                glm::vec3 n_geom1_val =
+                    calculateFaceNormal(
+                        current_vertex_data[f1_face_data.v_indices[0]].position,
+                        current_vertex_data[f1_face_data.v_indices[1]].position,
+                        current_vertex_data[f1_face_data.v_indices[2]].position);
+                glm::vec3 n_geom2_val =
+                    calculateFaceNormal(
+                        current_vertex_data[f2_face_data.v_indices[0]].position,
+                        current_vertex_data[f2_face_data.v_indices[1]].position,
+                        current_vertex_data[f2_face_data.v_indices[2]].position);
                 if (glm::length(n_geom1_val) > 0.0001f && glm::length(n_geom2_val) > 0.0001f) {
-                    if (calculateDihedralAngleFromNormals(n_geom1_val, n_geom2_val) > (180.0f - sharp_edge_angle_degrees + 0.01f)) current_edge.is_sharp = true;
+                    if (calculateDihedralAngleFromNormals(n_geom1_val, n_geom2_val) > (180.0f - sharp_edge_angle_degrees + 0.01f)) {
+                        current_edge.is_sharp = true;
+                    }
                 }
             }
             candidate_edges_list.push_back(current_edge);
         }
 
-        if (candidate_edges_list.empty()) { break; }
-        std::sort(candidate_edges_list.begin(), candidate_edges_list.end());
+        if (candidate_edges_list.empty()) {
+            break;
+        }
+        std::sort(
+            candidate_edges_list.begin(),
+            candidate_edges_list.end());
 
         std::vector<EdgeInternal> independent_set_to_collapse;
         std::vector<bool> vertex_locked_this_pass(current_vertex_data.size(), false);
         for (const EdgeInternal& edge_candidate : candidate_edges_list) {
-            if (independent_set_to_collapse.size() >= max_collapses_per_pass) break;
-            if (edge_candidate.v1_idx >= vertex_locked_this_pass.size() || edge_candidate.v2_idx >= vertex_locked_this_pass.size()) continue;
-            if (!vertex_locked_this_pass[edge_candidate.v1_idx] && !vertex_locked_this_pass[edge_candidate.v2_idx]) {
+            if (independent_set_to_collapse.size() >= max_collapses_per_pass) {
+                break;
+            }
+            if (edge_candidate.v1_idx >= vertex_locked_this_pass.size() ||
+                edge_candidate.v2_idx >= vertex_locked_this_pass.size()) {
+                continue;
+            }
+            if (!vertex_locked_this_pass[edge_candidate.v1_idx] &&
+                !vertex_locked_this_pass[edge_candidate.v2_idx]) {
                 independent_set_to_collapse.push_back(edge_candidate);
                 vertex_locked_this_pass[edge_candidate.v1_idx] = true;
                 vertex_locked_this_pass[edge_candidate.v2_idx] = true;
             }
         }
-        if (independent_set_to_collapse.empty()) { break; }
+        if (independent_set_to_collapse.empty()) {
+            break;
+        }
 
         int total_faces_removed_this_pass = 0;
         for (const EdgeInternal& edge_to_collapse_val : independent_set_to_collapse) {
-            if (active_face_count_val <= target_face_count) break;
+            if (active_face_count_val <= target_face_count) {
+                break;
+            }
             uint32_t v_idx_remove = edge_to_collapse_val.v2_idx;
             uint32_t v_idx_keep = edge_to_collapse_val.v1_idx;
-            if (v_idx_keep >= current_vertex_data.size() || v_idx_remove >= current_vertex_data.size()) continue;
+            if (v_idx_keep >= current_vertex_data.size() ||
+                v_idx_remove >= current_vertex_data.size()) {
+                continue;
+            }
 
             VertexStruct& vert_to_keep = current_vertex_data[v_idx_keep];
             const VertexStruct& vert_to_remove = current_vertex_data[v_idx_remove];
 
             vert_to_keep.position = (vert_to_keep.position + vert_to_remove.position) * 0.5f;
-            if (glm::length(vert_to_keep.normal) > 0.5f && glm::length(vert_to_remove.normal) > 0.5f) { vert_to_keep.normal = glm::normalize(vert_to_keep.normal + vert_to_remove.normal); }
-            else if (glm::length(vert_to_remove.normal) > 0.5f) { vert_to_keep.normal = glm::normalize(vert_to_remove.normal); }
+            if (glm::length(vert_to_keep.normal) > 0.5f &&
+                glm::length(vert_to_remove.normal) > 0.5f) {
+                vert_to_keep.normal = glm::normalize(vert_to_keep.normal + vert_to_remove.normal);
+            }
+            else if (glm::length(vert_to_remove.normal) > 0.5f) {
+                vert_to_keep.normal = glm::normalize(vert_to_remove.normal);
+            }
             vert_to_keep.uv = (vert_to_keep.uv + vert_to_remove.uv) * 0.5f;
 
             int faces_removed_this_single_collapse = 0;
             for (uint32_t face_idx = 0; face_idx < current_faces_vector.size(); ++face_idx) {
-                if (!current_faces_vector[face_idx].active) continue;
+                if (!current_faces_vector[face_idx].active) {
+                    continue;
+                }
                 Face& f_ref = current_faces_vector[face_idx];
-                for (int i_loop = 0; i_loop < 3; ++i_loop) { if (f_ref.v_indices[i_loop] == v_idx_remove) f_ref.v_indices[i_loop] = v_idx_keep; }
+                for (int i_loop = 0; i_loop < 3; ++i_loop) {
+                    if (f_ref.v_indices[i_loop] == v_idx_remove) {
+                        f_ref.v_indices[i_loop] = v_idx_keep;
+                    }
+                }
                 if (f_ref.isDegenerate()) { // CALL UPDATED NAME
                     if (current_faces_vector[face_idx].active) {
                         faces_removed_this_single_collapse++;
@@ -175,12 +255,19 @@ Mesh simplifyMeshActualButVeryBasic(
             active_face_count_val -= faces_removed_this_single_collapse;
             total_faces_removed_this_pass += faces_removed_this_single_collapse;
         }
-        if (total_faces_removed_this_pass == 0 && active_face_count_val > target_face_count) { break; }
-        if (active_face_count_val <= 0 && target_face_count > 0) { break; }
+        if (total_faces_removed_this_pass == 0 &&
+            active_face_count_val > target_face_count) {
+            break;
+        }
+        if (active_face_count_val <= 0 && target_face_count > 0) {
+            break;
+        }
         remained_faces_count -= total_faces_removed_this_pass;
         max_collapses_per_pass = std::max(remained_faces_count / 10, 10U);
     }
-    if (outer_iterations >= max_outer_iterations_const) { std::cout << "  Reached max outer iterations. Stopping." << std::endl; }
+    if (outer_iterations >= max_outer_iterations_const) {
+        std::cout << "  Reached max outer iterations. Stopping." << std::endl;
+    }
     std::cout << "  Finished iterative collapse. Target: " << target_face_count << ", Actual active faces: " << active_face_count_val << std::endl;
 
     Mesh simplified_mesh_result;
@@ -258,30 +345,59 @@ void printMesh(const Mesh& mesh_to_print, const std::string& mesh_name) {
 }
 
 // --- Multi-threaded Mesh Combining Function ---
-struct MeshCombineTaskArgs { const Mesh* input_mesh_ptr; Mesh* output_mesh_ptr; uint32_t vertex_data_write_start_idx; uint32_t face_write_start_idx; uint32_t base_vertex_idx_offset; };
+struct MeshCombineTaskArgs {
+    const Mesh* input_mesh_ptr;
+    Mesh* output_mesh_ptr;
+    uint32_t vertex_data_write_start_idx;
+    uint32_t face_write_start_idx;
+    uint32_t base_vertex_idx_offset;
+};
 
-void processSingleMeshForCombine(const MeshCombineTaskArgs& task_args) {
-    if (!task_args.input_mesh_ptr->isValid() || !task_args.output_mesh_ptr->isValid()) return;
+void processSingleMeshForCombine(
+    const MeshCombineTaskArgs& task_args) {
+    if (!task_args.input_mesh_ptr->isValid() || !task_args.output_mesh_ptr->isValid()) {
+        return;
+    }
     const auto& input_vertex_data_vec = *(task_args.input_mesh_ptr->vertex_data_ptr);
     auto& output_vertex_data_vec = *(task_args.output_mesh_ptr->vertex_data_ptr);
     for (size_t i_loop = 0; i_loop < input_vertex_data_vec.size(); ++i_loop) {
-        if (task_args.vertex_data_write_start_idx + i_loop < output_vertex_data_vec.size()) { output_vertex_data_vec[task_args.vertex_data_write_start_idx + i_loop] = input_vertex_data_vec[i_loop]; }
+        if (task_args.vertex_data_write_start_idx + i_loop < output_vertex_data_vec.size()) {
+            output_vertex_data_vec[task_args.vertex_data_write_start_idx + i_loop] = input_vertex_data_vec[i_loop];
+        }
     }
     const auto& input_faces_vec = *(task_args.input_mesh_ptr->faces_ptr);
     auto& output_faces_vec = *(task_args.output_mesh_ptr->faces_ptr);
     for (size_t i_loop = 0; i_loop < input_faces_vec.size(); ++i_loop) {
         const auto& original_face = input_faces_vec[i_loop];
-        Face new_built_face(original_face.v_indices[0] + task_args.base_vertex_idx_offset, original_face.v_indices[1] + task_args.base_vertex_idx_offset, original_face.v_indices[2] + task_args.base_vertex_idx_offset);
+        Face new_built_face(
+            original_face.v_indices[0] + task_args.base_vertex_idx_offset,
+            original_face.v_indices[1] + task_args.base_vertex_idx_offset,
+            original_face.v_indices[2] + task_args.base_vertex_idx_offset);
         new_built_face.active = original_face.active;
-        if (task_args.face_write_start_idx + i_loop < output_faces_vec.size()) { output_faces_vec[task_args.face_write_start_idx + i_loop] = new_built_face; }
+        if (task_args.face_write_start_idx + i_loop < output_faces_vec.size()) {
+            output_faces_vec[task_args.face_write_start_idx + i_loop] = new_built_face;
+        }
     }
 }
 
-Mesh combineMeshesMultithreaded(const std::vector<Mesh>& meshes_to_combine_list, uint32_t num_threads_hint_val = 0) {
-    if (meshes_to_combine_list.empty()) { return Mesh(); }
+Mesh combineMeshesMultithreaded(
+    const std::vector<Mesh>& meshes_to_combine_list,
+    uint32_t num_threads_hint_val = 0) {
+    if (meshes_to_combine_list.empty()) {
+        return Mesh();
+    }
     uint32_t actual_num_threads_to_use = num_threads_hint_val;
-    if (actual_num_threads_to_use == 0) { actual_num_threads_to_use = std::thread::hardware_concurrency(); if (actual_num_threads_to_use == 0) actual_num_threads_to_use = 2; }
-    actual_num_threads_to_use = std::max(1u, std::min(actual_num_threads_to_use, static_cast<uint32_t>(meshes_to_combine_list.size())));
+    if (actual_num_threads_to_use == 0) {
+        actual_num_threads_to_use = std::thread::hardware_concurrency();
+        if (actual_num_threads_to_use == 0) {
+            actual_num_threads_to_use = 2;
+        }
+    }
+    actual_num_threads_to_use =
+        std::max(1u,
+            std::min(
+                actual_num_threads_to_use,
+                static_cast<uint32_t>(meshes_to_combine_list.size())));
     Mesh combined_mesh_result;
     uint32_t total_vertex_data_items = 0; uint32_t total_face_items = 0;
     std::vector<uint32_t> vertex_data_write_starts(meshes_to_combine_list.size());
@@ -289,27 +405,52 @@ Mesh combineMeshesMultithreaded(const std::vector<Mesh>& meshes_to_combine_list,
     std::vector<uint32_t> base_vertex_idx_offsets_list(meshes_to_combine_list.size());
     uint32_t current_vertex_data_item_count = 0; uint32_t current_face_item_count = 0;
     for (size_t i_idx = 0; i_idx < meshes_to_combine_list.size(); ++i_idx) {
-        if (!meshes_to_combine_list[i_idx].isValid()) continue;
-        vertex_data_write_starts[i_idx] = current_vertex_data_item_count; face_write_starts[i_idx] = current_face_item_count; base_vertex_idx_offsets_list[i_idx] = current_vertex_data_item_count;
-        total_vertex_data_items += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getVertexCount()); total_face_items += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getFaceCount());
-        current_vertex_data_item_count += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getVertexCount()); current_face_item_count += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getFaceCount());
+        if (!meshes_to_combine_list[i_idx].isValid()) {
+            continue;
+        }
+        vertex_data_write_starts[i_idx] = current_vertex_data_item_count;
+        face_write_starts[i_idx] = current_face_item_count;
+        base_vertex_idx_offsets_list[i_idx] = current_vertex_data_item_count;
+        total_vertex_data_items += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getVertexCount());
+        total_face_items += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getFaceCount());
+        current_vertex_data_item_count += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getVertexCount());
+        current_face_item_count += static_cast<uint32_t>(meshes_to_combine_list[i_idx].getFaceCount());
     }
-    combined_mesh_result.vertex_data_ptr->resize(total_vertex_data_items); combined_mesh_result.faces_ptr->resize(total_face_items);
-    if (meshes_to_combine_list.empty() || (total_vertex_data_items == 0 && total_face_items == 0)) return combined_mesh_result;
+    combined_mesh_result.vertex_data_ptr->resize(total_vertex_data_items);
+    combined_mesh_result.faces_ptr->resize(total_face_items);
+    if (meshes_to_combine_list.empty() ||
+        (total_vertex_data_items == 0 && total_face_items == 0)) {
+        return combined_mesh_result;
+    }
     if (actual_num_threads_to_use == 1 || meshes_to_combine_list.size() <= 1) {
         for (size_t i_idx = 0; i_idx < meshes_to_combine_list.size(); ++i_idx) {
-            if (!meshes_to_combine_list[i_idx].isValid()) continue;
-            MeshCombineTaskArgs current_task_args = { &meshes_to_combine_list[i_idx],&combined_mesh_result,vertex_data_write_starts[i_idx],face_write_starts[i_idx],base_vertex_idx_offsets_list[i_idx] };
+            if (!meshes_to_combine_list[i_idx].isValid()) {
+                continue;
+            }
+            MeshCombineTaskArgs current_task_args = {
+                &meshes_to_combine_list[i_idx],
+                &combined_mesh_result,
+                vertex_data_write_starts[i_idx],
+                face_write_starts[i_idx],
+                base_vertex_idx_offsets_list[i_idx] };
             processSingleMeshForCombine(current_task_args);
         }
     }
     else {
-        std::vector<std::thread> worker_threads; worker_threads.reserve(actual_num_threads_to_use);
+        std::vector<std::thread> worker_threads;
+        worker_threads.reserve(actual_num_threads_to_use);
         for (uint32_t i_thread_idx = 0; i_thread_idx < actual_num_threads_to_use; ++i_thread_idx) {
             worker_threads.emplace_back([&, i_thread_idx, actual_num_threads_to_use]() {
                 for (size_t k_mesh_idx = i_thread_idx; k_mesh_idx < meshes_to_combine_list.size(); k_mesh_idx += actual_num_threads_to_use) {
-                    if (!meshes_to_combine_list[k_mesh_idx].isValid()) continue;
-                    MeshCombineTaskArgs current_task_args = { &meshes_to_combine_list[k_mesh_idx],&combined_mesh_result,vertex_data_write_starts[k_mesh_idx],face_write_starts[k_mesh_idx],base_vertex_idx_offsets_list[k_mesh_idx] };
+                    if (!meshes_to_combine_list[k_mesh_idx].isValid()) {
+                        continue;
+                    }
+                    MeshCombineTaskArgs current_task_args = {
+                        &meshes_to_combine_list[k_mesh_idx],
+                        &combined_mesh_result,
+                        vertex_data_write_starts[k_mesh_idx],
+                        face_write_starts[k_mesh_idx],
+                        base_vertex_idx_offsets_list[k_mesh_idx] };
                     processSingleMeshForCombine(current_task_args);
                 }
                 });
