@@ -22,6 +22,7 @@
 #include "third_parties/fbx/ufbx.h"
 
 static uint32_t num_draw_meshes = 0;
+#define DEBUG_OUTPUT 0
 
 namespace ego = engine::game_object;
 namespace engine {
@@ -800,12 +801,17 @@ static void setupMesh(
 
         if (create_bvh_tree) {
             bool debug_mode = false;
-#if 0
+
             std::cout << "mesh idx : " << mesh_idx
-                << "/" << fbx_scene->meshes.count
+                << "/" << fbx_scene->meshes.count;
+
+#if DEBUG_OUTPUT
+            std::cout << 
                 << ", mat part : " << i_part <<
                 ", num tris : " << vertex_indices.size() / 3
                 << std::endl;
+#else
+            std::cout << std::endl;
 #endif
             primitive_info.vertex_indices_ =
                 std::make_shared<std::vector<int32_t>>(vertex_indices);
@@ -852,12 +858,13 @@ static void setupMesh(
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
         lod_indice_info(helper::c_num_lods + 1);
     {
+#if DEBUG_OUTPUT
         std::cout << "====================" << std::endl;
         std::cout << "mesh idx : " << mesh_idx
             << "/" << fbx_scene->meshes.count
             << ", num tris : " << new_indices.size() / 3
             << std::endl;
-
+#endif
         uint32_t face_idx_offset = 0;
         lod_indice_info[0].resize(src_mesh->material_parts.count);
         for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
@@ -867,7 +874,9 @@ static void setupMesh(
             face_idx_offset += uint32_t(part.num_faces);
         }
         for (int i_lod = 0; i_lod < helper::c_num_lods; i_lod++) {
+#if DEBUG_OUTPUT
             std::cout << "start lod : " << i_lod + 1 << std::endl;
+#endif
             const auto& src_lod_indice_info = lod_indice_info[i_lod];
             auto& dst_lod_indice_info = lod_indice_info[i_lod + 1];
             dst_lod_indice_info.resize(src_mesh->material_parts.count);
@@ -897,14 +906,14 @@ static void setupMesh(
                         helper::c_normal_weight,
                         helper::c_uv_weight);
 
-                uint32_t num_lod_vertex = mesh_lod.vertex_data_ptr->size();
+                uint32_t num_lod_vertex = uint32_t(mesh_lod.vertex_data_ptr->size());
                 uint32_t vertex_index_offset = uint32_t(drawable_vertices->size());
-                for (int32_t i = 0; i < num_lod_vertex; i++) {
+                for (uint32_t i = 0; i < num_lod_vertex; i++) {
                     drawable_vertices->push_back(mesh_lod.vertex_data_ptr->at(i));
                 }
                 
                 auto num_faces = uint32_t(mesh_lod.faces_ptr->size());
-                for (int32_t i = 0; i < num_faces; i++) {
+                for (uint32_t i = 0; i < num_faces; i++) {
                     auto idx0 = mesh_lod.faces_ptr->at(i).v_indices[0];
                     auto idx1 = mesh_lod.faces_ptr->at(i).v_indices[1];
                     auto idx2 = mesh_lod.faces_ptr->at(i).v_indices[2];
@@ -1711,7 +1720,7 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
+        uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -3286,7 +3295,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
-            uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
+            uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =

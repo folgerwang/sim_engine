@@ -4,6 +4,8 @@
 namespace engine {
 namespace helper {
 
+#define DEBUG_OUTPUT 0
+
 EdgeInternal::EdgeInternal(
     uint32_t u_param,
     uint32_t v_param,
@@ -97,7 +99,9 @@ Mesh simplifyMeshActualButVeryBasic(
     float sharp_edge_angle_degrees,
     float normal_similarity_weight,
     float uv_distance_weight) {
-    //std::cout << "\n[Actual (But VERY BASIC) Simplification - Using VertexStruct, camelCase Funcs]" << std::endl;
+#if DEBUG_OUTPUT
+    std::cout << "\n[Actual (But VERY BASIC) Simplification - Using VertexStruct, camelCase Funcs]" << std::endl;
+#endif
     if (!input_mesh.isValid()) {
         return Mesh();
     }
@@ -294,9 +298,13 @@ Mesh simplifyMeshActualButVeryBasic(
         max_collapses_per_pass = std::max(remained_faces_count / 10, 10U);
     }
     if (outer_iterations >= max_outer_iterations_const) {
+#if DEBUG_OUTPUT
         std::cout << "  Reached max outer iterations. Stopping." << std::endl;
+#endif
     }
+#if DEBUG_OUTPUT
     std::cout << "  Finished iterative collapse. Target: " << target_face_count << ", Actual active faces: " << active_face_count_val << std::endl;
+#endif
 
     Mesh simplified_mesh_result;
     std::map<uint32_t, uint32_t> old_to_new_vertex_indices_map;
@@ -343,33 +351,11 @@ Mesh simplifyMeshActualButVeryBasic(
             }
         }
     }
+#if DEBUG_OUTPUT
     std::cout << "  Final simplified mesh: " << simplified_mesh_result.getVertexCount() << " Vertices, "
         << simplified_mesh_result.getFaceCount() << " Faces." << std::endl;
+#endif
     return simplified_mesh_result;
-}
-
-// --- printMesh Function ---
-void printMesh(const Mesh& mesh_to_print, const std::string& mesh_name) {
-    if (!mesh_to_print.isValid()) {
-        std::cout << "--- " << mesh_name << " (Mesh data pointers are null) ---" << std::endl;
-        return;
-    }
-    std::cout << "--- " << mesh_name << " ---" << std::endl;
-    std::cout << "Vertex Data entries (" << mesh_to_print.getVertexCount() << ")" << std::endl;
-    if (mesh_to_print.getVertexCount() == 0) { std::cout << "  (No vertex data)" << std::endl; }
-    for (size_t i_idx = 0; i_idx < mesh_to_print.getVertexCount(); ++i_idx) {
-        const auto& current_vert = (*mesh_to_print.vertex_data_ptr)[i_idx];
-        std::cout << "  V " << i_idx << ": P(" << current_vert.position.x << "," << current_vert.position.y << "," << current_vert.position.z << ")"
-            << " N(" << current_vert.normal.x << "," << current_vert.normal.y << "," << current_vert.normal.z << ")"
-            << " UV(" << current_vert.uv.x << "," << current_vert.uv.y << ")" << std::endl;
-    }
-    std::cout << "Faces (" << mesh_to_print.getFaceCount() << "):" << std::endl;
-    if (mesh_to_print.getFaceCount() == 0) { std::cout << "  (No faces)" << std::endl; }
-    for (size_t i_idx = 0; i_idx < mesh_to_print.getFaceCount(); ++i_idx) {
-        const Face& current_f = (*mesh_to_print.faces_ptr)[i_idx];
-        std::cout << "  F " << i_idx << ": (" << current_f.v_indices[0] << ", " << current_f.v_indices[1] << ", " << current_f.v_indices[2] << ")" << std::endl;
-    }
-    std::cout << "--------------------" << std::endl << std::endl;
 }
 
 // --- Multi-threaded Mesh Combining Function ---
@@ -487,57 +473,6 @@ Mesh combineMeshesMultithreaded(
     }
     return combined_mesh_result;
 }
-
-#if 0
-// --- Main Function ---
-int main() {
-    Mesh cube_mesh_data;
-    cube_mesh_data.vertex_data_ptr->assign({
-        {{0,0,0}, glm::normalize(glm::vec3(-1,-1,-1)), {0,0}}, {{1,0,0}, glm::normalize(glm::vec3(1,-1,-1)), {1,0}},
-        {{1,1,0}, glm::normalize(glm::vec3(1, 1,-1)), {1,1}}, {{0,1,0}, glm::normalize(glm::vec3(-1, 1,-1)), {0,1}},
-        {{0,0,1}, glm::normalize(glm::vec3(-1,-1, 1)), {0,1}}, {{1,0,1}, glm::normalize(glm::vec3(1,-1, 1)), {1,1}},
-        {{1,1,1}, glm::normalize(glm::vec3(1, 1, 1)), {1,0}}, {{0,1,1}, glm::normalize(glm::vec3(-1, 1, 1)), {0,0}} });
-    cube_mesh_data.faces_ptr->assign({
-        Face(0,1,2),Face(0,2,3),Face(4,5,6),Face(4,6,7), Face(0,1,5),Face(0,5,4),
-        Face(1,2,6),Face(1,6,5),Face(2,3,7),Face(2,7,6),Face(3,0,4),Face(3,4,7) });
-    printMesh(cube_mesh_data, "Test Mesh (Cube with VertexStruct, camelCase Funcs)");
-
-    std::vector<Mesh> all_meshes_list; all_meshes_list.push_back(cube_mesh_data);
-
-    auto start_time_combine_val = std::chrono::high_resolution_clock::now();
-    Mesh merged_mesh_data = combineMeshesMultithreaded(all_meshes_list, 0);
-    auto end_time_combine_val = std::chrono::high_resolution_clock::now();
-    std::cout << "\nMesh combining took: " << std::chrono::duration_cast<std::chrono::microseconds>(end_time_combine_val - start_time_combine_val).count() << " microseconds." << std::endl;
-    printMesh(merged_mesh_data, "Mesh to be Simplified");
-
-    std::cout << "\n--- Actual (BUT VERY BASIC) HLOD Simplification ---" << std::endl;
-    float sharp_edge_angle_thresh_degrees = 75.0f;
-    float normal_attr_weight = 20.0f;
-    float uv_attr_weight = 10.0f;
-    size_t collapses_per_pass_count = std::max(1UL, merged_mesh_data.getFaceCount() / 100);
-    collapses_per_pass_count = std::min(collapses_per_pass_count, static_cast<size_t>(20));
-
-    int original_face_count_val = merged_mesh_data.getFaceCount();
-    int target_simplification_face_count = std::max(2, original_face_count_val / 4);
-    if (original_face_count_val <= 4 && original_face_count_val > 0) target_simplification_face_count = std::max(1, original_face_count_val - 1);
-    if (target_simplification_face_count == original_face_count_val && original_face_count_val > 0) target_simplification_face_count--;
-
-    auto start_time_simplify_val = std::chrono::high_resolution_clock::now();
-    Mesh hlod_proxy_mesh = simplifyMeshActualButVeryBasic(
-        merged_mesh_data,
-        target_simplification_face_count,
-        sharp_edge_angle_thresh_degrees,
-        normal_attr_weight,
-        uv_attr_weight,
-        collapses_per_pass_count);
-    auto end_time_simplify_val = std::chrono::high_resolution_clock::now();
-    std::cout << "\nActual (VERY BASIC) mesh simplification took: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time_simplify_val - start_time_simplify_val).count() << " milliseconds." << std::endl;
-    printMesh(hlod_proxy_mesh, "Simplified HLOD Proxy");
-
-    std::cout << "\nREMINDER: This is a TOY IMPLEMENTATION. Quality and robustness are limited." << std::endl;
-    return 0;
-}
-#endif
 
 } // game_object
 } // engine
