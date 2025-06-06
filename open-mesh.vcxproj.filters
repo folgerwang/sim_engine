@@ -1,0 +1,115 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Source Files\Core">
+      <UniqueIdentifier>{bcb4da0d-3b2d-4da6-a28f-f0372fb8b8dc}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Core\IO">
+      <UniqueIdentifier>{ac39423e-ebb1-4dd7-8ac5-1438ddf8b953}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Core\IO\reader">
+      <UniqueIdentifier>{6cfcfedc-b825-43be-9b66-c6a5a3af5ee1}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Core\IO\writer">
+      <UniqueIdentifier>{8b796ac0-d65e-4a01-b6f0-9f96941322d9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Core\Mesh">
+      <UniqueIdentifier>{1d57395c-b678-4521-ae9f-3b3cc576248f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Core\System">
+      <UniqueIdentifier>{16a5c9a3-e69f-42af-81f5-847b9783d631}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Core\Utils">
+      <UniqueIdentifier>{c9e67e32-86a3-4743-abd8-dec8a7c5cf15}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\BaseWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\OBJWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\OFFWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\OMWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\PLYWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\STLWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\VTKWriter.cc">
+      <Filter>Source Files\Core\IO\writer</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\reader\BaseReader.cc">
+      <Filter>Source Files\Core\IO\reader</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\reader\OBJReader.cc">
+      <Filter>Source Files\Core\IO\reader</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\reader\OFFReader.cc">
+      <Filter>Source Files\Core\IO\reader</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\reader\OMReader.cc">
+      <Filter>Source Files\Core\IO\reader</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\reader\PLYReader.cc">
+      <Filter>Source Files\Core\IO\reader</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\reader\STLReader.cc">
+      <Filter>Source Files\Core\IO\reader</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\IOManager.cc">
+      <Filter>Source Files\Core\IO</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\OMFormat.cc">
+      <Filter>Source Files\Core\IO</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\BinaryHelper.cc">
+      <Filter>Source Files\Core\IO</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Mesh\ArrayKernel.cc">
+      <Filter>Source Files\Core\Mesh</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Mesh\BaseKernel.cc">
+      <Filter>Source Files\Core\Mesh</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Mesh\PolyConnectivity.cc">
+      <Filter>Source Files\Core\Mesh</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Mesh\TriConnectivity.cc">
+      <Filter>Source Files\Core\Mesh</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\System\omstream.cc">
+      <Filter>Source Files\Core\System</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\BaseProperty.cc">
+      <Filter>Source Files\Core\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\Endian.cc">
+      <Filter>Source Files\Core\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\PropertyCreator.cc">
+      <Filter>Source Files\Core\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\RandomNumberGenerator.cc">
+      <Filter>Source Files\Core\Utils</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>
