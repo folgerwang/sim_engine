@@ -22,7 +22,7 @@
 #include "third_parties/fbx/ufbx.h"
 
 static uint32_t num_draw_meshes = 0;
-#define DEBUG_OUTPUT 0
+#define DEBUG_OUTPUT 1
 
 namespace ego = engine::game_object;
 namespace engine {
@@ -46,6 +46,157 @@ size_t hashCombine(
         hash = hashCombine(hash, *(uint32_t*)(&items[i]));
     }
     return hash;
+}
+
+static uint32_t cacheVertexIndice(
+    std::unordered_map<size_t, uint32_t>& vertex_map,
+    std::vector<uint32_t>& indice_match_table,
+    const uint32_t num_items,
+    const float* vertex_data,
+    uint32_t src_vert_index) {
+
+    uint32_t new_indice = 0;
+    auto hash_value =
+        hashCombine(num_items, vertex_data);
+
+    auto it = vertex_map.find(hash_value);
+    if (it != vertex_map.end()) {
+        new_indice = it->second;
+    }
+    else {
+        auto new_index =
+            static_cast<uint32_t>(indice_match_table.size());
+        new_indice = new_index;
+        indice_match_table.push_back(src_vert_index);
+
+        vertex_map[hash_value] =
+            static_cast<uint32_t>(new_index);
+    }
+
+    return new_indice;
+}
+
+static int32_t getNewIndice(
+    std::vector<int32_t>& indice_match_table,
+    std::vector<int32_t>& org_vertex_indice_list,
+    uint32_t input_idx) {
+    if (indice_match_table[input_idx] < 0) {
+        indice_match_table[input_idx] =
+            int32_t(org_vertex_indice_list.size());
+        org_vertex_indice_list.push_back(input_idx);
+    }
+
+    return indice_match_table[input_idx];
+}
+
+static void packMeshPatchIndice(
+    helper::Mesh& output_mesh,
+    std::vector<int32_t>& org_vertex_indice_list,
+    const helper::Mesh& input_mesh) {
+    const auto& num_faces = input_mesh.faces_ptr->size();
+    const auto& num_vertex = input_mesh.vertex_data_ptr->size();
+
+    output_mesh.faces_ptr->resize(num_faces);
+    std::vector<int32_t> indice_match_table(num_vertex);
+    for (auto& indice : indice_match_table) {
+        indice = -1;
+    }
+
+    uint32_t face_index = 0;
+    org_vertex_indice_list.reserve(num_vertex);
+    for (const auto& face : *input_mesh.faces_ptr) {
+        auto& new_face = output_mesh.faces_ptr->at(face_index);
+        new_face = helper::Face(
+            getNewIndice(
+                indice_match_table,
+                org_vertex_indice_list,
+                face.v_indices[0]),
+            getNewIndice(
+                indice_match_table,
+                org_vertex_indice_list,
+                face.v_indices[1]),
+            getNewIndice(
+                indice_match_table,
+                org_vertex_indice_list,
+                face.v_indices[2]));
+        face_index++;
+    }
+}
+
+static void packMeshPatchVertex(
+    helper::Mesh& output_mesh,
+    const std::vector<int32_t>& org_vertex_indice_list,
+    const helper::Mesh& input_mesh) {
+
+    output_mesh.vertex_data_ptr->resize(org_vertex_indice_list.size());
+    for (uint32_t i = 0; i < org_vertex_indice_list.size(); i++) {
+        output_mesh.vertex_data_ptr->at(i) =
+            input_mesh.vertex_data_ptr->at(org_vertex_indice_list[i]);
+    }
+}
+
+static void packMeshPatch(
+    helper::Mesh& output_mesh,
+    const helper::Mesh& input_mesh) {
+    const auto& num_faces = input_mesh.faces_ptr->size();
+    const auto& num_vertex = input_mesh.vertex_data_ptr->size();
+
+    if (input_mesh.isValid() == false ||
+        output_mesh.isValid() == false) {
+        return;
+    }
+
+    std::vector<int32_t> org_vertex_indice_list;
+    packMeshPatchIndice(
+        output_mesh,
+        org_vertex_indice_list,
+        input_mesh);
+
+    packMeshPatchVertex(
+        output_mesh,
+        org_vertex_indice_list,
+        input_mesh);
+}
+
+static void mergeMeshPatch(
+    std::unordered_map<size_t, uint32_t>& vertex_map,
+    std::vector<uint32_t>& indice_match_table,
+    helper::Mesh& output_mesh,
+    const helper::Mesh& input_mesh) {
+
+    if (input_mesh.isValid() == false ||
+        output_mesh.isValid() == false) {
+        return;
+    }
+
+    helper::Mesh packed_input_mesh;
+    std::vector<int32_t> org_vertex_indice_list;
+    packMeshPatchIndice(
+        packed_input_mesh,
+        org_vertex_indice_list,
+        input_mesh);
+
+    std::vector<int32_t> new_indices(org_vertex_indice_list.size());
+    for (uint32_t i_indice = 0; i_indice < org_vertex_indice_list.size(); i_indice++) {
+        auto& cur_vertex = input_mesh.vertex_data_ptr->at(org_vertex_indice_list[i_indice]);
+        auto old_table_size = indice_match_table.size();
+        new_indices[i_indice] =
+            cacheVertexIndice(
+                vertex_map,
+                indice_match_table,
+                sizeof(cur_vertex) / sizeof(float),
+                &cur_vertex.position.x,
+                uint32_t(output_mesh.vertex_data_ptr->size()));
+        if (indice_match_table.size() > old_table_size) {
+            output_mesh.vertex_data_ptr->push_back(cur_vertex);
+        }
+    }
+
+    for (auto& face: *packed_input_mesh.faces_ptr) {
+        face.v_indices[0] = new_indices[face.v_indices[0]];
+        face.v_indices[1] = new_indices[face.v_indices[1]];
+        face.v_indices[2] = new_indices[face.v_indices[2]];
+    }
 }
 
 static std::string getFilePathExtension(const std::string& file_name) {
@@ -711,6 +862,8 @@ static void setupMesh(
     std::vector<float> vertex_data;
     vertex_data.reserve(20);
 
+    assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
+
     size_t num_traingles = 0;
     size_t num_indices = 0;
     bool has_bvh_trees = false;
@@ -747,10 +900,6 @@ static void setupMesh(
         ego::PrimitiveInfo primitive_info;
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
         primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
-
-        std::vector<int32_t> vertex_indices;
-        vertex_indices.reserve(part.num_faces * 3);
-
         for (int i_face = 0; i_face < part.num_faces; i_face++) {
             const auto& face_indice = part.face_indices[i_face];
             const auto& face = src_mesh->faces[face_indice];
@@ -758,7 +907,6 @@ static void setupMesh(
             for (uint32_t i_vert = 0; i_vert < face.num_indices; i_vert++) {
                 const auto src_vert_index = face.index_begin + i_vert;
                 auto pos_indice = src_mesh->vertex_position.indices[src_vert_index];
-                vertex_indices.push_back(pos_indice);
                 const auto& position = src_mesh->vertex_position.values[pos_indice];
                 auto position_packed = glm::vec3(position.x, position.y, position.z);
 
@@ -778,27 +926,20 @@ static void setupMesh(
                 const auto& uv = src_mesh->vertex_uv.values[uv_indice];
                 vertex_data.push_back(float(uv.x));
                 vertex_data.push_back(float(uv.y));
-                auto hash_value =
-                    hashCombine(
-                        static_cast<uint32_t>(vertex_data.size()),
-                        vertex_data.data());
 
-                auto it = vertex_map.find(hash_value);
-                if (it != vertex_map.end()) {
-                    new_indices.push_back(it->second);
-                }
-                else {
-                    auto new_index =
-                        static_cast<uint32_t>(indice_match_table.size());
-                    new_indices.push_back(new_index);
-                    indice_match_table.push_back(src_vert_index);
+                auto new_indice =
+                    cacheVertexIndice(
+                        vertex_map,
+                        indice_match_table,
+                        uint32_t(vertex_data.size()),
+                        vertex_data.data(),
+                        src_vert_index);
 
-                    vertex_map[hash_value] =
-                        static_cast<uint32_t>(new_index);
-                }
+                new_indices.push_back(new_indice);
             }
         }
 
+#if 0
         if (create_bvh_tree) {
             bool debug_mode = false;
 
@@ -807,9 +948,9 @@ static void setupMesh(
 
 #if DEBUG_OUTPUT
             std::cout << 
-                << ", mat part : " << i_part <<
-                ", num tris : " << vertex_indices.size() / 3
-                << std::endl;
+                ", mat part : " << i_part <<
+                ", num tris : " << vertex_indices.size() / 3 <<
+                std::endl;
 #else
             std::cout << std::endl;
 #endif
@@ -826,6 +967,7 @@ static void setupMesh(
 
             primitive_info.bvh_root_ = builder->getRoot();
         }
+#endif
 
         drawable_mesh.bbox_min_ =
             min(drawable_mesh.bbox_min_, primitive_info.bbox_min_);
@@ -852,8 +994,6 @@ static void setupMesh(
         vertex.uv = glm::vec2(uv.x, uv.y);
     }
 
-    assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
-
     // create HLOD
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
         lod_indice_info(helper::c_num_lods + 1);
@@ -875,7 +1015,7 @@ static void setupMesh(
         }
         for (int i_lod = 0; i_lod < helper::c_num_lods; i_lod++) {
 #if DEBUG_OUTPUT
-            std::cout << "start lod : " << i_lod + 1 << std::endl;
+            std::cout << "start lod : " << i_lod + 1 << ": ";
 #endif
             const auto& src_lod_indice_info = lod_indice_info[i_lod];
             auto& dst_lod_indice_info = lod_indice_info[i_lod + 1];
@@ -885,27 +1025,44 @@ static void setupMesh(
                 int32_t src_face_count = src_lod_indice_info[i_part].second;
                 int32_t target_face_count = std::max(int32_t(src_face_count * helper::c_target_lod_ratio), 1);
 
-                helper::Mesh input_mesh_const;
-                input_mesh_const.vertex_data_ptr = drawable_vertices;
-                input_mesh_const.faces_ptr = std::make_shared<std::vector<helper::Face>>();
-                input_mesh_const.faces_ptr->resize(src_face_count);
+                helper::Mesh input_mesh;
+                input_mesh.vertex_data_ptr = drawable_vertices;
+                input_mesh.faces_ptr = std::make_shared<std::vector<helper::Face>>();
+                input_mesh.faces_ptr->resize(src_face_count);
                 for (int32_t i = 0; i < src_face_count; i++) {
                     int32_t src_face_idx = src_face_start + i;
-                    input_mesh_const.faces_ptr->at(i) =
+                    input_mesh.faces_ptr->at(i) =
                         helper::Face(
                             new_indices[src_face_idx * 3 + 0],
                             new_indices[src_face_idx * 3 + 1],
                             new_indices[src_face_idx * 3 + 2]);
                 }
 
-                helper::Mesh mesh_lod =
-                    helper::simplifyMeshActualButVeryBasic(
-                        input_mesh_const,
-                        target_face_count,
-                        helper::c_sharp_edge_angle_threshold_degrees,
-                        helper::c_normal_weight,
-                        helper::c_uv_weight);
+                helper::Mesh compact_input_mesh;
+                packMeshPatch(
+                    compact_input_mesh,
+                    input_mesh);
+#if 0//DEBUG_OUTPUT
+                std::cout << ", part" << i_part <<
+                    ": faces : (" << compact_input_mesh.vertex_data_ptr->size() <<
+                    ", " << compact_input_mesh.faces_ptr->size() <<
+                    "/" << input_mesh.vertex_data_ptr->size() <<
+                    ", " << input_mesh.faces_ptr->size() << ") ";
+#endif
 
+                helper::Mesh mesh_lod;
+                helper::generateHLODWithSeamProtection(
+                    compact_input_mesh,
+                    mesh_lod,
+                    target_face_count,
+                    {});
+#if DEBUG_OUTPUT
+                std::cout << ", part" << i_part <<
+                    ": faces : (" << mesh_lod.vertex_data_ptr->size() <<
+                    ", " << mesh_lod.faces_ptr->size() <<
+                    "/" << compact_input_mesh.vertex_data_ptr->size() <<
+                    ", " << compact_input_mesh.faces_ptr->size() << ") ";
+#endif
                 uint32_t num_lod_vertex = uint32_t(mesh_lod.vertex_data_ptr->size());
                 uint32_t vertex_index_offset = uint32_t(drawable_vertices->size());
                 for (uint32_t i = 0; i < num_lod_vertex; i++) {
@@ -929,6 +1086,9 @@ static void setupMesh(
                 dst_lod_indice_info[i_part].second = num_faces;
                 face_idx_offset += num_faces;
             }
+#if DEBUG_OUTPUT
+            std::cout << std::endl;
+#endif
         }
     }
 
@@ -1720,7 +1880,7 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
+        uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -3295,7 +3455,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
-            uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
+            uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =

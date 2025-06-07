@@ -34,6 +34,12 @@
     <Filter Include="Source Files\Core\Utils">
       <UniqueIdentifier>{c9e67e32-86a3-4743-abd8-dec8a7c5cf15}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\Tools">
+      <UniqueIdentifier>{67b3b9a9-0bb3-43f5-a78a-f59063c22778}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Tools\Decimater">
+      <UniqueIdentifier>{fd4e147f-0ac2-433e-810a-a912eba2ca43}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\IO\writer\BaseWriter.cc">
@@ -110,6 +116,9 @@
     </ClCompile>
     <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\RandomNumberGenerator.cc">
       <Filter>Source Files\Core\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Tools\Decimater\Observer.cc">
+      <Filter>Source Files\Tools\Decimater</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

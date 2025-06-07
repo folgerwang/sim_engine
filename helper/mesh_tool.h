@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <map>
+#include <set>
 #include "renderer/renderer_structs.h"
 
 namespace engine {
@@ -53,32 +54,11 @@ struct Mesh {
     bool isValid() const { return vertex_data_ptr && faces_ptr; }
 };
 
-// --- Edge Structure for Simplification ---
-struct EdgeInternal {
-    uint32_t v1_idx, v2_idx;
-    float cost;
-    float length_sq_contrib;
-    float normal_penalty_contrib;
-    float uv_penalty_contrib;
-    bool is_sharp;
-
-    EdgeInternal(
-        uint32_t u_param,
-        uint32_t v_param,
-        const std::vector<VertexStruct>& all_vertex_data,
-        float normal_weight,
-        float uv_weight);
-
-    bool operator<(const EdgeInternal& other_edge) const;
-};
-
-// --- Forward declarations ---
-extern Mesh simplifyMeshActualButVeryBasic(
+extern void generateHLODWithSeamProtection(
     const Mesh& input_mesh,
-    int target_face_count,
-    float sharp_edge_angle_degrees,
-    float normal_similarity_weight,
-    float uv_distance_weight);
+    Mesh& output_mesh,
+    size_t target_face_count,
+    const std::set<uint32_t>& protected_vertex_indices);
 
 } // game_object
 } // engine

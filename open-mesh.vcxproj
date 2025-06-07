@@ -44,6 +44,7 @@
     <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\Endian.cc" />
     <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\PropertyCreator.cc" />
     <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Core\Utils\RandomNumberGenerator.cc" />
+    <ClCompile Include="third_parties\OpenMesh\src\OpenMesh\Tools\Decimater\Observer.cc" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
