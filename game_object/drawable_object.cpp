@@ -48,29 +48,30 @@ size_t hashCombine(
     return hash;
 }
 
+// Caches a vertex index based on a hash of its data. If the vertex data already exists in the map, returns the existing index.
+// Otherwise, adds the new vertex index to the match table and map, and returns the new index.
 static uint32_t cacheVertexIndice(
-    std::unordered_map<size_t, uint32_t>& vertex_map,
-    std::vector<uint32_t>& indice_match_table,
-    const uint32_t num_items,
-    const float* vertex_data,
-    uint32_t src_vert_index) {
-
+    std::unordered_map<size_t, uint32_t>& vertex_map,       // Map from vertex hash to index
+    std::vector<uint32_t>& indice_match_table,              // Table mapping new indices to source vertex indices
+    const uint32_t num_items,                               // Number of float items in the vertex data
+    const float* vertex_data,                               // Pointer to vertex data (float array)
+    uint32_t src_vert_index)                                // Source vertex index
+{
     uint32_t new_indice = 0;
-    auto hash_value =
-        hashCombine(num_items, vertex_data);
+    // Compute a hash value for the vertex data
+    auto hash_value = hashCombine(num_items, vertex_data);
 
+    // Check if this vertex data already exists in the map
     auto it = vertex_map.find(hash_value);
     if (it != vertex_map.end()) {
+        // Vertex already exists, use the existing index
         new_indice = it->second;
     }
     else {
-        auto new_index =
-            static_cast<uint32_t>(indice_match_table.size());
-        new_indice = new_index;
+        // Vertex is new, assign a new index and add to the match table and map
+        new_indice = static_cast<uint32_t>(indice_match_table.size());
         indice_match_table.push_back(src_vert_index);
-
-        vertex_map[hash_value] =
-            static_cast<uint32_t>(new_index);
+        vertex_map[hash_value] = static_cast<uint32_t>(new_indice);
     }
 
     return new_indice;
@@ -196,6 +197,7 @@ static void mergeMeshPatch(
         face.v_indices[0] = new_indices[face.v_indices[0]];
         face.v_indices[1] = new_indices[face.v_indices[1]];
         face.v_indices[2] = new_indices[face.v_indices[2]];
+        output_mesh.faces_ptr->push_back(face);
     }
 }
 
@@ -857,7 +859,7 @@ static void setupMesh(
     std::vector<uint32_t> new_indices;
     std::vector<uint32_t> indice_match_table;
     new_indices.reserve(src_mesh->num_indices * 3);
-    indice_match_table.reserve(src_mesh->num_indices);
+    indice_match_table.reserve(src_mesh->num_indices * 3);
 
     std::vector<float> vertex_data;
     vertex_data.reserve(20);
@@ -976,9 +978,19 @@ static void setupMesh(
         drawable_mesh.primitives_.push_back(primitive_info);
     }
 
-    auto drawable_vertices =
-        std::make_shared<std::vector<helper::VertexStruct>>();
-    drawable_vertices->reserve(indice_match_table.size() * 3);
+    helper::Mesh full_lod_meshes;
+    full_lod_meshes.vertex_data_ptr->reserve(indice_match_table.size() * 3);
+    full_lod_meshes.faces_ptr->reserve(src_mesh->num_indices);
+
+    for (uint32_t i_face = 0; i_face < new_indices.size() / 3; i_face++) {
+        full_lod_meshes.faces_ptr->push_back(
+            helper::Face(
+                new_indices[i_face * 3],
+                new_indices[i_face * 3 + 1],
+                new_indices[i_face * 3 + 2]));
+    }
+
+    auto& drawable_vertices = full_lod_meshes.vertex_data_ptr;
     for (int i_vert = 0; i_vert < indice_match_table.size(); i_vert++) {
         const uint32_t& src_vert_idx = indice_match_table[i_vert];
         drawable_vertices->emplace_back();
@@ -1030,12 +1042,8 @@ static void setupMesh(
                 input_mesh.faces_ptr = std::make_shared<std::vector<helper::Face>>();
                 input_mesh.faces_ptr->resize(src_face_count);
                 for (int32_t i = 0; i < src_face_count; i++) {
-                    int32_t src_face_idx = src_face_start + i;
                     input_mesh.faces_ptr->at(i) =
-                        helper::Face(
-                            new_indices[src_face_idx * 3 + 0],
-                            new_indices[src_face_idx * 3 + 1],
-                            new_indices[src_face_idx * 3 + 2]);
+                        full_lod_meshes.faces_ptr->at(src_face_start + i);
                 }
 
                 helper::Mesh compact_input_mesh;
@@ -1063,33 +1071,30 @@ static void setupMesh(
                     "/" << compact_input_mesh.vertex_data_ptr->size() <<
                     ", " << compact_input_mesh.faces_ptr->size() << ") ";
 #endif
-                uint32_t num_lod_vertex = uint32_t(mesh_lod.vertex_data_ptr->size());
-                uint32_t vertex_index_offset = uint32_t(drawable_vertices->size());
-                for (uint32_t i = 0; i < num_lod_vertex; i++) {
-                    drawable_vertices->push_back(mesh_lod.vertex_data_ptr->at(i));
-                }
-                
-                auto num_faces = uint32_t(mesh_lod.faces_ptr->size());
-                for (uint32_t i = 0; i < num_faces; i++) {
-                    auto idx0 = mesh_lod.faces_ptr->at(i).v_indices[0];
-                    auto idx1 = mesh_lod.faces_ptr->at(i).v_indices[1];
-                    auto idx2 = mesh_lod.faces_ptr->at(i).v_indices[2];
-                    assert(idx0 < num_lod_vertex);
-                    assert(idx1 < num_lod_vertex);
-                    assert(idx2 < num_lod_vertex);
-                    new_indices.push_back(vertex_index_offset + idx0);
-                    new_indices.push_back(vertex_index_offset + idx1);
-                    new_indices.push_back(vertex_index_offset + idx2);
-                }
+                mergeMeshPatch(
+                    vertex_map,
+                    indice_match_table,
+                    full_lod_meshes,
+                    mesh_lod);
 
+                uint32_t lod_faces_num = uint32_t(mesh_lod.faces_ptr->size());
                 dst_lod_indice_info[i_part].first = face_idx_offset;
-                dst_lod_indice_info[i_part].second = num_faces;
-                face_idx_offset += num_faces;
+                dst_lod_indice_info[i_part].second = lod_faces_num;
+                face_idx_offset += lod_faces_num;
             }
 #if DEBUG_OUTPUT
             std::cout << std::endl;
 #endif
         }
+    }
+
+    for (uint32_t i_face = uint32_t(new_indices.size()) / 3;
+        i_face < uint32_t(full_lod_meshes.faces_ptr->size());
+        i_face++) {
+        const auto& face = full_lod_meshes.faces_ptr->at(i_face);
+        new_indices.push_back(face.v_indices[0]);
+        new_indices.push_back(face.v_indices[1]);
+        new_indices.push_back(face.v_indices[2]);
     }
 
     renderer::Helper::createBuffer(
@@ -1880,7 +1885,7 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
+        uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -3455,7 +3460,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
-            uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
+            uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =
