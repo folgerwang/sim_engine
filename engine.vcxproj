@@ -261,11 +261,11 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>F:\work\procedure-world-sim\realworld\src\sim_engine\third_parties\OpenMesh\src;$(IncludePath)</IncludePath>
+    <IncludePath>$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>F:\work\procedure-world-sim\realworld\src\sim_engine\third_parties\OpenMesh\src;$(IncludePath)</IncludePath>
+    <IncludePath>$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -310,7 +310,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_parties\imgui;$(ProjectDir)third_parties\glfw\include;$(ProjectDir)third_parties\glm;$(ProjectDir)third_parties\Vulkan-Headers\Include;$(ProjectDir)third_parties\tinygltf;$(ProjectDir)third_parties\imgui\backends;$(ProjectDir)shaders;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_parties\OpenMesh\src;$(ProjectDir)third_parties\imgui;$(ProjectDir)third_parties\glfw\include;$(ProjectDir)third_parties\glm;$(ProjectDir)third_parties\Vulkan-Headers\Include;$(ProjectDir)third_parties\tinygltf;$(ProjectDir)third_parties\imgui\backends;$(ProjectDir)shaders;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
@@ -333,7 +333,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_parties\imgui;$(ProjectDir)third_parties\glfw\include;$(ProjectDir)third_parties\glm;$(ProjectDir)third_parties\Vulkan-Headers\Include;$(ProjectDir)third_parties\tinygltf;$(ProjectDir)third_parties\imgui\backends;$(ProjectDir)shaders;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_parties\OpenMesh\src;$(ProjectDir)third_parties\imgui;$(ProjectDir)third_parties\glfw\include;$(ProjectDir)third_parties\glm;$(ProjectDir)third_parties\Vulkan-Headers\Include;$(ProjectDir)third_parties\tinygltf;$(ProjectDir)third_parties\imgui\backends;$(ProjectDir)shaders;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
