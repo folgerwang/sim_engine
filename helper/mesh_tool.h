@@ -30,8 +30,7 @@ struct VertexStruct {
 // --- Face Structure ---
 struct Face {
     uint32_t v_indices[3];
-    bool active = true;
-    Face(unsigned int v0 = 0, unsigned int v1 = 0, unsigned int v2 = 0) : active(true) {
+    Face(uint32_t v0 = 0, uint32_t v1 = 0, uint32_t v2 = 0) {
         v_indices[0] = v0; v_indices[1] = v1; v_indices[2] = v2;
     }
     // RENAMED

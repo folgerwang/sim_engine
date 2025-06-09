@@ -47,6 +47,7 @@ void generateHLODWithSeamProtection(
     // ... (Initial checks and mesh conversion logic remain the same) ...
     if (!input_mesh.isValid() || input_mesh.getFaceCount() == 0) { return; }
     if (target_face_count >= input_mesh.getFaceCount()) { output_mesh = input_mesh; return; }
+
     MyMesh om_mesh;
     om_mesh.request_vertex_status();
     om_mesh.request_edge_status();

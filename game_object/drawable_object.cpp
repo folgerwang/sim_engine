@@ -966,7 +966,7 @@ static void setupMesh(
                     cacheVertexIndice(
                         vertex_map,
                         indice_match_table,
-                        uint32_t(sizeof(vertex_data)),
+                        sizeof(vertex_data) / sizeof(float),
                         &vertex_data.position.x,
                         src_vert_index);
 
@@ -1099,6 +1099,7 @@ static void setupMesh(
                     {});
 #if DEBUG_OUTPUT
                 std::cout << ", part" << i_part <<
+                    ", target : " << target_face_count <<
                     ": faces : (" << mesh_lod.vertex_data_ptr->size() <<
                     ", " << mesh_lod.faces_ptr->size() <<
                     "/" << compact_input_mesh.vertex_data_ptr->size() <<
@@ -1918,7 +1919,7 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        uint32_t cur_lod = std::min(2u, uint32_t(prim.index_desc_.size() - 1));
+        uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -3493,7 +3494,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
-            uint32_t cur_lod = std::min(2u, uint32_t(prim.index_desc_.size() - 1));
+            uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =
