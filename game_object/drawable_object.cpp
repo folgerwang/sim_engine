@@ -77,19 +77,29 @@ static uint32_t cacheVertexIndice(
     return new_indice;
 }
 
+// Returns the new or existing index for a given input vertex index, updating the match table and original index list as needed.
 static int32_t getNewIndice(
-    std::vector<int32_t>& indice_match_table,
-    std::vector<int32_t>& org_vertex_indice_list,
-    uint32_t input_idx) {
+    std::vector<int32_t>& indice_match_table,      // Table mapping input indices to new indices
+    std::vector<int32_t>& org_vertex_indice_list,  // List of original vertex indices in order of new indices
+    uint32_t input_idx)                            // The input vertex index to map
+{
+    // If this input index hasn't been assigned a new index yet
     if (indice_match_table[input_idx] < 0) {
+        // Assign the next available new index
         indice_match_table[input_idx] =
             int32_t(org_vertex_indice_list.size());
+        // Store the original input index in the list
         org_vertex_indice_list.push_back(input_idx);
     }
 
+    // Return the new index for this input index
     return indice_match_table[input_idx];
 }
 
+// Packs mesh indices: remaps input mesh vertex indices to a compacted list and updates faces accordingly.
+// - output_mesh: mesh to write packed indices into
+// - org_vertex_indice_list: output list of original vertex indices in new order
+// - input_mesh: mesh to read from
 static void packMeshPatchIndice(
     helper::Mesh& output_mesh,
     std::vector<int32_t>& org_vertex_indice_list,
@@ -107,6 +117,7 @@ static void packMeshPatchIndice(
     org_vertex_indice_list.reserve(num_vertex);
     for (const auto& face : *input_mesh.faces_ptr) {
         auto& new_face = output_mesh.faces_ptr->at(face_index);
+        // Remap each vertex index in the face to a new compacted index
         new_face = helper::Face(
             getNewIndice(
                 indice_match_table,
@@ -124,6 +135,10 @@ static void packMeshPatchIndice(
     }
 }
 
+// Packs mesh vertices: copies only the used vertices in the new order into output_mesh.
+// - output_mesh: mesh to write packed vertices into
+// - org_vertex_indice_list: list of original vertex indices in new order
+// - input_mesh: mesh to read from
 static void packMeshPatchVertex(
     helper::Mesh& output_mesh,
     const std::vector<int32_t>& org_vertex_indice_list,
@@ -136,6 +151,9 @@ static void packMeshPatchVertex(
     }
 }
 
+// Packs a mesh by compacting its vertices and remapping faces to the new indices.
+// - output_mesh: mesh to write packed data into
+// - input_mesh: mesh to read from
 static void packMeshPatch(
     helper::Mesh& output_mesh,
     const helper::Mesh& input_mesh) {
@@ -148,17 +166,24 @@ static void packMeshPatch(
     }
 
     std::vector<int32_t> org_vertex_indice_list;
+    // Remap indices and collect used vertex indices
     packMeshPatchIndice(
         output_mesh,
         org_vertex_indice_list,
         input_mesh);
 
+    // Copy only used vertices in new order
     packMeshPatchVertex(
         output_mesh,
         org_vertex_indice_list,
         input_mesh);
 }
 
+// Merges a mesh patch into an output mesh, deduplicating vertices and remapping indices.
+// - vertex_map: hash map for deduplicating vertices
+// - indice_match_table: table mapping new indices to source vertex indices
+// - output_mesh: mesh to merge into
+// - input_mesh: mesh patch to merge
 static void mergeMeshPatch(
     std::unordered_map<size_t, uint32_t>& vertex_map,
     std::vector<uint32_t>& indice_match_table,
@@ -170,6 +195,7 @@ static void mergeMeshPatch(
         return;
     }
 
+    // Pack input mesh to remove unused vertices and remap indices
     helper::Mesh packed_input_mesh;
     std::vector<int32_t> org_vertex_indice_list;
     packMeshPatchIndice(
@@ -177,27 +203,31 @@ static void mergeMeshPatch(
         org_vertex_indice_list,
         input_mesh);
 
-    std::vector<int32_t> new_indices(org_vertex_indice_list.size());
+    // For each packed vertex, deduplicate and add to output mesh if new
+    std::vector<int32_t> deduped_vertex_indices(org_vertex_indice_list.size());
     for (uint32_t i_indice = 0; i_indice < org_vertex_indice_list.size(); i_indice++) {
         auto& cur_vertex = input_mesh.vertex_data_ptr->at(org_vertex_indice_list[i_indice]);
         auto old_table_size = indice_match_table.size();
-        new_indices[i_indice] =
+        deduped_vertex_indices[i_indice] =
             cacheVertexIndice(
                 vertex_map,
                 indice_match_table,
                 sizeof(cur_vertex) / sizeof(float),
                 &cur_vertex.position.x,
                 uint32_t(output_mesh.vertex_data_ptr->size()));
+        // When vertex is not in cache, add new vertex to vertex buffer.
         if (indice_match_table.size() > old_table_size) {
             output_mesh.vertex_data_ptr->push_back(cur_vertex);
         }
     }
 
+    // Remap face indices to new deduplicated indices and add to output mesh
     for (auto& face: *packed_input_mesh.faces_ptr) {
-        face.v_indices[0] = new_indices[face.v_indices[0]];
-        face.v_indices[1] = new_indices[face.v_indices[1]];
-        face.v_indices[2] = new_indices[face.v_indices[2]];
-        output_mesh.faces_ptr->push_back(face);
+        output_mesh.faces_ptr->push_back(
+            helper::Face(
+                deduped_vertex_indices[face.v_indices[0]],
+                deduped_vertex_indices[face.v_indices[1]],
+                deduped_vertex_indices[face.v_indices[2]]));
     }
 }
 
@@ -861,9 +891,7 @@ static void setupMesh(
     new_indices.reserve(src_mesh->num_indices * 3);
     indice_match_table.reserve(src_mesh->num_indices * 3);
 
-    std::vector<float> vertex_data;
-    vertex_data.reserve(20);
-
+    helper::VertexStruct vertex_data;
     assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
 
     size_t num_traingles = 0;
@@ -915,26 +943,31 @@ static void setupMesh(
                 primitive_info.bbox_min_ = glm::min(primitive_info.bbox_min_, position_packed);
                 primitive_info.bbox_max_ = glm::max(primitive_info.bbox_max_, position_packed);
 
-                vertex_data.clear();
-                vertex_data.push_back(float(position.x));
-                vertex_data.push_back(float(position.y));
-                vertex_data.push_back(float(position.z));
+                vertex_data.position =
+                    glm::vec3(
+                        float(position.x),
+                        float(position.y),
+                        float(position.z));
                 auto norm_indice = src_mesh->vertex_normal.indices[src_vert_index];
                 const auto& normal = src_mesh->vertex_normal.values[norm_indice];
-                vertex_data.push_back(float(normal.x));
-                vertex_data.push_back(float(normal.y));
-                vertex_data.push_back(float(normal.z));
+                vertex_data.normal =
+                    glm::vec3(
+                        float(normal.x),
+                        float(normal.y),
+                        float(normal.z));
                 auto uv_indice = src_mesh->vertex_uv.indices[src_vert_index];
                 const auto& uv = src_mesh->vertex_uv.values[uv_indice];
-                vertex_data.push_back(float(uv.x));
-                vertex_data.push_back(float(uv.y));
+                vertex_data.uv =
+                    glm::vec2(
+                        float(uv.x),
+                        float(uv.y));
 
                 auto new_indice =
                     cacheVertexIndice(
                         vertex_map,
                         indice_match_table,
-                        uint32_t(vertex_data.size()),
-                        vertex_data.data(),
+                        uint32_t(sizeof(vertex_data)),
+                        &vertex_data.position.x,
                         src_vert_index);
 
                 new_indices.push_back(new_indice);
@@ -1885,7 +1918,7 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
+        uint32_t cur_lod = std::min(2u, uint32_t(prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -3460,7 +3493,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
-            uint32_t cur_lod = std::min(0u, uint32_t(prim.index_desc_.size() - 1));
+            uint32_t cur_lod = std::min(2u, uint32_t(prim.index_desc_.size() - 1));
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =
