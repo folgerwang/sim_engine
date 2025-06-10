@@ -23,55 +23,92 @@
 
 static uint32_t num_draw_meshes = 0;
 #define DEBUG_OUTPUT 1
+#define HASH_CHECK 0
 
 namespace ego = engine::game_object;
 namespace engine {
 
 namespace {
 
+struct VertexHashInfo {
+    uint32_t indice;
+#if HASH_CHECK
+    helper::VertexStruct vertex;
+#endif
+};
+
+
 size_t hashCombine(
     size_t seed,
     size_t value) {
-    seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-    return seed;
+    // A variation based on Boost and CityHash
+    const uint64_t kMul = 0x9ddfea08eb382d69ULL;
+    uint64_t a = (value ^ seed) * kMul;
+    a ^= (a >> 47);
+    uint64_t b = (seed ^ a) * kMul;
+    b ^= (b >> 47);
+    b *= kMul;
+    return b;
 }
 
 size_t hashCombine(
-    const uint32_t num_items,
-    const float* items) {
-    size_t hash = 0;
+    const helper::VertexStruct& vertex) {
+    uint64_t t0 =
+        ((uint64_t)(*(uint32_t*)(&vertex.position.x)) << 32) |
+        (uint64_t)(*(uint32_t*)(&vertex.normal.z));
+    uint64_t t1 =
+        ((uint64_t)(*(uint32_t*)(&vertex.position.y)) << 32) |
+        (uint64_t)(*(uint32_t*)(&vertex.uv.x));
+    uint64_t t2 =
+        ((uint64_t)(*(uint32_t*)(&vertex.normal.y)) << 32) |
+        (uint64_t)(*(uint32_t*)(&vertex.uv.y));
+    uint64_t t3 =
+        ((uint64_t)(*(uint32_t*)(&vertex.position.z)) << 32) |
+        (uint64_t)(*(uint32_t*)(&vertex.normal.x));
 
-    // Quantize and hash position
-    for (uint32_t i = 0; i < num_items; i++) {
-        hash = hashCombine(hash, *(uint32_t*)(&items[i]));
-    }
+    size_t hash = hashCombine(0, t0);
+    hash = hashCombine(hash, t1);
+    hash = hashCombine(hash, t2);
+    hash = hashCombine(hash, t3);
     return hash;
 }
 
 // Caches a vertex index based on a hash of its data. If the vertex data already exists in the map, returns the existing index.
 // Otherwise, adds the new vertex index to the match table and map, and returns the new index.
 static uint32_t cacheVertexIndice(
-    std::unordered_map<size_t, uint32_t>& vertex_map,       // Map from vertex hash to index
+    std::unordered_map<size_t, VertexHashInfo>& vertex_map,       // Map from vertex hash to index
     std::vector<uint32_t>& indice_match_table,              // Table mapping new indices to source vertex indices
-    const uint32_t num_items,                               // Number of float items in the vertex data
-    const float* vertex_data,                               // Pointer to vertex data (float array)
+    const helper::VertexStruct& vertex_data,                               // Pointer to vertex data (float array)
     uint32_t src_vert_index)                                // Source vertex index
 {
     uint32_t new_indice = 0;
     // Compute a hash value for the vertex data
-    auto hash_value = hashCombine(num_items, vertex_data);
+    auto hash_value = hashCombine(vertex_data);
 
     // Check if this vertex data already exists in the map
     auto it = vertex_map.find(hash_value);
     if (it != vertex_map.end()) {
         // Vertex already exists, use the existing index
-        new_indice = it->second;
+        new_indice = it->second.indice;
+#if HASH_CHECK
+        assert(vertex_data.position.x == it->second.vertex.position.x);
+        assert(vertex_data.position.y == it->second.vertex.position.y);
+        assert(vertex_data.position.z == it->second.vertex.position.z);
+        assert(vertex_data.normal.x == it->second.vertex.normal.x);
+        assert(vertex_data.normal.y == it->second.vertex.normal.y);
+        assert(vertex_data.normal.z == it->second.vertex.normal.z);
+        assert(vertex_data.uv.x == it->second.vertex.uv.x);
+        assert(vertex_data.uv.y == it->second.vertex.uv.y);
+#endif
     }
     else {
         // Vertex is new, assign a new index and add to the match table and map
         new_indice = static_cast<uint32_t>(indice_match_table.size());
         indice_match_table.push_back(src_vert_index);
-        vertex_map[hash_value] = static_cast<uint32_t>(new_indice);
+#if HASH_CHECK
+        vertex_map[hash_value].vertex = vertex_data;
+#endif
+        vertex_map[hash_value].indice = static_cast<uint32_t>(new_indice);
     }
 
     return new_indice;
@@ -185,7 +222,7 @@ static void packMeshPatch(
 // - output_mesh: mesh to merge into
 // - input_mesh: mesh patch to merge
 static void mergeMeshPatch(
-    std::unordered_map<size_t, uint32_t>& vertex_map,
+    std::unordered_map<size_t, VertexHashInfo>& vertex_map,
     std::vector<uint32_t>& indice_match_table,
     helper::Mesh& output_mesh,
     const helper::Mesh& input_mesh) {
@@ -212,8 +249,7 @@ static void mergeMeshPatch(
             cacheVertexIndice(
                 vertex_map,
                 indice_match_table,
-                sizeof(cur_vertex) / sizeof(float),
-                &cur_vertex.position.x,
+                cur_vertex,
                 uint32_t(output_mesh.vertex_data_ptr->size()));
         // When vertex is not in cache, add new vertex to vertex buffer.
         if (indice_match_table.size() > old_table_size) {
@@ -885,7 +921,7 @@ static void setupMesh(
         vertex_position[i].z = float_t(src_mesh->vertex_position[i].z);
     }
 
-    std::unordered_map<size_t, uint32_t> vertex_map;
+    std::unordered_map<size_t, VertexHashInfo> vertex_map;
     std::vector<uint32_t> new_indices;
     std::vector<uint32_t> indice_match_table;
     new_indices.reserve(src_mesh->num_indices * 3);
@@ -966,8 +1002,7 @@ static void setupMesh(
                     cacheVertexIndice(
                         vertex_map,
                         indice_match_table,
-                        sizeof(vertex_data) / sizeof(float),
-                        &vertex_data.position.x,
+                        vertex_data,
                         src_vert_index);
 
                 new_indices.push_back(new_indice);
