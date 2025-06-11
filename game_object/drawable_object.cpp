@@ -116,21 +116,21 @@ static uint32_t cacheVertexIndice(
 
 // Returns the new or existing index for a given input vertex index, updating the match table and original index list as needed.
 static int32_t getNewIndice(
-    std::vector<int32_t>& indice_match_table,      // Table mapping input indices to new indices
+    std::vector<int32_t>& remap_table,      // Table mapping input indices to new indices
     std::vector<int32_t>& org_vertex_indice_list,  // List of original vertex indices in order of new indices
     uint32_t input_idx)                            // The input vertex index to map
 {
     // If this input index hasn't been assigned a new index yet
-    if (indice_match_table[input_idx] < 0) {
+    if (remap_table[input_idx] < 0) {
         // Assign the next available new index
-        indice_match_table[input_idx] =
+        remap_table[input_idx] =
             int32_t(org_vertex_indice_list.size());
         // Store the original input index in the list
         org_vertex_indice_list.push_back(input_idx);
     }
 
     // Return the new index for this input index
-    return indice_match_table[input_idx];
+    return remap_table[input_idx];
 }
 
 // Packs mesh indices: remaps input mesh vertex indices to a compacted list and updates faces accordingly.
@@ -139,36 +139,36 @@ static int32_t getNewIndice(
 // - input_mesh: mesh to read from
 static void packMeshPatchIndice(
     helper::Mesh& output_mesh,
-    std::vector<int32_t>& org_vertex_indice_list,
-    const helper::Mesh& input_mesh) {
+    const helper::Mesh& input_mesh,
+    std::vector<int32_t>& org_vertex_indice_list) {
     const auto& num_faces = input_mesh.faces_ptr->size();
     const auto& num_vertex = input_mesh.vertex_data_ptr->size();
 
     output_mesh.faces_ptr->resize(num_faces);
-    std::vector<int32_t> indice_match_table(num_vertex);
-    for (auto& indice : indice_match_table) {
-        indice = -1;
+    std::vector<int32_t> remap_table(num_vertex);
+    for (auto& idx : remap_table) {
+        idx = -1;
     }
 
-    uint32_t face_index = 0;
     org_vertex_indice_list.reserve(num_vertex);
-    for (const auto& face : *input_mesh.faces_ptr) {
-        auto& new_face = output_mesh.faces_ptr->at(face_index);
+    for (auto i_face = 0; i_face < num_faces; i_face++) {
+        const auto& src_face = input_mesh.faces_ptr->at(i_face);
+        auto& dest_face = output_mesh.faces_ptr->at(i_face);
         // Remap each vertex index in the face to a new compacted index
-        new_face = helper::Face(
+        dest_face = helper::Face(
             getNewIndice(
-                indice_match_table,
+                remap_table,
                 org_vertex_indice_list,
-                face.v_indices[0]),
+                src_face.v_indices[0]),
             getNewIndice(
-                indice_match_table,
+                remap_table,
                 org_vertex_indice_list,
-                face.v_indices[1]),
+                src_face.v_indices[1]),
             getNewIndice(
-                indice_match_table,
+                remap_table,
                 org_vertex_indice_list,
-                face.v_indices[2]));
-        face_index++;
+                src_face.v_indices[2]));
+
     }
 }
 
@@ -178,13 +178,14 @@ static void packMeshPatchIndice(
 // - input_mesh: mesh to read from
 static void packMeshPatchVertex(
     helper::Mesh& output_mesh,
-    const std::vector<int32_t>& org_vertex_indice_list,
-    const helper::Mesh& input_mesh) {
+    const helper::Mesh& input_mesh,
+    const std::vector<int32_t>& org_vertex_indice_list) {
 
-    output_mesh.vertex_data_ptr->resize(org_vertex_indice_list.size());
-    for (uint32_t i = 0; i < org_vertex_indice_list.size(); i++) {
-        output_mesh.vertex_data_ptr->at(i) =
-            input_mesh.vertex_data_ptr->at(org_vertex_indice_list[i]);
+    const auto& num_vertex = org_vertex_indice_list.size();
+    output_mesh.vertex_data_ptr->resize(num_vertex);
+    for (uint32_t i_vert = 0; i_vert < num_vertex; i_vert++) {
+        output_mesh.vertex_data_ptr->at(i_vert) =
+            input_mesh.vertex_data_ptr->at(org_vertex_indice_list[i_vert]);
     }
 }
 
@@ -206,14 +207,14 @@ static void packMeshPatch(
     // Remap indices and collect used vertex indices
     packMeshPatchIndice(
         output_mesh,
-        org_vertex_indice_list,
-        input_mesh);
+        input_mesh,
+        org_vertex_indice_list);
 
     // Copy only used vertices in new order
     packMeshPatchVertex(
         output_mesh,
-        org_vertex_indice_list,
-        input_mesh);
+        input_mesh,
+        org_vertex_indice_list);
 }
 
 // Merges a mesh patch into an output mesh, deduplicating vertices and remapping indices.
@@ -222,10 +223,10 @@ static void packMeshPatch(
 // - output_mesh: mesh to merge into
 // - input_mesh: mesh patch to merge
 static void mergeMeshPatch(
-    std::unordered_map<size_t, VertexHashInfo>& vertex_map,
-    std::vector<uint32_t>& indice_match_table,
     helper::Mesh& output_mesh,
-    const helper::Mesh& input_mesh) {
+    const helper::Mesh& input_mesh,
+    std::unordered_map<size_t, VertexHashInfo>& vertex_map,
+    std::vector<uint32_t>& indice_match_table) {
 
     if (input_mesh.isValid() == false ||
         output_mesh.isValid() == false) {
@@ -237,8 +238,8 @@ static void mergeMeshPatch(
     std::vector<int32_t> org_vertex_indice_list;
     packMeshPatchIndice(
         packed_input_mesh,
-        org_vertex_indice_list,
-        input_mesh);
+        input_mesh,
+        org_vertex_indice_list);
 
     // For each packed vertex, deduplicate and add to output mesh if new
     std::vector<int32_t> deduped_vertex_indices(org_vertex_indice_list.size());
@@ -1141,10 +1142,10 @@ static void setupMesh(
                     ", " << compact_input_mesh.faces_ptr->size() << ") ";
 #endif
                 mergeMeshPatch(
-                    vertex_map,
-                    indice_match_table,
                     full_lod_meshes,
-                    mesh_lod);
+                    mesh_lod,
+                    vertex_map,
+                    indice_match_table);
 
                 uint32_t lod_faces_num = uint32_t(mesh_lod.faces_ptr->size());
                 dst_lod_indice_info[i_part].first = face_idx_offset;
