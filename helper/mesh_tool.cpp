@@ -3,6 +3,7 @@
 #include <OpenMesh/Core/IO/MeshIO.hh>
 #include <OpenMesh/Tools/Decimater/DecimaterT.hh>
 #include <OpenMesh/Tools/Decimater/ModQuadricT.hh>
+#include <OpenMesh/Tools/Decimater/ModNormalFlippingT.hh>
 #include "mesh_tool.h"
 
 namespace engine {
@@ -84,6 +85,17 @@ void generateHLODWithSeamProtection(
 
     // Register the module using the 'add' function found in BaseDecimaterT.hh
     decimater.add(quadric_handle); // This will create the module and populate the handle.
+
+    // 2. Define a handle for the normal flipping module (to preserve features)
+    OpenMesh::Decimater::ModHandleT<OpenMesh::Decimater::ModNormalFlippingT<MyMesh>> normal_flipping_handle;
+    decimater.add(normal_flipping_handle); //
+
+    // --- Configuration ---
+
+    // Configure the normal flipping module
+    // This tells the decimater to forbid any collapse that would change a face's
+    // normal by more than 30 degrees. This is very effective at keeping sharp edges.
+    decimater.module(normal_flipping_handle).set_max_normal_deviation(30.0f); //
 
     // Initialize the decimater. This should now succeed.
     decimater.initialize(); //
