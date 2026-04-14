@@ -1,4 +1,7 @@
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <limits>
 #include <algorithm>
 #include <stdexcept>
@@ -900,7 +903,8 @@ static void setupMesh(
     const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
     std::shared_ptr<ego::DrawableData>& drawable_object,
-    const uint32_t& mesh_idx) {
+    const uint32_t& mesh_idx,
+    std::ostringstream& log_buf) {
 
     auto vertex_buffer_idx = mesh_idx * 2;
     auto indice_buffer_idx = mesh_idx * 2 + 1;
@@ -1080,8 +1084,8 @@ static void setupMesh(
         lod_indice_info(helper::c_num_lods + 1);
     {
 #if DEBUG_OUTPUT
-        std::cout << "====================" << std::endl;
-        std::cout << "mesh idx : " << mesh_idx
+        log_buf << "====================" << std::endl;
+        log_buf << "mesh idx : " << mesh_idx
             << "/" << fbx_scene->meshes.count
             << ", num tris : " << new_indices.size() / 3
             << std::endl;
@@ -1096,7 +1100,7 @@ static void setupMesh(
         }
         for (int i_lod = 0; i_lod < helper::c_num_lods; i_lod++) {
 #if DEBUG_OUTPUT
-            std::cout << "start lod : " << i_lod + 1 << ": ";
+            log_buf << "start lod : " << i_lod + 1 << ": ";
 #endif
             const auto& src_lod_indice_info = lod_indice_info[i_lod];
             auto& dst_lod_indice_info = lod_indice_info[i_lod + 1];
@@ -1132,9 +1136,10 @@ static void setupMesh(
                     compact_input_mesh,
                     mesh_lod,
                     target_face_count,
-                    {});
+                    {},
+                    log_buf);
 #if DEBUG_OUTPUT
-                std::cout << ", part" << i_part <<
+                log_buf << ", part" << i_part <<
                     ", target : " << target_face_count <<
                     ": faces : (" << mesh_lod.vertex_data_ptr->size() <<
                     ", " << mesh_lod.faces_ptr->size() <<
@@ -1153,7 +1158,7 @@ static void setupMesh(
                 face_idx_offset += lod_faces_num;
             }
 #if DEBUG_OUTPUT
-            std::cout << std::endl;
+            log_buf << std::endl;
 #endif
         }
     }
@@ -1353,12 +1358,13 @@ static void setupMesh(
 static void setupMeshes(
     const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
-    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object,
+    std::ostringstream& log_buf) {
     drawable_object->meshes_.resize(fbx_scene->meshes.count);
     drawable_object->buffers_.resize(fbx_scene->meshes.count * 2);
     drawable_object->buffer_views_.resize(fbx_scene->meshes.count * 4);
     for (int i_mesh = 0; i_mesh < fbx_scene->meshes.count; i_mesh++) {
-        setupMesh(device, fbx_scene, drawable_object, i_mesh);
+        setupMesh(device, fbx_scene, drawable_object, i_mesh, log_buf);
     }
 }
 
@@ -3488,7 +3494,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     drawable_object->m_flip_v_ = true;
 
     setupMeshState(device, fbx_scene, drawable_object);
-    setupMeshes(device, fbx_scene, drawable_object);
+    std::ostringstream log_buf;
+    setupMeshes(device, fbx_scene, drawable_object, log_buf);
 //    setupAnimations(model, drawable_object);
 //    setupSkins(device, model, drawable_object);
     setupNodes(fbx_scene, drawable_object);
@@ -3500,6 +3507,25 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     }
 
     ufbx_free_scene(fbx_scene);
+
+    // Write LOD generation log to a timestamped file.
+    {
+        auto now = std::chrono::system_clock::now();
+        auto time_t_val = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_info{};
+#ifdef _WIN32
+        localtime_s(&tm_info, &time_t_val);
+#else
+        localtime_r(&time_t_val, &tm_info);
+#endif
+        std::ostringstream filename_ss;
+        filename_ss << "logs/" << std::put_time(&tm_info, "%Y-%m-%d_%H-%M-%S") << ".log";
+        std::filesystem::create_directories("logs");
+        std::ofstream log_file(filename_ss.str());
+        if (log_file.is_open()) {
+            log_file << log_buf.str();
+        }
+    }
 
     drawable_object->m_use_local_matrix_only_ = true;
 

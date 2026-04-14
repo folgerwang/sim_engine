@@ -63,7 +63,8 @@ extern void generateHLODWithSeamProtection(
     const Mesh& input_mesh,
     Mesh& output_mesh,
     size_t target_face_count,
-    const std::set<uint32_t>& protected_vertex_indices);
+    const std::set<uint32_t>& protected_vertex_indices,
+    std::ostream& log);
 
 } // game_object
 } // engine

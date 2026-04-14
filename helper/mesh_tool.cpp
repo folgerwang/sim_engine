@@ -1,4 +1,6 @@
 #include <stack>
+#include <map>
+#include <tuple>
 #include <OpenMesh/Core/Mesh/TriMesh_ArrayKernelT.hh>
 #include <OpenMesh/Core/IO/MeshIO.hh>
 #include <OpenMesh/Tools/Decimater/DecimaterT.hh>
@@ -43,7 +45,8 @@ void generateHLODWithSeamProtection(
     const Mesh& input_mesh,
     Mesh& output_mesh,
     size_t target_face_count,
-    const std::set<uint32_t>& protected_vertex_indices) {
+    const std::set<uint32_t>& protected_vertex_indices,
+    std::ostream& log) {
 
     // ... (Initial checks and mesh conversion logic remain the same) ...
     if (!input_mesh.isValid() || input_mesh.getFaceCount() == 0) { return; }
@@ -55,26 +58,58 @@ void generateHLODWithSeamProtection(
     om_mesh.request_face_status();
     om_mesh.request_vertex_normals();
     om_mesh.request_vertex_texcoords2D();
+
+    // Build OM vertices with position-based deduplication.
+    // UV-seam vertices share the same 3-D position but differ in normal/UV.
+    // Treating them as separate OM vertices causes every shared edge to appear
+    // twice, triggering "complex edge" errors.  We map by position so that
+    // topologically adjacent faces always reference the same vertex handle.
+    std::map<std::tuple<float, float, float>, MyMesh::VertexHandle> pos_to_handle;
     std::vector<MyMesh::VertexHandle> vertex_handles;
-    for (const auto& input_vertex : *input_mesh.vertex_data_ptr) {
-        MyMesh::VertexHandle vertex_handle = om_mesh.add_vertex(MyMesh::Point(input_vertex.position.x, input_vertex.position.y, input_vertex.position.z));
-        om_mesh.set_normal(vertex_handle, MyMesh::Normal(input_vertex.normal.x, input_vertex.normal.y, input_vertex.normal.z));
-        om_mesh.set_texcoord2D(vertex_handle, MyMesh::TexCoord2D(input_vertex.uv.x, input_vertex.uv.y));
-        vertex_handles.push_back(vertex_handle);
-    }
-    for (const auto& input_face : *input_mesh.faces_ptr) {
-        if (!input_face.isDegenerate()) {
-            std::vector<MyMesh::VertexHandle> face_vertex_handles;
-            face_vertex_handles.push_back(vertex_handles[input_face.v_indices[0]]);
-            face_vertex_handles.push_back(vertex_handles[input_face.v_indices[1]]);
-            face_vertex_handles.push_back(vertex_handles[input_face.v_indices[2]]);
-            om_mesh.add_face(face_vertex_handles);
+    vertex_handles.reserve(input_mesh.vertex_data_ptr->size());
+
+    for (const auto& v : *input_mesh.vertex_data_ptr) {
+        auto key = std::make_tuple(v.position.x, v.position.y, v.position.z);
+        auto [it, inserted] = pos_to_handle.emplace(key, MyMesh::VertexHandle{});
+        if (inserted) {
+            MyMesh::VertexHandle vh = om_mesh.add_vertex(
+                MyMesh::Point(v.position.x, v.position.y, v.position.z));
+            om_mesh.set_normal(vh, MyMesh::Normal(v.normal.x, v.normal.y, v.normal.z));
+            om_mesh.set_texcoord2D(vh, MyMesh::TexCoord2D(v.uv.x, v.uv.y));
+            it->second = vh;
         }
+        vertex_handles.push_back(it->second);
     }
+
+    // Lock protected vertices (indices still valid after merging).
     for (uint32_t vertex_idx : protected_vertex_indices) {
         if (vertex_idx < vertex_handles.size()) {
             om_mesh.status(vertex_handles[vertex_idx]).set_locked(true);
         }
+    }
+
+    // Add faces.  Redirect std::cerr so any residual OpenMesh topology warnings
+    // go to our log stream instead of the console.
+    std::streambuf* saved_cerr = std::cerr.rdbuf(log.rdbuf());
+    int skipped_faces = 0;
+    for (const auto& input_face : *input_mesh.faces_ptr) {
+        if (input_face.isDegenerate()) { ++skipped_faces; continue; }
+
+        MyMesh::VertexHandle vh0 = vertex_handles[input_face.v_indices[0]];
+        MyMesh::VertexHandle vh1 = vertex_handles[input_face.v_indices[1]];
+        MyMesh::VertexHandle vh2 = vertex_handles[input_face.v_indices[2]];
+
+        // After position-merging, distinct indices may map to the same handle.
+        if (vh0 == vh1 || vh1 == vh2 || vh0 == vh2) { ++skipped_faces; continue; }
+
+        auto fh = om_mesh.add_face({ vh0, vh1, vh2 });
+        if (!fh.is_valid()) { ++skipped_faces; }
+    }
+    std::cerr.rdbuf(saved_cerr);  // restore cerr
+
+    if (skipped_faces > 0) {
+        log << "[HLOD] " << skipped_faces
+            << " face(s) skipped (non-manifold or degenerate after position-merge).\n";
     }
 
     // --- Perform Decimation using the API from your header files ---
@@ -100,9 +135,9 @@ void generateHLODWithSeamProtection(
     // Initialize the decimater. This should now succeed.
     decimater.initialize(); //
 
-    std::cout << "Decimater initialized: " << std::boolalpha << decimater.is_initialized() << std::endl; //
+    log << "Decimater initialized: " << std::boolalpha << decimater.is_initialized() << std::endl;
     if (!decimater.is_initialized()) {
-        std::cout << "[ERROR] Decimater failed to initialize." << std::endl;
+        log << "[ERROR] Decimater failed to initialize." << std::endl;
         output_mesh = input_mesh;
         return;
     }
