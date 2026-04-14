@@ -1099,67 +1099,81 @@ static void setupMesh(
             face_idx_offset += uint32_t(part.num_faces);
         }
         for (int i_lod = 0; i_lod < helper::c_num_lods; i_lod++) {
-#if DEBUG_OUTPUT
-            log_buf << "start lod : " << i_lod + 1 << ": ";
-#endif
-            const auto& src_lod_indice_info = lod_indice_info[i_lod];
-            auto& dst_lod_indice_info = lod_indice_info[i_lod + 1];
-            dst_lod_indice_info.resize(src_mesh->material_parts.count);
+            const auto& src_lod_info = lod_indice_info[i_lod];
+            auto& dst_lod_info       = lod_indice_info[i_lod + 1];
+            dst_lod_info.resize(src_mesh->material_parts.count);
+
+            // Pack all parts of this LOD level into one local mesh so the QEM
+            // decimater can see and preserve inter-part seam vertices, which
+            // prevents T-junctions and stretched geometry at part boundaries.
+            helper::Mesh combined;
+            combined.vertex_data_ptr = std::make_shared<std::vector<helper::VertexStruct>>();
+            combined.faces_ptr       = std::make_shared<std::vector<helper::Face>>();
+            std::vector<int32_t> combined_part_ids;
+            size_t total_src_faces = 0;
+
+            // Map global drawable_vertices index → local packed index
+            std::unordered_map<uint32_t, uint32_t> g2l;
+            g2l.reserve(512);
+
             for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
-                int32_t src_face_start = src_lod_indice_info[i_part].first;
-                int32_t src_face_count = src_lod_indice_info[i_part].second;
-                int32_t target_face_count = std::max(int32_t(src_face_count * helper::c_target_lod_ratio), 1);
-
-                helper::Mesh input_mesh;
-                input_mesh.vertex_data_ptr = drawable_vertices;
-                input_mesh.faces_ptr = std::make_shared<std::vector<helper::Face>>();
-                input_mesh.faces_ptr->resize(src_face_count);
-                for (int32_t i = 0; i < src_face_count; i++) {
-                    input_mesh.faces_ptr->at(i) =
-                        full_lod_meshes.faces_ptr->at(src_face_start + i);
+                int32_t face_start = src_lod_info[i_part].first;
+                int32_t face_count = src_lod_info[i_part].second;
+                total_src_faces += face_count;
+                for (int32_t fi = 0; fi < face_count; fi++) {
+                    const auto& sf = full_lod_meshes.faces_ptr->at(face_start + fi);
+                    helper::Face lf;
+                    for (int k = 0; k < 3; k++) {
+                        uint32_t gi = sf.v_indices[k];
+                        auto [it, ins] = g2l.emplace(gi, uint32_t(combined.vertex_data_ptr->size()));
+                        if (ins)
+                            combined.vertex_data_ptr->push_back((*drawable_vertices)[gi]);
+                        lf.v_indices[k] = it->second;
+                    }
+                    combined.faces_ptr->push_back(lf);
+                    combined_part_ids.push_back(i_part);
                 }
-
-                helper::Mesh compact_input_mesh;
-                packMeshPatch(
-                    compact_input_mesh,
-                    input_mesh);
-#if 0//DEBUG_OUTPUT
-                std::cout << ", part" << i_part <<
-                    ": faces : (" << compact_input_mesh.vertex_data_ptr->size() <<
-                    ", " << compact_input_mesh.faces_ptr->size() <<
-                    "/" << input_mesh.vertex_data_ptr->size() <<
-                    ", " << input_mesh.faces_ptr->size() << ") ";
-#endif
-
-                helper::Mesh mesh_lod;
-                helper::generateHLODWithSeamProtection(
-                    compact_input_mesh,
-                    mesh_lod,
-                    target_face_count,
-                    {},
-                    log_buf);
-#if DEBUG_OUTPUT
-                log_buf << ", part" << i_part <<
-                    ", target : " << target_face_count <<
-                    ": faces : (" << mesh_lod.vertex_data_ptr->size() <<
-                    ", " << mesh_lod.faces_ptr->size() <<
-                    "/" << compact_input_mesh.vertex_data_ptr->size() <<
-                    ", " << compact_input_mesh.faces_ptr->size() << ") ";
-#endif
-                mergeMeshPatch(
-                    full_lod_meshes,
-                    mesh_lod,
-                    vertex_map,
-                    indice_match_table);
-
-                uint32_t lod_faces_num = uint32_t(mesh_lod.faces_ptr->size());
-                dst_lod_indice_info[i_part].first = face_idx_offset;
-                dst_lod_indice_info[i_part].second = lod_faces_num;
-                face_idx_offset += lod_faces_num;
             }
+
+            size_t target_total = std::max(
+                size_t(double(total_src_faces) * helper::c_target_lod_ratio), size_t(1));
+
+            // Decimate the whole mesh with QEM
+            helper::Mesh decimated;
+            std::vector<int32_t> dec_part_ids;
+            helper::decimateMesh(
+                combined, combined_part_ids,
+                decimated, dec_part_ids,
+                target_total, log_buf);
+
 #if DEBUG_OUTPUT
-            log_buf << std::endl;
+            log_buf << "  lod " << i_lod + 1 << ": "
+                    << total_src_faces << " -> "
+                    << decimated.getFaceCount() << " faces\n";
 #endif
+
+            // Append decimated vertices to the global vertex array
+            uint32_t base_v = uint32_t(drawable_vertices->size());
+            for (const auto& v : *decimated.vertex_data_ptr)
+                drawable_vertices->push_back(v);
+
+            // Bucket output faces by part, emit in part order
+            std::vector<std::vector<int>> part_face_idx(src_mesh->material_parts.count);
+            for (int fi = 0; fi < (int)decimated.faces_ptr->size(); fi++)
+                part_face_idx[dec_part_ids[fi]].push_back(fi);
+
+            for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+                dst_lod_info[i_part].first  = face_idx_offset;
+                dst_lod_info[i_part].second = uint32_t(part_face_idx[i_part].size());
+                for (int fi : part_face_idx[i_part]) {
+                    const auto& f = decimated.faces_ptr->at(fi);
+                    full_lod_meshes.faces_ptr->push_back(helper::Face(
+                        base_v + f.v_indices[0],
+                        base_v + f.v_indices[1],
+                        base_v + f.v_indices[2]));
+                }
+                face_idx_offset += dst_lod_info[i_part].second;
+            }
         }
     }
 
@@ -1961,7 +1975,12 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
+        // TODO: replace with distance-based LOD selection.
+        // cur_lod=1 was hardcoded which caused LOD 1 (30% faces) to always
+        // render regardless of camera distance, producing stretched polygons
+        // on close surfaces.  Use LOD 0 (original quality) until a proper
+        // distance-based selector is wired up.
+        uint32_t cur_lod = 0;
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -3556,7 +3575,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     uint32_t prim_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         for (const auto& prim : mesh.primitives_) {
-            uint32_t cur_lod = std::min(1u, uint32_t(prim.index_desc_.size() - 1));
+            // TODO: replace with distance-based LOD selection (same as drawMesh).
+            uint32_t cur_lod = 0;
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = 0;
             indirect_draw_buf[prim_idx].index_count =

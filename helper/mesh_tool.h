@@ -66,5 +66,18 @@ extern void generateHLODWithSeamProtection(
     const std::set<uint32_t>& protected_vertex_indices,
     std::ostream& log);
 
+// Decimate the entire mesh (all material parts at once) using QEM.
+// face_part_ids[i] is the material-part index for face i (0..num_parts-1).
+// Boundary edges and inter-part seam edges are detected automatically and
+// their vertices are locked so no T-junctions appear between parts.
+// The output mesh has its own self-contained vertex array.
+extern void decimateMesh(
+    const Mesh& input_mesh,
+    const std::vector<int32_t>& face_part_ids,
+    Mesh& output_mesh,
+    std::vector<int32_t>& output_face_part_ids,
+    size_t target_face_count,
+    std::ostream& log);
+
 } // game_object
 } // engine
