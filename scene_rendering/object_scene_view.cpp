@@ -97,9 +97,18 @@ void ObjectSceneView::draw(
     float delta_t,
     float cur_time,
     bool depth_only/* = false */,
-    const std::shared_ptr<er::ImageView>& depth_layer_view/* = nullptr */) {
+    const std::shared_ptr<er::ImageView>& depth_layer_view/* = nullptr */,
+    uint32_t layer_count/* = 1 */) {
+
+    // layer_count > 1 means a single-pass layered CSM draw: the geometry shader
+    // broadcasts each triangle to all layers; no per-layer view needed.
+    const bool csm_layered = (layer_count > 1);
 
     renderer::DescriptorSetList desc_set_list = desc_sets;
+    // For CSM layered pass there is no per-cascade camera descriptor — the GS
+    // reads VP matrices directly from RuntimeLightsParams.  Use a nullptr slot
+    // (the shadow vertex shader still reads from VIEW_PARAMS_SET for the
+    // world-space transform, so keep the base shadow camera descriptor).
     desc_set_list[VIEW_PARAMS_SET] =
         m_camera_object_->getViewCameraDescriptorSet();
 
@@ -116,8 +125,7 @@ void ObjectSceneView::draw(
             color_attachment_infos.push_back(attachment_info);
         }
         er::RenderingAttachmentInfo depth_attachment_info;
-        // Use the per-cascade layer view when provided (CSM rendering),
-        // otherwise fall back to the default depth buffer view.
+        // CSM layered: use the full array view; single-cascade: use per-layer view.
         depth_attachment_info.image_view =
             depth_layer_view ? depth_layer_view : m_depth_buffer_->view;
         depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -128,10 +136,10 @@ void ObjectSceneView::draw(
         er::RenderingInfo renderingInfo = {};
         renderingInfo.render_area_offset = { 0, 0 };
         renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
-        renderingInfo.layer_count = 1;
+        renderingInfo.layer_count = layer_count;   // >1 for single-pass CSM GS
         renderingInfo.view_mask = 0;
         renderingInfo.color_attachments = color_attachment_infos;
-        renderingInfo.depth_attachments = { depth_attachment_info }; // Or nullptr if no depth
+        renderingInfo.depth_attachments = { depth_attachment_info };
         renderingInfo.stencil_attachments = {};
 
         cmd_buf->beginDynamicRendering(renderingInfo);
@@ -148,13 +156,19 @@ void ObjectSceneView::draw(
     scissors[0].offset = glm::ivec2(0);
     scissors[0].extent = m_buffer_size_;
 
+    const auto draw_mode = csm_layered
+        ? ego::DrawableObject::DrawMode::kCsmLayered
+        : (depth_only ? ego::DrawableObject::DrawMode::kShadow
+                      : ego::DrawableObject::DrawMode::kForward);
+
     for (auto& drawable_obj : m_drawable_objects_) {
         drawable_obj->draw(
             cmd_buf,
             desc_set_list,
             viewports,
             scissors,
-            depth_only);
+            depth_only,
+            draw_mode);
     }
 
     if (sphere) {

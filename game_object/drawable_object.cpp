@@ -2169,8 +2169,12 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     std::shared_ptr<renderer::Device> device,
     bool has_texcoord_0,
     bool has_skin_set_0,
-    bool has_material) {
-    renderer::ShaderModuleList shader_modules(2);
+    bool has_material,
+    bool csm_layered = false) {
+    // csm_layered: when true, add a geometry shader that broadcasts each
+    // triangle to all CSM_CASCADE_COUNT depth-array layers in a single pass,
+    // eliminating the 4× redundant vertex transform overhead.
+    renderer::ShaderModuleList shader_modules(csm_layered ? 3 : 2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "");
     vert_feature_str = has_material ? vert_feature_str : "_NOMTL";
     auto frag_feature_str = vert_feature_str;
@@ -2185,7 +2189,17 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
             renderer::ShaderStageFlagBits::VERTEX_BIT,
             std::source_location::current());
 
-    shader_modules[1] =
+    if (csm_layered) {
+        // Geometry shader: amplifies each triangle to CSM_CASCADE_COUNT layers.
+        shader_modules[1] =
+            renderer::helper::loadShaderModule(
+                device,
+                "base_depthonly_csm_geom.spv",
+                renderer::ShaderStageFlagBits::GEOMETRY_BIT,
+                std::source_location::current());
+    }
+
+    shader_modules[csm_layered ? 2 : 1] =
         renderer::helper::loadShaderModule(
             device,
             "base_depthonly_frag" + frag_feature_str + ".spv",
@@ -2260,17 +2274,19 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     return drawable_pipeline;
 }
 
-static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
+static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const ego::PrimitiveInfo& primitive) {
+    const ego::PrimitiveInfo& primitive,
+    bool csm_layered) {
     auto shader_modules = getDrawableDepthonlyShaderModules(
         device,
         primitive.tag_.has_texcoord_0,
         primitive.tag_.has_skin_set_0,
-        primitive.material_idx_ >= 0);
+        primitive.material_idx_ >= 0,
+        csm_layered);
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
@@ -2320,6 +2336,30 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
         std::source_location::current());
 
     return drawable_pipeline;
+}
+
+// Single-cascade (per-layer) shadow pipeline — used as fallback / debug.
+static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+    return createDrawableShadowPipelineInternal(
+        device, renderbuffer_formats, pipeline_layout,
+        graphic_pipeline_info, primitive, false);
+}
+
+// All-cascade (layered GS) shadow pipeline — used for the single-pass CSM path.
+static std::shared_ptr<renderer::Pipeline> createDrawableCsmLayeredPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+    return createDrawableShadowPipelineInternal(
+        device, renderbuffer_formats, pipeline_layout,
+        graphic_pipeline_info, primitive, true);
 }
 
 renderer::WriteDescriptorList addDrawableIndirectDrawBuffers(
@@ -2539,6 +2579,7 @@ std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::skin_desc_set_lay
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_pipeline_layout_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_shadow_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_layered_pipeline_list_;
 std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::drawable_indirect_draw_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_indirect_draw_pipeline_layout_;
@@ -2817,6 +2858,22 @@ DrawableObject::DrawableObject(
                     if (result == drawable_shadow_pipeline_list_.end()) {
                         drawable_shadow_pipeline_list_[hash_value] =
                             createDrawableShadowPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
+                }
+
+                {
+                    // CSM layered pipeline: same as shadow but with GS for
+                    // single-pass all-cascade rendering.
+                    auto hash_value = primitive.getDepthonlyHash();
+                    auto result = drawable_csm_layered_pipeline_list_.find(hash_value);
+                    if (result == drawable_csm_layered_pipeline_list_.end()) {
+                        drawable_csm_layered_pipeline_list_[hash_value] =
+                            createDrawableCsmLayeredPipeline(
                                 device,
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                 drawable_pipeline_layout_,
@@ -3133,20 +3190,39 @@ void DrawableObject::recreateStaticMembers(
     }
     drawable_shadow_pipeline_list_.clear();
 
+    for (auto& pipeline : drawable_csm_layered_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_csm_layered_pipeline_list_.clear();
+
     for (auto& object : drawable_object_list_) {
         for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
             for (int i_prim = 0; i_prim < object.second->meshes_[i_mesh].primitives_.size(); i_prim++) {
                 const auto& primitive = object.second->meshes_[i_mesh].primitives_[i_prim];
                 auto hash_value = primitive.getDepthonlyHash();
-                auto result = drawable_shadow_pipeline_list_.find(hash_value);
-                if (result == drawable_shadow_pipeline_list_.end()) {
-                    drawable_shadow_pipeline_list_[hash_value] =
-                        createDrawableShadowPipeline(
-                            device,
-                            renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
-                            drawable_pipeline_layout_,
-                            graphic_pipeline_info,
-                            primitive);
+                {
+                    auto result = drawable_shadow_pipeline_list_.find(hash_value);
+                    if (result == drawable_shadow_pipeline_list_.end()) {
+                        drawable_shadow_pipeline_list_[hash_value] =
+                            createDrawableShadowPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
+                }
+                {
+                    auto result = drawable_csm_layered_pipeline_list_.find(hash_value);
+                    if (result == drawable_csm_layered_pipeline_list_.end()) {
+                        drawable_csm_layered_pipeline_list_[hash_value] =
+                            createDrawableCsmLayeredPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
                 }
             }
         }
@@ -3209,6 +3285,10 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_shadow_pipeline_list_.clear();
+    for (auto& pipeline : drawable_csm_layered_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_csm_layered_pipeline_list_.clear();
     drawable_object_list_.clear();
     device->destroyDescriptorSetLayout(drawable_indirect_draw_desc_set_layout_);
     device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
@@ -3344,10 +3424,13 @@ void DrawableObject::draw(
     const renderer::DescriptorSetList& desc_set_list,
     const std::vector<renderer::Viewport>& viewports,
     const std::vector<renderer::Scissor>& scissors,
-    bool depth_only/* = false */ ) {
+    bool depth_only/* = false */,
+    DrawMode draw_mode/* = DrawMode::kForward */) {
 
     auto& pipeline_list =
-        depth_only ? drawable_shadow_pipeline_list_ : drawable_pipeline_list_;
+        (draw_mode == DrawMode::kCsmLayered) ? drawable_csm_layered_pipeline_list_ :
+        depth_only                           ? drawable_shadow_pipeline_list_ :
+                                               drawable_pipeline_list_;
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);

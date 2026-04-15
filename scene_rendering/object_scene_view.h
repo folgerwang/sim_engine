@@ -45,7 +45,8 @@ public:
         float delta_t,
         float cur_time,
         bool depth_only = false,
-        const std::shared_ptr<er::ImageView>& depth_layer_view = nullptr);
+        const std::shared_ptr<er::ImageView>& depth_layer_view = nullptr,
+        uint32_t layer_count = 1);
 
     void destroy(
         const std::shared_ptr<renderer::Device>& device);

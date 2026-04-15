@@ -204,6 +204,8 @@ class DrawableObject {
     static std::shared_ptr<renderer::PipelineLayout> drawable_pipeline_layout_;
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_pipeline_list_;
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_shadow_pipeline_list_;
+    // Single-pass CSM shadow pipeline — geometry shader broadcasts to all layers.
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_layered_pipeline_list_;
     static std::unordered_map<std::string, std::shared_ptr<DrawableData>> drawable_object_list_;
     static std::shared_ptr<renderer::DescriptorSetLayout> drawable_indirect_draw_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> drawable_indirect_draw_pipeline_layout_;
@@ -239,11 +241,19 @@ public:
     void updateBuffers(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 
+    // How the object should be drawn.
+    enum class DrawMode {
+        kForward,       // regular lit forward pass
+        kShadow,        // per-cascade depth-only pass (legacy, 4 separate draws)
+        kCsmLayered,    // single-pass depth-only with GS broadcasting to all CSM layers
+    };
+
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
         const std::vector<renderer::Viewport>& viewports,
         const std::vector<renderer::Scissor>& scissors,
-        bool depth_only = false);
+        bool depth_only = false,
+        DrawMode draw_mode = DrawMode::kForward);
 
     void update(
         const std::shared_ptr<renderer::Device>& device,
