@@ -277,6 +277,14 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
 
+        if (ImGui::BeginMenu("Shadow"))
+        {
+            if (ImGui::MenuItem("Debug Cascades", NULL, show_csm_debug_)) {
+                show_csm_debug_ = !show_csm_debug_;
+            }
+            ImGui::EndMenu();
+        }
+
         if (ImGui::BeginMenu("Tools"))
         {
             if (ImGui::MenuItem("Compile Shaders", NULL)) {
@@ -421,6 +429,35 @@ bool Menu::draw(
         }
         ImGui::End();
     }
+
+    // ---- CSM cascade debug window ------------------------------------------
+    if (show_csm_debug_) {
+        ImGui::SetNextWindowSize(ImVec2(560, 340), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("CSM Debug", &show_csm_debug_)) {
+            constexpr float kThumbSize = 120.0f;
+            const char* labels[] = { "Cascade 0\n(near)", "Cascade 1", "Cascade 2", "Cascade 3\n(far)" };
+            for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
+                if (k > 0) ImGui::SameLine();
+                ImGui::BeginGroup();
+                // Label above each image
+                ImGui::Text("%s", labels[k]);
+                if (csm_debug_tex_ids_[k]) {
+                    ImGui::Image(csm_debug_tex_ids_[k], ImVec2(kThumbSize, kThumbSize));
+                    if (ImGui::IsItemHovered()) {
+                        // Show a larger tooltip preview.
+                        ImGui::BeginTooltip();
+                        ImGui::Image(csm_debug_tex_ids_[k], ImVec2(300, 300));
+                        ImGui::EndTooltip();
+                    }
+                } else {
+                    ImGui::Dummy(ImVec2(kThumbSize, kThumbSize));
+                }
+                ImGui::EndGroup();
+            }
+        }
+        ImGui::End();
+    }
+    // ------------------------------------------------------------------------
 
     chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
 

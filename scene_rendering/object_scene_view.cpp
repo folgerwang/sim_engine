@@ -96,7 +96,8 @@ void ObjectSceneView::draw(
     int dbuf_idx,
     float delta_t,
     float cur_time,
-    bool depth_only/* = false */) {
+    bool depth_only/* = false */,
+    const std::shared_ptr<er::ImageView>& depth_layer_view/* = nullptr */) {
 
     renderer::DescriptorSetList desc_set_list = desc_sets;
     desc_set_list[VIEW_PARAMS_SET] =
@@ -115,7 +116,10 @@ void ObjectSceneView::draw(
             color_attachment_infos.push_back(attachment_info);
         }
         er::RenderingAttachmentInfo depth_attachment_info;
-        depth_attachment_info.image_view = m_depth_buffer_->view;
+        // Use the per-cascade layer view when provided (CSM rendering),
+        // otherwise fall back to the default depth buffer view.
+        depth_attachment_info.image_view =
+            depth_layer_view ? depth_layer_view : m_depth_buffer_->view;
         depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
         depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;

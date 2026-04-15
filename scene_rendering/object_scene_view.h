@@ -44,7 +44,8 @@ public:
         int dbuf_idx,
         float delta_t,
         float cur_time,
-        bool depth_only = false);
+        bool depth_only = false,
+        const std::shared_ptr<er::ImageView>& depth_layer_view = nullptr);
 
     void destroy(
         const std::shared_ptr<renderer::Device>& device);

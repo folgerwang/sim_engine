@@ -1,8 +1,10 @@
 #pragma once
+#include <array>
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
 #include "chat_box.h"
+#include "imgui.h"
 
 namespace engine {
 namespace ui {
@@ -39,6 +41,10 @@ class Menu {
     ImTextureID rt_texture_id_;
     ImTextureID main_texture_id_;
 
+    // CSM debug visualisation
+    bool show_csm_debug_ = false;
+    std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
+
     std::shared_ptr<ChatBox> chat_box_;
 
 public:
@@ -67,8 +73,14 @@ public:
         return result;
     }
 
+    // CSM debug visualisation
+    inline bool showCsmDebug() const { return show_csm_debug_; }
+    void setCsmDebugTextureIds(const std::array<ImTextureID, CSM_CASCADE_COUNT>& ids) {
+        csm_debug_tex_ids_ = ids;
+    }
+
     inline bool isWaterPassTurnOff() {
-        return turn_off_water_pass_; 
+        return turn_off_water_pass_;
     }
 
     inline bool isGrassPassTurnOff() {

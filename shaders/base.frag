@@ -34,16 +34,30 @@ layout(location = 0) out vec4 outColor;
 
 const float SHADOW_BIAS = 0.001;
 float calculateShadowFactor(vec3 position_world) {
-    vec4 position_light_clip = runtime_lights.light_view_proj * vec4(position_world, 1.0);
+    // Compute view-space depth (positive distance from camera) for cascade selection.
+    vec4 position_view = camera_info.view * vec4(position_world, 1.0);
+    float view_depth = -position_view.z;  // camera looks along -Z, so negate
 
+    // Select the tightest cascade that covers this fragment.
+    int cascade_idx = CSM_CASCADE_COUNT - 1;
+    for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
+        if (view_depth < runtime_lights.cascade_splits[i]) {
+            cascade_idx = i;
+            break;
+        }
+    }
+
+    // Transform world position into the selected cascade's light clip space.
+    vec4 position_light_clip =
+        runtime_lights.light_view_proj[cascade_idx] * vec4(position_world, 1.0);
     vec3 position_light_NDC = position_light_clip.xyz / position_light_clip.w;
 
-    vec2 shadow_map_texcoord = position_light_NDC.xy * 0.5f + 0.5f;
-    shadow_map_texcoord.y = shadow_map_texcoord.y;
-
+    vec2 shadow_uv = position_light_NDC.xy * 0.5 + 0.5;
     float current_depth = position_light_NDC.z;
 
-    float closest_depth = texture(direct_shadow_sampler, shadow_map_texcoord).r;
+    // Sample the appropriate layer of the CSM shadow array.
+    float closest_depth =
+        texture(direct_shadow_sampler, vec3(shadow_uv, float(cascade_idx))).r;
 
     float shadow = 1.0;
     if (closest_depth < 1.0 && current_depth > closest_depth + SHADOW_BIAS) {

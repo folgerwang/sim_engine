@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include "renderer/renderer.h"
 #include "game_object/camera.h"
 #include "game_object/drawable_object.h"
@@ -84,6 +85,10 @@ public:
         return m_view_camera_->getCameraInfo().position;
     }
 
+    virtual const glsl::ViewCameraInfo& getCameraViewInfo() const {
+        return m_view_camera_->getCameraInfo();
+    }
+
 
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);
@@ -108,6 +113,13 @@ public:
 };
 
 class ShadowViewCameraObject : public CameraObject {
+private:
+    // Per-cascade GPU storage buffers and their descriptor sets.
+    // Each buffer holds one ViewCameraInfo with the cascade-specific VP matrix.
+    std::array<std::shared_ptr<er::BufferInfo>, CSM_CASCADE_COUNT>   m_cascade_bufs_{};
+    std::array<std::shared_ptr<er::DescriptorSet>, CSM_CASCADE_COUNT> m_cascade_desc_sets_{};
+    int m_current_cascade_ = -1;
+
 public:
     ShadowViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,
@@ -117,6 +129,43 @@ public:
     const glm::vec3& getLightDir() {
         return m_view_camera_params_.init_camera_dir;
     }
+
+    // Allocate the 4 per-cascade storage buffers and descriptor sets.
+    // Must be called once after construction, before the first shadow pass.
+    void initCascadeDescriptorSets(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
+
+    // Write ViewCameraInfo for cascade k into its dedicated GPU buffer.
+    void updateCascadeBuffer(int k, const glm::mat4& view_proj);
+
+    // Select which cascade's descriptor set getViewCameraDescriptorSet() returns.
+    void setCascadeIndex(int k) { m_current_cascade_ = k; }
+
+    // Override: returns the per-cascade descriptor set when a cascade is active,
+    // otherwise falls back to the base single-buffer descriptor set.
+    virtual std::shared_ptr<er::DescriptorSet>
+        getViewCameraDescriptorSet() const override;
+
+    // Override: also destroys the per-cascade buffers.
+    virtual void destroy(
+        const std::shared_ptr<renderer::Device>& device) override;
+
+    // Compute per-cascade light-space view-projection matrices.
+    // main_view / main_proj: perspective matrices from the main camera.
+    // cascade_far_vs: view-space (positive) far depths for each of the
+    //   CSM_CASCADE_COUNT cascades.  z_near_vs is the main camera near plane.
+    // out_vps: receives the CSM_CASCADE_COUNT orthographic view-proj matrices.
+    void computeCascadeMatrices(
+        const glm::mat4& main_view,
+        const glm::mat4& main_proj,
+        const glm::vec4& cascade_far_vs,
+        float z_near_vs,
+        std::array<glm::mat4, 4>& out_vps);
+
+    // Push a specific cascade view-projection matrix into the shadow camera's
+    // GPU-side ViewCameraInfo buffer so that base_depthonly.vert uses it.
+    void updateCameraForCascade(const glm::mat4& cascade_view_proj);
 };
 
 } // game_object

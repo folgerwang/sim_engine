@@ -164,6 +164,7 @@
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
 
 #define LIGHT_COUNT                             1
+#define CSM_CASCADE_COUNT                       4
 
 #define TONEMAP_DEFAULT                         0
 #define TONEMAP_UNCHARTED                       1
@@ -768,7 +769,8 @@ struct ViewCameraInfo {
 };
 
 struct RuntimeLightsParams {
-    mat4            light_view_proj;
+    mat4            light_view_proj[CSM_CASCADE_COUNT];
+    vec4            cascade_splits;   // view-space far depths for each cascade
     Light           lights[LIGHT_COUNT];
 };
 
