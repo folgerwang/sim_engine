@@ -1107,10 +1107,19 @@ void Helper::initImgui(
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;       // Enable Multi-Viewport / Platform Windows
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
     //ImGui::StyleColorsClassic();
+
+    // When viewports are enabled we tweak WindowRounding/WindowBg so platform
+    // windows can look identical to regular ones.
+    ImGuiStyle& style = ImGui::GetStyle();
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
 
     // Setup Platform/Renderer backends
     auto logic_device = RENDER_TYPE_CAST(Device, device);
@@ -1123,12 +1132,12 @@ void Helper::initImgui(
     init_info.Queue = RENDER_TYPE_CAST(Queue, graphics_queue)->get();
     init_info.PipelineCache = nullptr;// g_PipelineCache;
     init_info.DescriptorPool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool)->get();
-    init_info.RenderPass = RENDER_TYPE_CAST(RenderPass, render_pass)->get();
-    init_info.Subpass = 0;
+    init_info.PipelineInfoMain.RenderPass = RENDER_TYPE_CAST(RenderPass, render_pass)->get();
+    init_info.PipelineInfoMain.Subpass = 0;
+    init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.Allocator = nullptr; // g_Allocator;
     init_info.MinImageCount = static_cast<uint32_t>(swap_chain_info.framebuffers.size());
     init_info.ImageCount = static_cast<uint32_t>(swap_chain_info.framebuffers.size());
-    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.CheckVkResultFn = check_vk_result;
     ImGui_ImplVulkan_Init(&init_info);
 
@@ -1156,12 +1165,7 @@ void Helper::initImgui(
 //    io.Fonts->AddFontFromFileTTF((font_path + "ProggyTiny.ttf").c_str(), 16.0f);
 //    io.Fonts->Build();
 
-    // Upload Fonts
-    {
-        auto cmd_buf = device->setupTransientCommandBuffer();
-        ImGui_ImplVulkan_CreateFontsTexture();
-        device->submitAndWaitTransientCommandBuffer();
-    }
+    // Fonts are uploaded automatically on the first frame by the docking-branch backend.
 }
 
 void TextureInfo::destroy(const std::shared_ptr<Device>& device) {

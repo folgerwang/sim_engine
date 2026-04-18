@@ -221,6 +221,17 @@ public:
         const uint32_t group_count,
         const uint32_t sbt_size,
         void* shader_handle_storage) final;
+
+    virtual std::shared_ptr<QueryPool> createQueryPool(
+        uint32_t query_count) final;
+    virtual void destroyQueryPool(
+        std::shared_ptr<QueryPool> query_pool) final;
+    virtual bool getQueryPoolResults(
+        const std::shared_ptr<QueryPool>& query_pool,
+        uint32_t first_query,
+        uint32_t query_count,
+        std::vector<uint64_t>& results) final;
+    virtual float getTimestampPeriod() final;
 };
 
 } // namespace vk

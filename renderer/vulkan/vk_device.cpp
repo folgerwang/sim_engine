@@ -1694,6 +1694,57 @@ void VulkanDevice::getRayTracingShaderGroupHandles(
     }
 }
 
+// ----- Timestamp query pool -----------------------------------------------
+
+std::shared_ptr<QueryPool> VulkanDevice::createQueryPool(uint32_t query_count) {
+    VkQueryPoolCreateInfo info{};
+    info.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    info.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = query_count;
+
+    VkQueryPool qp;
+    auto result = vkCreateQueryPool(device_, &info, nullptr, &qp);
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create query pool! : ") +
+            VkResultToString(result));
+    }
+    return std::make_shared<VulkanQueryPool>(qp);
+}
+
+void VulkanDevice::destroyQueryPool(std::shared_ptr<QueryPool> query_pool) {
+    if (!query_pool) return;
+    auto vk_qp = RENDER_TYPE_CAST(QueryPool, query_pool);
+    vkDestroyQueryPool(device_, vk_qp->get(), nullptr);
+}
+
+bool VulkanDevice::getQueryPoolResults(
+    const std::shared_ptr<QueryPool>& query_pool,
+    uint32_t first_query,
+    uint32_t query_count,
+    std::vector<uint64_t>& results) {
+    results.resize(query_count);
+    auto vk_qp = RENDER_TYPE_CAST(QueryPool, query_pool);
+    VkResult result = vkGetQueryPoolResults(
+        device_,
+        vk_qp->get(),
+        first_query,
+        query_count,
+        query_count * sizeof(uint64_t),
+        results.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT);
+    // VK_NOT_READY means results are not yet available (GPU still running).
+    return (result == VK_SUCCESS);
+}
+
+float VulkanDevice::getTimestampPeriod() {
+    auto vk_phys = RENDER_TYPE_CAST(PhysicalDevice, physical_device_);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(vk_phys->get(), &props);
+    return props.limits.timestampPeriod;
+}
+
 } // vk
 } // renderer
 } // engine

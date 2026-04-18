@@ -8,6 +8,7 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
+#include <set>
 #include <filesystem>
 
 #include "helper/engine_helper.h"
@@ -2119,8 +2120,17 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
     push_const_range.size = sizeof(glsl::ModelParams);
 
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
+    desc_set_layouts.resize(MAX_NUM_PARAMS_SETS);
     desc_set_layouts[PBR_MATERIAL_PARAMS_SET] = material_desc_set_layout;
     desc_set_layouts[SKIN_PARAMS_SET] = skin_desc_set_layout;
+
+    // Fill any remaining null slots with an empty descriptor set layout so that
+    // the Vulkan pipeline layout has valid handles at every index.
+    for (size_t i = 0; i < desc_set_layouts.size(); ++i) {
+        if (!desc_set_layouts[i]) {
+            desc_set_layouts[i] = device->createDescriptorSetLayout({});
+        }
+    }
 
     return device->createPipelineLayout(
         desc_set_layouts,
@@ -2294,6 +2304,36 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
 
     auto binding_descs = primitive.binding_descs_;
     auto attribute_descs = primitive.attribute_descs_;
+
+    // The depth-only shadow shader (base_depthonly.vert) only reads
+    // POSITION(0), optional TEXCOORD0(1), and optional JOINTS/WEIGHTS
+    // (4,5 / 7,8).  Strip everything else so the validation layer does
+    // not warn "Vertex attribute at location N not consumed by vertex shader".
+    {
+        std::set<uint32_t> kept_bindings;
+        std::vector<renderer::VertexInputAttributeDescription> filtered;
+        filtered.reserve(attribute_descs.size());
+        for (auto& a : attribute_descs) {
+            const uint32_t loc = a.location;
+            const bool keep =
+                (loc == VINPUT_POSITION) ||
+                (loc == VINPUT_TEXCOORD0 && primitive.tag_.has_texcoord_0) ||
+                (loc == VINPUT_JOINTS_0  && primitive.tag_.has_skin_set_0) ||
+                (loc == VINPUT_WEIGHTS_0 && primitive.tag_.has_skin_set_0);
+            if (keep) {
+                filtered.push_back(a);
+                kept_bindings.insert(a.binding);
+            }
+        }
+        attribute_descs = std::move(filtered);
+
+        std::vector<renderer::VertexInputBindingDescription> kept_binding_descs;
+        kept_binding_descs.reserve(binding_descs.size());
+        for (auto& b : binding_descs) {
+            if (kept_bindings.count(b.binding)) kept_binding_descs.push_back(b);
+        }
+        binding_descs = std::move(kept_binding_descs);
+    }
 
     renderer::VertexInputBindingDescription desc;
     desc.binding = VINPUT_INSTANCE_BINDING_POINT;
@@ -3301,6 +3341,26 @@ void DrawableObject::destroyStaticMembers(
     device->destroyPipeline(update_instance_buffer_pipeline_);
 }
 
+void DrawableObject::updateGameObjectsCameraBuffer(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::BufferInfo>& view_camera_buffer) {
+    assert(view_camera_buffer);
+    for (int soil_water = 0; soil_water < 2; ++soil_water) {
+        if (!update_game_objects_buffer_desc_set_[soil_water]) {
+            continue;
+        }
+        renderer::WriteDescriptorList writes;
+        renderer::Helper::addOneBuffer(
+            writes,
+            update_game_objects_buffer_desc_set_[soil_water],
+            renderer::DescriptorType::STORAGE_BUFFER,
+            CAMERA_OBJECT_BUFFER_INDEX,
+            view_camera_buffer->buffer,
+            view_camera_buffer->buffer->getSize());
+        device->updateDescriptorSets(writes);
+    }
+}
+
 void DrawableObject::updateGameObjectsBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glm::vec2& world_min,
@@ -3686,5 +3746,5 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     return drawable_object;
 }
 
-} // game_object
-} // engine
+} // namespace game_object
+} // namespace engine

@@ -2045,6 +2045,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     device_features.shaderInt16 = VK_TRUE;
     device_features.multiDrawIndirect = VK_TRUE;
     device_features.multiViewport = VK_TRUE;
+    device_features.depthClamp = VK_TRUE;  // required for CSM / depth-clamp rasterization
 
     VkDeviceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -2073,6 +2074,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     VkPhysicalDeviceMeshShaderFeaturesEXT enabled_mesh_shader_features{};
     VkPhysicalDeviceMaintenance4Features enabled_maintenance4_features{};
     VkPhysicalDeviceFloat16Int8FeaturesKHR enabled_float16_int8_features{};
+    VkPhysicalDeviceVulkan11Features  enabled_vulkan11_features{};
     VkPhysicalDeviceVulkan13Features  enabled_vulkan13_features{};
 
     // Enable features required for ray tracing using feature chaining via pNext		
@@ -2097,11 +2099,19 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_float16_int8_features.shaderInt8 = VK_TRUE;
     enabled_float16_int8_features.pNext = &enabled_mesh_shader_features;
 
+    // Enable 16-bit SSBO access so shaders can declare OpVariable of
+    // 16-bit types in StorageBuffer class (e.g. uint16_t index buffers
+    // used by the ray-tracing closest-hit shader).
+    enabled_vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    enabled_vulkan11_features.storageBuffer16BitAccess            = VK_TRUE;
+    enabled_vulkan11_features.uniformAndStorageBuffer16BitAccess  = VK_TRUE;
+    enabled_vulkan11_features.pNext = &enabled_float16_int8_features;
+
     enabled_vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     enabled_vulkan13_features.dynamicRendering = VK_TRUE;
     enabled_vulkan13_features.synchronization2 = VK_TRUE;
     enabled_vulkan13_features.maintenance4 = VK_TRUE;
-    enabled_vulkan13_features.pNext = &enabled_float16_int8_features;
+    enabled_vulkan13_features.pNext = &enabled_vulkan11_features;
 
     // If a pNext(Chain) has been passed, we need to add it to the device creation info
     VkPhysicalDeviceFeatures2 physical_device_features2{};

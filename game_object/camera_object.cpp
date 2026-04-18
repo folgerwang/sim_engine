@@ -168,11 +168,20 @@ void CameraObject::readGpuCameraInfo() {
 }
 
 void CameraObject::destroy(const std::shared_ptr<renderer::Device>& device) {
-    m_device_->destroyDescriptorSetLayout(
-        CameraObject::s_view_camera_desc_set_layout_);
-
+    // NOTE: s_view_camera_desc_set_layout_ is a shared static — it must be
+    // destroyed exactly once via destroyStaticMembers(), not per-instance
+    // (otherwise double-free triggers "Couldn't find VkDescriptorSetLayout"
+    // validation errors when both main and shadow cameras are torn down).
     m_view_camera_->destroy(m_device_);
 };
+
+void CameraObject::destroyStaticMembers(
+    const std::shared_ptr<renderer::Device>& device) {
+    if (s_view_camera_desc_set_layout_) {
+        device->destroyDescriptorSetLayout(s_view_camera_desc_set_layout_);
+        s_view_camera_desc_set_layout_ = nullptr;
+    }
+}
 
 ObjectViewCameraObject::ObjectViewCameraObject(
         const std::shared_ptr<renderer::Device>& device,

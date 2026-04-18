@@ -92,6 +92,9 @@ public:
 
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);
+
+    static void destroyStaticMembers(
+        const std::shared_ptr<renderer::Device>& device);
 };
 
 class ObjectViewCameraObject : public CameraObject{

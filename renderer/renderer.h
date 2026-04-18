@@ -107,6 +107,9 @@ class DescriptorSet {
 class ShaderModule : public DeviceDebug {
 };
 
+class QueryPool {
+};
+
 namespace vk {
 class VulkanInstance : public Instance {
     VkInstance    instance_;
@@ -254,6 +257,13 @@ class VulkanFence : public Fence {
 public:
     VulkanFence(const VkFence& fence) : fence_(fence) {}
     VkFence get() { return fence_; }
+};
+
+class VulkanQueryPool : public QueryPool {
+    VkQueryPool  query_pool_;
+public:
+    VulkanQueryPool(const VkQueryPool& qp) : query_pool_(qp) {}
+    VkQueryPool get() { return query_pool_; }
 };
 
 class VulkanDeviceMemory : public DeviceMemory {

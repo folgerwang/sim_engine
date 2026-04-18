@@ -137,6 +137,16 @@ public:
     virtual void buildAccelerationStructures(
         const std::vector<AccelerationStructureBuildGeometryInfo>& as_build_geo_list,
         const std::vector<AccelerationStructureBuildRangeInfo>& as_build_range_list) = 0;
+
+    // GPU timestamp queries.
+    virtual void resetQueryPool(
+        const std::shared_ptr<QueryPool>& query_pool,
+        uint32_t first_query,
+        uint32_t query_count) = 0;
+    virtual void writeTimestamp(
+        const std::shared_ptr<QueryPool>& query_pool,
+        uint32_t query_index,
+        bool after_all_commands = true) = 0;
 };
 
 } // namespace renderer

@@ -595,6 +595,25 @@ void VulkanCommandBuffer::buildAccelerationStructures(
         vk_as_build_range_ptr_list.data());
 }
 
+void VulkanCommandBuffer::resetQueryPool(
+    const std::shared_ptr<QueryPool>& query_pool,
+    uint32_t first_query,
+    uint32_t query_count) {
+    auto vk_qp = RENDER_TYPE_CAST(QueryPool, query_pool);
+    vkCmdResetQueryPool(cmd_buf_, vk_qp->get(), first_query, query_count);
+}
+
+void VulkanCommandBuffer::writeTimestamp(
+    const std::shared_ptr<QueryPool>& query_pool,
+    uint32_t query_index,
+    bool after_all_commands/* = true*/) {
+    auto vk_qp = RENDER_TYPE_CAST(QueryPool, query_pool);
+    VkPipelineStageFlagBits stage = after_all_commands
+        ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+        : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    vkCmdWriteTimestamp(cmd_buf_, stage, vk_qp->get(), query_index);
+}
+
 } // namespace vk
 } // namespace renderer
 } // namespace engine

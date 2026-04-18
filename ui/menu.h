@@ -3,8 +3,11 @@
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
+#include "helper/gpu_profiler.h"
 #include "chat_box.h"
 #include "imgui.h"
+
+namespace plugins { class PluginManager; }
 
 namespace engine {
 namespace ui {
@@ -47,7 +50,19 @@ class Menu {
 
     std::shared_ptr<ChatBox> chat_box_;
 
+    // Optional GPU profiler — set from application after init.
+    engine::helper::GpuProfiler* gpu_profiler_ = nullptr;
+
+    // Plugin system — set from application after init.
+    plugins::PluginManager* plugin_manager_ = nullptr;
+
 public:
+    void setGpuProfiler(engine::helper::GpuProfiler* profiler) {
+        gpu_profiler_ = profiler;
+    }
+    void setPluginManager(plugins::PluginManager* pm) {
+        plugin_manager_ = pm;
+    }
     Menu(
         GLFWwindow* window,
         const std::shared_ptr<renderer::Device>& device,

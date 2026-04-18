@@ -10,6 +10,7 @@
 #include "helper/engine_helper.h"
 
 #include "menu.h"
+#include "plugins/plugin_manager.h"
 
 namespace er = engine::renderer;
 
@@ -164,6 +165,7 @@ bool Menu::draw(
     bool& dump_volume_noise,
     const float& delta_t) {
 
+    ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
@@ -186,6 +188,7 @@ bool Menu::draw(
     static bool s_show_weather = false;
     static bool s_show_shader_error_message = false;
     static std::string s_shader_error_message;
+    static bool s_show_gpu_profiler = false;
     bool compile_shaders = false;
 
     bool test_true = true;
@@ -295,6 +298,21 @@ bool Menu::draw(
                 dump_volume_noise = true;
             }
 
+            if (ImGui::MenuItem("GPU Profiler", NULL, s_show_gpu_profiler)) {
+                s_show_gpu_profiler = !s_show_gpu_profiler;
+            }
+
+            ImGui::EndMenu();
+        }
+
+        if (plugin_manager_ && ImGui::BeginMenu("Plugins"))
+        {
+            for (auto& p : plugin_manager_->plugins()) {
+                bool vis = p->isVisible();
+                if (ImGui::MenuItem(p->getName(), NULL, vis)) {
+                    p->setVisible(!vis);
+                }
+            }
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -304,8 +322,13 @@ bool Menu::draw(
         ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) ||
         ImGui::IsWindowFocused(ImGuiHoveredFlags_AnyWindow);
 
+    // Pin all menu windows to the main viewport so they stay inside the
+    // main application window (only the AutoRig plugin overrides this).
+    ImGuiID main_vp_id = ImGui::GetMainViewport()->ID;
+
     if (s_show_skydome) {
-        if (ImGui::Begin("Skydome", &s_show_skydome)) {
+        ImGui::SetNextWindowViewport(main_vp_id);
+        if (ImGui::Begin("Skydome", &s_show_skydome, ImGuiWindowFlags_NoDocking)) {
             ImGui::SliderFloat("phase func g", &skydome->getG(), -1.0f, 2.0f);
             ImGui::SliderFloat("rayleigh scale height", &skydome->getRayleighScaleHeight(), 0.0f, 16000.0f);
             ImGui::SliderFloat("mei scale height", &skydome->getMieScaleHeight(), 0.0f, 2400.0f);
@@ -314,7 +337,8 @@ bool Menu::draw(
     }
 
     if (s_show_weather) {
-        if (ImGui::Begin("Weather", &s_show_weather, ImGuiWindowFlags_NoScrollbar)) {
+        ImGui::SetNextWindowViewport(main_vp_id);
+        if (ImGui::Begin("Weather", &s_show_weather, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoDocking)) {
             ImGui::Checkbox("Turn off volume moist", &turn_off_volume_moist_);
             ImGui::Checkbox("Turn on airflow effect", &turn_on_airflow_);
 
@@ -424,7 +448,8 @@ bool Menu::draw(
     }
 
     if (s_show_shader_error_message) {
-        if (ImGui::Begin("Shader Compile Error", &s_show_shader_error_message, ImGuiWindowFlags_NoScrollbar)) {
+        ImGui::SetNextWindowViewport(main_vp_id);
+        if (ImGui::Begin("Shader Compile Error", &s_show_shader_error_message, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoDocking)) {
             ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", s_shader_error_message.c_str());
         }
         ImGui::End();
@@ -432,9 +457,13 @@ bool Menu::draw(
 
     // ---- CSM cascade debug window ------------------------------------------
     if (show_csm_debug_) {
-        ImGui::SetNextWindowSize(ImVec2(560, 340), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("CSM Debug", &show_csm_debug_)) {
-            constexpr float kThumbSize = 120.0f;
+        constexpr float kThumbSize = 240.0f;
+        // Fixed window size: 4 images side-by-side + padding/spacing.
+        constexpr float kWinW = kThumbSize * CSM_CASCADE_COUNT + 40.0f;
+        constexpr float kWinH = kThumbSize + 80.0f;
+        ImGui::SetNextWindowSize(ImVec2(kWinW, kWinH));
+        ImGui::SetNextWindowViewport(main_vp_id);
+        if (ImGui::Begin("CSM Debug", &show_csm_debug_, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
             const char* labels[] = { "Cascade 0\n(near)", "Cascade 1", "Cascade 2", "Cascade 3\n(far)" };
             for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
                 if (k > 0) ImGui::SameLine();
@@ -459,11 +488,30 @@ bool Menu::draw(
     }
     // ------------------------------------------------------------------------
 
+    // ---- GPU Profiler window -----------------------------------------------
+    if (s_show_gpu_profiler && gpu_profiler_) {
+        gpu_profiler_->drawImGui();
+    }
+    // ------------------------------------------------------------------------
+
+    // ---- Plugin windows ----------------------------------------------------
+    if (plugin_manager_) {
+        plugin_manager_->drawAllImGui();
+    }
+    // ------------------------------------------------------------------------
+
     chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
 
     renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
 
     cmd_buf->endRenderPass();
+
+    // Multi-viewport: update and render platform windows (separate OS windows).
+    ImGuiIO& vp_io = ImGui::GetIO();
+    if (vp_io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        ImGui::UpdatePlatformWindows();
+        ImGui::RenderPlatformWindowsDefault();
+    }
 
     return in_focus;
 }

@@ -188,6 +188,18 @@ public:
         const uint32_t group_count,
         const uint32_t sbt_size,
         void* shader_handle_storage) = 0;
+
+    // Timestamp query pool interface.
+    virtual std::shared_ptr<QueryPool> createQueryPool(
+        uint32_t query_count) = 0;
+    virtual void destroyQueryPool(
+        std::shared_ptr<QueryPool> query_pool) = 0;
+    virtual bool getQueryPoolResults(
+        const std::shared_ptr<QueryPool>& query_pool,
+        uint32_t first_query,
+        uint32_t query_count,
+        std::vector<uint64_t>& results) = 0;
+    virtual float getTimestampPeriod() = 0;
 };
 
 } // namespace renderer

@@ -25,20 +25,20 @@ bool ChatBox::draw(
 
     // In your per-frame UI construction section:
 
-// Get screen dimensions for positioning
+// Get screen dimensions and main viewport origin for positioning.
+    // With multi-viewport enabled, SetNextWindowPos uses absolute screen
+    // coordinates, so we must offset by the main viewport's position.
     ImGuiIO& io = ImGui::GetIO();
+    ImVec2 vpPos = ImGui::GetMainViewport()->Pos;
     float screenWidth = io.DisplaySize.x;
     float screenHeight = io.DisplaySize.y;
 
     // --- Speaker Name and Dialogue Text ---
-    // Let's define its properties more clearly
+    float speakerWindowPosX = vpPos.x + screenWidth * 0.15f;
+    float speakerWindowPosY = vpPos.y + screenHeight * 0.1f;
+    float speakerWindowWidth = screenWidth * 0.45f;
 
-    // Adjust these percentages to fit your layout and desired look
-    float speakerWindowPosX = screenWidth * 0.15f;  // Example: Start 15% from the left
-    float speakerWindowPosY = screenHeight * 0.1f; // Example: Start 10% from the top (above chat options)
-    float speakerWindowWidth = screenWidth * 0.45f; // KEY: Increase this width (e.g., 45-50% of screen width)
-
-    ImGui::SetNextWindowPos(ImVec2(speakerWindowPosX, speakerWindowPosY), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImVec2(speakerWindowPosX, speakerWindowPosY), ImGuiCond_Always);
     // Set a specific width, height will be determined by content due to AlwaysAutoResize
     ImGui::SetNextWindowSize(ImVec2(speakerWindowWidth, 0.0f), ImGuiCond_Always); // Using 0.0f for height + AlwaysAutoResize
 
@@ -50,8 +50,12 @@ bool ChatBox::draw(
         ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
         ImGuiWindowFlags_AlwaysAutoResize; // Important for height
 
+    ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
     ImGui::Begin("SpeakerInfo", nullptr, speaker_window_flags);
 
     std::string current_speaker_name = "SSGT HERRERA";
@@ -94,13 +98,13 @@ bool ChatBox::draw(
 
     // Approximate position from screenshot (adjust these percentages based on your game's layout)
     // It seems to start about 5-10% from the left and maybe 60-70% from the top.
-    ImVec2 chatBoxPos = ImVec2(screenWidth * 0.05f, screenHeight * 0.65f);
+    ImVec2 chatBoxPos = ImVec2(vpPos.x + screenWidth * 0.05f, vpPos.y + screenHeight * 0.65f);
 
-    ImGui::SetNextWindowPos(chatBoxPos, ImGuiCond_Appearing); // Set position once when it appears
+    ImGui::SetNextWindowPos(chatBoxPos, ImGuiCond_Always); // Fixed position every frame
     // SetNextWindowSizeConstraints can be useful to allow auto-resize by content
     // up to a certain maximum, or a fixed size.
     // For a box that grows with content like in the image:
-    ImGui::SetNextWindowSize(ImVec2(chatBoxWidth, 0.0f), ImGuiCond_Appearing); // Width fixed, height auto (0.0f) on first appear
+    ImGui::SetNextWindowSize(ImVec2(chatBoxWidth, 0.0f), ImGuiCond_Always); // Width fixed, height auto
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(15.0f, 10.0f)); // Add some padding inside the window
@@ -111,15 +115,10 @@ bool ChatBox::draw(
         ImGuiWindowFlags_NoMove |         // User cannot move
         ImGuiWindowFlags_NoScrollbar |    // No scrollbar (unless content overflows fixed size)
         ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoDocking |
         ImGuiWindowFlags_AlwaysAutoResize; // Key flag for height to fit content
 
-    // If you want a fixed height and enable scrolling if content overflows:
-    // ImGuiWindowFlags window_flags_1 = ImGuiWindowFlags_NoTitleBar |
-    //                                 ImGuiWindowFlags_NoResize |
-    //                                 ImGuiWindowFlags_NoMove |
-    //                                 ImGuiWindowFlags_NoSavedSettings;
-    // ImGui::SetNextWindowSize(ImVec2(chatBoxWidth, desiredFixedChatBoxHeight));
-
+    ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
     ImGui::Begin("DialogueUI", nullptr, window_flags_1);
 
     // Inside the "DialogueUI" window

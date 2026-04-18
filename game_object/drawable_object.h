@@ -317,6 +317,10 @@ public:
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
+    static void updateGameObjectsCameraBuffer(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::BufferInfo>& view_camera_buffer);
+
     static void updateGameObjectsBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const glm::vec2& world_min,

@@ -49,6 +49,7 @@ class CommandPool;
 class Queue;
 class Semaphore;
 class Fence;
+class QueryPool;
 struct ImageResourceInfo;
 
 struct MemoryRequirements {
