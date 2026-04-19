@@ -192,6 +192,8 @@ bool Menu::draw(
     bool compile_shaders = false;
 
     bool test_true = true;
+    ImVec2 vp_pos = ImGui::GetMainViewport()->Pos;
+    ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
     ImGui::Begin(
         "fps",
         &test_true,
@@ -199,8 +201,9 @@ bool Menu::draw(
         ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoInputs);
-    ImGui::SetWindowPos(ImVec2(float(screen_size.x) - 196.0f, menu_height));
+        ImGuiWindowFlags_NoInputs |
+        ImGuiWindowFlags_NoDocking);
+    ImGui::SetWindowPos(ImVec2(vp_pos.x + float(screen_size.x) - 196.0f, vp_pos.y + menu_height));
     ImGui::SetWindowSize(ImVec2((float)196, (float)36));
     ImGui::BeginChild("fps", ImVec2(0, 0), false);
     float fps = delta_t > 0.0f ? 1.0f / delta_t : 0.0f;
