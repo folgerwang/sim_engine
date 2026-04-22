@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <vulkan/vulkan.h>
 #include "../device.h"
 
@@ -16,6 +19,33 @@ class VulkanDevice : public Device {
     std::shared_ptr<CommandBuffer> transient_cmd_buffer_;
     std::shared_ptr<Queue> transient_compute_queue_;
     std::shared_ptr<Fence> transient_fence_;
+
+    // ── Async loader queue (see base Device) ──
+    // Second queue on the graphics family, used by the async mesh-load
+    // worker thread to submit vertex/index/texture staging copies without
+    // blocking the main frame tick. nullptr if the hardware exposes too
+    // few queues (callers fall back to the synchronous transient path).
+    std::shared_ptr<CommandPool> loader_cmd_pool_;
+    std::shared_ptr<Queue>       loader_queue_;
+    uint32_t                     loader_queue_family_index_ = (uint32_t)-1;
+
+    // ── Worker-thread transient channel ──
+    // setupTransientCommandBuffer() and submitAndWaitTransientCommandBuffer()
+    // look at std::this_thread::get_id() and route to this channel when the
+    // caller is the registered loader worker. This keeps existing helpers
+    // (Helper::createBuffer etc.) usable unchanged from the worker thread
+    // without serializing on the main thread's transient queue.
+    std::shared_ptr<CommandBuffer> loader_transient_cmd_buffer_;
+    std::shared_ptr<Fence>         loader_transient_fence_;
+    std::atomic<std::thread::id>   loader_thread_id_{std::thread::id{}};
+
+    // ── Resource tracking lists ──
+    // Guarded by tracking_mutex_ because the async mesh-load worker thread
+    // can create buffers/images concurrently with the main render thread.
+    // Vulkan itself allows concurrent object creation on different command
+    // pools, but our bookkeeping vectors are not thread-safe — hence the
+    // lock. Held only around the std::vector push_back / erase / find.
+    mutable std::mutex tracking_mutex_;
     std::vector<std::shared_ptr<Buffer>> buffer_list_;
     std::vector<std::shared_ptr<Image>> image_list_;
     std::vector<std::shared_ptr<ImageView>> image_view_list_;
@@ -39,6 +69,24 @@ public:
     VkDevice get() { return device_; }
     virtual std::shared_ptr<CommandBuffer> setupTransientCommandBuffer() final;
     virtual void submitAndWaitTransientCommandBuffer() final;
+
+    virtual bool hasLoaderQueue() const final {
+        return loader_queue_ != nullptr;
+    }
+    virtual std::shared_ptr<Queue> getLoaderQueue() final {
+        return loader_queue_;
+    }
+    virtual uint32_t getLoaderQueueFamilyIndex() const final {
+        return loader_queue_family_index_;
+    }
+    virtual std::shared_ptr<CommandPool> getLoaderCommandPool() final {
+        return loader_cmd_pool_;
+    }
+
+    virtual void registerLoaderThread(std::thread::id id) final {
+        loader_thread_id_.store(id, std::memory_order_release);
+    }
+
     const std::shared_ptr<PhysicalDevice>& getPhysicalDevice() {
         return physical_device_; }
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool() final;
@@ -204,6 +252,7 @@ public:
     virtual void freeCommandBuffers(std::shared_ptr<CommandPool> cmd_pool, const std::vector<std::shared_ptr<CommandBuffer>>& cmd_bufs) final;
     virtual void resetFences(const std::vector<std::shared_ptr<Fence>>& fences) final;
     virtual void waitForFences(const std::vector<std::shared_ptr<Fence>>& fences) final;
+    virtual bool isFenceSignaled(const std::shared_ptr<Fence>& fence) final;
     virtual void waitForSemaphores(const std::vector<std::shared_ptr<Semaphore>>& semaphores, uint64_t value) final;
     virtual void waitIdle() final;
     virtual void getAccelerationStructureBuildSizes(

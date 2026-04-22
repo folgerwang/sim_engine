@@ -66,6 +66,58 @@ VulkanDevice::VulkanDevice(
 
     transient_fence_ =
         createFence(std::source_location::current());
+
+    // ── Async loader queue setup ──
+    // Take a separate queue from the same family as the transient compute
+    // queue so the async mesh-load worker can submit staging copies
+    // without contending with the transient path. If there aren't enough
+    // queues in the family we leave loader_queue_ null and the engine
+    // falls back to synchronous uploads.
+    //
+    // Layout so far in the graphics/compute family:
+    //   index (count - 1): transient_compute_queue_
+    //   index (count - 2): loader_queue_       <-- this block
+    //   indices 0 ... (count - 3): free for graphics submit / present
+    //
+    // TODO: on hardware with a dedicated TRANSFER-only family we should
+    // request a queue from that family in createLogicalDevice() and
+    // prefer it here. Current path works on any family with >= 2 queues.
+    const auto& family_info =
+        queue_list.getQueueInfo(compute_queue_index);
+    if (family_info.queue_count_ >= 2 &&
+        transit_queue_index >= 1) {
+        loader_queue_family_index_ = compute_queue_index;
+        const uint32_t loader_index = transit_queue_index - 1;
+        loader_queue_ =
+            getDeviceQueue(loader_queue_family_index_, loader_index);
+        loader_cmd_pool_ =
+            createCommandPool(
+                loader_queue_family_index_,
+                static_cast<uint32_t>(CommandPoolCreateFlagBits::TRANSIENT_BIT) |
+                static_cast<uint32_t>(CommandPoolCreateFlagBits::RESET_COMMAND_BUFFER_BIT));
+
+        // Worker-thread transient channel: one reusable command buffer
+        // + fence allocated from the loader pool, used by helpers invoked
+        // from the worker thread so they don't share mutable state with
+        // the main thread's transient path.
+        loader_transient_cmd_buffer_ =
+            allocateCommandBuffers(loader_cmd_pool_, 1, true)[0];
+        loader_transient_fence_ =
+            createFence(std::source_location::current());
+
+        std::cout
+            << "[LOADER] async loader queue enabled: family="
+            << loader_queue_family_index_
+            << " queue_index=" << loader_index
+            << std::endl;
+    }
+    else {
+        std::cout
+            << "[LOADER] insufficient queues in family " << compute_queue_index
+            << " (count=" << family_info.queue_count_
+            << "); async loader disabled, uploads will be synchronous"
+            << std::endl;
+    }
 }
 
 VulkanDevice::~VulkanDevice()
@@ -84,11 +136,34 @@ VulkanDevice::~VulkanDevice()
 }
 
 std::shared_ptr<CommandBuffer> VulkanDevice::setupTransientCommandBuffer() {
+    // Route worker-thread callers to the loader transient channel so the
+    // two threads don't mutate the same command buffer / fence. Fallback
+    // to the original compute-queue path if no loader channel exists
+    // (single-queue hardware) or if the caller is the main thread.
+    const std::thread::id tid = std::this_thread::get_id();
+    const std::thread::id lid = loader_thread_id_.load(std::memory_order_acquire);
+    if (loader_transient_cmd_buffer_ && tid == lid && lid != std::thread::id{}) {
+        loader_transient_cmd_buffer_->beginCommandBuffer(
+            SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
+        return loader_transient_cmd_buffer_;
+    }
     transient_cmd_buffer_->beginCommandBuffer(SET_FLAG_BIT(CommandBufferUsage, ONE_TIME_SUBMIT_BIT));
     return transient_cmd_buffer_;
 }
 
 void VulkanDevice::submitAndWaitTransientCommandBuffer() {
+    const std::thread::id tid = std::this_thread::get_id();
+    const std::thread::id lid = loader_thread_id_.load(std::memory_order_acquire);
+    if (loader_transient_cmd_buffer_ && tid == lid && lid != std::thread::id{}) {
+        loader_transient_cmd_buffer_->endCommandBuffer();
+        loader_queue_->submit(
+            { loader_transient_cmd_buffer_ },
+            loader_transient_fence_);
+        waitForFences({ loader_transient_fence_ });
+        resetFences({ loader_transient_fence_ });
+        loader_transient_cmd_buffer_->reset(0);
+        return;
+    }
     transient_cmd_buffer_->endCommandBuffer();
     transient_compute_queue_->submit(
         { transient_cmd_buffer_ },
@@ -128,7 +203,10 @@ std::shared_ptr<Buffer> VulkanDevice::createBuffer(
             buffer,
             static_cast<uint32_t>(buf_size));
     vk_buffer->set_source_location(src_location);
-    buffer_list_.push_back(vk_buffer);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        buffer_list_.push_back(vk_buffer);
+    }
 
     return vk_buffer;
 }
@@ -205,7 +283,10 @@ std::shared_ptr<Image> VulkanDevice::createImage(
         std::make_shared<VulkanImage>(image);
     vk_image->setImageLayout(layout);
     vk_image->set_source_location(src_location);
-    image_list_.push_back(vk_image);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        image_list_.push_back(vk_image);
+    }
 
     return vk_image;
 }
@@ -251,7 +332,10 @@ std::shared_ptr<ImageView> VulkanDevice::createImageView(
     auto vk_image_view =
         std::make_shared<VulkanImageView>(image_view);
     vk_image_view->set_source_location(src_location);
-    image_view_list_.push_back(vk_image_view);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        image_view_list_.push_back(vk_image_view);
+    }
 
     return vk_image_view;
 }
@@ -302,7 +386,10 @@ VulkanDevice::createSampler(
     auto vk_tex_sampler =
         std::make_shared<VulkanSampler>(tex_sampler);
     vk_tex_sampler->set_source_location(src_location);
-    sampler_list_.push_back(vk_tex_sampler);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        sampler_list_.push_back(vk_tex_sampler);
+    }
 
     return vk_tex_sampler;
 }
@@ -344,7 +431,10 @@ std::shared_ptr<Semaphore> VulkanDevice::createSemaphore(
     auto vk_semaphore =
         std::make_shared<VulkanSemaphore>(semaphore);
     vk_semaphore->set_source_location(src_location);
-    semaphore_list_.push_back(vk_semaphore);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        semaphore_list_.push_back(vk_semaphore);
+    }
 
     return vk_semaphore;
 }
@@ -375,8 +465,11 @@ std::shared_ptr<Fence> VulkanDevice::createFence(
     auto vk_fence =
         std::make_shared<VulkanFence>(fence);
     vk_fence->set_source_location(src_location);
-    fence_list_.push_back(vk_fence);
-    
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        fence_list_.push_back(vk_fence);
+    }
+
     return vk_fence;
 }
 
@@ -409,8 +502,11 @@ VulkanDevice::createShaderModule(
         std::make_shared<VulkanShaderModule>(
             shader_module,
             shader_stage);
-    vk_shader_module->set_source_location(src_location),
-    shader_list_.push_back(vk_shader_module);
+    vk_shader_module->set_source_location(src_location);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        shader_list_.push_back(vk_shader_module);
+    }
 
     return vk_shader_module;
 }
@@ -549,7 +645,10 @@ std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
     auto vk_render_pass =
         std::make_shared<VulkanRenderPass>(render_pass);
     vk_render_pass->set_source_location(src_location);
-    render_pass_list_.push_back(vk_render_pass);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        render_pass_list_.push_back(vk_render_pass);
+    }
 
     return vk_render_pass;
 }
@@ -638,7 +737,10 @@ std::shared_ptr<PipelineLayout> VulkanDevice::createPipelineLayout(
     auto vk_pipeline_layout =
         std::make_shared<VulkanPipelineLayout>(pipeline_layout);
     vk_pipeline_layout->set_source_location(src_location);
-    pipeline_layout_list_.push_back(vk_pipeline_layout);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        pipeline_layout_list_.push_back(vk_pipeline_layout);
+    }
 
     return vk_pipeline_layout;
 }
@@ -717,7 +819,10 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(graphics_pipeline);
     vk_pipeline->set_source_location(src_location);
-    pipeline_list_.push_back(vk_pipeline);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        pipeline_list_.push_back(vk_pipeline);
+    }
 
     return vk_pipeline;
 }
@@ -823,7 +928,10 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(graphics_pipeline);
     vk_pipeline->set_source_location(src_location);
-    pipeline_list_.push_back(vk_pipeline);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        pipeline_list_.push_back(vk_pipeline);
+    }
 
     return vk_pipeline;
 }
@@ -864,7 +972,10 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(compute_pipeline);
     vk_pipeline->set_source_location(src_location);
-    pipeline_list_.push_back(vk_pipeline);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        pipeline_list_.push_back(vk_pipeline);
+    }
 
     return vk_pipeline;
 }
@@ -911,7 +1022,10 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(rt_pipeline);
     vk_pipeline->set_source_location(src_location);
-    pipeline_list_.push_back(vk_pipeline);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        pipeline_list_.push_back(vk_pipeline);
+    }
 
     return vk_pipeline;
 }
@@ -1008,7 +1122,10 @@ std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
     auto vk_frame_buffer =
         std::make_shared<VulkanFramebuffer>(frame_buffer);
     vk_frame_buffer->set_source_location(src_location);
-    framebuffer_list_.push_back(vk_frame_buffer);
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        framebuffer_list_.push_back(vk_frame_buffer);
+    }
 
     return vk_frame_buffer;
 }
@@ -1370,6 +1487,7 @@ void VulkanDevice::destroyDescriptorPool(std::shared_ptr<DescriptorPool> descrip
 }
 
 void VulkanDevice::destroyPipeline(std::shared_ptr<Pipeline> pipeline) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(pipeline_list_.begin(), pipeline_list_.end(), pipeline);
     if (result != pipeline_list_.end()) {
         auto vk_pipeline = RENDER_TYPE_CAST(Pipeline, pipeline);
@@ -1381,6 +1499,7 @@ void VulkanDevice::destroyPipeline(std::shared_ptr<Pipeline> pipeline) {
 }
 
 void VulkanDevice::destroyPipelineLayout(std::shared_ptr<PipelineLayout> pipeline_layout) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(pipeline_layout_list_.begin(), pipeline_layout_list_.end(), pipeline_layout);
     if (result != pipeline_layout_list_.end()) {
         auto vk_pipeline_layout = RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
@@ -1392,6 +1511,7 @@ void VulkanDevice::destroyPipelineLayout(std::shared_ptr<PipelineLayout> pipelin
 }
 
 void VulkanDevice::destroyRenderPass(std::shared_ptr<RenderPass> render_pass) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(render_pass_list_.begin(), render_pass_list_.end(), render_pass);
     if (result != render_pass_list_.end()) {
         auto vk_render_pass = RENDER_TYPE_CAST(RenderPass, render_pass);
@@ -1403,6 +1523,7 @@ void VulkanDevice::destroyRenderPass(std::shared_ptr<RenderPass> render_pass) {
 }
 
 void VulkanDevice::destroyFramebuffer(std::shared_ptr<Framebuffer> frame_buffer) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(framebuffer_list_.begin(), framebuffer_list_.end(), frame_buffer);
     if (result != framebuffer_list_.end()) {
         auto vk_framebuffer = RENDER_TYPE_CAST(Framebuffer, frame_buffer);
@@ -1414,6 +1535,7 @@ void VulkanDevice::destroyFramebuffer(std::shared_ptr<Framebuffer> frame_buffer)
 }
 
 void VulkanDevice::destroyImageView(std::shared_ptr<ImageView> image_view) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(image_view_list_.begin(), image_view_list_.end(), image_view);
     if (result != image_view_list_.end()) {
         auto vk_image_view = RENDER_TYPE_CAST(ImageView, image_view);
@@ -1425,6 +1547,7 @@ void VulkanDevice::destroyImageView(std::shared_ptr<ImageView> image_view) {
 }
 
 void VulkanDevice::destroySampler(std::shared_ptr<Sampler> sampler) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(sampler_list_.begin(), sampler_list_.end(), sampler);
     if (result != sampler_list_.end()) {
         auto vk_sampler = RENDER_TYPE_CAST(Sampler, sampler);
@@ -1436,6 +1559,7 @@ void VulkanDevice::destroySampler(std::shared_ptr<Sampler> sampler) {
 }
 
 void VulkanDevice::destroyImage(std::shared_ptr<Image> image) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(image_list_.begin(), image_list_.end(), image);
     if (result != image_list_.end()) {
         auto vk_image = RENDER_TYPE_CAST(Image, image);
@@ -1447,6 +1571,7 @@ void VulkanDevice::destroyImage(std::shared_ptr<Image> image) {
 }
 
 void VulkanDevice::destroyBuffer(std::shared_ptr<Buffer> buffer) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(buffer_list_.begin(), buffer_list_.end(), buffer);
     if (result != buffer_list_.end()) {
         auto vk_buffer = RENDER_TYPE_CAST(Buffer, buffer);
@@ -1458,6 +1583,7 @@ void VulkanDevice::destroyBuffer(std::shared_ptr<Buffer> buffer) {
 }
 
 void VulkanDevice::destroySemaphore(std::shared_ptr<Semaphore> semaphore) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(semaphore_list_.begin(), semaphore_list_.end(), semaphore);
     if (result != semaphore_list_.end()) {
         auto vk_semaphore = RENDER_TYPE_CAST(Semaphore, semaphore);
@@ -1469,6 +1595,7 @@ void VulkanDevice::destroySemaphore(std::shared_ptr<Semaphore> semaphore) {
 }
 
 void VulkanDevice::destroyFence(std::shared_ptr<Fence> fence) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(fence_list_.begin(), fence_list_.end(), fence);
     if (result != fence_list_.end()) {
         auto vk_fence = RENDER_TYPE_CAST(Fence, fence);
@@ -1488,6 +1615,7 @@ void VulkanDevice::destroyDescriptorSetLayout(std::shared_ptr<DescriptorSetLayou
 
 void VulkanDevice::destroyShaderModule(
     std::shared_ptr<ShaderModule> shader_module) {
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
     auto result = std::find(shader_list_.begin(), shader_list_.end(), shader_module);
     if (result != shader_list_.end()) {
         auto vk_shader_module = RENDER_TYPE_CAST(ShaderModule, shader_module);
@@ -1507,6 +1635,22 @@ void VulkanDevice::destroy() {
         transient_cmd_pool_);
 
     destroyFence(transient_fence_);
+
+    // Loader-channel teardown (may be null on single-queue hardware).
+    if (loader_cmd_pool_) {
+        if (loader_transient_cmd_buffer_) {
+            freeCommandBuffers(
+                loader_cmd_pool_,
+                { loader_transient_cmd_buffer_ });
+            loader_transient_cmd_buffer_.reset();
+        }
+        destroyCommandPool(loader_cmd_pool_);
+        loader_cmd_pool_.reset();
+    }
+    if (loader_transient_fence_) {
+        destroyFence(loader_transient_fence_);
+        loader_transient_fence_.reset();
+    }
 
     vkDestroyDevice(device_, nullptr);
 }
@@ -1570,6 +1714,30 @@ void VulkanDevice::waitForFences(const std::vector<std::shared_ptr<Fence>>& fenc
             std::string("wait for fence error : ") +
                 VkResultToString(result));
     }
+}
+
+bool VulkanDevice::isFenceSignaled(const std::shared_ptr<Fence>& fence) {
+    if (!fence) {
+        return false;
+    }
+    auto vk_fence = RENDER_TYPE_CAST(Fence, fence);
+    if (!vk_fence) {
+        return false;
+    }
+    // vkGetFenceStatus is a thread-safe, non-blocking query. Unlike
+    // vkWaitForFences it never stalls the calling thread, which is exactly
+    // what the async-loader poll loop needs on the main frame tick.
+    VkResult result = vkGetFenceStatus(device_, vk_fence->get());
+    if (result == VK_SUCCESS) {
+        return true;
+    }
+    if (result == VK_NOT_READY) {
+        return false;
+    }
+    // VK_ERROR_DEVICE_LOST and other errors propagate as "signaled" so the
+    // caller cleans up rather than spinning forever; an upstream crash will
+    // surface via the next validation-layer message.
+    return true;
 }
 
 void VulkanDevice::waitForSemaphores(

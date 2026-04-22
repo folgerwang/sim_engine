@@ -15,6 +15,7 @@
 #include "helper/bvh.h"
 #include "helper/mesh_tool.h"
 #include "game_object/drawable_object.h"
+#include "game_object/mesh_load_task_manager.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 
@@ -1080,6 +1081,21 @@ static void setupMesh(
         vertex.uv = glm::vec2(uv.x, uv.y);
     }
 
+    // ── Cluster sidecar build (only when --cluster-debug is active) ──
+    // `full_lod_meshes` at this point holds exactly LOD-0 of the mesh —
+    // new_indices.size()/3 faces and drawable_vertices populated above.
+    // The HLOD loop below will APPEND higher-LOD faces onto the same arrays;
+    // we want clusters for the base LOD only, so build them here first.
+    if (helper::clusterRenderingEnabled()) {
+        helper::buildClusterMesh(full_lod_meshes, drawable_mesh.cluster_mesh_);
+        // Expand to GPU-side buffers for the per-cluster flat-color draw.
+        // Safe to call with an empty sidecar -- uploadForMesh() no-ops then.
+        ego::ClusterDebugDraw::uploadForMesh(
+            device,
+            drawable_mesh.cluster_mesh_,
+            drawable_mesh.cluster_debug_gpu_);
+    }
+
     // create HLOD
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
         lod_indice_info(helper::c_num_lods + 1);
@@ -1952,6 +1968,40 @@ static void drawMesh(
     const std::vector<renderer::Scissor>& scissors,
     bool depth_only,
     size_t& last_hash) {
+
+    // ── --cluster-debug override (forward pass only) ──────────────────────
+    // When the CLI flag is live and this MeshInfo actually had its cluster
+    // sidecar + GPU expansion built (only the FBX-path static meshes do so
+    // far), bypass the whole primitive loop and paint the mesh with the
+    // per-cluster flat-color helper. Depth-only passes (shadow / pre-z)
+    // fall through to the normal path so they still write valid depth.
+    if (!depth_only &&
+        engine::helper::clusterRenderingEnabled() &&
+        mesh_info.cluster_debug_gpu_.ready() &&
+        ego::ClusterDebugDraw::ready()) {
+        // Cluster-debug pipeline layout only declares PBR_GLOBAL_PARAMS_SET
+        // and VIEW_PARAMS_SET (same layout list as ShapeBase). Slice just
+        // those two from the incoming list so the validation layers don't
+        // flag a layout/set-count mismatch.
+        renderer::DescriptorSetList cluster_desc_sets;
+        if (desc_set_list.size() > VIEW_PARAMS_SET) {
+            cluster_desc_sets = {
+                desc_set_list[PBR_GLOBAL_PARAMS_SET],
+                desc_set_list[VIEW_PARAMS_SET],
+            };
+        }
+        ego::ClusterDebugDraw::draw(
+            cmd_buf,
+            cluster_desc_sets,
+            mesh_info.cluster_debug_gpu_,
+            model_params.model_mat,
+            viewports,
+            scissors);
+        // Invalidate the normal-path's "last pipeline hash" cache so the
+        // next non-debug drawMesh call correctly re-binds its pipeline.
+        last_hash = 0;
+        return;
+    }
 
     for (const auto& prim : mesh_info.primitives_) {
         const auto& attrib_list = prim.attribute_descs_;
@@ -2941,10 +2991,210 @@ DrawableObject::DrawableObject(
             game_objects_buffer_);
 
         drawable_object_list_[file_name] = object_;
+
+        // Sync path: everything is set up by the time we return, so
+        // isReady() should report true immediately. Async path flips
+        // this same flag at the end of phase 3 (see createAsync).
+        object_->ready_.store(true, std::memory_order_release);
     }
     else {
         object_ = result->second;
     }
+}
+
+std::shared_ptr<DrawableObject> DrawableObject::createAsync(
+    MeshLoadTaskManager& task_manager,
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const std::shared_ptr<renderer::Sampler>& texture_sampler,
+    const renderer::TextureInfo& thin_film_lut_tex,
+    const std::string& file_name,
+    glm::mat4 location/* = glm::mat4(1.0f)*/) {
+
+    // Shell object the caller can push into draw lists immediately.
+    // object_ stays null (isReady() == false) until phase 3 finalizes.
+    auto obj = std::shared_ptr<DrawableObject>(new DrawableObject(location));
+
+    // Cache short-circuit: if this file has already been loaded,
+    // reuse the finalized DrawableData directly — no async work needed.
+    // drawable_object_list_ is only written on the main thread (from
+    // the sync ctor's tail or phase 3 below), so this lookup is safe
+    // without locking.
+    auto cached = drawable_object_list_.find(file_name);
+    if (cached != drawable_object_list_.end()) {
+        obj->object_ = cached->second;
+        // The cached DrawableData's ready_ is already set (either by
+        // sync ctor or a previous phase 3), so isReady() returns true.
+        return obj;
+    }
+
+    // Shared mailbox: phase 2 (worker thread) writes `data`; phase 3
+    // (main thread, after fence signals) reads it. The MeshLoadTaskManager
+    // runs phase3 only after phase2's command buffer fence signals, so
+    // there is a natural happens-before between the two lambdas.
+    struct LoadState {
+        std::shared_ptr<DrawableData> data;
+    };
+    auto state = std::make_shared<LoadState>();
+
+    const std::string ext =
+        std::filesystem::path(file_name).extension().string();
+
+    MeshLoadTask::Phase2Fn phase2_fn =
+        [device, file_name, ext, state](
+            const std::shared_ptr<renderer::Device>& /*dev*/,
+            const std::shared_ptr<renderer::CommandBuffer>& /*cmd_buf*/,
+            std::string& err_out) -> bool {
+            // NOTE: we deliberately do not record into the provided
+            // cmd_buf. loadGltfModel / loadFbxModel perform their GPU
+            // uploads via renderer::Helper::createBuffer, which goes
+            // through the thread-routed transient channel
+            // (VulkanDevice::setupTransientCommandBuffer dispatched
+            // by loader_thread_id_). That keeps the existing helper
+            // code unmodified. The outer cmd_buf is submitted empty,
+            // and its fence signals near-instantly, which is what
+            // drives phase 3 on the next main-thread poll().
+            try {
+                if (ext == ".fbx") {
+                    state->data = loadFbxModel(device, file_name);
+                } else if (ext == ".gltf" || ext == ".glb") {
+                    state->data = loadGltfModel(device, file_name);
+                } else {
+                    err_out = "unsupported mesh extension: " + ext;
+                    return false;
+                }
+                if (!state->data) {
+                    err_out = "loader returned null for '" + file_name + "'";
+                    return false;
+                }
+                return true;
+            } catch (const std::exception& e) {
+                err_out = std::string("load threw: ") + e.what();
+                return false;
+            }
+        };
+
+    // NOTE: renderbuffer_formats is a raw pointer into application-
+    // owned storage (Application::renderbuffer_formats_). It must
+    // outlive every in-flight async load, which it does for the
+    // application lifetime. graphic_pipeline_info and thin_film_lut_tex
+    // are captured by value.
+    MeshLoadTask::Phase3Fn phase3_fn =
+        [obj, state, device, descriptor_pool, renderbuffer_formats,
+         graphic_pipeline_info, texture_sampler, thin_film_lut_tex,
+         file_name]() {
+            auto data = state->data;
+            if (!data) {
+                // Phase 2 failed; MeshLoadTaskManager already logged
+                // the error. Leave obj->object_ null so isReady()
+                // stays false — the caller can notice via the task
+                // status if they held on to the MeshLoadTask handle.
+                return;
+            }
+
+            // Descriptor-set + texture-image work. The descriptor pool
+            // is not thread-safe per Vulkan spec, so this belongs on
+            // the main thread.
+            updateDescriptorSets(
+                device,
+                descriptor_pool,
+                material_desc_set_layout_,
+                skin_desc_set_layout_,
+                data,
+                texture_sampler,
+                thin_film_lut_tex);
+
+            // Pipeline creation (the per-primitive hashing + pipeline-cache
+            // lookups match the sync ctor above — duplicated deliberately
+            // to keep the two paths easy to diff).
+            for (int i_mesh = 0;
+                 i_mesh < static_cast<int>(data->meshes_.size());
+                 i_mesh++) {
+                for (int i_prim = 0;
+                     i_prim < static_cast<int>(data->meshes_[i_mesh].primitives_.size());
+                     i_prim++) {
+                    const auto& primitive =
+                        data->meshes_[i_mesh].primitives_[i_prim];
+                    {
+                        auto hash_value = primitive.getHash();
+                        auto result = drawable_pipeline_list_.find(hash_value);
+                        if (result == drawable_pipeline_list_.end()) {
+                            drawable_pipeline_list_[hash_value] =
+                                createDrawablePipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
+                    {
+                        auto hash_value = primitive.getDepthonlyHash();
+                        auto result =
+                            drawable_shadow_pipeline_list_.find(hash_value);
+                        if (result == drawable_shadow_pipeline_list_.end()) {
+                            drawable_shadow_pipeline_list_[hash_value] =
+                                createDrawableShadowPipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
+                    {
+                        auto hash_value = primitive.getDepthonlyHash();
+                        auto result =
+                            drawable_csm_layered_pipeline_list_.find(hash_value);
+                        if (result == drawable_csm_layered_pipeline_list_.end()) {
+                            drawable_csm_layered_pipeline_list_[hash_value] =
+                                createDrawableCsmLayeredPipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
+                }
+            }
+
+            device->createBuffer(
+                kNumDrawableInstance * sizeof(glsl::InstanceDataInfo),
+                SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+                0,
+                data->instance_buffer_.buffer,
+                data->instance_buffer_.memory,
+                std::source_location::current());
+
+            data->generateSharedDescriptorSet(
+                device,
+                descriptor_pool,
+                drawable_indirect_draw_desc_set_layout_,
+                update_instance_buffer_desc_set_layout_,
+                game_objects_buffer_);
+
+            // Publish into the global cache so subsequent loads of
+            // the same file short-circuit in createAsync's cache
+            // check above.
+            drawable_object_list_[file_name] = data;
+
+            // Attach to the shell DrawableObject and flip ready_.
+            // The release store on ready_ pairs with the acquire
+            // load in isReady(), synchronizing every preceding write
+            // in this lambda with anything the render thread does
+            // once it observes ready_ == true.
+            obj->object_ = data;
+            data->ready_.store(true, std::memory_order_release);
+        };
+
+    task_manager.submit(
+        file_name, std::move(phase2_fn), std::move(phase3_fn));
+
+    return obj;
 }
 
 void DrawableData::generateSharedDescriptorSet(
@@ -3408,6 +3658,13 @@ void DrawableObject::updateGameObjectsBuffer(
 void DrawableObject::updateInstanceBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
 
+    // Async-load safety: skip when the worker hasn't published the
+    // instance_buffer_ yet. isReady() performs an acquire-load on
+    // DrawableData::ready_ which is released at the end of phase 3.
+    if (!isReady()) {
+        return;
+    }
+
     cmd_buf->addBufferBarrier(
         object_->instance_buffer_.buffer,
         { SET_FLAG_BIT(Access, VERTEX_ATTRIBUTE_READ_BIT), SET_FLAG_BIT(PipelineStage, VERTEX_INPUT_BIT) },
@@ -3442,6 +3699,10 @@ void DrawableObject::updateInstanceBuffer(
 
 void DrawableObject::updateIndirectDrawBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
+
+    if (!isReady()) {
+        return;
+    }
 
     cmd_buf->addBufferBarrier(
         object_->indirect_draw_cmd_.buffer,
@@ -3487,6 +3748,13 @@ void DrawableObject::draw(
     bool depth_only/* = false */,
     DrawMode draw_mode/* = DrawMode::kForward */) {
 
+    // Skip while the async load is still in flight. The menu spinner
+    // (see application.cpp HUD wiring) is the user-visible signal; the
+    // object simply pops in the first frame after phase 3 finalizes.
+    if (!isReady()) {
+        return;
+    }
+
     auto& pipeline_list =
         (draw_mode == DrawMode::kCsmLayered) ? drawable_csm_layered_pipeline_list_ :
         depth_only                           ? drawable_shadow_pipeline_list_ :
@@ -3521,7 +3789,12 @@ void DrawableObject::draw(
 void DrawableObject::update(
     const std::shared_ptr<renderer::Device>& device,
     const float& time) {
-    if (object_) {
+    // Async-load safety: DrawableData::update reads nodes_/scenes_/skins_
+    // which are populated by phase 2 but only considered publishable
+    // once phase 3 flips ready_. Keep the null check too for belt-and-
+    // suspenders (the sync constructor path never flips ready_ but
+    // always leaves object_ non-null — see compat note below).
+    if (object_ && object_->ready_.load(std::memory_order_acquire)) {
         object_->update(
             device,
             0,

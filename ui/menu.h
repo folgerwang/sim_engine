@@ -10,6 +10,7 @@
 namespace plugins { class PluginManager; }
 
 namespace engine {
+namespace game_object { class MeshLoadTaskManager; }
 namespace ui {
 
 class Menu {
@@ -56,12 +57,20 @@ class Menu {
     // Plugin system — set from application after init.
     plugins::PluginManager* plugin_manager_ = nullptr;
 
+    // Optional async mesh loader — set from application after init.
+    // Used by the HUD spinner overlay (see draw()) to show which
+    // meshes are still loading. Non-owning.
+    engine::game_object::MeshLoadTaskManager* mesh_load_task_manager_ = nullptr;
+
 public:
     void setGpuProfiler(engine::helper::GpuProfiler* profiler) {
         gpu_profiler_ = profiler;
     }
     void setPluginManager(plugins::PluginManager* pm) {
         plugin_manager_ = pm;
+    }
+    void setMeshLoadTaskManager(engine::game_object::MeshLoadTaskManager* m) {
+        mesh_load_task_manager_ = m;
     }
     Menu(
         GLFWwindow* window,

@@ -423,6 +423,15 @@ struct BaseShapeDrawParams {
     mat4            transform;
 };
 
+// Push constants for the "Nanite-lite" per-cluster flat-color debug draw.
+// Populated on the C++ side by the ClusterDebugDraw helper, consumed by
+// cluster_debug.vert / cluster_debug.frag. Only the model transform is
+// needed — the hashed per-cluster color is derived entirely from the
+// vertex-attribute `cluster_id` that the vertex shader passes through.
+struct ClusterDebugParams {
+    mat4            transform;
+};
+
 struct VolumeMoistrueParams {
     vec2            world_min;
     vec2            inv_world_range;

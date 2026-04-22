@@ -1,4 +1,5 @@
 #pragma once
+#include <thread>
 #include "renderer_structs.h"
 
 namespace engine {
@@ -7,8 +8,34 @@ namespace renderer {
 class Device {
 public:
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool() = 0;
+    // Transient command buffer dispatch. When called from the loader
+    // worker thread (registered via registerLoaderThread) the device
+    // returns a worker-owned command buffer + fence + queue; otherwise
+    // the main/compute channel is used. This keeps the 18 existing call
+    // sites working on either thread without modification.
     virtual std::shared_ptr<CommandBuffer> setupTransientCommandBuffer() = 0;
     virtual void submitAndWaitTransientCommandBuffer() = 0;
+
+    // Tell the device which thread should be treated as the loader
+    // worker. Set at MeshLoadTaskManager worker startup. Re-setting
+    // is safe; pass std::thread::id{} to clear.
+    virtual void registerLoaderThread(std::thread::id id) = 0;
+
+    // ── Async loader queue (Layer 1 of async mesh load) ──────────────────
+    // A second queue intended for worker-thread uploads that must not block
+    // the main frame tick. On hardware with a dedicated transfer family we
+    // should eventually prefer that; for now we reuse the graphics family
+    // and take a separate queue index so the loader doesn't contend with
+    // the existing transient compute queue.
+    //
+    // Returns nullptr / (uint32_t)-1 if the hardware exposes too few queues
+    // to spare one — callers should fall back to the synchronous path
+    // (createBuffer + submitAndWaitTransientCommandBuffer) in that case.
+    virtual bool hasLoaderQueue() const = 0;
+    virtual std::shared_ptr<Queue> getLoaderQueue() = 0;
+    virtual uint32_t getLoaderQueueFamilyIndex() const = 0;
+    virtual std::shared_ptr<CommandPool> getLoaderCommandPool() = 0;
+
     virtual void createBuffer(
         const uint64_t& buffer_size,
         const BufferUsageFlags& usage,
@@ -171,6 +198,9 @@ public:
     virtual void freeCommandBuffers(std::shared_ptr<CommandPool> cmd_pool, const std::vector<std::shared_ptr<CommandBuffer>>& cmd_bufs) = 0;
     virtual void resetFences(const std::vector<std::shared_ptr<Fence>>& fences) = 0;
     virtual void waitForFences(const std::vector<std::shared_ptr<Fence>>& fences) = 0;
+    // Non-blocking fence status check. Returns true if the fence is signaled.
+    // Used by the async loader poll loop (vkGetFenceStatus path).
+    virtual bool isFenceSignaled(const std::shared_ptr<Fence>& fence) = 0;
     virtual void waitForSemaphores(const std::vector<std::shared_ptr<Semaphore>>& semaphores, uint64_t value) = 0;
     virtual void waitIdle() = 0;
     virtual void getAccelerationStructureBuildSizes(

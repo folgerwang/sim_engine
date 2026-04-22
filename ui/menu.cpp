@@ -1,5 +1,6 @@
 #include <vector>
 #include <filesystem>
+#include <cmath>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -11,6 +12,7 @@
 
 #include "menu.h"
 #include "plugins/plugin_manager.h"
+#include "game_object/mesh_load_task_manager.h"
 
 namespace er = engine::renderer;
 
@@ -23,6 +25,291 @@ namespace {
         if (err < 0)
             abort();
     }
+
+    // ------------------------------------------------------------------
+    // Fantasy aesthetic — ported from realworld/design/fantasy_menu.html.
+    // Deep indigo panels, muted gold accents, low-alpha borders. Applied
+    // once after ImGui init so every widget (menu bar, popups, sliders,
+    // plugin panels) picks up the look without per-call styling.
+    // ------------------------------------------------------------------
+    static void applyFantasyStyle() {
+        ImGuiStyle& s = ImGui::GetStyle();
+
+        const ImVec4 gold        = ImVec4(0.83f, 0.69f, 0.35f, 1.00f);
+        const ImVec4 gold_dim    = ImVec4(0.55f, 0.45f, 0.22f, 0.80f);
+        const ImVec4 gold_bright = ImVec4(0.95f, 0.86f, 0.60f, 1.00f);
+        const ImVec4 cream       = ImVec4(0.93f, 0.88f, 0.72f, 1.00f);
+
+        s.Colors[ImGuiCol_Text]              = cream;
+        s.Colors[ImGuiCol_TextDisabled]      = ImVec4(0.55f, 0.52f, 0.42f, 1.00f);
+        s.Colors[ImGuiCol_WindowBg]          = ImVec4(0.05f, 0.06f, 0.12f, 0.92f);
+        s.Colors[ImGuiCol_ChildBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        s.Colors[ImGuiCol_PopupBg]           = ImVec4(0.05f, 0.06f, 0.12f, 0.96f);
+        s.Colors[ImGuiCol_Border]            = ImVec4(0.55f, 0.45f, 0.22f, 0.40f);
+        s.Colors[ImGuiCol_BorderShadow]      = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        s.Colors[ImGuiCol_FrameBg]           = ImVec4(0.10f, 0.10f, 0.18f, 0.85f);
+        s.Colors[ImGuiCol_FrameBgHovered]    = ImVec4(0.18f, 0.16f, 0.28f, 1.00f);
+        s.Colors[ImGuiCol_FrameBgActive]     = ImVec4(0.25f, 0.22f, 0.38f, 1.00f);
+        s.Colors[ImGuiCol_TitleBg]           = ImVec4(0.04f, 0.05f, 0.10f, 1.00f);
+        s.Colors[ImGuiCol_TitleBgActive]     = ImVec4(0.08f, 0.08f, 0.15f, 1.00f);
+        s.Colors[ImGuiCol_TitleBgCollapsed]  = ImVec4(0.04f, 0.05f, 0.10f, 0.75f);
+        s.Colors[ImGuiCol_MenuBarBg]         = ImVec4(0.03f, 0.04f, 0.09f, 0.95f);
+        s.Colors[ImGuiCol_ScrollbarBg]       = ImVec4(0.02f, 0.02f, 0.06f, 0.60f);
+        s.Colors[ImGuiCol_ScrollbarGrab]     = ImVec4(0.20f, 0.18f, 0.30f, 1.00f);
+        s.Colors[ImGuiCol_ScrollbarGrabHovered] = gold_dim;
+        s.Colors[ImGuiCol_ScrollbarGrabActive]  = gold;
+        s.Colors[ImGuiCol_CheckMark]         = gold_bright;
+        s.Colors[ImGuiCol_SliderGrab]        = gold_dim;
+        s.Colors[ImGuiCol_SliderGrabActive]  = gold_bright;
+        s.Colors[ImGuiCol_Button]            = ImVec4(0.10f, 0.10f, 0.18f, 0.85f);
+        s.Colors[ImGuiCol_ButtonHovered]     = gold_dim;
+        s.Colors[ImGuiCol_ButtonActive]      = gold;
+        s.Colors[ImGuiCol_Header]            = ImVec4(0.10f, 0.10f, 0.18f, 0.85f);
+        s.Colors[ImGuiCol_HeaderHovered]     = gold_dim;
+        s.Colors[ImGuiCol_HeaderActive]      = gold;
+        s.Colors[ImGuiCol_Separator]         = ImVec4(0.35f, 0.30f, 0.18f, 0.60f);
+        s.Colors[ImGuiCol_SeparatorHovered]  = gold_dim;
+        s.Colors[ImGuiCol_SeparatorActive]   = gold;
+        s.Colors[ImGuiCol_Tab]               = ImVec4(0.08f, 0.08f, 0.15f, 1.00f);
+        s.Colors[ImGuiCol_TabHovered]        = gold_dim;
+        s.Colors[ImGuiCol_TabActive]         = ImVec4(0.14f, 0.14f, 0.22f, 1.00f);
+        s.Colors[ImGuiCol_TabUnfocused]      = ImVec4(0.05f, 0.06f, 0.12f, 1.00f);
+        s.Colors[ImGuiCol_TabUnfocusedActive]= ImVec4(0.10f, 0.10f, 0.18f, 1.00f);
+        s.Colors[ImGuiCol_ResizeGrip]        = ImVec4(0.35f, 0.30f, 0.18f, 0.40f);
+        s.Colors[ImGuiCol_ResizeGripHovered] = gold_dim;
+        s.Colors[ImGuiCol_ResizeGripActive]  = gold;
+
+        s.WindowRounding    = 2.0f;
+        s.FrameRounding     = 2.0f;
+        s.GrabRounding      = 2.0f;
+        s.PopupRounding     = 2.0f;
+        s.ScrollbarRounding = 2.0f;
+        s.TabRounding       = 2.0f;
+        s.WindowBorderSize  = 1.0f;
+        s.FrameBorderSize   = 0.0f;
+        s.PopupBorderSize   = 1.0f;
+        s.WindowPadding     = ImVec2(12.0f, 10.0f);
+        s.ItemSpacing       = ImVec2(8.0f, 6.0f);
+        s.IndentSpacing     = 18.0f;
+    }
+
+    // ------------------------------------------------------------------
+    // Dual counter-rotating rune loader ring. Mirrors the CSS animation
+    // in the HTML mockup: an outer dashed ring slowly clockwise, an
+    // inner ring counter-rotating faster, plus a bright sweep arc and a
+    // pulsing central dot. Time-driven so the cadence is stable across
+    // framerates.
+    // ------------------------------------------------------------------
+    static void drawRuneLoader(
+        ImDrawList* dl,
+        const ImVec2& c,
+        float radius,
+        float elapsed) {
+
+        const float kTwoPi = 6.28318530718f;
+        const ImU32 gold       = IM_COL32(212, 175,  90, 255);
+        const ImU32 gold_dim   = IM_COL32(180, 140,  70, 160);
+        const ImU32 cream      = IM_COL32(242, 220, 170, 230);
+        const ImU32 pulse_col  = IM_COL32(230, 200, 130, 200);
+
+        // Outer + inner base rings.
+        dl->AddCircle(c, radius,          gold_dim, 64, 1.4f);
+        dl->AddCircle(c, radius * 0.66f,  gold_dim, 48, 1.0f);
+
+        // Outer ring ticks, rotating clockwise.
+        const float outer_angle = elapsed * 0.6f;
+        const int   n_outer     = 12;
+        for (int i = 0; i < n_outer; ++i) {
+            const float f = float(i) / float(n_outer);
+            const float a = outer_angle + f * kTwoPi;
+            const float len = (i % 3 == 0) ? 6.0f : 3.0f;
+            const ImVec2 p0 = { c.x + std::cos(a) * radius,
+                                c.y + std::sin(a) * radius };
+            const ImVec2 p1 = { c.x + std::cos(a) * (radius + len),
+                                c.y + std::sin(a) * (radius + len) };
+            dl->AddLine(p0, p1, gold, 1.4f);
+        }
+
+        // Inner ring ticks, counter-rotating and faster.
+        const float inner_angle = -elapsed * 0.95f;
+        const int   n_inner     = 8;
+        const float r_inner     = radius * 0.66f;
+        for (int i = 0; i < n_inner; ++i) {
+            const float f = float(i) / float(n_inner);
+            const float a = inner_angle + f * kTwoPi;
+            const float len = 4.0f;
+            const ImVec2 p0 = { c.x + std::cos(a) * r_inner,
+                                c.y + std::sin(a) * r_inner };
+            const ImVec2 p1 = { c.x + std::cos(a) * (r_inner - len),
+                                c.y + std::sin(a) * (r_inner - len) };
+            dl->AddLine(p0, p1, gold, 1.2f);
+        }
+
+        // Bright ~90 degree sweep arc — the "rune is being read" hint.
+        const float sweep = outer_angle;
+        dl->PathArcTo(c, radius, sweep, sweep + kTwoPi * 0.25f, 24);
+        dl->PathStroke(cream, ImDrawFlags_None, 2.2f);
+
+        // Pulsing central dot.
+        const float pulse = 0.5f + 0.5f * std::sin(elapsed * 3.0f);
+        const float dot_r = 2.0f + 3.0f * pulse;
+        dl->AddCircleFilled(c, dot_r, pulse_col);
+    }
+
+    // Wide twilight backdrop strip that anchors the top of the screen
+    // behind the main menu bar. Everything cosmetic for the top header
+    // row — gradient, starfield, distant moon, title, subtitle, version
+    // stamp — is painted inside this single window so it all shares
+    // one proven-working draw list (earlier attempts with separate
+    // NoBackground windows dropped content under multi-viewport mode).
+    static void drawFantasyTopBackdrop(
+        const ImVec2& vp_pos,
+        float width,
+        float height,
+        float menu_height,
+        const char* title,
+        const char* subtitle,
+        const char* version) {
+
+        ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+        ImGui::SetNextWindowPos(vp_pos);
+        ImGui::SetNextWindowSize(ImVec2(width, height));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        const bool opened = ImGui::Begin(
+            "##fantasy_top_backdrop",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoBackground |
+            ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+        if (!opened) {
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+            return;
+        }
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = vp_pos;
+        const ImVec2 p1 = { vp_pos.x + width, vp_pos.y + height };
+
+        // Vertical twilight gradient split into two bands for the
+        // indigo → plum → dusty-rose transition from the HTML mockup.
+        const float mid_y = vp_pos.y + height * 0.55f;
+        const float low_y = p1.y;
+        const ImU32 c_top_l = IM_COL32( 26, 18,  54, 230);
+        const ImU32 c_top_r = IM_COL32( 38, 22,  72, 230);
+        const ImU32 c_mid_l = IM_COL32( 58, 35,  87, 220);
+        const ImU32 c_mid_r = IM_COL32( 90, 45,  98, 220);
+        const ImU32 c_bot_l = IM_COL32(125, 59,  94, 120);
+        const ImU32 c_bot_r = IM_COL32(201,118,  90,  90);
+
+        dl->AddRectFilledMultiColor(
+            p0, ImVec2(p1.x, mid_y),
+            c_top_l, c_top_r, c_mid_r, c_mid_l);
+        dl->AddRectFilledMultiColor(
+            ImVec2(p0.x, mid_y), ImVec2(p1.x, low_y),
+            c_mid_l, c_mid_r, c_bot_r, c_bot_l);
+
+        // Starfield — soft dots in the upper band only so they sit
+        // behind the menu bar and banner without crowding them.
+        const ImU32 star     = IM_COL32(255, 245, 210, 190);
+        const ImU32 star_dim = IM_COL32(210, 210, 240, 140);
+        const float xs[] = { 0.06f, 0.14f, 0.22f, 0.30f, 0.38f,
+                             0.46f, 0.54f, 0.62f, 0.70f, 0.78f };
+        const float ys_top[] = { 0.20f, 0.38f, 0.14f, 0.46f, 0.26f,
+                                 0.40f, 0.18f, 0.44f, 0.24f, 0.34f };
+        const float rs[] = { 1.0f, 0.7f, 1.2f, 0.8f, 1.0f,
+                             1.3f, 0.8f, 1.0f, 0.7f, 1.1f };
+        for (int i = 0; i < 10; ++i) {
+            const ImVec2 sp = {
+                vp_pos.x + width  * xs[i],
+                vp_pos.y + height * ys_top[i] };
+            dl->AddCircleFilled(sp, rs[i], (i % 3 == 0) ? star_dim : star, 8);
+        }
+
+        // Distant moon on the far right — small enough not to crowd
+        // the fps widget or the mesh-load HUD to its left.
+        const ImVec2 far_moon = {
+            vp_pos.x + width * 0.84f,
+            vp_pos.y + height * 0.28f };
+        dl->AddCircleFilled(far_moon, 18.0f, IM_COL32(253, 243, 209,  40), 32);
+        dl->AddCircleFilled(far_moon, 12.0f, IM_COL32(253, 243, 209,  80), 32);
+        dl->AddCircleFilled(far_moon,  7.0f, IM_COL32(253, 243, 209, 210), 32);
+
+        // Thin gold underline separating the backdrop from the scene.
+        dl->AddLine(
+            ImVec2(p0.x, low_y - 1.0f),
+            ImVec2(p1.x, low_y - 1.0f),
+            IM_COL32(180, 140, 70, 140), 1.0f);
+
+        // --- Title banner, drawn inline so it shares this draw list ---
+        // Anchored below the menu bar, top-left corner.
+        const float banner_x0 = vp_pos.x + 10.0f;
+        const float banner_y0 = vp_pos.y + menu_height + 6.0f;
+        const float banner_w  = 260.0f;
+        const float banner_h  = 40.0f;
+        const ImVec2 b0 = { banner_x0, banner_y0 };
+        const ImVec2 b1 = { banner_x0 + banner_w, banner_y0 + banner_h };
+
+        // A slightly darker inner panel so the banner has definition
+        // against the gradient backdrop.
+        dl->AddRectFilledMultiColor(
+            b0, b1,
+            IM_COL32( 18, 14,  38, 180),
+            IM_COL32( 36, 26,  60, 160),
+            IM_COL32( 16, 12,  30, 180),
+            IM_COL32( 10,  8,  24, 210));
+        // Gold frame.
+        dl->AddRect(b0, b1, IM_COL32(200, 158, 80, 200), 2.0f, 0, 1.2f);
+
+        // Little moon disc inside the banner (mirrors fantasy_menu.html).
+        const ImVec2 m_c = { b0.x + 22.0f, b0.y + banner_h * 0.5f };
+        dl->AddCircle      (m_c, 12.0f, IM_COL32(240, 230, 190,  80), 24, 2.0f);
+        dl->AddCircle      (m_c,  9.0f, IM_COL32(240, 230, 190, 140), 24, 1.0f);
+        dl->AddCircleFilled(m_c,  6.5f, IM_COL32(240, 230, 190, 240), 24);
+        dl->AddCircleFilled(
+            ImVec2(m_c.x - 1.5f, m_c.y - 1.5f),
+            1.4f, IM_COL32(210, 200, 160, 220), 12);
+
+        // Title + subtitle text.
+        if (title) {
+            dl->AddText(
+                ImVec2(b0.x + 44.0f, b0.y +  4.0f),
+                IM_COL32(240, 222, 172, 255),
+                title);
+        }
+        if (subtitle) {
+            dl->AddText(
+                ImVec2(b0.x + 44.0f, b0.y + 20.0f),
+                IM_COL32(205, 178, 122, 230),
+                subtitle);
+        }
+
+        // Version stamp just below the banner.
+        if (version) {
+            dl->AddText(
+                ImVec2(banner_x0 + 4.0f, banner_y0 + banner_h + 4.0f),
+                IM_COL32(180, 155, 95, 220),
+                version);
+        }
+
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+    }
+
+    // (Earlier drawFantasyTitleBanner was folded into
+    // drawFantasyTopBackdrop to keep all header-row chrome on a single
+    // proven-working draw list.)
 
     static void drawViewport(
         const ImTextureID& texture_id,
@@ -102,6 +389,13 @@ Menu::Menu(
         descriptor_pool,
         render_pass);
 
+    // Fantasy aesthetic (deep indigo panels, gold accents) picked up by
+    // all subsequent ImGui draws. See applyFantasyStyle() in this file
+    // for the palette; it ports the values from
+    // realworld/design/fantasy_menu.html so the mockup and the live
+    // game stay visually in sync.
+    applyFantasyStyle();
+
     const float kTempScale = 1.0f;
     const float kMoistScale = 1.0f;
 
@@ -176,6 +470,27 @@ bool Menu::draw(
 
     float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
 
+    // Twilight backdrop first — submitted before the menu bar and
+    // every other HUD element so it sits at the bottom of the ImGui
+    // z-order and acts as the fantasy "sky" behind the header row.
+    // Title banner + subtitle + version stamp are drawn inline into
+    // this window's draw list so they share the one proven-visible
+    // render path. Height covers: menu bar + banner (40px) + version
+    // stamp (~18px) + gold underline — no more.
+    {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const ImVec2 vp_pos = vp->Pos;
+        const float  vp_w   = vp->Size.x > 0.0f ? vp->Size.x : float(screen_size.x);
+        drawFantasyTopBackdrop(
+            vp_pos,
+            vp_w,
+            menu_height + 72.0f,
+            menu_height,
+            "Ashes of Eldra",
+            "chronicles of the fallen realm",
+            "v0.4.2  pre-alpha");
+    }
+
     cmd_buf->beginRenderPass(
         render_pass,
         framebuffer,
@@ -210,6 +525,108 @@ bool Menu::draw(
     ImGui::Text("fps : %8.5f", fps);
     ImGui::EndChild();
     ImGui::End();
+
+    // (Title banner + version stamp now drawn inline inside the
+    // twilight backdrop window earlier in this frame — see the call
+    // to drawFantasyTopBackdrop() above.)
+
+    // Async mesh-load HUD — dual counter-rotating rune ring + filename
+    // list. Sits just under the fps widget and stays hidden when
+    // nothing is loading. NoInputs so it can't steal clicks from the
+    // menu. See drawRuneLoader() above for the ring geometry; the
+    // aesthetic mirrors the loader in
+    // realworld/design/fantasy_menu.html.
+    if (mesh_load_task_manager_) {
+        auto in_flight = mesh_load_task_manager_->inFlightFilenames();
+        if (!in_flight.empty()) {
+            // Cap the displayed list so a large batch load doesn't
+            // blow past the screen edge; the count shown beside the
+            // loader still reflects the full set.
+            constexpr size_t kMaxListed = 6;
+
+            // Time-driven rotation so the cadence is stable across
+            // framerates. Main thread only, so the static is safe.
+            static float s_elapsed = 0.0f;
+            s_elapsed += delta_t;
+
+            const float kLoaderSize = 52.0f;
+            const ImVec2 mesh_win_pos = {
+                vp_pos.x + float(screen_size.x) - 380.0f,
+                vp_pos.y + menu_height + 40.0f };
+
+            ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+            ImGui::SetNextWindowPos(mesh_win_pos);
+            ImGui::Begin(
+                "mesh_loads",
+                nullptr,
+                ImGuiWindowFlags_NoTitleBar |
+                ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoInputs |
+                ImGuiWindowFlags_NoDocking |
+                ImGuiWindowFlags_AlwaysAutoResize);
+
+            // Rune ring is drawn into this window's own draw list
+            // (not a foreground list) so it renders via the exact
+            // same path as the filename text below — proven visible.
+            // Reserve a square of kLoaderSize first, then paint the
+            // ring centered inside it. SameLine() after puts the
+            // text flush to its right.
+            {
+                const ImVec2 slot_tl = ImGui::GetCursorScreenPos();
+                const ImVec2 loader_c = {
+                    slot_tl.x + kLoaderSize * 0.5f,
+                    slot_tl.y + kLoaderSize * 0.5f };
+                drawRuneLoader(
+                    ImGui::GetWindowDrawList(),
+                    loader_c,
+                    kLoaderSize * 0.45f,
+                    s_elapsed);
+            }
+            ImGui::Dummy(ImVec2(kLoaderSize, kLoaderSize));
+
+            // Title + first filename sit to the right of the rings.
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+            ImGui::TextColored(
+                ImVec4(0.95f, 0.86f, 0.60f, 1.0f),
+                "Loading %zu mesh%s",
+                in_flight.size(),
+                in_flight.size() == 1 ? "" : "es");
+            // Inline the first stem so a single-mesh load reads as one
+            // self-contained line ("Loading 1 mesh\nbistro.fbx").
+            if (!in_flight.empty()) {
+                const auto& name = in_flight[0];
+                auto pos = name.find_last_of("/\\");
+                std::string stem =
+                    pos == std::string::npos ? name : name.substr(pos + 1);
+                ImGui::TextColored(
+                    ImVec4(0.70f, 0.65f, 0.50f, 1.0f),
+                    "%s", stem.c_str());
+            }
+            ImGui::EndGroup();
+
+            // Remaining filenames below as bulleted list, capped.
+            if (in_flight.size() > 1) {
+                ImGui::Separator();
+                for (size_t i = 1;
+                     i < in_flight.size() && i < kMaxListed;
+                     ++i) {
+                    const auto& name = in_flight[i];
+                    auto pos = name.find_last_of("/\\");
+                    std::string stem = pos == std::string::npos
+                        ? name : name.substr(pos + 1);
+                    ImGui::BulletText("%s", stem.c_str());
+                }
+                if (in_flight.size() > kMaxListed) {
+                    ImGui::BulletText("... (+%zu more)",
+                        in_flight.size() - kMaxListed);
+                }
+            }
+            ImGui::End();
+        }
+    }
 
 // turn off ray tracing view window.
 #if 0

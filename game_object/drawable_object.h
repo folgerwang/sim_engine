@@ -1,10 +1,15 @@
 #pragma once
+#include <atomic>
 #include <unordered_map>
 #include "renderer/renderer.h"
 #include "helper/bvh.h"
+#include "helper/cluster_mesh.h"  // Optional "Nanite-lite" cluster sidecar.
+#include "cluster_debug_draw.h"   // Per-mesh GPU buffers for the cluster debug draw path.
 
 namespace engine {
 namespace game_object {
+
+class MeshLoadTaskManager;  // fwd-decl for async load API.
 
 struct MaterialInfo {
     int32_t                base_color_idx_ = -1;
@@ -107,6 +112,19 @@ struct MeshInfo {
     std::shared_ptr<std::vector<glm::vec3>> vertex_position_;
     glm::vec3                   bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
     glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+
+    // "Nanite-lite" cluster sidecar. Built at load time *only* when
+    // engine::helper::clusterRenderingEnabled() is true (i.e. the
+    // --cluster-debug CLI flag was set). Otherwise it stays empty and costs
+    // nothing. See helper/cluster_mesh.h for the data layout.
+    helper::ClusterMesh         cluster_mesh_;
+
+    // GPU-side companion buffers for the cluster debug draw path. Populated
+    // by ClusterDebugDraw::uploadForMesh() immediately after cluster_mesh_
+    // is built, and consumed by ClusterDebugDraw::draw() in place of the
+    // normal primitive loop while --cluster-debug is active. Empty and
+    // zero-cost when the flag is off.
+    ClusterDebugMeshBuffers     cluster_debug_gpu_;
 };
 
 struct NodeInfo {
@@ -159,6 +177,13 @@ struct DrawableData {
 
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> update_instance_buffer_desc_set_;
+
+    // Set true on the main thread at the end of async phase3, after
+    // descriptor-set / pipeline / instance-buffer creation. The render
+    // loop must check this before touching any of the members above —
+    // they may still be default-constructed while an async load is in
+    // flight. See DrawableObject::createAsync and DrawableObject::isReady.
+    std::atomic<bool> ready_{false};
 
 public:
     DrawableData(const std::shared_ptr<renderer::Device>& device) : device_(device) {}
@@ -220,6 +245,11 @@ class DrawableObject {
     static std::shared_ptr<renderer::BufferInfo> game_objects_buffer_;
 
 
+private:
+    // Used by createAsync() to build a shell whose object_ will be
+    // populated by phase 3 on the main thread once the worker finishes.
+    explicit DrawableObject(glm::mat4 location) : location_(location) {}
+
 public:
     DrawableObject() = delete;
     DrawableObject(
@@ -231,6 +261,34 @@ public:
         const renderer::TextureInfo& thin_film_lut_tex,
         const std::string& file_name,
         glm::mat4 location = glm::mat4(1.0f));
+
+    // Async factory. Submits a MeshLoadTask to `task_manager` and
+    // returns a shared_ptr<DrawableObject> whose object_ is nullptr
+    // until the worker finishes file parsing + GPU upload and the
+    // main-thread phase 3 (descriptor sets, pipelines, instance
+    // buffer) runs during the next task_manager.poll() call.
+    //
+    // Callers must check isReady() before draw()/update()/updateBuffers();
+    // those methods early-return when the object is not yet ready.
+    // The returned shared_ptr is safe to push into draw lists immediately.
+    static std::shared_ptr<DrawableObject> createAsync(
+        MeshLoadTaskManager& task_manager,
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const renderer::PipelineRenderbufferFormats* renderbuffer_formats,
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const std::shared_ptr<renderer::Sampler>& texture_sampler,
+        const renderer::TextureInfo& thin_film_lut_tex,
+        const std::string& file_name,
+        glm::mat4 location = glm::mat4(1.0f));
+
+    // True once phase 3 has published the populated DrawableData.
+    // Uses memory_order_acquire so the caller sees all of phase3's
+    // writes (descriptor sets, pipelines, buffers) synchronized
+    // with the ready_ flag.
+    bool isReady() const {
+        return object_ && object_->ready_.load(std::memory_order_acquire);
+    }
 
     void updateInstanceBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
