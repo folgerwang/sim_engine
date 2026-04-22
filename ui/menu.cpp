@@ -1,6 +1,7 @@
 #include <vector>
 #include <filesystem>
 #include <cmath>
+#include <source_location>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -204,14 +205,17 @@ namespace {
 
         // Vertical twilight gradient split into two bands for the
         // indigo → plum → dusty-rose transition from the HTML mockup.
+        // Alphas are kept near-opaque so the gradient survives
+        // composition over the brightly-lit game scene — at lower
+        // alpha the strip was invisible against a bright sky.
         const float mid_y = vp_pos.y + height * 0.55f;
         const float low_y = p1.y;
-        const ImU32 c_top_l = IM_COL32( 26, 18,  54, 230);
-        const ImU32 c_top_r = IM_COL32( 38, 22,  72, 230);
-        const ImU32 c_mid_l = IM_COL32( 58, 35,  87, 220);
-        const ImU32 c_mid_r = IM_COL32( 90, 45,  98, 220);
-        const ImU32 c_bot_l = IM_COL32(125, 59,  94, 120);
-        const ImU32 c_bot_r = IM_COL32(201,118,  90,  90);
+        const ImU32 c_top_l = IM_COL32( 26, 18,  54, 255);
+        const ImU32 c_top_r = IM_COL32( 38, 22,  72, 255);
+        const ImU32 c_mid_l = IM_COL32( 58, 35,  87, 250);
+        const ImU32 c_mid_r = IM_COL32( 90, 45,  98, 250);
+        const ImU32 c_bot_l = IM_COL32(125, 59,  94, 210);
+        const ImU32 c_bot_r = IM_COL32(201,118,  90, 190);
 
         dl->AddRectFilledMultiColor(
             p0, ImVec2(p1.x, mid_y),
@@ -426,6 +430,29 @@ Menu::Menu(
             renderer::Helper::addImTextureID(sampler, main_image_view);
     }
 
+    // Fantasy twilight landscape backdrop. 1920x1080 PNG, painted
+    // behind everything else on each frame. Load is best-effort —
+    // if the file is missing we just won't draw it, rather than
+    // taking the engine down.
+    try {
+        bg_texture_info_ = std::make_shared<renderer::TextureInfo>();
+        engine::helper::createTextureImage(
+            device,
+            "assets/ui/fantasy_bg.png",
+            renderer::Format::R8G8B8A8_UNORM,
+            true,  // is_srgb — the image was painted in sRGB space
+            *bg_texture_info_,
+            std::source_location::current());
+        if (bg_texture_info_->view) {
+            bg_texture_id_ = renderer::Helper::addImTextureID(
+                sampler, bg_texture_info_->view);
+        }
+    } catch (...) {
+        // Swallow — a missing background shouldn't crash the game.
+        bg_texture_info_.reset();
+        bg_texture_id_ = ImTextureID(0);
+    }
+
     chat_box_ = std::make_shared<ChatBox>();
 }
 
@@ -469,6 +496,48 @@ bool Menu::draw(
     clear_values[1].depth_stencil = { 1.0f, 0 };
 
     float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
+
+    // Full-screen fantasy landscape background. Submitted FIRST —
+    // before the twilight strip, before the menu bar, before every
+    // other HUD element — so it sits at the very bottom of the
+    // ImGui z-order. The window has NoBackground so only the
+    // ImGui::Image we draw is visible; NoInputs so it never steals
+    // clicks. Stretches to fill the main viewport regardless of
+    // aspect (the source PNG is 16:9; a mild non-uniform stretch
+    // at other aspect ratios is acceptable for a backdrop).
+    if (bg_texture_id_ != ImTextureID(0)) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowViewport(vp->ID);
+        ImGui::SetNextWindowPos(vp->Pos);
+        ImGui::SetNextWindowSize(vp->Size);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        const bool bg_open = ImGui::Begin(
+            "##fantasy_fullscreen_bg",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoBackground |
+            ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+        if (bg_open) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddImage(
+                bg_texture_id_,
+                vp->Pos,
+                ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y));
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+    }
 
     // Twilight backdrop first — submitted before the menu bar and
     // every other HUD element so it sits at the bottom of the ImGui

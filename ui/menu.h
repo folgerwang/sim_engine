@@ -45,6 +45,17 @@ class Menu {
     ImTextureID rt_texture_id_;
     ImTextureID main_texture_id_;
 
+    // Fantasy-twilight background image — loaded once in the
+    // constructor from assets/ui/fantasy_bg.png and rendered
+    // full-screen at the bottom of the ImGui draw order so it
+    // sits behind the game scene whenever the scene itself
+    // doesn't cover the framebuffer (e.g. during async mesh
+    // loads, or any part of the view that isn't opaque).
+    // bg_texture_info_ owns the Vulkan image + memory + view;
+    // bg_texture_id_ is the ImGui-side descriptor handle.
+    std::shared_ptr<renderer::TextureInfo> bg_texture_info_;
+    ImTextureID bg_texture_id_ = ImTextureID(0);
+
     // CSM debug visualisation
     bool show_csm_debug_ = false;
     std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
