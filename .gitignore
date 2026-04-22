@@ -1,0 +1,5 @@
+# LibTorch is downloaded at setup time (~1 GB) and must not be committed.
+# See ../../../.gitignore at the outer-repo level for the same entry; this
+# copy exists because this directory is itself a git submodule and the
+# outer .gitignore does not apply inside.
+third_parties/libtorch/
