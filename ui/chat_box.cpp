@@ -94,16 +94,15 @@ bool ChatBox::draw(
     // - Height determined by content.
 
     float chatBoxWidth = screenWidth * 0.45f; // Estimate: 45% of screen width
-    // float chatBoxMaxHeight = screenHeight * 0.4f; // Max height it can take up
 
-    // Approximate position from screenshot (adjust these percentages based on your game's layout)
-    // It seems to start about 5-10% from the left and maybe 60-70% from the top.
-    ImVec2 chatBoxPos = ImVec2(vpPos.x + screenWidth * 0.05f, vpPos.y + screenHeight * 0.65f);
+    // Anchor the dialog box from the bottom-left so it grows upward as options
+    // are added, rather than overflowing off the bottom of the screen.
+    float bottomMargin = screenHeight * 0.05f;  // 5% margin from screen bottom
+    float leftMargin   = screenWidth * 0.05f;
 
-    ImGui::SetNextWindowPos(chatBoxPos, ImGuiCond_Always); // Fixed position every frame
-    // SetNextWindowSizeConstraints can be useful to allow auto-resize by content
-    // up to a certain maximum, or a fixed size.
-    // For a box that grows with content like in the image:
+    // Use pivot (0, 1) = bottom-left corner anchored at the position.
+    ImVec2 chatBoxPos = ImVec2(vpPos.x + leftMargin, vpPos.y + screenHeight - bottomMargin);
+    ImGui::SetNextWindowPos(chatBoxPos, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(chatBoxWidth, 0.0f), ImGuiCond_Always); // Width fixed, height auto
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);

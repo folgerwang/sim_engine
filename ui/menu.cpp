@@ -400,6 +400,29 @@ Menu::Menu(
     // game stay visually in sync.
     applyFantasyStyle();
 
+    // Load title-screen layout from XML. If the file is missing we
+    // fall back to hardcoded values so the title screen always works.
+    title_config_ = loadTitleScreenConfig("assets/ui/title_screen.xml");
+    if (!title_config_.loaded) {
+        fprintf(stderr, "[title_screen] XML not found — using hardcoded fallback.\n");
+        title_config_.title    = "Ashes of Eldra";
+        title_config_.subtitle = "chronicles of the fallen realm";
+        title_config_.version  = "v0.4.2  pre-alpha";
+        title_config_.top_bar_height_extra = 72.0f;
+        title_config_.background_image = "assets/ui/fantasy_bg.png";
+        title_config_.menu_items = {
+            {"New Game",        "new_game"},
+            {"Load Game",       "load_game"},
+            {"Settings",        "settings"},
+            {"Quit to Desktop", "quit"}
+        };
+        title_config_.new_game_meshes = {
+            "assets/Bistro_v5_2/BistroExterior.fbx",
+            "assets/Bistro_v5_2/BistroInterior.fbx"
+        };
+        title_config_.loaded = true;
+    }
+
     const float kTempScale = 1.0f;
     const float kMoistScale = 1.0f;
 
@@ -497,15 +520,15 @@ bool Menu::draw(
 
     float menu_height = ImGui::GetFrameHeight(); // Gets the height of the menu bar
 
-    // Full-screen fantasy landscape background. Submitted FIRST —
-    // before the twilight strip, before the menu bar, before every
-    // other HUD element — so it sits at the very bottom of the
-    // ImGui z-order. The window has NoBackground so only the
-    // ImGui::Image we draw is visible; NoInputs so it never steals
-    // clicks. Stretches to fill the main viewport regardless of
-    // aspect (the source PNG is 16:9; a mild non-uniform stretch
-    // at other aspect ratios is acceptable for a backdrop).
-    if (bg_texture_id_ != ImTextureID(0)) {
+    // ---- Title-screen elements (background + top bar + menu items) ----
+    // Only drawn when we are on the title screen or still loading.
+    // Once InGame, the background and title elements are hidden.
+    const bool show_title_ui =
+        (game_state_ == GameState::TitleScreen ||
+         game_state_ == GameState::Loading);
+
+    // Full-screen fantasy landscape background.
+    if (show_title_ui && bg_enabled_ && bg_texture_id_ != ImTextureID(0)) {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowViewport(vp->ID);
         ImGui::SetNextWindowPos(vp->Pos);
@@ -539,25 +562,110 @@ bool Menu::draw(
         ImGui::PopStyleVar(3);
     }
 
-    // Twilight backdrop first — submitted before the menu bar and
-    // every other HUD element so it sits at the bottom of the ImGui
-    // z-order and acts as the fantasy "sky" behind the header row.
-    // Title banner + subtitle + version stamp are drawn inline into
-    // this window's draw list so they share the one proven-visible
-    // render path. Height covers: menu bar + banner (40px) + version
-    // stamp (~18px) + gold underline — no more.
-    {
+    // Twilight backdrop + title banner — text now driven by XML config.
+    if (show_title_ui) {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         const ImVec2 vp_pos = vp->Pos;
         const float  vp_w   = vp->Size.x > 0.0f ? vp->Size.x : float(screen_size.x);
+
+        const char* t_title    = title_config_.loaded ? title_config_.title.c_str()    : "Ashes of Eldra";
+        const char* t_subtitle = title_config_.loaded ? title_config_.subtitle.c_str() : "chronicles of the fallen realm";
+        const char* t_version  = title_config_.loaded ? title_config_.version.c_str()  : "v0.4.2  pre-alpha";
+        const float t_extra    = title_config_.loaded ? title_config_.top_bar_height_extra : 72.0f;
+
         drawFantasyTopBackdrop(
             vp_pos,
             vp_w,
-            menu_height + 72.0f,
+            menu_height + t_extra,
             menu_height,
-            "Ashes of Eldra",
-            "chronicles of the fallen realm",
-            "v0.4.2  pre-alpha");
+            t_title,
+            t_subtitle,
+            t_version);
+    }
+
+    // ---- Title-screen main menu (centred vertical list) ----
+    if (game_state_ == GameState::TitleScreen && title_config_.loaded &&
+        !title_config_.menu_items.empty()) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float vp_w = vp->Size.x;
+        const float vp_h = vp->Size.y;
+
+        // Menu block: centred horizontally, lower-third vertically.
+        const float item_w = 320.0f;
+        const float item_h = 48.0f;
+        const float spacing = 12.0f;
+        const int   n_items = (int)title_config_.menu_items.size();
+        const float block_h = n_items * item_h + (n_items - 1) * spacing;
+        const float start_x = vp->Pos.x + (vp_w - item_w) * 0.5f;
+        const float start_y = vp->Pos.y + vp_h * 0.52f;
+
+        ImGui::SetNextWindowViewport(vp->ID);
+        ImGui::SetNextWindowPos(ImVec2(start_x, start_y));
+        ImGui::SetNextWindowSize(ImVec2(item_w, block_h + 20.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+
+        ImGui::Begin(
+            "##title_menu",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_AlwaysAutoResize);
+
+        // Fantasy-styled buttons.
+        const ImVec4 btn_bg      = ImVec4(0.08f, 0.07f, 0.16f, 0.80f);
+        const ImVec4 btn_hovered = ImVec4(0.55f, 0.45f, 0.22f, 0.90f);
+        const ImVec4 btn_active  = ImVec4(0.83f, 0.69f, 0.35f, 1.00f);
+        const ImVec4 btn_border  = ImVec4(0.55f, 0.45f, 0.22f, 0.50f);
+        const ImVec4 text_col    = ImVec4(0.93f, 0.88f, 0.72f, 1.00f);
+
+        ImGui::PushStyleColor(ImGuiCol_Button,        btn_bg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  btn_hovered);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,   btn_active);
+        ImGui::PushStyleColor(ImGuiCol_Border,         btn_border);
+        ImGui::PushStyleColor(ImGuiCol_Text,           text_col);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+
+        for (int i = 0; i < n_items; ++i) {
+            const auto& mi = title_config_.menu_items[i];
+            if (ImGui::Button(mi.label.c_str(), ImVec2(item_w, item_h))) {
+                // Dispatch action.
+                if (mi.action == "new_game") {
+                    new_game_mesh_requests_ = title_config_.new_game_meshes;
+                    new_game_requested_ = true;
+                    game_state_ = GameState::Loading;
+                }
+                else if (mi.action == "quit") {
+                    // Request window close.
+                    if (auto* win = ImGui::GetIO().BackendPlatformUserData) {
+                        // Fallback: set GLFW should-close via the io ctx.
+                    }
+                    // We'll let application poll this via game state.
+                }
+                else if (mi.action == "load_game") {
+                    // TODO: implement load game
+                }
+                else if (mi.action == "settings") {
+                    // TODO: implement settings
+                }
+            }
+            if (i < n_items - 1)
+                ImGui::Dummy(ImVec2(0, spacing - ImGui::GetStyle().ItemSpacing.y));
+        }
+
+        ImGui::PopStyleVar(2);   // FrameRounding, FrameBorderSize
+        ImGui::PopStyleColor(5); // Button colors + text
+        ImGui::End();
+        ImGui::PopStyleColor();  // WindowBg
+        ImGui::PopStyleVar(3);   // WindowPadding, BorderSize, Rounding
     }
 
     cmd_buf->beginRenderPass(
@@ -722,7 +830,10 @@ bool Menu::draw(
     ImGui::EndChild();
 
 #endif
-    if (ImGui::BeginMainMenuBar())
+    // The dev menu bar is only visible once gameplay has started (or
+    // during mesh loading). On the title screen the XML-driven menu
+    // items are shown instead.
+    if (game_state_ != GameState::TitleScreen && ImGui::BeginMainMenuBar())
     {
         if (ImGui::BeginMenu("Raytracing"))
         {
@@ -989,7 +1100,10 @@ bool Menu::draw(
     }
     // ------------------------------------------------------------------------
 
-    chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
+    // Chat box / dialogue UI only during gameplay.
+    if (game_state_ == GameState::InGame) {
+        chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
+    }
 
     renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
 

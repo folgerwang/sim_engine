@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include "renderer/renderer.h"
 #include "game_object/camera.h"
 #include "game_object/terrain.h"
@@ -32,6 +33,14 @@ public:
     void addDrawableObject(
         const std::shared_ptr<ego::DrawableObject>& drawable_object) {
         m_drawable_objects_.push_back(drawable_object);
+    }
+
+    void removeDrawableObject(
+        const std::shared_ptr<ego::DrawableObject>& drawable_object) {
+        m_drawable_objects_.erase(
+            std::remove(m_drawable_objects_.begin(), m_drawable_objects_.end(),
+                        drawable_object),
+            m_drawable_objects_.end());
     }
 
     void duplicateColorAndDepthBuffer(

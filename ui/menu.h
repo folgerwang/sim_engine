@@ -5,6 +5,7 @@
 #include "shaders/global_definition.glsl.h"
 #include "helper/gpu_profiler.h"
 #include "chat_box.h"
+#include "title_screen_config.h"
 #include "imgui.h"
 
 namespace plugins { class PluginManager; }
@@ -12,6 +13,13 @@ namespace plugins { class PluginManager; }
 namespace engine {
 namespace game_object { class MeshLoadTaskManager; }
 namespace ui {
+
+// Game-level state machine driven by the title-screen menu.
+enum class GameState {
+    TitleScreen,   // showing background + menu items
+    Loading,       // "New Game" clicked — meshes streaming
+    InGame         // meshes loaded, gameplay active
+};
 
 class Menu {
     std::vector<std::string> gltf_file_names_;
@@ -42,6 +50,14 @@ class Menu {
 
     glsl::WeatherControl weather_controls_;
 
+    // Title-screen config loaded from XML.
+    TitleScreenConfig title_config_;
+    GameState game_state_ = GameState::TitleScreen;
+
+    // Meshes requested by "New Game" — consumed by application each frame.
+    std::vector<std::string> new_game_mesh_requests_;
+    bool new_game_requested_ = false;  // one-shot flag
+
     ImTextureID rt_texture_id_;
     ImTextureID main_texture_id_;
 
@@ -55,6 +71,7 @@ class Menu {
     // bg_texture_id_ is the ImGui-side descriptor handle.
     std::shared_ptr<renderer::TextureInfo> bg_texture_info_;
     ImTextureID bg_texture_id_ = ImTextureID(0);
+    bool bg_enabled_ = true;  // set to false once scene meshes are loaded
 
     // CSM debug visualisation
     bool show_csm_debug_ = false;
@@ -74,6 +91,8 @@ class Menu {
     engine::game_object::MeshLoadTaskManager* mesh_load_task_manager_ = nullptr;
 
 public:
+    void setBackgroundEnabled(bool enabled) { bg_enabled_ = enabled; }
+    bool isBackgroundEnabled() const { return bg_enabled_; }
     void setGpuProfiler(engine::helper::GpuProfiler* profiler) {
         gpu_profiler_ = profiler;
     }
@@ -82,6 +101,22 @@ public:
     }
     void setMeshLoadTaskManager(engine::game_object::MeshLoadTaskManager* m) {
         mesh_load_task_manager_ = m;
+    }
+
+    // Game state accessors.
+    GameState getGameState() const { return game_state_; }
+    void setGameState(GameState s) { game_state_ = s; }
+
+    // Returns true once after "New Game" is clicked, then resets.
+    bool consumeNewGameRequest() {
+        if (new_game_requested_) {
+            new_game_requested_ = false;
+            return true;
+        }
+        return false;
+    }
+    const std::vector<std::string>& getNewGameMeshes() const {
+        return new_game_mesh_requests_;
     }
     Menu(
         GLFWwindow* window,
