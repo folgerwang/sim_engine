@@ -335,6 +335,24 @@ void TerrainSceneView::draw(
     }
 }
 
+void TerrainSceneView::recreate(
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const glm::uvec2& new_buffer_size) {
+
+    resize(renderbuffer_formats, new_buffer_size);
+
+    // Re-allocate tile-resource descriptor sets from the new pool.
+    m_tile_res_desc_sets_.clear();
+    m_tile_res_desc_sets_.resize(2);
+    for (int idx = 0; idx < 2; idx++) {
+        m_tile_res_desc_sets_[idx] =
+            m_device_->createDescriptorSets(
+                m_descriptor_pool_,
+                ego::TileObject::getTileResDescSetLayout(),
+                1)[0];
+    }
+}
+
 void TerrainSceneView::destroy(const std::shared_ptr<renderer::Device>& device) {
     if (m_tile_pipeline_layout_) {
         device->destroyPipelineLayout(m_tile_pipeline_layout_);

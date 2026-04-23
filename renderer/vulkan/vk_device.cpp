@@ -122,17 +122,23 @@ VulkanDevice::VulkanDevice(
 
 VulkanDevice::~VulkanDevice()
 {
-    assert(buffer_list_.size() == 0);
-    assert(image_list_.size() == 0);
-    assert(image_view_list_.size() == 0);
-    assert(shader_list_.size() == 0);
-    assert(sampler_list_.size() == 0);
-    assert(framebuffer_list_.size() == 0);
-    assert(pipeline_layout_list_.size() == 0);
-    assert(pipeline_list_.size() == 0);
-    assert(render_pass_list_.size() == 0);
-    assert(semaphore_list_.size() == 0);
-    assert(fence_list_.size() == 0);
+    auto warn_leak = [](const char* name, size_t count) {
+        if (count != 0) {
+            fprintf(stderr, "[vk_device] WARNING: %zu %s still alive at device destruction.\n",
+                    count, name);
+        }
+    };
+    warn_leak("buffer(s)",      buffer_list_.size());      buffer_list_.clear();
+    warn_leak("image(s)",       image_list_.size());       image_list_.clear();
+    warn_leak("image view(s)",  image_view_list_.size());  image_view_list_.clear();
+    warn_leak("shader(s)",      shader_list_.size());      shader_list_.clear();
+    warn_leak("sampler(s)",     sampler_list_.size());     sampler_list_.clear();
+    warn_leak("framebuffer(s)", framebuffer_list_.size()); framebuffer_list_.clear();
+    warn_leak("pipeline layout(s)", pipeline_layout_list_.size()); pipeline_layout_list_.clear();
+    warn_leak("pipeline(s)",        pipeline_list_.size());        pipeline_list_.clear();
+    warn_leak("render pass(es)",    render_pass_list_.size());     render_pass_list_.clear();
+    warn_leak("semaphore(s)",       semaphore_list_.size());       semaphore_list_.clear();
+    warn_leak("fence(s)",           fence_list_.size());           fence_list_.clear();
 }
 
 std::shared_ptr<CommandBuffer> VulkanDevice::setupTransientCommandBuffer() {

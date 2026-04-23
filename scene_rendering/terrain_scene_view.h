@@ -64,6 +64,11 @@ public:
         float cur_time,
         bool depth_only = false);
 
+    // Re-allocate descriptor sets from the new pool and resize buffers.
+    void recreate(
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+        const glm::uvec2& new_buffer_size);
+
     void destroy(
         const std::shared_ptr<renderer::Device>& device);
 };

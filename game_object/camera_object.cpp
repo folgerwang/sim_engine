@@ -107,6 +107,24 @@ CameraObject::CameraObject(
     m_device_->updateDescriptorSets(buffer_descs);
 }
 
+void CameraObject::recreateDescriptorSet() {
+    assert(s_view_camera_desc_set_layout_ != nullptr);
+    m_view_camera_desc_set_ =
+        m_device_->createDescriptorSets(
+            m_descriptor_pool_,
+            s_view_camera_desc_set_layout_, 1)[0];
+    er::WriteDescriptorList buffer_descs;
+    buffer_descs.reserve(1);
+    er::Helper::addOneBuffer(
+        buffer_descs,
+        m_view_camera_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER,
+        VIEW_CAMERA_BUFFER_INDEX,
+        m_view_camera_->getViewCameraBuffer()->buffer,
+        sizeof(glsl::ViewCameraInfo));
+    m_device_->updateDescriptorSets(buffer_descs);
+}
+
 void CameraObject::updateCamera(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const uint32_t& dbuf_idx,
@@ -370,6 +388,33 @@ void ShadowViewCameraObject::initCascadeDescriptorSets(
             &base_info);
 
         // Allocate a descriptor set pointing to this cascade's buffer.
+        m_cascade_desc_sets_[k] =
+            device->createDescriptorSets(
+                descriptor_pool,
+                CameraObject::s_view_camera_desc_set_layout_, 1)[0];
+
+        er::WriteDescriptorList buffer_descs;
+        buffer_descs.reserve(1);
+        er::Helper::addOneBuffer(
+            buffer_descs,
+            m_cascade_desc_sets_[k],
+            er::DescriptorType::STORAGE_BUFFER,
+            VIEW_CAMERA_BUFFER_INDEX,
+            m_cascade_bufs_[k]->buffer,
+            sizeof(glsl::ViewCameraInfo));
+        device->updateDescriptorSets(buffer_descs);
+    }
+}
+
+void ShadowViewCameraObject::recreateCascadeDescriptorSets(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
+
+    assert(CameraObject::s_view_camera_desc_set_layout_ != nullptr);
+
+    for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        if (!m_cascade_bufs_[k]) continue;   // not initialised yet
+
         m_cascade_desc_sets_[k] =
             device->createDescriptorSets(
                 descriptor_pool,

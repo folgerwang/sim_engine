@@ -41,6 +41,9 @@ public:
     static void createViewCameraDescriptorSetLayout(
         const std::shared_ptr<er::Device>& device);
 
+    // Re-allocate the view-camera descriptor set from the new pool.
+    void recreateDescriptorSet();
+
     virtual void readGpuCameraInfo();
 
     virtual glm::vec3 getCameraPosition() const {
@@ -136,6 +139,12 @@ public:
     // Allocate the 4 per-cascade storage buffers and descriptor sets.
     // Must be called once after construction, before the first shadow pass.
     void initCascadeDescriptorSets(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
+
+    // Re-allocate descriptor sets from a new pool after swap chain
+    // recreation.  Keeps the existing cascade buffers.
+    void recreateCascadeDescriptorSets(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
 

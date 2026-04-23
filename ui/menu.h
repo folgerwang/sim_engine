@@ -73,6 +73,21 @@ class Menu {
     ImTextureID bg_texture_id_ = ImTextureID(0);
     bool bg_enabled_ = true;  // set to false once scene meshes are loaded
 
+    // Device + sampler kept for re-registering textures / cleanup.
+    std::shared_ptr<renderer::Device> device_;
+    std::shared_ptr<renderer::Sampler> sampler_;
+
+    // Stars detected in the background image at load time.
+    // Positions are normalised [0,1] so they scale with any viewport.
+    struct DetectedStar {
+        float nx, ny;       // normalised position in the image
+        float radius;       // approximate radius in pixels (at 1920 wide)
+        float brightness;   // 0..1 peak brightness
+        float speed;        // twinkle frequency (Hz)
+        float phase;        // twinkle phase offset
+    };
+    std::vector<DetectedStar> detected_stars_;
+
     // CSM debug visualisation
     bool show_csm_debug_ = false;
     std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
@@ -257,6 +272,10 @@ public:
         const float& delta_t);
 
     void destroy();
+
+    // Release GPU resources (background texture etc.) at final shutdown.
+    // Not called during swap chain recreation.
+    void destroyResources();
 };
 
 }// namespace ui

@@ -57,6 +57,12 @@ public:
         const std::shared_ptr<er::ImageView>& depth_layer_view = nullptr,
         uint32_t layer_count = 1);
 
+    // Re-allocate descriptor sets from the (new) descriptor pool and
+    // resize render buffers after a swap chain recreation.
+    void recreate(
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+        const glm::uvec2& new_buffer_size);
+
     void destroy(
         const std::shared_ptr<renderer::Device>& device);
 };

@@ -93,6 +93,20 @@ public:
 
     virtual renderer::TextureInfo getFinalImage() = 0;
 
+    // Re-create descriptor sets and the result image after a swap
+    // chain recreation.  Default: full destroy + re-init cycle.
+    virtual void recreate(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::BufferInfo>& camera_info,
+        const renderer::PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
+        const renderer::PhysicalDeviceAccelerationStructureFeatures& as_features,
+        glm::uvec2 size) {
+        destroy(device);
+        init(device, descriptor_pool, camera_info,
+             rt_pipeline_properties, as_features, size);
+    }
+
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device) = 0;
 };

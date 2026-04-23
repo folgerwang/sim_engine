@@ -178,6 +178,25 @@ void LbmTest::draw(
     }*/
 }
 
+void LbmTest::recreate(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::Sampler>& texture_sampler,
+    const std::shared_ptr<renderer::TextureInfo>& lbm_patch_tex) {
+
+    lbm_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool, lbm_desc_set_layout_, 1)[0];
+
+    auto lbm_test_material_descs =
+        addLbmTestTextures(
+            lbm_desc_set_,
+            texture_sampler,
+            lbm_patch_tex->view);
+
+    device->updateDescriptorSets(lbm_test_material_descs);
+}
+
 void LbmTest::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     device->destroyDescriptorSetLayout(lbm_desc_set_layout_);

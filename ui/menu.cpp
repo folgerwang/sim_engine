@@ -2,6 +2,18 @@
 #include <filesystem>
 #include <cmath>
 #include <source_location>
+#include <cstdlib>
+
+// stbi_load / stbi_image_free are already compiled into the project via
+// tinygltf (STB_IMAGE_IMPLEMENTATION lives in engine_helper.cpp).
+// Pull in just the declarations so we can scan the background PNG.
+extern "C" {
+    unsigned char* stbi_load(const char*, int*, int*, int*, int);
+    void stbi_image_free(void*);
+}
+#ifndef STBI_rgb_alpha
+#define STBI_rgb_alpha 4
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -224,22 +236,8 @@ namespace {
             ImVec2(p0.x, mid_y), ImVec2(p1.x, low_y),
             c_mid_l, c_mid_r, c_bot_r, c_bot_l);
 
-        // Starfield — soft dots in the upper band only so they sit
-        // behind the menu bar and banner without crowding them.
-        const ImU32 star     = IM_COL32(255, 245, 210, 190);
-        const ImU32 star_dim = IM_COL32(210, 210, 240, 140);
-        const float xs[] = { 0.06f, 0.14f, 0.22f, 0.30f, 0.38f,
-                             0.46f, 0.54f, 0.62f, 0.70f, 0.78f };
-        const float ys_top[] = { 0.20f, 0.38f, 0.14f, 0.46f, 0.26f,
-                                 0.40f, 0.18f, 0.44f, 0.24f, 0.34f };
-        const float rs[] = { 1.0f, 0.7f, 1.2f, 0.8f, 1.0f,
-                             1.3f, 0.8f, 1.0f, 0.7f, 1.1f };
-        for (int i = 0; i < 10; ++i) {
-            const ImVec2 sp = {
-                vp_pos.x + width  * xs[i],
-                vp_pos.y + height * ys_top[i] };
-            dl->AddCircleFilled(sp, rs[i], (i % 3 == 0) ? star_dim : star, 8);
-        }
+        // (Stars are now detected from the background image and drawn
+        // as a twinkling overlay in Menu::draw — see detected_stars_.)
 
         // Distant moon on the far right — small enough not to crowd
         // the fps widget or the mesh-load HUD to its left.
@@ -393,6 +391,11 @@ Menu::Menu(
         descriptor_pool,
         render_pass);
 
+    // Keep references for re-registering ImGui textures after swap chain
+    // recreation and for cleanup on shutdown.
+    device_  = device;
+    sampler_ = sampler;
+
     // Fantasy aesthetic (deep indigo panels, gold accents) picked up by
     // all subsequent ImGui draws. See applyFantasyStyle() in this file
     // for the palette; it ports the values from
@@ -476,6 +479,128 @@ Menu::Menu(
         bg_texture_id_ = ImTextureID(0);
     }
 
+    // ---- Scan the background PNG for bright star-like pixels ----
+    // Load the image a second time (CPU side only) to read pixel data.
+    // We look for small clusters of bright pixels (luminance > threshold)
+    // surrounded by darker sky, record their normalised positions, then
+    // free the pixel buffer. The cost is a one-time PNG decode at startup.
+    {
+        int w = 0, h = 0, ch = 0;
+        unsigned char* px = stbi_load(
+            "assets/ui/fantasy_bg.png", &w, &h, &ch, STBI_rgb_alpha);
+        if (px && w > 0 && h > 0) {
+            // Luminance threshold — anything above this is a candidate.
+            // Tuned for the twilight landscape: sky is dark (L < 0.35),
+            // stars are small bright dots (L > 0.65).
+            constexpr float kLumThreshold = 0.65f;
+            // Minimum spacing² between detected stars (in normalised coords)
+            // to avoid clustering many hits from the same bright patch.
+            constexpr float kMinDistSq = 0.012f * 0.012f;
+
+            // Scan at 2-pixel stride for speed; stars are small so we
+            // won't miss them.
+            for (int y = 0; y < h; y += 2) {
+                for (int x = 0; x < w; x += 2) {
+                    const int idx = (y * w + x) * 4;
+                    const float r = px[idx + 0] / 255.0f;
+                    const float g = px[idx + 1] / 255.0f;
+                    const float b = px[idx + 2] / 255.0f;
+                    const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+
+                    if (lum < kLumThreshold) continue;
+
+                    // Only detect stars in the upper 45% (sky region).
+                    if (float(y) / float(h) > 0.45f) continue;
+
+                    // A real star is a tiny bright dot surrounded by DARK sky.
+                    // Check a wider ring (radius 6–10 px) — if the average
+                    // luminance there is also high, this pixel is part of a
+                    // large bright object (moon, cloud) and not a star.
+                    float ring_sum = 0.0f;
+                    int   ring_n   = 0;
+                    for (int dy = -10; dy <= 10; dy += 4) {
+                        for (int dx = -10; dx <= 10; dx += 4) {
+                            const int d2 = dx * dx + dy * dy;
+                            if (d2 < 36 || d2 > 100) continue; // ring 6..10 px
+                            int rx = x + dx, ry = y + dy;
+                            if (rx < 0 || ry < 0 || rx >= w || ry >= h) continue;
+                            const int ri = (ry * w + rx) * 4;
+                            ring_sum += 0.2126f * px[ri] / 255.0f +
+                                        0.7152f * px[ri+1] / 255.0f +
+                                        0.0722f * px[ri+2] / 255.0f;
+                            ++ring_n;
+                        }
+                    }
+                    // If the surrounding ring is brighter than dark sky,
+                    // this is moon/cloud, not a star. Skip it.
+                    if (ring_n > 0 && (ring_sum / float(ring_n)) > 0.35f) continue;
+
+                    // Also verify this pixel is a local maximum (brighter
+                    // than its immediate neighbours).
+                    bool is_local_peak = true;
+                    for (int dy = -2; dy <= 2 && is_local_peak; dy += 2) {
+                        for (int dx = -2; dx <= 2 && is_local_peak; dx += 2) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx2 = x + dx, ny2 = y + dy;
+                            if (nx2 < 0 || ny2 < 0 || nx2 >= w || ny2 >= h) continue;
+                            const int ni = (ny2 * w + nx2) * 4;
+                            const float nl = 0.2126f * px[ni] / 255.0f +
+                                             0.7152f * px[ni+1] / 255.0f +
+                                             0.0722f * px[ni+2] / 255.0f;
+                            if (nl > lum) is_local_peak = false;
+                        }
+                    }
+                    if (!is_local_peak) continue;
+
+                    const float fnx = float(x) / float(w);
+                    const float fny = float(y) / float(h);
+
+                    // Reject if too close to an already-detected star.
+                    bool too_close = false;
+                    for (const auto& s : detected_stars_) {
+                        float ddx = fnx - s.nx, ddy = fny - s.ny;
+                        if (ddx * ddx + ddy * ddy < kMinDistSq) {
+                            too_close = true;
+                            break;
+                        }
+                    }
+                    if (too_close) continue;
+
+                    DetectedStar star;
+                    star.nx = fnx;
+                    star.ny = fny;
+                    star.brightness = lum;
+                    // Estimate radius from how many adjacent pixels are
+                    // also bright — cheap 1D horizontal scan.
+                    int span = 0;
+                    for (int sx = x + 1; sx < w && sx < x + 8; ++sx) {
+                        const int si = (y * w + sx) * 4;
+                        const float sl = 0.2126f * px[si] / 255.0f +
+                                         0.7152f * px[si+1] / 255.0f +
+                                         0.0722f * px[si+2] / 255.0f;
+                        if (sl < kLumThreshold * 0.7f) break;
+                        ++span;
+                    }
+                    star.radius = 1.0f + float(span) * 0.5f;
+
+                    // Skip large bright blobs (the moon, glowing clouds, etc).
+                    // Real stars are tiny — anything wider than ~4 px is not a star.
+                    if (star.radius > 4.0f) continue;
+
+                    // Unique twinkle parameters derived from position.
+                    star.speed = 0.8f + 2.0f * (float(std::abs(x * 7 + y * 13) % 100) / 100.0f);
+                    star.phase = 6.28f * (float(std::abs(x * 3 + y * 17) % 100) / 100.0f);
+
+                    detected_stars_.push_back(star);
+                }
+            }
+
+            stbi_image_free(px);
+            fprintf(stderr, "[title_screen] Detected %zu stars in background image.\n",
+                    detected_stars_.size());
+        }
+    }
+
     chat_box_ = std::make_shared<ChatBox>();
 }
 
@@ -498,6 +623,19 @@ void Menu::init(
         graphics_queue,
         descriptor_pool,
         render_pass);
+
+    // Re-apply the fantasy colour theme — the ImGui context was
+    // destroyed and recreated during swap chain recreation, so the
+    // style reverts to default.
+    applyFantasyStyle();
+
+    // Re-register the background texture with the fresh ImGui/Vulkan
+    // descriptor pool. The Vulkan image + view survive swap chain
+    // recreation, but the ImGui-side descriptor does not.
+    if (bg_texture_info_ && bg_texture_info_->view && sampler_) {
+        bg_texture_id_ = renderer::Helper::addImTextureID(
+            sampler_, bg_texture_info_->view);
+    }
 }
 
 bool Menu::draw(
@@ -528,38 +666,53 @@ bool Menu::draw(
          game_state_ == GameState::Loading);
 
     // Full-screen fantasy landscape background.
+    // Use the background draw list (behind all windows) so the image
+    // is never clipped by any ImGui window's client rect and always
+    // covers the entire framebuffer.
     if (show_title_ui && bg_enabled_ && bg_texture_id_ != ImTextureID(0)) {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowViewport(vp->ID);
-        ImGui::SetNextWindowPos(vp->Pos);
-        ImGui::SetNextWindowSize(vp->Size);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-        const bool bg_open = ImGui::Begin(
-            "##fantasy_fullscreen_bg",
-            nullptr,
-            ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse |
-            ImGuiWindowFlags_NoInputs |
-            ImGuiWindowFlags_NoBackground |
-            ImGuiWindowFlags_NoDocking |
-            ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoFocusOnAppearing |
-            ImGuiWindowFlags_NoBringToFrontOnFocus);
-        if (bg_open) {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddImage(
-                bg_texture_id_,
-                vp->Pos,
-                ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y));
+        {
+            ImDrawList* dl = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+            const ImVec2 p0 = vp->Pos;
+            const ImVec2 p1 = ImVec2(vp->Pos.x + vp->Size.x,
+                                     vp->Pos.y + vp->Size.y);
+            dl->AddImage(bg_texture_id_, p0, p1);
+
+            // Twinkle overlay — 4-point diffraction spikes + core glow.
+            // Drawn with standard AddLine / AddCircleFilled which
+            // handle the texture switch from the bg image correctly.
+            // Each spike fades by drawing 2–3 layered lines from thick
+            // bright to thin dim, simulating a soft taper.
+            if (!detected_stars_.empty()) {
+                const float t = (float)ImGui::GetTime();
+                const float scr_w = vp->Size.x;
+                const float scr_h = vp->Size.y;
+
+                for (const auto& s : detected_stars_) {
+                    const float pulse = 0.5f + 0.5f * std::sin(t * s.speed + s.phase);
+                    const ImVec2 c = {
+                        vp->Pos.x + s.nx * scr_w,
+                        vp->Pos.y + s.ny * scr_h };
+
+                    const uint8_t cr = (uint8_t)(230 + s.brightness * 25);
+                    const uint8_t cg = (uint8_t)(225 + s.brightness * 20);
+                    const uint8_t cb = (uint8_t)(200 + s.brightness * 15);
+
+                    // Short subtle cross spikes — kept small so they don't
+                    // stray beyond the sky region into the landscape.
+                    const float spike = s.radius * (1.5f + pulse * 3.0f);
+                    const uint8_t spike_a = (uint8_t)(30 + pulse * 90);
+                    const ImU32 spike_col = IM_COL32(cr, cg, cb, spike_a);
+                    dl->AddLine(ImVec2(c.x - spike, c.y), ImVec2(c.x + spike, c.y), spike_col, 1.0f);
+                    dl->AddLine(ImVec2(c.x, c.y - spike), ImVec2(c.x, c.y + spike), spike_col, 1.0f);
+
+                    // Bright core dot.
+                    const uint8_t core_a = (uint8_t)(80 + pulse * 175);
+                    dl->AddCircleFilled(c, s.radius * (0.5f + pulse * 0.5f),
+                        IM_COL32(cr, cg, cb, core_a), 10);
+                }
+            }
         }
-        ImGui::End();
-        ImGui::PopStyleVar(3);
     }
 
     // Twilight backdrop + title banner — text now driven by XML config.
@@ -619,23 +772,55 @@ bool Menu::draw(
             ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_AlwaysAutoResize);
 
-        // Fantasy-styled buttons.
-        const ImVec4 btn_bg      = ImVec4(0.08f, 0.07f, 0.16f, 0.80f);
-        const ImVec4 btn_hovered = ImVec4(0.55f, 0.45f, 0.22f, 0.90f);
-        const ImVec4 btn_active  = ImVec4(0.83f, 0.69f, 0.35f, 1.00f);
-        const ImVec4 btn_border  = ImVec4(0.55f, 0.45f, 0.22f, 0.50f);
-        const ImVec4 text_col    = ImVec4(0.93f, 0.88f, 0.72f, 1.00f);
+        // Fantasy-styled buttons with staggered glow pulse.
+        // Each button gets its own phase offset so they shimmer
+        // one after another like runes lighting up in sequence.
+        static float s_title_time = 0.0f;
+        s_title_time += delta_t;
 
-        ImGui::PushStyleColor(ImGuiCol_Button,        btn_bg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  btn_hovered);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,   btn_active);
-        ImGui::PushStyleColor(ImGuiCol_Border,         btn_border);
-        ImGui::PushStyleColor(ImGuiCol_Text,           text_col);
+        const ImVec4 btn_bg_base   = ImVec4(0.08f, 0.07f, 0.16f, 0.80f);
+        const ImVec4 btn_hovered   = ImVec4(0.55f, 0.45f, 0.22f, 0.90f);
+        const ImVec4 btn_active    = ImVec4(0.83f, 0.69f, 0.35f, 1.00f);
+        const ImVec4 text_base     = ImVec4(0.93f, 0.88f, 0.72f, 1.00f);
+
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
 
         for (int i = 0; i < n_items; ++i) {
             const auto& mi = title_config_.menu_items[i];
+
+            // Staggered sine pulse: each item is offset by ~0.7 s
+            // so the glow cascades down the menu list.
+            const float phase = s_title_time * 2.2f - float(i) * 1.5f;
+            const float pulse = 0.5f + 0.5f * std::sin(phase);
+
+            // Interpolate button bg from deep indigo → dim gold.
+            const ImVec4 btn_bg = ImVec4(
+                btn_bg_base.x + pulse * 0.12f,
+                btn_bg_base.y + pulse * 0.10f,
+                btn_bg_base.z + pulse * 0.04f,
+                btn_bg_base.w);
+
+            // Border brightens with the pulse.
+            const ImVec4 btn_border = ImVec4(
+                0.55f + pulse * 0.28f,
+                0.45f + pulse * 0.24f,
+                0.22f + pulse * 0.13f,
+                0.40f + pulse * 0.40f);
+
+            // Text glows from cream to bright gold.
+            const ImVec4 text_col = ImVec4(
+                text_base.x + pulse * 0.07f,
+                text_base.y + pulse * 0.04f,
+                text_base.z - pulse * 0.12f,
+                text_base.w);
+
+            ImGui::PushStyleColor(ImGuiCol_Button,        btn_bg);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  btn_hovered);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   btn_active);
+            ImGui::PushStyleColor(ImGuiCol_Border,         btn_border);
+            ImGui::PushStyleColor(ImGuiCol_Text,           text_col);
+
             if (ImGui::Button(mi.label.c_str(), ImVec2(item_w, item_h))) {
                 // Dispatch action.
                 if (mi.action == "new_game") {
@@ -657,12 +842,13 @@ bool Menu::draw(
                     // TODO: implement settings
                 }
             }
+            ImGui::PopStyleColor(5); // per-button colors
+
             if (i < n_items - 1)
                 ImGui::Dummy(ImVec2(0, spacing - ImGui::GetStyle().ItemSpacing.y));
         }
 
         ImGui::PopStyleVar(2);   // FrameRounding, FrameBorderSize
-        ImGui::PopStyleColor(5); // Button colors + text
         ImGui::End();
         ImGui::PopStyleColor();  // WindowBg
         ImGui::PopStyleVar(3);   // WindowPadding, BorderSize, Rounding
@@ -1123,6 +1309,17 @@ void Menu::destroy() {
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+}
+
+void Menu::destroyResources() {
+    // Release the background image GPU resources. Called once at
+    // application shutdown (NOT during swap chain recreation, where
+    // the texture needs to survive).
+    if (bg_texture_info_ && device_) {
+        bg_texture_info_->destroy(device_);
+        bg_texture_info_.reset();
+        bg_texture_id_ = ImTextureID(0);
+    }
 }
 
 }//namespace ui

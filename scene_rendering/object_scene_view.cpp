@@ -218,6 +218,27 @@ void ObjectSceneView::draw(
     }
 }
 
+void ObjectSceneView::recreate(
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const glm::uvec2& new_buffer_size) {
+
+    // Resize render buffers (destroys old, allocates at new size).
+    resize(renderbuffer_formats, new_buffer_size);
+
+    // Re-allocate tile-resource descriptor sets from the (new) pool.
+    // m_descriptor_pool_ is a reference to the application's pool, so
+    // it already points to the freshly-created pool.
+    m_tile_res_desc_sets_.clear();
+    m_tile_res_desc_sets_.resize(2);
+    for (int idx = 0; idx < 2; idx++) {
+        m_tile_res_desc_sets_[idx] =
+            m_device_->createDescriptorSets(
+                m_descriptor_pool_,
+                ego::TileObject::getTileResDescSetLayout(),
+                1)[0];
+    }
+}
+
 void ObjectSceneView::destroy(const std::shared_ptr<renderer::Device>& device) {
 
     ViewObject::destroy(device);

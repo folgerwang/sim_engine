@@ -33,6 +33,15 @@ public:
         const std::vector<renderer::Viewport>& viewports,
         const std::vector<renderer::Scissor>& scissors);
 
+    // Re-allocate the descriptor set from the new pool after swap
+    // chain recreation.  Layout + pipeline survive; only the pool
+    // allocation is stale.
+    void recreate(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::Sampler>& texture_sampler,
+        const std::shared_ptr<renderer::TextureInfo>& lbm_patch_tex);
+
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };
 
