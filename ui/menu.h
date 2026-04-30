@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cmath>
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
@@ -94,6 +95,84 @@ class Menu {
     bool show_csm_debug_ = false;
     std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
 
+    // ---- Time-of-day -------------------------------------------------------
+    // Hours in [0, 24).  The sun direction in `Skydome::update` is derived
+    // from this value.  IMPORTANT: the value is fed straight into the
+    // hour-angle calculation that interprets it as **UTC**, not local
+    // time, because the application's day-of-year/minute/second come
+    // from gmtime_s().  So `tod_hours_ = 12.0` means UTC 12:00, which
+    // for the hardcoded Mountain View coordinates (longitude -122) is
+    // local 04:00 - sun below horizon, dark sky.  Default is 22.0 to
+    // match the value the old hardcoded path used (≈ local 14:00 at MV,
+    // sun high, bright sky).  If you change the hardcoded latitude /
+    // longitude, retune this default accordingly, or swap in a localtime
+    // conversion in the application.
+    //
+    // When the user yanks the slider by more than tod_jump_threshold_
+    // in a single frame we treat it as a "skip" (debug "go to dawn"
+    // button etc.) and the application will reset the sky / IBL mini-
+    // buffers so they re-bootstrap instead of EMA-blending toward the
+    // new lighting over many seconds.
+    float tod_hours_ = 22.0f;
+    float tod_prev_hours_ = 22.0f;
+    bool  tod_auto_advance_ = true;      // tick forward with real time
+    // Speed factor: game time / real time.  100.0 means 1 real-second
+    // advances the in-game clock by 100 game-seconds, so a full 24-hour
+    // cycle takes ~14.4 real minutes.  Slider in the Skydome window
+    // exposes this directly; advanceTimeOfDay() converts to game-hours
+    // internally (game-seconds-added / 3600).
+    float tod_advance_speed_ = 100.0f;
+    float tod_jump_threshold_ = 0.5f;    // hours
+
+    // ---- IBL / sky cubemap debug visualisation ----------------------------
+    // Set from the application after IblCreator/Skydome textures exist.
+    // Every cubemap is exposed as a 2D array of ImTextureIDs indexed
+    // [mip][face], so each debug row gets its own mip slider.  Cubemaps
+    // that only have one mip (sky mini-buffer, IBL diffuse) leave higher
+    // mip rows zeroed and the per-row slider is range-clamped to [0, 0].
+    //
+    // ImTextureIDs are obtained from `TextureInfo::surface_views[mip][face]`
+    // (per-mip per-face 2D ImageViews populated by createCubemapTexture
+    // for use_as_framebuffer cubemaps) wrapped via `Helper::addImTextureID`.
+    bool show_ibl_debug_ = false;
+public:
+    // Public so the application can declare matching arrays when
+    // gathering per-mip ImTextureIDs to feed the setters below.
+    static constexpr int kIblDebugMaxMips = 10;
+    using IblDebugFaceArray = std::array<ImTextureID, 6>;
+    using IblDebugMipFaceArray = std::array<IblDebugFaceArray, kIblDebugMaxMips>;
+private:
+
+    IblDebugMipFaceArray envmap_face_mip_tex_ids_      = {};
+    IblDebugMipFaceArray mini_envmap_face_mip_tex_ids_ = {};
+    IblDebugMipFaceArray diffuse_face_mip_tex_ids_     = {};
+    IblDebugMipFaceArray specular_face_mip_tex_ids_    = {};
+    IblDebugMipFaceArray sheen_face_mip_tex_ids_       = {};
+
+    // Number of mips the application registered for each cubemap.  Caps
+    // each row's mip slider so we don't index zeroed slots.
+    int ibl_debug_envmap_num_mips_      = 1;
+    int ibl_debug_mini_envmap_num_mips_ = 1;
+    int ibl_debug_diffuse_num_mips_     = 1;
+    int ibl_debug_specular_num_mips_    = 1;
+    int ibl_debug_sheen_num_mips_       = 1;
+
+    // Currently-selected mip per row (driven by the ImGui sliders).
+    int ibl_debug_envmap_mip_      = 0;
+    int ibl_debug_mini_envmap_mip_ = 0;
+    int ibl_debug_diffuse_mip_     = 0;
+    int ibl_debug_specular_mip_    = 0;
+    int ibl_debug_sheen_mip_       = 0;
+
+    float ibl_debug_thumb_size_   = 96.0f;
+    // Exposure multiplier applied to every thumbnail via ImGui::Image's
+    // tint colour.  Atmospheric / IBL data is HDR linear; ImGui doesn't
+    // tonemap, so dim mid-tones (~0.05 linear) display as near-black and
+    // small step artifacts in atmosphere LUT raymarching can look like
+    // concentric rings.  Boosting this scales the displayed value into
+    // the visible sRGB range.  Stored as linear scale (1.0 = no change).
+    float ibl_debug_exposure_     = 1.0f;
+
     std::shared_ptr<ChatBox> chat_box_;
 
     // Optional GPU profiler — set from application after init.
@@ -177,6 +256,73 @@ public:
     inline bool showCsmDebug() const { return show_csm_debug_; }
     void setCsmDebugTextureIds(const std::array<ImTextureID, CSM_CASCADE_COUNT>& ids) {
         csm_debug_tex_ids_ = ids;
+    }
+
+    // ---- TOD (time-of-day) accessors --------------------------------------
+    // Hours in [0, 24) the application should feed to Skydome::update.
+    inline float getTimeOfDayHours() const { return tod_hours_; }
+    inline void  setTimeOfDayHours(float h) {
+        tod_hours_ = std::fmod(h + 24.0f, 24.0f);
+    }
+    // Returns true once when the user has yanked the slider far enough
+    // for the application to call resetMiniBuffer() on Skydome / IblCreator.
+    // Caller-driven: this method internally advances the "previous" value
+    // each call, so the application should call it exactly once per frame.
+    bool consumeTodJump() {
+        bool jumped =
+            std::fabs(tod_hours_ - tod_prev_hours_) > tod_jump_threshold_;
+        // Wrap-around: a small positive change like 23.9 -> 0.1 (== 0.2h)
+        // shouldn't count as a jump.
+        float wrapped = std::fabs(tod_hours_ - tod_prev_hours_);
+        if (wrapped > 12.0f) {
+            wrapped = 24.0f - wrapped;
+            jumped = wrapped > tod_jump_threshold_;
+        }
+        tod_prev_hours_ = tod_hours_;
+        return jumped;
+    }
+    // Optional: tick TOD forward each frame when auto-advance is on.
+    // tod_advance_speed_ is "game-time / real-time" (e.g. 100.0 means
+    // game runs 100x real time).  Convert to added-game-hours by
+    // multiplying by real-seconds-elapsed and dividing by 3600.
+    void advanceTimeOfDay(float real_delta_seconds) {
+        if (!tod_auto_advance_) return;
+        const float game_hours_added =
+            tod_advance_speed_ * real_delta_seconds / 3600.0f;
+        tod_hours_ = std::fmod(
+            tod_hours_ + game_hours_added + 24.0f,
+            24.0f);
+    }
+
+    // ---- IBL / sky debug texture binding ----------------------------------
+    // The application calls these once after the IBL/Sky textures exist.
+    // Each setter takes the full per-mip per-face ImTextureID array and a
+    // num_mips count; the menu's per-row slider is range-clamped to
+    // [0, num_mips - 1].
+    void setEnvmapFaceMipTextureIds(
+        const IblDebugMipFaceArray& ids, int num_mips) {
+        envmap_face_mip_tex_ids_ = ids;
+        ibl_debug_envmap_num_mips_ = num_mips;
+    }
+    void setMiniEnvmapFaceMipTextureIds(
+        const IblDebugMipFaceArray& ids, int num_mips) {
+        mini_envmap_face_mip_tex_ids_ = ids;
+        ibl_debug_mini_envmap_num_mips_ = num_mips;
+    }
+    void setIblDiffuseFaceMipTextureIds(
+        const IblDebugMipFaceArray& ids, int num_mips) {
+        diffuse_face_mip_tex_ids_ = ids;
+        ibl_debug_diffuse_num_mips_ = num_mips;
+    }
+    void setIblSpecularFaceMipTextureIds(
+        const IblDebugMipFaceArray& ids, int num_mips) {
+        specular_face_mip_tex_ids_ = ids;
+        ibl_debug_specular_num_mips_ = num_mips;
+    }
+    void setIblSheenFaceMipTextureIds(
+        const IblDebugMipFaceArray& ids, int num_mips) {
+        sheen_face_mip_tex_ids_ = ids;
+        ibl_debug_sheen_num_mips_ = num_mips;
     }
 
     inline bool isShadowPassTurnOff() const {

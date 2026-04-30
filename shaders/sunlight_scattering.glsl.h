@@ -16,7 +16,12 @@ float rsi(vec3 r0, vec3 rd, float sr) {
   float a = dot(rd, rd);
   float b = 2.0 * dot(rd, r0);
   float c = dot(r0, r0) - (sr * sr);
-  return (-b + sqrt((b * b) - 4.0 * a * c)) / (2.0 * a);
+  // Clamp the discriminant non-negative: for grazing/tangent rays it
+  // can fall slightly negative due to f32 rounding (the analytic value
+  // is >= 0 since r0 is inside the sphere), and sqrt(-tiny) would
+  // produce NaN that propagates through atmosphere math.
+  float disc = max(b * b - 4.0 * a * c, 0.0);
+  return (-b + sqrt(disc)) / (2.0 * a);
 }
 
 vec2 calculatePhaseFuncParams(vec3 ray, vec3 sun_dir, float g) {
@@ -129,18 +134,33 @@ vec2 calculateLutUv(vec3 pos_ws, vec3 sun_dir, float atmos_radius, float sqr_sam
     float dist_to_line_middle = dot(pos_ws, sun_dir);
     float sqr_dist_to_line_middle =
         dist_to_line_middle * dist_to_line_middle;
-    float sqr_perpendicular_dist_to_core =
-        sqr_sample_dist_to_core - sqr_dist_to_line_middle;
+
+    // Catastrophic-cancellation guard.  When pos_ws ~ kPlanetRadius along
+    // the chord direction (e.g. zenith sun), sqr_sample_dist_to_core and
+    // sqr_dist_to_line_middle are both ~kPlanetRadius^2 (~4e13), and
+    // their f32 difference can fall slightly negative even though the
+    // analytic value is >= 0.  sqrt(-tiny) -> NaN, which would propagate
+    // through the LUT lookup and exp2() into the final radiance.
+    float sqr_perpendicular_dist_to_core = max(
+        sqr_sample_dist_to_core - sqr_dist_to_line_middle, 0.0);
     float perpendicular_dist_to_core =
         sqrt(sqr_perpendicular_dist_to_core);
-    float whole_line_length =
-        2.0f * sqrt(atmos_radius * atmos_radius - sqr_perpendicular_dist_to_core);
+
+    // Same guard for whole_line_length: if numerical noise pushes
+    // sqr_perpendicular slightly above atmos_radius^2, we'd divide by
+    // sqrt(negative) -> NaN.  The analytic value is in [0, atmos_radius^2].
+    float whole_line_length = 2.0f * sqrt(max(
+        atmos_radius * atmos_radius - sqr_perpendicular_dist_to_core, 0.0));
+
     float sample_length = rsi(pos_ws, sun_dir, atmos_radius);
 
     vec2 lut_uv;
     lut_uv.x = perpendicular_dist_to_core / atmos_radius;
-    lut_uv.y = sample_length / whole_line_length;
-    
+    // Tangent rays drive whole_line_length -> 0; clamp the divisor to
+    // avoid +Inf / NaN in lut_uv.y.  The lookup result for a tangent
+    // chord is meaningless anyway (zero-length integration) so any
+    // small positive value is fine here.
+    lut_uv.y = sample_length / max(whole_line_length, 1e-3);
     return lut_uv;
 }
 

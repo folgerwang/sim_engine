@@ -1,6 +1,7 @@
 #include <vector>
 #include <filesystem>
 #include <cmath>
+#include <algorithm>
 #include <source_location>
 #include <cstdlib>
 
@@ -1077,6 +1078,11 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
 
+        if (ImGui::BeginMenu("IBL Debug")) {
+            show_ibl_debug_ = true;
+            ImGui::EndMenu();
+        }
+
         if (ImGui::BeginMenu("Shadow"))
         {
             if (ImGui::MenuItem("Turn off shadow pass", NULL, turn_off_shadow_pass_)) {
@@ -1311,6 +1317,33 @@ bool Menu::draw(
     if (s_show_skydome) {
         ImGui::SetNextWindowViewport(main_vp_id);
         if (ImGui::Begin("Skydome", &s_show_skydome, ImGuiWindowFlags_NoDocking)) {
+            // ---- Time of day -------------------------------------------
+            // Slider drives Skydome::update each frame; the application
+            // calls consumeTodJump() to detect big skips (debug "go to
+            // dawn" etc.) and reset the mini-buffer accumulators.
+            ImGui::SeparatorText("Time of day");
+            ImGui::SliderFloat("Hour (0..24)", &tod_hours_, 0.0f, 24.0f, "%.2f h");
+            // Quick-jump buttons for common test cases.
+            if (ImGui::Button("Dawn (6h)"))    { setTimeOfDayHours(6.0f); }
+            ImGui::SameLine();
+            if (ImGui::Button("Noon (12h)"))   { setTimeOfDayHours(12.0f); }
+            ImGui::SameLine();
+            if (ImGui::Button("Dusk (18h)"))   { setTimeOfDayHours(18.0f); }
+            ImGui::SameLine();
+            if (ImGui::Button("Midnight (0h)")){ setTimeOfDayHours(0.0f); }
+            ImGui::Checkbox("Auto-advance", &tod_auto_advance_);
+            if (tod_auto_advance_) {
+                ImGui::SameLine();
+                // Speed = game-time / real-time.  100x by default
+                // (1 real-second = 100 game-seconds, full day in ~14.4 min).
+                ImGui::SliderFloat("speed (x real-time)",
+                    &tod_advance_speed_, 1.0f, 10000.0f, "%.0fx",
+                    ImGuiSliderFlags_Logarithmic);
+            }
+            ImGui::SliderFloat("Jump threshold (h)",
+                &tod_jump_threshold_, 0.05f, 6.0f, "%.2f");
+
+            ImGui::SeparatorText("Atmosphere");
             ImGui::SliderFloat("phase func g", &skydome->getG(), -1.0f, 2.0f);
             ImGui::SliderFloat("rayleigh scale height", &skydome->getRayleighScaleHeight(), 0.0f, 16000.0f);
             ImGui::SliderFloat("mei scale height", &skydome->getMieScaleHeight(), 0.0f, 2400.0f);
@@ -1433,6 +1466,122 @@ bool Menu::draw(
         ImGui::SetNextWindowViewport(main_vp_id);
         if (ImGui::Begin("Shader Compile Error", &s_show_shader_error_message, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoDocking)) {
             ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", s_shader_error_message.c_str());
+        }
+        ImGui::End();
+    }
+
+    // ---- IBL / Sky cubemap debug window -----------------------------------
+    if (show_ibl_debug_) {
+        const float thumb = ibl_debug_thumb_size_;
+        const float row_w = thumb * 6.0f + 60.0f;
+        const float row_h = thumb + 60.0f;  // +slider line per row
+        const float win_w = row_w + 40.0f;
+        const float win_h = row_h * 5.0f + 80.0f;
+        ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowViewport(main_vp_id);
+        if (ImGui::Begin("IBL / Sky Debug", &show_ibl_debug_,
+                         ImGuiWindowFlags_NoDocking)) {
+            ImGui::SliderFloat("Thumbnail size",
+                &ibl_debug_thumb_size_, 32.0f, 256.0f, "%.0f px");
+            // Exposure slider: values up to 32x cover atmospheric mid-
+            // tones (~0.05 linear -> 1.6 displayed).  Logarithmic so
+            // small movements near 1.0 give intuitive control.
+            ImGui::SliderFloat("Exposure",
+                &ibl_debug_exposure_, 0.1f, 32.0f, "%.2fx",
+                ImGuiSliderFlags_Logarithmic);
+            ImGui::SameLine();
+            if (ImGui::Button("1x")) ibl_debug_exposure_ = 1.0f;
+
+            // Apply exposure as the ImGui::Image tint multiplier.  Alpha
+            // stays at 1 so we don't accidentally key transparency off
+            // the cubemap's alpha channel.
+            const ImVec4 tint(
+                ibl_debug_exposure_,
+                ibl_debug_exposure_,
+                ibl_debug_exposure_,
+                1.0f);
+            const ImVec4 border(0, 0, 0, 0);
+
+            const char* face_names[6] = { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+
+            // One helper for ALL rows: label + per-row mip slider + 6
+            // face thumbnails at the selected mip.  Rows whose cubemap
+            // has only one mip get a degenerate [0, 0] slider that
+            // ImGui still draws so the layout stays uniform across rows.
+            auto draw_mip_row = [&](
+                const char* row_id,
+                const char* label,
+                const IblDebugMipFaceArray& mip_face_ids,
+                int num_mips,
+                int* current_mip) {
+                ImGui::SeparatorText(label);
+                ImGui::PushID(row_id);
+                const int max_mip = std::max(0, num_mips - 1);
+                ImGui::SetNextItemWidth(thumb * 4.0f);
+                ImGui::SliderInt("mip", current_mip, 0, max_mip);
+                ImGui::PopID();
+                const int picked = std::clamp(
+                    *current_mip, 0, kIblDebugMaxMips - 1);
+                const auto& faces = mip_face_ids[picked];
+
+                for (int f = 0; f < 6; ++f) {
+                    if (f > 0) ImGui::SameLine();
+                    ImGui::BeginGroup();
+                    ImGui::Text("%s", face_names[f]);
+                    ImTextureID id = faces[f];
+                    if (id) {
+                        ImGui::Image(id, ImVec2(thumb, thumb),
+                            ImVec2(0, 0), ImVec2(1, 1), tint, border);
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::BeginTooltip();
+                            ImGui::Image(id, ImVec2(384.0f, 384.0f),
+                                ImVec2(0, 0), ImVec2(1, 1), tint, border);
+                            ImGui::EndTooltip();
+                        }
+                    } else {
+                        ImGui::Dummy(ImVec2(thumb, thumb));
+                    }
+                    ImGui::EndGroup();
+                }
+            };
+
+            // Sky envmap (full mip chain - useful for verifying mipgen
+            // smoothing of the dithered partial updates).
+            draw_mip_row(
+                "envmap", "Sky envmap",
+                envmap_face_mip_tex_ids_,
+                ibl_debug_envmap_num_mips_,
+                &ibl_debug_envmap_mip_);
+
+            // Sky mini-buffer (size/8 cubemap, single mip - slider goes
+            // 0..0 but stays in the UI for layout consistency).
+            draw_mip_row(
+                "mini_envmap", "Sky mini-buffer (size/8)",
+                mini_envmap_face_mip_tex_ids_,
+                ibl_debug_mini_envmap_num_mips_,
+                &ibl_debug_mini_envmap_mip_);
+
+            // IBL diffuse (Lambertian, single mip).
+            draw_mip_row(
+                "ibl_diffuse", "IBL diffuse (Lambertian)",
+                diffuse_face_mip_tex_ids_,
+                ibl_debug_diffuse_num_mips_,
+                &ibl_debug_diffuse_mip_);
+
+            // IBL specular (GGX, full mip chain - higher mips are box-
+            // filter mipgen of mip 0; visible blur progression).
+            draw_mip_row(
+                "ibl_specular", "IBL specular (GGX, +mipgen)",
+                specular_face_mip_tex_ids_,
+                ibl_debug_specular_num_mips_,
+                &ibl_debug_specular_mip_);
+
+            // IBL sheen (Charlie, full mip chain).
+            draw_mip_row(
+                "ibl_sheen", "IBL sheen (Charlie, +mipgen)",
+                sheen_face_mip_tex_ids_,
+                ibl_debug_sheen_num_mips_,
+                &ibl_debug_sheen_mip_);
         }
         ImGui::End();
     }

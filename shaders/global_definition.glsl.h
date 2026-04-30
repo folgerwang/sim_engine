@@ -308,6 +308,55 @@ struct IblParams {
 	float lodBias;
 };
 
+// Push constants for the dithered + temporally-integrated "mini-buffer"
+// IBL convolution update.
+//
+// Per dispatch the shader processes one mip of one IBL filter.  Two
+// orthogonal cost reductions are applied on top of the reference
+// fragment-shader path (cube_ibl.frag):
+//
+//   1. Spatial 8x8 dither.  Only 1/64 of the destination mip's texels are
+//      touched per frame; dither_offset cycles through 64 unique (dx, dy)
+//      positions over 64 frames so the whole mip is eventually refreshed.
+//      For mips with face_size < 8 we fall back to a full update every
+//      frame (dither_stride == 1, dither_offset == (0, 0)).
+//
+//   2. Temporal sample subdivision.  Each touched texel does only
+//      NUM_SAMPLES_PER_FRAME = NUM_SAMPLES/64 importance samples per
+//      frame.  The new partial estimate is blended into the existing
+//      texel value with `temporal_alpha` (exponential moving average),
+//      so the texel "integrates" sample contributions over many touches.
+//      `frame_index` is used to stratify which sample subset is taken
+//      this frame: across 64 touches a pixel sees all NUM_SAMPLES sample
+//      indices.
+//
+// For specular / sheen, only mip 0 is convolved.  The lower-resolution
+// mips are produced by a downsample (box-filter mipgen) pass after the
+// dispatch - see updateIblSpecularMapMini / updateIblSheenMapMini.
+struct IblMiniParams {
+    float roughness;          // for THIS mip (matches old IblParams.roughness)
+    int   currentMipLevel;    // mip index of the destination
+    int   width;              // top-mip cube_size (used by solidAngleTexel)
+    float lodBias;
+
+    int   mip_face_size;      // size of THIS mip's face (cube_size >> mip)
+    int   mini_size;          // dispatch threads per axis (mip_face_size/stride)
+    int   dither_stride;      // 8 for sparse, 1 for full-update small mips
+    // 1 on the very first dispatch into this IBL output (== "first
+    // touch": the image is in UNDEFINED layout / contains garbage).  In
+    // this mode each compute thread evaluates a single partial-sample
+    // estimate and broadcasts it to ALL stride^2 texels of its block, so
+    // every texel is initialized in one cheap dispatch.  No imageLoad /
+    // EMA blend is performed - we'd otherwise be blending against
+    // uninitialized memory.  Subsequent frames switch back to single-
+    // texel sparse dither + EMA integration.
+    int   is_first_touch;
+
+    ivec2 dither_offset;      // (dx, dy) within the dither block
+    int   frame_index;        // monotonic frame counter, used for sample stratification
+    float temporal_alpha;     // EMA weight for the partial new estimate (0..1)
+};
+
 struct IblComputeParams {
     ivec4           size;
 };
@@ -541,6 +590,31 @@ struct SunSkyParams {
     float           inv_rayleigh_scale_height;
     float           inv_mie_scale_height;
     vec2            pad1;
+};
+
+// Push constants for the dithered "mini-buffer" sky cubemap update.
+// Each frame, only 1/64 of the full-res cubemap texels are recomputed at full
+// quality: a (mini_size = cube_size/8)-resolution cubemap is fully refreshed
+// and its texels are scattered into the corresponding 8x8 block in the
+// full-res envmap, using a per-frame dither offset that cycles through all
+// 64 unique positions over 64 frames.
+struct SunSkyMiniParams {
+    vec3            sun_pos;
+    float           g;
+    float           inv_rayleigh_scale_height;
+    float           inv_mie_scale_height;
+    int             cube_size;        // full-res cubemap face width (= mini_size * 8)
+    int             mini_size;        // mini-buffer face width (= cube_size / 8)
+    ivec2           dither_offset;    // (dx, dy) within the 8x8 block, 0..7
+    int             frame_index;      // monotonic frame index (modulo 64 used in shader)
+    // 1 on the very first dispatch for this buffer (== "first touch": the
+    // image is in UNDEFINED layout / contains garbage memory).  In this
+    // mode each compute thread evaluates one sample at its dither
+    // position and broadcasts it to ALL 64 texels in the 8x8 block, so
+    // the entire envmap is filled in a single cheap dispatch.  After that
+    // the regular sparse 8x8 dither runs, refining individual texels.
+    // Replaces the heavyweight `drawCubeSkyBox` bootstrap.
+    int             is_first_touch;
 };
 
 struct CloudParams {
