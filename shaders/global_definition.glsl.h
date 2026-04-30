@@ -469,7 +469,7 @@ struct BindlessMaterialParams {
     int   base_color_tex_idx;   // index into base_color_textures[]; -1 = no texture
     float alpha_cutoff;         // ALPHA_MASK threshold (ignored when flag not set)
     int   flags;                // BINDLESS_MAT_* bits
-    int   pad0;
+    int   normal_tex_idx;       // index into normal_textures[]; -1 = no normal map
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).

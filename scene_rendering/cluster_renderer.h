@@ -48,10 +48,15 @@ class ClusterRenderer {
     std::vector<glsl::ClusterCullInfo>        staging_cull_infos_;
     std::vector<glsl::ClusterDrawInfo>        staging_draw_infos_;
     std::vector<glsl::BindlessMaterialParams> staging_material_params_;
-    // Texture views staged for the bindless sampler array (one per unique texture).
+    // Base-colour texture views staged for the bindless sampler array (binding 2).
     std::vector<std::shared_ptr<renderer::ImageView>> staging_tex_views_;
     // Dedup map: ImageView raw pointer → slot index in staging_tex_views_.
     std::unordered_map<renderer::ImageView*, int> staging_tex_slot_map_;
+
+    // Normal-map texture views staged for the bindless sampler array (binding 3).
+    std::vector<std::shared_ptr<renderer::ImageView>> staging_normal_tex_views_;
+    std::unordered_map<renderer::ImageView*, int>     staging_normal_slot_map_;
+
     uint32_t uploaded_mesh_count_ = 0;
 
     // ── Shared sampler + dummy 1×1 white texture (fallback for empty slots) ──
@@ -91,8 +96,9 @@ class ClusterRenderer {
     renderer::BufferInfo merged_index_buffer_;  // uint32_t[]
     uint32_t total_merged_vertices_ = 0;
     uint32_t total_merged_indices_  = 0;
-    uint32_t total_materials_       = 0;  // set by finalizeUploads
-    uint32_t total_textures_        = 0;  // set by finalizeUploads
+    uint32_t total_materials_        = 0;  // set by finalizeUploads
+    uint32_t total_textures_         = 0;  // set by finalizeUploads
+    uint32_t total_normal_textures_  = 0;  // set by finalizeUploads
 
     // ── Bindless rendering pipeline ──
     std::shared_ptr<renderer::DescriptorSetLayout> bindless_desc_set_layout_;
@@ -141,11 +147,14 @@ public:
 
     // Upload one mesh's cluster data (appends to CPU staging arrays).
     // Call after helper::buildClusterMesh() has run on the mesh.
+    // cluster_prim_map[i] gives the primitive index for cluster i.
+    // Allows one call per FBX mesh (not per primitive) while still assigning
+    // the correct per-cluster material. Build with MeshInfo::cluster_prim_map_.
     void uploadMeshClusters(
         const helper::ClusterMesh& cluster_mesh,
         const game_object::DrawableData& drawable_data,
         uint32_t mesh_idx,
-        uint32_t primitive_idx,
+        const std::vector<uint32_t>& cluster_prim_map,
         const glm::mat4& model_transform);
 
     // Create merged GPU SSBOs + descriptor set from all staged data.

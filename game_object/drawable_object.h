@@ -65,6 +65,8 @@ public:
     std::vector<renderer::VertexInputBindingDescription> binding_descs_;
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs_;
 
+    // (Per-primitive cluster_mesh_ removed — see MeshInfo::cluster_prim_map_)
+
     void generateHash();
     size_t getHash() const { return hash_; }
     size_t getDepthonlyHash() const { return depthonly_hash_; }
@@ -129,6 +131,13 @@ struct MeshInfo {
     // normal primitive loop while --cluster-debug is active. Empty and
     // zero-cost when the flag is off.
     ClusterDebugMeshBuffers     cluster_debug_gpu_;
+
+    // Per-cluster primitive index: cluster_prim_map_[i] = primitive index
+    // whose material cluster i belongs to. Built alongside cluster_mesh_ by
+    // checking which primitive's face range each cluster's first face falls in.
+    // Passed to uploadMeshClusters() so it can assign per-cluster materials
+    // while keeping ONE cluster mesh per FBX mesh (no per-primitive BVH overhead).
+    std::vector<uint32_t>       cluster_prim_map_;
 
     // ClusterRenderer per-mesh index. Set during cluster upload in
     // application.cpp. -1 means this mesh has no cluster data.

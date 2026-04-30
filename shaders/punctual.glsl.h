@@ -1,3 +1,8 @@
+#ifndef PUNCTUAL_GLSL_H
+#define PUNCTUAL_GLSL_H
+
+#include "functions.glsl.h"
+#include "brdf.glsl.h"
 
 // https://github.com/KhronosGroup/glTF/blob/master/extensions/2.0/Khronos/KHR_lights_punctual/README.md#range-property
 float getRangeAttenuation(float range, float distance)
@@ -58,3 +63,5 @@ vec3 getPunctualRadianceSheen(vec3 sheenColor, float sheenIntensity, float sheen
 {
     return NdotL * BRDF_specularSheen(sheenColor, sheenIntensity, sheenRoughness, NdotL, NdotV, NdotH);
 }
+
+#endif // PUNCTUAL_GLSL_H

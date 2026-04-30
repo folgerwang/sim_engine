@@ -1,3 +1,9 @@
+#ifndef IBL_GLSL_H
+#define IBL_GLSL_H
+
+#include "functions.glsl.h"
+#include "punctual.glsl.h"
+
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = GGX_LUT_INDEX) uniform sampler2D ggx_lut;
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = GGX_ENV_TEX_INDEX) uniform samplerCube ggx_env_sampler;
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = LAMBERTIAN_ENV_TEX_INDEX) uniform samplerCube lambertian_env_sampler;
@@ -89,3 +95,5 @@ vec3 getIBLRadianceSubsurface(vec3 n, vec3 v, float scale, float distortion, flo
 
     return diffuseLight * getPunctualRadianceSubsurface(n, v, -v, scale, distortion, power, color, thickness);
 }
+
+#endif // IBL_GLSL_H

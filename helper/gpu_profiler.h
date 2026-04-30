@@ -115,6 +115,15 @@ public:
     void setPaused(bool p) { m_paused_ = p; }
     bool isPaused() const { return m_paused_; }
 
+    // Returns a pointer to the most recently collected FrameRecord, or nullptr
+    // if no frame has been collected yet.  The pointer is valid until the next
+    // call to collectResults() (ring-buffer slot may be reused after 128 frames).
+    const FrameRecord* getLatestFrame() const {
+        if (m_frame_count_ <= 0) return nullptr;
+        int idx = (m_frame_write_idx_ - 1 + kHistorySize) % kHistorySize;
+        return &m_frames_[idx];
+    }
+
 private:
     // ----- Recording state (per frame-in-flight slot) ----------------------
 

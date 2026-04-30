@@ -1156,13 +1156,58 @@ static void setupMesh(
     // The HLOD loop below will APPEND higher-LOD faces onto the same arrays;
     // we want clusters for the base LOD only, so build them here first.
     helper::buildClusterMesh(full_lod_meshes, drawable_mesh.cluster_mesh_);
-    // Always upload debug GPU buffers so the "Cluster Debug Draw" toggle
-    // works at runtime (previously gated on clusterRenderingEnabled() which
-    // was false at load time, so debug buffers were never created).
-    ego::ClusterDebugDraw::uploadForMesh(
-        device,
-        drawable_mesh.cluster_mesh_,
-        drawable_mesh.cluster_debug_gpu_);
+    // Only build the expanded per-triangle debug vertex buffer when the
+    // cluster-debug visualisation is actually active.  Building it for every
+    // FBX mesh unconditionally wastes hundreds of MB of GPU memory on large
+    // scenes (Bistro: ~500 meshes × many triangles × 48 bytes/vertex).
+    // The cluster indirect renderer (GPU culling path) does NOT need this
+    // buffer — it uses cluster_global_mesh_idx_ >= 0 to identify its meshes.
+    if (engine::helper::clusterRenderingEnabled()) {
+        ego::ClusterDebugDraw::uploadForMesh(
+            device,
+            drawable_mesh.cluster_mesh_,
+            drawable_mesh.cluster_debug_gpu_);
+    }
+
+    // ── Build cluster_prim_map_ ─────────────────────────────────────────────
+    // Each cluster in the mesh-level cluster_mesh_ is assigned to the primitive
+    // whose contiguous face range contains the cluster's first face index.
+    // This keeps ONE cluster mesh per FBX mesh (efficient packing / low cluster
+    // count) while still giving uploadMeshClusters the per-cluster material info
+    // it needs — avoiding the 3-10× cluster explosion of per-primitive building.
+    {
+        // prim_face_start[i] = first global face index owned by primitive i.
+        // prim_face_start[num_parts] = total face count (sentinel).
+        std::vector<uint32_t> prim_face_start;
+        prim_face_start.reserve(
+            static_cast<size_t>(src_mesh->material_parts.count) + 1);
+        uint32_t face_offset = 0;
+        for (int i_part = 0; i_part < src_mesh->material_parts.count; i_part++) {
+            prim_face_start.push_back(face_offset);
+            face_offset += static_cast<uint32_t>(
+                src_mesh->material_parts[i_part].num_faces);
+        }
+        prim_face_start.push_back(face_offset);  // sentinel
+
+        drawable_mesh.cluster_prim_map_.clear();
+        drawable_mesh.cluster_prim_map_.reserve(
+            drawable_mesh.cluster_mesh_.clusters.size());
+        for (const auto& cl : drawable_mesh.cluster_mesh_.clusters) {
+            uint32_t prim_idx = 0;
+            if (!cl.face_indices.empty()) {
+                const uint32_t first_face = cl.face_indices[0];
+                // Linear scan — number of material parts per mesh is small.
+                for (uint32_t p = 0; p + 1 < prim_face_start.size(); ++p) {
+                    if (first_face >= prim_face_start[p] &&
+                        first_face <  prim_face_start[p + 1]) {
+                        prim_idx = p;
+                        break;
+                    }
+                }
+            }
+            drawable_mesh.cluster_prim_map_.push_back(prim_idx);
+        }
+    }
 
     // create HLOD
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
@@ -2077,9 +2122,12 @@ static void drawMesh(
     // When the cluster indirect draw is active this mesh is handled by the
     // cluster renderer pass — skip it entirely in the forward pass (avoids
     // double-rendering with z-fighting between the two draws).
+    // Use cluster_global_mesh_idx_ >= 0 (set during cluster upload) as the
+    // "this mesh is owned by the cluster renderer" flag — independent of
+    // whether debug GPU buffers happen to exist.
     if (!depth_only &&
         engine::helper::clusterIndirectActive() &&
-        mesh_info.cluster_debug_gpu_.ready()) {
+        mesh_info.cluster_global_mesh_idx_ >= 0) {
         return;
     }
 

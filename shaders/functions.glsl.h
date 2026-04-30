@@ -1,3 +1,6 @@
+#ifndef FUNCTIONS_GLSL_H
+#define FUNCTIONS_GLSL_H
+
 const float M_PI = 3.141592653589793;
 
 const float GAMMA = 2.2;
@@ -77,3 +80,5 @@ vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
     direction.z = sin(radians(-yaw)) * cos(radians(pitch));
     return normalize(direction);
 }
+
+#endif // FUNCTIONS_GLSL_H

@@ -203,7 +203,7 @@ void ClusterRenderer::uploadMeshClusters(
     const helper::ClusterMesh& cluster_mesh,
     const game_object::DrawableData& drawable_data,
     uint32_t mesh_idx,
-    uint32_t primitive_idx,
+    const std::vector<uint32_t>& cluster_prim_map,
     const glm::mat4& model_transform) {
 
     if (cluster_mesh.empty() || !cluster_mesh.source) {
@@ -251,19 +251,26 @@ void ClusterRenderer::uploadMeshClusters(
         }
     }
 
-    // ── Material lookup ───────────────────────────────────────────────
-    // All clusters from this upload share the same primitive material.
-    // Map it into staging_material_params_ (dedup by inserting unconditionally;
-    // a small array is fine for the typical handful of materials per scene).
-    uint32_t material_staging_idx = 0;
-    {
-        glm::vec4 base_color(1.0f);  // white default
+    // ── Per-cluster material lookup ────────────────────────────────────────
+    // One material entry is created per unique primitive index encountered in
+    // cluster_prim_map. prim_to_mat_idx caches prim_idx → staging index so
+    // clusters that share a primitive reuse the same entry (no duplication).
+    std::unordered_map<uint32_t, uint32_t> prim_to_mat_idx;
+    const auto& meshes = drawable_data.meshes_;
 
-        const auto& meshes = drawable_data.meshes_;
+    auto getMaterialIdx = [&](uint32_t prim_idx) -> uint32_t {
+        auto cache_it = prim_to_mat_idx.find(prim_idx);
+        if (cache_it != prim_to_mat_idx.end()) return cache_it->second;
+
+        glm::vec4 base_color(1.0f);  // white default
+        glsl::BindlessMaterialParams mp{};
+        mp.base_color_tex_idx = -1;
+        mp.normal_tex_idx     = -1;
+
         if (mesh_idx < meshes.size()) {
             const auto& prims = meshes[mesh_idx].primitives_;
-            if (primitive_idx < prims.size()) {
-                int32_t mat_idx = prims[primitive_idx].material_idx_;
+            if (prim_idx < prims.size()) {
+                int32_t mat_idx = prims[prim_idx].material_idx_;
                 if (mat_idx >= 0 &&
                     static_cast<size_t>(mat_idx) < drawable_data.materials_.size()) {
                     const auto& mat = drawable_data.materials_[mat_idx];
@@ -277,60 +284,60 @@ void ClusterRenderer::uploadMeshClusters(
                             device_->unmapMemory(mat.uniform_buffer_.memory);
                         }
                     }
-                }
-            }
-        }
-
-        material_staging_idx =
-            static_cast<uint32_t>(staging_material_params_.size());
-        glsl::BindlessMaterialParams mp{};
-        mp.base_color_factor = base_color;
-        mp.base_color_tex_idx = -1;  // no texture by default
-
-        // Try to stage the base-color texture (reuse `meshes` already in scope).
-        if (mesh_idx < meshes.size()) {
-            const auto& prims2 = meshes[mesh_idx].primitives_;
-            if (primitive_idx < prims2.size()) {
-                int32_t mat_idx2 = prims2[primitive_idx].material_idx_;
-                if (mat_idx2 >= 0 &&
-                    static_cast<size_t>(mat_idx2) < drawable_data.materials_.size()) {
-                    const auto& mat2 = drawable_data.materials_[mat_idx2];
-                    int32_t tex_idx = mat2.base_color_idx_;
+                    // Stage the base-color texture (binding 2).
+                    int32_t tex_idx = mat.base_color_idx_;
                     if (tex_idx >= 0 &&
                         static_cast<size_t>(tex_idx) < drawable_data.textures_.size()) {
                         const auto& tex = drawable_data.textures_[tex_idx];
                         if (tex.view) {
-                            auto it = staging_tex_slot_map_.find(tex.view.get());
-                            if (it != staging_tex_slot_map_.end()) {
-                                // Reuse existing slot — no duplication.
-                                mp.base_color_tex_idx = it->second;
+                            auto tex_it = staging_tex_slot_map_.find(tex.view.get());
+                            if (tex_it != staging_tex_slot_map_.end()) {
+                                mp.base_color_tex_idx = tex_it->second;
                             } else if (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
                                 int slot = static_cast<int>(staging_tex_views_.size());
                                 staging_tex_slot_map_[tex.view.get()] = slot;
                                 staging_tex_views_.push_back(tex.view);
                                 mp.base_color_tex_idx = slot;
                             }
-                            // else: over MAX_CLUSTER_TEXTURES — tex_idx stays -1
+                            // else: over MAX_CLUSTER_TEXTURES — idx stays -1
                         }
                     }
-
+                    // Stage the normal-map texture (binding 3).
+                    int32_t norm_idx = mat.normal_idx_;
+                    if (norm_idx >= 0 &&
+                        static_cast<size_t>(norm_idx) < drawable_data.textures_.size()) {
+                        const auto& ntex = drawable_data.textures_[norm_idx];
+                        if (ntex.view) {
+                            auto n_it = staging_normal_slot_map_.find(ntex.view.get());
+                            if (n_it != staging_normal_slot_map_.end()) {
+                                mp.normal_tex_idx = n_it->second;
+                            } else if (staging_normal_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
+                                int slot = static_cast<int>(staging_normal_tex_views_.size());
+                                staging_normal_slot_map_[ntex.view.get()] = slot;
+                                staging_normal_tex_views_.push_back(ntex.view);
+                                mp.normal_tex_idx = slot;
+                            }
+                        }
+                    }
                     // Alpha mask — discard fragments below cutoff.
-                    if (mat2.alpha_mask_ && mat2.alpha_cutoff_ > 0.0f) {
-                        mp.alpha_cutoff = mat2.alpha_cutoff_;
+                    if (mat.alpha_mask_ && mat.alpha_cutoff_ > 0.0f) {
+                        mp.alpha_cutoff = mat.alpha_cutoff_;
                         mp.flags |= BINDLESS_MAT_ALPHA_MASK;
                     }
                 }
-
                 // Double-sided — primitive property, not material-level.
-                if (prims2[primitive_idx].tag_.double_sided) {
+                if (prims[prim_idx].tag_.double_sided) {
                     mp.flags |= BINDLESS_MAT_DOUBLE_SIDED;
                 }
             }
         }
 
+        mp.base_color_factor = base_color;
+        uint32_t idx = static_cast<uint32_t>(staging_material_params_.size());
         staging_material_params_.push_back(mp);
-
-    }
+        prim_to_mat_idx[prim_idx] = idx;
+        return idx;
+    };
 
     for (uint32_t c = 0; c < num_clusters; ++c) {
         const auto& cl = cluster_mesh.clusters[c];
@@ -452,7 +459,11 @@ void ClusterRenderer::uploadMeshClusters(
         draw_info.index_count   = static_cast<uint32_t>(
             staging_indices_.size()) - merged_index_base;  // actual emitted count
         draw_info.vertex_offset = 0;  // absolute indices, no base vertex needed
-        draw_info.material_idx  = material_staging_idx;
+        {
+            uint32_t prim_idx = (c < cluster_prim_map.size())
+                ? cluster_prim_map[c] : 0u;
+            draw_info.material_idx = getMaterialIdx(prim_idx);
+        }
         staging_draw_infos_.push_back(draw_info);
     }
 
@@ -722,9 +733,14 @@ void ClusterRenderer::finalizeUploads() {
         std::max(size_t(1), staging_material_params_.size()));
     // Texture staging is kept alive until initBindlessPipeline writes descriptors.
     total_textures_ = static_cast<uint32_t>(staging_tex_views_.size());
-    // Pad unused texture slots with the dummy white texture.
+    // Pad unused base-colour texture slots with the dummy white texture.
     while (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
         staging_tex_views_.push_back(dummy_texture_.view);
+    }
+    // Same for normal-map slots.
+    total_normal_textures_ = static_cast<uint32_t>(staging_normal_tex_views_.size());
+    while (staging_normal_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
+        staging_normal_tex_views_.push_back(dummy_texture_.view);
     }
 
     // Free CPU staging memory.
@@ -735,6 +751,7 @@ void ClusterRenderer::finalizeUploads() {
     staging_material_params_.clear();
     staging_material_params_.shrink_to_fit();
     staging_tex_slot_map_.clear();
+    staging_normal_slot_map_.clear();
     staging_vertices_.clear();
     staging_vertices_.shrink_to_fit();
     staging_indices_.clear();
@@ -995,8 +1012,9 @@ void ClusterRenderer::initBindlessPipeline(
     // binding 0: ClusterDrawInfo[]        SSBO (index/count per cluster)
     // binding 1: BindlessMaterialParams[] SSBO (base colour + tex idx per material)
     // binding 2: sampler2D[MAX_CLUSTER_TEXTURES]  (base colour texture array)
+    // binding 3: sampler2D[MAX_CLUSTER_TEXTURES]  (normal map texture array)
     {
-        std::vector<er::DescriptorSetLayoutBinding> bindings(3);
+        std::vector<er::DescriptorSetLayoutBinding> bindings(4);
         bindings[0] = er::helper::getBufferDescriptionSetLayoutBinding(
             0, SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
                SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
@@ -1004,12 +1022,18 @@ void ClusterRenderer::initBindlessPipeline(
         bindings[1] = er::helper::getBufferDescriptionSetLayoutBinding(
             1, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
             er::DescriptorType::STORAGE_BUFFER);
-        // Texture array: fixed count = MAX_CLUSTER_TEXTURES.
+        // Base-colour texture array.
         auto tex_binding = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
             2, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
             er::DescriptorType::COMBINED_IMAGE_SAMPLER);
         tex_binding.descriptor_count = MAX_CLUSTER_TEXTURES;
         bindings[2] = tex_binding;
+        // Normal-map texture array.
+        auto norm_binding = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            3, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER);
+        norm_binding.descriptor_count = MAX_CLUSTER_TEXTURES;
+        bindings[3] = norm_binding;
         bindless_desc_set_layout_ = device_->createDescriptorSetLayout(bindings);
     }
 
@@ -1115,7 +1139,7 @@ void ClusterRenderer::initBindlessPipeline(
     // ── Write descriptors ──
     {
         er::WriteDescriptorList writes;
-        writes.reserve(2 + MAX_CLUSTER_TEXTURES);
+        writes.reserve(2 + MAX_CLUSTER_TEXTURES * 2);
 
         // binding 0: ClusterDrawInfo SSBO
         er::Helper::addOneBuffer(writes, bindless_desc_set_,
@@ -1148,12 +1172,30 @@ void ClusterRenderer::initBindlessPipeline(
             writes.push_back(tex_write);
         }
 
+        // binding 3: normal_textures[MAX_CLUSTER_TEXTURES]
+        for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
+            auto nw = std::make_shared<er::TextureDescriptor>();
+            nw->binding           = 3;
+            nw->dst_array_element = ti;
+            nw->desc_type         = er::DescriptorType::COMBINED_IMAGE_SAMPLER;
+            nw->desc_set          = bindless_desc_set_;
+            nw->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            nw->sampler           = default_sampler_;
+            nw->texture           =
+                (ti < staging_normal_tex_views_.size() && staging_normal_tex_views_[ti])
+                    ? staging_normal_tex_views_[ti]
+                    : dummy_texture_.view;
+            writes.push_back(nw);
+        }
+
         device_->updateDescriptorSets(writes);
     }
 
     // Texture staging views are no longer needed after descriptor write.
     staging_tex_views_.clear();
     staging_tex_views_.shrink_to_fit();
+    staging_normal_tex_views_.clear();
+    staging_normal_tex_views_.shrink_to_fit();
 
     std::printf("[CLUSTER_RENDERER] Bindless graphics pipeline created. "
                 "Bindless set at index %u.\n", bindless_set_index);
@@ -1171,29 +1213,13 @@ uint32_t ClusterRenderer::draw(
         return 0;
     }
 
-    // ── Read back previous frame's visible cluster count ──
-    // draw_count_buffer_ is HOST_VISIBLE|HOST_COHERENT so no stall needed.
-    uint32_t prev_visible = 0;
-    if (draw_count_buffer_.memory) {
-        const void* ptr = device_->mapMemory(
-            draw_count_buffer_.memory, sizeof(uint32_t), 0);
-        if (ptr) {
-            std::memcpy(&prev_visible, ptr, sizeof(uint32_t));
-            device_->unmapMemory(draw_count_buffer_.memory);
-        }
-    }
-    prev_visible = std::min(prev_visible, total_clusters_all_meshes_);
-    total_visible_all_meshes_ = prev_visible;
-
-    // Update visible triangle count from per-cluster tri counts.
-    visible_triangles_ = 0;
-    // (Approximate from visible cluster count — exact requires per-cluster readback)
-    if (total_clusters_all_meshes_ > 0 && total_triangles_all_meshes_ > 0) {
-        visible_triangles_ = static_cast<uint64_t>(
-            static_cast<double>(total_triangles_all_meshes_) *
-            (static_cast<double>(prev_visible) /
-             static_cast<double>(total_clusters_all_meshes_)));
-    }
+    // NOTE: total_visible_all_meshes_ and visible_triangles_ are already set
+    // by cull() at the start of each frame (reading draw_count_buffer_ before
+    // it is zeroed for the current dispatch). Do NOT re-read the buffer here —
+    // by the time draw() is called, cull() has already zeroed the counter in
+    // preparation for the current frame's dispatch, so any CPU map of
+    // draw_count_buffer_ at this point would return 0, not the actual count.
+    const uint32_t prev_visible = total_visible_all_meshes_;
 
     // ── Build full descriptor set list ──
     // Caller provides: set 0 (PBR global), set 1 (view camera),
@@ -1274,6 +1300,17 @@ void ClusterRenderer::recreate(
         tex_write->sampler           = default_sampler_;
         tex_write->texture           = dummy_texture_.view;
         writes.push_back(tex_write);
+    }
+    for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
+        auto nw = std::make_shared<er::TextureDescriptor>();
+        nw->binding           = 3;
+        nw->dst_array_element = ti;
+        nw->desc_type         = er::DescriptorType::COMBINED_IMAGE_SAMPLER;
+        nw->desc_set          = bindless_desc_set_;
+        nw->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        nw->sampler           = default_sampler_;
+        nw->texture           = dummy_texture_.view;
+        writes.push_back(nw);
     }
 
     device_->updateDescriptorSets(writes);

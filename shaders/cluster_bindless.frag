@@ -15,13 +15,13 @@
 //   • Directional sun from RuntimeLightsParams (set RUNTIME_LIGHTS_PARAMS_SET)
 //   • Diffuse: Lambertian ÷π (simplified, no Fresnel energy conservation)
 //   • Single CSM shadow sample (cheapest cascade, no PCF)
-//   • Flat ambient (0.03 × albedo) — no IBL
+//   • Diffuse IBL ambient via lambertian_env_sampler (matches base.frag USE_IBL path)
 //   • linearTosRGB tone mapping — matches base.frag default path
 // ─────────────────────────────────────────────────────────────────────
 
-// set 0 — shadow sampler
-layout(set = PBR_GLOBAL_PARAMS_SET, binding = DIRECT_SHADOW_INDEX)
-    uniform sampler2DArray direct_shadow_sampler;
+// set 0 — IBL + shadow samplers (ibl.glsl.h declares all of set 0, including
+// direct_shadow_sampler at DIRECT_SHADOW_INDEX — do not redeclare it below).
+#include "ibl.glsl.h"
 
 // set 1 — camera
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
@@ -29,7 +29,7 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     ViewCameraInfo camera_info;
 };
 
-// set 2 — cluster SSBOs + texture array
+// set 2 — cluster SSBOs + texture arrays
 layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 0)
     readonly buffer DrawInfoBuffer {
     ClusterDrawInfo draw_infos[];
@@ -40,6 +40,8 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 1)
 };
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 2)
     uniform sampler2D base_color_textures[MAX_CLUSTER_TEXTURES];
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 3)
+    uniform sampler2D normal_textures[MAX_CLUSTER_TEXTURES];
 
 // set 4 — runtime lights
 layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
@@ -101,11 +103,59 @@ void main() {
 
     vec3 albedo = albedo4.rgb;
 
-    // Normal — for double-sided materials flip N on back faces so lighting is
-    // correct from both sides. Backface culling is disabled for the cluster pipeline.
+    // Geometry normal — flip for back faces BEFORE building TBN so the cotangent
+    // frame is oriented correctly for double-sided materials.
+    // Backface culling is disabled for the cluster pipeline.
     vec3 N = normalize(v_normal);
     if ((mat_flags & BINDLESS_MAT_DOUBLE_SIDED) != 0 && !gl_FrontFacing) {
         N = -N;
+    }
+
+    // Screen-space derivatives MUST be computed unconditionally (outside any
+    // non-uniform branch). dFdx/dFdy are quad operations — if some fragments
+    // in the 2×2 quad take a different branch the GPU helper lanes produce
+    // garbage values, causing wrong normals along cluster material boundaries.
+    vec3 dPdx  = dFdx(v_world_pos);
+    vec3 dPdy  = dFdy(v_world_pos);
+    vec2 dUVdx = dFdx(v_uv);
+    vec2 dUVdy = dFdy(v_uv);
+
+    // Normal map — sample and rotate into world space via cotangent TBN frame.
+    int norm_idx = material_params[mat_idx].normal_tex_idx;
+    if (norm_idx >= 0) {
+        // Sample and decode the normal map.
+        // Bistro (and most DCC tools) export DirectX-convention normal maps where
+        // the green channel is inverted relative to OpenGL/GLSL tangent space.
+        // base.frag applies n.y = -n.y for the same reason — we must match it.
+        // Z is reconstructed from XY (more robust than reading the stored Z which
+        // can be degraded by DXT5nm / BC5 compression).
+        vec4 raw_n = texture(normal_textures[nonuniformEXT(norm_idx)], v_uv);
+        vec2 nxy   = raw_n.xy * 2.0 - 1.0;
+        nxy.y      = -nxy.y;   // DX → GL convention flip
+        vec3 ts_n  = vec3(nxy, sqrt(max(1.0 - dot(nxy, nxy), 0.0)));
+
+        // det of the UV Jacobian; sign encodes UV handedness (negative = mirrored UV).
+        float det = dUVdx.x * dUVdy.y - dUVdx.y * dUVdy.x;
+
+        vec3 T;
+        if (abs(det) > 1e-6) {
+            // Solve: T = (dV/dy * dP/dx - dV/dx * dP/dy) / det
+            //  i.e. the world-space direction of increasing U.
+            T = (dUVdy.y * dPdx - dUVdx.y * dPdy) / det;
+        } else {
+            // Degenerate / missing UVs — arbitrary tangent perpendicular to N.
+            vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+            T = cross(up, N);
+        }
+
+        // Gram-Schmidt: remove the component of T along N so TBN is orthonormal.
+        T = normalize(T - dot(T, N) * N);
+
+        // Derive B via cross product — always orthogonal to both T and N.
+        // sign(det) flips B for UV-mirrored meshes to preserve correct handedness.
+        vec3 B = cross(N, T) * sign(det);
+
+        N = normalize(mat3(T, B, N) * ts_n);
     }
 
     vec3 V = normalize(camera_info.position - v_world_pos);
@@ -124,8 +174,11 @@ void main() {
         shad = shadowFactor(v_world_pos);
     }
 
-    // Flat ambient (no IBL) — 3% albedo is a standard dark-room approximation.
-    vec3 ambient = albedo * 0.03;
+    // Diffuse IBL ambient — samples the pre-convolved lambertian irradiance
+    // cubemap with the surface normal, matching base.frag's USE_IBL path.
+    // This gives direction-dependent ambient (brighter sky-facing surfaces,
+    // darker ground-facing ones) instead of the old flat 3% approximation.
+    vec3 ambient = getIBLRadianceLambertian(N, albedo);
 
     // Lambertian diffuse (÷π matches PBR BRDF_lambertian normalisation).
     vec3 diffuse = albedo * light_col * (NdotL * shad / M_PI);

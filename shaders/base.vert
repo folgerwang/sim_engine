@@ -58,6 +58,35 @@ layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
 
 layout(location = 0) out ObjectVsPsData out_data;
 
+// ── Skinning helpers ─────────────────────────────────────────────────────────
+// getNormal() / getTangent() are called before skin_matrix is computed in
+// main(), so they cannot reference that local variable.  These functions
+// recompute the weighted joint matrix on demand.
+#ifdef USE_SKINNING
+mat4 getSkinningMatrix()
+{
+    mat4 skin = mat4(0);
+#ifdef HAS_SKIN_SET_0
+    skin += in_weights_0.x * joint_matrices[int(in_joints_0.x)]
+          + in_weights_0.y * joint_matrices[int(in_joints_0.y)]
+          + in_weights_0.z * joint_matrices[int(in_joints_0.z)]
+          + in_weights_0.w * joint_matrices[int(in_joints_0.w)];
+#endif
+#ifdef HAS_SKIN_SET_1
+    skin += in_weights_1.x * joint_matrices[int(in_joints_1.x)]
+          + in_weights_1.y * joint_matrices[int(in_joints_1.y)]
+          + in_weights_1.z * joint_matrices[int(in_joints_1.z)]
+          + in_weights_1.w * joint_matrices[int(in_joints_1.w)];
+#endif
+    return skin;
+}
+
+mat4 getSkinningNormalMatrix()
+{
+    return transpose(inverse(getSkinningMatrix()));
+}
+#endif // USE_SKINNING
+
 #ifdef HAS_NORMALS
 vec3 getNormal()
 {

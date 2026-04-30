@@ -1,3 +1,8 @@
+#ifndef BRDF_GLSL_H
+#define BRDF_GLSL_H
+
+#include "functions.glsl.h"
+
 //
 // Fresnel
 //
@@ -157,3 +162,5 @@ vec3 BRDF_specularSheen(vec3 sheenColor, float sheenIntensity, float sheenRoughn
     float sheenVisibility = V_Ashikhmin(NdotL, NdotV);
     return sheenColor * sheenIntensity * sheenDistribution * sheenVisibility;
 }
+
+#endif // BRDF_GLSL_H
