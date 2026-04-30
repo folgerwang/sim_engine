@@ -26,6 +26,9 @@ extern "C" {
 #include "menu.h"
 #include "plugins/plugin_manager.h"
 #include "game_object/mesh_load_task_manager.h"
+#include "scene_rendering/ssao.h"
+#include "scene_rendering/cluster_renderer.h"
+#include "helper/cluster_mesh.h"
 
 namespace er = engine::renderer;
 
@@ -881,11 +884,19 @@ bool Menu::draw(
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoInputs |
         ImGuiWindowFlags_NoDocking);
-    ImGui::SetWindowPos(ImVec2(vp_pos.x + float(screen_size.x) - 196.0f, vp_pos.y + menu_height));
-    ImGui::SetWindowSize(ImVec2((float)196, (float)36));
+    ImGui::SetWindowPos(ImVec2(vp_pos.x + float(screen_size.x) - 220.0f, vp_pos.y + menu_height));
+    ImGui::SetWindowSize(ImVec2((float)210, (float)47));
     ImGui::BeginChild("fps", ImVec2(0, 0), false);
-    float fps = delta_t > 0.0f ? 1.0f / delta_t : 0.0f;
-    ImGui::Text("fps : %8.5f", fps);
+    // Rolling average over the last 60 frames for a stable reading.
+    static float s_fps_history[60] = {};
+    static int   s_fps_idx = 0;
+    float instant_fps = delta_t > 0.0f ? 1.0f / delta_t : 0.0f;
+    s_fps_history[s_fps_idx] = instant_fps;
+    s_fps_idx = (s_fps_idx + 1) % 60;
+    float fps_sum = 0.0f;
+    for (int i = 0; i < 60; ++i) fps_sum += s_fps_history[i];
+    float fps = fps_sum / 60.0f;
+    ImGui::Text("fps : %8.2f", fps);
     ImGui::EndChild();
     ImGui::End();
 
@@ -1068,10 +1079,35 @@ bool Menu::draw(
 
         if (ImGui::BeginMenu("Shadow"))
         {
+            if (ImGui::MenuItem("Turn off shadow pass", NULL, turn_off_shadow_pass_)) {
+                turn_off_shadow_pass_ = !turn_off_shadow_pass_;
+            }
+
+            ImGui::Separator();
+
             if (ImGui::MenuItem("Debug Cascades", NULL, show_csm_debug_)) {
                 show_csm_debug_ = !show_csm_debug_;
             }
+
+            ImGui::Separator();
+
+            if (ssao_) {
+                if (ImGui::MenuItem("SSAO Enabled", NULL, ssao_->enabled)) {
+                    ssao_->enabled = !ssao_->enabled;
+                }
+                ImGui::SliderFloat("AO Radius",    &ssao_->radius,      0.01f, 5.0f,  "%.3f");
+                ImGui::SliderFloat("AO Bias",      &ssao_->bias,        0.001f, 0.1f, "%.4f");
+                ImGui::SliderFloat("AO Power",     &ssao_->power,       0.5f,  4.0f,  "%.2f");
+                ImGui::SliderFloat("AO Intensity", &ssao_->intensity,   0.1f,  3.0f,  "%.2f");
+                ImGui::SliderFloat("AO Strength",  &ssao_->strength,    0.0f,  1.0f,  "%.2f");
+                ImGui::SliderInt("AO Samples",     &ssao_->kernel_size, 4,     64);
+            }
+
             ImGui::EndMenu();
+        }
+
+        if (cluster_renderer_ && ImGui::MenuItem("Smart Mesh")) {
+            show_smart_mesh_window_ = !show_smart_mesh_window_;
         }
 
         if (ImGui::BeginMenu("Tools"))
@@ -1102,6 +1138,166 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
+    }
+
+    // ── Smart Mesh floating window (visible while moving around) ────
+    if (cluster_renderer_ && show_smart_mesh_window_) {
+        ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Smart Mesh", &show_smart_mesh_window_,
+                         ImGuiWindowFlags_NoFocusOnAppearing |
+                         ImGuiWindowFlags_AlwaysAutoResize)) {
+            // Master toggle: cluster rendering vs direct mesh rendering.
+            bool cluster_on = cluster_renderer_->isEnabled();
+            if (ImGui::Checkbox("Enable Cluster Rendering", &cluster_on)) {
+                cluster_renderer_->getEnabled() = cluster_on;
+                if (!cluster_on) cluster_renderer_->resetStats();
+            }
+
+            // Culling method radio (only when cluster rendering is on).
+            if (cluster_on) {
+                bool gpu_mode = !cluster_renderer_->getCpuCullMode();
+                if (ImGui::RadioButton("GPU Culling", gpu_mode)) {
+                    cluster_renderer_->getCpuCullMode() = false;
+                }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("CPU Culling", !gpu_mode)) {
+                    cluster_renderer_->getCpuCullMode() = true;
+                }
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Uploaded Meshes: %u", cluster_renderer_->getMeshCount());
+
+            // Helper lambda: format large numbers with K/M suffix.
+            auto fmtCount = [](uint64_t n, char* buf, size_t sz) {
+                if (n >= 1000000)
+                    snprintf(buf, sz, "%.2fM", n / 1000000.0);
+                else if (n >= 1000)
+                    snprintf(buf, sz, "%.1fK", n / 1000.0);
+                else
+                    snprintf(buf, sz, "%llu", static_cast<unsigned long long>(n));
+            };
+
+            {
+                char totalBuf[32], visBuf[32];
+                uint64_t totalTri = cluster_renderer_->getTotalTriangles();
+                uint64_t visTri   = cluster_renderer_->getVisibleTriangles();
+                fmtCount(totalTri, totalBuf, sizeof(totalBuf));
+                fmtCount(visTri,   visBuf,   sizeof(visBuf));
+
+                ImGui::Text("Total Clusters:  %u (%s tris)",
+                            cluster_renderer_->getTotalClusters(), totalBuf);
+                ImGui::Text("Visible:         %u (%s tris)",
+                            cluster_renderer_->getTotalVisible(), visBuf);
+            }
+            ImGui::Text("Culled:          %.1f%%", cluster_renderer_->getCullPercentage());
+            // Show per-mesh visibility stats.
+            {
+                uint32_t total_m = cluster_renderer_->getRegisteredMeshCount();
+                uint32_t vis_m = 0;
+                for (uint32_t i = 0; i < total_m; ++i)
+                    if (cluster_renderer_->isMeshVisible(i)) ++vis_m;
+                ImGui::Text("Meshes Visible:  %u / %u", vis_m, total_m);
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Debug");
+            bool cluster_debug = engine::helper::clusterRenderingEnabled();
+            if (ImGui::Checkbox("Cluster Debug Draw", &cluster_debug)) {
+                engine::helper::clusterRenderingEnabled() = cluster_debug;
+            }
+            bool bbox_draw = cluster_renderer_->getDebugDrawBBox();
+            if (ImGui::Checkbox("Cluster Bound Box Draw", &bbox_draw)) {
+                cluster_renderer_->getDebugDrawBBox() = bbox_draw;
+            }
+            ImGui::Separator();
+            const auto& vp = cluster_renderer_->getDebugVP();
+            const auto& cp = cluster_renderer_->getDebugCamPos();
+            ImGui::Text("VP diag: %.2f, %.2f, %.2f, %.2f",
+                        vp[0][0], vp[1][1], vp[2][2], vp[3][3]);
+            ImGui::Text("Cam: %.1f, %.1f, %.1f", cp.x, cp.y, cp.z);
+        }
+        ImGui::End();
+    }
+
+    // ── Cluster bounding box wireframe overlay ──────────────────────
+    // When enabled, projects cluster AABB corners to screen space and
+    // draws wireframe boxes via ImGui's background draw list so they
+    // appear on top of the 3D scene but behind other UI.
+    if (cluster_renderer_ && cluster_renderer_->getDebugDrawBBox()) {
+        const auto& samples = cluster_renderer_->getDebugSampleClusters();
+        const auto& vp_mat  = cluster_renderer_->getDebugVP();
+
+        ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
+        ImVec2 display_size = ImGui::GetIO().DisplaySize;
+        float half_w = display_size.x * 0.5f;
+        float half_h = display_size.y * 0.5f;
+
+        // Project a world-space point to screen pixel coords.
+        // Returns false if behind camera (clip.w <= 0).
+        auto projectToScreen = [&](const glm::vec3& world_pos,
+                                   ImVec2& out_screen) -> bool {
+            glm::vec4 clip = vp_mat * glm::vec4(world_pos, 1.0f);
+            if (clip.w <= 0.001f) return false;
+            float inv_w = 1.0f / clip.w;
+            float ndc_x = clip.x * inv_w;
+            float ndc_y = clip.y * inv_w;
+            out_screen.x = (ndc_x * 0.5f + 0.5f) * display_size.x;
+            out_screen.y = (ndc_y * 0.5f + 0.5f) * display_size.y;
+            return true;
+        };
+
+        // 12 edges of a box: pairs of corner indices (0..7)
+        static const int edges[12][2] = {
+            {0,1},{1,3},{3,2},{2,0},  // bottom face
+            {4,5},{5,7},{7,6},{6,4},  // top face
+            {0,4},{1,5},{2,6},{3,7}   // vertical edges
+        };
+
+        const ImU32 bbox_color = IM_COL32(0, 255, 0, 160);  // green wireframe
+
+        for (const auto& ci : samples) {
+            glm::vec3 mn(ci.aabb_min_pad.x, ci.aabb_min_pad.y, ci.aabb_min_pad.z);
+            glm::vec3 mx(ci.aabb_max_pad.x, ci.aabb_max_pad.y, ci.aabb_max_pad.z);
+
+            // Skip degenerate / zero AABBs
+            if (mn == mx) continue;
+
+            // 8 corners of the AABB
+            glm::vec3 corners[8] = {
+                {mn.x, mn.y, mn.z},  // 0
+                {mx.x, mn.y, mn.z},  // 1
+                {mn.x, mx.y, mn.z},  // 2
+                {mx.x, mx.y, mn.z},  // 3
+                {mn.x, mn.y, mx.z},  // 4
+                {mx.x, mn.y, mx.z},  // 5
+                {mn.x, mx.y, mx.z},  // 6
+                {mx.x, mx.y, mx.z},  // 7
+            };
+
+            // Project all 8 corners
+            ImVec2 screen_pts[8];
+            bool visible[8];
+            int visible_count = 0;
+            for (int i = 0; i < 8; ++i) {
+                visible[i] = projectToScreen(corners[i], screen_pts[i]);
+                if (visible[i]) ++visible_count;
+            }
+
+            // Only draw if at least 2 corners are on screen
+            if (visible_count < 2) continue;
+
+            // Draw 12 edges
+            for (int e = 0; e < 12; ++e) {
+                int a = edges[e][0];
+                int b = edges[e][1];
+                if (visible[a] && visible[b]) {
+                    draw_list->AddLine(screen_pts[a], screen_pts[b],
+                                       bbox_color, 1.0f);
+                }
+            }
+        }
     }
 
     bool in_focus =

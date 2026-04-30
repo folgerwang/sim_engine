@@ -162,6 +162,7 @@
 #define FEATURE_HAS_METALLIC_CHANNEL            0x00200000
 
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
+#define FEATURE_INPUT_SHADOW_DISABLED           0x00000002
 
 #define LIGHT_COUNT                             1
 #define CSM_CASCADE_COUNT                       4
@@ -430,6 +431,59 @@ struct BaseShapeDrawParams {
 // vertex-attribute `cluster_id` that the vertex shader passes through.
 struct ClusterDebugParams {
     mat4            transform;
+};
+
+// ─── Nanite-like GPU cluster culling structures ──────────────────────────
+// Shared between cluster_cull.comp and the C++ ClusterRenderer class.
+// All data is packed for std430 SSBO access.
+
+// Per-cluster culling data — one entry per cluster in the mesh.
+struct ClusterCullInfo {
+    vec4    bounds_sphere;       // xyz = center, w = radius
+    vec4    cone_axis_cutoff;    // xyz = cone axis (unit), w = cutoff (cos angle)
+    vec4    aabb_min_pad;        // xyz = AABB min, w = pad
+    vec4    aabb_max_pad;        // xyz = AABB max, w = pad
+};
+
+// Per-cluster draw data — index buffer offset + count for indirect draw.
+struct ClusterDrawInfo {
+    uint    index_offset;        // byte offset into the global index buffer
+    uint    index_count;         // number of indices (triangles * 3)
+    uint    vertex_offset;       // base vertex (added to each index)
+    uint    material_idx;        // material index for the cluster
+};
+
+// Maximum textures that can be bound in the cluster bindless pass.
+// Must match the sampler2D array size in cluster_bindless.frag.
+#define MAX_CLUSTER_TEXTURES 128
+
+// Per-material colour data for the bindless cluster renderer.
+struct BindlessMaterialParams {
+    vec4  base_color_factor;    // RGBA base colour (linear)
+    int   base_color_tex_idx;   // index into base_color_textures[]; -1 = no texture
+    int   pad0, pad1, pad2;
+};
+
+// Flattened BVH node for GPU traversal (iterative stack-based).
+struct ClusterBVHNodeGPU {
+    vec4    aabb_min_pad;        // xyz = min, w = left_child_idx (-1 if leaf)
+    vec4    aabb_max_pad;        // xyz = max, w = right_child_idx (-1 if leaf)
+    // For leaf: cluster_start/cluster_count encode the range into a
+    // separate cluster_indices[] array. For inner: both are 0.
+    uint    cluster_start;       // first index into cluster_indices[]
+    uint    cluster_count;       // number of cluster indices in this leaf
+    uint    pad0;
+    uint    pad1;
+};
+
+// Push constants for the cluster culling compute shader.
+struct ClusterCullPushConstants {
+    mat4    view_proj;
+    vec4    camera_pos_pad;      // xyz = camera world pos, w = pad
+    uint    total_clusters;
+    uint    total_bvh_nodes;
+    float   lod_error_threshold; // screen-space error threshold for LOD
+    uint    use_bvh;             // 0 = flat per-cluster, 1 = BVH traversal
 };
 
 struct VolumeMoistrueParams {
@@ -774,7 +828,7 @@ struct ViewCameraInfo {
     float           pitch;
     vec2            mouse_pos;
     float           camera_follow_dist;
-    float           pad;
+    uint            input_features;   // FEATURE_INPUT_* flags set per-frame by CPU
 };
 
 struct RuntimeLightsParams {

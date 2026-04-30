@@ -425,6 +425,14 @@ void ViewCamera::updateViewCameraInfo(
         &m_camera_info_);
 }
 
+void ViewCamera::setInputFeatureFlags(uint32_t flags) {
+    m_camera_info_.input_features = flags;
+    m_device_->updateBufferMemory(
+        m_view_camera_buffer_->memory,
+        sizeof(m_camera_info_),
+        &m_camera_info_);
+}
+
 void ViewCamera::readGpuCameraInfo(
     const std::shared_ptr<renderer::Device>& device) {
 

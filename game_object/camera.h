@@ -79,6 +79,10 @@ public:
     void readGpuCameraInfo(
         const std::shared_ptr<renderer::Device>& device);
 
+    // Patch the input_features bitfield in the GPU camera buffer without
+    // triggering a full camera recompute.  Call after updateViewCameraInfo.
+    void setInputFeatureFlags(uint32_t flags);
+
     const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;
     }

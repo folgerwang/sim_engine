@@ -317,6 +317,7 @@ struct PushConstantRange {
 
 struct WriteDescriptor {
     uint32_t binding = (uint32_t)-1;
+    uint32_t dst_array_element = 0;   // index into the binding's descriptor array
     DescriptorType desc_type = DescriptorType::MAX_ENUM;
     std::shared_ptr<DescriptorSet> desc_set = nullptr;
 };

@@ -95,7 +95,12 @@ void main() {
             v,
             baseColor.xyz);
 
-    float shadow = calculateShadowFactor(ps_in_data.vertex_position);
+    // Skip shadow sampling when the pass is disabled (avoids stale/zero CSM
+    // texture reads that would incorrectly shadow the whole scene).
+    float shadow = 1.0;
+    if ((camera_info.input_features & FEATURE_INPUT_SHADOW_DISABLED) == 0u) {
+        shadow = calculateShadowFactor(ps_in_data.vertex_position);
+    }
 
     bool light_from_back = false;
 #ifdef USE_PUNCTUAL    

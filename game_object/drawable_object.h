@@ -125,6 +125,10 @@ struct MeshInfo {
     // normal primitive loop while --cluster-debug is active. Empty and
     // zero-cost when the flag is off.
     ClusterDebugMeshBuffers     cluster_debug_gpu_;
+
+    // ClusterRenderer per-mesh index. Set during cluster upload in
+    // application.cpp. -1 means this mesh has no cluster data.
+    int32_t cluster_global_mesh_idx_ = -1;
 };
 
 struct NodeInfo {
@@ -290,6 +294,12 @@ public:
         return object_ && object_->ready_.load(std::memory_order_acquire);
     }
 
+    // Access mesh info for cluster upload. Only valid when isReady().
+    const std::vector<MeshInfo>& getMeshes() const { return object_->meshes_; }
+    std::vector<MeshInfo>& getMutableMeshes() { return object_->meshes_; }
+    const DrawableData& getDrawableData() const { return *object_; }
+    const glm::mat4& getLocation() const { return location_; }
+
     void updateInstanceBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 
@@ -334,6 +344,13 @@ public:
         const renderer::TextureInfo& soil_water_layer_1,
         const renderer::TextureInfo& water_flow,
         const std::shared_ptr<renderer::ImageView>& airflow_tex);
+
+    // Per-frame frustum cull state. Set once per frame before draw(),
+    // used inside drawMesh() to skip meshes whose world-space bounding
+    // sphere is entirely outside the view frustum. The planes are in
+    // world space (Gribb-Hartmann, normalised).
+    static void setFrustumCullPlanes(const glm::vec4 planes[6]);
+    static void clearFrustumCull();
 
     static void initGameObjectBuffer(
         const std::shared_ptr<renderer::Device>& device);

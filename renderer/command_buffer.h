@@ -77,6 +77,15 @@ public:
         uint32_t buffer_offset = 0,
         uint32_t draw_count = 1,
         uint32_t stride = sizeof(DrawIndirectCommand)) = 0;
+    // GPU-driven indirect draw with count read from a buffer (Vulkan 1.2).
+    // maxDrawCount is the upper bound; actual count is min(buffer value, max).
+    virtual void drawIndexedIndirectCount(
+        const renderer::BufferInfo& indirect_draw_cmd_buf,
+        uint64_t indirect_offset,
+        const renderer::BufferInfo& count_buf,
+        uint64_t count_offset,
+        uint32_t max_draw_count,
+        uint32_t stride = sizeof(DrawIndexedIndirectCommand)) = 0;
     typedef void (VKAPI_PTR* PFN_vkCmdDrawMeshTasksEXT)(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
     typedef void (VKAPI_PTR* PFN_vkCmdDrawMeshTasksIndirectEXT)(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride);
     typedef void (VKAPI_PTR* PFN_vkCmdDrawMeshTasksIndirectCountEXT)(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride);
@@ -137,6 +146,13 @@ public:
     virtual void buildAccelerationStructures(
         const std::vector<AccelerationStructureBuildGeometryInfo>& as_build_geo_list,
         const std::vector<AccelerationStructureBuildRangeInfo>& as_build_range_list) = 0;
+
+    // Fill buffer with a fixed 32-bit value (wraps vkCmdFillBuffer).
+    virtual void fillBuffer(
+        const std::shared_ptr<Buffer>& buffer,
+        uint64_t offset,
+        uint64_t size,
+        uint32_t data) = 0;
 
     // GPU timestamp queries.
     virtual void resetQueryPool(

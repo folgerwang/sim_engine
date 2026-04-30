@@ -83,6 +83,13 @@ public:
         uint32_t buffer_offset = 0,
         uint32_t draw_count = 1,
         uint32_t stride = sizeof(DrawIndirectCommand)) final;
+    virtual void drawIndexedIndirectCount(
+        const renderer::BufferInfo& indirect_draw_cmd_buf,
+        uint64_t indirect_offset,
+        const renderer::BufferInfo& count_buf,
+        uint64_t count_offset,
+        uint32_t max_draw_count,
+        uint32_t stride = sizeof(DrawIndexedIndirectCommand)) final;
     virtual void drawMeshTasks(
         uint32_t group_count_x = 1,
         uint32_t group_count_y = 1,
@@ -139,6 +146,12 @@ public:
     virtual void buildAccelerationStructures(
         const std::vector<AccelerationStructureBuildGeometryInfo>& as_build_geo_list,
         const std::vector<AccelerationStructureBuildRangeInfo>& as_build_range_list) final;
+
+    virtual void fillBuffer(
+        const std::shared_ptr<Buffer>& buffer,
+        uint64_t offset,
+        uint64_t size,
+        uint32_t data) final;
 
     virtual void resetQueryPool(
         const std::shared_ptr<QueryPool>& query_pool,

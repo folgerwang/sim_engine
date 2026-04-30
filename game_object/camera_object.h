@@ -92,6 +92,10 @@ public:
         return m_view_camera_->getCameraInfo();
     }
 
+    void setInputFeatureFlags(uint32_t flags) {
+        m_view_camera_->setInputFeatureFlags(flags);
+    }
+
 
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);

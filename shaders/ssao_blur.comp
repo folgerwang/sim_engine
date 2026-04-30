@@ -1,0 +1,47 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ─── SSAO bilateral blur ───────────────────────────────────────
+// 4×4 separable bilateral blur that preserves depth edges.
+// Run twice (H then V) for a full 2D blur, or once as a box filter.
+
+layout(push_constant) uniform SSAOBlurPushConstants {
+    vec2  inv_screen_size;
+    vec2  blur_dir;        // (1,0) for horizontal, (0,1) for vertical
+};
+
+layout(set = 0, binding = 0) uniform sampler2D ao_in;
+layout(set = 0, binding = 1) uniform sampler2D depth_tex;
+layout(set = 0, binding = 2, r16f) uniform writeonly image2D ao_out;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (vec2(coords) + 0.5) * inv_screen_size;
+
+    float center_ao    = texture(ao_in, uv).r;
+    float center_depth = texture(depth_tex, uv).r;
+
+    float total_ao     = center_ao;
+    float total_weight = 1.0;
+
+    const int RADIUS = 4;
+    for (int i = -RADIUS; i <= RADIUS; ++i) {
+        if (i == 0) continue;
+
+        vec2 sample_uv = uv + blur_dir * inv_screen_size * float(i);
+        float sample_ao    = texture(ao_in, sample_uv).r;
+        float sample_depth = texture(depth_tex, sample_uv).r;
+
+        // Bilateral weight: reduce contribution at depth discontinuities.
+        float depth_diff = abs(center_depth - sample_depth);
+        float w = exp(-depth_diff * 1000.0) * (1.0 / (1.0 + abs(float(i))));
+
+        total_ao     += sample_ao * w;
+        total_weight += w;
+    }
+
+    imageStore(ao_out, coords, vec4(total_ao / total_weight, 0.0, 0.0, 0.0));
+}

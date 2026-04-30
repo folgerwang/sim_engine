@@ -288,6 +288,22 @@ void VulkanCommandBuffer::drawIndirect(
     vkCmdDrawIndirect(cmd_buf_, vk_indirect_buffer->get(), buffer_offset, draw_count, stride);
 }
 
+void VulkanCommandBuffer::drawIndexedIndirectCount(
+    const renderer::BufferInfo& indirect_draw_cmd_buf,
+    uint64_t indirect_offset,
+    const renderer::BufferInfo& count_buf,
+    uint64_t count_offset,
+    uint32_t max_draw_count,
+    uint32_t stride/* = sizeof(DrawIndexedIndirectCommand)*/) {
+    auto vk_indirect_buffer = RENDER_TYPE_CAST(Buffer, indirect_draw_cmd_buf.buffer);
+    auto vk_count_buffer = RENDER_TYPE_CAST(Buffer, count_buf.buffer);
+    vkCmdDrawIndexedIndirectCount(
+        cmd_buf_,
+        vk_indirect_buffer->get(), indirect_offset,
+        vk_count_buffer->get(), count_offset,
+        max_draw_count, stride);
+}
+
 void VulkanCommandBuffer::drawMeshTasks(
     uint32_t group_count_x/* = 1*/,
     uint32_t group_count_y/* = 1*/,
@@ -601,6 +617,15 @@ void VulkanCommandBuffer::resetQueryPool(
     uint32_t query_count) {
     auto vk_qp = RENDER_TYPE_CAST(QueryPool, query_pool);
     vkCmdResetQueryPool(cmd_buf_, vk_qp->get(), first_query, query_count);
+}
+
+void VulkanCommandBuffer::fillBuffer(
+    const std::shared_ptr<Buffer>& buffer,
+    uint64_t offset,
+    uint64_t size,
+    uint32_t data) {
+    auto vk_buf = RENDER_TYPE_CAST(Buffer, buffer);
+    vkCmdFillBuffer(cmd_buf_, vk_buf->get(), offset, size, data);
 }
 
 void VulkanCommandBuffer::writeTimestamp(

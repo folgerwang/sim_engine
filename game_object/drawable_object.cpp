@@ -30,6 +30,10 @@ static uint32_t num_draw_meshes = 0;
 #define DEBUG_OUTPUT 1
 #define HASH_CHECK 0
 
+// ── Per-frame frustum cull state (set by application.cpp) ──────────────
+static bool     s_frustum_cull_active = false;
+static glm::vec4 s_frustum_planes[6];
+
 namespace ego = engine::game_object;
 namespace engine {
 
@@ -701,6 +705,16 @@ static void setupMeshState(
                 texture_is_srgb[tex_id] = true;
             }
         }
+
+        // ufbx PBR fallback: mark base-color and emissive textures sRGB
+        // even when they use non-standard property names (Stingray PBS, etc.)
+        const auto* bc_tex = src_material->pbr.base_color.texture;
+        if (!bc_tex) bc_tex = src_material->fbx.diffuse_color.texture;
+        if (bc_tex) texture_is_srgb[bc_tex->typed_id] = true;
+
+        const auto* em_tex = src_material->pbr.emission_color.texture;
+        if (!em_tex) em_tex = src_material->fbx.emission_color.texture;
+        if (em_tex) texture_is_srgb[em_tex->typed_id] = true;
     }
 
     for (size_t i_tex = 0; i_tex < fbx_scene->textures.count; i_tex++) {
@@ -729,7 +743,7 @@ static void setupMeshState(
                 auto tex = src_material->textures[i];
                 const auto& texture_string =
                     std::string(tex.material_prop.data);
-                const auto& texture_name = 
+                const auto& texture_name =
                     std::string(tex.texture->filename.data);
 
                 auto tex_id = texture_map[str_hash(texture_name)];
@@ -744,7 +758,7 @@ static void setupMeshState(
                     dst_material.normal_idx_ = tex_id;
                 }
                 else if (texture_string == "MetallicRoughness") {
-                    assert(0);
+                    dst_material.metallic_roughness_idx_ = tex_id;
                 }
                 else if (texture_string == "EmissiveColor") {
                     dst_material.emissive_idx_ = tex_id;
@@ -752,10 +766,56 @@ static void setupMeshState(
                 else if (texture_string == "Occlusion") {
                     dst_material.occlusion_idx_ = tex_id;
                 }
-                else {
-                    assert(0);
+                // else: unknown FBX texture property — skip silently.
+                // Non-standard shaders (Stingray PBS, Arnold, etc.) use
+                // namespaced property names that ufbx normalises into the
+                // pbr / fbx struct.  We pick those up in the fallback below.
+            }
+
+            // ── ufbx PBR fallback ─────────────────────────────────────────
+            // For materials that use non-standard FBX shaders (Stingray PBS,
+            // 3dsMax|Parameters|base_color_map, …), the raw texture strings
+            // don't match "DiffuseColor".  ufbx auto-maps those into
+            // src_material->pbr.  Use that when the loop above found nothing.
+            if (dst_material.base_color_idx_ < 0) {
+                const auto* tex = src_material->pbr.base_color.texture;
+                if (!tex) tex = src_material->fbx.diffuse_color.texture;
+                if (tex) {
+                    dst_material.base_color_idx_ =
+                        static_cast<int32_t>(tex->typed_id);
                 }
             }
+            if (dst_material.normal_idx_ < 0) {
+                const auto* tex = src_material->pbr.normal_map.texture;
+                if (!tex) tex = src_material->fbx.normal_map.texture;
+                if (tex) {
+                    dst_material.normal_idx_ =
+                        static_cast<int32_t>(tex->typed_id);
+                }
+            }
+            if (dst_material.metallic_roughness_idx_ < 0) {
+                const auto* tex = src_material->pbr.roughness.texture;
+                if (tex) {
+                    dst_material.metallic_roughness_idx_ =
+                        static_cast<int32_t>(tex->typed_id);
+                }
+            }
+            if (dst_material.emissive_idx_ < 0) {
+                const auto* tex = src_material->pbr.emission_color.texture;
+                if (!tex) tex = src_material->fbx.emission_color.texture;
+                if (tex) {
+                    dst_material.emissive_idx_ =
+                        static_cast<int32_t>(tex->typed_id);
+                }
+            }
+            if (dst_material.occlusion_idx_ < 0) {
+                const auto* tex = src_material->pbr.ambient_occlusion.texture;
+                if (tex) {
+                    dst_material.occlusion_idx_ =
+                        static_cast<int32_t>(tex->typed_id);
+                }
+            }
+            // ─────────────────────────────────────────────────────────────
 
             if (dst_material.base_color_idx_ >= 0) {
                 drawable_object->textures_[dst_material.base_color_idx_].linear = false;
@@ -1081,20 +1141,19 @@ static void setupMesh(
         vertex.uv = glm::vec2(uv.x, uv.y);
     }
 
-    // ── Cluster sidecar build (only when --cluster-debug is active) ──
+    // ── Cluster sidecar build (always-on for Nanite-lite GPU culling) ──
     // `full_lod_meshes` at this point holds exactly LOD-0 of the mesh —
     // new_indices.size()/3 faces and drawable_vertices populated above.
     // The HLOD loop below will APPEND higher-LOD faces onto the same arrays;
     // we want clusters for the base LOD only, so build them here first.
-    if (helper::clusterRenderingEnabled()) {
-        helper::buildClusterMesh(full_lod_meshes, drawable_mesh.cluster_mesh_);
-        // Expand to GPU-side buffers for the per-cluster flat-color draw.
-        // Safe to call with an empty sidecar -- uploadForMesh() no-ops then.
-        ego::ClusterDebugDraw::uploadForMesh(
-            device,
-            drawable_mesh.cluster_mesh_,
-            drawable_mesh.cluster_debug_gpu_);
-    }
+    helper::buildClusterMesh(full_lod_meshes, drawable_mesh.cluster_mesh_);
+    // Always upload debug GPU buffers so the "Cluster Debug Draw" toggle
+    // works at runtime (previously gated on clusterRenderingEnabled() which
+    // was false at load time, so debug buffers were never created).
+    ego::ClusterDebugDraw::uploadForMesh(
+        device,
+        drawable_mesh.cluster_mesh_,
+        drawable_mesh.cluster_debug_gpu_);
 
     // create HLOD
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
@@ -1969,12 +2028,52 @@ static void drawMesh(
     bool depth_only,
     size_t& last_hash) {
 
+    // ── Per-mesh frustum culling (forward pass only) ────────────────────────
+    // Transform the mesh's local-space bounding sphere into world space
+    // using model_params.model_mat, then test against the frustum planes
+    // set by application.cpp. Shadow / depth-only passes are NOT culled
+    // so off-screen geometry still casts correct shadows.
+    if (!depth_only && s_frustum_cull_active) {
+        // Compute local-space bounding sphere from AABB.
+        glm::vec3 local_center = (mesh_info.bbox_min_ + mesh_info.bbox_max_) * 0.5f;
+        glm::vec3 local_half   = (mesh_info.bbox_max_ - mesh_info.bbox_min_) * 0.5f;
+        float local_radius     = glm::length(local_half);
+
+        // Transform center to world space.
+        glm::vec4 world_center4 = model_params.model_mat * glm::vec4(local_center, 1.0f);
+        glm::vec3 world_center  = glm::vec3(world_center4);
+
+        // Scale radius by the largest axis scale of the model matrix.
+        float sx = glm::length(glm::vec3(model_params.model_mat[0]));
+        float sy = glm::length(glm::vec3(model_params.model_mat[1]));
+        float sz = glm::length(glm::vec3(model_params.model_mat[2]));
+        float world_radius = local_radius * glm::max(sx, glm::max(sy, sz));
+
+        // Sphere-vs-frustum: if the sphere is entirely behind any plane, cull.
+        bool outside = false;
+        for (int p = 0; p < 6; ++p) {
+            float dist = glm::dot(glm::vec3(s_frustum_planes[p]), world_center)
+                       + s_frustum_planes[p].w;
+            if (dist < -world_radius) { outside = true; break; }
+        }
+        if (outside) return;
+    }
+
     // ── --cluster-debug override (forward pass only) ──────────────────────
     // When the CLI flag is live and this MeshInfo actually had its cluster
     // sidecar + GPU expansion built (only the FBX-path static meshes do so
     // far), bypass the whole primitive loop and paint the mesh with the
     // per-cluster flat-color helper. Depth-only passes (shadow / pre-z)
     // fall through to the normal path so they still write valid depth.
+    // When the cluster indirect draw is active this mesh is handled by the
+    // cluster renderer pass — skip it entirely in the forward pass (avoids
+    // double-rendering with z-fighting between the two draws).
+    if (!depth_only &&
+        engine::helper::clusterIndirectActive() &&
+        mesh_info.cluster_debug_gpu_.ready()) {
+        return;
+    }
+
     if (!depth_only &&
         engine::helper::clusterRenderingEnabled() &&
         mesh_info.cluster_debug_gpu_.ready() &&
@@ -3257,6 +3356,16 @@ void DrawableObject::createGameObjectUpdateDescSet(
 
         device->updateDescriptorSets(write_descs);
     }
+}
+
+void DrawableObject::setFrustumCullPlanes(const glm::vec4 planes[6]) {
+    for (int i = 0; i < 6; ++i)
+        s_frustum_planes[i] = planes[i];
+    s_frustum_cull_active = true;
+}
+
+void DrawableObject::clearFrustumCull() {
+    s_frustum_cull_active = false;
 }
 
 void DrawableObject::initGameObjectBuffer(

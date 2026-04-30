@@ -136,5 +136,9 @@ void buildClusterBVH(ClusterMesh& cm, uint32_t leaf_threshold = 4);
 // the new path is wired up. Expose in ImGui debug panel / cvars as desired.
 bool& clusterRenderingEnabled();
 
+// True when the GPU indirect cluster draw is active.  When set, the forward
+// pass skips clustered meshes entirely — the cluster renderer handles them.
+bool& clusterIndirectActive();
+
 }  // namespace helper
 }  // namespace engine

@@ -187,7 +187,8 @@ VkWriteDescriptorSet addDescriptWrite(
     const VkDescriptorSet& description_set,
     const VkDescriptorImageInfo* image_info,
     uint32_t binding,
-    const VkDescriptorType& desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    const VkDescriptorType& desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+    uint32_t dst_array_element = 0);
 
 void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,

@@ -2046,6 +2046,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     device_features.multiDrawIndirect = VK_TRUE;
     device_features.multiViewport = VK_TRUE;
     device_features.depthClamp = VK_TRUE;  // required for CSM / depth-clamp rasterization
+    device_features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;  // bindless texture array indexing
 
     VkDeviceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -2361,12 +2362,13 @@ VkWriteDescriptorSet addDescriptWrite(
     const VkDescriptorSet& description_set,
     const VkDescriptorImageInfo* image_info,
     uint32_t binding,
-    const VkDescriptorType& desc_type/* = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER*/) {
+    const VkDescriptorType& desc_type/* = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER*/,
+    uint32_t dst_array_element/* = 0*/) {
     VkWriteDescriptorSet result = {};
     result.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     result.dstSet = description_set;
     result.dstBinding = binding;
-    result.dstArrayElement = 0;
+    result.dstArrayElement = dst_array_element;
     result.descriptorType = desc_type;
     result.descriptorCount = 1;
     result.pImageInfo = image_info;

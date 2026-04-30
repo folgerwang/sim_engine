@@ -12,6 +12,7 @@ namespace plugins { class PluginManager; }
 
 namespace engine {
 namespace game_object { class MeshLoadTaskManager; }
+namespace scene_rendering { class SSAO; class ClusterRenderer; }
 namespace ui {
 
 // Game-level state machine driven by the title-screen menu.
@@ -29,6 +30,7 @@ class Menu {
     bool turn_off_grass_pass_ = false;
     bool turn_off_ray_tracing_ = false;
     bool turn_off_volume_moist_ = false;
+    bool turn_off_shadow_pass_ = false;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;
     float air_flow_strength_ = 50.0f;
@@ -105,6 +107,13 @@ class Menu {
     // meshes are still loading. Non-owning.
     engine::game_object::MeshLoadTaskManager* mesh_load_task_manager_ = nullptr;
 
+    // Optional SSAO — set from application after init.
+    engine::scene_rendering::SSAO* ssao_ = nullptr;
+
+    // Optional ClusterRenderer — set from application after init.
+    engine::scene_rendering::ClusterRenderer* cluster_renderer_ = nullptr;
+    bool show_smart_mesh_window_ = false;
+
 public:
     void setBackgroundEnabled(bool enabled) { bg_enabled_ = enabled; }
     bool isBackgroundEnabled() const { return bg_enabled_; }
@@ -116,6 +125,12 @@ public:
     }
     void setMeshLoadTaskManager(engine::game_object::MeshLoadTaskManager* m) {
         mesh_load_task_manager_ = m;
+    }
+    void setSSAO(engine::scene_rendering::SSAO* s) {
+        ssao_ = s;
+    }
+    void setClusterRenderer(engine::scene_rendering::ClusterRenderer* cr) {
+        cluster_renderer_ = cr;
     }
 
     // Game state accessors.
@@ -162,6 +177,10 @@ public:
     inline bool showCsmDebug() const { return show_csm_debug_; }
     void setCsmDebugTextureIds(const std::array<ImTextureID, CSM_CASCADE_COUNT>& ids) {
         csm_debug_tex_ids_ = ids;
+    }
+
+    inline bool isShadowPassTurnOff() const {
+        return turn_off_shadow_pass_;
     }
 
     inline bool isWaterPassTurnOff() {

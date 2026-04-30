@@ -1,0 +1,28 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+// ─── Apply SSAO to HDR color buffer ───────────────────────────
+// Multiplies the blurred AO texture into the color buffer in-place.
+
+layout(push_constant) uniform SSAOApplyPushConstants {
+    vec2  inv_screen_size;
+    float ao_strength;    // 0 = no AO, 1 = full AO
+    float pad;
+};
+
+layout(set = 0, binding = 0) uniform sampler2D ao_tex;
+layout(set = 0, binding = 1, r11f_g11f_b10f) uniform image2D color_buf;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (vec2(coords) + 0.5) * inv_screen_size;
+
+    float ao = texture(ao_tex, uv).r;
+    ao = mix(1.0, ao, ao_strength);
+
+    vec4 color = imageLoad(color_buf, coords);
+    color.rgb *= ao;
+    imageStore(color_buf, coords, color);
+}

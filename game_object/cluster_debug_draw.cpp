@@ -186,12 +186,18 @@ void ClusterDebugDraw::uploadForMesh(
                 continue;
             }
             const auto& face = source_faces[face_idx];
+            // Validate ALL 3 vertex indices before pushing any vertex.
+            // With a non-indexed TRIANGLE_LIST draw, every group of 3
+            // consecutive vertices forms one triangle. Pushing 1 or 2
+            // vertices for an invalid face would shift the alignment of
+            // every subsequent triangle, producing garbage geometry.
+            if (face.v_indices[0] >= source_verts.size() ||
+                face.v_indices[1] >= source_verts.size() ||
+                face.v_indices[2] >= source_verts.size()) {
+                continue;  // skip the whole face — keeps 3-vertex alignment
+            }
             for (int k = 0; k < 3; ++k) {
-                uint32_t v_idx = face.v_indices[k];
-                if (v_idx >= source_verts.size()) {
-                    continue;
-                }
-                positions.push_back(source_verts[v_idx].position);
+                positions.push_back(source_verts[face.v_indices[k]].position);
                 cluster_ids.push_back(c_idx);
             }
         }

@@ -1,0 +1,182 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ─── Cluster Culling Compute Shader ───────────────────────────────
+// GPU-driven frustum + backface-cone culling per mesh cluster.
+//
+// For each cluster, tests:
+//   1. Frustum culling (sphere vs 6 frustum planes)
+//   2. Backface cone culling (normal cone vs view direction)
+//
+// Visible clusters are appended to the output indirect draw buffer
+// via atomicAdd on a draw count. The indirect draw buffer is then
+// consumed by vkCmdDrawIndexedIndirect with drawCount read from
+// the atomic counter.
+
+layout(push_constant) uniform PushConstants {
+    ClusterCullPushConstants params;
+};
+
+// Set 0: cluster data SSBOs
+layout(std430, set = 0, binding = 0) readonly buffer ClusterCullBuffer {
+    ClusterCullInfo cluster_cull_infos[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer ClusterDrawBuffer {
+    ClusterDrawInfo cluster_draw_infos[];
+};
+
+// Set 0, binding 2: output indirect draw commands
+// Each entry is a DrawIndexedIndirectCommand:
+//   uint indexCount, instanceCount, firstIndex, vertexOffset, firstInstance
+layout(std430, set = 0, binding = 2) writeonly buffer IndirectDrawBuffer {
+    uint indirect_draws[];   // packed as 5 uints per command
+};
+
+// Set 0, binding 3: atomic draw count (single uint)
+layout(std430, set = 0, binding = 3) buffer DrawCountBuffer {
+    uint draw_count;
+};
+
+// Set 0, binding 4: visible cluster index list (for debug / stats)
+layout(std430, set = 0, binding = 4) writeonly buffer VisibleClusterBuffer {
+    uint visible_cluster_indices[];
+};
+
+layout(local_size_x = 64, local_size_y = 1) in;
+
+// ─── Shared Frustum Planes ──────────────────────────────────────
+// Extracted once per workgroup by thread 0, then shared across all
+// 64 threads. Avoids 64× redundant plane extraction per group.
+shared vec4 s_frustum_planes[6];
+
+// Extract 6 frustum planes from the view-projection matrix.
+// Each plane is vec4(normal.xyz, distance) with inward-facing normal.
+void extractFrustumPlanes(mat4 vp) {
+    // Left
+    s_frustum_planes[0] = vec4(vp[0][3] + vp[0][0],
+                                vp[1][3] + vp[1][0],
+                                vp[2][3] + vp[2][0],
+                                vp[3][3] + vp[3][0]);
+    // Right
+    s_frustum_planes[1] = vec4(vp[0][3] - vp[0][0],
+                                vp[1][3] - vp[1][0],
+                                vp[2][3] - vp[2][0],
+                                vp[3][3] - vp[3][0]);
+    // Bottom — Gribb-Hartmann row3+row1, but proj[1].y is negated for Vulkan
+    // Y-flip, which swaps the meaning of top and bottom planes. So bottom
+    // becomes row3 - row1 and top becomes row3 + row1.
+    s_frustum_planes[2] = vec4(vp[0][3] - vp[0][1],
+                                vp[1][3] - vp[1][1],
+                                vp[2][3] - vp[2][1],
+                                vp[3][3] - vp[3][1]);
+    // Top (see note above)
+    s_frustum_planes[3] = vec4(vp[0][3] + vp[0][1],
+                                vp[1][3] + vp[1][1],
+                                vp[2][3] + vp[2][1],
+                                vp[3][3] + vp[3][1]);
+    // Near — Vulkan depth is Z∈[0,1] (GLM_FORCE_DEPTH_ZERO_TO_ONE), so the
+    // near plane is Z_clip >= 0, which is just row2 of the VP matrix.
+    // The GL formula (row3 + row2) is wrong here and lets behind-near-plane
+    // clusters through, causing the vertex-stretching artefacts.
+    s_frustum_planes[4] = vec4(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
+    // Far
+    s_frustum_planes[5] = vec4(vp[0][3] - vp[0][2],
+                                vp[1][3] - vp[1][2],
+                                vp[2][3] - vp[2][2],
+                                vp[3][3] - vp[3][2]);
+
+    // Normalize planes
+    for (int i = 0; i < 6; ++i) {
+        float len = length(s_frustum_planes[i].xyz);
+        if (len > 0.0001) {
+            s_frustum_planes[i] /= len;
+        }
+    }
+}
+
+// ─── Sphere vs Frustum (uses shared planes) ────────────────────
+bool sphereInFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; ++i) {
+        float d = dot(s_frustum_planes[i].xyz, center) + s_frustum_planes[i].w;
+        if (d < -radius) {
+            return false;  // fully outside this plane
+        }
+    }
+    return true;
+}
+
+// ─── Backface Cone Cull ─────────────────────────────────────────
+// If every triangle in the cluster faces away from the camera,
+// we can skip it. The cone_axis is the average normal, cone_cutoff
+// is cos(max angle from axis). If dot(view_dir, cone_axis) >= cutoff,
+// ALL triangles are backfacing.
+bool isBackfacing(vec3 cluster_center, vec3 cone_axis, float cone_cutoff,
+                  vec3 camera_pos) {
+    // cutoff < 0 means "don't cull" (cone too wide to be useful)
+    if (cone_cutoff < 0.0) return false;
+
+    vec3 view_dir = normalize(cluster_center - camera_pos);
+    return dot(view_dir, cone_axis) >= cone_cutoff;
+}
+
+// ─── Main ────────────────────────────────────────────────────────
+
+void main() {
+    // Thread 0 in each workgroup extracts frustum planes into shared memory.
+    if (gl_LocalInvocationID.x == 0u) {
+        extractFrustumPlanes(params.view_proj);
+    }
+    barrier();
+
+    uint cluster_idx = gl_GlobalInvocationID.x;
+    if (cluster_idx >= params.total_clusters) {
+        return;
+    }
+
+    ClusterCullInfo cull = cluster_cull_infos[cluster_idx];
+    vec3 center = cull.bounds_sphere.xyz;
+    float radius = cull.bounds_sphere.w;
+
+    // Debug modes via use_bvh push constant:
+    //   0 = normal frustum + backface culling
+    //   2 = force cull every other cluster (pipeline test)
+    //   3 = distance-based cull (data validation test)
+    if (params.use_bvh == 2u) {
+        if ((cluster_idx & 1u) != 0u) return;
+    } else if (params.use_bvh == 3u) {
+        // Simple distance cull: cull if > 50 units from camera.
+        // Tests that cluster positions and camera_pos are in the same space.
+        float dist = distance(center, params.camera_pos_pad.xyz);
+        if (dist > 50.0) return;
+    } else {
+        // 1. Frustum cull (sphere test against shared planes)
+        if (!sphereInFrustum(center, radius)) {
+            return;  // culled by frustum
+        }
+
+        // 2. Backface cone cull
+        if (isBackfacing(center, cull.cone_axis_cutoff.xyz,
+                         cull.cone_axis_cutoff.w,
+                         params.camera_pos_pad.xyz)) {
+            return;  // all triangles face away
+        }
+    }
+
+    // Cluster is visible — emit an indirect draw command.
+    ClusterDrawInfo draw = cluster_draw_infos[cluster_idx];
+
+    uint slot = atomicAdd(draw_count, 1u);
+
+    // Pack DrawIndexedIndirectCommand (5 uints)
+    uint base = slot * 5u;
+    indirect_draws[base + 0] = draw.index_count;     // indexCount
+    indirect_draws[base + 1] = 1u;                    // instanceCount
+    indirect_draws[base + 2] = draw.index_offset;     // firstIndex
+    indirect_draws[base + 3] = draw.vertex_offset;    // vertexOffset (int32)
+    indirect_draws[base + 4] = cluster_idx;           // firstInstance = cluster index (for bindless material lookup)
+
+    // Record visible cluster for stats / debug.
+    visible_cluster_indices[slot] = cluster_idx;
+}

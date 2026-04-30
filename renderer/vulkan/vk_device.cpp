@@ -1223,7 +1223,8 @@ void VulkanDevice::updateDescriptorSets(
                     vk_desc_set->get(),
                     desc_image.get(),
                     src_tex_desc->binding,
-                    helper::toVkDescriptorType(src_tex_desc->desc_type)));
+                    helper::toVkDescriptorType(src_tex_desc->desc_type),
+                    src_tex_desc->dst_array_element));
         }
         else if (is_buffer) {
             const auto src_buf_desc = static_cast<const BufferDescriptor*>(src_write_desc.get());
@@ -1238,7 +1239,7 @@ void VulkanDevice::updateDescriptorSets(
             descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptor_write.dstSet = vk_desc_set->get();
             descriptor_write.dstBinding = src_buf_desc->binding;
-            descriptor_write.dstArrayElement = 0;
+            descriptor_write.dstArrayElement = src_buf_desc->dst_array_element;
 
             descriptor_write.descriptorType = helper::toVkDescriptorType(src_buf_desc->desc_type);
             descriptor_write.descriptorCount = 1;

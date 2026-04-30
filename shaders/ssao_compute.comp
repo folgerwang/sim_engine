@@ -1,0 +1,138 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ─── SSAO compute shader ───────────────────────────────────────
+// Depth-only SSAO using the same depth linearization as the
+// volume cloud shader (proven working in this engine).
+
+layout(push_constant) uniform SSAOPushConstants {
+    vec2  inv_screen_size;
+    float radius;
+    float bias;
+    float power;
+    float intensity;
+    int   kernel_size;
+    float pad;
+};
+
+layout(std430, set = 1, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+layout(set = 0, binding = 0) uniform sampler2D depth_tex;
+layout(set = 0, binding = 1) uniform sampler2D noise_tex;
+layout(set = 0, binding = 2, r16f) uniform writeonly image2D ao_out;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ─── Helpers ───────────────────────────────────────────────────
+
+// Linearize depth to view-space Z (positive = away from camera).
+// Matches render_volume_cloud.comp line 42 exactly.
+float linearizeDepth(float d) {
+    return camera_info.proj[3][2] / (d + camera_info.proj[2][2]);
+}
+
+// Reconstruct view-space position from screen UV + raw depth.
+vec3 viewPosFromDepth(vec2 uv, float depth) {
+    float z = linearizeDepth(depth);
+    // depth_params.zw = (1/proj[0][0], 1/proj[1][1])
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc * camera_info.depth_params.zw * z, z);
+}
+
+// Reconstruct normal from depth via cross product of ddx/ddy.
+vec3 reconstructNormal(vec2 uv, vec3 pos) {
+    vec2 dx = vec2(inv_screen_size.x, 0.0);
+    vec2 dy = vec2(0.0, inv_screen_size.y);
+    float dR = texture(depth_tex, uv + dx).r;
+    float dU = texture(depth_tex, uv + dy).r;
+    vec3 pR = viewPosFromDepth(uv + dx, dR);
+    vec3 pU = viewPosFromDepth(uv + dy, dU);
+    return normalize(cross(pR - pos, pU - pos));
+}
+
+// Simple hash for per-pixel random rotation.
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+// ─── Main ─────────────────────────────────────────────────────
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (vec2(coords) + 0.5) * inv_screen_size;
+
+    float depth = texture(depth_tex, uv).r;
+
+    // Sky pixels — no occlusion.
+    if (depth < 1e-6 || depth > 0.9999) {
+        imageStore(ao_out, coords, vec4(1.0));
+        return;
+    }
+
+    vec3 frag_pos = viewPosFromDepth(uv, depth);
+    vec3 normal   = reconstructNormal(uv, frag_pos);
+
+    // Per-pixel random rotation from noise texture (4x4 tiled).
+    vec3 random_vec = texture(noise_tex, vec2(coords % 4) * 0.25 + 0.125).rgb * 2.0 - 1.0;
+
+    // Gram-Schmidt: build TBN to orient hemisphere along normal.
+    vec3 tangent  = normalize(random_vec - normal * dot(random_vec, normal));
+    vec3 binormal = cross(normal, tangent);
+    mat3 TBN      = mat3(tangent, binormal, normal);
+
+    float occlusion = 0.0;
+    int samples = clamp(kernel_size, 4, 64);
+
+    for (int i = 0; i < samples; ++i) {
+        // Hammersley-like sample distribution on hemisphere.
+        float fi = float(i) + 0.5;
+        float fn = float(samples);
+
+        // Radical inverse for quasi-random phi.
+        uint bits = uint(i);
+        bits = (bits << 16u) | (bits >> 16u);
+        bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+        bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+        bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+        bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+        float phi = float(bits) * 2.3283064365386963e-10 * 6.2831853;
+
+        float cos_theta = 1.0 - fi / fn;
+        float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+
+        // Scale: more samples near the origin.
+        float scale = fi / fn;
+        scale = mix(0.1, 1.0, scale * scale);
+
+        vec3 sample_dir = vec3(cos(phi) * sin_theta,
+                               sin(phi) * sin_theta,
+                               cos_theta) * scale;
+
+        // Orient into tangent space and offset from fragment position.
+        vec3 sample_pos = frag_pos + TBN * sample_dir * radius;
+
+        // Project back to screen UV.
+        vec4 proj_pos = camera_info.proj * vec4(sample_pos, 1.0);
+        proj_pos.xy /= proj_pos.w;
+        vec2 sample_uv = proj_pos.xy * 0.5 + 0.5;
+
+        // Sample depth at the projected position.
+        float sample_depth = texture(depth_tex, sample_uv).r;
+        float sample_z = linearizeDepth(sample_depth);
+
+        // Range check to avoid halo at depth discontinuities.
+        float range_check = smoothstep(0.0, 1.0,
+            radius / (abs(frag_pos.z - sample_z) + 0.001));
+
+        // If the sampled surface is closer than our sample point, it occludes.
+        occlusion += (sample_z <= sample_pos.z - bias ? 1.0 : 0.0) * range_check;
+    }
+
+    float ao = 1.0 - (occlusion / float(samples)) * intensity;
+    ao = pow(clamp(ao, 0.0, 1.0), power);
+
+    imageStore(ao_out, coords, vec4(ao, 0.0, 0.0, 0.0));
+}

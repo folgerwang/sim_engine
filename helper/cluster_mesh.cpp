@@ -234,6 +234,11 @@ bool& clusterRenderingEnabled() {
     return enabled;
 }
 
+bool& clusterIndirectActive() {
+    static bool active = false;
+    return active;
+}
+
 // ─── buildClusterMesh() ─────────────────────────────────────────────────────
 void buildClusterMesh(const Mesh& mesh,
                       ClusterMesh& out,
@@ -420,11 +425,12 @@ void buildClusterMesh(const Mesh& mesh,
     }
 
     // ── 4) aggregate stats ─────────────────────────────────────────────────
-    out.source           = std::shared_ptr<const Mesh>(&mesh, [](const Mesh*){});
-    // ^ non-owning alias — we don't control Mesh's lifetime. The comment in
-    //   cluster_mesh.h explicitly calls out that dropping the source Mesh
-    //   invalidates the ClusterMesh; this shared_ptr is just a weak handle
-    //   with a no-op deleter so callers can still write `cm.source->...`.
+    // Store an owning copy of the Mesh struct. The Mesh itself is lightweight
+    // (two shared_ptrs) so the copy is cheap — it just bumps the ref counts
+    // on vertex_data_ptr and faces_ptr, keeping the underlying data alive
+    // as long as this ClusterMesh exists. The previous non-owning alias
+    // (no-op deleter) dangled when the source Mesh was a stack local.
+    out.source = std::make_shared<const Mesh>(mesh);
 
     out.total_clusters  = static_cast<uint32_t>(out.clusters.size());
     uint32_t sum_tris = 0;
