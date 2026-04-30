@@ -19,6 +19,10 @@ struct MaterialInfo {
     int32_t                emissive_idx_ = -1;
     int32_t                occlusion_idx_ = -1;
 
+    // Cluster renderer needs these CPU-side (avoids re-reading the GPU UBO).
+    float                  alpha_cutoff_ = 0.0f;  // >0 enables alpha-mask discard
+    bool                   alpha_mask_   = false; // material is MASK mode (not OPAQUE)
+
     renderer::BufferInfo   uniform_buffer_;
     std::shared_ptr<renderer::DescriptorSet>  desc_set_;
 };

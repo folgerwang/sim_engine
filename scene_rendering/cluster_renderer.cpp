@@ -294,7 +294,8 @@ void ClusterRenderer::uploadMeshClusters(
                 int32_t mat_idx2 = prims2[primitive_idx].material_idx_;
                 if (mat_idx2 >= 0 &&
                     static_cast<size_t>(mat_idx2) < drawable_data.materials_.size()) {
-                    int32_t tex_idx = drawable_data.materials_[mat_idx2].base_color_idx_;
+                    const auto& mat2 = drawable_data.materials_[mat_idx2];
+                    int32_t tex_idx = mat2.base_color_idx_;
                     if (tex_idx >= 0 &&
                         static_cast<size_t>(tex_idx) < drawable_data.textures_.size()) {
                         const auto& tex = drawable_data.textures_[tex_idx];
@@ -312,6 +313,17 @@ void ClusterRenderer::uploadMeshClusters(
                             // else: over MAX_CLUSTER_TEXTURES — tex_idx stays -1
                         }
                     }
+
+                    // Alpha mask — discard fragments below cutoff.
+                    if (mat2.alpha_mask_ && mat2.alpha_cutoff_ > 0.0f) {
+                        mp.alpha_cutoff = mat2.alpha_cutoff_;
+                        mp.flags |= BINDLESS_MAT_ALPHA_MASK;
+                    }
+                }
+
+                // Double-sided — primitive property, not material-level.
+                if (prims2[primitive_idx].tag_.double_sided) {
+                    mp.flags |= BINDLESS_MAT_DOUBLE_SIDED;
                 }
             }
         }
@@ -413,6 +425,10 @@ void ClusterRenderer::uploadMeshClusters(
                     model_transform * glm::vec4(sv.position, 1.0f));
                 bv.normal = glm::normalize(normal_mat3 * sv.normal);
                 bv.uv = sv.uv;
+                // Apply the same UV flip that base.vert applies via model_params.flip_uv_coord.
+                // FBX files always set m_flip_v_=true (V-axis is inverted vs OpenGL/Vulkan).
+                if (drawable_data.m_flip_u_) bv.uv.x = 1.0f - bv.uv.x;
+                if (drawable_data.m_flip_v_) bv.uv.y = 1.0f - bv.uv.y;
                 staging_vertices_.push_back(bv);
             }
         }
@@ -1071,7 +1087,14 @@ void ClusterRenderer::initBindlessPipeline(
     input_assembly.topology      = er::PrimitiveTopology::TRIANGLE_LIST;
     input_assembly.restart_enable = false;
 
-    er::RasterizationStateOverride raster_override{};  // no overrides needed
+    // The cluster pipeline renders all geometry in one draw — some primitives are
+    // double-sided (plants, leaves). Disable backface culling globally; the
+    // fragment shader flips N via gl_FrontFacing for back faces of double-sided
+    // materials, and single-sided back faces are lit but not discarded (acceptable
+    // for an approximate cluster pass).
+    er::RasterizationStateOverride raster_override{};
+    raster_override.override_double_sided = true;
+    raster_override.double_sided          = true;
 
     bindless_pipeline_ = device_->createPipeline(
         bindless_pipeline_layout_,

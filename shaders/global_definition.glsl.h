@@ -455,13 +455,21 @@ struct ClusterDrawInfo {
 
 // Maximum textures that can be bound in the cluster bindless pass.
 // Must match the sampler2D array size in cluster_bindless.frag.
-#define MAX_CLUSTER_TEXTURES 128
+// Bistro has 600+ DDS textures; 256 covers the most common base-colour set
+// without blowing the descriptor pool budget.
+#define MAX_CLUSTER_TEXTURES 256
+
+// Flags for BindlessMaterialParams.flags
+#define BINDLESS_MAT_DOUBLE_SIDED   1   // bit 0: accept both face orientations (flip N on back face)
+#define BINDLESS_MAT_ALPHA_MASK     2   // bit 1: discard if alpha < alpha_cutoff
 
 // Per-material colour data for the bindless cluster renderer.
 struct BindlessMaterialParams {
     vec4  base_color_factor;    // RGBA base colour (linear)
     int   base_color_tex_idx;   // index into base_color_textures[]; -1 = no texture
-    int   pad0, pad1, pad2;
+    float alpha_cutoff;         // ALPHA_MASK threshold (ignored when flag not set)
+    int   flags;                // BINDLESS_MAT_* bits
+    int   pad0;
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).

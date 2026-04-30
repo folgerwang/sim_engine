@@ -2108,11 +2108,22 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_vulkan11_features.uniformAndStorageBuffer16BitAccess  = VK_TRUE;
     enabled_vulkan11_features.pNext = &enabled_float16_int8_features;
 
+    // Vulkan 1.2: enable non-uniform indexing of sampler arrays.
+    // Required for GL_EXT_nonuniform_qualifier in the cluster bindless fragment
+    // shader, where tex_idx varies per cluster across the same draw call.
+    // Without this, the GPU picks one texture for the whole subgroup (wave),
+    // producing wrong textures at material boundaries between clusters.
+    VkPhysicalDeviceVulkan12Features enabled_vulkan12_features{};
+    enabled_vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    enabled_vulkan12_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    enabled_vulkan12_features.descriptorIndexing                        = VK_TRUE;
+    enabled_vulkan12_features.pNext = &enabled_vulkan11_features;
+
     enabled_vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     enabled_vulkan13_features.dynamicRendering = VK_TRUE;
     enabled_vulkan13_features.synchronization2 = VK_TRUE;
     enabled_vulkan13_features.maintenance4 = VK_TRUE;
-    enabled_vulkan13_features.pNext = &enabled_vulkan11_features;
+    enabled_vulkan13_features.pNext = &enabled_vulkan12_features;
 
     // If a pNext(Chain) has been passed, we need to add it to the device creation info
     VkPhysicalDeviceFeatures2 physical_device_features2{};

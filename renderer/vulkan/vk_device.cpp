@@ -1140,7 +1140,7 @@ std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool() {
     VkDescriptorPoolSize pool_sizes[] =
     {
         { VK_DESCRIPTOR_TYPE_SAMPLER, 16 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 },
         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 256 },

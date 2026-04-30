@@ -415,6 +415,8 @@ static void setupMeshState(
             dst_material.metallic_roughness_idx_ = src_material.pbrMetallicRoughness.metallicRoughnessTexture.index;
             dst_material.emissive_idx_ = src_material.emissiveTexture.index;
             dst_material.occlusion_idx_ = src_material.occlusionTexture.index;
+            dst_material.alpha_cutoff_ = static_cast<float>(src_material.alphaCutoff);
+            dst_material.alpha_mask_ = (src_material.alphaMode == "MASK");
 
             if (dst_material.base_color_idx_ >= 0) {
                 drawable_object->textures_[dst_material.base_color_idx_].linear = false;
@@ -824,6 +826,13 @@ static void setupMeshState(
             if (dst_material.emissive_idx_ >= 0) {
                 drawable_object->textures_[dst_material.emissive_idx_].linear = false;
             }
+
+            // Alpha mask: base.frag has #define ALPHAMODE_MASK 1 always active,
+            // meaning ALL FBX materials always discard fragments where alpha < 0.1.
+            // Opaque textures have alpha=1.0 so the discard never fires for them.
+            // Match this behaviour exactly in the cluster pass.
+            dst_material.alpha_cutoff_ = 0.1f;
+            dst_material.alpha_mask_ = true;
 
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
