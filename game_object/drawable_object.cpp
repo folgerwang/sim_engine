@@ -410,6 +410,9 @@ static void setupMeshState(
             auto& dst_material = drawable_object->materials_[i_mat];
             const auto& src_material = model.materials[i_mat];
 
+            // Source-asset material name for gameplay surface lookup.
+            dst_material.name_ = src_material.name;
+
             dst_material.base_color_idx_ = src_material.pbrMetallicRoughness.baseColorTexture.index;
             dst_material.normal_idx_ = src_material.normalTexture.index;
             dst_material.metallic_roughness_idx_ = src_material.pbrMetallicRoughness.metallicRoughnessTexture.index;
@@ -773,6 +776,13 @@ static void setupMeshState(
         for (size_t i_mat = 0; i_mat < fbx_scene->materials.count; i_mat++) {
             auto& dst_material = drawable_object->materials_[i_mat];
             const auto& src_material = fbx_scene->materials[i_mat];
+
+            // Capture the source-asset material name for gameplay use
+            // (footstep sound lookup, surface-friction tables, etc.).
+            // ufbx guarantees `name.data` is null-terminated; default
+            // to empty when the source had no name set.
+            dst_material.name_ = src_material->name.data
+                ? std::string(src_material->name.data) : std::string();
 
             for (int i = 0; i < src_material->textures.count; i++) {
                 auto tex = src_material->textures[i];

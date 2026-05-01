@@ -10,6 +10,30 @@ namespace engine {
 namespace game_object { class DrawableObject; }
 namespace helper {
 
+// How buildFromDrawablePrimitive shapes the resulting CollisionMesh.
+//   None         -- keep the welded source triangle list verbatim.
+//   Decimate     -- run OpenMesh QEM decimation (preserves
+//                   silhouette, yields a low-poly mesh that still
+//                   looks like the original).
+//   VoxelCube    -- conservatively voxelise the welded mesh into a
+//                   `voxel_size`-spaced grid, then emit a surface
+//                   mesh of axis-aligned cubes for every occupied
+//                   cell, culling the faces between two occupied
+//                   cells. Result is a "Minecraft" view of the
+//                   primitive -- chunky, simple, gap-free. Default
+//                   shape; default voxel_size is 5cm.
+//   VoxelSphere  -- same voxelisation, but each occupied cell emits
+//                   a low-poly octahedron centered on the cell.
+//                   Useful when the cube faces feel too rigid;
+//                   triangle count is higher because there's no
+//                   adjacency culling.
+enum class CollisionShape {
+    None,
+    Decimate,
+    VoxelCube,
+    VoxelSphere,
+};
+
 // CollisionMesh — static-mesh CPU collision representation.
 class CollisionMesh {
 public:
@@ -44,6 +68,52 @@ public:
         size_t mesh_idx,
         bool build_bvh = true);
 
+    // Build a CollisionMesh from a SINGLE primitive (one material
+    // part) of one mesh. Each primitive maps cleanly to one
+    // material, so the resulting CollisionMesh carries a
+    // self-contained `material_name_` that gameplay code can read
+    // for surface-aware behaviour (footstep sounds, friction, decal
+    // selection). The triangle list is also QEM-decimated to
+    // `c_target_lod_ratio` of its original face count when
+    // simplify=true, preserving silhouette while lowering both GPU
+    // upload size and BVH-build cost.
+    //
+    // weld_eps: spatial-quantisation epsilon (in scene units --
+    // metres for Bistro) used to merge near-coincident vertices.
+    // Authoring tools and FBX export often leave gaps where two
+    // parts meet; quantising to a `weld_eps` grid and de-duplicating
+    // closes those gaps so the decimater sees a properly connected
+    // surface and the resulting collision / viz mesh has no
+    // hairline cracks. Default 0.1m (10cm) is aggressive -- it
+    // collapses small props into a single chunk and bridges visible
+    // seams between adjacent floor / wall sections, which is what
+    // we want for a coarse collision proxy. Lower it (e.g. 1e-3f)
+    // when you need finer fidelity. Pass 0.0f to disable welding
+    // entirely.
+    //
+    // shape selects how the welded triangle list is finalised. The
+    // default `VoxelCube` voxelises the primitive into 5cm cells and
+    // emits a chunky surface mesh -- much simpler than the source
+    // and gap-free. See the `CollisionShape` doc comment for
+    // alternatives.
+    //
+    // voxel_size: edge length of each voxel cell, in scene units
+    // (metres for Bistro). Only consulted by the VoxelCube /
+    // VoxelSphere shapes. Smaller values preserve more surface
+    // detail but multiply triangle count cubically. The total grid
+    // size is capped internally so a single oversized primitive
+    // can't blow up memory.
+    bool buildFromDrawablePrimitive(
+        const game_object::DrawableObject& drawable,
+        size_t mesh_idx,
+        size_t prim_idx,
+        bool build_bvh = true,
+        CollisionShape shape = CollisionShape::VoxelCube,
+        float weld_eps = 0.1f,
+        float voxel_size = 0.05f);
+
+    const std::string& materialName() const { return material_name_; }
+
     bool resolveCapsule(
         glm::vec3& position,
         float radius,
@@ -70,6 +140,12 @@ private:
     std::vector<int>            indices_;
     std::shared_ptr<BVHNode>    bvh_root_;
     AABB                        bounds_;
+
+    // Source-asset material name for the primitive that produced
+    // this CollisionMesh (only set by buildFromDrawablePrimitive).
+    // Empty for the multi-mesh / multi-primitive build paths since
+    // a single name can't summarise an aggregated triangle list.
+    std::string                 material_name_;
 
     // Debug GPU buffers — `mutable` so const draw paths can populate
     // them on first use.

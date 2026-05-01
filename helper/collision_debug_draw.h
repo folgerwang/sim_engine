@@ -38,8 +38,20 @@ struct CollisionDebugMeshBuffers {
     std::shared_ptr<renderer::BufferInfo> triangle_id_buffer;
     uint32_t vertex_count = 0;          // == triangle_count * 3
 
+    // Index buffer for the wireframe edge overlay pass. For each
+    // triangle (i0, i1, i2) in the solid fill we push three line
+    // segments (i0,i1), (i1,i2), (i2,i0) -- 6 uint32 indices per
+    // triangle. Drawn with LINE_LIST topology against the same
+    // position / id vertex buffers above.
+    std::shared_ptr<renderer::BufferInfo> line_index_buffer;
+    uint32_t line_index_count = 0;      // == triangle_count * 6
+
     bool ready() const {
         return position_buffer && triangle_id_buffer && vertex_count > 0;
+    }
+
+    bool wireframeReady() const {
+        return ready() && line_index_buffer && line_index_count > 0;
     }
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
@@ -87,13 +99,28 @@ public:
         const std::vector<renderer::Viewport>& viewports,
         const std::vector<renderer::Scissor>& scissors);
 
+    // Draw one collision mesh's wireframe (LINE_LIST topology) over
+    // the previously-drawn solid fill. Uses depth_bias to win the
+    // LESS depth test against the fill it rides on top of, and a
+    // dedicated fragment shader that emits white instead of the
+    // segmentation hash so the topology pops against the colours.
+    static void drawWireframe(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_set_list,
+        const CollisionDebugMeshBuffers& gpu,
+        const glm::mat4& model_transform,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
     static bool ready() { return s_pipeline_ != nullptr; }
+    static bool wireframeReady() { return s_wireframe_pipeline_ != nullptr; }
 
 private:
     static std::vector<renderer::VertexInputBindingDescription>   s_binding_descs_;
     static std::vector<renderer::VertexInputAttributeDescription> s_attrib_descs_;
     static std::shared_ptr<renderer::PipelineLayout>              s_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline>                    s_pipeline_;
+    static std::shared_ptr<renderer::Pipeline>                    s_wireframe_pipeline_;
 };
 
 } // namespace helper

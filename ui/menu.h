@@ -106,6 +106,27 @@ class Menu {
     // forwards through toggleCollisionDebug() below).
     bool show_collision_debug_ = false;
 
+    // Which CollisionShape mode application.cpp should pass to
+    // CollisionMesh::buildFromDrawablePrimitive when (re)building
+    // the collision world for visualisation. Three user-facing
+    // options live in the Physics submenu; the application maps
+    // them onto the engine's CollisionShape enum at build time.
+    // Default is Volume (5cm voxel cubes) -- the cleanest read
+    // for inspecting what gameplay actually collides against.
+public:
+    enum class CollisionDebugShape : int {
+        Original   = 0,   // CollisionShape::None
+        Simplified = 1,   // CollisionShape::Decimate (post-weld)
+        Volume     = 2,   // CollisionShape::VoxelCube
+    };
+private:
+    CollisionDebugShape collision_debug_shape_ =
+        CollisionDebugShape::Volume;
+    // Set by setCollisionDebugShape() whenever the menu choice
+    // changes; the application clears it after rebuilding the
+    // collision world to match.
+    bool collision_world_dirty_ = false;
+
     // ---- Time-of-day -------------------------------------------------------
     // Hours in [0, 24) in the player's **local timezone**.  Initialised
     // at startup from localtime_s / localtime_r so the sun position and
@@ -271,6 +292,23 @@ public:
     inline void setCollisionDebug(bool on) { show_collision_debug_ = on; }
     inline void toggleCollisionDebug() {
         show_collision_debug_ = !show_collision_debug_;
+    }
+
+    // Collision-shape selector accessors.
+    inline CollisionDebugShape collisionDebugShape() const {
+        return collision_debug_shape_;
+    }
+    inline void setCollisionDebugShape(CollisionDebugShape s) {
+        if (collision_debug_shape_ != s) {
+            collision_debug_shape_ = s;
+            collision_world_dirty_ = true;
+        }
+    }
+    inline bool collisionWorldDirty() const {
+        return collision_world_dirty_;
+    }
+    inline void clearCollisionWorldDirty() {
+        collision_world_dirty_ = false;
     }
 
     // ---- TOD (time-of-day) accessors --------------------------------------

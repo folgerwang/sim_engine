@@ -63,7 +63,19 @@ static auto createPipeline(
     renderer::PipelineInputAssemblyStateCreateInfo input_assembly;
     input_assembly.topology = renderer::PrimitiveTopology::TRIANGLE_LIST;
     input_assembly.restart_enable = false;
+
+    // Double-sided rasterisation: collision-debug geometry is
+    // built from voxel surfaces, AABB faces, and source-mesh
+    // triangles whose winding can vary with the upstream FBX
+    // export.  Some single-cell-thick voxel slabs (flat ground
+    // tiles, decals) end up showing only one face after culling
+    // -- we'd rather always see them than lose ground tiles to
+    // back-face culling.  Cheap on the GPU side because debug
+    // geometry is low-poly, and avoids a class of "where did my
+    // mesh go" reports.
     renderer::RasterizationStateOverride rasterization_state_info;
+    rasterization_state_info.override_double_sided = true;
+    rasterization_state_info.double_sided          = true;
 
     return device->createPipeline(
         pipeline_layout,
@@ -77,6 +89,63 @@ static auto createPipeline(
         std::source_location::current());
 }
 
+static renderer::ShaderModuleList getWireShaderModules(
+    std::shared_ptr<renderer::Device> device) {
+    renderer::ShaderModuleList shader_modules(2);
+    shader_modules[0] =
+        renderer::helper::loadShaderModule(
+            device,
+            "collision_debug_vert.spv",   // shared with the solid pass
+            renderer::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+    shader_modules[1] =
+        renderer::helper::loadShaderModule(
+            device,
+            "collision_debug_wire_frag.spv",
+            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
+    return shader_modules;
+}
+
+static auto createWirePipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const std::vector<renderer::VertexInputBindingDescription>& binding_descs,
+    const std::vector<renderer::VertexInputAttributeDescription>& attribute_descs,
+    const renderer::PipelineRenderbufferFormats& frame_buffer_format) {
+    renderer::PipelineInputAssemblyStateCreateInfo input_assembly;
+    input_assembly.topology = renderer::PrimitiveTopology::LINE_LIST;
+    input_assembly.restart_enable = false;
+
+    // Push wireframe lines toward the camera so they win the LESS
+    // depth test against the solid fill drawn at the same Z. The
+    // exact constants are chosen empirically: large enough to clear
+    // depth quantisation noise on the Bistro's geometry, small
+    // enough not to draw lines belonging to occluded back faces.
+    // Also double-sided to match the solid-fill pipeline -- LINE_LIST
+    // rasterisation isn't directly affected by cull_mode, but keeping
+    // both pipelines on identical state simplifies reasoning.
+    renderer::RasterizationStateOverride rasterization_state_info;
+    rasterization_state_info.override_double_sided = true;
+    rasterization_state_info.double_sided          = true;
+    rasterization_state_info.override_depth_bias = true;
+    rasterization_state_info.depth_bias_enable = true;
+    rasterization_state_info.depth_bias_constant_factor = -2.0f;
+    rasterization_state_info.depth_bias_slope_factor    = -2.0f;
+
+    return device->createPipeline(
+        pipeline_layout,
+        binding_descs,
+        attribute_descs,
+        input_assembly,
+        graphic_pipeline_info,
+        getWireShaderModules(device),
+        frame_buffer_format,
+        rasterization_state_info,
+        std::source_location::current());
+}
+
 } // anonymous namespace
 
 namespace helper {
@@ -85,6 +154,7 @@ std::vector<renderer::VertexInputBindingDescription>   CollisionDebugDraw::s_bin
 std::vector<renderer::VertexInputAttributeDescription> CollisionDebugDraw::s_attrib_descs_;
 std::shared_ptr<renderer::PipelineLayout>              CollisionDebugDraw::s_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline>                    CollisionDebugDraw::s_pipeline_;
+std::shared_ptr<renderer::Pipeline>                    CollisionDebugDraw::s_wireframe_pipeline_;
 
 void CollisionDebugMeshBuffers::destroy(
     const std::shared_ptr<renderer::Device>& device) {
@@ -96,7 +166,12 @@ void CollisionDebugMeshBuffers::destroy(
         triangle_id_buffer->destroy(device);
         triangle_id_buffer.reset();
     }
+    if (line_index_buffer) {
+        line_index_buffer->destroy(device);
+        line_index_buffer.reset();
+    }
     vertex_count = 0;
+    line_index_count = 0;
 }
 
 void CollisionDebugDraw::initStaticMembers(
@@ -142,6 +217,13 @@ void CollisionDebugDraw::initStaticMembers(
         s_binding_descs_,
         s_attrib_descs_,
         frame_buffer_format);
+    s_wireframe_pipeline_ = createWirePipeline(
+        device,
+        s_pipeline_layout_,
+        graphic_pipeline_info,
+        s_binding_descs_,
+        s_attrib_descs_,
+        frame_buffer_format);
 }
 
 void CollisionDebugDraw::destroyStaticMembers(
@@ -153,6 +235,10 @@ void CollisionDebugDraw::destroyStaticMembers(
     if (s_pipeline_) {
         device->destroyPipeline(s_pipeline_);
         s_pipeline_.reset();
+    }
+    if (s_wireframe_pipeline_) {
+        device->destroyPipeline(s_wireframe_pipeline_);
+        s_wireframe_pipeline_.reset();
     }
     s_binding_descs_.clear();
     s_attrib_descs_.clear();
@@ -220,6 +306,35 @@ stop:
             std::source_location::current());
 
     out_gpu.vertex_count = static_cast<uint32_t>(positions.size());
+
+    // Build the wireframe-overlay index buffer alongside the solid
+    // fill data. Each non-indexed triangle (verts 3t, 3t+1, 3t+2)
+    // produces three line segments connecting its corners, drawn
+    // with LINE_LIST topology against the same position / id vertex
+    // buffers as the solid fill -- 6 indices per triangle.
+    const uint32_t tri_count_u32 =
+        static_cast<uint32_t>(positions.size() / 3);
+    if (tri_count_u32 > 0) {
+        std::vector<uint32_t> line_indices;
+        line_indices.reserve(static_cast<size_t>(tri_count_u32) * 6);
+        for (uint32_t t = 0; t < tri_count_u32; ++t) {
+            const uint32_t i0 = 3u * t + 0u;
+            const uint32_t i1 = 3u * t + 1u;
+            const uint32_t i2 = 3u * t + 2u;
+            line_indices.push_back(i0); line_indices.push_back(i1);
+            line_indices.push_back(i1); line_indices.push_back(i2);
+            line_indices.push_back(i2); line_indices.push_back(i0);
+        }
+        out_gpu.line_index_buffer =
+            helper::createUnifiedMeshBuffer(
+                device,
+                SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                line_indices.size() * sizeof(line_indices[0]),
+                line_indices.data(),
+                std::source_location::current());
+        out_gpu.line_index_count =
+            static_cast<uint32_t>(line_indices.size());
+    }
 }
 
 void CollisionDebugDraw::draw(
@@ -262,6 +377,57 @@ void CollisionDebugDraw::draw(
         sizeof(params));
 
     cmd_buf->draw(gpu.vertex_count);
+}
+
+void CollisionDebugDraw::drawWireframe(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_set_list,
+    const CollisionDebugMeshBuffers& gpu,
+    const glm::mat4& model_transform,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+
+    if (!wireframeReady() || !gpu.wireframeReady()) {
+        return;
+    }
+
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::GRAPHICS,
+        s_wireframe_pipeline_);
+
+    cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+    cmd_buf->setScissors (scissors,  0, uint32_t(scissors.size()));
+
+    // Same vertex bindings as the solid fill -- the wireframe vert
+    // shader is collision_debug.vert (shared) so locations 0 and 15
+    // must remain bound. The wire fragment shader ignores the id
+    // input; binding it anyway keeps pipeline state consistent.
+    std::vector<std::shared_ptr<renderer::Buffer>> buffers = {
+        gpu.position_buffer->buffer,
+        gpu.triangle_id_buffer->buffer,
+    };
+    std::vector<uint64_t> offsets = { 0, 0 };
+    cmd_buf->bindVertexBuffers(0, buffers, offsets);
+
+    cmd_buf->bindIndexBuffer(
+        gpu.line_index_buffer->buffer,
+        /*offset=*/0,
+        renderer::IndexType::UINT32);
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::GRAPHICS,
+        s_pipeline_layout_,
+        desc_set_list);
+
+    glsl::ClusterDebugParams params{};
+    params.transform = model_transform;
+    cmd_buf->pushConstants(
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
+        s_pipeline_layout_,
+        &params,
+        sizeof(params));
+
+    cmd_buf->drawIndexed(gpu.line_index_count);
 }
 
 } // namespace helper

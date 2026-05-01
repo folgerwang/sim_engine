@@ -3195,6 +3195,14 @@ VkPipelineRasterizationStateCreateInfo fillVkPipelineRasterizationStateCreateInf
     rasterizer.depthBiasConstantFactor = rasterization_info.depth_bias_constant_factor; // Optional
     rasterizer.depthBiasClamp = rasterization_info.depth_bias_clamp; // Optional
     rasterizer.depthBiasSlopeFactor = rasterization_info.depth_bias_slope_factor; // Optional
+    if (rasterization_state_override.override_depth_bias) {
+        rasterizer.depthBiasEnable =
+            rasterization_state_override.depth_bias_enable ? VK_TRUE : VK_FALSE;
+        rasterizer.depthBiasConstantFactor =
+            rasterization_state_override.depth_bias_constant_factor;
+        rasterizer.depthBiasSlopeFactor =
+            rasterization_state_override.depth_bias_slope_factor;
+    }
 
     return rasterizer;
 }

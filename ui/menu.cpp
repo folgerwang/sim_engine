@@ -1121,6 +1121,35 @@ bool Menu::draw(
                 show_collision_debug_ = !show_collision_debug_;
             }
 
+            // Collision-shape selector. Switching here flips
+            // `collision_world_dirty_`; application.cpp drains the
+            // flag the next frame, calls device_->waitIdle(), tears
+            // down the existing CollisionWorld, and rebuilds it
+            // with the new shape. Brief stall (~tens of ms on
+            // Bistro), expected for a debug mode change.
+            if (ImGui::BeginMenu("Collision Shape")) {
+                const auto cur = collision_debug_shape_;
+                if (ImGui::MenuItem(
+                        "Original mesh", NULL,
+                        cur == CollisionDebugShape::Original)) {
+                    setCollisionDebugShape(
+                        CollisionDebugShape::Original);
+                }
+                if (ImGui::MenuItem(
+                        "Gap-filled simplified", NULL,
+                        cur == CollisionDebugShape::Simplified)) {
+                    setCollisionDebugShape(
+                        CollisionDebugShape::Simplified);
+                }
+                if (ImGui::MenuItem(
+                        "Volume (5cm voxels)", NULL,
+                        cur == CollisionDebugShape::Volume)) {
+                    setCollisionDebugShape(
+                        CollisionDebugShape::Volume);
+                }
+                ImGui::EndMenu();
+            }
+
             ImGui::EndMenu();
         }
 

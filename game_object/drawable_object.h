@@ -27,6 +27,13 @@ enum class AlphaMode : uint8_t {
 };
 
 struct MaterialInfo {
+    // Source-asset material name (e.g. "MASTER_BistroFloor",
+    // "Wood_Beams_Dark"). Populated at FBX/GLTF load directly from
+    // the source material -- gameplay code can read it to decide
+    // surface-specific behaviour (footstep sounds, friction,
+    // bullet impact decals, etc.). Empty if the source had no name.
+    std::string            name_;
+
     int32_t                base_color_idx_ = -1;
     int32_t                normal_idx_ = -1;
     int32_t                metallic_roughness_idx_ = -1;

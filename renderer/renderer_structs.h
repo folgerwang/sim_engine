@@ -642,6 +642,17 @@ struct RasterizationStateOverride {
     bool double_sided = false;
     bool override_depth_clamp_enable = false;
     bool depth_clamp_enable = false;
+    // Depth-bias override for wireframe-on-top debug passes etc.
+    // When override_depth_bias is true, all three depth_bias_*
+    // fields below are applied to the pipeline regardless of the
+    // base GraphicPipelineInfo's settings. Use a slightly negative
+    // constant factor (e.g. -1.0) to push lines toward the camera
+    // so they win the LESS depth test against the solid fill they
+    // ride on top of.
+    bool override_depth_bias = false;
+    bool depth_bias_enable = false;
+    float depth_bias_constant_factor = 0.0f;
+    float depth_bias_slope_factor = 0.0f;
 };
 
 typedef std::vector<std::shared_ptr<PhysicalDevice>> PhysicalDeviceList;
