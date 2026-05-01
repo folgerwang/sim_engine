@@ -398,10 +398,11 @@ void buildClusterMesh(const Mesh& mesh,
         if (axis_len2 > 1e-12f) {
             cl.cone_axis = sum_n / std::sqrt(axis_len2);
 
-            // Cutoff = min dot(axis, per-face unit normal). If any face
-            // disagrees too much (triangle-pair clusters at sharp creases),
-            // this may go negative — in which case back-face culling the
-            // cluster is unsafe and we fall back to "don't cull".
+            // Compute min dot(axis, face_normal) = cos(θ_max), the cosine of
+            // the largest angle between any face normal and the cone axis.
+            // If any face points more than 90° from the axis (min_dot <= 0),
+            // the cone spans more than a hemisphere — back-face culling the
+            // cluster is unsafe, so we mark it uncullable.
             float min_dot = 1.0f;
             for (uint32_t f : cl.face_indices) {
                 const Face& face = faces[f];
@@ -413,10 +414,31 @@ void buildClusterMesh(const Mesh& mesh,
                 n /= std::sqrt(l2);
                 min_dot = std::min(min_dot, glm::dot(cl.cone_axis, n));
             }
-            // Safety margin: if any face normal makes more than ~90° with the
-            // axis (min_dot <= 0), the cone isn't useful for back-face
-            // culling — disable it for this cluster.
-            cl.cone_cutoff = (min_dot > 0.0f) ? min_dot : -1.0f;
+
+            // Store SINE of the cone half-angle, not cosine.
+            //
+            // The GPU cull test is:
+            //   view_dir = normalize(cluster_center - camera_pos)  // cam→cluster
+            //   cull if: dot(view_dir, cone_axis) >= cone_cutoff
+            //
+            // A cluster is all-backfacing when every face normal n satisfies
+            // dot(n, view_dir) > 0. With cone half-angle θ, the minimum dot
+            // product of any cone normal with view_dir is cos(φ + θ) where φ
+            // is the angle between view_dir and cone_axis. For all-backfacing:
+            //   cos(φ + θ) > 0  →  φ < π/2 − θ  →  cos(φ) > sin(θ)
+            //   i.e.  dot(view_dir, cone_axis) > sin(θ)
+            //
+            // So the threshold stored must be sin(θ) = sqrt(1 − cos²(θ)).
+            // Storing cos(θ) directly (the previous approach) is wrong for any
+            // θ > 45° and causes aggressive false-culling of clusters at creases,
+            // corners, and curved surfaces.
+            //
+            // Sentinel −1.0 means "don't cull" (cone too wide to be useful).
+            if (min_dot > 0.0f) {
+                cl.cone_cutoff = std::sqrt(1.0f - min_dot * min_dot);  // = sin(θ)
+            } else {
+                cl.cone_cutoff = -1.0f;  // uncullable
+            }
         } else {
             // Degenerate cluster (e.g. all triangles collinear).
             cl.cone_axis   = glm::vec3(0.0f, 0.0f, 1.0f);

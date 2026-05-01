@@ -136,8 +136,15 @@ public:
         const std::shared_ptr<er::DescriptorPool>& descriptor_pool,
         const glm::vec3& light_dir);
 
-    const glm::vec3& getLightDir() {
+    const glm::vec3& getLightDir() const {
         return m_view_camera_params_.init_camera_dir;
+    }
+
+    // Update the light direction each frame (e.g. from Skydome::getSunDir()).
+    // dir must be a unit vector pointing FROM the sun TOWARD the scene
+    // (i.e. negate Skydome::getSunDir() which points ground→sun).
+    void setLightDir(const glm::vec3& dir) {
+        m_view_camera_params_.init_camera_dir = dir;
     }
 
     // Allocate the 4 per-cascade storage buffers and descriptor sets.

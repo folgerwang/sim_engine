@@ -53,10 +53,13 @@ struct MeshletCluster {
     glm::vec3 aabb_min = glm::vec3( std::numeric_limits<float>::max());
     glm::vec3 aabb_max = glm::vec3(-std::numeric_limits<float>::max());
     // Normal cone for back-face culling whole clusters at once:
-    //   axis    — averaged face normal (unit length)
-    //   cutoff  — cos(max angle between axis and any face normal in cluster).
-    // Cull rule: if dot(view_dir_from_cluster, cone_axis) >= cone_cutoff,
-    // every triangle faces away from the camera and the cluster is skippable.
+    //   axis    — area-weighted average face normal (unit length, local space)
+    //   cutoff  — sin(θ_max), where θ_max is the maximum angle between the
+    //             axis and any face normal in the cluster.
+    //             Stored as sin not cos so the GPU test is simply:
+    //               cull if dot(normalize(cluster_center - cam_pos), axis) >= cutoff
+    //             (see cluster_mesh.cpp for the full derivation).
+    //             cutoff = −1 means "never cull" (cone too wide / degenerate).
     glm::vec3 cone_axis   = glm::vec3(0.0f, 0.0f, 1.0f);
     float     cone_cutoff = -1.0f;  // -1 = "don't cull" (safe default)
 

@@ -742,7 +742,6 @@ void IblCreator::createIblDiffuseMap(
         { ibl_tex_desc_set_ });
 
     cmd_buf->draw(3);
-
     cmd_buf->endRenderPass();
 
     cmd_buf->addImageBarrier(
@@ -865,15 +864,34 @@ namespace {
 
 // EMA blend weight applied to each touched texel's new partial estimate.
 // Lower = smoother (more samples averaged) but slower to react to sun /
-// atmosphere parameter changes.  Tuned for visibly-stable convergence
-// within ~1-2 seconds at 60 fps for a slowly-moving sky.
-//   alpha = 1/8  ->  ~16 effective full touches averaged
-//                ->  ~240 effective samples once steady-state reached
-//                    with NUM_SAMPLES_PER_FRAME = 16
-// Set lower (e.g. 1/32) for higher quality with slower adaptation, or
-// higher (e.g. 1/2) for faster response to sky changes at the cost of
-// more flicker.
-constexpr float kIblTemporalAlpha = 1.0f / 8.0f;
+// atmosphere parameter changes.
+//
+//   alpha = 1/8   ->  ~16 effective touches averaged  (~240 effective samples)
+//                     convergence lag ~ 512 frames = 8.5 s @ 60 fps
+//                     IBL visibly lags the sky; appears frozen at slow TOD speeds.
+//
+//   alpha = 1/2   ->  ~3 effective touches averaged   (~48 effective samples)
+//                     90% convergence in ~192 frames = 3.2 s @ 60 fps
+//
+//   alpha = 1/4   ->  ~5 effective touches averaged  (~112 effective samples)
+//                     90% convergence in ~320 frames = 5.3 s @ 60 fps
+//                     At tod_advance_speed=100 the sun moves ~2.2° during that
+//                     window — imperceptible at midday, very small near horizon.
+//                     Enough temporal smoothing to suppress 16-sample variance.
+//
+//   alpha = 1.0   ->  no EMA; immediate replacement each touch
+//                     IBL converges in one 64-frame dither cycle (≈1 s @ 60 fps)
+//                     Causes visible per-pixel flicker on the diffuse buffer:
+//                     the Lambertian kernel draws 16 random hemisphere samples
+//                     whose variance is directly visible with no smoothing.
+//
+// alpha = 1/8 caused "IBL never changes" at tod_advance_speed=100: the sun only
+// moves ~3.5° during the 512-frame lag, which is invisible at midday and barely
+// perceptible near the horizon.
+// alpha = 1.0 caused diffuse flicker: 16 samples/touch have high variance with
+// no temporal smoothing.  1/4 is the middle ground: fast enough to track the
+// sky, smooth enough to suppress noise.
+constexpr float kIblTemporalAlpha = 1.0f / 4.0f;
 
 // Dispatch one compute pass for a single mip of one IBL filter.  Handles
 // the dither-stride decision (8 for big mips, 1 for small ones), the
@@ -939,12 +957,22 @@ void dispatchIblMiniMip(
     // After that, the previous frame's contents must be preserved (the
     // shader reads each touched texel for EMA blending), so we come from
     // SHADER_READ_ONLY_OPTIMAL.
+    //
+    // IMPORTANT: the non-first-touch path does imageLoad + imageStore (EMA).
+    // Using getImageAsStore() (dstAccess = SHADER_WRITE only) does NOT make
+    // prior writes visible to imageLoad reads — use getImageAsLoadStore()
+    // (dstAccess = SHADER_READ | SHADER_WRITE) so the GPU flushes its shader
+    // read cache before the compute dispatch.  Without this, imageLoad returns
+    // stale/undefined values on frames where the cache was evicted, causing
+    // sudden IBL intensity jumps.
     cmd_buf->addImageBarrier(
         dst_image,
         is_first_touch
             ? er::Helper::getImageAsSource()
             : er::Helper::getImageAsShaderSampler(),
-        er::Helper::getImageAsStore(),
+        is_first_touch
+            ? er::Helper::getImageAsStore()      // first touch: write-only block fill
+            : er::Helper::getImageAsLoadStore(), // EMA path: imageLoad + imageStore
         mip_level, 1, 0, 6);
 
     cmd_buf->pushConstants(

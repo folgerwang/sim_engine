@@ -76,6 +76,10 @@ class Menu {
     ImTextureID bg_texture_id_ = ImTextureID(0);
     bool bg_enabled_ = true;  // set to false once scene meshes are loaded
 
+    // Analog clock face overlay — loaded from assets/ui/clock_face.png.
+    std::shared_ptr<renderer::TextureInfo> clock_tex_info_;
+    ImTextureID clock_tex_id_ = ImTextureID(0);
+
     // Device + sampler kept for re-registering textures / cleanup.
     std::shared_ptr<renderer::Device> device_;
     std::shared_ptr<renderer::Sampler> sampler_;
@@ -96,25 +100,20 @@ class Menu {
     std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
 
     // ---- Time-of-day -------------------------------------------------------
-    // Hours in [0, 24).  The sun direction in `Skydome::update` is derived
-    // from this value.  IMPORTANT: the value is fed straight into the
-    // hour-angle calculation that interprets it as **UTC**, not local
-    // time, because the application's day-of-year/minute/second come
-    // from gmtime_s().  So `tod_hours_ = 12.0` means UTC 12:00, which
-    // for the hardcoded Mountain View coordinates (longitude -122) is
-    // local 04:00 - sun below horizon, dark sky.  Default is 22.0 to
-    // match the value the old hardcoded path used (≈ local 14:00 at MV,
-    // sun high, bright sky).  If you change the hardcoded latitude /
-    // longitude, retune this default accordingly, or swap in a localtime
-    // conversion in the application.
+    // Hours in [0, 24) in the player's **local timezone**.  Initialised
+    // at startup from localtime_s / localtime_r so the sun position and
+    // the clock overlay both reflect the player's local time of day.
+    // The hour-angle formula in Skydome::update treats this value as
+    // local solar time, so local noon (12.0) puts the sun at its highest
+    // point for the configured latitude/longitude.
     //
     // When the user yanks the slider by more than tod_jump_threshold_
     // in a single frame we treat it as a "skip" (debug "go to dawn"
     // button etc.) and the application will reset the sky / IBL mini-
     // buffers so they re-bootstrap instead of EMA-blending toward the
     // new lighting over many seconds.
-    float tod_hours_ = 22.0f;
-    float tod_prev_hours_ = 22.0f;
+    float tod_hours_      = 0.0f;  // overwritten in constructor from local wall clock
+    float tod_prev_hours_ = 0.0f;
     bool  tod_auto_advance_ = true;      // tick forward with real time
     // Speed factor: game time / real time.  100.0 means 1 real-second
     // advances the in-game clock by 100 game-seconds, so a full 24-hour

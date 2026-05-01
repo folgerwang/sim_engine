@@ -126,6 +126,25 @@ er::BufferInfo createIndexBuffer(
     return buffer;
 }
 
+er::ShaderModuleList getSkyboxEnvmapShaderModules(
+    std::shared_ptr<er::Device> device)
+{
+    er::ShaderModuleList shader_modules(2);
+    shader_modules[0] =
+        er::helper::loadShaderModule(
+            device,
+            "skybox_envmap_vert.spv",
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+    shader_modules[1] =
+        er::helper::loadShaderModule(
+            device,
+            "skybox_envmap_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
+    return shader_modules;
+}
+
 er::WriteDescriptorList addSkyboxTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
@@ -717,52 +736,310 @@ void Skydome::recreate(
     // Rebind the mini-buffer compute descriptor set against the new pool.
     // The compute pipeline / layout themselves do not depend on display_size
     // and are kept across recreate() calls.
-    if (cube_skybox_mini_desc_set_layout_ != nullptr) {
-        bindMiniSkyBoxTargets(device, descriptor_pool, rt_envmap_tex);
-    }
+    bindMiniSkyBoxTargets(device, descriptor_pool, rt_envmap_tex);
 }
 
-// render skybox.
+void Skydome::updateCubeSkyBoxMini(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::TextureInfo& rt_envmap_tex,
+    const uint32_t& cube_size) {
+
+    const uint32_t mini_size     = std::max(1u, cube_size / 8u);
+    const uint32_t num_mips      = static_cast<uint32_t>(std::log2(cube_size) + 1);
+    const glm::ivec2 dither      = ditherOffsetForFrame(mini_frame_index_);
+    const bool is_first_touch    = (mini_frame_index_ == 0u);
+
+    // ── Push-constant payload ─────────────────────────────────────────────
+    glsl::SunSkyMiniParams params = {};
+    params.sun_pos                    = sun_dir_;
+    params.g                          = g_;
+    params.inv_rayleigh_scale_height  = 1.0f / rayleigh_scale_height_;
+    params.inv_mie_scale_height       = 1.0f / mie_scale_height_;
+    params.cube_size                  = static_cast<int>(cube_size);
+    params.mini_size                  = static_cast<int>(mini_size);
+    params.dither_offset              = dither;
+    params.frame_index                = static_cast<int>(mini_frame_index_);
+    params.is_first_touch             = is_first_touch ? 1 : 0;
+
+    // ── Transition mini-buffer → GENERAL (imageStore target) ─────────────
+    // On first touch the image is in UNDEFINED (just allocated); after that
+    // the previous frame's dispatch left it in SHADER_READ_ONLY_OPTIMAL.
+    cmd_buf->addImageBarrier(
+        mini_envmap_tex_.image,
+        is_first_touch
+            ? er::Helper::getImageAsSource()        // UNDEFINED
+            : er::Helper::getImageAsShaderSampler(),// SHADER_READ_ONLY
+        er::Helper::getImageAsStore(),              // → GENERAL
+        0, 1, 0, 6);
+
+    // ── Transition full-res envmap mip 0 → GENERAL ───────────────────────
+    // The compute shader writes only mip 0 of the envmap (imageStore on the
+    // base mip of the view). On first touch the mip is UNDEFINED; on
+    // subsequent frames it was left in SHADER_READ_ONLY_OPTIMAL by the
+    // previous call's mip-chain generation.
+    cmd_buf->addImageBarrier(
+        rt_envmap_tex.image,
+        is_first_touch
+            ? er::Helper::getImageAsSource()
+            : er::Helper::getImageAsShaderSampler(),
+        er::Helper::getImageAsStore(),
+        0, 1, 0, 6);
+
+    // ── Dispatch ──────────────────────────────────────────────────────────
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::COMPUTE,
+        cube_skybox_mini_pipeline_);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        cube_skybox_mini_pipeline_layout_,
+        &params,
+        sizeof(params));
+
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::COMPUTE,
+        cube_skybox_mini_pipeline_layout_,
+        { cube_skybox_mini_desc_set_ });
+
+    // Each workgroup covers one 8x8 block of mini texels; z=6 for cube faces.
+    const uint32_t groups = (mini_size + 7u) / 8u;
+    cmd_buf->dispatch(groups, groups, 6u);
+
+    // ── Transition mini-buffer → SHADER_READ_ONLY ─────────────────────────
+    cmd_buf->addImageBarrier(
+        mini_envmap_tex_.image,
+        er::Helper::getImageAsStore(),
+        er::Helper::getImageAsShaderSampler(),
+        0, 1, 0, 6);
+
+    // ── Transition envmap mip 0 → SHADER_READ_ONLY, regenerate mip chain ──
+    // generateMipmapLevels expects mip 0 in SHADER_READ_ONLY_OPTIMAL as its
+    // blit source; it transitions each destination mip from UNDEFINED and
+    // blits down, leaving the full chain in SHADER_READ_ONLY_OPTIMAL when
+    // done. The IBL mini compute shaders sample the envmap via textureLod
+    // and need the full chain to be readable from the next frame onward.
+    cmd_buf->addImageBarrier(
+        rt_envmap_tex.image,
+        er::Helper::getImageAsStore(),
+        er::Helper::getImageAsShaderSampler(),
+        0, 1, 0, 6);
+
+    if (num_mips > 1) {
+        renderer::Helper::generateMipmapLevels(
+            cmd_buf,
+            rt_envmap_tex.image,
+            num_mips,
+            cube_size,
+            cube_size,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    // Advance the dither frame counter so the next call uses a fresh
+    // (dx, dy) offset.  Stays in sync with IblCreator::mini_frame_index_
+    // which is advanced at the end of updateIblSheenMapMini.
+    ++mini_frame_index_;
+}
+
+
+// ─── draw ────────────────────────────────────────────────────────────────────
+// Renders the skybox into the current render pass using the full-resolution
+// atmospheric scattering shader.  Called once per frame inside the main
+// forward render pass.
 void Skydome::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const std::shared_ptr<renderer::DescriptorSet>& view_desc_set) {
+    const std::shared_ptr<renderer::DescriptorSet>& frame_desc_set) {
+
+    glsl::SunSkyParams params = {};
+    params.sun_pos                  = sun_dir_;
+    params.g                        = g_;
+    params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
+    params.inv_mie_scale_height     = 1.0f / mie_scale_height_;
+
     cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS, skybox_pipeline_);
-    std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
-    std::vector<uint64_t> offsets(1);
-    buffers[0] = vertex_buffer_.buffer;
-    offsets[0] = 0;
-
-    cmd_buf->bindVertexBuffers(0, buffers, offsets);
-    cmd_buf->bindIndexBuffer(index_buffer_.buffer, 0, renderer::IndexType::UINT16);
-
-    glsl::SunSkyParams sun_sky_params = {};
-    sun_sky_params.sun_pos = sun_dir_;
-    sun_sky_params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
-    sun_sky_params.inv_mie_scale_height = 1.0f / mie_scale_height_;
-    sun_sky_params.g = g_;
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
         skybox_pipeline_layout_,
-        &sun_sky_params,
-        sizeof(sun_sky_params));
+        &params,
+        sizeof(params));
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
         skybox_pipeline_layout_,
-        {skybox_tex_desc_set_, view_desc_set });
+        { skybox_tex_desc_set_, frame_desc_set });
 
+    std::vector<std::shared_ptr<renderer::Buffer>> buffers = { vertex_buffer_.buffer };
+    std::vector<uint64_t> offsets = { 0 };
+    cmd_buf->bindVertexBuffers(0, buffers, offsets);
+
+    cmd_buf->bindIndexBuffer(
+        index_buffer_.buffer,
+        0,
+        renderer::IndexType::UINT16);
+
+    // 6 cube faces × 6 indices each = 36 indices.
     cmd_buf->drawIndexed(36);
 }
 
+// ─── initEnvmapBackgroundPipeline ────────────────────────────────────────────
+// Creates the descriptor set layout, pipeline layout, pipeline, and descriptor
+// set for the fullscreen sky envmap background pass.
+//
+// Uses the dynamic-rendering pipeline variant (no VkRenderPass) so it works
+// with the engine's main forward pass which uses vkCmdBeginRenderingKHR.
+// Depth state: LESS_OR_EQUAL / no write — the sky quad is at z=1.0 (far
+// plane) so it only draws where the depth buffer still holds 1.0 (background).
+void Skydome::initEnvmapBackgroundPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const renderer::TextureInfo& rt_envmap_tex,
+    const std::shared_ptr<renderer::Sampler>& texture_sampler,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats) {
+
+    // ── Tear down any previous instance (swap-chain rebuild) ─────────────────
+    if (skybox_envmap_pipeline_layout_ != nullptr) {
+        device->destroyPipelineLayout(skybox_envmap_pipeline_layout_);
+        skybox_envmap_pipeline_layout_ = nullptr;
+    }
+    if (skybox_envmap_pipeline_ != nullptr) {
+        device->destroyPipeline(skybox_envmap_pipeline_);
+        skybox_envmap_pipeline_ = nullptr;
+    }
+    // Descriptor set and layout are pool-allocated; the pool is recreated on
+    // swap-chain rebuild, so simply release the shared_ptrs.
+    skybox_envmap_desc_set_ = nullptr;
+    skybox_envmap_desc_set_layout_ = nullptr;
+
+    // ── Descriptor set layout: envmap cubemap sampler at binding 0 ───────────
+    skybox_envmap_desc_set_layout_ =
+        device->createDescriptorSetLayout(
+            { er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                ENVMAP_TEX_INDEX,
+                SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER) });
+
+    // ── Pipeline layout: push constant carries SkyboxEnvmapParams (mat4) ─────
+    er::PushConstantRange push_const_range{};
+    push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
+    push_const_range.offset      = 0;
+    push_const_range.size        = sizeof(glsl::SkyboxEnvmapParams);
+
+    skybox_envmap_pipeline_layout_ = device->createPipelineLayout(
+        { skybox_envmap_desc_set_layout_ },
+        { push_const_range },
+        std::source_location::current());
+
+    // ── Pipeline state ────────────────────────────────────────────────────────
+    // Depth test ON (LESS_OR_EQUAL), depth write OFF — sky at z=1.0 only
+    // draws on pixels where no geometry has been rasterized.
+    auto depth_stencil = std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+        er::helper::fillPipelineDepthStencilStateCreateInfo(
+            true,   // depth_test_enable
+            false,  // depth_write_enable
+            er::CompareOp::LESS_OR_EQUAL));
+
+    // No blending, no back-face culling (fullscreen triangle has no culling issue).
+    auto blend_state = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+        er::helper::fillPipelineColorBlendStateCreateInfo(
+            { er::helper::fillPipelineColorBlendAttachmentState() }));
+    auto raster_info = std::make_shared<er::PipelineRasterizationStateCreateInfo>(
+        er::helper::fillPipelineRasterizationStateCreateInfo(
+            false, false,
+            er::PolygonMode::FILL,
+            SET_FLAG_BIT(CullMode, NONE)));
+    auto ms_info = std::make_shared<er::PipelineMultisampleStateCreateInfo>(
+        er::helper::fillPipelineMultisampleStateCreateInfo());
+
+    er::GraphicPipelineInfo pipeline_info;
+    pipeline_info.blend_state_info   = blend_state;
+    pipeline_info.rasterization_info = raster_info;
+    pipeline_info.ms_info            = ms_info;
+    pipeline_info.depth_stencil_info = depth_stencil;
+
+    er::PipelineInputAssemblyStateCreateInfo input_assembly;
+    input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
+    input_assembly.restart_enable = false;
+
+    skybox_envmap_pipeline_ = device->createPipeline(
+        skybox_envmap_pipeline_layout_,
+        {}, {},        // no vertex bindings — vertices generated in the shader
+        input_assembly,
+        pipeline_info,
+        getSkyboxEnvmapShaderModules(device),
+        renderbuffer_formats,
+        er::RasterizationStateOverride{},
+        std::source_location::current());
+
+    // ── Descriptor set: bind rt_envmap_tex as the source cubemap sampler ─────
+    skybox_envmap_desc_set_ =
+        device->createDescriptorSets(
+            descriptor_pool,
+            skybox_envmap_desc_set_layout_, 1)[0];
+
+    er::WriteDescriptorList desc_writes;
+    er::Helper::addOneTexture(
+        desc_writes,
+        skybox_envmap_desc_set_,
+        er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        ENVMAP_TEX_INDEX,
+        texture_sampler,
+        rt_envmap_tex.view,
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    device->updateDescriptorSets(desc_writes);
+}
+
+// ─── drawEnvmap ──────────────────────────────────────────────────────────────
+// Draws the sky envmap as a fullscreen background triangle into the currently
+// active dynamic rendering pass.  The pipeline depth state (LESS_OR_EQUAL,
+// no write) ensures sky only fills pixels where no geometry was rasterized
+// (depth buffer == 1.0 = far-plane cleared value).
+//
+// Must be called after initEnvmapBackgroundPipeline() and inside a dynamic
+// rendering pass that exposes the forward color + depth attachments.
+void Skydome::drawEnvmap(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const glm::mat4& inv_view_proj_relative) {
+
+    glsl::SkyboxEnvmapParams params = {};
+    params.inv_view_proj_relative = inv_view_proj_relative;
+
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::GRAPHICS,
+        skybox_envmap_pipeline_);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        skybox_envmap_pipeline_layout_,
+        &params,
+        sizeof(params));
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::GRAPHICS,
+        skybox_envmap_pipeline_layout_,
+        { skybox_envmap_desc_set_ });
+
+    // 3 vertices: fullscreen triangle generated entirely in the vertex shader.
+    cmd_buf->draw(3);
+}
+
+// ─── drawCubeSkyBox ──────────────────────────────────────────────────────────
+// One-shot high-quality bake of the full-resolution sky cubemap using a
+// fragment shader that outputs all 6 faces in a single draw (layered
+// framebuffer attachment).  Generates the full mip chain afterwards.
+//
+// Used as the initial bootstrap before the dithered mini-buffer path takes
+// over.  In the current app flow this is no longer called (the mini-buffer
+// path replaces it with is_first_touch block-fill on frame 0), but the method
+// is retained for debug/tooling use and as a fallback.
 void Skydome::drawCubeSkyBox(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::RenderPass>& render_pass,
     const renderer::TextureInfo& rt_envmap_tex,
-    const std::vector<er::ClearValue>& clear_values,
-    const uint32_t& cube_size)
-{
-    // generate envmap from skybox.
+    const std::vector<renderer::ClearValue>& clear_values,
+    const uint32_t& cube_size) {
+
+    // Transition mip 0 of the envmap from whatever layout it is in to
+    // COLOR_ATTACHMENT_OPTIMAL so the render pass can write to it.
     cmd_buf->addImageBarrier(
         rt_envmap_tex.image,
         renderer::Helper::getImageAsSource(),
@@ -773,267 +1050,387 @@ void Skydome::drawCubeSkyBox(
         renderer::PipelineBindPoint::GRAPHICS,
         cube_skybox_pipeline_);
 
-    std::vector<renderer::ClearValue> envmap_clear_values(6, clear_values[0]);
+    glsl::SunSkyParams params = {};
+    params.sun_pos                   = sun_dir_;
+    params.g                         = g_;
+    params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
+    params.inv_mie_scale_height      = 1.0f / mie_scale_height_;
+
+    // The framebuffers[0] entry is the full-resolution layered framebuffer
+    // covering all 6 cube faces at mip 0, created by createCubemapTexture().
+    std::vector<renderer::ClearValue> cube_clear_values(6, clear_values[0]);
     cmd_buf->beginRenderPass(
         render_pass,
         rt_envmap_tex.framebuffers[0],
-        glm::uvec2(cube_size),
-        envmap_clear_values);
-
-    glsl::SunSkyParams sun_sky_params = {};
-    sun_sky_params.sun_pos = sun_dir_;
-    sun_sky_params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
-    sun_sky_params.inv_mie_scale_height = 1.0f / mie_scale_height_;
-    sun_sky_params.g = g_;
+        glm::uvec2(cube_size, cube_size),
+        cube_clear_values);
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
         cube_skybox_pipeline_layout_,
-        &sun_sky_params,
-        sizeof(sun_sky_params));
+        &params,
+        sizeof(params));
 
     cmd_buf->bindDescriptorSets(
         renderer::PipelineBindPoint::GRAPHICS,
         cube_skybox_pipeline_layout_,
         { skybox_tex_desc_set_ });
 
+    // Full-screen triangle — the vertex shader produces clip-space positions
+    // from gl_VertexIndex with no vertex buffer.  The fragment shader loops
+    // over all 6 faces and writes to layered output attachments.
     cmd_buf->draw(3);
 
     cmd_buf->endRenderPass();
 
-    uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
-
-    renderer::Helper::generateMipmapLevels(
-        cmd_buf,
-        rt_envmap_tex.image,
-        num_mips,
-        cube_size,
-        cube_size,
-        renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-}
-
-void Skydome::updateCubeSkyBoxMini(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const renderer::TextureInfo& rt_envmap_tex,
-    const uint32_t& cube_size) {
-
-    // First-touch handling: on the very first call the envmap image is
-    // still in UNDEFINED layout and contains garbage memory, so we use
-    // the shader's "fill the whole 8x8 block with this thread's sample"
-    // path to initialize every texel in one cheap dispatch.  Every later
-    // call assumes mip 0 holds a valid prior frame's contents and uses
-    // the regular sparse 1-of-64 dither + scatter path.
-    const bool is_first_touch = (mini_frame_index_ == 0u);
     const uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
-
-    // Full-res envmap mip 0: layout transition to GENERAL.  On first
-    // touch the image is in UNDEFINED and we'll overwrite every texel
-    // anyway, so getImageAsSource() (UNDEFINED) is the correct src.
-    // After that, mip 0 holds the previous frame's data we want to
-    // preserve (the shader only overwrites a 1/64 sparse subset), so we
-    // come from SHADER_READ_ONLY_OPTIMAL.
-    cmd_buf->addImageBarrier(
-        rt_envmap_tex.image,
-        is_first_touch
-            ? renderer::Helper::getImageAsSource()
-            : renderer::Helper::getImageAsShaderSampler(),
-        renderer::Helper::getImageAsStore(),
-        0, 1, 0, 6);
-
-    // Mini-buffer is fully overwritten every frame, so discarding the old
-    // contents (UNDEFINED via getImageAsSource) is fine and avoids
-    // requiring a known prior layout.
-    cmd_buf->addImageBarrier(
-        mini_envmap_tex_.image,
-        renderer::Helper::getImageAsSource(),
-        renderer::Helper::getImageAsStore(),
-        0, 1, 0, 6);
-
-    cmd_buf->bindPipeline(
-        renderer::PipelineBindPoint::COMPUTE,
-        cube_skybox_mini_pipeline_);
-
-    glsl::SunSkyMiniParams params = {};
-    params.sun_pos = sun_dir_;
-    params.g = g_;
-    params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
-    params.inv_mie_scale_height = 1.0f / mie_scale_height_;
-    params.cube_size = static_cast<int>(cube_size);
-    params.mini_size = static_cast<int>(std::max(1u, cube_size / 8u));
-
-    const glm::ivec2 dither = ditherOffsetForFrame(mini_frame_index_);
-    params.dither_offset = dither;
-    params.frame_index = static_cast<int>(mini_frame_index_);
-    params.is_first_touch = is_first_touch ? 1 : 0;
-
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        cube_skybox_mini_pipeline_layout_,
-        &params,
-        sizeof(params));
-
-    cmd_buf->bindDescriptorSets(
-        renderer::PipelineBindPoint::COMPUTE,
-        cube_skybox_mini_pipeline_layout_,
-        { cube_skybox_mini_desc_set_ });
-
-    // Dispatch one thread per mini-buffer texel.  local_size is (8, 8, 1).
-    const uint32_t mini_size = static_cast<uint32_t>(params.mini_size);
-    const uint32_t group_xy = (mini_size + 7u) / 8u;
-    cmd_buf->dispatch(group_xy, group_xy, 6u);
-
-    // Transition the mini-buffer to a sampleable state so the IBL Debug
-    // window (and any future passes) can read it.
-    cmd_buf->addImageBarrier(
-        mini_envmap_tex_.image,
-        renderer::Helper::getImageAsStore(),
-        renderer::Helper::getImageAsShaderSampler(),
-        0, 1, 0, 6);
-
-    // Mip 0 has been partially refreshed in GENERAL layout.  Hand it
-    // straight to generateMipmapLevels with cur_image_layout=GENERAL so
-    // it issues a proper GENERAL -> TRANSFER_SRC_OPTIMAL barrier on mip 0
-    // before reading.  (The earlier code did GENERAL -> UNDEFINED -> ...
-    // which is *invalid* per the Vulkan spec - newLayout cannot be
-    // UNDEFINED - and on strict drivers leaves mip 0 logically discarded,
-    // producing concentric-ring banding patterns in the regenerated
-    // mip chain.)
-    renderer::Helper::generateMipmapLevels(
-        cmd_buf,
-        rt_envmap_tex.image,
-        num_mips,
-        cube_size,
-        cube_size,
-        renderer::ImageLayout::GENERAL);
-
-    ++mini_frame_index_;
-}
-
-void Skydome::update(float latitude, float longtitude, int d, int th, int tm, int ts) {
-    float latitude_r = glm::radians(latitude);
-    float decline_angle = glm::radians(
-        -23.44f * cos(2.0f * PI / 365.0f * (d + 10.0f)));
-    float t = th + tm / 60.0f + ts / 3600.0f;
-    float h = -15.0f * (t - 12.0f);
-    float delta_h = glm::radians(h - longtitude);
-
-    sun_dir_.x = cos(latitude_r) * sin(decline_angle) - sin(latitude_r) * cos(decline_angle) * cos(delta_h);
-    sun_dir_.z = cos(decline_angle) * sin(delta_h);
-    sun_dir_.y = sin(latitude_r) * sin(decline_angle) + cos(latitude_r) * cos(decline_angle) * cos(delta_h);
-}
-
-void Skydome::updateSkyScatteringLut(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
-
-    if (rayleigh_scale_height_ != lut_rayleigh_scale_height_ ||
-        mie_scale_height_ != lut_mie_scale_height_) {
-        renderer::helper::transitMapTextureToStoreImage(
+    if (num_mips > 1) {
+        renderer::Helper::generateMipmapLevels(
             cmd_buf,
-            { sky_scattering_lut_tex_.image,
-                sky_scattering_lut_sum_tex_.image });
-
-        const uint32_t scattering_lut_height_group =
-            (kAtmosphereScatteringLutHeight + kAtmosphereScatteringLutGroupSize - 1) /
-            kAtmosphereScatteringLutGroupSize;
-
-        {
-            cmd_buf->bindPipeline(
-                renderer::PipelineBindPoint::COMPUTE,
-                sky_scattering_lut_first_pass_pipeline_);
-
-            glsl::SkyScatteringParams params = {};
-            params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
-            params.inv_mie_scale_height = 1.0f / mie_scale_height_;
-
-            cmd_buf->pushConstants(
-                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                sky_scattering_lut_first_pass_pipeline_layout_,
-                &params,
-                sizeof(params));
-
-            cmd_buf->bindDescriptorSets(
-                renderer::PipelineBindPoint::COMPUTE,
-                sky_scattering_lut_first_pass_pipeline_layout_,
-                { sky_scattering_lut_first_pass_desc_set_ });
-
-            cmd_buf->dispatch(
-                kAtmosphereScatteringLutWidth,
-                scattering_lut_height_group,
-                1);
-        }
-
-        {
-            cmd_buf->bindPipeline(
-                renderer::PipelineBindPoint::COMPUTE,
-                sky_scattering_lut_sum_pass_pipeline_);
-
-            cmd_buf->bindDescriptorSets(
-                renderer::PipelineBindPoint::COMPUTE,
-                sky_scattering_lut_sum_pass_pipeline_layout_,
-                { sky_scattering_lut_sum_pass_desc_set_ });
-
-            cmd_buf->dispatch(
-                kAtmosphereScatteringLutWidth,
-                1,
-                1);
-        }
-
-        {
-            cmd_buf->bindPipeline(
-                renderer::PipelineBindPoint::COMPUTE,
-                sky_scattering_lut_final_pass_pipeline_);
-
-            cmd_buf->bindDescriptorSets(
-                renderer::PipelineBindPoint::COMPUTE,
-                sky_scattering_lut_final_pass_pipeline_layout_,
-                { sky_scattering_lut_final_pass_desc_set_ });
-
-            cmd_buf->dispatch(
-                kAtmosphereScatteringLutWidth,
-                scattering_lut_height_group,
-                1);
-        }
-
-        renderer::helper::transitMapTextureFromStoreImage(
-            cmd_buf,
-            { sky_scattering_lut_tex_.image,
-              sky_scattering_lut_sum_tex_.image });
-
-        lut_rayleigh_scale_height_ = rayleigh_scale_height_;
-        lut_mie_scale_height_ = mie_scale_height_;
+            rt_envmap_tex.image,
+            num_mips,
+            cube_size,
+            cube_size,
+            renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
     }
 }
 
-void Skydome::destroy(
-    const std::shared_ptr<renderer::Device>& device) {
-    vertex_buffer_.destroy(device);
-    index_buffer_.destroy(device);
+// ─── update ──────────────────────────────────────────────────────────────────
+// Computes the sun direction from geographic coordinates and time of day using
+// the Spencer (1971) / Michalsky (1988) solar position approximation.
+//
+// Coordinate system: world-space Y-up (matches the engine convention used
+// throughout the atmospheric scattering shaders).  The returned vector points
+// FROM the earth TOWARD the sun and is not normalized — the shader normalizes
+// it via normalize(params.sun_pos).
+//
+// Parameters
+//   latitude   — degrees north (positive) / south (negative)
+//   longtitude — degrees east (positive) / west (negative)  [sic: typo in API]
+//   d          — day of year (0 = Jan 1)
+//   h/m/s      — local solar time (hour, minute, second)
+void Skydome::update(
+    float latitude,
+    float longtitude,
+    int d,
+    int h,
+    int m,
+    int s) {
 
-    sky_scattering_lut_tex_.destroy(device);
-    sky_scattering_lut_sum_tex_.destroy(device);
-    mini_envmap_tex_.destroy(device);
+    constexpr float kDegToRad = glm::pi<float>() / 180.0f;
 
-    device->destroyDescriptorSetLayout(skybox_desc_set_layout_);
-    device->destroyPipelineLayout(skybox_pipeline_layout_);
-    device->destroyPipeline(skybox_pipeline_);
-    device->destroyPipelineLayout(cube_skybox_pipeline_layout_);
-    device->destroyPipeline(cube_skybox_pipeline_);
+    // Fractional hour in local solar time.
+    const float t_hours = static_cast<float>(h)
+                        + static_cast<float>(m) / 60.0f
+                        + static_cast<float>(s) / 3600.0f;
 
-    device->destroyDescriptorSetLayout(sky_scattering_lut_first_pass_desc_set_layout_);
-    device->destroyDescriptorSetLayout(sky_scattering_lut_sum_pass_desc_set_layout_);
-    device->destroyDescriptorSetLayout(sky_scattering_lut_final_pass_desc_set_layout_);
-    device->destroyPipelineLayout(sky_scattering_lut_first_pass_pipeline_layout_);
-    device->destroyPipelineLayout(sky_scattering_lut_sum_pass_pipeline_layout_);
-    device->destroyPipelineLayout(sky_scattering_lut_final_pass_pipeline_layout_);
-    device->destroyPipeline(sky_scattering_lut_first_pass_pipeline_);
-    device->destroyPipeline(sky_scattering_lut_sum_pass_pipeline_);
-    device->destroyPipeline(sky_scattering_lut_final_pass_pipeline_);
+    // Solar declination (degrees) — Spencer 1971.
+    // B = 360/365 × (d - 81), with d = day of year starting at 1.
+    const float B = (360.0f / 365.0f) * (static_cast<float>(d + 1) - 81.0f) * kDegToRad;
+    const float decl_deg = 23.45f * std::sin(B);
+    const float decl     = decl_deg * kDegToRad;
 
-    // Mini-buffer compute pipeline.
-    device->destroyDescriptorSetLayout(cube_skybox_mini_desc_set_layout_);
-    device->destroyPipelineLayout(cube_skybox_mini_pipeline_layout_);
-    device->destroyPipeline(cube_skybox_mini_pipeline_);
+    // Hour angle: 0 at solar noon, negative in the morning.
+    // Each hour = 15°; we add the longitude correction assuming the time
+    // provided is already local solar time (no UTC offset needed here —
+    // application.cpp passes the menu's time-of-day slider directly).
+    const float hour_angle = (t_hours - 12.0f) * 15.0f * kDegToRad;
+
+    const float lat = latitude * kDegToRad;
+
+    // Solar altitude above horizon.
+    const float sin_alt = std::sin(lat)  * std::sin(decl)
+                        + std::cos(lat)  * std::cos(decl) * std::cos(hour_angle);
+    const float altitude = std::asin(glm::clamp(sin_alt, -1.0f, 1.0f));
+
+    // Solar azimuth (measured clockwise from north in the horizontal plane).
+    const float cos_alt = std::cos(altitude);
+    float azimuth = 0.0f;
+    if (cos_alt > 1e-6f) {
+        const float sin_az = (std::cos(decl) * std::sin(hour_angle)) / cos_alt;
+        const float cos_az = (std::sin(lat) * sin_alt - std::sin(decl))
+                           / (std::cos(lat) * cos_alt);
+        azimuth = std::atan2(sin_az, cos_az);
+    }
+
+    // Convert to world-space Cartesian (Y-up, Z-south, X-east convention).
+    //   x =  sin(azimuth) * cos(altitude)   — east component
+    //   y =  sin(altitude)                   — up component
+    //   z = -cos(azimuth) * cos(altitude)   — north component (Z points south)
+    sun_dir_ = glm::vec3(
+         std::sin(azimuth) * cos_alt,
+         sin_alt,
+        -std::cos(azimuth) * cos_alt);
 }
 
-}//namespace scene_rendering
-}//namespace engine
+// ─── dumpScatteringLut ───────────────────────────────────────────────────────
+// Debug helper: copies the LUT to a staging buffer and prints sample values.
+// Must be called after device->waitIdle() so the LUT compute is complete and
+// the image is in SHADER_READ_ONLY_OPTIMAL layout.
+void Skydome::dumpScatteringLut(const std::shared_ptr<renderer::Device>& device) {
+    constexpr uint32_t kW = kAtmosphereScatteringLutWidth;
+    constexpr uint32_t kH = kAtmosphereScatteringLutHeight;
+    constexpr uint64_t kPixelBytes = 8;                    // rg32f = 2 × float32
+    constexpr uint64_t kBufBytes   = kW * kH * kPixelBytes;
+
+    // ── Create a host-visible staging buffer ─────────────────────────────────
+    std::shared_ptr<er::Buffer>       staging_buf;
+    std::shared_ptr<er::DeviceMemory> staging_mem;
+    er::Helper::createBuffer(
+        device,
+        SET_FLAG_BIT(BufferUsage, TRANSFER_DST_BIT),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+        0,
+        staging_buf,
+        staging_mem,
+        std::source_location::current(),
+        kBufBytes);
+
+    // ── Transient cmd buffer: barrier → copy → barrier ───────────────────────
+    auto cmd = device->setupTransientCommandBuffer();
+
+    // SHADER_READ_ONLY_OPTIMAL → TRANSFER_SRC_OPTIMAL
+    er::ImageResourceInfo from_sampler = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT)
+    };
+    er::ImageResourceInfo to_transfer_src = {
+        er::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT)
+    };
+    cmd->addImageBarrier(sky_scattering_lut_tex_.image,
+                         from_sampler, to_transfer_src, 0, 1, 0, 1);
+
+    // Copy entire LUT mip0 to staging buffer
+    er::BufferImageCopyInfo region;
+    region.buffer_offset      = 0;
+    region.buffer_row_length  = 0;
+    region.buffer_image_height = 0;
+    region.image_subresource  = { SET_FLAG_BIT(ImageAspect, COLOR_BIT), 0, 0, 1 };
+    region.image_offset       = { 0, 0, 0 };
+    region.image_extent       = { kW, kH, 1 };
+    cmd->copyImageToBuffer(sky_scattering_lut_tex_.image,
+                           staging_buf, { region },
+                           er::ImageLayout::TRANSFER_SRC_OPTIMAL);
+
+    // TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+    er::ImageResourceInfo back_to_sampler = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT)
+    };
+    cmd->addImageBarrier(sky_scattering_lut_tex_.image,
+                         to_transfer_src, back_to_sampler, 0, 1, 0, 1);
+
+    device->submitAndWaitTransientCommandBuffer();
+
+    // ── Read back and print a coarse sample grid ──────────────────────────────
+    std::vector<float> pixels(kW * kH * 2);
+    device->dumpBufferMemory(staging_mem, kBufBytes, pixels.data());
+
+    std::cout << "\n=== sky_scattering_lut dump (log2-optical-depth, rg32f) ===\n";
+    std::cout << "Format: [x][y] = (log2_rlh, log2_mie)  exp2→ (rlh_od, mie_od)\n";
+    // Print a 8×8 coarse grid and a dense strip at x=256 (mid-perpendicular)
+    static const uint32_t kXSamples[] = { 0, 64, 128, 192, 256, 320, 384, 448, 511 };
+    static const uint32_t kYSamples[] = { 0, 64, 128, 192, 256, 320, 384, 448, 511 };
+    for (uint32_t xi = 0; xi < 9; xi++) {
+        uint32_t x = kXSamples[xi];
+        for (uint32_t yi = 0; yi < 9; yi++) {
+            uint32_t y = kYSamples[yi];
+            uint32_t base = (y * kW + x) * 2;
+            float lr = pixels[base + 0];   // log2(rlh_od)
+            float lm = pixels[base + 1];   // log2(mie_od)
+            float rlh = std::exp2(lr);
+            float mie = std::exp2(lm);
+            std::cout << "  [" << x << "][" << y << "]"
+                      << " log2=(" << lr << ", " << lm << ")"
+                      << " od=(" << rlh << ", " << mie << ")\n";
+        }
+    }
+
+    // Also print the raw first/last value to catch zeros/NaN/Inf early.
+    {
+        float r0 = pixels[0], m0 = pixels[1];
+        float rE = pixels[(kW*kH-1)*2], mE = pixels[(kW*kH-1)*2+1];
+        std::cout << "  [0][0]   raw log2=(" << r0 << ", " << m0 << ")\n";
+        std::cout << "  [511][511] raw log2=(" << rE << ", " << mE << ")\n";
+    }
+    std::cout << "=== end of LUT dump ===\n" << std::flush;
+
+    // ── Free staging buffer ───────────────────────────────────────────────────
+    device->destroyBuffer(staging_buf);
+    device->freeMemory(staging_mem);
+}
+
+// ─── updateSkyScatteringLut ───────────────────────────────────────────────────
+// Runs the 3-pass atmospheric scattering LUT bake when the Rayleigh or Mie
+// scale heights have changed.  The LUT is read by both the skybox fragment
+// shader and the mini-buffer compute shader; it must be current before either
+// of those runs.
+//
+// Pass layout:
+//   first_pass  — writes per-column partial optical depth to sky_scattering_lut_tex_
+//                 Dispatch(512, 8, 1); push SkyScatteringParams (COMPUTE_BIT).
+//   sum_pass    — accumulates column sums into sky_scattering_lut_sum_tex_
+//                 Dispatch(512, 1, 1); no push constants.
+//   final_pass  — normalises back into sky_scattering_lut_tex_ using sum
+//                 Dispatch(512, 8, 1); no push constants.
+void Skydome::updateSkyScatteringLut(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
+
+    // Early-out: LUT is already up to date for the current scale heights.
+    if (lut_rayleigh_scale_height_ == rayleigh_scale_height_ &&
+        lut_mie_scale_height_      == mie_scale_height_) {
+        return;
+    }
+    lut_rayleigh_scale_height_ = rayleigh_scale_height_;
+    lut_mie_scale_height_      = mie_scale_height_;
+
+    constexpr uint32_t kLutWidth   = kAtmosphereScatteringLutWidth;
+    constexpr uint32_t kLutHeight  = kAtmosphereScatteringLutHeight;
+    constexpr uint32_t kGroupSize  = kAtmosphereScatteringLutGroupSize;
+
+    // ── Transition LUT textures to GENERAL for storage-image writes ──────────
+    cmd_buf->addImageBarrier(
+        sky_scattering_lut_tex_.image,
+        renderer::Helper::getImageAsShaderSampler(),
+        renderer::Helper::getImageAsStore(),
+        0, 1, 0, 1);
+
+    cmd_buf->addImageBarrier(
+        sky_scattering_lut_sum_tex_.image,
+        renderer::Helper::getImageAsShaderSampler(),
+        renderer::Helper::getImageAsStore(),
+        0, 1, 0, 1);
+
+    // ── First pass: per-column partial optical depth ─────────────────────────
+    glsl::SkyScatteringParams lut_params = {};
+    lut_params.inv_rayleigh_scale_height = 1.0f / rayleigh_scale_height_;
+    lut_params.inv_mie_scale_height      = 1.0f / mie_scale_height_;
+
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        sky_scattering_lut_first_pass_pipeline_);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        sky_scattering_lut_first_pass_pipeline_layout_,
+        &lut_params,
+        sizeof(lut_params));
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::COMPUTE,
+        sky_scattering_lut_first_pass_pipeline_layout_,
+        { sky_scattering_lut_first_pass_desc_set_ });
+
+    cmd_buf->dispatch(kLutWidth, kLutHeight / kGroupSize, 1);
+
+    // ── Barrier: first_pass writes → sum_pass reads (LUT tex) ───────────────
+    // dst must be getImageAsLoadStore() (SHADER_READ|WRITE in GENERAL layout).
+    // A Store→Store barrier (dst=getImageAsStore(), dstAccess=SHADER_WRITE only)
+    // does NOT make the first_pass writes visible to sum_pass's imageLoad calls.
+    cmd_buf->addImageBarrier(
+        sky_scattering_lut_tex_.image,
+        renderer::Helper::getImageAsStore(),
+        renderer::Helper::getImageAsLoadStore(),
+        0, 1, 0, 1);
+
+    // ── Sum pass: accumulate column totals ───────────────────────────────────
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        sky_scattering_lut_sum_pass_pipeline_);
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::COMPUTE,
+        sky_scattering_lut_sum_pass_pipeline_layout_,
+        { sky_scattering_lut_sum_pass_desc_set_ });
+
+    cmd_buf->dispatch(kLutWidth, 1, 1);
+
+    // ── Barrier: sum_pass writes → final_pass reads (sum tex) ───────────────
+    // Same reasoning: final_pass reads src_sum_lut via imageLoad, so dstAccess
+    // must include SHADER_READ_BIT, not just SHADER_WRITE_BIT.
+    cmd_buf->addImageBarrier(
+        sky_scattering_lut_sum_tex_.image,
+        renderer::Helper::getImageAsStore(),
+        renderer::Helper::getImageAsLoadStore(),
+        0, 1, 0, 1);
+
+    // ── Final pass: normalise using accumulated sums ─────────────────────────
+    cmd_buf->bindPipeline(
+        renderer::PipelineBindPoint::COMPUTE,
+        sky_scattering_lut_final_pass_pipeline_);
+
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::COMPUTE,
+        sky_scattering_lut_final_pass_pipeline_layout_,
+        { sky_scattering_lut_final_pass_desc_set_ });
+
+    cmd_buf->dispatch(kLutWidth, kLutHeight / kGroupSize, 1);
+
+    // ── Transition both LUT textures back to SHADER_READ_ONLY ────────────────
+    cmd_buf->addImageBarrier(
+        sky_scattering_lut_tex_.image,
+        renderer::Helper::getImageAsStore(),
+        renderer::Helper::getImageAsShaderSampler(),
+        0, 1, 0, 1);
+
+    cmd_buf->addImageBarrier(
+        sky_scattering_lut_sum_tex_.image,
+        renderer::Helper::getImageAsStore(),
+        renderer::Helper::getImageAsShaderSampler(),
+        0, 1, 0, 1);
+}
+
+// ─── destroy ─────────────────────────────────────────────────────────────────
+void Skydome::destroy(const std::shared_ptr<renderer::Device>& device) {
+    // Geometry buffers.
+    if (vertex_buffer_.buffer) vertex_buffer_.destroy(device);
+    if (index_buffer_.buffer)  index_buffer_.destroy(device);
+
+    // Textures.
+    if (sky_scattering_lut_tex_.image)     sky_scattering_lut_tex_.destroy(device);
+    if (sky_scattering_lut_sum_tex_.image) sky_scattering_lut_sum_tex_.destroy(device);
+    if (mini_envmap_tex_.image)            mini_envmap_tex_.destroy(device);
+
+    // Skybox graphics pipeline.
+    if (skybox_pipeline_)        device->destroyPipeline(skybox_pipeline_);
+    if (skybox_pipeline_layout_) device->destroyPipelineLayout(skybox_pipeline_layout_);
+    if (skybox_desc_set_layout_) device->destroyDescriptorSetLayout(skybox_desc_set_layout_);
+
+    // Cube skybox graphics pipeline (used by drawCubeSkyBox).
+    if (cube_skybox_pipeline_)        device->destroyPipeline(cube_skybox_pipeline_);
+    if (cube_skybox_pipeline_layout_) device->destroyPipelineLayout(cube_skybox_pipeline_layout_);
+
+    // Mini-buffer compute pipeline.
+    if (cube_skybox_mini_pipeline_)        device->destroyPipeline(cube_skybox_mini_pipeline_);
+    if (cube_skybox_mini_pipeline_layout_) device->destroyPipelineLayout(cube_skybox_mini_pipeline_layout_);
+    if (cube_skybox_mini_desc_set_layout_) device->destroyDescriptorSetLayout(cube_skybox_mini_desc_set_layout_);
+
+    // Sky scattering LUT compute pipelines.
+    if (sky_scattering_lut_first_pass_pipeline_)
+        device->destroyPipeline(sky_scattering_lut_first_pass_pipeline_);
+    if (sky_scattering_lut_sum_pass_pipeline_)
+        device->destroyPipeline(sky_scattering_lut_sum_pass_pipeline_);
+    if (sky_scattering_lut_final_pass_pipeline_)
+        device->destroyPipeline(sky_scattering_lut_final_pass_pipeline_);
+
+    if (sky_scattering_lut_first_pass_pipeline_layout_)
+        device->destroyPipelineLayout(sky_scattering_lut_first_pass_pipeline_layout_);
+    if (sky_scattering_lut_sum_pass_pipeline_layout_)
+        device->destroyPipelineLayout(sky_scattering_lut_sum_pass_pipeline_layout_);
+    if (sky_scattering_lut_final_pass_pipeline_layout_)
+        device->destroyPipelineLayout(sky_scattering_lut_final_pass_pipeline_layout_);
+
+    if (sky_scattering_lut_first_pass_desc_set_layout_)
+        device->destroyDescriptorSetLayout(sky_scattering_lut_first_pass_desc_set_layout_);
+    if (sky_scattering_lut_sum_pass_desc_set_layout_)
+        device->destroyDescriptorSetLayout(sky_scattering_lut_sum_pass_desc_set_layout_);
+    if (sky_scattering_lut_final_pass_desc_set_layout_)
+        device->destroyDescriptorSetLayout(sky_scattering_lut_final_pass_desc_set_layout_);
+}
+
+}// namespace scene_rendering
+}// namespace engine

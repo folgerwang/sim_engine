@@ -252,34 +252,50 @@ void main() {
     vec3 new_estimate = filterColorPartial(N, sample_base);
 
     if (params.is_first_touch != 0) {
-        // FIRST-TOUCH BLOCK FILL.  The texture is in UNDEFINED layout /
-        // contains garbage memory; broadcast this thread's partial
-        // estimate to every texel in its stride x stride block so the
-        // whole IBL output is initialized in one cheap dispatch (no
-        // imageLoad - we don't want to blend against garbage).  Sub-
-        // sequent frames switch to the per-texel dither + EMA path
-        // below, refining individual texels.
+        // FIRST-TOUCH INITIALIZATION.
+        //
+        // Old behaviour (removed): broadcast one estimate to every texel in
+        // the 8x8 block.  This initialised the whole image in one frame but
+        // produced a visible block-grid pop because all 64 blocks jumped to
+        // rough (16-sample) estimates simultaneously.
+        //
+        // New behaviour: clear the entire block to vec4(0) and write the
+        // actual partial estimate only to the ONE dither-position texel.
+        // Alpha == 0 is the "untouched" sentinel; the EMA path below checks
+        // it and uses effective_alpha = 1.0 (direct replacement) rather than
+        // blending against zero.  Texels fill in individually over the next
+        // 64 frames — smooth, no block pop.  If resetMiniBuffer() is ever
+        // called the clear happens again, giving a smooth fade-in instead of
+        // a sudden grid flash.
         for (int dy = 0; dy < params.dither_stride; ++dy) {
             for (int dx = 0; dx < params.dither_stride; ++dx) {
                 int wx = mini_x * params.dither_stride + dx;
                 int wy = mini_y * params.dither_stride + dy;
                 if (wx < params.mip_face_size && wy < params.mip_face_size) {
-                    imageStore(dst_img, ivec3(wx, wy, face), vec4(new_estimate, 1.0));
+                    bool is_dither_pos = (wx == full_x && wy == full_y);
+                    imageStore(dst_img, ivec3(wx, wy, face),
+                               is_dither_pos ? vec4(new_estimate, 1.0)
+                                             : vec4(0.0));
                 }
             }
         }
         return;
     }
 
-    // EMA blend with the texel's previous value.  Steady-state variance
-    // is roughly (alpha / (2 - alpha)) * Var(new), i.e. the effective
-    // sample count is ~ NUM_SAMPLES_PER_FRAME * (2/alpha - 1).  With
-    // alpha = 1/8 and NUM_SAMPLES_PER_FRAME = 16 that's ~240 effective
-    // samples - well below NUM_SAMPLES = 1024 but smooth and ~4000x
-    // cheaper than a fresh full-quality convolution every frame.
-    vec3 old_value = imageLoad(dst_img, ivec3(full_x, full_y, face)).rgb;
-    float alpha = clamp(params.temporal_alpha, 0.0, 1.0);
-    vec3 result = mix(old_value, new_estimate, alpha);
+    // EMA blend with the texel's previous value.
+    //
+    // Alpha channel stores a "has been seeded" flag: 0.0 = this texel has
+    // never been written (it was cleared to vec4(0) during the first-touch
+    // pass but the dither cycle hasn't reached it yet).  For those texels
+    // use effective_alpha = 1.0 — pure replacement — so we never blend the
+    // new estimate against the zero initialiser.  Once a texel has been
+    // seeded (alpha == 1.0) switch to the configured temporal_alpha so the
+    // EMA integrates additional samples smoothly.
+    vec4 old_pixel = imageLoad(dst_img, ivec3(full_x, full_y, face));
+    float old_weight = old_pixel.w;
+    float effective_alpha = (old_weight < 0.01) ? 1.0
+                                                 : clamp(params.temporal_alpha, 0.0, 1.0);
+    vec3 result = mix(old_pixel.rgb, new_estimate, effective_alpha);
 
     imageStore(dst_img, ivec3(full_x, full_y, face), vec4(result, 1.0));
 }

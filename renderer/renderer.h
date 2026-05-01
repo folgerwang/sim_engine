@@ -323,6 +323,12 @@ public:
     static ImageResourceInfo getImageAsColorAttachment() { return image_as_color_attachement_; }
     static ImageResourceInfo getImageAsDepthAttachment() { return image_as_depth_attachement_; }
     static ImageResourceInfo getImageAsStore() { return image_as_store_; }
+    // Storage image in GENERAL layout that will be read (imageLoad) by the next
+    // pass.  Carries both SHADER_READ_BIT and SHADER_WRITE_BIT so that a barrier
+    // with this as the *destination* state correctly makes prior SHADER_WRITE
+    // operations visible to subsequent imageLoad calls (pure Store→Store misses
+    // the read dependency and lets the GPU observe stale data).
+    static ImageResourceInfo getImageAsLoadStore() { return image_as_load_store_; }
     static ImageResourceInfo getImageAsShaderSampler() { return image_as_shader_sampler_; }
     static ImageResourceInfo getDepthAsShaderSampler() { return depth_as_shader_sampler_; }
 
@@ -600,6 +606,7 @@ public:
     static ImageResourceInfo image_as_color_attachement_;
     static ImageResourceInfo image_as_depth_attachement_;
     static ImageResourceInfo image_as_store_;
+    static ImageResourceInfo image_as_load_store_;
     static ImageResourceInfo image_as_shader_sampler_;
     static ImageResourceInfo depth_as_shader_sampler_;
 };

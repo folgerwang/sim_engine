@@ -36,6 +36,16 @@ class Skydome {
     std::shared_ptr<renderer::Pipeline> skybox_pipeline_;
     std::shared_ptr<renderer::Pipeline> cube_skybox_pipeline_;
 
+    // ── Envmap background pipeline ─────────────────────────────────────────
+    // Renders a fullscreen triangle at the far plane (z=1.0) that samples
+    // the live sky envmap cubemap using a view direction reconstructed from
+    // the push-constant inv_view_proj_relative matrix.  Depth test is
+    // LESS_OR_EQUAL so the sky only fills pixels where no geometry was drawn.
+    std::shared_ptr<renderer::DescriptorSetLayout> skybox_envmap_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet>       skybox_envmap_desc_set_;
+    std::shared_ptr<renderer::PipelineLayout>      skybox_envmap_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            skybox_envmap_pipeline_;
+
     // Compute pipeline / descriptors for the mini-buffer sky update.
     std::shared_ptr<renderer::DescriptorSetLayout> cube_skybox_mini_desc_set_layout_;
     std::shared_ptr<renderer::DescriptorSet> cube_skybox_mini_desc_set_;
@@ -122,6 +132,24 @@ public:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const std::shared_ptr<renderer::DescriptorSet>& frame_desc_set);
 
+    // Creates the fullscreen envmap background pipeline using the dynamic-
+    // rendering format descriptors.  Call once after construction (and after
+    // recreate) before the first drawEnvmap() call.  Also creates/updates the
+    // envmap sampler descriptor set.
+    void initEnvmapBackgroundPipeline(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const renderer::TextureInfo& rt_envmap_tex,
+        const std::shared_ptr<renderer::Sampler>& texture_sampler,
+        const renderer::PipelineRenderbufferFormats& renderbuffer_formats);
+
+    // Draws the sky envmap as a fullscreen background into the currently active
+    // dynamic rendering pass.  Only pixels at far-plane depth (no geometry) are
+    // shaded.  inv_view_proj_relative must be inverse(proj * view_no_translation).
+    void drawEnvmap(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const glm::mat4& inv_view_proj_relative);
+
     void drawCubeSkyBox(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
@@ -156,6 +184,11 @@ public:
 
     void updateSkyScatteringLut(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
+
+    // DEBUG: reads the scattering LUT back to CPU and prints a sample grid.
+    // Call ONLY after the device is idle (e.g. waitIdle after the first frame).
+    // Set enabled=false once the sky is working to avoid the GPU stall.
+    void dumpScatteringLut(const std::shared_ptr<renderer::Device>& device);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

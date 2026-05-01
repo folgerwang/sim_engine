@@ -72,6 +72,7 @@ ImageResourceInfo Helper::image_source_info_;
 ImageResourceInfo Helper::image_as_color_attachement_;
 ImageResourceInfo Helper::image_as_depth_attachement_;
 ImageResourceInfo Helper::image_as_store_;
+ImageResourceInfo Helper::image_as_load_store_;
 ImageResourceInfo Helper::image_as_shader_sampler_;
 ImageResourceInfo Helper::depth_as_shader_sampler_;
 TextureInfo Helper::white_tex_;
@@ -111,6 +112,15 @@ void Helper::init(const std::shared_ptr<Device>& device) {
     image_as_store_ = {
         ImageLayout::GENERAL,
         SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+        SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
+
+    // Storage image (GENERAL layout) that will be both read and written.
+    // Use as the *destination* state in a barrier when the next consumer uses
+    // imageLoad — a pure Store→Store barrier (dstAccess=SHADER_WRITE only)
+    // does NOT make prior writes visible to imageLoad reads.
+    image_as_load_store_ = {
+        ImageLayout::GENERAL,
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
         SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
 
     image_as_shader_sampler_ = {

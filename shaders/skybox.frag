@@ -74,5 +74,12 @@ void main() {
 #endif
 
 
+// DEBUG: set to 1 to force solid green on-screen — confirms skybox.frag runs.
+#define DEBUG_FORCE_GREEN 0
+#if DEBUG_FORCE_GREEN
+    outColor = vec4(0.0, 1.0, 0.0, 1.0);
+    return;
+#endif
+
     outColor = vec4(color/*textureLod(skybox_tex, view_dir, 0).xyz*/, 1.0);
 }

@@ -75,8 +75,65 @@ void main() {
     // Match cube_skybox.frag axis convention (flip Y).
     view_dir = vec3(view_dir.x, -view_dir.y, view_dir.z);
 
-    vec3 sun_pos = normalize(params.sun_pos);
+    // Clamp the sun to at least 3° above the horizon so the sky and IBL
+    // always carry some energy.  Below this elevation the atmosphere model
+    // returns near-zero, which would EMA-drive the entire envmap to black
+    // and kill all PBR lighting during dusk/night transitions.
+    vec3 sun_dir_raw = normalize(params.sun_pos);
+    const float kMinSinElevation = sin(radians(3.0));
+    vec3 sun_pos = normalize(vec3(sun_dir_raw.x,
+                                  max(sun_dir_raw.y, kMinSinElevation),
+                                  sun_dir_raw.z));
+
     vec3 color = vec3(0.0);
+
+// ── DEBUG MODE selector ───────────────────────────────────────────────────
+// 0 = normal atmosphere rendering
+// 1 = solid red (confirmed working)
+// 2 = sun_pos as color (shows whether sun direction is sane)
+// 3 = view_dir as color (shows whether view directions are correct)
+// 4 = cast_range / 200000 in blue channel (shows RSI result)
+// 5 = raw atmosphere() × 10000 amplified (shows any tiny non-zero signal)
+#define DEBUG_MODE 0
+
+#if DEBUG_MODE == 1
+    vec4 dbg = vec4(1.0, 0.0, 0.0, 1.0);
+#elif DEBUG_MODE == 2
+    // sun_pos remapped to [0,1] — should show a distinct non-grey color
+    vec4 dbg = vec4(sun_pos * 0.5 + 0.5, 1.0);
+#elif DEBUG_MODE == 3
+    // view_dir remapped to [0,1] — should vary across cubemap faces
+    vec4 dbg = vec4(view_dir * 0.5 + 0.5, 1.0);
+#elif DEBUG_MODE == 4
+    // cast_range ~ 100 km for upward rays → blue ≈ 0.5; 0 = no intersection
+    vec3 r_dbg = view_dir;
+    vec3 r0_dbg = vec3(0.0, kPlanetRadius, 0.0);
+    float cr_dbg = rsi(r0_dbg, r_dbg, kAtmosphereRadius);
+    vec4 dbg = vec4(cr_dbg / 200000.0, 0.0, 0.0, 1.0);
+#elif DEBUG_MODE == 5
+    // Atmosphere output × 10000; if still black, the function returns 0
+    vec3 r_dbg = view_dir;
+    vec3 r0_dbg = vec3(0.0, kPlanetRadius, 0.0);
+    float cr_dbg = rsi(r0_dbg, r_dbg, kAtmosphereRadius);
+    vec3 atmo_dbg = atmosphere(r_dbg, r0_dbg, cr_dbg, sun_pos, 22.0,
+        kPlanetRadius, kAtmosphereRadius,
+        vec3(5.5e-6, 13.0e-6, 22.4e-6), 21e-6,
+        params.inv_rayleigh_scale_height, params.inv_mie_scale_height,
+        params.g);
+    vec4 dbg = vec4(clamp(atmo_dbg * 10000.0, 0.0, 1.0), 1.0);
+#endif
+
+#if DEBUG_MODE != 0
+    imageStore(mini_img, ivec3(mini_x, mini_y, face), dbg);
+    for (int dy = 0; dy < 8; ++dy)
+        for (int dx = 0; dx < 8; ++dx) {
+            int wx = mini_x * 8 + dx;
+            int wy = mini_y * 8 + dy;
+            if (wx < params.cube_size && wy < params.cube_size)
+                imageStore(full_img, ivec3(wx, wy, face), dbg);
+        }
+    return;
+#endif
 
 #if RENDER_SUNLIGHT_SCATTERING
     vec3 r  = view_dir;

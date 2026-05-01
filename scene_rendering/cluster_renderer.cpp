@@ -213,9 +213,14 @@ void ClusterRenderer::uploadMeshClusters(
     const uint32_t num_clusters =
         static_cast<uint32_t>(cluster_mesh.clusters.size());
 
-    // Extract the upper-left 3×3 for transforming normals/axes.
+    // Correct normal-space transform = transpose(inverse(upper3×3)).
+    // The raw upper3×3 is only valid for orthogonal (uniform-scale + rotation)
+    // matrices. Non-uniform scale shears normals in the wrong direction.
+    // We always normalize the result, so the overall scale factor doesn't
+    // matter — only the direction needs to be correct.
     // Use the max column scale to conservatively inflate radii.
-    const glm::mat3 normal_mat(model_transform);
+    const glm::mat3 normal_mat =
+        glm::transpose(glm::inverse(glm::mat3(model_transform)));
     const float scale_x = glm::length(glm::vec3(model_transform[0]));
     const float scale_y = glm::length(glm::vec3(model_transform[1]));
     const float scale_z = glm::length(glm::vec3(model_transform[2]));
@@ -409,7 +414,9 @@ void ClusterRenderer::uploadMeshClusters(
             static_cast<uint32_t>(src_verts.size());
         const uint32_t src_face_count =
             static_cast<uint32_t>(src_faces.size());
-        const glm::mat3 normal_mat3(model_transform);
+        // Same inverse-transpose as normal_mat above — reuse it so we don't
+        // compute another matrix inverse per cluster (one per mesh is fine).
+        const glm::mat3& normal_mat3 = normal_mat;
 
         // Pass 1: scan all faces in this cluster, collect unique vertices,
         // transform to world space, and push into staging VB.
@@ -866,6 +873,9 @@ void ClusterRenderer::cull(
                 }
                 if (!visible) continue;
 
+                // Backface cone cull (mirrors cluster_cull.comp::isBackfacing).
+                // cone_cutoff stores sin(θ_max) — see cluster_mesh.cpp derivation.
+                // Cull when dot(cam→cluster, cone_axis) ≥ sin(θ_max).
                 glm::vec3 cone_axis(cull_data[ci].cone_axis_cutoff);
                 float cone_cutoff = cull_data[ci].cone_axis_cutoff.w;
                 if (cone_cutoff >= 0.0f) {

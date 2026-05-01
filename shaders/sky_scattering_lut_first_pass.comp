@@ -38,23 +38,23 @@ void main()
 	for (int i = 0; i < kNumSamples; i++) {
 		float sample_length = start_line_length + (i + 0.5f) *step_size;
 		float dist_to_middle = sample_length - whole_line_length * 0.5f;
-		// REVERT: keep the original (geometrically-wrong) `* sqr_height_from_center`
-		// and `* kPlanetRadius` formulas.  They produce nonsense distances
-		// that drive `exp(-thickness * inv_scale_height)` to ~0 across the
-		// whole LUT, which the consumer treats as "no secondary attenuation"
-		// - effectively disabling the LUT and falling back to primary-ray
-		// optical depth only.  This is what gives bright (if ringed) sky.
+		// Correct Pythagorean distance from planet center to this chord sample.
+		// `sqr_height_from_center` = (perpendicular distance from center)^2, and
+		// `dist_to_middle` is the signed offset along the chord from its midpoint.
+		// Together they give the actual sample-to-center distance.
 		//
-		// The "correct" Pythagorean + subtraction version produces real
-		// optical depths, but the LUT's sub-surface clamp (max(thickness, 0))
-		// then treats every chord that passes through the planet as a
-		// uniform-density gas, inflating jOd by thousands of km and driving
-		// attn to zero.  We need a real sub-surface model (set density=0
-		// inside the planet, or skip those chord segments) before the
-		// corrected math can be re-enabled - that's a separate fix.  See
-		// sub_surface analysis in the LUT pipeline notes.
-		float dist_to_center = sqrt(dist_to_middle * dist_to_middle * sqr_height_from_center);
-		float thickness = max(dist_to_center * kPlanetRadius, 0.0f);
+		// Sub-surface clamping: when the chord passes through the planet
+		// (perpendicular distance < rPlanet), height_above_planet goes negative.
+		// Clamping to 0 treats those samples as surface-level density, which
+		// rapidly accumulates huge optical depth and drives attn → 0 — correctly
+		// representing planet shadow.  For horizon-grazing chords (dawn/dusk sun),
+		// the near-surface high density produces the wavelength-selective
+		// attenuation that creates orange/red sky colors.  This is physically
+		// correct; the previous "inflated jOd → attn=0" concern was misplaced
+		// because for sun directions blocked by the planet, zero transmission
+		// IS the right answer.
+		float dist_to_center = sqrt(dist_to_middle * dist_to_middle + sqr_height_from_center);
+		float thickness = max(dist_to_center - kPlanetRadius, 0.0f);
 
 		// Accumulate the optical depth.
 		accumulate_rlh += exp(-thickness * params.inv_rayleigh_scale_height) * step_size;

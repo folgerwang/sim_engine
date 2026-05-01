@@ -108,17 +108,28 @@ bool sphereInFrustum(vec3 center, float radius) {
 }
 
 // ─── Backface Cone Cull ─────────────────────────────────────────
-// If every triangle in the cluster faces away from the camera,
-// we can skip it. The cone_axis is the average normal, cone_cutoff
-// is cos(max angle from axis). If dot(view_dir, cone_axis) >= cutoff,
-// ALL triangles are backfacing.
+// If every triangle in the cluster faces away from the camera we
+// can skip the cluster.
+//
+// cone_axis   = area-weighted average face normal (world-space, unit)
+// cone_cutoff = sin(θ_max), where θ_max is the maximum angle between
+//               the cone axis and any face normal in the cluster.
+//               (NOT cos — see cluster_mesh.cpp for derivation.)
+//
+// Derivation: let φ = angle between view_dir (cam→cluster) and cone_axis.
+//   Every face normal n satisfies dot(n, cone_axis) ≥ cos(θ_max).
+//   Minimum dot(n, view_dir) over all such n = cos(φ + θ_max).
+//   All-backfacing ↔ cos(φ + θ_max) > 0 ↔ φ + θ_max < π/2
+//                 ↔ cos(φ) > sin(θ_max) ↔ dot(view_dir, cone_axis) > sin(θ_max).
+//   So the correct threshold is sin(θ_max) = cone_cutoff as stored.
+//
+// cone_cutoff < 0 is the "never cull" sentinel (cone spans > hemisphere).
 bool isBackfacing(vec3 cluster_center, vec3 cone_axis, float cone_cutoff,
                   vec3 camera_pos) {
-    // cutoff < 0 means "don't cull" (cone too wide to be useful)
-    if (cone_cutoff < 0.0) return false;
+    if (cone_cutoff < 0.0) return false;  // uncullable cluster
 
-    vec3 view_dir = normalize(cluster_center - camera_pos);
-    return dot(view_dir, cone_axis) >= cone_cutoff;
+    vec3 view_dir = normalize(cluster_center - camera_pos);  // cam → cluster
+    return dot(view_dir, cone_axis) >= cone_cutoff;          // all backfacing?
 }
 
 // ─── Main ────────────────────────────────────────────────────────

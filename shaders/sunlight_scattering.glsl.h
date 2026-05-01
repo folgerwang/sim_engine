@@ -1,6 +1,9 @@
 #if RENDER_SUNLIGHT_SCATTERING
 
-#define  ATMOSPHERE_USE_LUT     1
+// DEBUG: set to 0 to bypass LUT and use brute-force secondary ray.
+// If sky is colored with 0 but black with 1, the LUT pipeline is broken.
+// If sky is black with both, the primary ray or output path is broken.
+#define  ATMOSPHERE_USE_LUT     0
 
 #ifndef _SUNLIGHT_SCATTERING_GLSL_H_
 #define _SUNLIGHT_SCATTERING_GLSL_H_
@@ -22,6 +25,27 @@ float rsi(vec3 r0, vec3 rd, float sr) {
   // produce NaN that propagates through atmosphere math.
   float disc = max(b * b - 4.0 * a * c, 0.0);
   return (-b + sqrt(disc)) / (2.0 * a);
+}
+
+// Ray-sphere intersection for an exterior ray (r0 may be outside the sphere).
+// Returns the nearest positive hit distance, or -1.0 if there is no forward
+// intersection (ray misses or sphere is entirely behind origin).
+// Used to test whether the secondary (sun) ray from a primary sample passes
+// through the planet before reaching open sky.
+float rsiExterior(vec3 r0, vec3 rd, float sr) {
+    // rd need not be normalised but typically is.
+    float a = dot(rd, rd);
+    float b = 2.0 * dot(rd, r0);
+    float c = dot(r0, r0) - sr * sr;
+    float disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) return -1.0;
+    float sq  = sqrt(disc);
+    float t0  = (-b - sq) / (2.0 * a);
+    float t1  = (-b + sq) / (2.0 * a);
+    // Both roots behind origin → no intersection ahead.
+    if (t1 < 1e-3) return -1.0;
+    // t0 is the nearer root; if it's positive we hit the near face.
+    return (t0 > 1e-3) ? t0 : t1;
 }
 
 vec2 calculatePhaseFuncParams(vec3 ray, vec3 sun_dir, float g) {
@@ -87,6 +111,15 @@ vec3 atmosphere(
     iOdRlh += odStepRlh;
     iOdMie += odStepMie;
 
+    // Planet shadow: if the secondary ray toward the sun intersects the planet
+    // body from this sample position, the sample is in shadow — no direct
+    // sunlight reaches it.  Skip rather than letting negative sample heights
+    // blow up the exponential optical-depth integrals.
+    if (rsiExterior(iPos, pSun, rPlanet) >= 0.0) {
+      iTime += iStepSize;
+      continue;
+    }
+
     // Calculate the step size of the secondary ray.
     float jStepSize = rsi(iPos, pSun, rAtmos) / float(jSteps);
 
@@ -103,7 +136,10 @@ vec3 atmosphere(
       vec3 jPos = iPos + pSun * (jTime + jStepSize * 0.5);
 
       // Calculate the height of the sample.
-      float jHeight = length(jPos) - rPlanet;
+      // Clamp to zero: grazing secondary rays may dip fractionally below
+      // the surface due to fp32 rounding; a negative height would make
+      // exp(-h * inv_scale) overflow to +Inf.
+      float jHeight = max(length(jPos) - rPlanet, 0.0);
 
       // Accumulate the optical depth.
       jOdRlh += exp(-jHeight * inv_rayleigh_scale_height) * jStepSize;

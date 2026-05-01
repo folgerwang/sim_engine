@@ -400,6 +400,24 @@ Menu::Menu(
     device_  = device;
     sampler_ = sampler;
 
+    // Initialise time-of-day from the player's local wall clock so the
+    // sky lighting and the clock overlay both reflect the local time of day.
+    {
+        std::time_t now = std::time(nullptr);
+        struct tm local_tm{};
+#if defined(_WIN32)
+        localtime_s(&local_tm, &now);
+#else
+        localtime_r(&now, &local_tm);
+#endif
+        const float local_hours =
+            static_cast<float>(local_tm.tm_hour) +
+            static_cast<float>(local_tm.tm_min)  / 60.0f +
+            static_cast<float>(local_tm.tm_sec)  / 3600.0f;
+        tod_hours_      = local_hours;
+        tod_prev_hours_ = local_hours;
+    }
+
     // Fantasy aesthetic (deep indigo panels, gold accents) picked up by
     // all subsequent ImGui draws. See applyFantasyStyle() in this file
     // for the palette; it ports the values from
@@ -481,6 +499,25 @@ Menu::Menu(
         // Swallow — a missing background shouldn't crash the game.
         bg_texture_info_.reset();
         bg_texture_id_ = ImTextureID(0);
+    }
+
+    // ---- Analog clock face texture ----------------------------------------
+    try {
+        clock_tex_info_ = std::make_shared<renderer::TextureInfo>();
+        engine::helper::createTextureImage(
+            device,
+            "assets/ui/clock_face.png",
+            renderer::Format::R8G8B8A8_UNORM,
+            true,
+            *clock_tex_info_,
+            std::source_location::current());
+        if (clock_tex_info_->view) {
+            clock_tex_id_ = renderer::Helper::addImTextureID(
+                sampler, clock_tex_info_->view);
+        }
+    } catch (...) {
+        clock_tex_info_.reset();
+        clock_tex_id_ = ImTextureID(0);
     }
 
     // ---- Scan the background PNG for bright star-like pixels ----
@@ -1079,7 +1116,9 @@ bool Menu::draw(
         }
 
         if (ImGui::BeginMenu("IBL Debug")) {
-            show_ibl_debug_ = true;
+            if (ImGui::MenuItem("Open IBL / Sky Debug")) {
+                show_ibl_debug_ = true;
+            }
             ImGui::EndMenu();
         }
 
@@ -1470,17 +1509,23 @@ bool Menu::draw(
         ImGui::End();
     }
 
-    // ---- IBL / Sky cubemap debug window -----------------------------------
+    // ---- IBL / Sky cubemap debug — popup float window ---------------------
+    // ---- IBL / Sky cubemap debug — floating tool window -------------------
+    // Regular Begin (not modal) so the main scene stays fully interactive.
     if (show_ibl_debug_) {
         const float thumb = ibl_debug_thumb_size_;
         const float row_w = thumb * 6.0f + 60.0f;
         const float row_h = thumb + 60.0f;  // +slider line per row
         const float win_w = row_w + 40.0f;
-        const float win_h = row_h * 5.0f + 80.0f;
-        ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowViewport(main_vp_id);
-        if (ImGui::Begin("IBL / Sky Debug", &show_ibl_debug_,
-                         ImGuiWindowFlags_NoDocking)) {
+        const float win_h = row_h * 5.0f + 120.0f;
+
+        // Centre on first appearance; user can move/resize freely after.
+        const ImVec2 vp_centre = {
+            vp_pos.x + float(screen_size.x) * 0.5f,
+            vp_pos.y + float(screen_size.y) * 0.5f };
+        ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
+        if (ImGui::Begin("IBL / Sky Debug", &show_ibl_debug_)) {
             ImGui::SliderFloat("Thumbnail size",
                 &ibl_debug_thumb_size_, 32.0f, 256.0f, "%.0f px");
             // Exposure slider: values up to 32x cover atmospheric mid-
@@ -1636,6 +1681,74 @@ bool Menu::draw(
         chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
     }
 
+    // ---- Analog clock overlay (top-left, always on top) --------------------
+    // Drawn directly on the foreground draw list so it is always visible
+    // above every ImGui window, regardless of window z-order.
+    {
+        constexpr float kFaceSize = 96.0f;
+        constexpr float kPad      = 4.0f;
+        const float kMenuH = ImGui::GetFrameHeight();
+
+        // Top-left anchor in screen space (below the menu bar).
+        const ImVec2 vp_min = ImGui::GetMainViewport()->Pos;
+        const ImVec2 origin(vp_min.x + 14.0f, vp_min.y + kMenuH + 8.0f);
+        const ImVec2 ctr(origin.x + kPad + kFaceSize * 0.5f,
+                         origin.y + kPad + kFaceSize * 0.5f);
+        const float  R = kFaceSize * 0.5f;
+
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+        // ── clock face image (or fallback circle) ─────────────────────────
+        const ImVec2 img_min(origin.x + kPad, origin.y + kPad);
+        const ImVec2 img_max(img_min.x + kFaceSize, img_min.y + kFaceSize);
+        if (clock_tex_id_) {
+            // Tint alpha = 230 → 90 % opaque
+            dl->AddImage(clock_tex_id_, img_min, img_max,
+                         ImVec2(0,0), ImVec2(1,1), IM_COL32(255, 255, 255, 230));
+        } else {
+            dl->AddCircleFilled(ctr, R, IM_COL32(18, 14, 52, 230), 64);
+            dl->AddCircle      (ctr, R, IM_COL32(191, 157, 45, 230), 64, 2.0f);
+        }
+
+        // ── decompose tod_hours_ into hand angles ─────────────────────────
+        const float tod  = tod_hours_;
+        const float h12  = std::fmod(tod, 12.0f);
+        const float mins = std::fmod(tod * 60.0f, 60.0f);
+        constexpr float k2Pi  = 2.0f * 3.14159265f;
+        constexpr float kBase = -3.14159265f * 0.5f;   // 12 o'clock at top
+        const float ang_h = kBase + (h12  / 12.0f) * k2Pi;
+        const float ang_m = kBase + (mins / 60.0f) * k2Pi;
+
+        // ── clock hands ───────────────────────────────────────────────────
+        auto drawHand = [&](float ang, float len, float stub,
+                            float thick, ImU32 col) {
+            const float ca = std::cos(ang), sa = std::sin(ang);
+            dl->AddLine(ctr,
+                        ImVec2(ctr.x - ca * stub, ctr.y - sa * stub),
+                        col, thick * 0.6f);
+            dl->AddLine(ctr,
+                        ImVec2(ctr.x + ca * len, ctr.y + sa * len),
+                        col, thick);
+        };
+        drawHand(ang_h, R * 0.50f, R * 0.12f, 5.0f, IM_COL32(220, 185,  60, 230));
+        drawHand(ang_m, R * 0.75f, R * 0.15f, 3.0f, IM_COL32(210, 210, 210, 230));
+
+        // Centre cap
+        dl->AddCircleFilled(ctr, 5.0f, IM_COL32(255, 220,  80, 230), 16);
+        dl->AddCircle      (ctr, 5.0f, IM_COL32(120,  90,  20, 230), 16, 1.5f);
+
+        // ── HH:MM digital readout below the dial ─────────────────────────
+        const int disp_h = static_cast<int>(tod) % 24;
+        const int disp_m = static_cast<int>(mins);
+        char timebuf[8];
+        snprintf(timebuf, sizeof(timebuf), "%02d:%02d", disp_h, disp_m);
+        const ImVec2 txt_sz = ImGui::CalcTextSize(timebuf);
+        const ImVec2 txt_pos(ctr.x - txt_sz.x * 0.5f,
+                             img_max.y + 3.0f);
+        dl->AddText(txt_pos, IM_COL32(242, 209, 89, 230), timebuf);
+    }
+    // ------------------------------------------------------------------------
+
     renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
 
     cmd_buf->endRenderPass();
@@ -1664,6 +1777,11 @@ void Menu::destroyResources() {
         bg_texture_info_->destroy(device_);
         bg_texture_info_.reset();
         bg_texture_id_ = ImTextureID(0);
+    }
+    if (clock_tex_info_ && device_) {
+        clock_tex_info_->destroy(device_);
+        clock_tex_info_.reset();
+        clock_tex_id_ = ImTextureID(0);
     }
 }
 

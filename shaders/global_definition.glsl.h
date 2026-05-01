@@ -342,14 +342,13 @@ struct IblMiniParams {
     int   mip_face_size;      // size of THIS mip's face (cube_size >> mip)
     int   mini_size;          // dispatch threads per axis (mip_face_size/stride)
     int   dither_stride;      // 8 for sparse, 1 for full-update small mips
-    // 1 on the very first dispatch into this IBL output (== "first
-    // touch": the image is in UNDEFINED layout / contains garbage).  In
-    // this mode each compute thread evaluates a single partial-sample
-    // estimate and broadcasts it to ALL stride^2 texels of its block, so
-    // every texel is initialized in one cheap dispatch.  No imageLoad /
-    // EMA blend is performed - we'd otherwise be blending against
-    // uninitialized memory.  Subsequent frames switch back to single-
-    // texel sparse dither + EMA integration.
+    // 1 on the very first dispatch into this IBL output (image is in
+    // UNDEFINED layout / contains garbage).  In this mode the shader
+    // clears the entire stride^2 block to vec4(0) (alpha=0 = "untouched"
+    // sentinel) and writes the partial estimate only to the single
+    // dither-position texel.  The EMA path uses effective_alpha=1.0
+    // whenever alpha==0 so each texel seeds cleanly on its literal first
+    // touch over the next 64 frames - no block-grid pop.
     int   is_first_touch;
 
     ivec2 dither_offset;      // (dx, dy) within the dither block
@@ -590,6 +589,13 @@ struct SunSkyParams {
     float           inv_rayleigh_scale_height;
     float           inv_mie_scale_height;
     vec2            pad1;
+};
+
+// Push constant for the sky envmap background fullscreen pass.
+// Contains only the rotation-only inverse view-projection so the fragment
+// shader can reconstruct a world-space view direction per screen pixel.
+struct SkyboxEnvmapParams {
+    mat4            inv_view_proj_relative;
 };
 
 // Push constants for the dithered "mini-buffer" sky cubemap update.
