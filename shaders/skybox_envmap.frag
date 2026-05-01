@@ -26,7 +26,7 @@ layout(location = 0) out vec4 outColor;
 
 // DEBUG_SKY: 0=normal (tone-mapped), 1=solid red, 3=view_dir RGB,
 //            4=envmap raw (no tone-map), 5=envmap×10000
-#define DEBUG_SKY 0
+#define DEBUG_SKY 4
 
 void main()
 {
@@ -50,6 +50,11 @@ void main()
     // Sample the live sky envmap.  The envmap stores HDR radiance (atmosphere
     // output × 2.0), so apply an exposure + Reinhard tone-map to compress it
     // into displayable [0, 1] range for all sky conditions (noon to twilight).
+    //
+    // Convention note: cube_skybox_mini.comp uses uvToXYZ() where face index 2
+    // maps to the -Y *direction* but writes to Vulkan layer 2 = +Y cubemap face.
+    // The Y-flip in the write shaders compensates for that uvToXYZ/layer mismatch,
+    // so textureLod here should use the un-flipped world-space view_dir directly.
     vec3 col = textureLod(u_envmap, view_dir, 0).rgb;
     const float kExposure = 8.0;
     col *= kExposure;
