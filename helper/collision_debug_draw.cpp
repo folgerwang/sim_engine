@@ -161,6 +161,7 @@ void CollisionDebugDraw::destroyStaticMembers(
 void CollisionDebugDraw::uploadForMesh(
     const std::shared_ptr<renderer::Device>& device,
     const CollisionMesh& mesh,
+    uint32_t mesh_id,
     CollisionDebugMeshBuffers& out_gpu) {
 
     if (out_gpu.ready()) return;          // already uploaded
@@ -176,23 +177,27 @@ void CollisionDebugDraw::uploadForMesh(
 
     const size_t tri_count = indices.size() / 3;
     std::vector<glm::vec3> positions;
-    std::vector<uint32_t>  triangle_ids;
+    std::vector<uint32_t>  seg_ids;
     positions.reserve(tri_count * 3);
-    triangle_ids.reserve(tri_count * 3);
+    seg_ids.reserve(tri_count * 3);
 
     for (size_t t = 0; t < tri_count; ++t) {
-        // Pull all three corners and tag each with the same triangle id.
+        // Pull all three corners and tag every vertex with the SAME
+        // mesh_id. Each CollisionMesh becomes one solid colour after the
+        // fragment shader hashes the id, so adjacent meshes appear as
+        // distinct flat regions -- "instance segmentation" of the
+        // physics world.
         for (int k = 0; k < 3; ++k) {
             int v_idx = indices[3 * t + k];
             if (v_idx < 0 || (size_t)v_idx >= vertices.size()) {
                 // Malformed index — skip the whole triangle to keep
                 // 3-vertex alignment in the non-indexed draw.
                 positions.resize(t * 3);
-                triangle_ids.resize(t * 3);
+                seg_ids.resize(t * 3);
                 goto stop;
             }
             positions.push_back(vertices[v_idx]);
-            triangle_ids.push_back(static_cast<uint32_t>(t));
+            seg_ids.push_back(mesh_id);
         }
     }
 stop:
@@ -210,8 +215,8 @@ stop:
         helper::createUnifiedMeshBuffer(
             device,
             SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-            triangle_ids.size() * sizeof(triangle_ids[0]),
-            triangle_ids.data(),
+            seg_ids.size() * sizeof(seg_ids[0]),
+            seg_ids.data(),
             std::source_location::current());
 
     out_gpu.vertex_count = static_cast<uint32_t>(positions.size());

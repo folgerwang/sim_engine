@@ -1105,6 +1105,14 @@ static void setupMesh(
         ego::PrimitiveInfo primitive_info;
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
         primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+
+        // Range of indices contributed by this primitive within
+        // `new_indices`.  Captured here (before the face loop) and used
+        // after the loop to slice out a per-primitive collision index
+        // list -- only for primitives that pass the BVH (collision)
+        // gate above, so foliage / lights / banners do not contribute.
+        const size_t part_index_start = new_indices.size();
+
         for (int i_face = 0; i_face < part.num_faces; i_face++) {
             const auto& face_indice = part.face_indices[i_face];
             const auto& face = src_mesh->faces[face_indice];
@@ -1146,6 +1154,32 @@ static void setupMesh(
 
                 new_indices.push_back(new_indice);
             }
+        }
+
+        // Capture this primitive's index range as a CPU-side companion
+        // array for the collision-mesh builder (CollisionMesh::
+        // buildFromDrawable iterates per-primitive `vertex_indices_`
+        // and skips primitives whose pointer is null).
+        //
+        // Capture for EVERY primitive with triangles, regardless of the
+        // create_bvh_tree material-name gate above.  That gate was
+        // tuned for a future BVH-collision path (excludes lights,
+        // foliage, banners, ...) but its substring rules overreach
+        // for visualisation -- "MASTER", "Fabric", "Beams" match the
+        // Bistro's main Master_Paint_*, Fabric_Wall_*, Wood_Beams_*
+        // floor / wall / structure materials, hiding the bulk of the
+        // building.  For the collision-debug viz we want to see the
+        // whole world; the create_bvh_tree flag is preserved on
+        // has_bvh_trees so the BVH path can re-filter at build time
+        // when it's re-enabled.
+        const size_t part_index_end = new_indices.size();
+        if (part_index_end > part_index_start) {
+            auto part_idx_list = std::make_shared<std::vector<int32_t>>();
+            part_idx_list->reserve(part_index_end - part_index_start);
+            for (size_t k = part_index_start; k < part_index_end; ++k) {
+                part_idx_list->push_back(static_cast<int32_t>(new_indices[k]));
+            }
+            primitive_info.vertex_indices_ = std::move(part_idx_list);
         }
 
 #if 0
@@ -1444,9 +1478,32 @@ static void setupMesh(
         index_type = renderer::IndexType::UINT32;
     }
 
-    if (has_bvh_trees) {
-        drawable_mesh.vertex_position_ =
-            std::make_shared<std::vector<glm::vec3>>(vertex_position);
+    // CPU-side position companion array for the collision-mesh
+    // builder. Must use the *deduped* vertices that `new_indices`
+    // (and therefore the per-primitive `vertex_indices_` captured
+    // above) reference -- not the raw FBX `vertex_position` table.
+    // `drawable_vertices` is the same buffer about to be uploaded
+    // to the GPU vertex buffer, so positions are guaranteed to
+    // match the GPU index buffer 1:1.
+    //
+    // Captured unconditionally (no longer gated on has_bvh_trees)
+    // so the collision-debug viz can show every mesh, including
+    // those whose every material part missed the BVH gate. The
+    // memory cost is one CPU-side glm::vec3 per deduped vertex,
+    // bounded by the size of the GPU vertex buffer we're about to
+    // upload anyway.
+    //
+    // LOD-N (N>=1) vertices are appended to drawable_vertices later
+    // in this function, but LOD0 indices reference only the front
+    // portion of the array, so storing the full array is safe --
+    // the LOD tail is just unreferenced extra memory.
+    if (drawable_vertices && !drawable_vertices->empty()) {
+        auto positions = std::make_shared<std::vector<glm::vec3>>();
+        positions->reserve(drawable_vertices->size());
+        for (const auto& v : *drawable_vertices) {
+            positions->push_back(v.position);
+        }
+        drawable_mesh.vertex_position_ = std::move(positions);
     }
 
     num_traingles = 0;

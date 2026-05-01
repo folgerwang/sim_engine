@@ -13,7 +13,36 @@ namespace helper {
 // CollisionMesh — static-mesh CPU collision representation.
 class CollisionMesh {
 public:
-    bool buildFromDrawable(const game_object::DrawableObject& drawable);
+    // Build the CPU triangle list (always) plus, optionally, the
+    // multithreaded SAH BVH used by `resolveCapsule`. Pass
+    // build_bvh=false when only the debug visualisation needs the
+    // mesh -- the BVH build is O(N log N) with a worker-thread pool
+    // and on a Bistro-sized scene takes seconds, which is not
+    // acceptable on the render thread. With BVH skipped the call
+    // completes in milliseconds; resolveCapsule() will early-return
+    // (no bvh_root_) so static-mesh capsule collision is disabled
+    // for that mesh.
+    //
+    // Concatenates ALL meshes inside the drawable into a single
+    // CollisionMesh -- correct for capsule physics (one BVH per
+    // drawable is plenty) but produces a coarse single-colour blob
+    // in the segmentation viz. Use buildFromDrawableMesh() instead
+    // when you want per-FBX-mesh granularity in the debug view.
+    bool buildFromDrawable(
+        const game_object::DrawableObject& drawable,
+        bool build_bvh = true);
+
+    // Build a CollisionMesh from a SINGLE mesh inside the drawable
+    // (data.meshes_[mesh_idx]) so each FBX mesh can be drawn with
+    // its own segmentation colour. Returns false if the drawable is
+    // not ready, the index is out of range, the mesh has no
+    // populated vertex_position_ / vertex_indices_, or the
+    // resulting triangle list is too small. build_bvh has the same
+    // meaning as in buildFromDrawable above.
+    bool buildFromDrawableMesh(
+        const game_object::DrawableObject& drawable,
+        size_t mesh_idx,
+        bool build_bvh = true);
 
     bool resolveCapsule(
         glm::vec3& position,

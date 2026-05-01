@@ -4,10 +4,11 @@
 #include "functions.glsl.h"
 
 // --- collision_debug.frag ---------------------------------------------
-// Hashes the flat-interpolated triangle id from the vertex stage into
-// an RGB color so neighbouring triangles get visibly different tints,
-// making it easy to spot whether the CPU triangle BVH actually covers
-// every face of the static mesh and where seams or gaps live.
+// Hashes the flat-interpolated segmentation id from the vertex stage
+// into an RGB colour so adjacent CollisionMeshes get visibly different
+// solid tints, giving an "instance segmentation" view of the physics
+// world. The vertex stage feeds the same mesh_id through every vertex
+// of a given mesh, so the whole mesh resolves to one flat colour.
 // ----------------------------------------------------------------------
 
 layout(push_constant) uniform CollisionDebugUniformBufferObject {

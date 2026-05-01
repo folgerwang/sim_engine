@@ -176,7 +176,8 @@ bool aabbOverlap(const AABB& a, const AABB& b) {
 } // namespace
 
 bool CollisionMesh::buildFromDrawable(
-    const game_object::DrawableObject& drawable) {
+    const game_object::DrawableObject& drawable,
+    bool build_bvh) {
 
     if (!drawable.isReady()) return false;
     const auto& data = drawable.getDrawableData();
@@ -197,15 +198,40 @@ bool CollisionMesh::buildFromDrawable(
 
     bounds_ = AABB();
 
-    for (const auto& mesh : data.meshes_) {
+    // Build mesh_idx → world-ish-space transform table. NodeInfo::
+    // cached_matrix_ already includes the full parent hierarchy
+    // (DrawableData::update bakes it). First node referencing each
+    // mesh wins, mirroring the cluster-upload pattern in application
+    // .cpp -- handles the common case of one node per mesh in FBX
+    // bistro scenes. Without this, every mesh's positions land at the
+    // origin in mesh-local space and the debug draw shows a tangled
+    // pile of overlapping geometry instead of the actual scene layout.
+    std::vector<glm::mat4> mesh_transforms(
+        data.meshes_.size(), glm::mat4(1.0f));
+    std::vector<bool> mesh_has_xform(data.meshes_.size(), false);
+    for (const auto& node : data.nodes_) {
+        if (node.mesh_idx_ >= 0 &&
+            static_cast<size_t>(node.mesh_idx_) < data.meshes_.size()) {
+            const size_t mi = static_cast<size_t>(node.mesh_idx_);
+            if (!mesh_has_xform[mi]) {
+                mesh_transforms[mi] = node.cached_matrix_;
+                mesh_has_xform[mi] = true;
+            }
+        }
+    }
+
+    for (size_t mi = 0; mi < data.meshes_.size(); ++mi) {
+        const auto& mesh = data.meshes_[mi];
         if (!mesh.vertex_position_) continue;
         const auto& positions = *mesh.vertex_position_;
         if (positions.empty()) continue;
 
-        int vert_offset = (int)vertices_.size();
+        const glm::mat4& xform = mesh_transforms[mi];
+        const int vert_offset = (int)vertices_.size();
         for (const auto& p : positions) {
-            vertices_.push_back(p);
-            bounds_.extend(p);
+            const glm::vec3 wp = glm::vec3(xform * glm::vec4(p, 1.0f));
+            vertices_.push_back(wp);
+            bounds_.extend(wp);
         }
         for (const auto& prim : mesh.primitives_) {
             if (!prim.vertex_indices_) continue;
@@ -219,6 +245,15 @@ bool CollisionMesh::buildFromDrawable(
         vertices_.clear();
         indices_.clear();
         return false;
+    }
+
+    if (!build_bvh) {
+        // Debug-visualisation path: caller doesn't need spatial queries,
+        // so skip the multithreaded BVH build (seconds on Bistro-sized
+        // input). The mesh is still drawable -- only resolveCapsule()
+        // becomes a no-op for this mesh because bvh_root_ stays null.
+        bvh_root_ = nullptr;
+        return true;
     }
 
     BVHBuilder builder(vertices_, indices_, /*debug_mode=*/false);
@@ -347,6 +382,71 @@ bool CollisionMesh::resolveCapsule(
     return any_hit;
 }
 
+bool CollisionMesh::buildFromDrawableMesh(
+    const game_object::DrawableObject& drawable,
+    size_t mesh_idx,
+    bool build_bvh) {
+
+    if (!drawable.isReady()) return false;
+    const auto& data = drawable.getDrawableData();
+    if (mesh_idx >= data.meshes_.size()) return false;
+
+    const auto& mesh = data.meshes_[mesh_idx];
+    if (!mesh.vertex_position_) return false;
+    const auto& positions = *mesh.vertex_position_;
+    if (positions.empty()) return false;
+
+    // First node referencing this mesh wins, mirroring the multi-mesh
+    // path in buildFromDrawable() and the cluster-upload pattern in
+    // application.cpp. Bakes parent hierarchy into vertices_ so the
+    // per-draw model transform stays identity.
+    glm::mat4 xform(1.0f);
+    for (const auto& node : data.nodes_) {
+        if (node.mesh_idx_ == static_cast<int32_t>(mesh_idx)) {
+            xform = node.cached_matrix_;
+            break;
+        }
+    }
+
+    size_t est_indices = 0;
+    for (const auto& p : mesh.primitives_) {
+        if (p.vertex_indices_) est_indices += p.vertex_indices_->size();
+    }
+    if (est_indices < 3) return false;
+
+    vertices_.reserve(positions.size());
+    indices_.reserve(est_indices);
+    bounds_ = AABB();
+
+    for (const auto& p : positions) {
+        const glm::vec3 wp = glm::vec3(xform * glm::vec4(p, 1.0f));
+        vertices_.push_back(wp);
+        bounds_.extend(wp);
+    }
+    for (const auto& prim : mesh.primitives_) {
+        if (!prim.vertex_indices_) continue;
+        const auto& src = *prim.vertex_indices_;
+        if (src.size() < 3 || (src.size() % 3) != 0) continue;
+        for (int idx : src) indices_.push_back(idx);
+    }
+
+    if (indices_.size() < 3) {
+        vertices_.clear();
+        indices_.clear();
+        return false;
+    }
+
+    if (!build_bvh) {
+        bvh_root_ = nullptr;
+        return true;
+    }
+
+    BVHBuilder builder(vertices_, indices_, /*debug_mode=*/false);
+    builder.build();
+    bvh_root_ = builder.getRoot();
+    return bvh_root_ != nullptr;
+}
+
 void CollisionWorld::drawDebug(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
@@ -354,10 +454,15 @@ void CollisionWorld::drawDebug(
     const std::vector<renderer::Viewport>& viewports,
     const std::vector<renderer::Scissor>& scissors) const {
     if (!CollisionDebugDraw::ready()) return;
-    for (const auto& m : meshes_) {
+    for (size_t i = 0; i < meshes_.size(); ++i) {
+        const auto& m = meshes_[i];
         if (!m || m->empty()) continue;
-        // Lazy upload of per-mesh GPU debug buffers on first draw.
-        CollisionDebugDraw::uploadForMesh(device, *m, m->debugBuffers());
+        // Lazy upload of per-mesh GPU debug buffers on first draw. The
+        // mesh_id we pass is just the world-list index -- stable across
+        // frames, unique per mesh -- which the fragment shader hashes
+        // into a flat segmentation colour.
+        CollisionDebugDraw::uploadForMesh(
+            device, *m, static_cast<uint32_t>(i), m->debugBuffers());
         if (!m->debugBuffers().ready()) continue;
         // Triangles are already in world space (FBX bake), so the
         // per-draw model transform is identity.
