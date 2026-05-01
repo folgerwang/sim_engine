@@ -1105,6 +1105,25 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
 
+        // ── Physics menu ─────────────────────────────────────────────────
+        // Collects toggles related to the static-mesh CollisionWorld and
+        // any future physics-driven bits (rigid bodies, debug draws,
+        // pause/step). Entries here drive engine state, not just UI.
+        if (ImGui::BeginMenu("Physics"))
+        {
+            // Collision-mesh debug visualisation. Equivalent to pressing
+            // F1; the application reads `isCollisionDebugOn()` each
+            // frame and swaps in CollisionWorld::drawDebug for the
+            // regular object forward pass when this is on.
+            if (ImGui::MenuItem(
+                    "Debug Draw Collision Meshes (F1)", NULL,
+                    show_collision_debug_)) {
+                show_collision_debug_ = !show_collision_debug_;
+            }
+
+            ImGui::EndMenu();
+        }
+
         if (ImGui::BeginMenu("Skydome")) {
             s_show_skydome = true;
             ImGui::EndMenu();

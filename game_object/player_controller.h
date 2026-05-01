@@ -8,69 +8,63 @@
 struct GLFWwindow;
 
 namespace engine {
+namespace helper { class CollisionWorld; }
 namespace game_object {
 
 class DrawableObject;
 
 // PlayerController — third-person character driver.
 //
-// Responsibilities:
-//   1. Read WASD from GLFW each frame, advance the player's world
-//      position relative to the camera yaw, with terrain-clamped Y.
-//   2. Resolve simple AABB collisions against a list of static
-//      "level" obstacles by sliding the player on the obstacle face.
-//   3. Drive the rigged scene-skinned.gltf rig procedurally
-//      (the file ships with no animation channels) — set the root
-//      node's TRS for translation/rotation, and rotate a handful
-//      of named bones (hips, chest, arms, legs) for an idle-bob and
-//      a walk cycle that swings opposing arms+legs in sync with the
-//      player's planar speed.
-//
-// Lifetime: owned by RealWorldApplication; `update()` is called once
-// per frame from the main loop, AFTER the camera has been updated for
-// the same frame (so we can read the latest camera yaw).
+// Reads WASD each frame, advances the player relative to the camera
+// yaw with terrain-clamped Y, resolves collisions against (a) any
+// triangle-mesh CollisionWorld passed in and (b) AABBs of fallback
+// drawable obstacles, then drives the rigged scene-skinned.gltf rig
+// procedurally for an idle-bob + walk cycle.
 class PlayerController {
 public:
     PlayerController();
 
-    // Per-frame tick.
-    //   window         - GLFW window for polling W/A/S/D state.
-    //   delta_t        - frame time in seconds.
-    //   camera_yaw_deg - main camera yaw in degrees (player movement
-    //                    is interpreted relative to this so pressing W
-    //                    walks "into the screen" regardless of how the
-    //                    camera is rotated).
-    //   player         - the DrawableObject that loaded scene-skinned.gltf.
-    //   obstacles      - other DrawableObjects to collide against
-    //                    (treated as world-axis-aligned bounding boxes
-    //                    in the XZ plane).
+    // Per-frame tick. `world` is optional; when non-null it overrides
+    // the AABB obstacle path with proper capsule-vs-triangle resolve.
     void update(
         GLFWwindow* window,
         float delta_t,
         float camera_yaw_deg,
         const std::shared_ptr<DrawableObject>& player,
-        const std::vector<std::shared_ptr<DrawableObject>>& obstacles);
+        const std::vector<std::shared_ptr<DrawableObject>>& obstacles,
+        const helper::CollisionWorld* world = nullptr);
 
-    // World-space position of the player's pivot (feet).
     glm::vec3 getPosition() const { return position_; }
+    float     getYaw() const      { return yaw_deg_; }
+    bool      isWalking() const   { return walking_; }
+    bool      isSpawned() const   { return initialized_; }
 
-    // Facing yaw in degrees (0 = +X, increases CCW in XZ plane,
-    // matching the camera convention).
-    float getYaw() const { return yaw_deg_; }
+    // Place the player at a specific world position + facing yaw.
+    // Calling this flips initialized_ so update() will start running
+    // input/physics/animation. The application calls it once the
+    // level has finished streaming so the character appears in front
+    // of the camera (rather than the lazy default spawn at origin).
+    void spawnAt(const glm::vec3& world_position, float yaw_deg) {
+        position_    = world_position;
+        yaw_deg_     = yaw_deg;
+        anim_phase_  = 0.0f;
+        idle_phase_  = 0.0f;
+        walking_     = false;
+        initialized_ = true;
+    }
 
-    // True when the player is moving fast enough that the walk cycle
-    // is being driven this frame.
-    bool isWalking() const { return walking_; }
+    // Capsule shape — exposed so the caller can tune it without
+    // recompiling.  `height` includes the two hemispheres.
+    void setCapsule(float radius, float height) {
+        player_radius_ = radius;
+        player_height_ = height;
+    }
+    float capsuleRadius() const { return player_radius_; }
+    float capsuleHeight() const { return player_height_; }
 
 private:
-    // Apply the procedural pose to the rig's bones based on the
-    // current anim_phase_ and walking_ state.
     void applyPose(const std::shared_ptr<DrawableObject>& player);
 
-    // Resolve collisions in the XZ plane: if `desired_xz` would push
-    // the player into one of the obstacles, push them back along the
-    // shallowest axis so the motion becomes a "slide". The XY
-    // component of obstacles is ignored.
     glm::vec2 resolveXzCollisions(
         const glm::vec2& current_xz,
         const glm::vec2& desired_xz,
@@ -78,11 +72,12 @@ private:
 
     glm::vec3 position_      = glm::vec3(0.0f, 0.0f, 0.0f);
     float     yaw_deg_       = 0.0f;
-    float     anim_phase_    = 0.0f;     // accumulated walk-cycle phase
-    float     idle_phase_    = 0.0f;     // accumulated idle-bob phase
-    float     walk_speed_    = 5.0f;     // m/s when WASD held
-    float     turn_speed_    = 720.0f;   // deg/s — how fast yaw chases motion direction
-    float     player_radius_ = 0.4f;     // collision radius in XZ
+    float     anim_phase_    = 0.0f;
+    float     idle_phase_    = 0.0f;
+    float     walk_speed_    = 5.0f;
+    float     turn_speed_    = 720.0f;
+    float     player_radius_ = 0.4f;     // capsule radius
+    float     player_height_ = 1.8f;     // total capsule height (incl. hemispheres)
     bool      walking_       = false;
     bool      initialized_   = false;
 };

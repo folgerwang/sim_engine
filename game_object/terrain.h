@@ -4,6 +4,13 @@
 namespace engine {
 namespace game_object {
 
+// Sample the procedural ground height at world XZ position. Used by
+// PlayerController for terrain-clamp / collision and by any other code
+// that needs the same height the renderer would draw at this XZ.
+// The implementation just wraps the global terrainMap() helper that
+// the tile shader uses so CPU and GPU stay in sync.
+float getTerrainGroundHeight(const glm::vec2& xz);
+
 class TileObject {
     enum class TileConst{
         kRockLayerSize = 8192,

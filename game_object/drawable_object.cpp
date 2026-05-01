@@ -416,7 +416,33 @@ static void setupMeshState(
             dst_material.emissive_idx_ = src_material.emissiveTexture.index;
             dst_material.occlusion_idx_ = src_material.occlusionTexture.index;
             dst_material.alpha_cutoff_ = static_cast<float>(src_material.alphaCutoff);
-            dst_material.alpha_mask_ = (src_material.alphaMode == "MASK");
+            // ── Alpha mode (Opaque / Mask / Blend) ─────────────────────
+            // Authoritative source: glTF alphaMode field. We then layer
+            // a substring-match override on the material NAME so common
+            // glass authoring (e.g. material called "GlassWindow") gets
+            // promoted to Blend even when the asset author left
+            // alphaMode at its OPAQUE default.
+            if (src_material.alphaMode == "MASK") {
+                dst_material.alpha_mode_ = ego::AlphaMode::Mask;
+            } else if (src_material.alphaMode == "BLEND") {
+                dst_material.alpha_mode_ = ego::AlphaMode::Blend;
+            } else {
+                dst_material.alpha_mode_ = ego::AlphaMode::Opaque;
+            }
+            {
+                const std::string& mn = src_material.name;
+                auto contains = [&mn](const char* needle) {
+                    return mn.find(needle) != std::string::npos;
+                };
+                if (contains("glass")  || contains("Glass")  ||
+                    contains("window") || contains("Window") ||
+                    contains("transparent") || contains("Transparent")) {
+                    dst_material.alpha_mode_   = ego::AlphaMode::Blend;
+                    dst_material.glass_forced_ = true;
+                }
+            }
+            dst_material.alpha_mask_ =
+                (dst_material.alpha_mode_ == ego::AlphaMode::Mask);
 
             if (dst_material.base_color_idx_ >= 0) {
                 drawable_object->textures_[dst_material.base_color_idx_].linear = false;
@@ -441,6 +467,13 @@ static void setupMeshState(
                 src_material.pbrMetallicRoughness.baseColorFactor[1],
                 src_material.pbrMetallicRoughness.baseColorFactor[2],
                 src_material.pbrMetallicRoughness.baseColorFactor[3]);
+
+            // Force glass-tagged materials translucent if the asset
+            // author left them at full alpha. 0.4 reads as obvious
+            // glass without going invisible.
+            if (dst_material.glass_forced_ && ubo.base_color_factor.a >= 0.95f) {
+                ubo.base_color_factor.a = 0.4f;
+            }
 
             ubo.glossiness_factor = 1.0f;
             ubo.metallic_roughness_specular_factor = 1.0f;
@@ -833,6 +866,27 @@ static void setupMeshState(
             // Match this behaviour exactly in the cluster pass.
             dst_material.alpha_cutoff_ = 0.1f;
             dst_material.alpha_mask_ = true;
+            dst_material.alpha_mode_ = ego::AlphaMode::Mask;
+
+            // ── FBX glass-name override ────────────────────────────────────
+            // Bistro authors many windows / bottles / display cases as
+            // separate materials called "Glass*", "Window*", etc. Promote
+            // those to true alpha-blend (drawn after opaque + mask, with
+            // no depth-write).
+            {
+                std::string mn(src_material->name.data
+                    ? src_material->name.data : "");
+                auto contains = [&mn](const char* needle) {
+                    return mn.find(needle) != std::string::npos;
+                };
+                if (contains("glass")  || contains("Glass")  ||
+                    contains("window") || contains("Window") ||
+                    contains("transparent") || contains("Transparent")) {
+                    dst_material.alpha_mode_   = ego::AlphaMode::Blend;
+                    dst_material.glass_forced_ = true;
+                    dst_material.alpha_mask_   = false;
+                }
+            }
 
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
@@ -861,6 +915,15 @@ static void setupMeshState(
                     ubo.base_color_factor.w =
                         float(base_factor.value_vec4.w);
                 }
+            }
+
+            // FBX glass override: clamp alpha so the material actually
+            // reads as translucent.  Bistro bottles / windows often ship
+            // with full-opaque base color + alpha=1 textures; without
+            // this clamp the alpha-blend pipeline would blend an opaque
+            // colour and look identical to opaque rendering.
+            if (dst_material.glass_forced_ && ubo.base_color_factor.w >= 0.95f) {
+                ubo.base_color_factor.w = 0.4f;
             }
 
             const auto& emission_factor = src_material->pbr.emission_factor;
@@ -2159,7 +2222,32 @@ static void drawMesh(
         return;
     }
 
-    for (const auto& prim : mesh_info.primitives_) {
+    // ── Sort primitives by alpha mode ─────────────────────────────────
+    // Draw order within the mesh: Opaque -> Mask -> Blend. Stable
+    // sort preserves source order within each bucket so cluster
+    // hashing / pipeline batching still benefits from cache locality.
+    // Per-mesh sorting (typically <50 primitives) is enough for
+    // correctness; cross-mesh alpha sorting is the WBOIT resolve's job.
+    std::vector<const ego::PrimitiveInfo*> sorted_prims;
+    sorted_prims.reserve(mesh_info.primitives_.size());
+    for (const auto& p : mesh_info.primitives_) sorted_prims.push_back(&p);
+    std::stable_sort(
+        sorted_prims.begin(), sorted_prims.end(),
+        [&](const ego::PrimitiveInfo* a, const ego::PrimitiveInfo* b) {
+            auto bucket = [&](const ego::PrimitiveInfo* pp) -> int {
+                if (pp->material_idx_ < 0) return 0;
+                switch (drawable_object->materials_[pp->material_idx_].alpha_mode_) {
+                    case ego::AlphaMode::Opaque: return 0;
+                    case ego::AlphaMode::Mask:   return 1;
+                    case ego::AlphaMode::Blend:  return 2;
+                }
+                return 0;
+            };
+            return bucket(a) < bucket(b);
+        });
+
+    for (const auto* prim_ptr : sorted_prims) {
+        const auto& prim = *prim_ptr;
         const auto& attrib_list = prim.attribute_descs_;
 
         auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
@@ -3036,8 +3124,10 @@ void DrawableData::update(
             getNodeMatrix(i_node, use_local_matrix_only);
     }
 
-        // update joints
-    if (animations_.size() > 0) {
+    // update joints — gated on skins_ (not animations_) so procedurally-
+    // posed rigs like scene-skinned.gltf still get their GPU joint
+    // matrices uploaded each frame.
+    if (skins_.size() > 0) {
         for (auto& scene : scenes_) {
             for (auto& node : scene.nodes_) {
                 updateJoints(device, node);
@@ -3955,11 +4045,6 @@ void DrawableObject::draw(
 void DrawableObject::update(
     const std::shared_ptr<renderer::Device>& device,
     const float& time) {
-    // Async-load safety: DrawableData::update reads nodes_/scenes_/skins_
-    // which are populated by phase 2 but only considered publishable
-    // once phase 3 flips ready_. Keep the null check too for belt-and-
-    // suspenders (the sync constructor path never flips ready_ but
-    // always leaves object_ non-null — see compat note below).
     if (object_ && object_->ready_.load(std::memory_order_acquire)) {
         object_->update(
             device,
@@ -3967,6 +4052,59 @@ void DrawableObject::update(
             time,
             object_->m_use_local_matrix_only_);
     }
+}
+
+void DrawableObject::setRootNodeTransform(
+    const glm::vec3& translation,
+    const glm::quat& rotation) {
+    if (!object_ || !object_->ready_.load(std::memory_order_acquire))
+        return;
+    if (object_->nodes_.empty()) return;
+    int32_t root = 0;
+    if (object_->default_scene_ < (int32_t)object_->scenes_.size()) {
+        const auto& scene = object_->scenes_[object_->default_scene_];
+        if (!scene.nodes_.empty()) root = scene.nodes_[0];
+    }
+    if (root < 0 || (size_t)root >= object_->nodes_.size()) return;
+    auto& n = object_->nodes_[root];
+    n.translation_ = translation;
+    n.rotation_ = rotation;
+}
+
+int DrawableObject::findNodeIndexByName(const std::string& name) const {
+    if (!object_ || !object_->ready_.load(std::memory_order_acquire))
+        return -1;
+    for (size_t i = 0; i < object_->nodes_.size(); ++i) {
+        if (object_->nodes_[i].name_ == name) return (int)i;
+    }
+    return -1;
+}
+
+bool DrawableObject::setNodeRotationByName(
+    const std::string& name,
+    const glm::quat& rotation) {
+    int idx = findNodeIndexByName(name);
+    if (idx < 0) return false;
+    object_->nodes_[idx].rotation_ = rotation;
+    return true;
+}
+
+glm::vec3 DrawableObject::getModelBboxMin() const {
+    if (!object_ || !object_->ready_.load(std::memory_order_acquire))
+        return glm::vec3(0.0f);
+    glm::vec3 mn(std::numeric_limits<float>::max());
+    for (const auto& m : object_->meshes_) mn = glm::min(mn, m.bbox_min_);
+    if (mn.x == std::numeric_limits<float>::max()) return glm::vec3(0.0f);
+    return mn;
+}
+
+glm::vec3 DrawableObject::getModelBboxMax() const {
+    if (!object_ || !object_->ready_.load(std::memory_order_acquire))
+        return glm::vec3(0.0f);
+    glm::vec3 mx(std::numeric_limits<float>::lowest());
+    for (const auto& m : object_->meshes_) mx = glm::max(mx, m.bbox_max_);
+    if (mx.x == std::numeric_limits<float>::lowest()) return glm::vec3(0.0f);
+    return mx;
 }
 
 std::shared_ptr<renderer::BufferInfo> DrawableObject::getGameObjectsBuffer() {

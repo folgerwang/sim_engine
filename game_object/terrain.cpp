@@ -1498,6 +1498,16 @@ std::vector<uint32_t> generateTileMeshIndex(const uint32_t& segment_count) {
 
 namespace engine {
 namespace game_object {
+
+// CPU-side terrain height lookup. The active terrain shader uses
+// terrainMap() (global namespace, file-local) to compute ground
+// elevation; we expose that same value through a stable public name
+// so PlayerController and friends can do terrain-clamp / collision
+// without re-implementing the heightfield.
+float getTerrainGroundHeight(const glm::vec2& xz) {
+    return ::terrainMap(xz).x;
+}
+
 namespace {
 
 renderer::WriteDescriptorList addTileCreatorBuffers(

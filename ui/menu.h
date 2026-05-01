@@ -99,6 +99,13 @@ class Menu {
     bool show_csm_debug_ = false;
     std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
 
+    // Collision-mesh debug visualisation. When ON the application
+    // skips the regular object forward pass and draws the static
+    // CollisionWorld with hashed-per-triangle colours instead. Also
+    // toggleable via F1 in the application's key callback (which
+    // forwards through toggleCollisionDebug() below).
+    bool show_collision_debug_ = false;
+
     // ---- Time-of-day -------------------------------------------------------
     // Hours in [0, 24) in the player's **local timezone**.  Initialised
     // at startup from localtime_s / localtime_r so the sun position and
@@ -255,6 +262,15 @@ public:
     inline bool showCsmDebug() const { return show_csm_debug_; }
     void setCsmDebugTextureIds(const std::array<ImTextureID, CSM_CASCADE_COUNT>& ids) {
         csm_debug_tex_ids_ = ids;
+    }
+
+    // Collision-mesh debug visualisation. The menu owns the canonical
+    // state; the application reads it each frame to decide whether to
+    // run the normal forward pass or CollisionWorld::drawDebug.
+    inline bool isCollisionDebugOn() const { return show_collision_debug_; }
+    inline void setCollisionDebug(bool on) { show_collision_debug_ = on; }
+    inline void toggleCollisionDebug() {
+        show_collision_debug_ = !show_collision_debug_;
     }
 
     // ---- TOD (time-of-day) accessors --------------------------------------

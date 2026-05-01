@@ -11,6 +11,21 @@ namespace game_object {
 
 class MeshLoadTaskManager;  // fwd-decl for async load API.
 
+// glTF / FBX alpha-mode categorisation.
+//   Opaque - fully opaque, no alpha test, no blending. Default.
+//   Mask   - alpha test against alpha_cutoff_. Still depth-write & opaque-bin.
+//   Blend  - alpha-blend with framebuffer. Drawn after opaque + mask, no
+//            depth-write so transparent surfaces don't occlude each other.
+//
+// Promoted from the previous bool (alpha_mask_) so we can express BLEND
+// as a first-class state. The legacy `alpha_mask_` field is kept as a
+// derived alias for downstream code that hasn't migrated yet.
+enum class AlphaMode : uint8_t {
+    Opaque = 0,
+    Mask   = 1,
+    Blend  = 2,
+};
+
 struct MaterialInfo {
     int32_t                base_color_idx_ = -1;
     int32_t                normal_idx_ = -1;
@@ -21,7 +36,14 @@ struct MaterialInfo {
 
     // Cluster renderer needs these CPU-side (avoids re-reading the GPU UBO).
     float                  alpha_cutoff_ = 0.0f;  // >0 enables alpha-mask discard
-    bool                   alpha_mask_   = false; // material is MASK mode (not OPAQUE)
+    AlphaMode              alpha_mode_   = AlphaMode::Opaque;
+    bool                   alpha_mask_   = false; // legacy alias = (alpha_mode_ == Mask)
+
+    // True if the loader detected this material as glass-like by name
+    // (substring match on "glass" / "window" / "transparent"). Promoted
+    // to AlphaMode::Blend with a low base-color alpha. The flag is kept
+    // around so debug UIs can highlight forced-glass materials.
+    bool                   glass_forced_ = false;
 
     renderer::BufferInfo   uniform_buffer_;
     std::shared_ptr<renderer::DescriptorSet>  desc_set_;
@@ -312,6 +334,21 @@ public:
     std::vector<MeshInfo>& getMutableMeshes() { return object_->meshes_; }
     const DrawableData& getDrawableData() const { return *object_; }
     const glm::mat4& getLocation() const { return location_; }
+
+    // ── Player / procedural-pose helpers ─────────────────────────────────
+    // scene-skinned.gltf has no animation channels, so PlayerController
+    // drives the rig procedurally. These accessors expose just enough of
+    // the node hierarchy to (a) place the model in the world and
+    // (b) rotate individual bones each frame.
+    void setRootNodeTransform(
+        const glm::vec3& translation,
+        const glm::quat& rotation);
+    int  findNodeIndexByName(const std::string& name) const;
+    bool setNodeRotationByName(
+        const std::string& name,
+        const glm::quat& rotation);
+    glm::vec3 getModelBboxMin() const;
+    glm::vec3 getModelBboxMax() const;
 
     void updateInstanceBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
