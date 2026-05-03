@@ -119,13 +119,16 @@ namespace {
 
 std::shared_ptr<er::DescriptorSetLayout> createCullDescSetLayout(
     const std::shared_ptr<er::Device>& device) {
-    // binding 0: ClusterCullInfo[]  (SSBO, readonly)
-    // binding 1: ClusterDrawInfo[]  (SSBO, readonly)
-    // binding 2: IndirectDrawBuffer (SSBO, writeonly)
-    // binding 3: DrawCountBuffer    (SSBO, read/write — atomicAdd)
-    // binding 4: VisibleClusterBuffer (SSBO, writeonly)
-    std::vector<er::DescriptorSetLayoutBinding> bindings(5);
-    for (int i = 0; i < 5; ++i) {
+    // binding 0: ClusterCullInfo[]               (SSBO, readonly)
+    // binding 1: ClusterDrawInfo[]               (SSBO, readonly)
+    // binding 2: IndirectDrawBuffer (opaque)     (SSBO, writeonly)
+    // binding 3: DrawCountBuffer    (opaque)     (SSBO, read/write — atomicAdd)
+    // binding 4: VisibleClusterBuffer (opaque)   (SSBO, writeonly)
+    // binding 5: BindlessMaterialParams[]        (SSBO, readonly — for flags)
+    // binding 6: TransIndirectDrawBuffer         (SSBO, writeonly)
+    // binding 7: TransDrawCountBuffer            (SSBO, read/write — atomicAdd)
+    std::vector<er::DescriptorSetLayoutBinding> bindings(8);
+    for (int i = 0; i < 8; ++i) {
         bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
             i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_BUFFER);
@@ -141,10 +144,14 @@ void writeCullDescriptors(
     const renderer::BufferInfo& draw_info_buffer,
     const renderer::BufferInfo& indirect_draw_buffer,
     const renderer::BufferInfo& draw_count_buffer,
-    const renderer::BufferInfo& visible_buffer) {
+    const renderer::BufferInfo& visible_buffer,
+    const renderer::BufferInfo& material_params_buffer,
+    uint32_t                    total_materials,
+    const renderer::BufferInfo& trans_indirect_draw_buffer,
+    const renderer::BufferInfo& trans_draw_count_buffer) {
 
     er::WriteDescriptorList writes;
-    writes.reserve(5);
+    writes.reserve(8);
 
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 0,
@@ -170,6 +177,26 @@ void writeCullDescriptors(
         er::DescriptorType::STORAGE_BUFFER, 4,
         visible_buffer.buffer,
         static_cast<uint32_t>(total_clusters * sizeof(uint32_t)));
+
+    // Material params — same buffer the bindless render pass uses.  Cull
+    // shader reads .flags only, but we expose the whole struct so the
+    // layout matches across the two consumers.  The buffer always has at
+    // least one entry (the white-fallback initialisation in finalizeUploads).
+    er::Helper::addOneBuffer(writes, desc_set,
+        er::DescriptorType::STORAGE_BUFFER, 5,
+        material_params_buffer.buffer,
+        static_cast<uint32_t>(std::max(total_materials, 1u)
+                              * sizeof(glsl::BindlessMaterialParams)));
+
+    er::Helper::addOneBuffer(writes, desc_set,
+        er::DescriptorType::STORAGE_BUFFER, 6,
+        trans_indirect_draw_buffer.buffer,
+        static_cast<uint32_t>(total_clusters * 5u * sizeof(uint32_t)));
+
+    er::Helper::addOneBuffer(writes, desc_set,
+        er::DescriptorType::STORAGE_BUFFER, 7,
+        trans_draw_count_buffer.buffer,
+        sizeof(uint32_t));
 
     device->updateDescriptorSets(writes);
 }
@@ -422,6 +449,15 @@ void ClusterRenderer::uploadMeshClusters(
                     if (mat.alpha_mask_ && mat.alpha_cutoff_ > 0.0f) {
                         mp.alpha_cutoff = mat.alpha_cutoff_;
                         mp.flags |= BINDLESS_MAT_ALPHA_MASK;
+                    }
+                    // Translucent (glass / windows / asset-authored Blend).
+                    // The cluster pipeline currently still draws these as
+                    // opaque (no separate translucent pass yet), but we
+                    // flag them so the "Translucent" render-debug
+                    // visualisation can highlight them, and so the data
+                    // is in place when a real translucent pass is added.
+                    if (mat.alpha_mode_ == game_object::AlphaMode::Blend) {
+                        mp.flags |= BINDLESS_MAT_TRANSLUCENT;
                     }
                 }
                 // Double-sided — primitive property, not material-level.
@@ -678,7 +714,7 @@ void ClusterRenderer::finalizeUploads() {
             &white);
     }
 
-    // Indirect draw buffer: worst case all clusters visible.
+    // Indirect draw buffer: worst case all clusters visible (opaque bucket).
     indirect_draw_buffer_ = createIndirectSSBO(
         device_,
         total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
@@ -686,22 +722,37 @@ void ClusterRenderer::finalizeUploads() {
     // Atomic draw count buffer (host visible for readback).
     draw_count_buffer_ = createCounterBuffer(device_);
 
-    // Visible cluster indices buffer.
+    // Visible cluster indices buffer (opaque bucket only).
     visible_buffer_ = createSSBO(
         device_,
         total_clusters_all_meshes_ * sizeof(uint32_t),
         nullptr);
 
+    // Translucent bucket — same worst-case sizing as opaque so a 100%-glass
+    // scene wouldn't overflow.  In practice these allocations are dwarfed
+    // by the merged VB/IB so the doubled indirect-buffer cost is fine.
+    trans_indirect_draw_buffer_ = createIndirectSSBO(
+        device_,
+        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+    trans_draw_count_buffer_ = createCounterBuffer(device_);
+
     // Allocate and write descriptor set.
     cull_desc_set_ = device_->createDescriptorSets(
         descriptor_pool_, cull_desc_set_layout_, 1)[0];
 
+    // material_params_buffer_ was just created above; staging_material_params_
+    // still has the source data for the size lookup.  total_materials_ isn't
+    // assigned until later in finalizeUploads, so use the staging size here.
+    const uint32_t mat_count = static_cast<uint32_t>(
+        std::max(size_t(1), staging_material_params_.size()));
     writeCullDescriptors(
         device_, cull_desc_set_,
         total_clusters_all_meshes_,
         cull_info_buffer_, draw_info_buffer_,
         indirect_draw_buffer_, draw_count_buffer_,
-        visible_buffer_);
+        visible_buffer_,
+        material_params_buffer_, mat_count,
+        trans_indirect_draw_buffer_, trans_draw_count_buffer_);
 
     // ── DEBUG: validate merged staging data — write to file ──
     {
@@ -1039,6 +1090,20 @@ void ClusterRenderer::cull(
                 device_->unmapMemory(draw_count_buffer_.memory);
             }
         }
+        // The CPU cull path doesn't bucket clusters by alpha mode (yet);
+        // explicitly zero the translucent counter so the second indirect
+        // draw in draw() is a no-op rather than reading stale commands
+        // left over from a prior GPU-cull frame.  Glass simply won't
+        // render under CPU cull until this path learns about the bucket.
+        {
+            uint32_t zero = 0;
+            void* mapped = device_->mapMemory(
+                trans_draw_count_buffer_.memory, sizeof(uint32_t), 0);
+            if (mapped) {
+                std::memcpy(mapped, &zero, sizeof(uint32_t));
+                device_->unmapMemory(trans_draw_count_buffer_.memory);
+            }
+        }
         total_visible_all_meshes_ = visible_count;
 
         // Barrier: host writes → indirect draw reads.
@@ -1055,20 +1120,28 @@ void ClusterRenderer::cull(
         cmd_buf->addBufferBarrier(
             draw_count_buffer_.buffer,
             ssbo_host_write, indirect_read);
+        // Translucent counter was zeroed above — also needs a host→indirect
+        // barrier so draw()'s drawIndexedIndirectCount sees the zero.
+        cmd_buf->addBufferBarrier(
+            trans_draw_count_buffer_.buffer,
+            ssbo_host_write, indirect_read);
 
     } else {
         // ── GPU compute culling path ─────────────────────────────────
 
-        // Zero the counter for THIS frame's dispatch (4 bytes, negligible).
-        {
+        // Zero the counters for THIS frame's dispatch (4 bytes each).
+        // Both opaque and translucent buckets are atomic-appended by the
+        // cull shader so both must start at zero.
+        auto zero_counter = [&](const renderer::BufferInfo& buf) {
             uint32_t zero = 0;
-            void* mapped = device_->mapMemory(
-                draw_count_buffer_.memory, sizeof(uint32_t), 0);
+            void* mapped = device_->mapMemory(buf.memory, sizeof(uint32_t), 0);
             if (mapped) {
                 std::memcpy(mapped, &zero, sizeof(uint32_t));
-                device_->unmapMemory(draw_count_buffer_.memory);
+                device_->unmapMemory(buf.memory);
             }
-        }
+        };
+        zero_counter(draw_count_buffer_);
+        zero_counter(trans_draw_count_buffer_);
 
         // Barrier: host counter-zero + previous indirect reads → compute.
         er::BufferResourceInfo ssbo_host_write = {
@@ -1077,16 +1150,26 @@ void ClusterRenderer::cull(
         er::BufferResourceInfo ssbo_compute_rw = {
             SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
             SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+        er::BufferResourceInfo prev_indirect_read = {
+            SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+            SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
 
         cmd_buf->addBufferBarrier(
             draw_count_buffer_.buffer,
             ssbo_host_write,
             ssbo_compute_rw);
+        cmd_buf->addBufferBarrier(
+            trans_draw_count_buffer_.buffer,
+            ssbo_host_write,
+            ssbo_compute_rw);
 
         cmd_buf->addBufferBarrier(
             indirect_draw_buffer_.buffer,
-            { SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
-              SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) },
+            prev_indirect_read,
+            ssbo_compute_rw);
+        cmd_buf->addBufferBarrier(
+            trans_indirect_draw_buffer_.buffer,
+            prev_indirect_read,
             ssbo_compute_rw);
 
         // Bind pipeline + descriptor set + push constants — ONCE.
@@ -1117,7 +1200,7 @@ void ClusterRenderer::cull(
         uint32_t groups = (total_clusters_all_meshes_ + 63) / 64;
         cmd_buf->dispatch(groups, 1);
 
-        // Barrier: compute writes → indirect draw reads.
+        // Barrier: compute writes → indirect draw reads.  Both buckets.
         er::BufferResourceInfo indirect_read = {
             SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
             SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
@@ -1126,9 +1209,16 @@ void ClusterRenderer::cull(
             indirect_draw_buffer_.buffer,
             ssbo_compute_rw,
             indirect_read);
-
         cmd_buf->addBufferBarrier(
             draw_count_buffer_.buffer,
+            ssbo_compute_rw,
+            indirect_read);
+        cmd_buf->addBufferBarrier(
+            trans_indirect_draw_buffer_.buffer,
+            ssbo_compute_rw,
+            indirect_read);
+        cmd_buf->addBufferBarrier(
+            trans_draw_count_buffer_.buffer,
             ssbo_compute_rw,
             indirect_read);
     }
@@ -1278,6 +1368,192 @@ void ClusterRenderer::initBindlessPipeline(
         raster_override,
         std::source_location::current());
 
+    // ── OIT translucent pipeline (Weighted Blended OIT) ──────────────
+    // McGuire & Bavoil 2013.  cluster_bindless.frag is recompiled with
+    // -DOIT_OUTPUT into cluster_bindless_oit_frag.spv, which writes:
+    //   • location 0  (accum ): vec4(rgb*α*w, α*w)   — additive blend
+    //   • location 1  (reveal): float α              — Π(1−α) blend
+    //
+    // Per-attachment blends:
+    //   accum : src=ONE,  dst=ONE,                 op=ADD
+    //   reveal: src=ZERO, dst=ONE_MINUS_SRC_COLOR, op=ADD  (multiplicative)
+    //
+    // Depth-test ON (so opaque geometry in front rejects translucent),
+    // depth-write OFF (translucent fragments don't occlude one another in
+    // the depth buffer).  Resolved by oit_composite_pipeline_ below.
+    //
+    // Renders into the kOitAccumFormat / kOitRevealFormat attachments —
+    // NOT into the host's color buffer directly.  draw() begins a fresh
+    // dynamic rendering pass on those targets between the opaque indirect
+    // draw and the composite.
+    constexpr er::Format kOitAccumFormat  = er::Format::R16G16B16A16_SFLOAT;
+    constexpr er::Format kOitRevealFormat = er::Format::R8_UNORM;
+    {
+        // accum attachment: additive (ONE / ONE).
+        auto accum_blend = er::helper::fillPipelineColorBlendAttachmentState(
+            SET_FLAG_BIT(ColorComponent, ALL_BITS),
+            /*blend_enable*/ true,
+            /*src color*/    er::BlendFactor::ONE,
+            /*dst color*/    er::BlendFactor::ONE,
+            /*color op*/     er::BlendOp::ADD,
+            /*src alpha*/    er::BlendFactor::ONE,
+            /*dst alpha*/    er::BlendFactor::ONE,
+            /*alpha op*/     er::BlendOp::ADD);
+        // reveal attachment: multiplicative (ZERO / 1−SRC_COLOR).
+        // Each fragment's α multiplies the accumulated visibility, so a
+        // sequence of α₁, α₂, … produces dst = Π(1 − αᵢ).
+        auto reveal_blend = er::helper::fillPipelineColorBlendAttachmentState(
+            SET_FLAG_BIT(ColorComponent, R_BIT),  // single-channel
+            /*blend_enable*/ true,
+            /*src color*/    er::BlendFactor::ZERO,
+            /*dst color*/    er::BlendFactor::ONE_MINUS_SRC_COLOR,
+            /*color op*/     er::BlendOp::ADD,
+            /*src alpha*/    er::BlendFactor::ZERO,
+            /*dst alpha*/    er::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            /*alpha op*/     er::BlendOp::ADD);
+        auto oit_blend_state =
+            std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+                er::helper::fillPipelineColorBlendStateCreateInfo(
+                    { accum_blend, reveal_blend }));
+
+        auto oit_depth_stencil =
+            std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+                er::helper::fillPipelineDepthStencilStateCreateInfo(
+                    /*depth_test_enable */ true,
+                    /*depth_write_enable*/ false,
+                    er::CompareOp::LESS_OR_EQUAL));
+
+        er::GraphicPipelineInfo oit_info = graphic_pipeline_info;
+        oit_info.blend_state_info   = oit_blend_state;
+        oit_info.depth_stencil_info = oit_depth_stencil;
+
+        // OIT shader pair: reuse the existing vertex shader, swap fragment.
+        er::ShaderModuleList oit_shader_modules(2);
+        oit_shader_modules[0] = shader_modules[0];   // cluster_bindless_vert.spv
+        oit_shader_modules[1] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_oit_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
+
+        // OIT framebuffer format: 2 color attachments + same depth as host.
+        er::PipelineRenderbufferFormats oit_fmt;
+        oit_fmt.color_formats = { kOitAccumFormat, kOitRevealFormat };
+        oit_fmt.depth_format  = framebuffer_format.depth_format;
+
+        bindless_translucent_pipeline_ = device_->createPipeline(
+            bindless_pipeline_layout_,   // same layout — same descriptor sets
+            binding_descs,
+            attrib_descs,
+            input_assembly,
+            oit_info,
+            oit_shader_modules,
+            oit_fmt,
+            raster_override,
+            std::source_location::current());
+    }
+
+    // ── OIT composite resources ──────────────────────────────────────
+    // The composite is a fullscreen pass that samples accum + reveal and
+    // blends the resolved colour over the existing scene.  Owns its own
+    // sampler, descriptor set layout, pipeline layout, and pipeline; the
+    // descriptor set itself is rewritten whenever the OIT targets are
+    // (re)created in ensureOitTargets().
+    {
+        oit_composite_sampler_ = device_->createSampler(
+            er::Filter::NEAREST,                         // 1:1 fullscreen
+            er::SamplerAddressMode::CLAMP_TO_EDGE,
+            er::SamplerMipmapMode::NEAREST,
+            0.0f,
+            std::source_location::current());
+
+        std::vector<er::DescriptorSetLayoutBinding> comp_bindings(2);
+        comp_bindings[0] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            0, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER);
+        comp_bindings[1] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            1, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER);
+        oit_composite_desc_set_layout_ =
+            device_->createDescriptorSetLayout(comp_bindings);
+
+        oit_composite_pipeline_layout_ = device_->createPipelineLayout(
+            { oit_composite_desc_set_layout_ }, {},
+            std::source_location::current());
+
+        // Composite pipeline: fullscreen triangle, no depth, alpha-blend
+        // resolved colour over the scene.  src=SRC_ALPHA / dst=ONE_MINUS_SRC_ALPHA
+        // gives:  out = resolved.rgb * (1 − reveal) + dst.rgb * reveal
+        auto comp_blend_attach = er::helper::fillPipelineColorBlendAttachmentState(
+            SET_FLAG_BIT(ColorComponent, ALL_BITS),
+            /*blend_enable*/ true,
+            er::BlendFactor::SRC_ALPHA, er::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            er::BlendOp::ADD,
+            er::BlendFactor::ONE, er::BlendFactor::ZERO,
+            er::BlendOp::ADD);
+        auto comp_blend_state =
+            std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+                er::helper::fillPipelineColorBlendStateCreateInfo(
+                    { comp_blend_attach }));
+        // Depth-write ON with ALWAYS compare: the composite shader emits
+        // gl_FragDepth = 0.99999 at every glass pixel (everywhere it doesn't
+        // discard), which marks those pixels as "translucent layer present"
+        // in the depth buffer.  The downstream sky envmap pass uses
+        // LESS_OR_EQUAL against a sky depth of 1.0; with our 0.99999 stamp
+        // sky's test becomes 1.0 <= 0.99999 → false, so sky no longer
+        // overwrites resolved-glass colour.  Without this, glass with sky
+        // visible behind it (windows, glass facades) gets fully painted
+        // over by the subsequent sky pass and reads on screen as "missing".
+        auto comp_depth_stencil =
+            std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+                er::helper::fillPipelineDepthStencilStateCreateInfo(
+                    /*depth_test_enable */ true,
+                    /*depth_write_enable*/ true,
+                    er::CompareOp::ALWAYS));
+        auto comp_raster = std::make_shared<er::PipelineRasterizationStateCreateInfo>(
+            er::helper::fillPipelineRasterizationStateCreateInfo(
+                false, false, er::PolygonMode::FILL,
+                SET_FLAG_BIT(CullMode, NONE)));
+        auto comp_ms = std::make_shared<er::PipelineMultisampleStateCreateInfo>(
+            er::helper::fillPipelineMultisampleStateCreateInfo());
+
+        er::GraphicPipelineInfo comp_info;
+        comp_info.blend_state_info   = comp_blend_state;
+        comp_info.rasterization_info = comp_raster;
+        comp_info.ms_info            = comp_ms;
+        comp_info.depth_stencil_info = comp_depth_stencil;
+
+        er::ShaderModuleList comp_shaders(2);
+        comp_shaders[0] = er::helper::loadShaderModule(
+            device_, "full_screen_vert.spv",
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+        comp_shaders[1] = er::helper::loadShaderModule(
+            device_, "oit_composite_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
+
+        // Composite framebuffer format: host color + host depth.  Depth is
+        // attached so the shader can stamp gl_FragDepth = 0.99999 at glass
+        // pixels (see comp_depth_stencil above for why this is required).
+        er::PipelineRenderbufferFormats comp_fmt;
+        comp_fmt.color_formats = { framebuffer_format.color_formats[0] };
+        comp_fmt.depth_format  = framebuffer_format.depth_format;
+
+        er::PipelineInputAssemblyStateCreateInfo comp_input_assembly;
+        comp_input_assembly.topology = er::PrimitiveTopology::TRIANGLE_LIST;
+        comp_input_assembly.restart_enable = false;
+
+        oit_composite_pipeline_ = device_->createPipeline(
+            oit_composite_pipeline_layout_,
+            {}, {},                      // no vertex bindings — VS generates a fullscreen tri
+            comp_input_assembly,
+            comp_info,
+            comp_shaders,
+            comp_fmt,
+            er::RasterizationStateOverride{},
+            std::source_location::current());
+    }
+
     // ── Allocate the bindless descriptor set ──
     auto desc_sets = device_->createDescriptorSets(
         descriptor_pool_, bindless_desc_set_layout_, 1);
@@ -1348,62 +1624,236 @@ void ClusterRenderer::initBindlessPipeline(
                 "Bindless set at index %u.\n", bindless_set_index);
 }
 
-// ─── Draw (single drawIndexedIndirectCount for all visible clusters) ──────
+// ─── ensureOitTargets ──────────────────────────────────────────────
+// Lazily (re)create the OIT accum + reveal targets at the requested size.
+// First call allocates them; subsequent calls reallocate only when the
+// size changes (e.g. window resize).  Also (re)allocates the composite
+// descriptor set so it points at the current views.
+//
+// Both targets are created with COLOR_ATTACHMENT | SAMPLED so the OIT
+// translucent pass can write them, then the composite pass can sample
+// them.  Initial layout is UNDEFINED; the OIT pass's load_op = CLEAR
+// transitions them to COLOR_ATTACHMENT_OPTIMAL on first use.
+void ClusterRenderer::ensureOitTargets(const glm::uvec2& size) {
+    if (oit_target_size_ == size && oit_accum_tex_.image && oit_reveal_tex_.image) {
+        return;
+    }
+
+    if (oit_accum_tex_.image)  oit_accum_tex_.destroy(device_);
+    if (oit_reveal_tex_.image) oit_reveal_tex_.destroy(device_);
+
+    const auto col_usage =
+        SET_FLAG_BIT(ImageUsage, COLOR_ATTACHMENT_BIT) |
+        SET_FLAG_BIT(ImageUsage, SAMPLED_BIT);
+
+    er::Helper::create2DTextureImage(
+        device_, er::Format::R16G16B16A16_SFLOAT, size, 1,
+        oit_accum_tex_, col_usage,
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
+
+    er::Helper::create2DTextureImage(
+        device_, er::Format::R8_UNORM, size, 1,
+        oit_reveal_tex_, col_usage,
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        std::source_location::current());
+
+    oit_target_size_ = size;
+
+    // (Re)allocate the composite descriptor set against the new views.
+    if (descriptor_pool_ && oit_composite_desc_set_layout_) {
+        oit_composite_desc_set_ = device_->createDescriptorSets(
+            descriptor_pool_, oit_composite_desc_set_layout_, 1)[0];
+
+        er::WriteDescriptorList writes;
+        er::Helper::addOneTexture(writes, oit_composite_desc_set_,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER, 0,
+            oit_composite_sampler_, oit_accum_tex_.view,
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        er::Helper::addOneTexture(writes, oit_composite_desc_set_,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER, 1,
+            oit_composite_sampler_, oit_reveal_tex_.view,
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        device_->updateDescriptorSets(writes);
+    }
+}
+
+// ─── Draw — opaque pass + WBOIT translucent pass + composite ──────────────
 
 uint32_t ClusterRenderer::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_sets,
     const std::vector<renderer::Viewport>& viewports,
-    const std::vector<renderer::Scissor>& scissors) {
+    const std::vector<renderer::Scissor>& scissors,
+    const std::shared_ptr<renderer::ImageView>& color_view,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& screen_size) {
 
     if (!gpu_ready_ || !bindless_pipeline_ || !bindless_desc_set_) {
         return 0;
     }
 
-    // NOTE: total_visible_all_meshes_ and visible_triangles_ are already set
-    // by cull() at the start of each frame (reading draw_count_buffer_ before
-    // it is zeroed for the current dispatch). Do NOT re-read the buffer here —
-    // by the time draw() is called, cull() has already zeroed the counter in
-    // preparation for the current frame's dispatch, so any CPU map of
-    // draw_count_buffer_ at this point would return 0, not the actual count.
+    // total_visible_all_meshes_ was already set by cull() at the start of
+    // this frame.  See the long comment below for why we don't re-read.
     const uint32_t prev_visible = total_visible_all_meshes_;
 
     // ── Build full descriptor set list ──
-    // Caller provides: set 0 (PBR global), set 1 (view camera),
-    //                  set 4 (runtime lights) if enabled.
-    // We append our bindless set at PBR_MATERIAL_PARAMS_SET (2).
     er::DescriptorSetList all_desc_sets = desc_sets;
-    // Pad to make room for our set.
     while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
         all_desc_sets.push_back(nullptr);
     }
     all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
 
-    // ── Issue draw ──
-    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, bindless_pipeline_);
+    auto bind_geometry_state = [&](const std::shared_ptr<er::Pipeline>& pipe) {
+        cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, pipe);
+        cmd_buf->setViewports(viewports);
+        cmd_buf->setScissors(scissors);
+        cmd_buf->bindDescriptorSets(
+            er::PipelineBindPoint::GRAPHICS,
+            bindless_pipeline_layout_,
+            all_desc_sets);
+        cmd_buf->bindVertexBuffers(0, { merged_vertex_buffer_.buffer }, { 0 });
+        cmd_buf->bindIndexBuffer(
+            merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+    };
+
+    // ── Pass 1: opaque + alpha-mask in caller's currently-active pass ──
+    bind_geometry_state(bindless_pipeline_);
+    cmd_buf->drawIndexedIndirectCount(
+        indirect_draw_buffer_, 0,
+        draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+
+    // If OIT resources aren't ready yet (e.g. shader compile failed), skip
+    // the translucent draw entirely; opaque-only is already in the buffer.
+    if (!bindless_translucent_pipeline_ || !oit_composite_pipeline_) {
+        return prev_visible;
+    }
+
+    ensureOitTargets(screen_size);
+    if (!oit_composite_desc_set_) {
+        return prev_visible;
+    }
+
+    // ── End the caller's pass; we're about to begin our own ──
+    cmd_buf->endDynamicRendering();
+
+    // ── Pass 2: WBOIT translucent ──
+    // Two color attachments (accum, reveal) + caller's depth (read-only).
+    // Clear values: accum=(0,0,0,0), reveal=(1,0,0,0).  After the OIT
+    // shaders' per-attachment blends, accum holds Σ(c·α·w, α·w) and
+    // reveal holds Π(1−α).  See cluster_bindless.frag (OIT_OUTPUT path).
+    er::RenderingAttachmentInfo accum_att;
+    accum_att.image_view   = oit_accum_tex_.view;
+    accum_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    accum_att.load_op      = er::AttachmentLoadOp::CLEAR;
+    accum_att.store_op     = er::AttachmentStoreOp::STORE;
+    accum_att.clear_value.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+
+    er::RenderingAttachmentInfo reveal_att;
+    reveal_att.image_view   = oit_reveal_tex_.view;
+    reveal_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    reveal_att.load_op      = er::AttachmentLoadOp::CLEAR;
+    reveal_att.store_op     = er::AttachmentStoreOp::STORE;
+    reveal_att.clear_value.color = { { 1.0f, 0.0f, 0.0f, 0.0f } };
+
+    er::RenderingAttachmentInfo oit_depth_att;
+    oit_depth_att.image_view   = depth_view;
+    oit_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    oit_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
+    oit_depth_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingInfo oit_ri = {};
+    oit_ri.render_area_offset = { 0, 0 };
+    oit_ri.render_area_extent = screen_size;
+    oit_ri.layer_count        = 1;
+    oit_ri.view_mask          = 0;
+    oit_ri.color_attachments  = { accum_att, reveal_att };
+    oit_ri.depth_attachments  = { oit_depth_att };
+    oit_ri.stencil_attachments = {};
+
+    cmd_buf->beginDynamicRendering(oit_ri);
+    bind_geometry_state(bindless_translucent_pipeline_);
+    cmd_buf->drawIndexedIndirectCount(
+        trans_indirect_draw_buffer_, 0,
+        trans_draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+    cmd_buf->endDynamicRendering();
+
+    // ── Transition accum/reveal: COLOR_ATTACHMENT → SHADER_READ_ONLY ──
+    er::ImageResourceInfo from_color_att = {
+        er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT) };
+    er::ImageResourceInfo to_shader_read = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
+    cmd_buf->addImageBarrier(oit_accum_tex_.image,  from_color_att, to_shader_read, 0, 1, 0, 1);
+    cmd_buf->addImageBarrier(oit_reveal_tex_.image, from_color_att, to_shader_read, 0, 1, 0, 1);
+
+    // ── Pass 3: fullscreen composite onto the host's color buffer ──
+    // Now also attaches the host depth buffer so the composite fragment
+    // shader can stamp gl_FragDepth = 0.99999 at glass pixels — this
+    // prevents the downstream sky pass (LESS_OR_EQUAL vs depth=1.0) from
+    // painting sky over the freshly-resolved glass colour at pixels where
+    // no opaque geometry is behind the glass.
+    er::RenderingAttachmentInfo comp_color_att;
+    comp_color_att.image_view   = color_view;
+    comp_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    comp_color_att.load_op      = er::AttachmentLoadOp::LOAD;
+    comp_color_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingAttachmentInfo comp_depth_att;
+    comp_depth_att.image_view   = depth_view;
+    comp_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    comp_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
+    comp_depth_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingInfo comp_ri = {};
+    comp_ri.render_area_offset  = { 0, 0 };
+    comp_ri.render_area_extent  = screen_size;
+    comp_ri.layer_count         = 1;
+    comp_ri.view_mask           = 0;
+    comp_ri.color_attachments   = { comp_color_att };
+    comp_ri.depth_attachments   = { comp_depth_att };
+    comp_ri.stencil_attachments = {};
+
+    cmd_buf->beginDynamicRendering(comp_ri);
+    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, oit_composite_pipeline_);
     cmd_buf->setViewports(viewports);
     cmd_buf->setScissors(scissors);
-
     cmd_buf->bindDescriptorSets(
         er::PipelineBindPoint::GRAPHICS,
-        bindless_pipeline_layout_,
-        all_desc_sets);
+        oit_composite_pipeline_layout_,
+        { oit_composite_desc_set_ });
+    cmd_buf->draw(3);   // fullscreen triangle generated in full_screen.vert
+    cmd_buf->endDynamicRendering();
 
-    cmd_buf->bindVertexBuffers(
-        0,
-        { merged_vertex_buffer_.buffer },
-        { 0 });
-    cmd_buf->bindIndexBuffer(
-        merged_index_buffer_.buffer,
-        0,
-        er::IndexType::UINT32);
+    // ── Re-begin the caller's pass with LOAD/LOAD ──
+    // Preserves the API contract: caller's matching endDynamicRendering()
+    // still has a pass open to close.
+    er::RenderingAttachmentInfo host_color_att;
+    host_color_att.image_view   = color_view;
+    host_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    host_color_att.load_op      = er::AttachmentLoadOp::LOAD;
+    host_color_att.store_op     = er::AttachmentStoreOp::STORE;
 
-    cmd_buf->drawIndexedIndirectCount(
-        indirect_draw_buffer_,
-        0,
-        draw_count_buffer_,
-        0,
-        total_clusters_all_meshes_);
+    er::RenderingAttachmentInfo host_depth_att;
+    host_depth_att.image_view   = depth_view;
+    host_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    host_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
+    host_depth_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingInfo host_ri = {};
+    host_ri.render_area_offset  = { 0, 0 };
+    host_ri.render_area_extent  = screen_size;
+    host_ri.layer_count         = 1;
+    host_ri.view_mask           = 0;
+    host_ri.color_attachments   = { host_color_att };
+    host_ri.depth_attachments   = { host_depth_att };
+    host_ri.stencil_attachments = {};
+    cmd_buf->beginDynamicRendering(host_ri);
 
     return prev_visible;
 }
@@ -1467,6 +1917,7 @@ void ClusterRenderer::recreate(
 
 void ClusterRenderer::destroy() {
     bindless_pipeline_.reset();
+    bindless_translucent_pipeline_.reset();
     bindless_pipeline_layout_.reset();
     bindless_desc_set_.reset();
     bindless_desc_set_layout_.reset();
@@ -1474,7 +1925,20 @@ void ClusterRenderer::destroy() {
     cull_pipeline_layout_.reset();
     cull_desc_set_.reset();
     cull_desc_set_layout_.reset();
-    // GPU buffers are released when their shared_ptrs go out of scope.
+
+    // ── OIT resources ──
+    oit_composite_pipeline_.reset();
+    oit_composite_pipeline_layout_.reset();
+    oit_composite_desc_set_.reset();
+    oit_composite_desc_set_layout_.reset();
+    oit_composite_sampler_.reset();
+    if (oit_accum_tex_.image)  oit_accum_tex_.destroy(device_);
+    if (oit_reveal_tex_.image) oit_reveal_tex_.destroy(device_);
+    oit_target_size_ = glm::uvec2(0, 0);
+
+    // GPU buffers (including trans_indirect_draw_buffer_ /
+    // trans_draw_count_buffer_) are released when their shared_ptrs go
+    // out of scope alongside the rest of the cluster state.
     gpu_ready_ = false;
 }
 

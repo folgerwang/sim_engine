@@ -99,6 +99,14 @@ class ClusterRenderer {
     renderer::BufferInfo indirect_draw_buffer_; // DrawIndexedIndirectCommand[]
     renderer::BufferInfo draw_count_buffer_;    // single uint (host-visible)
     renderer::BufferInfo visible_buffer_;       // visible cluster indices
+    // Parallel buckets for AlphaMode::Blend (glass / windows).  The cull
+    // compute routes each visible cluster into either the opaque indirect
+    // list above or these translucent ones, based on
+    // BindlessMaterialParams.flags & BINDLESS_MAT_TRANSLUCENT.  Drawn in
+    // a second pass after the opaque draw with bindless_translucent_pipeline_
+    // (alpha blend on, depth-write off).
+    renderer::BufferInfo trans_indirect_draw_buffer_;
+    renderer::BufferInfo trans_draw_count_buffer_;
     std::shared_ptr<renderer::DescriptorSet> cull_desc_set_;
 
     // ── Merged vertex/index buffers for bindless rendering ──
@@ -114,6 +122,39 @@ class ClusterRenderer {
     std::shared_ptr<renderer::DescriptorSetLayout> bindless_desc_set_layout_;
     std::shared_ptr<renderer::PipelineLayout>      bindless_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline>            bindless_pipeline_;
+    // OIT (Weighted Blended) pipeline for the translucent draw.  Same
+    // shader source as bindless_pipeline_ compiled with -DOIT_OUTPUT so
+    // it writes vec4 accum + float reveal to two separate render targets
+    // (oit_accum_tex_, oit_reveal_tex_) instead of a single colour.
+    // Per-attachment blend setup:
+    //   accum  attachment: src=ONE,  dst=ONE,                  op=ADD
+    //   reveal attachment: src=ZERO, dst=ONE_MINUS_SRC_COLOR,  op=ADD
+    // Depth test on, depth write off (translucent surfaces don't occlude
+    // one another in the depth buffer).  Resolved by oit_composite_pipeline_
+    // in a fullscreen pass after the OIT draw.
+    std::shared_ptr<renderer::Pipeline>            bindless_translucent_pipeline_;
+
+    // (Re)create the OIT accum + reveal targets at the requested size,
+    // and update the composite descriptor set to point at the new views.
+    // Lazy: no-op when the size hasn't changed.  Called from draw() so
+    // the targets always match the host color buffer's resolution
+    // (handles swap-chain rebuild without an explicit recreate hook).
+    void ensureOitTargets(const glm::uvec2& size);
+
+    // ── OIT resources (created/recreated with screen size) ──────────────
+    // accum  = RGBA16F, cleared to (0,0,0,0)
+    // reveal = R8/R16F, cleared to (1,0,0,0)
+    // Both are framebuffer-attachable AND sampler-readable so the resolve
+    // pass can read them via the composite descriptor set.
+    renderer::TextureInfo                          oit_accum_tex_;
+    renderer::TextureInfo                          oit_reveal_tex_;
+    glm::uvec2                                     oit_target_size_{0, 0};
+
+    std::shared_ptr<renderer::Sampler>             oit_composite_sampler_;
+    std::shared_ptr<renderer::DescriptorSetLayout> oit_composite_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet>       oit_composite_desc_set_;
+    std::shared_ptr<renderer::PipelineLayout>      oit_composite_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            oit_composite_pipeline_;
     std::shared_ptr<renderer::DescriptorSet>       bindless_desc_set_;
 
     bool gpu_ready_ = false;  // set after finalizeUploads()
@@ -186,13 +227,34 @@ public:
         const glm::mat4& view_proj,
         const glm::vec3& camera_pos);
 
-    // Bindless draw: single drawIndexedIndirectCount for all visible clusters.
-    // Returns visible cluster count (from previous frame's readback).
+    // Bindless draw — issues two indirect draws and a fullscreen OIT
+    // composite, all sharing the same merged VB/IB and bindless desc set:
+    //   1. Opaque + alpha-mask clusters into the caller's currently-active
+    //      dynamic rendering pass (color + depth).
+    //   2. End caller's pass; begin internal OIT pass; translucent
+    //      clusters write WBOIT (accum + reveal) into oit_accum_tex_ +
+    //      oit_reveal_tex_ with depth-test on / depth-write off.
+    //   3. End OIT pass; begin internal composite pass on color_view;
+    //      fullscreen quad samples accum+reveal and blends the resolved
+    //      colour over the existing scene with WBOIT's resolve formula.
+    //   4. Re-begin the caller's dynamic rendering pass with LOAD/LOAD so
+    //      the caller's matching endDynamicRendering() still has a pass
+    //      open to close (preserves the API contract).
+    //
+    // `color_view` / `depth_view` are the caller's render targets (taken
+    // from the existing forward dynamic-rendering setup).  `screen_size`
+    // sizes the OIT accum/reveal targets — they're recreated lazily when
+    // it changes (e.g. swap-chain rebuild).
+    //
+    // Returns previous frame's visible cluster count for HUD reporting.
     uint32_t draw(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_sets,
         const std::vector<renderer::Viewport>& viewports,
-        const std::vector<renderer::Scissor>& scissors);
+        const std::vector<renderer::Scissor>& scissors,
+        const std::shared_ptr<renderer::ImageView>& color_view,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& screen_size);
 
     // Swap chain resize.
     void recreate(

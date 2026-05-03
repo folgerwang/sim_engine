@@ -1215,6 +1215,7 @@ bool Menu::draw(
                 "6: Roughness (perceptual)",
                 "7: Metallic",
                 "8: Geometric normal",
+                "9: Translucent (alpha mode)",
             };
             for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
                 bool selected = (debug_render_mode_ == i);

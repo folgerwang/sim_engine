@@ -501,6 +501,13 @@ static void setupMeshState(
             ubo.material_features |= (src_material.emissiveTexture.index >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
             ubo.material_features |= (src_material.occlusionTexture.index >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
             ubo.material_features |= (src_material.normalTexture.index >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
+            // Propagate the CPU-side AlphaMode so the fragment shader can
+            // dispatch on translucency (currently consumed by the
+            // "Translucent" render-debug visualisation).  Glass-by-name
+            // overrides earlier in the loader force AlphaMode::Blend, so
+            // this also flags forced-glass materials as translucent.
+            ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Blend ? FEATURE_MATERIAL_BLEND : 0);
+            ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
             ubo.specular_color = glm::vec3(1.0f, 1.0f, 1.0f);
@@ -1037,6 +1044,12 @@ static void setupMeshState(
             ubo.material_features |= (dst_material.occlusion_idx_ >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
             ubo.material_features |= (dst_material.normal_idx_ >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
             ubo.material_features |= (dst_material.specular_color_idx_ >= 0 ? FEATURE_MATERIAL_SPECULARGLOSSINESS : 0);
+            // FBX path mirror of the GLTF block above — feed the CPU-side
+            // AlphaMode (including FBX glass-by-name overrides at line ~895)
+            // into the shader so the "Translucent" debug mode can spot
+            // them.  Glass-tagged materials always end up as Blend here.
+            ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Blend ? FEATURE_MATERIAL_BLEND : 0);
+            ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
 
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
         }

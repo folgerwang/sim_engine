@@ -27,21 +27,42 @@ layout(std430, set = 0, binding = 1) readonly buffer ClusterDrawBuffer {
     ClusterDrawInfo cluster_draw_infos[];
 };
 
-// Set 0, binding 2: output indirect draw commands
+// Set 0, binding 2: output indirect draw commands for OPAQUE / Mask clusters.
 // Each entry is a DrawIndexedIndirectCommand:
 //   uint indexCount, instanceCount, firstIndex, vertexOffset, firstInstance
 layout(std430, set = 0, binding = 2) writeonly buffer IndirectDrawBuffer {
     uint indirect_draws[];   // packed as 5 uints per command
 };
 
-// Set 0, binding 3: atomic draw count (single uint)
+// Set 0, binding 3: atomic draw count for opaque bucket.
 layout(std430, set = 0, binding = 3) buffer DrawCountBuffer {
     uint draw_count;
 };
 
-// Set 0, binding 4: visible cluster index list (for debug / stats)
+// Set 0, binding 4: visible cluster index list (for debug / stats; opaque only).
 layout(std430, set = 0, binding = 4) writeonly buffer VisibleClusterBuffer {
     uint visible_cluster_indices[];
+};
+
+// Set 0, binding 5: per-material flags (BindlessMaterialParams) so we can
+// route each cluster into the opaque or translucent bucket based on its
+// AlphaMode.  The cull pass only needs the .flags field, but binding the
+// whole struct avoids divergence with the render pass's data layout.
+layout(std430, set = 0, binding = 5) readonly buffer MaterialParamsBuffer {
+    BindlessMaterialParams material_params[];
+};
+
+// Set 0, binding 6: output indirect draw commands for TRANSLUCENT clusters.
+// Drawn in a second pass with a separate pipeline that has alpha blending
+// enabled (and depth-write off so translucent surfaces don't occlude one
+// another in the depth buffer).
+layout(std430, set = 0, binding = 6) writeonly buffer TransIndirectDrawBuffer {
+    uint trans_indirect_draws[];
+};
+
+// Set 0, binding 7: atomic draw count for translucent bucket.
+layout(std430, set = 0, binding = 7) buffer TransDrawCountBuffer {
+    uint trans_draw_count;
 };
 
 layout(local_size_x = 64, local_size_y = 1) in;
@@ -175,19 +196,31 @@ void main() {
         }
     }
 
-    // Cluster is visible — emit an indirect draw command.
+    // Cluster is visible — emit an indirect draw command.  Route to the
+    // opaque or translucent bucket based on the material's BLEND flag so
+    // glass / windows can be drawn in a second pass with alpha blending.
     ClusterDrawInfo draw = cluster_draw_infos[cluster_idx];
+    bool is_translucent =
+        (material_params[draw.material_idx].flags & BINDLESS_MAT_TRANSLUCENT) != 0;
 
-    uint slot = atomicAdd(draw_count, 1u);
-
-    // Pack DrawIndexedIndirectCommand (5 uints)
-    uint base = slot * 5u;
-    indirect_draws[base + 0] = draw.index_count;     // indexCount
-    indirect_draws[base + 1] = 1u;                    // instanceCount
-    indirect_draws[base + 2] = draw.index_offset;     // firstIndex
-    indirect_draws[base + 3] = draw.vertex_offset;    // vertexOffset (int32)
-    indirect_draws[base + 4] = cluster_idx;           // firstInstance = cluster index (for bindless material lookup)
-
-    // Record visible cluster for stats / debug.
-    visible_cluster_indices[slot] = cluster_idx;
+    if (is_translucent) {
+        uint slot = atomicAdd(trans_draw_count, 1u);
+        uint base = slot * 5u;
+        trans_indirect_draws[base + 0] = draw.index_count;
+        trans_indirect_draws[base + 1] = 1u;
+        trans_indirect_draws[base + 2] = draw.index_offset;
+        trans_indirect_draws[base + 3] = draw.vertex_offset;
+        trans_indirect_draws[base + 4] = cluster_idx;  // firstInstance = bindless material lookup
+        // Translucent clusters are not appended to visible_cluster_indices —
+        // that buffer is sized for opaque only and is a debug accessory.
+    } else {
+        uint slot = atomicAdd(draw_count, 1u);
+        uint base = slot * 5u;
+        indirect_draws[base + 0] = draw.index_count;     // indexCount
+        indirect_draws[base + 1] = 1u;                    // instanceCount
+        indirect_draws[base + 2] = draw.index_offset;     // firstIndex
+        indirect_draws[base + 3] = draw.vertex_offset;    // vertexOffset (int32)
+        indirect_draws[base + 4] = cluster_idx;           // firstInstance = cluster index (for bindless material lookup)
+        visible_cluster_indices[slot] = cluster_idx;
+    }
 }

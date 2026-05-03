@@ -153,6 +153,14 @@
 #define FEATURE_MATERIAL_IOR                    0x00000100
 #define FEATURE_MATERIAL_THICKNESS              0x00000200
 #define FEATURE_MATERIAL_ABSORPTION             0x00000400
+// Alpha-mode flags propagated from CPU AlphaMode::*.  Allows the fragment
+// shader to dispatch on translucency at runtime — primarily so the
+// "Translucent" render-debug mode can highlight blend / mask / opaque
+// materials without inspecting per-mesh names.  Glass-by-name materials
+// (matched in drawable_object loader) also set FEATURE_MATERIAL_BLEND so
+// they show up in the visualisation alongside asset-authored blends.
+#define FEATURE_MATERIAL_BLEND                  0x00000800
+#define FEATURE_MATERIAL_ALPHA_MASK             0x00001000
 
 #define FEATURE_HAS_BASE_COLOR_MAP              0x00010000
 #define FEATURE_HAS_NORMAL_MAP                  0x00020000
@@ -180,6 +188,11 @@
 #define DEBUG_RENDER_MODE_ROUGHNESS             6   // perceptual roughness (grayscale)
 #define DEBUG_RENDER_MODE_METALLIC              7   // metallic (grayscale)
 #define DEBUG_RENDER_MODE_GEOMETRIC_NORMAL      8   // ng (un-perturbed normal) as RGB
+#define DEBUG_RENDER_MODE_TRANSLUCENT           9   // alpha-mode tint: opaque=dark grey,
+                                                    // mask=yellow, blend/glass=magenta.
+                                                    // Use to verify glass materials are
+                                                    // correctly tagged AlphaMode::Blend
+                                                    // in the cluster + standard paths.
 
 #define LIGHT_COUNT                             1
 #define CSM_CASCADE_COUNT                       4
@@ -527,6 +540,12 @@ struct ClusterDrawInfo {
 // Flags for BindlessMaterialParams.flags
 #define BINDLESS_MAT_DOUBLE_SIDED   1   // bit 0: accept both face orientations (flip N on back face)
 #define BINDLESS_MAT_ALPHA_MASK     2   // bit 1: discard if alpha < alpha_cutoff
+#define BINDLESS_MAT_TRANSLUCENT    4   // bit 2: AlphaMode::Blend (glass / windows).
+                                        // Currently the cluster pipeline draws this as
+                                        // opaque too — the flag is set so the
+                                        // "Translucent" render-debug mode can highlight
+                                        // these materials, and so future work that adds
+                                        // a real translucent pipeline pass has the data.
 
 // Per-material colour data for the bindless cluster renderer.
 struct BindlessMaterialParams {

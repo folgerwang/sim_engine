@@ -230,6 +230,17 @@ void main() {
         outColor = vec4(vec3(material_info.perceptualRoughness), 1.0);
     } else if (dbg_mode == DEBUG_RENDER_MODE_METALLIC) {
         outColor = vec4(vec3(material_info.metallic), 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_TRANSLUCENT) {
+        // Tint by AlphaMode so it's instantly clear which materials are
+        // tagged translucent (glass / windows), alpha-tested, or opaque.
+        // Magenta = blend / glass, yellow = mask, dark grey = opaque.
+        if ((material.material_features & FEATURE_MATERIAL_BLEND) != 0u) {
+            outColor = vec4(1.0, 0.2, 1.0, 1.0);
+        } else if ((material.material_features & FEATURE_MATERIAL_ALPHA_MASK) != 0u) {
+            outColor = vec4(1.0, 1.0, 0.0, 1.0);
+        } else {
+            outColor = vec4(0.1, 0.1, 0.1, 1.0);
+        }
     }
 #else
     outColor = baseColor;
