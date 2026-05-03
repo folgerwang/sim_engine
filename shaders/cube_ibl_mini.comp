@@ -5,21 +5,29 @@
 //
 // Two orthogonal cost reductions on top of the reference cube_ibl.frag:
 //
-//   (a) Spatial 8x8 dither: each frame only 1/64 of the destination mip's
-//       texels are touched; the per-frame dither_offset cycles through all
-//       64 (dx, dy) positions over 64 frames.
+//   (a) Spatial 32x32 dither: each frame only 1/1024 of the destination
+//       mip's texels are touched; the per-frame dither_offset cycles
+//       through all 1024 (dx, dy) positions over 1024 frames.
 //
 //   (b) Temporal sample subdivision: each touched texel runs only
-//       NUM_SAMPLES_PER_FRAME = NUM_SAMPLES/64 importance samples this
+//       NUM_SAMPLES_PER_FRAME = NUM_SAMPLES/1024 importance samples this
 //       frame, drawn from a frame-dependent stratum of the full sample
 //       sequence.  The new partial estimate is EMA-blended into the
-//       texel's existing value; over many touches the value integrates
-//       toward the full NUM_SAMPLES result.
+//       texel's existing value.
+//
+//       NOTE: NUM_SAMPLES must be > dither_count (1024) for true temporal
+//       integration to work.  When NUM_SAMPLES <= dither_count, every
+//       (stride * dither_count) mod NUM_SAMPLES == 0 so each pixel re-reads
+//       the same sample_base on every revisit -- visible as a static dot
+//       pattern in the IBL outputs.  The default NUM_SAMPLES = 16384 set
+//       in cmake/CompileShaders.cmake satisfies this with
+//       NUM_SAMPLES_PER_FRAME = 16 per touch and stride = 17 coprime with
+//       both 1024 and 16384.
 //
 // Combined per-frame work for one mip is roughly
-//     (full_pixels / 64) x (NUM_SAMPLES / 64)
-//   = full_pixels x NUM_SAMPLES / 4096
-// of the reference fragment-shader path - a ~4000x reduction at mip 0.
+//     (full_pixels / 1024) x (NUM_SAMPLES / 1024)
+// of the reference fragment-shader path.  At NUM_SAMPLES = 1024 that's
+// full_pixels / 1024 work per frame -- a ~1000x reduction at mip 0.
 // Higher mips are not convolved at all here; the caller blits mip 0 down
 // to fill the rest of the chain.
 //
@@ -32,14 +40,15 @@
 #define UX3D_MATH_PI 3.1415926535897932384626433832795
 #define UX3D_MATH_INV_PI (1.0 / UX3D_MATH_PI)
 
-// Per-frame slice of NUM_SAMPLES.  64 frames cover the whole sample
-// sequence.  Override on the command line if you want a different time/
-// quality split (e.g. -DNUM_SAMPLES_PER_FRAME=32 for double-rate refresh).
+// Per-frame slice of NUM_SAMPLES.  1024 frames cover the whole sample
+// sequence (matching the 32x32 spatial dither cycle).  Override on the
+// command line if you want a different time/quality split (e.g.
+// -DNUM_SAMPLES_PER_FRAME=2 for double-rate refresh).
 #ifndef NUM_SAMPLES_PER_FRAME
-#define NUM_SAMPLES_PER_FRAME (NUM_SAMPLES / 64)
+#define NUM_SAMPLES_PER_FRAME (NUM_SAMPLES / 1024)
 #endif
 #if NUM_SAMPLES_PER_FRAME < 1
-#error "NUM_SAMPLES_PER_FRAME must be >= 1; pick a NUM_SAMPLES that's at least 64"
+#error "NUM_SAMPLES_PER_FRAME must be >= 1; pick a NUM_SAMPLES that's at least 1024"
 #endif
 
 layout(set = 0, binding = ENVMAP_TEX_INDEX) uniform samplerCube uCubeMap;
@@ -115,9 +124,10 @@ float D_Charlie(float sheenRoughness, float NdotH) {
 // Direction sampler that takes an absolute index into the [0, NUM_SAMPLES)
 // global sample sequence.  The global X coordinate is what governs the
 // importance-sampling distribution; only the *index ordering* across
-// touches changes per frame, not the underlying samples themselves.  This
-// is what makes the temporal accumulation converge to the NUM_SAMPLES
-// reference: across 64 touches a texel sees every index in [0, NUM_SAMPLES).
+// touches changes per frame, not the underlying samples themselves.
+// With the default NUM_SAMPLES = 16384 (> dither_count = 1024) a texel
+// cycles through disjoint sample subsets across consecutive touches and
+// the EMA integrates toward the full NUM_SAMPLES reference.
 vec3 getSampleVector(uint sampleIndex, vec3 N, float roughness) {
     float X = float(sampleIndex) / float(NUM_SAMPLES);
     float noise = hash11(X);
@@ -234,17 +244,22 @@ void main() {
     N.y = -N.y;  // match cube_ibl.frag axis convention
 
     // This frame's sample stratum.  We need temporal variation across
-    // dither cycles: a pixel is only touched once every 64 frames, so if
-    // (stride * 64) % NUM_SAMPLES == 0 the same pixel would see identical
-    // samples each touch and the EMA would converge to a 16-sample
-    // estimate, never to the full NUM_SAMPLES integral.
+    // dither cycles: a pixel is only touched once every 1024 frames, so
+    // if (stride * 1024) % NUM_SAMPLES == 0 the same pixel would see
+    // identical samples each touch and the EMA would converge to a
+    // NUM_SAMPLES_PER_FRAME-sample estimate, never to the full
+    // NUM_SAMPLES integral.
     //
-    // Picking stride = NUM_SAMPLES_PER_FRAME would do exactly that
-    // (16 * 64 = 1024 = NUM_SAMPLES).  We use NUM_SAMPLES_PER_FRAME + 1
-    // instead, which is coprime with 64 for any power-of-two
-    // NUM_SAMPLES_PER_FRAME and keeps consecutive touches of the same
-    // pixel on disjoint sample subsets - that's what makes "integrate by
-    // time" work.
+    // We use NUM_SAMPLES_PER_FRAME + 1 (which becomes odd whenever
+    // NUM_SAMPLES_PER_FRAME is a power of two, hence coprime with
+    // 1024 = 2^10) so consecutive touches of the same pixel land on
+    // disjoint sample subsets when NUM_SAMPLES > dither_count.
+    //
+    // CAVEAT: when NUM_SAMPLES <= 1024 (the dither_count) the touch
+    // gap (1024 frames) is itself a multiple of NUM_SAMPLES and
+    // (stride * 1024) mod NUM_SAMPLES is identically 0 for any
+    // stride - the formula degenerates and each pixel sees a fixed
+    // sample_base every revisit.  See the header comment.
     uint sample_base =
         (uint(params.frame_index) * (uint(NUM_SAMPLES_PER_FRAME) + 1u))
         % uint(NUM_SAMPLES);
@@ -252,30 +267,27 @@ void main() {
     vec3 new_estimate = filterColorPartial(N, sample_base);
 
     if (params.is_first_touch != 0) {
-        // FIRST-TOUCH INITIALIZATION.
+        // FIRST-TOUCH INITIALIZATION (block-fill bootstrap).
         //
-        // Old behaviour (removed): broadcast one estimate to every texel in
-        // the 8x8 block.  This initialised the whole image in one frame but
-        // produced a visible block-grid pop because all 64 blocks jumped to
-        // rough (16-sample) estimates simultaneously.
+        // Broadcast this thread's partial estimate to every texel in its
+        // dither_stride x dither_stride block.  The whole IBL output is
+        // therefore valid (block-uniform, but valid) from frame 0 — no
+        // black pixels, no rendering popping in over 1024 frames.  This
+        // mirrors the sky-envmap first-touch path in cube_skybox_mini.comp.
         //
-        // New behaviour: clear the entire block to vec4(0) and write the
-        // actual partial estimate only to the ONE dither-position texel.
-        // Alpha == 0 is the "untouched" sentinel; the EMA path below checks
-        // it and uses effective_alpha = 1.0 (direct replacement) rather than
-        // blending against zero.  Texels fill in individually over the next
-        // 64 frames — smooth, no block pop.  If resetMiniBuffer() is ever
-        // called the clear happens again, giving a smooth fade-in instead of
-        // a sudden grid flash.
+        // The blockiness fades away over the next 1024 frames as the dither
+        // cycle visits each texel and the EMA below replaces the bootstrap
+        // value with that texel's own correct estimate.  Alpha is set to
+        // 1.0 here so the EMA path always blends (no "untouched" sentinel
+        // path); the bootstrap value is a reasonable starting point for
+        // EMA integration.
+        vec4 fill = vec4(new_estimate, 1.0);
         for (int dy = 0; dy < params.dither_stride; ++dy) {
             for (int dx = 0; dx < params.dither_stride; ++dx) {
                 int wx = mini_x * params.dither_stride + dx;
                 int wy = mini_y * params.dither_stride + dy;
                 if (wx < params.mip_face_size && wy < params.mip_face_size) {
-                    bool is_dither_pos = (wx == full_x && wy == full_y);
-                    imageStore(dst_img, ivec3(wx, wy, face),
-                               is_dither_pos ? vec4(new_estimate, 1.0)
-                                             : vec4(0.0));
+                    imageStore(dst_img, ivec3(wx, wy, face), fill);
                 }
             }
         }
@@ -284,13 +296,13 @@ void main() {
 
     // EMA blend with the texel's previous value.
     //
-    // Alpha channel stores a "has been seeded" flag: 0.0 = this texel has
-    // never been written (it was cleared to vec4(0) during the first-touch
-    // pass but the dither cycle hasn't reached it yet).  For those texels
-    // use effective_alpha = 1.0 — pure replacement — so we never blend the
-    // new estimate against the zero initialiser.  Once a texel has been
-    // seeded (alpha == 1.0) switch to the configured temporal_alpha so the
-    // EMA integrates additional samples smoothly.
+    // After the first-touch bootstrap every texel carries a valid (if
+    // block-uniform) value with alpha == 1.0, so we always take the
+    // configured temporal_alpha path here.  The (old_weight < 0.01) guard
+    // is retained as a defensive fallback: if the bootstrap was somehow
+    // skipped (e.g. resetMiniBuffer() called and the dispatch dropped) it
+    // forces a direct replacement instead of blending against zero — which
+    // would leak black ghosts across the EMA.
     vec4 old_pixel = imageLoad(dst_img, ivec3(full_x, full_y, face));
     float old_weight = old_pixel.w;
     float effective_alpha = (old_weight < 0.01) ? 1.0

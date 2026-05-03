@@ -7,8 +7,11 @@
 
 #define ALPHAMODE_MASK 1
 
-#define DEBUG_BASE_COLOR 0
-#define DEBUG_MIP_LEVEL 0
+// Render-debug visualisation is now controlled at runtime via the
+// FEATURE_INPUT_DEBUG_MODE bits of camera_info.input_features (set by the
+// "Render Debug" combo in the menu) and dispatched at the bottom of main().
+// The old compile-time DEBUG_BASE_COLOR / DEBUG_MIP_LEVEL toggles are
+// removed because the runtime path covers their use cases.
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	ViewCameraInfo camera_info;
@@ -202,18 +205,33 @@ void main() {
 
     // regular shading
     outColor = vec4(toneMap(material, color), baseColor.a);
+
+    // ── Runtime render-debug override ────────────────────────────────────────
+    // Driven by the "Render Debug" menu (packed into camera_info.input_features
+    // bits 16..23 by application.cpp).  Mode 0 = the shaded path above, all
+    // other modes overwrite outColor with a single intermediate channel so we
+    // can visually inspect what each part of the pipeline is contributing.
+    uint dbg_mode =
+        (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+            >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+    if (dbg_mode == DEBUG_RENDER_MODE_ALBEDO) {
+        outColor = vec4(baseColor.rgb, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_NORMAL) {
+        outColor = vec4(normal_info.n * 0.5 + 0.5, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_GEOMETRIC_NORMAL) {
+        outColor = vec4(normal_info.ng * 0.5 + 0.5, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_DIFFUSE) {
+        outColor = vec4(color_info.f_diffuse, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SPECULAR) {
+        outColor = vec4(color_info.f_specular, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SHADOW) {
+        outColor = vec4(vec3(shadow), 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_ROUGHNESS) {
+        outColor = vec4(vec3(material_info.perceptualRoughness), 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_METALLIC) {
+        outColor = vec4(vec3(material_info.metallic), 1.0);
+    }
 #else
     outColor = baseColor;
 #endif // NO_MTL
-
-#if DEBUG_BASE_COLOR
-    outColor.xyz = baseColor.xyz;
-#endif
-
-#if DEBUG_MIP_LEVEL
-#ifndef NO_MTL// Debugging: show mip level
-    float lod = textureQueryLod(albedo_tex, ps_in_data.vertex_tex_coord.xy).x;
-    outColor.xyz = vec3(lod / 10.0f);
-#endif
-#endif
 }

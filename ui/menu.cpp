@@ -1199,6 +1199,32 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
 
+        // ── Forward / cluster PBR debug visualisation ────────────────────────
+        // Drives DEBUG_RENDER_MODE_* (packed into camera_info.input_features
+        // by application.cpp).  Both base.frag and cluster_bindless.frag read
+        // and dispatch on this value; mode 0 = the normal shaded path.
+        if (ImGui::BeginMenu("Render Debug"))
+        {
+            static const char* kRenderDebugItems[] = {
+                "0: Final shaded",
+                "1: Albedo (baseColor)",
+                "2: Normal (perturbed)",
+                "3: Diffuse term",
+                "4: Specular term",
+                "5: Shadow factor",
+                "6: Roughness (perceptual)",
+                "7: Metallic",
+                "8: Geometric normal",
+            };
+            for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
+                bool selected = (debug_render_mode_ == i);
+                if (ImGui::MenuItem(kRenderDebugItems[i], NULL, selected)) {
+                    debug_render_mode_ = i;
+                }
+            }
+            ImGui::EndMenu();
+        }
+
         if (cluster_renderer_ && ImGui::MenuItem("Smart Mesh")) {
             show_smart_mesh_window_ = !show_smart_mesh_window_;
         }
@@ -1434,6 +1460,30 @@ bool Menu::draw(
             ImGui::SliderFloat("phase func g", &skydome->getG(), -1.0f, 2.0f);
             ImGui::SliderFloat("rayleigh scale height", &skydome->getRayleighScaleHeight(), 0.0f, 16000.0f);
             ImGui::SliderFloat("mei scale height", &skydome->getMieScaleHeight(), 0.0f, 2400.0f);
+
+            // ---- Sky envmap fragment-shader debug visualisation -------
+            // Drives SkyboxEnvmapParams::debug_mode in skybox_envmap.frag
+            // each frame.  Internally the shader's switch is sparse (no
+            // mode "2"), so we keep the same numeric values and label
+            // them explicitly via the items[] array.
+            ImGui::SeparatorText("Debug");
+            static const char* kSkyDebugItems[] = {
+                "0: Normal (tone-mapped)",
+                "1: Solid red (FS smoke test)",
+                "3: view_dir RGB",
+                "4: Envmap raw (HDR)",
+                "5: Envmap x10000",
+            };
+            static const int kSkyDebugValues[] = { 0, 1, 3, 4, 5 };
+            int& debug_sky_mode = skydome->getDebugSkyMode();
+            int current_idx = 0;
+            for (int i = 0; i < IM_ARRAYSIZE(kSkyDebugValues); ++i) {
+                if (kSkyDebugValues[i] == debug_sky_mode) { current_idx = i; break; }
+            }
+            if (ImGui::Combo("Debug mode", &current_idx,
+                             kSkyDebugItems, IM_ARRAYSIZE(kSkyDebugItems))) {
+                debug_sky_mode = kSkyDebugValues[current_idx];
+            }
         }
         ImGui::End();
     }

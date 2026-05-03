@@ -34,6 +34,10 @@ class Menu {
     bool turn_off_shadow_pass_ = false;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;
+    // PBR / forward-pass debug visualisation; values match
+    // DEBUG_RENDER_MODE_* in global_definition.glsl.h.  Driven by the
+    // "Render Debug" combo in the menu bar.
+    int debug_render_mode_ = 0;
     float air_flow_strength_ = 50.0f;
     float water_flow_strength_ = 1.0f;
     float light_ext_factor_ = 0.004f;
@@ -143,12 +147,12 @@ private:
     float tod_hours_      = 0.0f;  // overwritten in constructor from local wall clock
     float tod_prev_hours_ = 0.0f;
     bool  tod_auto_advance_ = true;      // tick forward with real time
-    // Speed factor: game time / real time.  100.0 means 1 real-second
-    // advances the in-game clock by 100 game-seconds, so a full 24-hour
-    // cycle takes ~14.4 real minutes.  Slider in the Skydome window
+    // Speed factor: game time / real time.  5.0 means 1 real-second
+    // advances the in-game clock by 5 game-seconds, so a full 24-hour
+    // cycle takes ~4.8 real hours.  Slider in the Skydome window
     // exposes this directly; advanceTimeOfDay() converts to game-hours
     // internally (game-seconds-added / 3600).
-    float tod_advance_speed_ = 100.0f;
+    float tod_advance_speed_ = 5.0f;
     float tod_jump_threshold_ = 0.5f;    // hours
 
     // ---- IBL / sky cubemap debug visualisation ----------------------------
@@ -381,6 +385,12 @@ public:
     inline bool isShadowPassTurnOff() const {
         return turn_off_shadow_pass_;
     }
+
+    // Render-debug visualisation for the forward + cluster bindless paths.
+    // Returned value is one of DEBUG_RENDER_MODE_* (defined in
+    // global_definition.glsl.h).  application.cpp packs it into the upper
+    // bits of camera_info.input_features each frame.
+    inline int getDebugRenderMode() const { return debug_render_mode_; }
 
     inline bool isWaterPassTurnOff() {
         return turn_off_water_pass_;

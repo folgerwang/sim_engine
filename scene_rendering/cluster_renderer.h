@@ -65,10 +65,20 @@ class ClusterRenderer {
 
     // ── Merged VB/IB staging for bindless rendering ──
     // Vertices are transformed to world space during upload.
+    //   tangent.xyz = world-space tangent (already orthogonalised against normal)
+    //   tangent.w   = bitangent sign so the fragment shader can derive
+    //                 B = cross(N, tangent.xyz) * tangent.w
+    // The tangent is computed at upload time from the source mesh's
+    // per-triangle position+UV gradients (Lengyel-style accumulation,
+    // normalised + Gram-Schmidt against the vertex normal).  Carrying it as
+    // an interpolated vertex attribute lets cluster_bindless.frag apply
+    // normal mapping without the per-fragment dFdx/dFdy reconstruction
+    // that previously produced fine-grained sparkle on shaded surfaces.
     struct BindlessVertex {
         glm::vec3 position;
         glm::vec3 normal;
         glm::vec2 uv;
+        glm::vec4 tangent;
     };
     std::vector<BindlessVertex> staging_vertices_;
     std::vector<uint32_t>       staging_indices_;

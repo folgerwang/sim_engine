@@ -22,18 +22,25 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
 layout(location = 0) in vec3 in_position;   // world-space position
 layout(location = 1) in vec3 in_normal;      // world-space normal
 layout(location = 2) in vec2 in_uv;          // texture UV
+// in_tangent.xyz = world-space tangent (orthogonalised against in_normal,
+// computed at upload by computeMeshTangents in cluster_renderer.cpp);
+// in_tangent.w   = bitangent handedness sign so the fragment shader can
+//                  recover B = cross(N, T) * w without storing B explicitly.
+layout(location = 3) in vec4 in_tangent;
 
 // Outputs to fragment shader.
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out uint v_cluster_idx;
+layout(location = 4) out vec4 v_tangent;
 
 void main() {
     v_world_pos   = in_position;
     v_normal      = in_normal;
     v_uv          = in_uv;
     v_cluster_idx = gl_InstanceIndex;
+    v_tangent     = in_tangent;
 
     gl_Position = camera_info.view_proj * vec4(in_position, 1.0);
 }

@@ -164,6 +164,23 @@
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
 #define FEATURE_INPUT_SHADOW_DISABLED           0x00000002
 
+// Debug render mode is packed into bits 16..23 of camera_info.input_features
+// (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack
+// it as `(input_features >> SHIFT) & 0xFF` and override outColor when the
+// value is non-zero.  Driven by the "Render Debug" combo in the menu bar.
+#define FEATURE_INPUT_DEBUG_MODE_SHIFT          16
+#define FEATURE_INPUT_DEBUG_MODE_MASK           0x00FF0000
+
+#define DEBUG_RENDER_MODE_FINAL                 0   // shipping shaded path
+#define DEBUG_RENDER_MODE_ALBEDO                1   // baseColor.rgb (linear)
+#define DEBUG_RENDER_MODE_NORMAL                2   // perturbed N as RGB (×0.5+0.5)
+#define DEBUG_RENDER_MODE_DIFFUSE               3   // IBL+punctual diffuse term
+#define DEBUG_RENDER_MODE_SPECULAR              4   // IBL+punctual specular term
+#define DEBUG_RENDER_MODE_SHADOW                5   // CSM shadow factor (grayscale)
+#define DEBUG_RENDER_MODE_ROUGHNESS             6   // perceptual roughness (grayscale)
+#define DEBUG_RENDER_MODE_METALLIC              7   // metallic (grayscale)
+#define DEBUG_RENDER_MODE_GEOMETRIC_NORMAL      8   // ng (un-perturbed normal) as RGB
+
 #define LIGHT_COUNT                             1
 #define CSM_CASCADE_COUNT                       4
 
@@ -592,10 +609,22 @@ struct SunSkyParams {
 };
 
 // Push constant for the sky envmap background fullscreen pass.
-// Contains only the rotation-only inverse view-projection so the fragment
-// shader can reconstruct a world-space view direction per screen pixel.
+// Carries the rotation-only inverse view-projection so the fragment shader
+// can reconstruct a world-space view direction per screen pixel, plus a
+// runtime debug-mode selector exposed in the Skydome ImGui menu.
+//
+// debug_mode values (kept in sync with skybox_envmap.frag):
+//   0 = normal (Reinhard tone-mapped)
+//   1 = solid red          (fragment-shader smoke test)
+//   3 = view_dir RGB       (camera-matrix smoke test)
+//   4 = envmap raw         (HDR sample, no tone-map)
+//   5 = envmap × 10000     (saturate sample, useful for low-radiance debug)
 struct SkyboxEnvmapParams {
     mat4            inv_view_proj_relative;
+    int             debug_mode;
+    int             _pad0;
+    int             _pad1;
+    int             _pad2;
 };
 
 // Push constants for the dithered "mini-buffer" sky cubemap update.

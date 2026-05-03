@@ -167,20 +167,21 @@ std::shared_ptr<er::PipelineLayout> createIblMiniPipelineLayout(
         std::source_location::current());
 }
 
-// Bit-reversal Van der Corput permutation of [0, 64).  Same construction
-// used in Skydome::ditherOffsetForFrame - we deliberately keep them in
-// sync: Skydome and IblCreator both consume the same dither order so the
-// envmap mip 0 and the IBL outputs converge over the same 64-frame window
-// (though they advance their own counters independently, so the offsets
-// align only at frame 0 - this is fine for steady-state quality).
+// Bit-reversal Van der Corput permutation of [0, 1024).  Sweeps the 32x32
+// dither block in low-discrepancy order: 10-bit reversed index, lower 5 bits
+// → x, upper 5 bits → y.  Skydome::ditherOffsetForFrame uses the smaller
+// 8x8 block; the two are intentionally NOT in sync any more (the IBL
+// convolution gets the slower 1024-frame fill window while the sky envmap
+// stays on its tighter 64-frame cycle so sun motion shows up promptly in
+// the visible sky).
 glm::ivec2 iblDitherOffsetForFrame(uint32_t frame_index) {
-    uint32_t i = frame_index & 63u;
+    uint32_t i = frame_index & 1023u;
     uint32_t r = 0u;
-    for (uint32_t b = 0u; b < 6u; ++b) {
-        r |= ((i >> b) & 1u) << (5u - b);
+    for (uint32_t b = 0u; b < 10u; ++b) {
+        r |= ((i >> b) & 1u) << (9u - b);
     }
-    return glm::ivec2(static_cast<int>(r & 7u),
-                      static_cast<int>((r >> 3u) & 7u));
+    return glm::ivec2(static_cast<int>(r & 31u),
+                      static_cast<int>((r >> 5u) & 31u));
 }
 
 // Write descriptor entries for one mini-buffer IBL pass:
@@ -913,13 +914,14 @@ void dispatchIblMiniMip(
     const uint32_t mip_face_size =
         std::max(cube_size >> mip_level, 1u);
 
-    // Sparse 8x8 dither only when the mip is at least one block tall.
+    // Sparse 32x32 dither only when the mip is at least one block tall.
     // Smaller mips fall back to a full update each frame - they have at
-    // most 64 + 16 + 4 + 1 = 85 texels per face, which is rounding error.
-    const bool sparse = mip_face_size >= 8u;
-    const uint32_t dither_stride = sparse ? 8u : 1u;
+    // most 16x16 + 8x8 + 4x4 + 2x2 + 1 = 341 texels per face, which is
+    // rounding error compared to the convolution work elsewhere.
+    const bool sparse = mip_face_size >= 32u;
+    const uint32_t dither_stride = sparse ? 32u : 1u;
     const uint32_t mini_size =
-        sparse ? (mip_face_size / 8u) : mip_face_size;
+        sparse ? (mip_face_size / 32u) : mip_face_size;
 
     // Roughness is identical to the existing fragment-shader path: 0 at
     // the top mip, 1 at the smallest.  See createIblSpecularMap.

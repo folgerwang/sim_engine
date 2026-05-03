@@ -24,9 +24,19 @@ layout(push_constant) uniform SkyboxEnvmapUniformBufferObject {
 layout(location = 0) in vec2 v_UV;
 layout(location = 0) out vec4 outColor;
 
-// DEBUG_SKY: 0=normal (tone-mapped), 1=solid red, 3=view_dir RGB,
-//            4=envmap raw (no tone-map), 5=envmap×10000
-#define DEBUG_SKY 4
+// debug_mode is now driven from the CPU-side push constant (see
+// SkyboxEnvmapParams in global_definition.glsl.h).  Modes:
+//   0 = normal (Reinhard tone-mapped)   — the shipping path
+//   1 = solid red                        — fragment-shader smoke test
+//   3 = view_dir RGB                     — camera-matrix smoke test
+//   4 = envmap raw (no tone-map)         — HDR sample, useful when the
+//                                          envmap content itself is suspect
+//   5 = envmap × 10000                   — saturates the sample so any
+//                                          variation across the sphere is
+//                                          visible regardless of radiance
+//                                          magnitude
+// Driven by the "Debug mode" combo under the Skydome ImGui menu so we can
+// flip between modes at runtime without recompiling the shader.
 
 void main()
 {
@@ -37,19 +47,26 @@ void main()
     vec4 dir_h = params.inv_view_proj_relative * vec4(ndc, 1.0, 1.0);
     vec3 view_dir = normalize(dir_h.xyz / dir_h.w);
 
-#if DEBUG_SKY == 1
-    outColor = vec4(1.0, 0.0, 0.0, 1.0); return;
-#elif DEBUG_SKY == 3
-    outColor = vec4(view_dir * 0.5 + 0.5, 1.0); return;
-#elif DEBUG_SKY == 4
-    outColor = vec4(textureLod(u_envmap, view_dir, 0).rgb, 1.0); return;
-#elif DEBUG_SKY == 5
-    outColor = vec4(textureLod(u_envmap, view_dir, 0).rgb * 10000.0, 1.0); return;
-#endif
+    if (params.debug_mode == 1) {
+        outColor = vec4(1.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    if (params.debug_mode == 3) {
+        outColor = vec4(view_dir * 0.5 + 0.5, 1.0);
+        return;
+    }
+    if (params.debug_mode == 4) {
+        outColor = vec4(textureLod(u_envmap, view_dir, 0).rgb, 1.0);
+        return;
+    }
+    if (params.debug_mode == 5) {
+        outColor = vec4(textureLod(u_envmap, view_dir, 0).rgb * 10000.0, 1.0);
+        return;
+    }
 
-    // Sample the live sky envmap.  The envmap stores HDR radiance (atmosphere
-    // output × 2.0), so apply an exposure + Reinhard tone-map to compress it
-    // into displayable [0, 1] range for all sky conditions (noon to twilight).
+    // Default (debug_mode == 0): sample the live sky envmap and apply
+    // exposure + Reinhard tone-mapping so HDR radiance compresses to
+    // displayable [0, 1] range across noon→twilight conditions.
     //
     // Convention note: cube_skybox_mini.comp uses uvToXYZ() where face index 2
     // maps to the -Y *direction* but writes to Vulkan layer 2 = +Y cubemap face.

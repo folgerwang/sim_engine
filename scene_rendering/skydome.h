@@ -22,6 +22,13 @@ class Skydome {
     // 8x8 block is covered every 64 frames.
     uint32_t mini_frame_index_ = 0;
 
+    // Runtime debug-mode for the sky envmap fragment shader, surfaced as
+    // a combo under the Skydome ImGui menu.  Pushed into SkyboxEnvmapParams
+    // every frame; values mirror the documentation in skybox_envmap.frag:
+    //   0 = normal tone-mapped, 1 = solid red, 3 = view_dir RGB,
+    //   4 = envmap raw, 5 = envmap × 10000.
+    int debug_sky_mode_ = 0;
+
     renderer::TextureInfo sky_scattering_lut_tex_;
     renderer::TextureInfo sky_scattering_lut_sum_tex_;
     // Mini-buffer cubemap at (cube_size/8, cube_size/8, 6).  Holds the
@@ -94,6 +101,12 @@ public:
 
     inline float& getG() {
         return g_;
+    }
+
+    // Mutable accessor so ImGui can drive the sky envmap fragment shader's
+    // debug branch directly.  Values match SkyboxEnvmapParams::debug_mode.
+    inline int& getDebugSkyMode() {
+        return debug_sky_mode_;
     }
 
     inline const std::shared_ptr<renderer::ImageView>& getScatteringLutTex() {

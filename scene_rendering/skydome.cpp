@@ -1002,6 +1002,7 @@ void Skydome::drawEnvmap(
 
     glsl::SkyboxEnvmapParams params = {};
     params.inv_view_proj_relative = inv_view_proj_relative;
+    params.debug_mode             = debug_sky_mode_;
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,

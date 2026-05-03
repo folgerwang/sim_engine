@@ -19,6 +19,100 @@ namespace er  = engine::renderer;
 namespace engine {
 namespace scene_rendering {
 
+// ─── Per-source-vertex tangent computation ────────────────────────────────
+//
+// Lengyel-style accumulation: for each triangle, derive (T, B) from position
+// and UV gradients, then accumulate into each of the triangle's three vertex
+// slots.  After visiting every face, normalise each vertex's accumulated T,
+// orthogonalise it against the vertex normal (Gram-Schmidt), and stash the
+// bitangent sign in .w so the fragment shader can recover the bitangent as
+// `B = cross(N, T) * tangent.w`.
+//
+// This is the same scheme MikkT uses at low quality settings — good enough
+// for normal-map rendering without the per-fragment dFdx/dFdy reconstruction
+// that produces speckle in cluster_bindless.frag.  Returns one vec4 per
+// source vertex in object space; the caller transforms .xyz to world space.
+namespace {
+
+std::vector<glm::vec4> computeMeshTangents(
+    const std::vector<engine::helper::VertexStruct>& verts,
+    const std::vector<engine::helper::Face>&         faces) {
+
+    const size_t nv = verts.size();
+    std::vector<glm::vec3> tan_acc(nv, glm::vec3(0.0f));
+    std::vector<glm::vec3> bit_acc(nv, glm::vec3(0.0f));
+
+    for (const auto& f : faces) {
+        if (f.isDegenerate()) continue;
+        if (f.v_indices[0] >= nv || f.v_indices[1] >= nv ||
+            f.v_indices[2] >= nv) continue;
+
+        const auto& v0 = verts[f.v_indices[0]];
+        const auto& v1 = verts[f.v_indices[1]];
+        const auto& v2 = verts[f.v_indices[2]];
+
+        glm::vec3 e1  = v1.position - v0.position;
+        glm::vec3 e2  = v2.position - v0.position;
+        glm::vec2 du1 = v1.uv - v0.uv;
+        glm::vec2 du2 = v2.uv - v0.uv;
+
+        // Determinant of the UV Jacobian; sign encodes UV handedness.
+        // Tiny |det| means the triangle is UV-degenerate (collapsed to a
+        // line in texture space) — skip rather than divide by ~0.
+        float det = du1.x * du2.y - du2.x * du1.y;
+        if (std::abs(det) < 1e-8f) continue;
+        float r = 1.0f / det;
+
+        glm::vec3 T = r * ( du2.y * e1 - du1.y * e2);
+        glm::vec3 B = r * (-du2.x * e1 + du1.x * e2);
+
+        for (int k = 0; k < 3; ++k) {
+            uint32_t vi = f.v_indices[k];
+            tan_acc[vi] += T;
+            bit_acc[vi] += B;
+        }
+    }
+
+    std::vector<glm::vec4> out(nv);
+    for (size_t i = 0; i < nv; ++i) {
+        glm::vec3 N = verts[i].normal;
+        float n_len = glm::length(N);
+        if (n_len < 1e-6f) {
+            // Degenerate vertex normal — emit an arbitrary frame.  The
+            // fragment shader will still work; the surface just won't show
+            // normal-map detail (which is consistent with degenerate input).
+            out[i] = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+            continue;
+        }
+        N /= n_len;
+
+        glm::vec3 T = tan_acc[i];
+        // Orthogonalise the accumulated tangent against the vertex normal.
+        T = T - glm::dot(T, N) * N;
+        float t_len = glm::length(T);
+        if (t_len < 1e-6f) {
+            // No usable UV info on any incident face — pick an arbitrary
+            // perpendicular to N so downstream math (cross, normalize) is
+            // stable.  Picks the world axis least aligned with N.
+            glm::vec3 up = std::abs(N.y) < 0.99f
+                ? glm::vec3(0.0f, 1.0f, 0.0f)
+                : glm::vec3(1.0f, 0.0f, 0.0f);
+            T = glm::normalize(glm::cross(up, N));
+        } else {
+            T /= t_len;
+        }
+
+        // Bitangent sign: if cross(N, T) aligns with the accumulated B,
+        // sign is +1; otherwise -1.  Shader recomputes B = cross(N, T) * w.
+        float w = glm::dot(glm::cross(N, T), bit_acc[i]) >= 0.0f
+            ? 1.0f : -1.0f;
+        out[i] = glm::vec4(T, w);
+    }
+    return out;
+}
+
+}  // anonymous namespace
+
 // ─── Descriptor set layout for the cull compute pass ───────────────
 
 namespace {
@@ -344,6 +438,27 @@ void ClusterRenderer::uploadMeshClusters(
         return idx;
     };
 
+    // ── Per-source-mesh tangent precomputation ────────────────────────────
+    // Computed ONCE per uploadMeshClusters call (not per cluster) and
+    // looked up by source vertex index inside the cluster loop below.  Each
+    // entry is a vec4(T_object, bitangent_sign).  Empty if the source mesh
+    // has no CPU-side geometry (e.g. it was already freed after the
+    // original draw path's GPU upload) — the per-cluster code below already
+    // bails out in that case, so we just leave src_tangents empty.
+    std::vector<glm::vec4> src_tangents;
+    if (cluster_mesh.source->vertex_data_ptr &&
+        cluster_mesh.source->faces_ptr &&
+        !cluster_mesh.source->vertex_data_ptr->empty()) {
+        src_tangents = computeMeshTangents(
+            *cluster_mesh.source->vertex_data_ptr,
+            *cluster_mesh.source->faces_ptr);
+    }
+    // Direction-vector transform for tangents.  Tangents lie IN the surface
+    // plane and transform like position differences (mat3 of model_transform),
+    // NOT like normals (inverse-transpose).  For rigid / uniform-scale
+    // instances the two are identical; for shears they differ.
+    const glm::mat3 tangent_mat3 = glm::mat3(model_transform);
+
     for (uint32_t c = 0; c < num_clusters; ++c) {
         const auto& cl = cluster_mesh.clusters[c];
 
@@ -443,6 +558,20 @@ void ClusterRenderer::uploadMeshClusters(
                 // FBX files always set m_flip_v_=true (V-axis is inverted vs OpenGL/Vulkan).
                 if (drawable_data.m_flip_u_) bv.uv.x = 1.0f - bv.uv.x;
                 if (drawable_data.m_flip_v_) bv.uv.y = 1.0f - bv.uv.y;
+                // World-space tangent + bitangent sign.  src_tangents[vi].xyz is
+                // the orthogonalised object-space tangent from
+                // computeMeshTangents(); we transform direction-only with
+                // tangent_mat3.  Renormalise after the transform because
+                // non-uniform scale would otherwise leave |T| != 1.  The .w
+                // bitangent sign is preserved unchanged.
+                if (vi < src_tangents.size()) {
+                    glm::vec3 ws_T =
+                        glm::normalize(tangent_mat3 * glm::vec3(src_tangents[vi]));
+                    bv.tangent = glm::vec4(ws_T, src_tangents[vi].w);
+                } else {
+                    // Defensive fallback for out-of-range indices.
+                    bv.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+                }
                 staging_vertices_.push_back(bv);
             }
         }
@@ -1099,7 +1228,7 @@ void ClusterRenderer::initBindlessPipeline(
     binding_descs[0].stride = sizeof(BindlessVertex);
     binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
 
-    std::vector<er::VertexInputAttributeDescription> attrib_descs(3);
+    std::vector<er::VertexInputAttributeDescription> attrib_descs(4);
     // location 0: vec3 position
     attrib_descs[0].binding  = 0;
     attrib_descs[0].location = 0;
@@ -1115,6 +1244,14 @@ void ClusterRenderer::initBindlessPipeline(
     attrib_descs[2].location = 2;
     attrib_descs[2].format   = er::Format::R32G32_SFLOAT;
     attrib_descs[2].offset   = offsetof(BindlessVertex, uv);
+    // location 3: vec4 tangent (xyz = world-space tangent, w = bitangent sign).
+    // Used by cluster_bindless.frag to apply normal mapping without the per-
+    // fragment dFdx/dFdy reconstruction that produced sparkle on shaded
+    // surfaces.  See BindlessVertex doc + computeMeshTangents() for details.
+    attrib_descs[3].binding  = 0;
+    attrib_descs[3].location = 3;
+    attrib_descs[3].format   = er::Format::R32G32B32A32_SFLOAT;
+    attrib_descs[3].offset   = offsetof(BindlessVertex, tangent);
 
     // ── Graphics pipeline ──
     er::PipelineInputAssemblyStateCreateInfo input_assembly;
