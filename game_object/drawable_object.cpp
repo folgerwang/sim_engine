@@ -2736,8 +2736,21 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_depth_clamp_enable = true;
     rasterization_state_override.depth_clamp_enable = true;
+    // ── Force double-sided for the SHADOW pass ─────────────────────
+    // Shadow / depth-only renders should NOT cull back faces — when a
+    // single-sided asset (a fence panel, a leaf, a fabric strip) is
+    // viewed from the shadow caster's side and its front normals face
+    // away from the light, BACK-bit culling would drop every triangle
+    // and the surface stops casting any shadow.  Forcing double_sided
+    // = true here unconditionally rasterises both sides into the depth
+    // attachment, so thin / one-sided meshes still produce correct
+    // shadow silhouettes.
+    //
+    // The forward render pass keeps the asset's authored sidedness
+    // (see createDrawablePipelineInternal above), so visible shading
+    // still respects the original double_sided flag.
     rasterization_state_override.override_double_sided = true;
-    rasterization_state_override.double_sided = primitive.tag_.double_sided;
+    rasterization_state_override.double_sided = true;
     auto drawable_pipeline = device->createPipeline(
         pipeline_layout,
         binding_descs,

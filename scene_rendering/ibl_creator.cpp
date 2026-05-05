@@ -456,12 +456,27 @@ void IblCreator::createCubeTextures(
         tmp_ibl_sheen_tex_,
         std::source_location::current());
 
+    // Diffuse accumulator at 4× linear / 16× area of the consumer-facing
+    // diffuse cube.  The mini-buffer Lambertian convolution writes mip 0
+    // each frame at the larger size; we then run box-filter mipgen to
+    // populate mips 1 and 2 — mip 2 is a proper 4×4-averaged 1× cube,
+    // and we blit that to tmp_ibl_diffuse_tex_ for consumers.
+    //
+    // Why 3 mips and not just LINEAR-blit 4×→1× directly:
+    //   Vulkan's LINEAR blit filter uses a 2×2 footprint regardless of
+    //   the downsample ratio, so a 4:1 LINEAR blit misses 12 out of every
+    //   16 source pixels per output cell — the 4 it does read are biased
+    //   toward whatever dither phase the cycle happens to land on, which
+    //   shows up as systematic darkening of the consumer-facing cube.
+    //   Two sequential 2:1 LINEAR blits via mipgen each cover their full
+    //   2×2 source neighbourhood and chain into a true 4×4 box average,
+    //   so every accumulator texel contributes to the consumer cube.
     renderer::Helper::createCubemapTexture(
         device,
         cube_render_pass,
-        cube_size,
-        cube_size,
-        1,
+        cube_size * 4,
+        cube_size * 4,
+        3,                      // mips 0 (4×), 1 (2×), 2 (1×)
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
         rt_ibl_diffuse_tex_,
@@ -576,18 +591,34 @@ void IblCreator::createDescriptorSets(
         device->updateDescriptorSets(ibl_texture_descs);
     }
 
-    // ibl diffuse compute
+    // ibl diffuse blur compute.
+    //
+    // Layout decision:
+    //   src = rt_ibl_diffuse_tex_   (the EMA accumulator the mini-buffer
+    //                                Lambertian convolution reads/writes
+    //                                each frame — its full history)
+    //   dst = tmp_ibl_diffuse_tex_  (the consumer-facing blurred output
+    //                                bound at LAMBERTIAN_ENV_TEX_INDEX
+    //                                — see addToGlobalTextures())
+    //
+    // The blur is therefore a *read-only side-channel* on the EMA: it
+    // never writes back into rt_, so successive frames' Monte-Carlo
+    // averages don't compound the spatial blur into themselves.  The
+    // earlier "blur made the buffer darker every frame" symptom was
+    // exactly that feedback loop: the previous descriptor binding had
+    // src=tmp_, dst=rt_, so each frame the EMA picked up the blurred
+    // result as its starting point and the sequence converged toward a
+    // doubly-low-pass-filtered, increasingly desaturated steady state.
+    // Swapping src/dst breaks that loop entirely.
     {
-        // only one descriptor layout.
         ibl_diffuse_tex_desc_set_ = device->createDescriptorSets(
             descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
 
-        // create a global ibl texture descriptor set.
         auto ibl_texture_descs = addIblComputeTextures(
             ibl_diffuse_tex_desc_set_,
             texture_sampler,
-            tmp_ibl_diffuse_tex_,
-            rt_ibl_diffuse_tex_);
+            rt_ibl_diffuse_tex_,    // src = EMA history
+            tmp_ibl_diffuse_tex_);  // dst = blurred consumer-facing
         device->updateDescriptorSets(ibl_texture_descs);
     }
 
@@ -626,13 +657,20 @@ void IblCreator::addToGlobalTextures(
     renderer::WriteDescriptorList& descriptor_writes,
     const std::shared_ptr<renderer::DescriptorSet>& description_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler) {
+    // LAMBERTIAN_ENV_TEX_INDEX → tmp_ibl_diffuse_tex_ (post-blur output).
+    // The on-disk-loaded fallback that some assets use still binds rt_
+    // directly (not blurred), but for the live, runtime-convolved cube
+    // the consumer reads the blurred side-channel that blurIblMaps()
+    // produces each frame from the EMA accumulator in rt_.  See the
+    // src/dst comment in createDescriptorSets() for why the blur output
+    // doesn't feed back into the accumulator.
     er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
         er::DescriptorType::COMBINED_IMAGE_SAMPLER,
         LAMBERTIAN_ENV_TEX_INDEX,
         texture_sampler,
-        rt_ibl_diffuse_tex_.view,
+        tmp_ibl_diffuse_tex_.view,
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     er::Helper::addOneTexture(
         descriptor_writes,
@@ -1008,18 +1046,98 @@ void IblCreator::updateIblDiffuseMapMini(
 
     const glm::ivec2 dither = iblDitherOffsetForFrame(mini_frame_index_);
 
-    // Diffuse only convolves mip 0; total per-frame cost is ~1/64 of the
-    // old full-res Lambertian fragment-shader pass.
+    // The diffuse accumulator (rt_ibl_diffuse_tex_) is allocated at 4×
+    // the consumer-facing size (16× area) with a 3-mip chain.  Each
+    // frame:
+    //   1. Convolve mip 0 at the larger size (more dither coverage per
+    //      cycle).
+    //   2. Box-filter mipgen mips 1 and 2 — two sequential 2:1 LINEAR
+    //      blits, equivalent to a true 4×4 box filter on mip 0.  This
+    //      replaces a single 4:1 LINEAR blit, which only reads a 2×2
+    //      footprint per output pixel and so misses 12/16 of the source
+    //      data — the cause of the systematic darkening we saw with
+    //      direct rt_(4×) → tmp_(1×) blits.
+    //   3. Copy mip 2 (now exactly cube_size sized) → tmp_ for consumers.
+    const uint32_t accum_size = cube_size * 4;
+
     dispatchIblMiniMip(
         cmd_buf,
         ibl_mini_pipeline_layout_,
         diffuse_mini_desc_sets_[0],
         rt_ibl_diffuse_tex_.image,
-        cube_size,
+        accum_size,
         /*mip_level*/ 0u,
         /*num_mips */ 1u,
         dither,
         mini_frame_index_);
+    // dispatchIblMiniMip leaves rt_ mip 0 in SHADER_READ_ONLY_OPTIMAL.
+    // Mips 1 and 2 are still in UNDEFINED on first frame (just allocated)
+    // and SHADER_READ_ONLY_OPTIMAL on subsequent frames (left there by
+    // the previous frame's mipgen tail).  generateMipmapLevels handles
+    // both cases — it uses cur_image_layout for the source mip and
+    // transitions destination mips internally.
+
+    // Step 2: box-filter mipgen across mips 0 → 1 → 2.
+    renderer::Helper::generateMipmapLevels(
+        cmd_buf,
+        rt_ibl_diffuse_tex_.image,
+        /*mip_count*/ 3,
+        accum_size, accum_size,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    // After mipgen, every mip of rt_ is in SHADER_READ_ONLY_OPTIMAL.
+
+    // Step 3: copy mip 2 (1× size) → tmp_ mip 0 for consumers.
+    er::ImageResourceInfo as_xfer_src = {
+        er::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    er::ImageResourceInfo as_xfer_dst = {
+        er::ImageLayout::TRANSFER_DST_OPTIMAL,
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+
+    // Only mip 2 of rt_ needs to flip to TRANSFER_SRC (mips 0/1 stay
+    // in SHADER_READ_ONLY).
+    cmd_buf->addImageBarrier(
+        rt_ibl_diffuse_tex_.image,
+        er::Helper::getImageAsShaderSampler(),
+        as_xfer_src,
+        /*baseMip*/ 2, /*mipCount*/ 1, 0, 6);
+    cmd_buf->addImageBarrier(
+        tmp_ibl_diffuse_tex_.image,
+        er::Helper::getImageAsSource(),
+        as_xfer_dst,
+        0, 1, 0, 6);
+
+    er::ImageCopyInfo copy_region{};
+    copy_region.src_subresource.aspect_mask      = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
+    copy_region.src_subresource.mip_level        = 2;
+    copy_region.src_subresource.base_array_layer = 0;
+    copy_region.src_subresource.layer_count      = 6;
+    copy_region.src_offset = glm::ivec3(0, 0, 0);
+    copy_region.dst_subresource = copy_region.src_subresource;
+    copy_region.dst_subresource.mip_level = 0;
+    copy_region.dst_offset = glm::ivec3(0, 0, 0);
+    copy_region.extent     = glm::uvec3(cube_size, cube_size, 1);
+
+    cmd_buf->copyImage(
+        rt_ibl_diffuse_tex_.image,  er::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        tmp_ibl_diffuse_tex_.image, er::ImageLayout::TRANSFER_DST_OPTIMAL,
+        { copy_region });
+
+    // tmp_ → SHADER_READ_ONLY for consumers (cluster bindless ambient,
+    // base.frag IBL ambient, glass OIT).  rt_ mip 2 → SHADER_READ_ONLY
+    // for next-frame state symmetry.
+    cmd_buf->addImageBarrier(
+        tmp_ibl_diffuse_tex_.image,
+        as_xfer_dst,
+        er::Helper::getImageAsShaderSampler(),
+        0, 1, 0, 6);
+    cmd_buf->addImageBarrier(
+        rt_ibl_diffuse_tex_.image,
+        as_xfer_src,
+        er::Helper::getImageAsShaderSampler(),
+        /*baseMip*/ 2, /*mipCount*/ 1, 0, 6);
 }
 
 void IblCreator::updateIblSpecularMapMini(
@@ -1112,47 +1230,80 @@ void IblCreator::blurIblMaps(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const uint32_t& cube_size) {
 
+    // ── Shallow Gaussian on the diffuse cubemap ────────────────────────
+    // Reads the EMA accumulator (rt_ibl_diffuse_tex_) and writes the
+    // consumer-facing blurred cubemap (tmp_ibl_diffuse_tex_, bound at
+    // LAMBERTIAN_ENV_TEX_INDEX in addToGlobalTextures).  The blur is a
+    // pure side-channel: it never writes back into rt_, so successive
+    // frames' EMA accumulations don't pick up the spatial blur as their
+    // own starting point — see ibl_diffuse_tex_desc_set_ wiring in
+    // createDescriptorSets() for the rationale.
+    //
+    // Specular is intentionally NOT blurred: at the call site's
+    // num_mips=1 the GGX importance sampler degenerates to envmap(N),
+    // which already matches its consumer's expectation, and adding a
+    // blur to the specular side-channel would require either a second
+    // mipgen pass or a parallel blurred-specular allocation.
+
+    er::ImageResourceInfo rt_for_compute_read = {
+        er::ImageLayout::GENERAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+
+    // 1. rt_diffuse: SHADER_READ_ONLY → GENERAL (storage-image read).
+    //    The mini-buffer convolution left it in SHADER_READ_ONLY at end.
     cmd_buf->addImageBarrier(
         rt_ibl_diffuse_tex_.image,
+        er::Helper::getImageAsShaderSampler(),
+        rt_for_compute_read,
+        0, 1, 0, 6);
+    // 2. tmp_diffuse: any layout → GENERAL (storage-image write).
+    //    On first frame this comes from UNDEFINED; subsequently from
+    //    SHADER_READ_ONLY left by the previous frame's tail barrier.
+    //    Using getImageAsSource() (which encodes UNDEFINED) is safe in
+    //    both cases — we overwrite every texel anyway.
+    cmd_buf->addImageBarrier(
+        tmp_ibl_diffuse_tex_.image,
         er::Helper::getImageAsSource(),
         er::Helper::getImageAsStore(),
         0, 1, 0, 6);
 
+    // 3. Bind, push constants, dispatch.
+    glsl::IblComputeParams ibl_comp_params = {};
+    ibl_comp_params.size = glm::ivec4(cube_size, cube_size, 0, 0);
+
     cmd_buf->bindPipeline(
         er::PipelineBindPoint::COMPUTE,
         blur_comp_pipeline_);
-
-    glsl::IblComputeParams ibl_comp_params = {};
-    ibl_comp_params.size = glm::ivec4(cube_size, cube_size, 0, 0);
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         ibl_comp_pipeline_layout_,
         &ibl_comp_params,
         sizeof(ibl_comp_params));
-
     cmd_buf->bindDescriptorSets(
         er::PipelineBindPoint::COMPUTE,
         ibl_comp_pipeline_layout_,
         { ibl_diffuse_tex_desc_set_ });
+    cmd_buf->dispatch(
+        (cube_size + 7) / 8, (cube_size + 7) / 8, 6);
 
-    cmd_buf->dispatch((cube_size + 7) / 8, (cube_size + 7) / 8, 6);
-
-    uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
+    // 4. tmp_diffuse → SHADER_READ_ONLY for consumers (cluster bindless
+    //    ambient, base.frag IBL ambient, glass OIT).
     cmd_buf->addImageBarrier(
-        rt_ibl_diffuse_tex_.image,
+        tmp_ibl_diffuse_tex_.image,
         er::Helper::getImageAsStore(),
         er::Helper::getImageAsShaderSampler(),
         0, 1, 0, 6);
+    // 5. rt_diffuse → SHADER_READ_ONLY so the next frame's mini-buffer
+    //    EMA path (which transitions GENERAL→GENERAL via getImageAsLoad
+    //    Store before its dispatch) starts from a known well-defined
+    //    layout, AND so the IBL Debug viewer's SAMPLED descriptors over
+    //    rt_'s per-mip face views remain valid for ImGui::Image reads.
     cmd_buf->addImageBarrier(
-        rt_ibl_specular_tex_.image,
-        er::Helper::getImageAsSource(),
+        rt_ibl_diffuse_tex_.image,
+        rt_for_compute_read,
         er::Helper::getImageAsShaderSampler(),
-        0, num_mips, 0, 6);
-    cmd_buf->addImageBarrier(
-        rt_ibl_sheen_tex_.image,
-        er::Helper::getImageAsSource(),
-        er::Helper::getImageAsShaderSampler(),
-        0, num_mips, 0, 6);
+        0, 1, 0, 6);
 }
 
 void IblCreator::recreate(

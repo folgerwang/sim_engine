@@ -49,6 +49,31 @@ layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
     RuntimeLightsParams runtime_lights;
 };
 
+// set 5 — ambient probe SSBO (AmbientProbeSystem grid).  Gated by the
+// USE_AMBIENT_PROBES define so the shader still compiles when the probe
+// pipeline isn't wired into the cluster layout yet.  When enabled, the
+// fragment shader replaces the static IBL Lambertian ambient with a
+// position-dependent SH evaluation from the 8 nearest probes.
+//
+// To enable end-to-end:
+//   1. Add `AmbientProbeSystem::getProbeDescSetLayout()` to the layouts
+//      passed to the cluster bindless pipeline (alongside the existing
+//      sets above).
+//   2. Bind ambient_probe_system_->getProbeDescSet() during draw().
+//   3. Build cluster_bindless_frag.spv with `-DUSE_AMBIENT_PROBES`.
+#ifdef USE_AMBIENT_PROBES
+#define AMBIENT_PROBE_SET 5
+#define AMBIENT_PROBE_BINDING 0
+#include "ambient_probes.glsl.h"
+
+// Grid bounds — the application could plumb these via push_constants
+// or a UBO; for now the shader header's defaults are used (matching
+// the kDefaultGrid* constants in AmbientProbeSystem) and the grid
+// extents are passed as push constants alongside other per-frame state.
+// If you don't have a UBO yet, call sampleAmbientProbeGrid with literal
+// vec3 mins/maxes that match what placeProbeGrid was called with.
+#endif
+
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec2 v_uv;
@@ -200,7 +225,27 @@ void main() {
     // cubemap with the surface normal, matching base.frag's USE_IBL path.
     // This gives direction-dependent ambient (brighter sky-facing surfaces,
     // darker ground-facing ones) instead of the old flat 3% approximation.
+#ifdef USE_AMBIENT_PROBES
+    // Probe-driven ambient: trilinear-blend SH evaluation from the 8
+    // nearest probes in the grid.  Each probe's coefficients were baked
+    // from a moving DynamicCubemap that visited that probe's world
+    // position over 6 frames and projected the captured cube into 9
+    // RGB SH coefficients.  Cosine convolution is already baked into
+    // the stored coefficients (sh_project.comp), so this is a simple
+    // dot-product evaluation — no extra cosine factor needed.
+    //
+    // Grid bounds match what AmbientProbeSystem::placeProbeGrid was
+    // called with in application.cpp.  If you change those, update
+    // these constants OR plumb them via a UBO.
+    const vec3 kProbeGridMin = vec3(-50.0, -10.0, -50.0);
+    const vec3 kProbeGridMax = vec3( 50.0,  30.0,  50.0);
+    vec3 probe_irradiance =
+        sampleAmbientProbeGrid(v_world_pos, N,
+                               kProbeGridMin, kProbeGridMax);
+    vec3 ambient = albedo * probe_irradiance;
+#else
     vec3 ambient = getIBLRadianceLambertian(N, albedo);
+#endif
 
     // Lambertian diffuse (÷π matches PBR BRDF_lambertian normalisation).
     vec3 diffuse = albedo * light_col * (NdotL * shad / M_PI);

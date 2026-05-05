@@ -33,12 +33,21 @@ void main() {
     vec4  accum  = textureLod(u_accum,  v_UV, 0.0);
     float reveal = textureLod(u_reveal, v_UV, 0.0).r;
 
-    // Pixels with no translucent contribution have accum == 0 and
-    // reveal == 1, which would produce 0/0 in the divide.  Skip them
-    // entirely so the composite blend leaves the scene colour intact
-    // and we don't stamp depth where there's no glass (otherwise the
-    // sky pass below would be blocked from drawing over empty sky).
-    if (reveal >= 1.0 - 1e-5) {
+    // ── Robust "no-glass-here" rejection ────────────────────────────
+    // Two independent signals must both indicate that some glass actually
+    // wrote to this pixel before we fire the composite, otherwise the
+    // fullscreen pass would paint over and stamp depth across the entire
+    // scene whenever either accumulator drifts slightly off its clear
+    // value (numerical noise from drawing zero glass clusters, residual
+    // FP16 from a prior frame's content, etc.).
+    //   • reveal must be < 0.99   (cleared to 1.0; only true glass
+    //     fragments multiply it down via dst*(1−SRC_COLOR))
+    //   • accum.a must be > 1e-3  (glass writes α·weight which is ≥
+    //     0.05·1e-2 = 5e-4 even for the most transparent case after
+    //     the shader's α-clamp)
+    // Both conditions are loose enough that real glass always passes
+    // and tight enough that empty-OIT pixels never sneak through.
+    if (reveal > 0.99 || accum.a < 1e-3) {
         discard;
     }
 

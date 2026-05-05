@@ -256,6 +256,18 @@ public:
         const std::shared_ptr<renderer::ImageView>& depth_view,
         const glm::uvec2& screen_size);
 
+    // Opaque-only draw for cube face captures (DynamicCubemap).  Skips
+    // OIT + composite to avoid the size-dependent OIT target
+    // reallocation hazard — see the implementation comment in
+    // cluster_renderer.cpp for the full rationale.  Caller must have
+    // an active dynamic-rendering pass with appropriate color + depth
+    // attachments already bound.
+    uint32_t drawOpaqueOnly(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
     // Swap chain resize.
     void recreate(
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);

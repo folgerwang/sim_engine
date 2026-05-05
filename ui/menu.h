@@ -204,6 +204,34 @@ private:
     // the visible sRGB range.  Stored as linear scale (1.0 = no change).
     float ibl_debug_exposure_     = 1.0f;
 
+    // ---- Dynamic camera-positioned reflection cubemap debug viewer --------
+    // The DynamicCubemap probe captures one face per frame at the main
+    // camera position and reprojects the others.  The viewer below shows
+    // each ping-pong buffer's 6 face slices as a 6-thumbnail strip so we
+    // can visually verify that fresh captures look right and that the
+    // depth-aware reprojection is producing coherent output as the
+    // camera moves.  ImTextureIDs are wrapped from the per-face 2D layer
+    // views exposed by DynamicCubemap::getColorFaceView.
+    bool show_dynamic_cube_debug_ = false;
+
+    // Toggle in-scene probe debug-draw — when on, the application
+    // renders a small icosphere at every grid probe position via
+    // AmbientProbeSystem::drawDebug, so you can see where probes are
+    // placed and what irradiance each one is currently emitting.
+    bool show_probe_debug_ = false;
+    // [ping_pong_idx][face_idx] — populated by setDynamicCubeFaceTextureIds().
+    std::array<IblDebugFaceArray, 2> dynamic_cube_face_tex_ids_ = {};
+    // Live frame state mirrored from DynamicCubemap so the viewer can
+    // pick the right ping-pong index AND highlight which face was just
+    // freshly rendered (vs reprojected) this frame.  Set every frame
+    // by setDynamicCubeFrameInfo() before draw().
+    int  dynamic_cube_current_read_idx_ = 0;
+    int  dynamic_cube_current_face_     = 0;
+    uint64_t dynamic_cube_frame_index_  = 0;
+    glm::vec3 dynamic_cube_face_capture_pos_[6] = {};
+    float dynamic_cube_thumb_size_ = 128.0f;
+    float dynamic_cube_exposure_   = 1.0f;
+
     std::shared_ptr<ChatBox> chat_box_;
 
     // Optional GPU profiler — set from application after init.
@@ -381,6 +409,30 @@ public:
         sheen_face_mip_tex_ids_ = ids;
         ibl_debug_sheen_num_mips_ = num_mips;
     }
+
+    // ---- Dynamic-cubemap debug viewer ------------------------------------
+    // Application calls this once at startup with both ping-pong buffers'
+    // 6 face ImTextureIDs already wrapped via Helper::addImTextureID.
+    void setDynamicCubeFaceTextureIds(
+        const std::array<IblDebugFaceArray, 2>& ids) {
+        dynamic_cube_face_tex_ids_ = ids;
+    }
+    // Application calls this every frame so the viewer can pick the
+    // current ping-pong slice and highlight the freshly-rendered face.
+    void setDynamicCubeFrameInfo(
+        int current_read_idx, int current_face,
+        uint64_t frame_index,
+        const glm::vec3 face_capture_pos[6]) {
+        dynamic_cube_current_read_idx_ = current_read_idx;
+        dynamic_cube_current_face_     = current_face;
+        dynamic_cube_frame_index_      = frame_index;
+        for (int f = 0; f < 6; ++f) {
+            dynamic_cube_face_capture_pos_[f] = face_capture_pos[f];
+        }
+    }
+
+    // Probe in-scene debug-draw toggle.
+    inline bool showProbeDebug() const { return show_probe_debug_; }
 
     inline bool isShadowPassTurnOff() const {
         return turn_off_shadow_pass_;

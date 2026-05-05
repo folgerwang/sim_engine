@@ -1,0 +1,144 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+// ─── cube_reproject.comp ────────────────────────────────────────────────
+// Depth-aware reprojection pass for the DynamicCubemap reflection probe.
+//
+// The probe captures one cube face per frame at the current main-camera
+// position.  The other five faces still hold colour captured at older
+// camera positions.  This compute pass walks each output texel of every
+// "stale" face and resolves what its colour should be at the *current*
+// probe origin, using the depth captured at the old origin to estimate
+// world-space hit points.
+//
+// Algorithm (per output texel, 1 invocation = 1 dst pixel of 1 face):
+//
+//   1. Decode the destination texel coordinates → (face_idx, x, y).
+//   2. Build the world-space view direction d_dst that this texel
+//      represents from the *current* probe origin (P_now).  This is
+//      identical to the direction used by sampling code: invert the
+//      cube-face mapping (face_idx, uv) → unit vector.
+//   3. Sample the source cubemap's depth at d_dst (approximation: at
+//      small camera deltas vs scene depth, the direction is close
+//      enough that the depth value at d_dst matches the depth at the
+//      true source direction).  This gives us linear depth z.
+//   4. Reconstruct the world point W = P_old(face) + d_dst · z, where
+//      P_old(face) is the camera position at which this face was last
+//      freshly captured.
+//   5. Compute the *corrected* source direction d_src = normalize(W − P_now).
+//      Sample the source cubemap colour at d_src (which may land on a
+//      different face than face_idx; the cube sampler handles that).
+//   6. Write the resolved colour to the destination cube's face slice.
+//
+// The freshly-rendered face this frame is skipped via push_constant
+// `rendered_face_mask`: that face's content is already correct, so the
+// dispatch range excludes it.
+//
+// Caveats:
+//   • Depth sampled at d_dst (not d_src) is an approximation; it works
+//     well when the camera delta per frame is small relative to scene
+//     depth.  For large jumps (teleport), force a full-cycle re-render.
+//   • Disocclusion at silhouettes leaves smearing — acceptable for
+//     reflection probes where high-frequency detail is convolved away.
+//   • Far-plane samples (z >= far_plane − ε) are treated as sky and
+//     skipped: the captured direction is already correct since sky is
+//     at infinity.
+//
+// Layout:
+//   set 0 binding 0 — samplerCube     u_src_color   (RGBA16F, read)
+//   set 0 binding 1 — samplerCube     u_src_depth   (R32F, read)
+//   set 0 binding 2 — image2D         u_dst_color   (RGBA16F, write,
+//                                                    bound as a single
+//                                                    face's 2D layer of
+//                                                    the destination
+//                                                    cube ping-pong)
+//   push_constant   — ReprojectPushConstants
+// ─────────────────────────────────────────────────────────────────────
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube u_src_color;
+layout(set = 0, binding = 1) uniform samplerCube u_src_depth;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_dst_color;
+
+layout(push_constant) uniform ReprojectPushConstants {
+    // World-space probe origin used when this face was last freshly
+    // captured.  Reprojection targets P_now using this as the "old" anchor.
+    vec3  src_origin;
+    float pad0;
+    // World-space probe origin for the current frame (where consumers
+    // will sample the cubemap from).
+    vec3  dst_origin;
+    float pad1;
+    // Destination cube face index 0..5 (matches Vulkan cube layer order).
+    int   face_idx;
+    int   edge;          // edge length of the destination face in pixels
+    float far_plane;     // depth values >= this are treated as sky
+    float pad2;
+} pc;
+
+// ─── Cube-face direction reconstruction ────────────────────────────────
+// Given face index and (u, v) ∈ [-1, 1] coordinates within the face,
+// returns the world-space unit vector in the standard Vulkan cube layout.
+// Matches GL_TEXTURE_CUBE_MAP_POSITIVE_X etc.  Reference: Khronos cubemap
+// coordinate spec.
+vec3 cubeFaceDir(int face, vec2 uv) {
+    // uv is in [-1, 1] across the face.
+    vec3 dir;
+    switch (face) {
+        case 0: dir = vec3( 1.0, -uv.y, -uv.x); break;  // +X
+        case 1: dir = vec3(-1.0, -uv.y,  uv.x); break;  // -X
+        case 2: dir = vec3( uv.x,  1.0,  uv.y); break;  // +Y
+        case 3: dir = vec3( uv.x, -1.0, -uv.y); break;  // -Y
+        case 4: dir = vec3( uv.x, -uv.y,  1.0); break;  // +Z
+        default: dir = vec3(-uv.x, -uv.y, -1.0); break; // -Z
+    }
+    return normalize(dir);
+}
+
+void main() {
+    ivec2 dst_pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (dst_pixel.x >= pc.edge || dst_pixel.y >= pc.edge) return;
+
+    // Pixel-centred uv ∈ [-1, 1].
+    vec2 uv = (vec2(dst_pixel) + 0.5) / float(pc.edge) * 2.0 - 1.0;
+    vec3 d_dst = cubeFaceDir(pc.face_idx, uv);
+
+    // ── Step 1: depth at d_dst from the source cube ──
+    // The source cube was captured at src_origin; its depth at direction
+    // d_dst is the distance from src_origin along d_dst to the first
+    // surface that was visible at the time of capture.  We assume that
+    // direction is close enough to the "true" source direction that the
+    // depth read is a usable approximation.
+    float z = textureLod(u_src_depth, d_dst, 0.0).r;
+
+    // Sky / no-hit path: the captured direction is already correct since
+    // sky pixels are at infinity.  Just sample the source colour at
+    // d_dst — no parallax warp required.
+    if (z >= pc.far_plane - 1e-3) {
+        vec3 sky = textureLod(u_src_color, d_dst, 0.0).rgb;
+        imageStore(u_dst_color, dst_pixel, vec4(sky, 1.0));
+        return;
+    }
+
+    // ── Step 2: reconstruct world point + corrected source direction ──
+    vec3 W = pc.src_origin + d_dst * z;
+    vec3 d_src = W - pc.dst_origin;
+    float len2 = dot(d_src, d_src);
+    if (len2 < 1e-6) {
+        // Degenerate: world point coincides with current camera (e.g.
+        // probe inside geometry).  Fall back to the un-warped direction.
+        vec3 fallback = textureLod(u_src_color, d_dst, 0.0).rgb;
+        imageStore(u_dst_color, dst_pixel, vec4(fallback, 1.0));
+        return;
+    }
+    d_src *= inversesqrt(len2);
+
+    // ── Step 3: sample colour at corrected direction ──
+    // The cube sampler resolves which face d_src lands on, so reprojected
+    // pixels can pull colour from any of the 6 source faces — that is
+    // exactly the point of reprojection: when the camera moves, content
+    // shifts between faces.
+    vec3 c = textureLod(u_src_color, d_src, 0.0).rgb;
+    imageStore(u_dst_color, dst_pixel, vec4(c, 1.0));
+}

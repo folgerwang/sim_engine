@@ -5,7 +5,7 @@
 
 // Sky envmap background fragment shader.
 //
-// Reconstructs the world-space view direction for each screen pixel from the
+// Reconstructs the world-space view direction for each screen pixel from then
 // push-constant inv_view_proj_relative matrix (= inverse of proj * view_without_translation),
 // then samples mip 0 of the pre-convolved sky envmap cubemap.
 //

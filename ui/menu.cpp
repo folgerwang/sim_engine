@@ -1223,6 +1223,27 @@ bool Menu::draw(
                     debug_render_mode_ = i;
                 }
             }
+            ImGui::Separator();
+            // Toggle the popup window that displays each face of the
+            // camera-positioned dynamic reflection cubemap.  Useful for
+            // verifying that the per-frame face capture and the depth-
+            // aware reprojection of the other 5 faces are producing
+            // coherent results as the camera moves.  The window is
+            // rendered later in this same draw() call (see the
+            // `show_dynamic_cube_debug_` block further down).
+            if (ImGui::MenuItem(
+                    "Dynamic Cubemap Viewer", NULL, show_dynamic_cube_debug_)) {
+                show_dynamic_cube_debug_ = !show_dynamic_cube_debug_;
+            }
+            // Toggle in-scene probe icospheres.  Each sphere is colored
+            // by its probe's SH-evaluated irradiance in the surface
+            // normal direction — pending probes (not yet baked) draw
+            // solid red so they're easy to spot.  See
+            // AmbientProbeSystem::drawDebug + probe_debug.frag.
+            if (ImGui::MenuItem(
+                    "Show Probes (in scene)", NULL, show_probe_debug_)) {
+                show_probe_debug_ = !show_probe_debug_;
+            }
             ImGui::EndMenu();
         }
 
@@ -1705,9 +1726,15 @@ bool Menu::draw(
                 ibl_debug_mini_envmap_num_mips_,
                 &ibl_debug_mini_envmap_mip_);
 
-            // IBL diffuse (Lambertian, single mip).
+            // IBL diffuse (Lambertian, single mip).  The application
+            // registers the *blurred consumer-facing* cube here (see
+            // IblCreator::getIblDiffuseTexture, which now returns
+            // tmp_ibl_diffuse_tex_ — the post-blur output bound at
+            // LAMBERTIAN_ENV_TEX_INDEX).  This is what cluster /
+            // forward / glass shaders actually sample, so the panel
+            // matches what's on screen.
             draw_mip_row(
-                "ibl_diffuse", "IBL diffuse (Lambertian)",
+                "ibl_diffuse", "IBL diffuse (Lambertian, post-blur)",
                 diffuse_face_mip_tex_ids_,
                 ibl_debug_diffuse_num_mips_,
                 &ibl_debug_diffuse_mip_);
@@ -1757,6 +1784,152 @@ bool Menu::draw(
                     ImGui::Dummy(ImVec2(kThumbSize, kThumbSize));
                 }
                 ImGui::EndGroup();
+            }
+        }
+        ImGui::End();
+    }
+    // ------------------------------------------------------------------------
+
+    // ---- Dynamic camera-positioned cubemap debug viewer --------------------
+    // Mirrors the IBL Debug window layout but for the per-frame DynamicCubemap
+    // probe.  Rows shown:
+    //   • "Read buffer" — the ping-pong slice currently being sampled by
+    //     downstream consumers (glass OIT, opaque IBL).  Each face index's
+    //     thumbnail comes from the per-face 2D layer view registered with
+    //     ImGui at startup.  The face that was freshly rendered THIS frame
+    //     is highlighted with a yellow border so the round-robin update
+    //     pattern is visible at a glance.
+    //   • "Write buffer" — the other ping-pong slice (next frame's read
+    //     target).  Useful for comparing reprojection output against the
+    //     previously-stable buffer.
+    // Per-face capture-position metadata is shown in a tooltip on hover.
+    if (show_dynamic_cube_debug_) {
+        const float thumb = dynamic_cube_thumb_size_;
+        const float win_w = thumb * 6.0f + 80.0f;
+        const float win_h = thumb * 2.0f + 200.0f;
+
+        const ImVec2 vp_centre = {
+            vp_pos.x + float(screen_size.x) * 0.5f,
+            vp_pos.y + float(screen_size.y) * 0.5f };
+        ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing,
+                                ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
+        if (ImGui::Begin("Dynamic Cubemap Debug", &show_dynamic_cube_debug_)) {
+            // Detect "not yet wired" state — every entry is a default-
+            // constructed ImTextureID(0).  Show a hint instead of an
+            // empty grid of Dummy slots so it's obvious why the panel
+            // is blank.
+            bool any_id_set = false;
+            for (int p = 0; p < 2 && !any_id_set; ++p) {
+                for (int f = 0; f < 6; ++f) {
+                    if (dynamic_cube_face_tex_ids_[p][f]) {
+                        any_id_set = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_id_set) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                    "DynamicCubemap not yet wired into application.");
+                ImGui::Spacing();
+                ImGui::TextWrapped(
+                    "The class skeleton, reprojection compute shader and "
+                    "viewer UI are all in place, but the application has "
+                    "not yet:");
+                ImGui::Bullet(); ImGui::TextWrapped("instantiated DynamicCubemap;");
+                ImGui::Bullet(); ImGui::TextWrapped(
+                    "registered each face view via Helper::addImTextureID;");
+                ImGui::Bullet(); ImGui::TextWrapped(
+                    "called setDynamicCubeFaceTextureIds() / setDynamicCubeFrameInfo();");
+                ImGui::Bullet(); ImGui::TextWrapped(
+                    "called cubemap->update() each frame.");
+                ImGui::Spacing();
+                ImGui::TextWrapped(
+                    "Once that wiring is added, this panel will show "
+                    "the live face strip with hover tooltips and "
+                    "yellow-bordered \"freshly rendered\" highlights.");
+            } else {
+                ImGui::Text("Frame %llu, face just rendered: %d",
+                    static_cast<unsigned long long>(dynamic_cube_frame_index_),
+                    dynamic_cube_current_face_);
+                ImGui::Text("Read ping-pong index: %d",
+                    dynamic_cube_current_read_idx_);
+                ImGui::SliderFloat("Thumbnail size",
+                    &dynamic_cube_thumb_size_, 32.0f, 256.0f, "%.0f px");
+                ImGui::SliderFloat("Exposure",
+                    &dynamic_cube_exposure_, 0.1f, 32.0f, "%.2fx",
+                    ImGuiSliderFlags_Logarithmic);
+                ImGui::SameLine();
+                if (ImGui::Button("1x")) dynamic_cube_exposure_ = 1.0f;
+
+                const ImVec4 tint(
+                    dynamic_cube_exposure_,
+                    dynamic_cube_exposure_,
+                    dynamic_cube_exposure_,
+                    1.0f);
+                const ImVec4 border_normal(0, 0, 0, 0);
+                const ImVec4 border_hot(1.0f, 0.85f, 0.1f, 1.0f); // yellow
+
+                const char* face_names[6] =
+                    { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+
+                // Helper: draw one labelled row of 6 face thumbnails.
+                // `is_read_buffer` controls whether the freshly-rendered-face
+                // highlight + capture-position tooltip is applied.
+                auto draw_cube_row = [&](
+                    const char* row_id, const char* label,
+                    int ping_pong_idx,
+                    bool is_read_buffer) {
+                    ImGui::SeparatorText(label);
+                    ImGui::PushID(row_id);
+                    const auto& faces =
+                        dynamic_cube_face_tex_ids_[ping_pong_idx];
+                    for (int f = 0; f < 6; ++f) {
+                        if (f > 0) ImGui::SameLine();
+                        ImGui::BeginGroup();
+                        ImGui::Text("%s", face_names[f]);
+                        ImTextureID id = faces[f];
+                        const bool is_fresh = is_read_buffer &&
+                            (f == dynamic_cube_current_face_);
+                        const ImVec4& brd = is_fresh
+                            ? border_hot : border_normal;
+                        if (id) {
+                            ImGui::Image(id, ImVec2(thumb, thumb),
+                                ImVec2(0, 0), ImVec2(1, 1), tint, brd);
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::BeginTooltip();
+                                ImGui::Image(id, ImVec2(384.0f, 384.0f),
+                                    ImVec2(0, 0), ImVec2(1, 1),
+                                    tint, border_normal);
+                                const auto& p = dynamic_cube_face_capture_pos_[f];
+                                ImGui::Text(
+                                    "face %s (%d)\nlast captured at "
+                                    "(%.2f, %.2f, %.2f)",
+                                    face_names[f], f, p.x, p.y, p.z);
+                                if (is_fresh) {
+                                    ImGui::TextColored(
+                                        ImVec4(1, 0.8f, 0, 1),
+                                        "freshly rendered this frame");
+                                }
+                                ImGui::EndTooltip();
+                            }
+                        } else {
+                            ImGui::Dummy(ImVec2(thumb, thumb));
+                        }
+                        ImGui::EndGroup();
+                    }
+                    ImGui::PopID();
+                };
+
+                const int read_idx  = dynamic_cube_current_read_idx_;
+                const int write_idx = 1 - read_idx;
+
+                draw_cube_row(
+                    "##dyn_cube_read", "Read buffer (consumed this frame)",
+                    read_idx,  /*is_read_buffer*/ true);
+                draw_cube_row(
+                    "##dyn_cube_write", "Other ping-pong (next frame's read)",
+                    write_idx, /*is_read_buffer*/ false);
             }
         }
         ImGui::End();

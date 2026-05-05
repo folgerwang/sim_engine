@@ -1129,24 +1129,34 @@ void ClusterRenderer::cull(
     } else {
         // ── GPU compute culling path ─────────────────────────────────
 
-        // Zero the counters for THIS frame's dispatch (4 bytes each).
-        // Both opaque and translucent buckets are atomic-appended by the
-        // cull shader so both must start at zero.
-        auto zero_counter = [&](const renderer::BufferInfo& buf) {
-            uint32_t zero = 0;
-            void* mapped = device_->mapMemory(buf.memory, sizeof(uint32_t), 0);
-            if (mapped) {
-                std::memcpy(mapped, &zero, sizeof(uint32_t));
-                device_->unmapMemory(buf.memory);
-            }
-        };
-        zero_counter(draw_count_buffer_);
-        zero_counter(trans_draw_count_buffer_);
+        // Zero the counters via vkCmdFillBuffer (GPU-side).
+        //
+        // We used to do this with a host-side mapMemory + memcpy, which
+        // works fine when cull() runs once per frame but races when
+        // it's called multiple times per frame.  Specifically: the
+        // probe pass calls cull() THEN drawIndexedIndirectCount; the
+        // main cull THEN re-issues cull() (host-zeroing the same
+        // buffer) BEFORE the GPU has finished the probe's indirect
+        // read.  HOST_COHERENT memory is visible to the GPU at
+        // arbitrary times between barriers, so the host-zero from the
+        // second cull can clobber the count the probe's
+        // drawIndexedIndirectCount is about to read — making the
+        // probe pass occasionally render zero clusters and the cube
+        // face go blank for one frame.  Whole-scene flicker.
+        //
+        // vkCmdFillBuffer is a GPU command, properly ordered with
+        // surrounding compute / indirect operations via the ssbo
+        // barriers below.  No host involvement, no race.
+        cmd_buf->fillBuffer(draw_count_buffer_.buffer,
+                            0, sizeof(uint32_t), 0);
+        cmd_buf->fillBuffer(trans_draw_count_buffer_.buffer,
+                            0, sizeof(uint32_t), 0);
 
-        // Barrier: host counter-zero + previous indirect reads → compute.
-        er::BufferResourceInfo ssbo_host_write = {
-            SET_FLAG_BIT(Access, HOST_WRITE_BIT),
-            SET_FLAG_BIT(PipelineStage, HOST_BIT) };
+        // Barrier: counter-zero (GPU transfer) + previous indirect
+        // reads → compute.
+        er::BufferResourceInfo ssbo_transfer_write = {
+            SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+            SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
         er::BufferResourceInfo ssbo_compute_rw = {
             SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
             SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
@@ -1156,11 +1166,11 @@ void ClusterRenderer::cull(
 
         cmd_buf->addBufferBarrier(
             draw_count_buffer_.buffer,
-            ssbo_host_write,
+            ssbo_transfer_write,
             ssbo_compute_rw);
         cmd_buf->addBufferBarrier(
             trans_draw_count_buffer_.buffer,
-            ssbo_host_write,
+            ssbo_transfer_write,
             ssbo_compute_rw);
 
         cmd_buf->addBufferBarrier(
@@ -1679,6 +1689,59 @@ void ClusterRenderer::ensureOitTargets(const glm::uvec2& size) {
 }
 
 // ─── Draw — opaque pass + WBOIT translucent pass + composite ──────────────
+
+// ─── drawOpaqueOnly ─────────────────────────────────────────────────────
+// Opaque-only draw used by the dynamic cubemap face capture path.
+//
+// The full draw() method below also runs OIT + composite, which need
+// accum/reveal targets sized to the caller's screen_size.  When the
+// dynamic cubemap calls draw() with edge_×edge_ = 512×512 *and* the
+// main render path then calls draw() with the swapchain size, the OIT
+// helper destroys+reallocates the accum/reveal cubes between the two
+// calls.  That destruction happens during command-buffer recording but
+// the recorded probe-pass commands still hold VkImage handles for the
+// freed targets, which causes DEVICE_LOST at submission time.
+//
+// Glass / OIT content is irrelevant for ambient SH probes (they
+// integrate diffuse irradiance over the hemisphere; the contribution
+// of partly-transparent surfaces is already captured implicitly by
+// what's behind them).  So we skip OIT here entirely — only the
+// opaque cluster draw runs, into the caller's already-bound render
+// pass.  No size-dependent state, no reallocation hazard.
+uint32_t ClusterRenderer::drawOpaqueOnly(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !bindless_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, bindless_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_pipeline_layout_,
+        all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexedIndirectCount(
+        indirect_draw_buffer_, 0,
+        draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+    return total_visible_all_meshes_;
+}
 
 uint32_t ClusterRenderer::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

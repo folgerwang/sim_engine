@@ -2,35 +2,100 @@
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
 
+// ─── ibl_smooth.comp ────────────────────────────────────────────────────
+// Wide-radius Gaussian blur for the diffuse IBL cubemap.
+//
+// Why this exists:
+//   The mini-buffer IBL convolution touches each texel only once per
+//   1024-frame dither cycle, with NUM_SAMPLES_PER_FRAME = 16 importance
+//   samples per touch.  Even with the corrected Hammersley stratification
+//   (see cube_ibl_mini.comp), the per-touch Lambertian estimate has
+//   noticeable Monte-Carlo variance, and the 32×32 dither block
+//   first-touch bootstrap leaves visible block-shaped seams in the
+//   result.
+//
+//   Diffuse irradiance is *physically* a strong low-pass filter of the
+//   envmap (a cosine-weighted hemisphere integral throws away virtually
+//   all the high-frequency content), so it is correct and cheap to
+//   post-process the convolution output with a wide spatial Gaussian.
+//   The blur removes Monte-Carlo noise + dither block seams without
+//   altering the visible diffuse appearance.
+//
+// Kernel:
+//   2D separable Gaussian, radius RADIUS, σ = RADIUS / 2.0.  Implemented
+//   as a single 2D pass for code simplicity — the diffuse cube is small
+//   (typically 64²–128² per face), so the memory traffic is negligible
+//   at this point in the pipeline.  Samples outside the face are
+//   coordinate-clamped (Neumann boundary) — adjacent cube faces are
+//   visually similar at the edge for diffuse irradiance, so the clamp
+//   produces seam-free results without the cost of cross-face cube
+//   sampling.
+// ─────────────────────────────────────────────────────────────────────
+
 layout(push_constant) uniform IblUniformBufferObject {
     IblComputeParams ibl_params;
 };
 
-layout(rgba32f, set = 0, binding = SRC_TEX_INDEX) uniform imageCube src_img;
-layout(rgba32f, set = 0, binding = DST_TEX_INDEX) uniform imageCube dst_img;
+// IMPORTANT — these layout-qualifier formats MUST match the actual
+// image format that the descriptor set binds (R16G16B16A16_SFLOAT, set
+// up by ibl_creator.cpp).  When the shader declares rgba32f against an
+// rgba16f image, the imageLoad/imageStore behaviour is undefined per
+// the Vulkan spec — most drivers return zeros, which manifests as the
+// blurred buffer being uniformly very dark.  rgba32f used to be safe
+// here only because blurIblMaps was dead code (never called from any
+// caller); now that it runs every frame the mismatch matters.
+layout(rgba16f, set = 0, binding = SRC_TEX_INDEX) uniform imageCube src_img;
+layout(rgba16f, set = 0, binding = DST_TEX_INDEX) uniform imageCube dst_img;
+
+// Moderate Gaussian: 9×9 kernel (RADIUS = 4, σ = 2).  Wide enough to
+// visibly smooth Monte-Carlo speckle and partially blend across the
+// 32×32 dither-block seams from the mini-buffer first-touch bootstrap,
+// without going so wide that diffuse irradiance loses its directional
+// gradient.  Diffuse-only (specular keeps the mipgen-only path).
+//
+// Quick sizing reference (pick by what you want):
+//   RADIUS = 1, σ = 0.5  → essentially identity; only erases sub-pixel jitter
+//   RADIUS = 4, σ = 2    ← current; clear speckle reduction, gentle seam blend
+//   RADIUS = 8, σ = 4    → strong, fully crosses dither block boundaries
+#define RADIUS 4                            // 9×9 kernel
+#define KERNEL_SIZE (2 * RADIUS + 1)
+const float SIGMA      = 2.0;
+const float TWO_SIGMA2 = 2.0 * SIGMA * SIGMA;
 
 layout(local_size_x = 8, local_size_y = 8) in;
-void main()
-{
-  // get index in global work group i.e x,y position
-  ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+void main() {
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    int   face         = int(gl_GlobalInvocationID.z);
+    ivec2 size         = ivec2(ibl_params.size.x, ibl_params.size.y);
+    if (pixel_coords.x >= size.x || pixel_coords.y >= size.y || face >= 6) {
+        return;
+    }
 
-  // base pixel colour for image
-  vec4 pixel = vec4(0);
-  const int sample_count = 1;
-  int num_samples = 0;
-  for (int y = -sample_count; y <= sample_count; y++) {
-	for(int x = -sample_count; x <= sample_count; x++) {
-		ivec2 cur_coord = pixel_coords + ivec2(x, y);
-		if (cur_coord.x >= 0 && cur_coord.y >= 0 && cur_coord.x < ibl_params.size.x && cur_coord.y < ibl_params.size.y) {
-			pixel += imageLoad(src_img, ivec3(pixel_coords + ivec2(x, y), gl_GlobalInvocationID.z));
-			num_samples ++;
-		}
-	}
-  }
+    vec4  accum         = vec4(0.0);
+    float weight_total  = 0.0;
 
-  pixel /= num_samples;
-  
-  // output to a specific pixel in the image
-  imageStore(dst_img, ivec3(pixel_coords, gl_GlobalInvocationID.z), pixel);
+    // Single-pass 2D Gaussian.  Separable (horiz + vert) would be cheaper
+    // for big images, but the diffuse cube is small enough that this
+    // straight-up implementation runs in well under a millisecond.
+    for (int dy = -RADIUS; dy <= RADIUS; ++dy) {
+        for (int dx = -RADIUS; dx <= RADIUS; ++dx) {
+            // Coordinate-clamped Neumann boundary so the kernel weight
+            // sums to 1 at face edges (no darkening), and the diffuse
+            // irradiance varies smoothly across face seams.
+            ivec2 c = clamp(pixel_coords + ivec2(dx, dy),
+                            ivec2(0), size - ivec2(1));
+
+            // Gaussian weight in 2D: w = exp(−(dx² + dy²) / (2σ²)).
+            // Normalisation by weight_total below removes the missing
+            // 1/(2π σ²) prefactor and any boundary truncation bias.
+            float r2 = float(dx * dx + dy * dy);
+            float w  = exp(-r2 / TWO_SIGMA2);
+
+            accum         += w * imageLoad(src_img, ivec3(c, face));
+            weight_total  += w;
+        }
+    }
+
+    vec4 result = accum / max(weight_total, 1e-6);
+    imageStore(dst_img, ivec3(pixel_coords, face), result);
 }

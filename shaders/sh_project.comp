@@ -1,0 +1,204 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+// ─── sh_project.comp ────────────────────────────────────────────────────
+// Project a cubemap (DynamicCubemap colour cube) into the first 9
+// 2nd-order spherical harmonic basis functions, producing 9 RGB
+// coefficients suitable for diffuse irradiance evaluation in fragment
+// shaders.
+//
+// MATH:
+//   Given an environment radiance L(ω) sampled as a cubemap, the
+//   diffuse irradiance E(N) at surface normal N is:
+//     E(N) = ∫ L(ω) · max(N·ω, 0) dω
+//   Using Ramamoorthi & Hanrahan 2001's diffuse-IBL identity,
+//     E(N) ≈ Σ_l Σ_m  Â_l · L_lm · Y_lm(N)
+//   where Y_lm are SH basis functions and Â_l are constant cosine-lobe
+//   convolution kernels (Â_0 = π, Â_1 = 2π/3, Â_2 = π/4).  Storing
+//   only the 9 coefficients up to l = 2 captures >99 % of the diffuse
+//   irradiance for typical envmaps.
+//
+//   We project L(ω) onto SH:
+//     L_lm = ∫ L(ω) · Y_lm(ω) dω
+//        ≈ Σ_texel  L(texel) · Y_lm(dir(texel)) · solidAngle(texel)
+//   Then bake the cosine convolution into the stored coefficient so
+//   the fragment shader can evaluate E(N) directly:
+//     stored_lm = Â_l · L_lm
+//
+// DISPATCH:
+//   One workgroup per probe (push_constant.probe_idx).  The single
+//   workgroup is responsible for all 6 × edge × edge texels of the cube;
+//   we use a serial loop within the (single) invocation since edge is
+//   typically 512 — 1.5 M texels — and the projection isn't bandwidth
+//   bound.  A 1×1 workgroup keeps the SSBO write hazard-free without
+//   needing atomic adds.
+//
+// LAYOUT:
+//   set 0 binding 0 — samplerCube  u_src       (the captured cube)
+//   set 0 binding 1 — buffer       ProbeBuffer (output SH SSBO)
+//   push_constant   — { uint probe_idx; uint edge; }
+// ─────────────────────────────────────────────────────────────────────
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube u_src;
+// Linear-distance cube — written by depth_to_linear.comp after each
+// face render.  Sampled here to do parallax-aware reprojection of the
+// camera-centered cubemap into per-probe SH coefficients.
+layout(set = 0, binding = 2) uniform samplerCube u_src_depth;
+
+struct ProbeData {
+    vec4 position;       // .xyz = world pos, .w = "ready" flag
+    vec4 sh[9];          // per-band cosine-convolved RGB coefficients
+};
+
+layout(std430, set = 0, binding = 1) buffer ProbeBuffer {
+    ProbeData probes[];
+};
+
+layout(push_constant) uniform Push {
+    vec4  camera_pos_pad;   // .xyz = camera (cubemap origin)
+    vec4  probe_pos_pad;    // .xyz = active probe origin
+    uint  probe_idx;
+    uint  edge;             // cube face edge length in pixels
+    float pad0;
+    float pad1;
+} pc;
+
+const float SENTINEL_INF = 1e6;
+
+// Cube-face direction reconstruction — Vulkan/GL layer order.
+vec3 cubeFaceDir(int face, vec2 uv) {
+    vec3 d;
+    switch (face) {
+        case 0: d = vec3( 1.0, -uv.y, -uv.x); break;  // +X
+        case 1: d = vec3(-1.0, -uv.y,  uv.x); break;  // -X
+        case 2: d = vec3( uv.x,  1.0,  uv.y); break;  // +Y
+        case 3: d = vec3( uv.x, -1.0, -uv.y); break;  // -Y
+        case 4: d = vec3( uv.x, -uv.y,  1.0); break;  // +Z
+        default: d = vec3(-uv.x, -uv.y, -1.0); break; // -Z
+    }
+    return normalize(d);
+}
+
+// Differential solid angle for a unit-cube texel at face uv ∈ [-1, 1]
+// with edge size E.  Standard formula: dω = 4 / (E² · (1 + u² + v²)^(3/2)).
+float texelSolidAngle(vec2 uv, float inv_edge2) {
+    float u = uv.x, v = uv.y;
+    float r = 1.0 + u * u + v * v;
+    return 4.0 * inv_edge2 / (r * sqrt(r));
+}
+
+// 2nd-order real SH basis evaluated at a unit direction d.
+// Coefficients are the standard {Y00, Y1-1, Y10, Y11, Y2-2, Y2-1, Y20,
+// Y21, Y22} ordering used by Ramamoorthi/Hanrahan.
+void shBasis9(vec3 d, out float Y[9]) {
+    const float k0  = 0.282094791773878;   // 1 / (2 sqrt(π))
+    const float k1  = 0.488602511902919;   // sqrt(3 / (4π))
+    const float k2  = 1.092548430592079;   // sqrt(15 / (4π))
+    const float k20 = 0.315391565252520;   // sqrt(5 / (16π))
+    const float k22 = 0.546274215296039;   // sqrt(15 / (16π))
+
+    Y[0] =  k0;
+    Y[1] = -k1  * d.y;        // Y_{1,-1}
+    Y[2] =  k1  * d.z;        // Y_{1, 0}
+    Y[3] = -k1  * d.x;        // Y_{1, 1}
+    Y[4] =  k2  * d.x * d.y;
+    Y[5] = -k2  * d.y * d.z;
+    Y[6] =  k20 * (3.0 * d.z * d.z - 1.0);
+    Y[7] = -k2  * d.x * d.z;
+    Y[8] =  0.5 * k22 * (d.x * d.x - d.y * d.y);
+}
+
+void main() {
+    if (pc.probe_idx >= probes.length()) return;
+
+    // Cosine-lobe convolution kernel A_l, l = 0,1,2.
+    const float A0 = 3.141592653589793;          // π
+    const float A1 = 2.0943951023931953;         // 2π/3
+    const float A2 = 0.7853981633974483;         // π/4
+    const float A_band[9] = float[](
+        A0, A1, A1, A1, A2, A2, A2, A2, A2);
+
+    vec3 sh_acc[9];
+    for (int i = 0; i < 9; ++i) sh_acc[i] = vec3(0.0);
+
+    // ── Mip-averaged grid sampling ─────────────────────────────────
+    // The cubemap has a full mip chain (DynamicCubemap::generateMipsForRead
+    // runs box-filter mipgen at end of each probe cycle).  At
+    // textureLod(lod = log2(edge / SH_GRID)) each grid-cell read is
+    // hardware-averaged across (edge/SH_GRID)² mip-0 texels — so we
+    // can use a TINY grid (4 × 4 × 6 = 96 samples per probe) and
+    // still recover an accurate SH integral, with no aliasing.
+    //
+    // Tuneable: bump SH_GRID up if you ever want higher-frequency SH
+    // accuracy.  At 4 the worst-case integration error is well under
+    // 1 % for typical envmaps; 8 gives effectively reference quality.
+    const int SH_GRID = 4;
+    float inv_grid2 = 1.0 / float(SH_GRID * SH_GRID);
+    // Solid angle of one *grid cell* (not one texel) — texelSolidAngle's
+    // 1/E² factor becomes 1/grid² because each grid cell now represents
+    // (E/grid)² original texels.
+    // Parallax-aware sampling — for each direction d_probe (from the
+    // probe origin), reconstruct the world point the camera saw in
+    // that direction at the probe's distance, then sample the camera
+    // cube at the camera direction that hits the same world point.
+    //
+    //   1. Sample camera linear distance at d_probe: t = depth(d_probe)
+    //   2. Estimate world point along probe ray: W = probe + d_probe·t
+    //      (parallel-ray approximation — assumes the surface camera
+    //      sees in direction d_probe is at roughly the same distance
+    //      from the probe; valid for distant or weakly-parallax-prone
+    //      geometry, and the only practical option from a single
+    //      camera cube without per-probe depth)
+    //   3. Convert W back to camera direction d_camera = normalise(W − camera)
+    //   4. Sample camera colour at d_camera, accumulate SH at d_probe
+    //
+    // Sky pixels (t == SENTINEL_INF) skip the parallax entirely:
+    // sky is at infinity so the probe-vs-camera offset doesn't change
+    // the apparent direction.
+    vec3 cam_pos   = pc.camera_pos_pad.xyz;
+    vec3 probe_pos = pc.probe_pos_pad.xyz;
+
+    for (int face = 0; face < 6; ++face) {
+        for (int gy = 0; gy < SH_GRID; ++gy) {
+            for (int gx = 0; gx < SH_GRID; ++gx) {
+                vec2 uv = (vec2(float(gx), float(gy)) + 0.5) /
+                          float(SH_GRID) * 2.0 - 1.0;
+                vec3 d_probe = cubeFaceDir(face, uv);
+                float dW = texelSolidAngle(uv, inv_grid2);
+                float lod = log2(float(pc.edge) / float(SH_GRID));
+
+                float t = textureLod(u_src_depth, d_probe, 0.0).r;
+                vec3 d_camera;
+                if (t >= 0.5 * SENTINEL_INF) {
+                    // Sky — same direction from every probe.
+                    d_camera = d_probe;
+                } else {
+                    vec3 W = probe_pos + d_probe * t;
+                    vec3 to_W = W - cam_pos;
+                    float l2 = dot(to_W, to_W);
+                    d_camera = (l2 > 1e-6) ? to_W * inversesqrt(l2)
+                                            : d_probe;
+                }
+                vec3 L = textureLod(u_src, d_camera, lod).rgb;
+
+                float Y[9];
+                shBasis9(d_probe, Y);
+
+                for (int k = 0; k < 9; ++k) {
+                    sh_acc[k] += L * Y[k] * dW;
+                }
+            }
+        }
+    }
+
+    // Apply cosine convolution and store coefficients into THIS
+    // probe's SSBO slot.  Each probe gets its own dispatch (caller
+    // loops over all probes), and each dispatch's parallax-aware
+    // sampling above produced position-distinct SH integrals.
+    for (int k = 0; k < 9; ++k) {
+        probes[pc.probe_idx].sh[k] = vec4(A_band[k] * sh_acc[k], 0.0);
+    }
+    probes[pc.probe_idx].position.w = 1.0;
+}

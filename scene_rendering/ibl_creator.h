@@ -85,9 +85,18 @@ public:
     // Menu's "IBL Debug" window to show face-by-face previews via
     // ImGui::Image.  TextureInfo::surface_views[mip][face] gives
     // sampleable 2D views for each cube face per mip - ideal for ImGui.
-    inline const renderer::TextureInfo& getIblDiffuseTexture()  const { return rt_ibl_diffuse_tex_; }
-    inline const renderer::TextureInfo& getIblSpecularTexture() const { return rt_ibl_specular_tex_; }
-    inline const renderer::TextureInfo& getIblSheenTexture()    const { return rt_ibl_sheen_tex_; }
+    // Returns the *blurred, consumer-facing* diffuse cube — the same
+    // image bound at LAMBERTIAN_ENV_TEX_INDEX that cluster_bindless.frag,
+    // base.frag and the glass OIT shading block actually sample for
+    // diffuse irradiance.  Used by the IBL Debug viewer so the
+    // thumbnails reflect what the shaders see, not the noisier EMA
+    // accumulator that lives behind the blur.  For the unblurred
+    // accumulator (debugging the convolution path itself) use
+    // getIblDiffuseAccumulator() below.
+    inline const renderer::TextureInfo& getIblDiffuseTexture()      const { return tmp_ibl_diffuse_tex_; }
+    inline const renderer::TextureInfo& getIblDiffuseAccumulator()  const { return rt_ibl_diffuse_tex_; }
+    inline const renderer::TextureInfo& getIblSpecularTexture()     const { return rt_ibl_specular_tex_; }
+    inline const renderer::TextureInfo& getIblSheenTexture()        const { return rt_ibl_sheen_tex_; }
 
     // Reset the mini-buffer's temporal accumulation state across all
     // three IBL filters (Lambertian / GGX / Charlie).  Forces the next

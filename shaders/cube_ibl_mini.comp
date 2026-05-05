@@ -122,29 +122,82 @@ float D_Charlie(float sheenRoughness, float NdotH) {
 }
 
 // Direction sampler that takes an absolute index into the [0, NUM_SAMPLES)
-// global sample sequence.  The global X coordinate is what governs the
-// importance-sampling distribution; only the *index ordering* across
-// touches changes per frame, not the underlying samples themselves.
-// With the default NUM_SAMPLES = 16384 (> dither_count = 1024) a texel
-// cycles through disjoint sample subsets across consecutive touches and
-// the EMA integrates toward the full NUM_SAMPLES reference.
+// global sample sequence.
+//
+// ── Stratification ─────────────────────────────────────────────────────
+// We build a 2D Hammersley pair from `sampleIndex`:
+//   • X = sampleIndex / NUM_SAMPLES    (linear, controls θ via the
+//                                       importance-sample inverse CDF)
+//   • U = bit-reversed sampleIndex     (van der Corput base 2, controls φ)
+//
+// The crucial property is that U is decorrelated from contiguous index
+// runs: 16 consecutive sample indices give 16 widely-spread U values.
+// Without this — e.g. with the previous `phi = 2π · X` mapping —
+// `NUM_SAMPLES_PER_FRAME = 16` consecutive samples covered a φ-arc of
+// (16/16384)·360° ≈ 0.35°, so each per-touch estimate was wildly biased
+// toward whatever azimuth that thin sliver happened to point at, and
+// the EMA over 1024-frame revisits averaged out very slowly.
+//
+// Specular at roughness = 0 (the path the current call site uses) was
+// degenerate and didn't notice the bias — every sampled direction
+// collapses to N.  Lambertian / diffuse covers the whole hemisphere
+// and DID notice: it never converged within a usable time window.
+// Bit-reversed φ stratification fixes that.
+//
+// At small NUM_SAMPLES_PER_FRAME (e.g. 16) the 16 samples now cover
+// φ uniformly across the full circle, giving each per-touch estimate
+// a near-unbiased view of the hemisphere.  Convergence falls from
+// "1024² frames per pixel for full coverage" to "tens of frames per
+// pixel for usable diffuse irradiance".
 vec3 getSampleVector(uint sampleIndex, vec3 N, float roughness) {
     float X = float(sampleIndex) / float(NUM_SAMPLES);
-    float noise = hash11(X);
-    float Y = pow(noise, 2.0);
 
-    float phi = 2.0 * UX3D_MATH_PI * X;
+    // Van der Corput base 2 / bit reversal.  The /2^32 normalises the
+    // 32-bit reversed integer into [0, 1).  This works regardless of
+    // NUM_SAMPLES (no need to thread log2 in as a #define).
+    float U = float(bitfieldReverse(sampleIndex)) * (1.0 / 4294967296.0);
+
+    float phi      = 2.0 * UX3D_MATH_PI * U;
     float cosTheta = 0.0;
     float sinTheta = 0.0;
 
 #ifdef LAMBERTIAN_FILTER
-    cosTheta = 1.0 - Y;
-    sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    // ── Proper cosine-weighted hemisphere inverse CDF ───────────────────
+    // The declared PDF (see PDF() below) is cosθ/π, the standard cosine-
+    // weighted Lambertian PDF.  Sampling from that PDF requires the
+    // inverse CDF
+    //     cosθ = sqrt(1 − u),   u ∈ [0, 1] uniform
+    // (CDF P(cosθ ≤ c) = c² ⇒ density 2·cosθ, which divided by 2π over
+    //  the hemisphere gives cosθ/π — matching the declared PDF).
+    //
+    // The previous formulation `cosθ = 1 − pow(hash11(X), 2)` actually
+    // sampled cosθ from density 1/(2·√(1−cosθ)), which doesn't match the
+    // declared PDF — making the importance-sampled estimator BIASED.
+    // Combined with the narrow per-frame φ-arc that's been fixed above,
+    // this is what was preventing diffuse from converging to a smooth
+    // Lambertian irradiance: every per-touch estimate was off by a
+    // direction-dependent constant the EMA could never average away.
+    //
+    // Using the linear stratified X (= sampleIndex / NUM_SAMPLES) for the
+    // cosθ dimension keeps adjacent samples within a touch on a narrow
+    // zenith ring, while bit-reversed U scatters them across the full φ
+    // — together forming a proper 2D Hammersley sequence whose per-touch
+    // estimate is now unbiased.
+    cosTheta = sqrt(max(1.0 - X, 0.0));
+    sinTheta = sqrt(X);                 // = sqrt(1 − cosθ²)
 #elif defined(GGX_FILTER)
+    // Keep the original GGX inverse CDF for the time being.  At the
+    // current call site num_mips=1 ⇒ roughness=0, which collapses any
+    // GGX sampler (alpha²=0 makes cosθ=1 for any Y), so the convergence
+    // properties of this branch don't yet matter.  When higher-roughness
+    // mips are convolved here directly we'd want the same Hammersley
+    // treatment as above.
+    float Y     = pow(hash11(X), 2.0);
     float alpha = roughness * roughness;
     cosTheta = sqrt((1.0 - Y) / (1.0 + (alpha * alpha - 1.0) * Y));
     sinTheta = sqrt(1.0 - cosTheta * cosTheta);
 #elif defined(CHARLIE_FILTER)
+    float Y     = pow(hash11(X), 2.0);
     float alpha = roughness * roughness;
     sinTheta = pow(Y, alpha / (2.0 * alpha + 1.0));
     cosTheta = sqrt(1.0 - sinTheta * sinTheta);
