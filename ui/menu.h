@@ -38,6 +38,12 @@ class Menu {
     // DEBUG_RENDER_MODE_* in global_definition.glsl.h.  Driven by the
     // "Render Debug" combo in the menu bar.
     int debug_render_mode_ = 0;
+    // Forward vs deferred rendering toggle.  Application syncs its
+    // own deferred_rendering_enabled_ from this each frame.  Defaults
+    // to ON so the new G-buffer + compute resolve path is the
+    // out-of-the-box experience; flip OFF in the Render Debug menu
+    // to A/B against the legacy forward bindless path.
+    bool deferred_rendering_ = true;
     float air_flow_strength_ = 50.0f;
     float water_flow_strength_ = 1.0f;
     float light_ext_factor_ = 0.004f;
@@ -443,6 +449,12 @@ public:
     // global_definition.glsl.h).  application.cpp packs it into the upper
     // bits of camera_info.input_features each frame.
     inline int getDebugRenderMode() const { return debug_render_mode_; }
+
+    // Forward vs deferred toggle — read by application drawScene to
+    // route the cluster opaque pass through the G-buffer + compute
+    // resolve (true) or the legacy forward bindless pipeline (false).
+    inline bool isDeferredRendering() const { return deferred_rendering_; }
+    inline void setDeferredRendering(bool on) { deferred_rendering_ = on; }
 
     inline bool isWaterPassTurnOff() {
         return turn_off_water_pass_;

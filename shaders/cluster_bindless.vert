@@ -34,6 +34,16 @@ layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out uint v_cluster_idx;
 layout(location = 4) out vec4 v_tangent;
+// Current and previous-frame homogeneous clip positions.  The fragment
+// shader's GBUFFER_OUTPUT branch divides each by .w to get NDC and
+// writes (curNDC.xy - prevNDC.xy) into the RT3 velocity attachment.
+// Cluster vertices are baked in WORLD space and the geometry is static,
+// so velocity here purely reflects camera motion — that's enough for
+// camera-driven TAA/motion blur on cluster meshes.  Animated/skinned
+// instances would also need their previous-frame model transform fed in
+// here, but the current cluster pipeline doesn't have that.
+layout(location = 5) out vec4 v_cur_clip;
+layout(location = 6) out vec4 v_prev_clip;
 
 void main() {
     v_world_pos   = in_position;
@@ -42,5 +52,8 @@ void main() {
     v_cluster_idx = gl_InstanceIndex;
     v_tangent     = in_tangent;
 
-    gl_Position = camera_info.view_proj * vec4(in_position, 1.0);
+    vec4 world = vec4(in_position, 1.0);
+    v_cur_clip  = camera_info.view_proj      * world;
+    v_prev_clip = camera_info.prev_view_proj * world;
+    gl_Position = v_cur_clip;
 }

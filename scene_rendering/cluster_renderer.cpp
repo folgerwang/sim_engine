@@ -1921,6 +1921,282 @@ uint32_t ClusterRenderer::draw(
     return prev_visible;
 }
 
+// ─── Deferred G-buffer pipeline + draw ────────────────────────────────────
+// Builds a third variant of the bindless pipeline using the same vertex
+// shader and the cluster_bindless.frag GBUFFER_OUTPUT branch (3 RTs, no
+// in-shader lighting).  Reuses bindless_pipeline_layout_ / bindless_desc_
+// set_ — only the colour-attachment formats and the fragment SPV change.
+//
+// drawOpaqueGBuffer() then issues exactly the same indirect draw as the
+// forward opaque pipeline, but with this G-buffer pipeline bound, so the
+// per-cluster cull SSBOs / vertex layout / texture arrays remain shared.
+void ClusterRenderer::initBindlessGBufferPipeline(
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const renderer::PipelineRenderbufferFormats& gbuffer_format) {
+
+    // No-op if the forward init didn't run (e.g. no merged geometry) — the
+    // application will simply fall back to the forward path.
+    if (!gpu_ready_ || !bindless_pipeline_layout_) {
+        return;
+    }
+    if (bindless_gbuffer_pipeline_) {
+        return;   // already built
+    }
+
+    // Vertex input description — must match BindlessVertex exactly.  Mirror
+    // the layout from initBindlessPipeline rather than refactoring it out
+    // to keep this addition minimally invasive.
+    std::vector<er::VertexInputBindingDescription> binding_descs(1);
+    binding_descs[0].binding    = 0;
+    binding_descs[0].stride     = sizeof(BindlessVertex);
+    binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
+
+    // VertexInputAttributeDescription has no list-init operator= — assign
+    // each field explicitly, mirroring initBindlessPipeline above.
+    std::vector<er::VertexInputAttributeDescription> attrib_descs(4);
+    attrib_descs[0].binding  = 0;
+    attrib_descs[0].location = 0;
+    attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
+    attrib_descs[0].offset   = offsetof(BindlessVertex, position);
+    attrib_descs[1].binding  = 0;
+    attrib_descs[1].location = 1;
+    attrib_descs[1].format   = er::Format::R32G32B32_SFLOAT;
+    attrib_descs[1].offset   = offsetof(BindlessVertex, normal);
+    attrib_descs[2].binding  = 0;
+    attrib_descs[2].location = 2;
+    attrib_descs[2].format   = er::Format::R32G32_SFLOAT;
+    attrib_descs[2].offset   = offsetof(BindlessVertex, uv);
+    attrib_descs[3].binding  = 0;
+    attrib_descs[3].location = 3;
+    attrib_descs[3].format   = er::Format::R32G32B32A32_SFLOAT;
+    attrib_descs[3].offset   = offsetof(BindlessVertex, tangent);
+
+    er::PipelineInputAssemblyStateCreateInfo input_assembly;
+    input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
+    input_assembly.restart_enable = false;
+
+    er::RasterizationStateOverride raster_override{};
+    raster_override.override_double_sided = true;
+    raster_override.double_sided          = true;
+
+    // 3 colour attachments — no blending: each G-buffer texel is owned by a
+    // single fragment after depth test.  The application supplies the
+    // attachment formats; we build a no-blend state with N attachments to
+    // match.
+    std::vector<er::PipelineColorBlendAttachmentState> gbuf_no_blend(
+        gbuffer_format.color_formats.size(),
+        er::helper::fillPipelineColorBlendAttachmentState());
+    auto gbuf_blend_state =
+        std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+            er::helper::fillPipelineColorBlendStateCreateInfo(gbuf_no_blend));
+
+    er::GraphicPipelineInfo gbuf_info = graphic_pipeline_info;
+    gbuf_info.blend_state_info = gbuf_blend_state;
+
+    er::ShaderModuleList gbuf_shader_modules(2);
+    gbuf_shader_modules[0] = er::helper::loadShaderModule(
+        device_, "cluster_bindless_vert.spv",
+        er::ShaderStageFlagBits::VERTEX_BIT,
+        std::source_location::current());
+    gbuf_shader_modules[1] = er::helper::loadShaderModule(
+        device_, "cluster_bindless_gbuf_frag.spv",
+        er::ShaderStageFlagBits::FRAGMENT_BIT,
+        std::source_location::current());
+
+    bindless_gbuffer_pipeline_ = device_->createPipeline(
+        bindless_pipeline_layout_,
+        binding_descs,
+        attrib_descs,
+        input_assembly,
+        gbuf_info,
+        gbuf_shader_modules,
+        gbuffer_format,
+        raster_override,
+        std::source_location::current());
+}
+
+uint32_t ClusterRenderer::drawOpaqueGBuffer(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !bindless_gbuffer_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, bindless_gbuffer_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_pipeline_layout_,
+        all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexedIndirectCount(
+        indirect_draw_buffer_, 0,
+        draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+    return total_visible_all_meshes_;
+}
+
+uint32_t ClusterRenderer::drawTranslucentForward(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    const std::shared_ptr<renderer::ImageView>& color_view,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& screen_size) {
+    if (!gpu_ready_ || !bindless_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+    if (!bindless_translucent_pipeline_ || !oit_composite_pipeline_) {
+        return total_visible_all_meshes_;
+    }
+
+    ensureOitTargets(screen_size);
+    if (!oit_composite_desc_set_) {
+        return total_visible_all_meshes_;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    auto bind_geometry_state = [&](const std::shared_ptr<er::Pipeline>& pipe) {
+        cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, pipe);
+        cmd_buf->setViewports(viewports);
+        cmd_buf->setScissors(scissors);
+        cmd_buf->bindDescriptorSets(
+            er::PipelineBindPoint::GRAPHICS,
+            bindless_pipeline_layout_,
+            all_desc_sets);
+        cmd_buf->bindVertexBuffers(0, { merged_vertex_buffer_.buffer }, { 0 });
+        cmd_buf->bindIndexBuffer(
+            merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+    };
+
+    // ── End host pass (caller's pass on color_view + depth_view) ──
+    cmd_buf->endDynamicRendering();
+
+    // ── WBOIT translucent into accum + reveal ──
+    er::RenderingAttachmentInfo accum_att;
+    accum_att.image_view   = oit_accum_tex_.view;
+    accum_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    accum_att.load_op      = er::AttachmentLoadOp::CLEAR;
+    accum_att.store_op     = er::AttachmentStoreOp::STORE;
+    accum_att.clear_value.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+
+    er::RenderingAttachmentInfo reveal_att;
+    reveal_att.image_view   = oit_reveal_tex_.view;
+    reveal_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    reveal_att.load_op      = er::AttachmentLoadOp::CLEAR;
+    reveal_att.store_op     = er::AttachmentStoreOp::STORE;
+    reveal_att.clear_value.color = { { 1.0f, 0.0f, 0.0f, 0.0f } };
+
+    er::RenderingAttachmentInfo oit_depth_att;
+    oit_depth_att.image_view   = depth_view;
+    oit_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    oit_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
+    oit_depth_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingInfo oit_ri = {};
+    oit_ri.render_area_offset = { 0, 0 };
+    oit_ri.render_area_extent = screen_size;
+    oit_ri.layer_count        = 1;
+    oit_ri.view_mask          = 0;
+    oit_ri.color_attachments  = { accum_att, reveal_att };
+    oit_ri.depth_attachments  = { oit_depth_att };
+
+    cmd_buf->beginDynamicRendering(oit_ri);
+    bind_geometry_state(bindless_translucent_pipeline_);
+    cmd_buf->drawIndexedIndirectCount(
+        trans_indirect_draw_buffer_, 0,
+        trans_draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+    cmd_buf->endDynamicRendering();
+
+    er::ImageResourceInfo from_color_att = {
+        er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT) };
+    er::ImageResourceInfo to_shader_read = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
+    cmd_buf->addImageBarrier(oit_accum_tex_.image,  from_color_att, to_shader_read, 0, 1, 0, 1);
+    cmd_buf->addImageBarrier(oit_reveal_tex_.image, from_color_att, to_shader_read, 0, 1, 0, 1);
+
+    // ── Composite ──
+    er::RenderingAttachmentInfo comp_color_att;
+    comp_color_att.image_view   = color_view;
+    comp_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    comp_color_att.load_op      = er::AttachmentLoadOp::LOAD;
+    comp_color_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingAttachmentInfo comp_depth_att;
+    comp_depth_att.image_view   = depth_view;
+    comp_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    comp_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
+    comp_depth_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingInfo comp_ri = {};
+    comp_ri.render_area_offset  = { 0, 0 };
+    comp_ri.render_area_extent  = screen_size;
+    comp_ri.layer_count         = 1;
+    comp_ri.view_mask           = 0;
+    comp_ri.color_attachments   = { comp_color_att };
+    comp_ri.depth_attachments   = { comp_depth_att };
+
+    cmd_buf->beginDynamicRendering(comp_ri);
+    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, oit_composite_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        oit_composite_pipeline_layout_,
+        { oit_composite_desc_set_ });
+    cmd_buf->draw(3);
+    cmd_buf->endDynamicRendering();
+
+    // ── Re-open caller's pass with LOAD/LOAD ──
+    er::RenderingAttachmentInfo host_color_att;
+    host_color_att.image_view   = color_view;
+    host_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    host_color_att.load_op      = er::AttachmentLoadOp::LOAD;
+    host_color_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingAttachmentInfo host_depth_att;
+    host_depth_att.image_view   = depth_view;
+    host_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    host_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
+    host_depth_att.store_op     = er::AttachmentStoreOp::STORE;
+
+    er::RenderingInfo host_ri = {};
+    host_ri.render_area_offset  = { 0, 0 };
+    host_ri.render_area_extent  = screen_size;
+    host_ri.layer_count         = 1;
+    host_ri.view_mask           = 0;
+    host_ri.color_attachments   = { host_color_att };
+    host_ri.depth_attachments   = { host_depth_att };
+    cmd_buf->beginDynamicRendering(host_ri);
+
+    return total_visible_all_meshes_;
+}
+
 // ─── Recreate (swap chain resize) ─────────────────────────────────────────
 
 void ClusterRenderer::recreate(
@@ -1981,6 +2257,7 @@ void ClusterRenderer::recreate(
 void ClusterRenderer::destroy() {
     bindless_pipeline_.reset();
     bindless_translucent_pipeline_.reset();
+    bindless_gbuffer_pipeline_.reset();
     bindless_pipeline_layout_.reset();
     bindless_desc_set_.reset();
     bindless_desc_set_layout_.reset();

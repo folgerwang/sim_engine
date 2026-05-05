@@ -1,0 +1,185 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "functions.glsl.h"
+
+// ─── deferred_resolve.comp ────────────────────────────────────────────────
+// Phase 1 deferred lighting compute.
+//
+// Reads the 3-RT G-buffer + depth written by the cluster bindless GBUFFER
+// pipeline and runs the same lighting math that cluster_bindless.frag's
+// forward path runs (Lambertian sun direct + Blinn-Phong specular + a
+// single-cascade CSM shadow + Lambertian IBL ambient).  The lit colour is
+// linearTosRGB-encoded to match the forward path's tone-map exactly so
+// switching deferred ON/OFF does not visibly shift colour.
+//
+// Pixels whose depth equals 1.0 are sky/empty: we skip them and leave
+// hdr_color_buffer_ untouched so the downstream sky envmap pass can paint
+// over them.  This matches the forward path's depth-LEQUAL sky behaviour.
+//
+// Set bindings mirror the forward shaders:
+//   set 0 = PBR globals (IBL cubes, BRDF LUTs, CSM array)
+//   set 1 = view camera (inv_view_proj for world-pos reconstruction)
+//   set 2 = G-buffer + HDR output (this file's local set)
+//   set 3 = unused (kept for SKIN_PARAMS_SET symmetry with forward path)
+//   set 4 = runtime lights (sun + cascade VPs / splits)
+
+#include "ibl.glsl.h"   // declares set 0 IBL + direct_shadow_sampler
+
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
+    readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 0)
+    uniform sampler2D gbuf_albedo_ao;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 1)
+    uniform sampler2D gbuf_normal_rough;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 2)
+    uniform sampler2D gbuf_emissive_metal;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 3)
+    uniform sampler2D gbuf_depth;
+// HDR colour target — matches the application's main scene colour buffer
+// format (B10G11R11_UFLOAT_PACK32 → r11f_g11f_b10f in GLSL terms).  Must
+// stay in sync with hdr_format_ in application.h.
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 4, r11f_g11f_b10f)
+    uniform writeonly image2D hdr_out;
+// G-buffer RT3 — screen-space NDC velocity.  Only sampled by the
+// DEBUG_RENDER_MODE_VELOCITY visualisation below; the real lighting math
+// doesn't need it.
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 5)
+    uniform sampler2D gbuf_velocity;
+
+layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
+    uniform RuntimeLightsUniformBufferObject {
+    RuntimeLightsParams runtime_lights;
+};
+
+// Octahedral decode — companion of the encode in cluster_bindless.frag
+// (GBUFFER_OUTPUT branch).  Maps a 2D unit-square coordinate back onto a
+// unit sphere with no singularities and ~7 bits of angular precision per
+// channel — adequate for diffuse + low-spec lighting at RGBA8 storage.
+vec3 octDecode(vec2 f) {
+    f = f * 2.0 - 1.0;
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = max(-n.z, 0.0);
+    n.x += (n.x >= 0.0) ? -t : t;
+    n.y += (n.y >= 0.0) ? -t : t;
+    return normalize(n);
+}
+
+const float SHADOW_BIAS = 0.001;
+float shadowFactor(vec3 world_pos) {
+    float view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
+    int cascade = CSM_CASCADE_COUNT - 1;
+    for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
+        if (view_depth < runtime_lights.cascade_splits[i]) {
+            cascade = i;
+            break;
+        }
+    }
+    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(world_pos, 1.0);
+    vec3 lndc  = lclip.xyz / lclip.w;
+    vec2 uv    = lndc.xy * 0.5 + 0.5;
+    float ref  = lndc.z;
+    float map  = texture(direct_shadow_sampler, vec3(uv, float(cascade))).r;
+    return (map < 1.0 && ref > map + SHADOW_BIAS) ? 0.0 : 1.0;
+}
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(hdr_out);
+    if (px.x >= sz.x || px.y >= sz.y) return;
+
+    vec2 uv = (vec2(px) + vec2(0.5)) / vec2(sz);
+
+    // Sky / empty pixels: depth was never written by the cluster G-buffer
+    // pass.  Skip — sky envmap pass paints these later in drawScene.
+    float z = texture(gbuf_depth, uv).r;
+    if (z >= 1.0) return;
+
+    vec4 albedo_ao = texture(gbuf_albedo_ao, uv);
+    // Cluster G-buffer is CLEARed to (0,0,0,0) before the pass and the
+    // GBUFFER_OUTPUT branch always writes albedo_ao.a = 1.0 — so an
+    // alpha sentinel of < 0.5 means "no cluster fragment hit this pixel".
+    // Forward base (terrain/grass/hair/...) already lit these pixels in
+    // its own forward pass; leave their colour alone.
+    if (albedo_ao.a < 0.5) return;
+
+    vec4 nr          = texture(gbuf_normal_rough, uv);
+    vec4 em          = texture(gbuf_emissive_metal, uv);
+
+    vec3  albedo    = albedo_ao.rgb;
+    float ao        = albedo_ao.a;
+    vec3  N         = octDecode(nr.xy);
+    // (roughness in nr.z and metallic in em.a are reserved for the eventual
+    // GGX path; the current resolve uses Blinn-Phong to match the legacy
+    // forward output 1:1, so they're sampled but not yet consumed here.)
+    vec3  emissive  = em.rgb;
+
+    // Reconstruct world position from depth + inv_view_proj.
+    vec4 ndc = vec4(uv * 2.0 - 1.0, z, 1.0);
+    vec4 world_h = camera_info.inv_view_proj * ndc;
+    vec3 world_pos = world_h.xyz / world_h.w;
+
+    vec3 V = normalize(camera_info.position - world_pos);
+    vec3 L = normalize(-runtime_lights.lights[0].direction);
+    vec3 light_col = runtime_lights.lights[0].color *
+                     runtime_lights.lights[0].intensity;
+    float NdotL = max(dot(N, L), 0.0);
+
+    float shad = 1.0;
+    if ((camera_info.input_features & FEATURE_INPUT_SHADOW_DISABLED) == 0u) {
+        shad = shadowFactor(world_pos);
+    }
+
+    // Lambertian diffuse + Blinn-Phong specular — bit-identical to
+    // cluster_bindless.frag's forward path so visual parity holds.
+    vec3 ambient = getIBLRadianceLambertian(N, albedo) * ao;
+    vec3 diffuse = albedo * light_col * (NdotL * shad / M_PI);
+    vec3  H        = normalize(L + V);
+    float spec     = pow(max(dot(N, H), 0.0), 32.0) * shad;
+    vec3  specular = light_col * (0.05 * spec / M_PI);
+
+    vec3 color = ambient + diffuse + specular + emissive;
+
+    // Render-debug overrides — same modes/codes as the forward path so
+    // toggling deferred mode in the menu stays consistent for debugging.
+    uint dbg_mode =
+        (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+            >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+    if (dbg_mode == DEBUG_RENDER_MODE_ALBEDO) {
+        color = albedo;
+    } else if (dbg_mode == DEBUG_RENDER_MODE_NORMAL) {
+        color = N * 0.5 + 0.5;
+    } else if (dbg_mode == DEBUG_RENDER_MODE_GEOMETRIC_NORMAL) {
+        color = N * 0.5 + 0.5;   // geometric == perturbed at G-buffer level
+    } else if (dbg_mode == DEBUG_RENDER_MODE_DIFFUSE) {
+        color = ambient + diffuse;
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SPECULAR) {
+        color = specular;
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SHADOW) {
+        color = vec3(shad);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_ROUGHNESS) {
+        color = vec3(nr.z);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_METALLIC) {
+        color = vec3(em.a);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_VELOCITY) {
+        // Visualise the screen-space NDC delta the cluster G-buffer pass
+        // wrote into RT3.  Scale by 50 so the typical (small) per-frame
+        // motion is visible — pan the camera fast and individual pixels
+        // start to saturate the [0,1] colour range.  Encoding:
+        //   grey  = no motion             (0,0)
+        //   red   = +X NDC motion         (camera panning left)
+        //   cyan  = -X NDC motion         (camera panning right)
+        //   green = +Y NDC motion         (camera tilting down)
+        //   magenta= -Y NDC motion        (camera tilting up)
+        // Sky / forward-base pixels stayed at the (0,0) clear → grey.
+        const float kVelocityViewScale = 50.0;
+        vec2 v = texture(gbuf_velocity, uv).rg * kVelocityViewScale;
+        color = vec3(v * 0.5 + 0.5, 0.5);
+    }
+
+    imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));
+}

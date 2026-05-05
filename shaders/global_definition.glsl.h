@@ -193,6 +193,16 @@
                                                     // Use to verify glass materials are
                                                     // correctly tagged AlphaMode::Blend
                                                     // in the cluster + standard paths.
+#define DEBUG_RENDER_MODE_VELOCITY              10  // screen-space NDC-delta velocity:
+                                                    //   grey   = no motion (0,0)
+                                                    //   red    = +X motion (camera panning left)
+                                                    //   cyan   = -X
+                                                    //   green  = +Y (camera tilting down)
+                                                    //   magenta= -Y
+                                                    // In deferred mode samples gbuf_velocity_;
+                                                    // in forward mode computes inline from
+                                                    // cur/prev clip varyings.  Cluster geometry
+                                                    // only — terrain/grass/hair stay 0.
 
 #define LIGHT_COUNT                             1
 #define CSM_CASCADE_COUNT                       4
@@ -955,6 +965,15 @@ struct ViewCameraInfo {
     mat4            inv_view_proj_relative;
     mat4            inv_view;
     mat4            inv_proj;
+    // Previous frame's view_proj — captured BEFORE view_proj is
+    // recomputed each frame (see ViewCamera::updateViewCameraInfo).
+    // Consumed by any pass that needs screen-space motion vectors:
+    // the cluster G-buffer's velocity attachment (RT3) computes
+    // velocity = curNDC - prevNDC for each fragment, which downstream
+    // passes (TAA, motion blur, temporal reprojection / upscaling)
+    // can sample.  On the very first frame this equals view_proj,
+    // so velocity reads zero everywhere — correct "no history yet".
+    mat4            prev_view_proj;
     vec4            depth_params;
     vec3            position;
     uint            status;                   // 32 bits for status, todo.

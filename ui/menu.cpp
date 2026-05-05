@@ -1216,12 +1216,31 @@ bool Menu::draw(
                 "7: Metallic",
                 "8: Geometric normal",
                 "9: Translucent (alpha mode)",
+                "10: Velocity (NDC delta x50)",
             };
             for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
                 bool selected = (debug_render_mode_ == i);
                 if (ImGui::MenuItem(kRenderDebugItems[i], NULL, selected)) {
                     debug_render_mode_ = i;
                 }
+            }
+            ImGui::Separator();
+
+            // ── Forward vs Deferred rendering toggle ─────────────────────
+            // Two mutually-exclusive radio items — picking one un-ticks the
+            // other.  The application reads isDeferredRendering() each
+            // frame in drawScene to route the cluster opaque pass through
+            // the G-buffer + compute resolve (Deferred) or the legacy
+            // single-pass bindless pipeline (Forward).  All non-cluster
+            // opaque passes (terrain / grass / hair / sky / OIT) are
+            // unaffected — they always render forward over the result.
+            if (ImGui::MenuItem(
+                    "Pipeline: Deferred", NULL, deferred_rendering_)) {
+                deferred_rendering_ = true;
+            }
+            if (ImGui::MenuItem(
+                    "Pipeline: Forward",  NULL, !deferred_rendering_)) {
+                deferred_rendering_ = false;
             }
             ImGui::Separator();
             // Toggle the popup window that displays each face of the

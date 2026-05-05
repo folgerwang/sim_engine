@@ -299,6 +299,21 @@ void ViewCamera::updateViewCameraInfo(
     const glsl::ViewCameraParams& view_camera_params,
     std::shared_ptr<glm::vec3> input_camera_pos) {
 
+    // Capture last frame's VP BEFORE recomputing view/proj/view_proj.
+    // Consumers downstream (cluster G-buffer velocity attachment + any
+    // future TAA / motion blur / reprojection pass) read prev_view_proj
+    // from the camera UBO and compute velocity = curNDC - prevNDC.  On
+    // the very first call view_proj is still zero-initialised; we
+    // detect that and after the new VP is computed we mirror it into
+    // prev_view_proj at the bottom of this function (see the matching
+    // block).  Result: velocity reads exactly zero on frame 0 and
+    // becomes meaningful from frame 1 onward.
+    const bool first_vp_capture =
+        glm::determinant(m_camera_info_.view_proj) == 0.0f;
+    if (!first_vp_capture) {
+        m_camera_info_.prev_view_proj = m_camera_info_.view_proj;
+    }
+
     if (m_is_ortho_) {
         if (input_camera_pos) 
             m_camera_info_.position = glm::ivec3(*input_camera_pos);
@@ -417,6 +432,14 @@ void ViewCamera::updateViewCameraInfo(
             1.0f / m_camera_info_.proj[0].x,
             1.0f / m_camera_info_.proj[1].y);
         m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
+    }
+
+    // Companion of the first_vp_capture detection at the top of this
+    // function: on the very first call there was no previous VP to copy,
+    // so seed prev_view_proj with the freshly-computed VP — that makes
+    // velocity = curNDC - prevNDC exactly zero everywhere on frame 0.
+    if (first_vp_capture) {
+        m_camera_info_.prev_view_proj = m_camera_info_.view_proj;
     }
 
     m_device_->updateBufferMemory(

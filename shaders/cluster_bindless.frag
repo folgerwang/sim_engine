@@ -82,19 +82,59 @@ layout(location = 3) flat in uint v_cluster_idx;
 // in cluster_renderer.h).  Replaces the per-fragment dFdx/dFdy tangent
 // reconstruction that produced sparkle on shaded surfaces.
 layout(location = 4) in vec4 v_tangent;
+// Current + previous-frame homogeneous clip positions, populated by
+// cluster_bindless.vert from camera_info.view_proj and
+// camera_info.prev_view_proj.  Only consumed by the GBUFFER_OUTPUT
+// branch (velocity write); other variants ignore them but the vertex
+// shader still computes them — the cost is two extra mat4*vec4 per
+// vertex which is negligible relative to the rest of the cluster pass.
+layout(location = 5) in vec4 v_cur_clip;
+layout(location = 6) in vec4 v_prev_clip;
 
-// OIT_OUTPUT compiles a translucent variant that writes the McGuire-Bavoil
-// "Weighted Blended OIT" pair (accum + reveal) instead of a single colour.
-// The translucent cluster pipeline uses this variant; opaque uses the
-// default single-attachment output.  See oit_composite.frag for the
-// resolve shader and ClusterRenderer::initBindlessPipeline for the per-
-// pipeline blend setup.
+// Three output variants compiled from this single fragment source:
+//   default        — single-RT lit colour for the legacy forward path.
+//   OIT_OUTPUT     — McGuire-Bavoil WBOIT pair (accum + reveal) for
+//                    translucent clusters; resolved by oit_composite.frag.
+//   GBUFFER_OUTPUT — 3-RT G-buffer for the deferred path:
+//                      RT0 RGBA8       albedo.rgb + ao.a
+//                      RT1 RGBA8       octahedral normal.xy + roughness.z
+//                                      + flags.w
+//                      RT2 RGBA8       emissive.rgb + metallic.a
+//                    deferred_resolve.comp consumes these to run lighting
+//                    once per pixel in compute, replacing the in-shader
+//                    PBR math below.  See ClusterRenderer::initBindless
+//                    GBufferPipeline for the pipeline blend / format setup.
 #ifdef OIT_OUTPUT
     layout(location = 0) out vec4 out_accum;   // RGBA16F: rgb = colour×alpha×w, a = alpha×w
     layout(location = 1) out float out_reveal; // R8/R16F: accumulates Π(1 − αᵢ)
+#elif defined(GBUFFER_OUTPUT)
+    layout(location = 0) out vec4 out_albedo_ao;
+    layout(location = 1) out vec4 out_normal_rough;
+    layout(location = 2) out vec4 out_emissive_metal;
+    // RT3 — RG16F screen-space NDC-delta velocity.  Standard convention
+    // for TAA: stores curNDC - prevNDC so reprojection is just
+    // sample(prev, uv - velocity * 0.5) (NDC ∈ [-1,1] → UV ∈ [0,1]
+    // halves the magnitude).  Sky / unwritten pixels remain at the
+    // CLEAR value (0,0) so a downstream pass can treat zero velocity as
+    // "no history" and fall back to current colour.
+    layout(location = 3) out vec2 out_velocity;
 #else
     layout(location = 0) out vec4 out_color;
 #endif
+
+// Octahedral encode — paired with octDecode in deferred_resolve.comp.
+// Maps a unit-length direction onto the 2D unit square with no
+// singularities and ~7-8 bits of angular error per channel after RGBA8
+// quantisation, which is well within the threshold for the diffuse +
+// low-spec lighting we perform on the resolve side.
+vec2 octEncodeDir(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 oct = (n.z >= 0.0) ? n.xy
+                            : (1.0 - abs(n.yx)) * vec2(
+                                  n.x >= 0.0 ? 1.0 : -1.0,
+                                  n.y >= 0.0 ? 1.0 : -1.0);
+    return oct * 0.5 + 0.5;
+}
 
 // ── Cheap single-cascade shadow ──────────────────────────────────────
 // Picks the tightest cascade in view-space depth and does one point
@@ -204,6 +244,38 @@ void main() {
 
         N = normalize(mat3(T, B, N) * ts_n);
     }
+
+#ifdef GBUFFER_OUTPUT
+    // Deferred path: stash material attributes into the 3-RT G-buffer and
+    // bail out before any lighting math runs.  deferred_resolve.comp will
+    // consume these targets to do PBR once per visible pixel.
+    //
+    // Slot 0: albedo.rgb + ao.a     — ao is 1.0 placeholder; an SSAO pass
+    //                                  may later route into RT0.a.
+    // Slot 1: octEncode(N).xy +
+    //         roughness.z + flags.w — roughness is a 0.5 default until we
+    //                                  plumb metal-rough textures through
+    //                                  BindlessMaterialParams; flags.w
+    //                                  reserved for shading-model bits.
+    // Slot 2: emissive.rgb + metallic.a — both default 0 for the same
+    //                                     reason; cluster materials don't
+    //                                     yet author either channel.
+    out_albedo_ao      = vec4(albedo, 1.0);
+    out_normal_rough   = vec4(octEncodeDir(N), 0.5, 0.0);
+    out_emissive_metal = vec4(0.0, 0.0, 0.0, 0.0);
+
+    // Screen-space NDC velocity = curNDC.xy - prevNDC.xy.  Both clip
+    // positions came from per-vertex matrix multiplies in the vertex
+    // shader; perspective-divide here so each fragment's velocity is
+    // its own current-vs-previous projected location.  When the
+    // application has just initialised, prev_view_proj is mirrored
+    // from view_proj (see ViewCamera::updateViewCameraInfo) so the
+    // first frame writes 0 — correct "no history yet".
+    vec2 cur_ndc  = v_cur_clip.xy  / v_cur_clip.w;
+    vec2 prev_ndc = v_prev_clip.xy / v_prev_clip.w;
+    out_velocity  = cur_ndc - prev_ndc;
+    return;
+#endif
 
     vec3 V = normalize(camera_info.position - v_world_pos);
 
@@ -367,7 +439,14 @@ void main() {
     // shader filters them out anyway.
     vec4 final_color = vec4(linearTosRGB(color), albedo4.a);
 
-#ifdef OIT_OUTPUT
+#if defined(GBUFFER_OUTPUT)
+    // The GBUFFER_OUTPUT branch already wrote out_albedo_ao /
+    // out_normal_rough / out_emissive_metal and `return`'d above before
+    // any of the lighting / sRGB / debug-override code below ran.  We
+    // guard this region anyway so the compiler doesn't try to type-check
+    // the out_color / out_accum / out_reveal references against a layout
+    // qualifier set that doesn't declare them in this variant.
+#elif defined(OIT_OUTPUT)
     // ── Weighted Blended OIT output ─────────────────────────────────────
     // McGuire & Bavoil 2013, "weight 7" formulation.  The weight emphasises
     // near-camera fragments (1 − z * 0.9) and high-alpha fragments (alpha
@@ -444,6 +523,17 @@ void main() {
         } else {
             out_color = vec4(0.1, 0.1, 0.1, 1.0);
         }
+    } else if (dbg_mode == DEBUG_RENDER_MODE_VELOCITY) {
+        // Forward path: there is no velocity G-buffer to sample, but the
+        // vertex shader still provides cur/prev clip — compute velocity
+        // inline so the visualisation matches the deferred path 1:1
+        // (same scale, same encoding) and toggling pipelines doesn't
+        // change colours under this debug mode.
+        const float kVelocityViewScale = 50.0;
+        vec2 cur_ndc  = v_cur_clip.xy  / v_cur_clip.w;
+        vec2 prev_ndc = v_prev_clip.xy / v_prev_clip.w;
+        vec2 v        = (cur_ndc - prev_ndc) * kVelocityViewScale;
+        out_color = vec4(v * 0.5 + 0.5, 0.5, 1.0);
     }
 #endif // OIT_OUTPUT
 }

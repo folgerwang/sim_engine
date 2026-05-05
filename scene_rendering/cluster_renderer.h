@@ -134,6 +134,15 @@ class ClusterRenderer {
     // in a fullscreen pass after the OIT draw.
     std::shared_ptr<renderer::Pipeline>            bindless_translucent_pipeline_;
 
+    // ── Deferred G-buffer variant ────────────────────────────────────────
+    // Same pipeline layout (and bindless descriptor set) as the forward
+    // bindless_pipeline_ but built against the application's 3-RT G-buffer
+    // format and using cluster_bindless.frag compiled with -DGBUFFER_OUTPUT.
+    // Lives lazily — only created when the application calls
+    // initBindlessGBufferPipeline(); drawOpaqueGBuffer() no-ops if it
+    // hasn't been initialised so legacy forward callers are unaffected.
+    std::shared_ptr<renderer::Pipeline>            bindless_gbuffer_pipeline_;
+
     // (Re)create the OIT accum + reveal targets at the requested size,
     // and update the composite descriptor set to point at the new views.
     // Lazy: no-op when the size hasn't changed.  Called from draw() so
@@ -221,6 +230,15 @@ public:
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::PipelineRenderbufferFormats& framebuffer_format);
 
+    // Initialise the deferred G-buffer variant of the bindless pipeline.
+    // Reuses the existing pipeline layout + descriptor set built by
+    // initBindlessPipeline (must be called first), then compiles a 3-RT
+    // pipeline against the supplied G-buffer format.  drawOpaqueGBuffer()
+    // returns 0 if this hasn't been called.
+    void initBindlessGBufferPipeline(
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const renderer::PipelineRenderbufferFormats& gbuffer_format);
+
     // Dispatch cluster culling compute shader (single dispatch for all meshes).
     void cull(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
@@ -248,6 +266,35 @@ public:
     //
     // Returns previous frame's visible cluster count for HUD reporting.
     uint32_t draw(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors,
+        const std::shared_ptr<renderer::ImageView>& color_view,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& screen_size);
+
+    // Deferred opaque-only draw — issues the same indirect draw as
+    // drawOpaqueOnly() but binds bindless_gbuffer_pipeline_, which
+    // writes the 3-RT G-buffer instead of lit colour.  Caller must have
+    // an active dynamic-rendering pass with the application's G-buffer
+    // colour attachments (3) + the scene depth attachment bound.
+    // Returns 0 if initBindlessGBufferPipeline() has not run.
+    uint32_t drawOpaqueGBuffer(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
+    // Forward-only translucent / OIT path for the deferred renderer.  The
+    // deferred lighting compute writes opaque pixels into hdr_color_buffer_
+    // before this is called; drawTranslucentForward() then runs the WBOIT
+    // accum + reveal passes and the fullscreen composite (the same three
+    // sub-passes draw() already runs internally), composited on top of
+    // hdr_color_buffer_.  Caller must have the host pass on color_view +
+    // depth_view OPEN (LOAD/LOAD), exactly like draw(); the function
+    // re-opens it before returning.  Returns previous-frame visible count.
+    uint32_t drawTranslucentForward(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_sets,
         const std::vector<renderer::Viewport>& viewports,
