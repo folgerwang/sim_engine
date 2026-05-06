@@ -311,7 +311,15 @@ void AmbientProbeSystem::update(
         const uint32_t face = static_cast<uint32_t>(frame_index_ % 6);
         const glm::mat4 face_vp =
             DynamicCubemap::cubeFaceViewProj(face, probe_pos);
-        cluster_renderer->cull(cmd_buf, face_vp, probe_pos);
+        // Force-disable Hi-Z occlusion for probe-face culls — the
+        // pyramid is built from the main camera's depth and would
+        // wildly mis-cull a cubemap face viewed from a different
+        // origin / direction.  last_view_proj_ is unused when the
+        // override forces the test off.
+        cluster_renderer->cull(
+            cmd_buf, face_vp, probe_pos,
+            /*last_view_proj*/ face_vp,
+            /*hiz_cull_override*/ std::optional<bool>(false));
     }
 
     // Drive the dynamic cubemap.  It renders face = (frame % 6) into

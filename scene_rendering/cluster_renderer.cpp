@@ -142,12 +142,24 @@ std::shared_ptr<er::DescriptorSetLayout> createCullDescSetLayout(
     // binding 9: IndirectDrawBuffer (Phase A)    (SSBO, writeonly) — only used by
     //              Phase A cull; Phase B writes the regular binding 2.
     // binding 10: DrawCountBuffer    (Phase A)   (SSBO, read/write — atomicAdd)
-    std::vector<er::DescriptorSetLayoutBinding> bindings(11);
+    // binding 11: Hi-Z pyramid sampler           (sampler2D, read-only)
+    //              Bound to the application's hiz_pyramid_ texture so the
+    //              cull pass can reproject each cluster's bounding sphere
+    //              through last_view_proj and reject clusters fully behind
+    //              the previous frame's depth (Nanite-style occlusion).
+    //              When use_last_frame_depth_cull_ is off the shader skips
+    //              the sample, so a dummy 1×1 white texture is fine — but
+    //              the binding MUST be valid even then because Vulkan
+    //              validates descriptor presence at dispatch time.
+    std::vector<er::DescriptorSetLayoutBinding> bindings(12);
     for (int i = 0; i < 11; ++i) {
         bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
             i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_BUFFER);
     }
+    bindings[11] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        11, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        er::DescriptorType::COMBINED_IMAGE_SAMPLER);
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -166,10 +178,12 @@ void writeCullDescriptors(
     const renderer::BufferInfo& trans_draw_count_buffer,
     const renderer::BufferInfo& visibility_bit_buffer,
     const renderer::BufferInfo& indirect_draw_buffer_phase_a,
-    const renderer::BufferInfo& draw_count_buffer_phase_a) {
+    const renderer::BufferInfo& draw_count_buffer_phase_a,
+    const std::shared_ptr<er::Sampler>& hiz_sampler,
+    const std::shared_ptr<er::ImageView>& hiz_view) {
 
     er::WriteDescriptorList writes;
-    writes.reserve(11);
+    writes.reserve(12);
 
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 0,
@@ -234,6 +248,19 @@ void writeCullDescriptors(
         er::DescriptorType::STORAGE_BUFFER, 10,
         draw_count_buffer_phase_a.buffer,
         sizeof(uint32_t));
+
+    // Hi-Z pyramid for last-frame occlusion cull.  Caller must pass a
+    // valid sampler + view: nullptrs would emit a non-conforming
+    // descriptor write.  When the application hasn't built the pyramid
+    // yet (e.g. very first frame) it should pass its dummy 1×1 white
+    // texture and Hi-Z sample in the shader will read 1.0 (= far
+    // plane) so no cluster is rejected.
+    if (hiz_sampler && hiz_view) {
+        er::Helper::addOneTexture(writes, desc_set,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER, 11,
+            hiz_sampler, hiz_view,
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
 
     device->updateDescriptorSets(writes);
 }
@@ -821,7 +848,13 @@ void ClusterRenderer::finalizeUploads() {
         trans_indirect_draw_buffer_, trans_draw_count_buffer_,
         visibility_bit_buffer_,
         indirect_draw_buffer_phase_a_,
-        draw_count_buffer_phase_a_);
+        draw_count_buffer_phase_a_,
+        // Hi-Z binding: pass through whatever the application has
+        // already provided via setHiZTexture().  May be null on the
+        // very first finalizeUploads if the app hasn't called it yet
+        // — the shader's sample is gated on use_hiz_cull anyway, so
+        // a null binding is fine until the first descriptor refresh.
+        hiz_sampler_, hiz_view_);
 
     // ── DEBUG: validate merged staging data — write to file ──
     {
@@ -1014,12 +1047,44 @@ void ClusterRenderer::finalizeUploads() {
     staging_indices_.shrink_to_fit();
 }
 
+// ─── setHiZTexture ─────────────────────────────────────────────────────────
+// Stash the Hi-Z handles and refresh the cull descriptor's binding 11
+// pointer so subsequent dispatches see the new pyramid.  Idempotent and
+// cheap; safe to call every swap-chain rebuild.
+
+void ClusterRenderer::setHiZTexture(
+    const std::shared_ptr<renderer::Sampler>& sampler,
+    const std::shared_ptr<renderer::ImageView>& view,
+    const glm::uvec2& size,
+    uint32_t mip_count) {
+
+    hiz_sampler_   = sampler;
+    hiz_view_      = view;
+    hiz_size_      = size;
+    hiz_mip_count_ = mip_count;
+
+    // If the cull descriptor set hasn't been allocated yet (called before
+    // finalizeUploads), the next writeCullDescriptors inside finalize will
+    // pick up the stored handles.  Otherwise patch binding 11 in place.
+    if (cull_desc_set_ && sampler && view) {
+        er::WriteDescriptorList writes;
+        writes.reserve(1);
+        er::Helper::addOneTexture(writes, cull_desc_set_,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER, 11,
+            sampler, view,
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        device_->updateDescriptorSets(writes);
+    }
+}
+
 // ─── Cull (single dispatch for ALL clusters) ──────────────────────
 
 void ClusterRenderer::cull(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glm::mat4& view_proj,
-    const glm::vec3& camera_pos) {
+    const glm::vec3& camera_pos,
+    const glm::mat4& last_view_proj,
+    std::optional<bool> hiz_cull_override) {
 
     if (!enabled_ || !gpu_ready_) return;
 
@@ -1263,6 +1328,18 @@ void ClusterRenderer::cull(
         push.total_bvh_nodes = 0;
         push.lod_error_threshold = 1.0f;
         push.use_bvh = debug_distance_cull_ ? 3 : 0;
+        // Hi-Z occlusion cull is gated by the menu toggle; the shader
+        // currently treats this as a no-op stub but the flag is plumbed
+        // through end-to-end so wiring up the actual sampler later is
+        // a shader-only change.
+        const bool effective_hiz_cull =
+            hiz_cull_override.value_or(use_last_frame_depth_cull_);
+        push.use_hiz_cull = effective_hiz_cull ? 1u : 0u;
+        push.pad0 = 0u;
+        push.last_view_proj = last_view_proj;
+        push.hiz_size_mips_pad = glm::vec4(
+            float(hiz_size_.x), float(hiz_size_.y),
+            float(hiz_mip_count_), 0.0f);
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),

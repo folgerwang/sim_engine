@@ -1255,6 +1255,15 @@ bool Menu::draw(
                     "Dynamic Cubemap Viewer", NULL, show_dynamic_cube_debug_)) {
                 show_dynamic_cube_debug_ = !show_dynamic_cube_debug_;
             }
+            // Hi-Z pyramid (last-frame depth) viewer — opens a strip of
+            // mip thumbnails so we can verify the per-frame Hi-Z build
+            // dispatch is actually populating the pyramid with depth
+            // values, before chasing further bugs in the cluster cull
+            // sample math.
+            if (ImGui::MenuItem(
+                    "Hi-Z Pyramid Viewer", NULL, show_hiz_debug_)) {
+                show_hiz_debug_ = !show_hiz_debug_;
+            }
             // Toggle in-scene probe icospheres.  Each sphere is colored
             // by its probe's SH-evaluated irradiance in the surface
             // normal direction — pending probes (not yet baked) draw
@@ -1371,6 +1380,15 @@ bool Menu::draw(
             bool bbox_draw = cluster_renderer_->getDebugDrawBBox();
             if (ImGui::Checkbox("Cluster Bound Box Draw", &bbox_draw)) {
                 cluster_renderer_->getDebugDrawBBox() = bbox_draw;
+            }
+            // Hi-Z occlusion-cull toggle: when on, the cluster cull
+            // dispatch reprojects the last frame's depth pyramid and
+            // rejects clusters whose bounding sphere is fully occluded.
+            // Off = plain frustum + backface cone cull (the default).
+            bool hiz_cull = cluster_renderer_->getUseLastFrameDepthCull();
+            if (ImGui::Checkbox("Use Last-Frame Depth (Hi-Z) Cull",
+                                &hiz_cull)) {
+                cluster_renderer_->getUseLastFrameDepthCull() = hiz_cull;
             }
             ImGui::Separator();
             const auto& vp = cluster_renderer_->getDebugVP();
@@ -1809,6 +1827,67 @@ bool Menu::draw(
         ImGui::End();
     }
     // ------------------------------------------------------------------------
+
+    // ---- Hi-Z pyramid debug viewer -----------------------------------------
+    // Strip of per-mip thumbnails for the cluster Z-cull pyramid built
+    // each frame from depth_buffer_copy_.  Useful for verifying that
+    // the per-frame Hi-Z build dispatch is firing AND producing sane
+    // values BEFORE chasing further bugs in the cluster cull's sample
+    // math.  The texture format is R32F (max-Z reduction); ImGui will
+    // sample it as grey-scale, so:
+    //   black  → near plane (closest geometry)
+    //   white  → far plane (sky / unwritten / cleared 1.0)
+    //   grey   → real depth values
+    // If every mip is uniform white the build isn't writing the
+    // pyramid; if uniform black the binding is reading 0; mips that
+    // look like a fuzzy depth map across the whole strip mean the
+    // build is working and we can trust the sample side.
+    if (show_hiz_debug_) {
+        const ImVec2 vp_centre = {
+            vp_pos.x + float(screen_size.x) * 0.5f,
+            vp_pos.y + float(screen_size.y) * 0.5f };
+        ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing,
+                                ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(800.0f, 220.0f), ImGuiCond_Appearing);
+        if (ImGui::Begin("Hi-Z Pyramid Debug", &show_hiz_debug_)) {
+            if (hiz_debug_tex_ids_.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                    "Hi-Z pyramid viewer not yet wired into application.");
+                ImGui::Spacing();
+                ImGui::TextWrapped(
+                    "The application needs to register one ImTextureID "
+                    "per pyramid mip (using Helper::addImTextureID on "
+                    "each entry of hiz_mip_views_) and pass them via "
+                    "menu_->setHiZDebugTextureIds(...).");
+            } else {
+                ImGui::Text("Mip 0 = full-res depth on the left.  "
+                            "Mips halve in size each step to the right.");
+                ImGui::Text("Black = near, white = far.  Uniform white "
+                            "across all mips usually means the build "
+                            "dispatch isn't writing.");
+                ImGui::Spacing();
+
+                // Each mip is half the resolution of the previous one;
+                // the displayed thumbnail width also halves so the
+                // proportions stay correct as you scan across.
+                float w = 256.0f;
+                for (size_t m = 0; m < hiz_debug_tex_ids_.size(); ++m) {
+                    if (m > 0) ImGui::SameLine();
+                    if (hiz_debug_tex_ids_[m]) {
+                        ImGui::Image(
+                            hiz_debug_tex_ids_[m],
+                            ImVec2(std::max(w, 8.0f),
+                                   std::max(w, 8.0f)));
+                    } else {
+                        ImGui::Dummy(ImVec2(std::max(w, 8.0f),
+                                            std::max(w, 8.0f)));
+                    }
+                    w *= 0.5f;
+                }
+            }
+        }
+        ImGui::End();
+    }
 
     // ---- Dynamic camera-positioned cubemap debug viewer --------------------
     // Mirrors the IBL Debug window layout but for the per-frame DynamicCubemap

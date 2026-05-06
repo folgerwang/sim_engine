@@ -593,6 +593,22 @@ struct ClusterCullPushConstants {
     uint    total_bvh_nodes;
     float   lod_error_threshold; // screen-space error threshold for LOD
     uint    use_bvh;             // 0 = flat per-cluster, 1 = BVH traversal
+    // 1 = reproject last-frame Hi-Z pyramid and reject clusters whose
+    // bounding sphere is fully occluded.  0 = skip the Hi-Z test (plain
+    // frustum + cone cull only).  Toggled at runtime from the cluster
+    // debug menu via ClusterRenderer::use_last_frame_depth_cull_.
+    uint    use_hiz_cull;
+    uint    pad0;
+    // Last frame's view-projection matrix.  When use_hiz_cull is set we
+    // reproject each cluster's bounding sphere through this matrix to
+    // figure out where it sat on screen YESTERDAY, then sample the Hi-Z
+    // pyramid (built from that frame's depth) at that screen footprint.
+    // Set to view_proj for the first frame (no history yet).
+    mat4    last_view_proj;
+    // x, y = Hi-Z mip 0 size in pixels (next-pow2 of swap-chain size).
+    // z   = total mip count (so the shader can clamp the chosen mip).
+    // w   = pad.
+    vec4    hiz_size_mips_pad;
 };
 
 struct VolumeMoistrueParams {

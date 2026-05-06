@@ -225,6 +225,15 @@ private:
     // AmbientProbeSystem::drawDebug, so you can see where probes are
     // placed and what irradiance each one is currently emitting.
     bool show_probe_debug_ = false;
+
+    // Hi-Z pyramid (last-frame depth in cluster Z-cull) debug viewer.
+    // Each mip is registered as an ImTextureID by the application.  The
+    // viewer shows them as a horizontal strip — left = mip 0 (full res),
+    // right = top mip (1×1).  Lets us verify that the per-frame Hi-Z
+    // build is actually populating the pyramid with sane values before
+    // chasing further bugs in the cluster cull's sample math.
+    bool show_hiz_debug_ = false;
+    std::vector<ImTextureID> hiz_debug_tex_ids_;
     // [ping_pong_idx][face_idx] — populated by setDynamicCubeFaceTextureIds().
     std::array<IblDebugFaceArray, 2> dynamic_cube_face_tex_ids_ = {};
     // Live frame state mirrored from DynamicCubemap so the viewer can
@@ -415,6 +424,19 @@ public:
         sheen_face_mip_tex_ids_ = ids;
         ibl_debug_sheen_num_mips_ = num_mips;
     }
+
+    // ---- Hi-Z pyramid debug viewer ----------------------------------------
+    // Application supplies one ImTextureID per Hi-Z pyramid mip (0..N-1).
+    // The viewer renders them in a horizontal strip so we can verify the
+    // per-frame Hi-Z build dispatch is producing sane values across the
+    // entire mip chain.  Black = near, white = far (raw Vulkan depth).
+    void setHiZDebugTextureIds(std::vector<ImTextureID> ids) {
+        hiz_debug_tex_ids_ = std::move(ids);
+    }
+    // Read by the application so it can run the Hi-Z BUILD dispatch
+    // even when the cull-side toggle is off, letting the user inspect
+    // the pyramid contents independently of the cull behaviour.
+    bool isHiZDebugOn() const { return show_hiz_debug_; }
 
     // ---- Dynamic-cubemap debug viewer ------------------------------------
     // Application calls this once at startup with both ping-pong buffers'

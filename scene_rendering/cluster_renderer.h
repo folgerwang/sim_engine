@@ -26,6 +26,7 @@
 
 #include <vector>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace engine {
@@ -203,6 +204,24 @@ class ClusterRenderer {
     bool cpu_cull_mode_ = false;          // true = CPU frustum cull, false = GPU compute cull
     bool debug_draw_bbox_ = false;        // draw cluster bounding boxes
     bool debug_distance_cull_ = false;    // debug: set use_bvh=3 for distance-based cull
+    // Toggle: reproject last-frame depth (Hi-Z pyramid) for cluster
+    // occlusion culling.  When true, the cull pass receives the
+    // ClusterCullPushConstants.use_hiz_cull = 1 flag and (once the
+    // shader-side sampler is wired up) will reject clusters whose
+    // bounding sphere is fully behind the previous frame's Hi-Z.
+    // When false the pass falls back to plain frustum + cone culling.
+    // Plumbed through end-to-end (menu → renderer → push constant →
+    // shader) so toggling it at runtime is enough; no rebuild needed.
+    bool use_last_frame_depth_cull_ = false;
+
+    // Hi-Z pyramid handles supplied via setHiZTexture().  view + sampler
+    // get bound at descriptor binding 11 of the cull set; size + mip
+    // count are forwarded to the shader via push constants so it can
+    // pick an appropriate mip and clamp the sample coordinates.
+    std::shared_ptr<renderer::Sampler>   hiz_sampler_;
+    std::shared_ptr<renderer::ImageView> hiz_view_;
+    glm::uvec2                           hiz_size_      = glm::uvec2(0);
+    uint32_t                             hiz_mip_count_ = 0;
 
     // Debug: last-used VP matrix and camera pos for display.
     glm::mat4 debug_last_vp_ = glm::mat4(1.0f);
@@ -258,10 +277,33 @@ public:
         const renderer::PipelineRenderbufferFormats& gbuffer_format);
 
     // Dispatch cluster culling compute shader (single dispatch for all meshes).
+    // last_view_proj is the previous frame's view-projection matrix —
+    // used to reproject cluster bounds into yesterday's screen space for
+    // the Hi-Z occlusion test.  Pass view_proj on the first frame (no
+    // history yet); the shader gates the test on use_hiz_cull anyway.
+    // hiz_cull_override:
+    //   nullopt → fall back to the menu toggle use_last_frame_depth_cull_
+    //   false   → force-skip the Hi-Z test (probe / cubemap face passes
+    //             that have no business sampling the main camera's pyramid)
+    //   true    → force-enable (currently unused; reserved for tooling)
     void cull(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const glm::mat4& view_proj,
-        const glm::vec3& camera_pos);
+        const glm::vec3& camera_pos,
+        const glm::mat4& last_view_proj = glm::mat4(1.0f),
+        std::optional<bool> hiz_cull_override = std::nullopt);
+
+    // Provide the application's Hi-Z pyramid for last-frame occlusion
+    // culling.  Call ONCE after pyramid creation and AGAIN whenever the
+    // pyramid is recreated (swap-chain resize).  Caller passes the
+    // sampler used to read the pyramid (point/CLAMP_TO_EDGE filter
+    // recommended), the mip-0 image view, the mip-0 size in pixels, and
+    // the total mip count so the shader can clamp its mip pick.
+    void setHiZTexture(
+        const std::shared_ptr<renderer::Sampler>& sampler,
+        const std::shared_ptr<renderer::ImageView>& view,
+        const glm::uvec2& size,
+        uint32_t mip_count);
 
     // Bindless draw — issues two indirect draws and a fullscreen OIT
     // composite, all sharing the same merged VB/IB and bindless desc set:
@@ -363,6 +405,7 @@ public:
     bool isCpuCullMode() const { return cpu_cull_mode_; }
     bool& getDebugDrawBBox() { return debug_draw_bbox_; }
     bool& getDebugDistanceCull() { return debug_distance_cull_; }
+    bool& getUseLastFrameDepthCull() { return use_last_frame_depth_cull_; }
     const std::vector<glsl::ClusterCullInfo>& getDebugSampleClusters() const {
         return debug_sample_clusters_;
     }

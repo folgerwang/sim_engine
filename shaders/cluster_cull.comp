@@ -65,6 +65,15 @@ layout(std430, set = 0, binding = 7) buffer TransDrawCountBuffer {
     uint trans_draw_count;
 };
 
+// Set 0, binding 11: Hi-Z pyramid (R32F max-Z, full mip chain).
+// Built each frame from last frame's depth by hiz_build.comp.  Sampled
+// here when params.use_hiz_cull == 1 to reject clusters whose bounding
+// sphere is fully behind the previous frame's depth at their screen
+// footprint.  CLAMP_TO_EDGE sampler so out-of-screen samples don't
+// wrap around and falsely occlude.  textureLod with explicit mip is
+// used (no mip-mapped filtering — we pick the mip ourselves).
+layout(set = 0, binding = 11) uniform sampler2D hiz_pyramid;
+
 layout(local_size_x = 64, local_size_y = 1) in;
 
 // ─── Shared Frustum Planes ──────────────────────────────────────
@@ -193,6 +202,111 @@ void main() {
                          cull.cone_axis_cutoff.w,
                          params.camera_pos_pad.xyz)) {
             return;  // all triangles face away
+        }
+
+        // 3. Hi-Z occlusion cull using the last frame's depth pyramid.
+        //    Project the cluster's bounding sphere through last_view_proj
+        //    into yesterday's screen space, derive the sphere's screen-
+        //    space AABB, pick the mip whose 2×2 footprint covers that
+        //    AABB, sample the four max-Z values, and reject if the
+        //    cluster's NEAREST point is still BEHIND the deepest sample.
+        //
+        //    Approximations vs. a fully-rigorous Nanite test:
+        //    - We use the sphere center's projected radius (same in X
+        //      and Y), not a tight oriented-bounding-box screen AABB.
+        //      Slightly conservative for elongated clusters; safe.
+        //    - We sample 4 mip texels via 4 explicit textureLod fetches.
+        //      A single textureGather would be cheaper but the API isn't
+        //      always available on all targets; keep it portable.
+        //    - Cluster sphere's near-Z is derived via view-space depth
+        //      then projected by last_view_proj's z-row.  Standard.
+        if (params.use_hiz_cull == 1u) {
+            // ── DEBUG: probe the Hi-Z pyramid contents ────────────────
+            // Cull every cluster whose centre projects to a screen pixel
+            // where the pyramid says "anything closer than the far
+            // plane".  This is NOT a real Hi-Z occlusion test — it's a
+            // diagnostic probe to figure out what values the pyramid
+            // actually contains.  Possible outcomes after toggling:
+            //   - Foreground regions of the scene blink out (anything
+            //     not sky disappears) → pyramid has real depth values,
+            //     and the previous conservative test's plausibility +
+            //     margin checks were the reason no culling happened.
+            //     I'll relax those.
+            //   - Nothing disappears → pyramid is all 1.0 (cleared, never
+            //     written by hiz_build).  Means dispatchHiZBuild isn't
+            //     populating the pyramid.  Likely descriptor-binding or
+            //     barrier issue inside the build loop.
+            //   - Everything disappears (whole scene goes black) →
+            //     pyramid is all 0.0 (unwritten / unbound binding).
+            //     Means binding 11 isn't seeing the pyramid view.
+            // Replace this stub with a real test once we know which.
+            {
+                vec4 dbg_clip = params.last_view_proj * vec4(center, 1.0);
+                if (dbg_clip.w > 0.001) {
+                    vec3 dbg_ndc = dbg_clip.xyz / dbg_clip.w;
+                    vec2 dbg_uv  = dbg_ndc.xy * 0.5 + 0.5;
+                    if (dbg_uv.x >= 0.0 && dbg_uv.x <= 1.0 &&
+                        dbg_uv.y >= 0.0 && dbg_uv.y <= 1.0) {
+                        float dbg_d = textureLod(hiz_pyramid, dbg_uv, 0.0).r;
+                        // Cull whenever the sampled depth indicates
+                        // ANY geometry at this pixel.
+                        if (dbg_d < 0.999) {
+                            return;
+                        }
+                    }
+                }
+            }
+            // (real Hi-Z math below is unreachable while this stub fires)
+
+            // ── Conservative Hi-Z occlusion test (defensive variant) ──
+            // The previous more-aggressive formulation was over-culling
+            // visible buildings (sun showed through where opaque
+            // geometry should have been) — caused by some combination
+            // of (a) first-frame identity last_view_proj, (b) the
+            // approximation `length(last_view_proj[0])` mis-estimating
+            // the projection scale on rotated cameras, and (c) a 4-tap
+            // sample at a too-fine mip occasionally landing entirely
+            // on a foreground object's depth.  This rewrite trades
+            // culling efficiency for correctness:
+            //   - No mip pick.  4 taps at mip 0 around the projected
+            //     centre — only effective for clusters smaller than
+            //     ~2 pixels.  Big clusters won't be Hi-Z-culled at
+            //     all (downstream frustum + cone cull still applies).
+            //   - No screen-space radius math.  Compare the cluster's
+            //     CENTRE depth (no near-Z extrapolation) against the
+            //     pyramid max with a generous 0.05 NDC margin.
+            //   - Sanity-skip when the pyramid sample looks empty
+            //     (≈ 0) or unwritten (≈ 1) — protects against the
+            //     descriptor being unbound or the build dispatch
+            //     having missed a frame.
+            // Tightening the test back up after this is safe to
+            // iterate on; the plumbing is correct.
+            vec4 clip = params.last_view_proj * vec4(center, 1.0);
+            if (clip.w > radius * 2.0) {
+                vec3 ndc = clip.xyz / clip.w;
+                bool on_screen =
+                    abs(ndc.x) <= 1.0 && abs(ndc.y) <= 1.0 &&
+                    ndc.z >= 0.0 && ndc.z <= 1.0;
+                if (on_screen) {
+                    vec2 uv = ndc.xy * 0.5 + 0.5;
+                    float px = 1.0 / max(params.hiz_size_mips_pad.x, 1.0);
+                    float d0 = textureLod(hiz_pyramid, uv + vec2(-px, -px), 0.0).r;
+                    float d1 = textureLod(hiz_pyramid, uv + vec2( px, -px), 0.0).r;
+                    float d2 = textureLod(hiz_pyramid, uv + vec2(-px,  px), 0.0).r;
+                    float d3 = textureLod(hiz_pyramid, uv + vec2( px,  px), 0.0).r;
+                    float pyramid_max_z = max(max(d0, d1), max(d2, d3));
+
+                    // Plausible-data check: ignore samples that look
+                    // like clear values (an unbuilt or unbound mip).
+                    bool sample_plausible =
+                        pyramid_max_z > 0.01 && pyramid_max_z < 0.999;
+
+                    if (sample_plausible &&
+                        ndc.z > pyramid_max_z + 0.05) {
+                        return;  // cluster centre clearly behind the depth
+                    }
+                }
+            }
         }
     }
 
