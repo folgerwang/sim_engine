@@ -193,6 +193,17 @@
                                                     // Use to verify glass materials are
                                                     // correctly tagged AlphaMode::Blend
                                                     // in the cluster + standard paths.
+#define DEBUG_RENDER_MODE_HIZ                   12  // Hi-Z pyramid mip:
+                                                    //   selected mip rendered as
+                                                    //   greyscale depth (close=black,
+                                                    //   far=white).  Mip level packed
+                                                    //   into bits 24..27 of
+                                                    //   camera_info.input_features.
+                                                    //   Only meaningful in deferred
+                                                    //   mode — forward path renders
+                                                    //   as final shaded.
+#define FEATURE_INPUT_HIZ_MIP_SHIFT             24
+#define FEATURE_INPUT_HIZ_MIP_MASK              0x0F000000
 #define DEBUG_RENDER_MODE_VELOCITY              10  // screen-space NDC-delta velocity:
                                                     //   grey   = no motion (0,0)
                                                     //   red    = +X motion (camera panning left)
@@ -598,6 +609,18 @@ struct ClusterCullPushConstants {
     // frustum + cone cull only).  Toggled at runtime from the cluster
     // debug menu via ClusterRenderer::use_last_frame_depth_cull_.
     uint    use_hiz_cull;
+    // Two-pass occlusion phase selector:
+    //   0 = single-pass legacy cull (forward path).
+    //   1 = Phase A: gated on visibility bits, frustum+backface only,
+    //                emits to indirect_draw_buffer_phase_a (binding 9/10).
+    //   2 = Phase B: tests ALL clusters with frustum+backface+Hi-Z,
+    //                emits to the standard opaque indirect (binding 2/3)
+    //                AND atomicOr's the visibility bit for survivors so
+    //                next frame's Phase A picks them up.
+    // Phase A also atomicOr's its survivors' bits — that way the union
+    // of A's emit set and B's emit set is the canonical "visible this
+    // frame" signal, with no leak from the previous frame's bits.
+    uint    cull_phase;
     uint    pad0;
     // Last frame's view-projection matrix.  When use_hiz_cull is set we
     // reproject each cluster's bounding sphere through this matrix to

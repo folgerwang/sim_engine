@@ -49,6 +49,14 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = 4, r11f_g11f_b10f)
 // doesn't need it.
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 5)
     uniform sampler2D gbuf_velocity;
+// Full-pyramid Hi-Z sampled view — mip 0 is half-res of the scene depth
+// max-reduced to be conservative-far.  Sampled only by the
+// DEBUG_RENDER_MODE_HIZ visualisation; the regular lighting path
+// ignores it.  textureLod(hiz_pyramid, uv, mip) picks the level the
+// menu's mip slider chose (packed into camera_info.input_features bits
+// 24..27).
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 6)
+    uniform sampler2D hiz_pyramid;
 
 layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
     uniform RuntimeLightsUniformBufferObject {
@@ -93,6 +101,46 @@ void main() {
     if (px.x >= sz.x || px.y >= sz.y) return;
 
     vec2 uv = (vec2(px) + vec2(0.5)) / vec2(sz);
+
+    // Hi-Z debug visualisation runs BEFORE the sentinel checks below so
+    // it covers every pixel on screen, not just cluster fragments.  The
+    // mip level comes from input_features bits 24..27, packed by the CPU
+    // each frame from the menu's Hi-Z mip slider.
+    {
+        uint dbg = (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+                       >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+        if (dbg == DEBUG_RENDER_MODE_HIZ) {
+            uint mip = (camera_info.input_features & FEATURE_INPUT_HIZ_MIP_MASK)
+                           >> FEATURE_INPUT_HIZ_MIP_SHIFT;
+            float h = clamp(textureLod(hiz_pyramid, uv, float(mip)).r,
+                            0.0, 1.0);
+
+            // Linearise the Hi-Z depth so the visualisation actually
+            // shows world-space distance, not perspective-compressed Z
+            // (which packs every visible scene depth into the [0.95, 1.0]
+            // tail and makes a raw greyscale display look uniformly
+            // bright).  For Vulkan's [0,1] depth perspective:
+            //   linearZ = b / (a + ndc_z)
+            // where a = proj[2][2], b = proj[3][2] — already stashed by
+            // ViewCamera::updateViewCameraInfo into depth_params.x/.y.
+            // h == 1.0 corresponds to the far plane: linearZ = far,
+            // so sky / never-written pixels show as white at the
+            // chosen kVizFarRange.
+            float a = camera_info.depth_params.x;
+            float b = camera_info.depth_params.y;
+            float linZ = b / (a + h);
+
+            // Map linearZ to greyscale over a useful viewing band.  50 m
+            // is "near-mid scene"; tweak if your level is bigger or
+            // smaller.  Beyond this distance pixels saturate to white
+            // — they're behind everything visible anyway.
+            const float kVizFarRange = 50.0;
+            float vis = clamp(linZ / kVizFarRange, 0.0, 1.0);
+
+            imageStore(hdr_out, px, vec4(linearTosRGB(vec3(vis)), 1.0));
+            return;
+        }
+    }
 
     // Sky / empty pixels: depth was never written by the cluster G-buffer
     // pass.  Skip — sky envmap pass paints these later in drawScene.

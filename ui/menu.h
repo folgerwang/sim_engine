@@ -38,6 +38,11 @@ class Menu {
     // DEBUG_RENDER_MODE_* in global_definition.glsl.h.  Driven by the
     // "Render Debug" combo in the menu bar.
     int debug_render_mode_ = 0;
+    // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
+    // 0 = half-res (richest detail), higher = increasingly down-sampled.
+    // Clamped to the actual pyramid mip count by the menu UI.  Packed into
+    // camera_info.input_features bits 24..27 by drawScene each frame.
+    int hiz_debug_mip_ = 0;
     // Forward vs deferred rendering toggle.  Application syncs its
     // own deferred_rendering_enabled_ from this each frame.  Defaults
     // to ON so the new G-buffer + compute resolve path is the
@@ -477,6 +482,11 @@ public:
     // resolve (true) or the legacy forward bindless pipeline (false).
     inline bool isDeferredRendering() const { return deferred_rendering_; }
     inline void setDeferredRendering(bool on) { deferred_rendering_ = on; }
+
+    // Hi-Z mip selector for DEBUG_RENDER_MODE_HIZ.  Clamped externally to
+    // the pyramid's actual mip count.
+    inline int  getHiZDebugMip() const { return hiz_debug_mip_; }
+    inline void setHiZDebugMip(int m)  { hiz_debug_mip_ = m; }
 
     inline bool isWaterPassTurnOff() {
         return turn_off_water_pass_;

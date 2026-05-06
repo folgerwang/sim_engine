@@ -293,6 +293,56 @@ public:
         const glm::mat4& last_view_proj = glm::mat4(1.0f),
         std::optional<bool> hiz_cull_override = std::nullopt);
 
+    // ── Two-pass occlusion culling (Nanite-style) ────────────────────────
+    // Phase A: gated on visibility bits, frustum + backface only, emits
+    // to indirect_draw_buffer_phase_a_.  No Hi-Z test (Phase A clusters
+    // are the trusted "visible last frame" set, used as the depth-prepass
+    // for Phase B's Hi-Z).  Sets visibility bits for survivors so they
+    // continue carrying forward.
+    void cullPhaseA(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const glm::mat4& view_proj,
+        const glm::vec3& camera_pos);
+
+    // Phase B: tests ALL clusters with frustum + backface + Hi-Z (using
+    // the pyramid built from Phase A's depth).  Emits to the standard
+    // opaque indirect (overwriting Phase A's count — Phase B's emit set
+    // is the COMPLETE set this frame, so the standard buffer carries
+    // it for any consumer that wants "all visible clusters").  Also
+    // emits to the translucent bucket (translucents only run in B).
+    // Atomically OR's the visibility bit for every opaque survivor.
+    void cullPhaseB(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const glm::mat4& view_proj,
+        const glm::vec3& camera_pos);
+
+    // Indirect draw consumer for Phase A.  Same merged VB/IB + bindless
+    // descriptor set as drawOpaqueGBuffer; the only difference is which
+    // indirect buffer we read from.  Caller must have an active
+    // dynamic-rendering pass with G-buffer attachments + depth bound.
+    uint32_t drawOpaqueGBufferPhaseA(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
+    // Phase B's indirect draw is exactly drawOpaqueGBuffer (same indirect
+    // buffer); aliased here for symmetry / clarity at the call site.
+    uint32_t drawOpaqueGBufferPhaseB(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors) {
+        return drawOpaqueGBuffer(cmd_buf, desc_sets, viewports, scissors);
+    }
+
+    // Reset the persistent visibility bit set to all zeros.  Called
+    // between Phase A and Phase B each frame so that Phase B's atomicOr
+    // writes produce the correct "visible this frame" set without any
+    // leak from the previous frame's bits.
+    void clearVisibilityBuffer(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
+
     // Provide the application's Hi-Z pyramid for last-frame occlusion
     // culling.  Call ONCE after pyramid creation and AGAIN whenever the
     // pyramid is recreated (swap-chain resize).  Caller passes the

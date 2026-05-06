@@ -1218,12 +1218,21 @@ bool Menu::draw(
                 "9: Translucent (alpha mode)",
                 "10: Velocity (NDC delta x50)",
                 "11: SSAO (raw AO factor)",
+                "12: Hi-Z pyramid (mip)",
             };
             for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
                 bool selected = (debug_render_mode_ == i);
                 if (ImGui::MenuItem(kRenderDebugItems[i], NULL, selected)) {
                     debug_render_mode_ = i;
                 }
+            }
+            // Hi-Z mip selector — only meaningful when DEBUG_RENDER_MODE_HIZ
+            // is the active mode.  Range is 0..15 (the field carries 4 bits
+            // of mip selection in input_features); the application clamps
+            // against the actual pyramid mip count when packing.
+            if (debug_render_mode_ == 12) {
+                ImGui::Separator();
+                ImGui::SliderInt("Hi-Z mip", &hiz_debug_mip_, 0, 15);
             }
             ImGui::Separator();
 

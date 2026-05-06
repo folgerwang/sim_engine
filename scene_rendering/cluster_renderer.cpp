@@ -1380,6 +1380,269 @@ void ClusterRenderer::cull(
     }
 }
 
+// ─── Two-pass occlusion culling (Nanite-style) ────────────────────────────
+// Phase A: cluster_cull.comp with cull_phase=1.  Reads visibility bits
+// from last frame's Phase B output, emits opaque draws to the dedicated
+// phase-A indirect buffer, no Hi-Z test, no translucents.
+//
+// Phase B: cluster_cull.comp with cull_phase=2.  Tests every cluster
+// against frustum + backface + Hi-Z (built from Phase A's depth between
+// the two cull dispatches).  Writes the canonical "visible this frame"
+// set via atomicOr into visibility_bit_buffer_, fills the standard
+// opaque + translucent indirect buffers.
+//
+// Both share the same compute pipeline / descriptor set as cull() —
+// only the push-constant cull_phase value differs.  Buffer barriers
+// reset the per-phase counters and ensure ordering between the two
+// cull dispatches and their respective indirect-draw consumers.
+
+namespace {
+
+// Helper for the per-phase cull dispatch — builds and pushes a
+// ClusterCullPushConstants with the requested phase, leaving the rest
+// (view_proj, camera_pos, etc.) at the supplied values.  The descriptor
+// set, pipeline, and counter-reset barriers are caller-supplied so
+// each phase can sequence them differently.
+}  // anonymous namespace
+
+void ClusterRenderer::cullPhaseA(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const glm::mat4& view_proj,
+    const glm::vec3& camera_pos) {
+
+    if (!enabled_ || !gpu_ready_) return;
+    if (cpu_cull_mode_) return;   // CPU path doesn't support two-pass
+
+    // Reset Phase A's draw counter.  The visibility-bit buffer is
+    // expected to hold last frame's Phase B output — we DON'T clear it
+    // here; the orchestrator does so between Phase A and Phase B.
+    cmd_buf->fillBuffer(draw_count_buffer_phase_a_.buffer,
+                        0, sizeof(uint32_t), 0);
+
+    er::BufferResourceInfo ssbo_transfer_write = {
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    er::BufferResourceInfo ssbo_compute_rw = {
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    er::BufferResourceInfo prev_indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+
+    cmd_buf->addBufferBarrier(
+        draw_count_buffer_phase_a_.buffer,
+        ssbo_transfer_write, ssbo_compute_rw);
+    cmd_buf->addBufferBarrier(
+        indirect_draw_buffer_phase_a_.buffer,
+        prev_indirect_read, ssbo_compute_rw);
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::COMPUTE, cull_pipeline_);
+
+    glsl::ClusterCullPushConstants push{};
+    push.view_proj = view_proj;
+    push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
+    push.total_clusters = total_clusters_all_meshes_;
+    push.use_bvh = 0;
+    push.use_hiz_cull = 0u;     // Phase A skips Hi-Z; the shader also
+                                // gates this internally on cull_phase != 1.
+    push.cull_phase = 1u;
+    push.last_view_proj = glm::mat4(1.0f);
+    push.hiz_size_mips_pad = glm::vec4(0.0f);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        cull_pipeline_layout_, &push, sizeof(push));
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::COMPUTE,
+        cull_pipeline_layout_, { cull_desc_set_ });
+
+    uint32_t groups = (total_clusters_all_meshes_ + 63) / 64;
+    cmd_buf->dispatch(groups, 1);
+
+    er::BufferResourceInfo indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+    cmd_buf->addBufferBarrier(
+        indirect_draw_buffer_phase_a_.buffer,
+        ssbo_compute_rw, indirect_read);
+    cmd_buf->addBufferBarrier(
+        draw_count_buffer_phase_a_.buffer,
+        ssbo_compute_rw, indirect_read);
+}
+
+void ClusterRenderer::cullPhaseB(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const glm::mat4& view_proj,
+    const glm::vec3& camera_pos) {
+
+    if (!enabled_ || !gpu_ready_) return;
+    if (cpu_cull_mode_) return;
+
+    // Reset standard opaque + translucent counters.  Visibility bits are
+    // cleared separately by clearVisibilityBuffer() — that has to happen
+    // BEFORE this dispatch but AFTER Phase A consumed the previous bits.
+    cmd_buf->fillBuffer(draw_count_buffer_.buffer,
+                        0, sizeof(uint32_t), 0);
+    cmd_buf->fillBuffer(trans_draw_count_buffer_.buffer,
+                        0, sizeof(uint32_t), 0);
+
+    er::BufferResourceInfo ssbo_transfer_write = {
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    er::BufferResourceInfo ssbo_compute_rw = {
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    er::BufferResourceInfo prev_indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+
+    cmd_buf->addBufferBarrier(
+        draw_count_buffer_.buffer,
+        ssbo_transfer_write, ssbo_compute_rw);
+    cmd_buf->addBufferBarrier(
+        trans_draw_count_buffer_.buffer,
+        ssbo_transfer_write, ssbo_compute_rw);
+    cmd_buf->addBufferBarrier(
+        indirect_draw_buffer_.buffer,
+        prev_indirect_read, ssbo_compute_rw);
+    cmd_buf->addBufferBarrier(
+        trans_indirect_draw_buffer_.buffer,
+        prev_indirect_read, ssbo_compute_rw);
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::COMPUTE, cull_pipeline_);
+
+    glsl::ClusterCullPushConstants push{};
+    push.view_proj = view_proj;
+    push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
+    push.total_clusters = total_clusters_all_meshes_;
+    push.use_bvh = debug_distance_cull_ ? 3u : 0u;
+    // Hi-Z is the whole point of Phase B in principle, but the
+    // current shader-side test (4 mip-0 taps + 0.05 NDC centre-margin)
+    // can over-occlude — clusters whose centre dips behind a
+    // foreground edge get rejected even when the cluster's near side
+    // is still visible.  That produces 1-frame flicker (drop → next
+    // frame Hi-Z lacks the depth → drawn again → repeat).  Until the
+    // test is tightened, gate Hi-Z on the menu toggle so the default
+    // two-pass behaviour is "frustum + backface only" (stable, no
+    // occlusion benefit yet).  Flip use_last_frame_depth_cull_ in the
+    // cluster debug menu to evaluate the current Hi-Z heuristic.
+    push.use_hiz_cull = use_last_frame_depth_cull_ ? 1u : 0u;
+    push.cull_phase = 2u;
+    // Phase B reprojects against the CURRENT frame's view-proj because
+    // the Hi-Z pyramid was built from THIS frame's Phase A depth (not
+    // last frame's).  So pass view_proj for both.
+    push.last_view_proj = view_proj;
+    push.hiz_size_mips_pad = glm::vec4(
+        float(hiz_size_.x), float(hiz_size_.y),
+        float(hiz_mip_count_), 0.0f);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        cull_pipeline_layout_, &push, sizeof(push));
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::COMPUTE,
+        cull_pipeline_layout_, { cull_desc_set_ });
+
+    uint32_t groups = (total_clusters_all_meshes_ + 63) / 64;
+    cmd_buf->dispatch(groups, 1);
+
+    er::BufferResourceInfo indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+    cmd_buf->addBufferBarrier(
+        indirect_draw_buffer_.buffer,
+        ssbo_compute_rw, indirect_read);
+    cmd_buf->addBufferBarrier(
+        draw_count_buffer_.buffer,
+        ssbo_compute_rw, indirect_read);
+    cmd_buf->addBufferBarrier(
+        trans_indirect_draw_buffer_.buffer,
+        ssbo_compute_rw, indirect_read);
+    cmd_buf->addBufferBarrier(
+        trans_draw_count_buffer_.buffer,
+        ssbo_compute_rw, indirect_read);
+}
+
+void ClusterRenderer::clearVisibilityBuffer(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
+    if (!gpu_ready_ || !visibility_bit_buffer_.buffer) return;
+
+    const uint32_t vis_uint_count =
+        (total_clusters_all_meshes_ + 31u) / 32u;
+    const uint64_t bytes = uint64_t(vis_uint_count) * sizeof(uint32_t);
+    if (bytes == 0) return;
+
+    // ── Pre-fill barrier ─────────────────────────────────────────────────
+    // Phase A's compute dispatch (which ran BEFORE this clear) reads the
+    // visibility bits.  Without this barrier the GPU is free to reorder
+    // Phase A's reads with this transfer write, which can let the fill
+    // race the read and produce frames where Phase A sees partially-
+    // cleared bits — those frames render nothing (or a sparse subset)
+    // for Phase A, the Hi-Z is built from incomplete depth, Phase B
+    // compensates by drawing extra, and the next frame inverts the bug
+    // because the bits are correct again.  Net visual: flicker.
+    er::BufferResourceInfo ssbo_compute_read = {
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    er::BufferResourceInfo ssbo_transfer_write = {
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    cmd_buf->addBufferBarrier(
+        visibility_bit_buffer_.buffer,
+        ssbo_compute_read, ssbo_transfer_write);
+
+    cmd_buf->fillBuffer(
+        visibility_bit_buffer_.buffer,
+        /*offset*/ 0,
+        /*size*/ bytes,
+        /*data*/ 0u);
+
+    // ── Post-fill barrier ────────────────────────────────────────────────
+    // Make the clear visible to the cull compute that runs next (Phase B).
+    er::BufferResourceInfo ssbo_compute_rw = {
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    cmd_buf->addBufferBarrier(
+        visibility_bit_buffer_.buffer,
+        ssbo_transfer_write, ssbo_compute_rw);
+}
+
+uint32_t ClusterRenderer::drawOpaqueGBufferPhaseA(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !bindless_gbuffer_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, bindless_gbuffer_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_pipeline_layout_, all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexedIndirectCount(
+        indirect_draw_buffer_phase_a_, 0,
+        draw_count_buffer_phase_a_, 0,
+        total_clusters_all_meshes_);
+    return total_visible_all_meshes_;
+}
+
 // ─── Init bindless graphics pipeline ──────────────────────────────
 
 void ClusterRenderer::initBindlessPipeline(

@@ -53,6 +53,15 @@ void main() {
         return;
     }
 
+    // Other debug visualisations (Hi-Z, velocity, normals, etc.) wrote
+    // their final pixels directly into color_buf — modulating by AO on
+    // top would mix occluder darkening into the diagnostic image and
+    // make it visually noisy / misleading.  Skip the multiply for any
+    // non-FINAL debug mode so the viz is clean.
+    if (debug_mode != DEBUG_RENDER_MODE_FINAL) {
+        return;
+    }
+
     ao = mix(1.0, ao, ao_strength);
 
     vec4 color = imageLoad(color_buf, coords);

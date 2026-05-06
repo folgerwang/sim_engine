@@ -65,6 +65,27 @@ layout(std430, set = 0, binding = 7) buffer TransDrawCountBuffer {
     uint trans_draw_count;
 };
 
+// Set 0, binding 8: per-cluster visibility bit set (one bit per cluster,
+// packed into uints — index = cluster_idx >> 5, mask = 1u << (cluster_idx & 31)).
+// Phase A reads + atomicOr writes (so its survivors carry forward).
+// Phase B clears (caller does vkCmdFillBuffer between A and B) then
+// atomicOr writes for every cluster that survives all three tests.
+// Single-pass mode (cull_phase==0) ignores this binding.
+layout(std430, set = 0, binding = 8) buffer VisibilityBitBuffer {
+    uint visibility_bits[];
+};
+
+// Set 0, binding 9: Phase A indirect draw output.  Same 5-uint-per-command
+// packing as binding 2.  Untouched by Phase B and the single-pass mode.
+layout(std430, set = 0, binding = 9) writeonly buffer IndirectDrawBufferPhaseA {
+    uint indirect_draws_phase_a[];
+};
+
+// Set 0, binding 10: Phase A atomic draw count.
+layout(std430, set = 0, binding = 10) buffer DrawCountBufferPhaseA {
+    uint draw_count_phase_a;
+};
+
 // Set 0, binding 11: Hi-Z pyramid (R32F max-Z, full mip chain).
 // Built each frame from last frame's depth by hiz_build.comp.  Sampled
 // here when params.use_hiz_cull == 1 to reject clusters whose bounding
@@ -176,6 +197,16 @@ void main() {
         return;
     }
 
+    // Phase A entry filter: only consider clusters whose visibility bit
+    // is set (= they emitted a draw last frame).  Anything not visible
+    // last frame is deferred to Phase B, which will catch it via the
+    // Hi-Z occlusion test against Phase A's freshly-rendered depth.
+    if (params.cull_phase == 1u) {
+        uint word = visibility_bits[cluster_idx >> 5u];
+        uint mask = 1u << (cluster_idx & 31u);
+        if ((word & mask) == 0u) return;
+    }
+
     ClusterCullInfo cull = cluster_cull_infos[cluster_idx];
     vec3 center = cull.bounds_sphere.xyz;
     float radius = cull.bounds_sphere.w;
@@ -220,44 +251,11 @@ void main() {
         //      always available on all targets; keep it portable.
         //    - Cluster sphere's near-Z is derived via view-space depth
         //      then projected by last_view_proj's z-row.  Standard.
-        if (params.use_hiz_cull == 1u) {
-            // ── DEBUG: probe the Hi-Z pyramid contents ────────────────
-            // Cull every cluster whose centre projects to a screen pixel
-            // where the pyramid says "anything closer than the far
-            // plane".  This is NOT a real Hi-Z occlusion test — it's a
-            // diagnostic probe to figure out what values the pyramid
-            // actually contains.  Possible outcomes after toggling:
-            //   - Foreground regions of the scene blink out (anything
-            //     not sky disappears) → pyramid has real depth values,
-            //     and the previous conservative test's plausibility +
-            //     margin checks were the reason no culling happened.
-            //     I'll relax those.
-            //   - Nothing disappears → pyramid is all 1.0 (cleared, never
-            //     written by hiz_build).  Means dispatchHiZBuild isn't
-            //     populating the pyramid.  Likely descriptor-binding or
-            //     barrier issue inside the build loop.
-            //   - Everything disappears (whole scene goes black) →
-            //     pyramid is all 0.0 (unwritten / unbound binding).
-            //     Means binding 11 isn't seeing the pyramid view.
-            // Replace this stub with a real test once we know which.
-            {
-                vec4 dbg_clip = params.last_view_proj * vec4(center, 1.0);
-                if (dbg_clip.w > 0.001) {
-                    vec3 dbg_ndc = dbg_clip.xyz / dbg_clip.w;
-                    vec2 dbg_uv  = dbg_ndc.xy * 0.5 + 0.5;
-                    if (dbg_uv.x >= 0.0 && dbg_uv.x <= 1.0 &&
-                        dbg_uv.y >= 0.0 && dbg_uv.y <= 1.0) {
-                        float dbg_d = textureLod(hiz_pyramid, dbg_uv, 0.0).r;
-                        // Cull whenever the sampled depth indicates
-                        // ANY geometry at this pixel.
-                        if (dbg_d < 0.999) {
-                            return;
-                        }
-                    }
-                }
-            }
-            // (real Hi-Z math below is unreachable while this stub fires)
-
+        // Phase A skips Hi-Z occlusion entirely — these clusters were
+        // visible last frame, we trust them to render the depth that
+        // Phase B will then test against.  Phase B and the legacy
+        // single-pass mode honour the use_hiz_cull menu toggle.
+        if (params.use_hiz_cull == 1u && params.cull_phase != 1u) {
             // ── Conservative Hi-Z occlusion test (defensive variant) ──
             // The previous more-aggressive formulation was over-culling
             // visible buildings (sun showed through where opaque
@@ -301,21 +299,72 @@ void main() {
                     bool sample_plausible =
                         pyramid_max_z > 0.01 && pyramid_max_z < 0.999;
 
-                    if (sample_plausible &&
-                        ndc.z > pyramid_max_z + 0.05) {
-                        return;  // cluster centre clearly behind the depth
+                    // Compute the cluster's NEAREST-POINT NDC z by
+                    // projecting the world-space point on the bounding
+                    // sphere closest to the camera (= centre minus
+                    // radius along the camera→cluster unit vector).
+                    // This is exact for the depth axis and removes the
+                    // need for the centre-plus-margin fudge — a cluster
+                    // is rejected only when even its closest visible
+                    // point is behind the conservative-far Hi-Z value.
+                    vec3 cam = params.camera_pos_pad.xyz;
+                    vec3 to_cluster = center - cam;
+                    float dist = length(to_cluster);
+                    bool ok_to_test = dist > radius * 1.01;
+                    if (ok_to_test) {
+                        vec3 nearest_world =
+                            center - (to_cluster / dist) * radius;
+                        vec4 clip_near =
+                            params.last_view_proj * vec4(nearest_world, 1.0);
+                        if (clip_near.w > 0.001) {
+                            float ndc_z_near = clip_near.z / clip_near.w;
+                            if (sample_plausible &&
+                                ndc_z_near > pyramid_max_z) {
+                                return;   // even closest point is occluded
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // Cluster is visible — emit an indirect draw command.  Route to the
-    // opaque or translucent bucket based on the material's BLEND flag so
-    // glass / windows can be drawn in a second pass with alpha blending.
+    // Cluster is visible.  Routing depends on cull_phase:
+    //   0 (single-pass) = standard opaque/translucent buckets — legacy.
+    //   1 (Phase A)     = phase-A indirect ONLY (translucents skipped;
+    //                     they're handled in Phase B).  Vis bit set so
+    //                     this cluster carries forward to next frame.
+    //   2 (Phase B)     = standard opaque/translucent buckets PLUS vis
+    //                     bit set; this is the canonical "visible this
+    //                     frame" signal for next frame's Phase A.
+    //
+    // Visibility-bit write uses atomicOr.  Phase A and Phase B may both
+    // emit the same cluster (Phase A's set is a subset of Phase B's
+    // expected set in steady state), and atomicOr is idempotent so the
+    // double-write is harmless.  The ordering between Phase A's writes
+    // and Phase B's clear+rewrite is enforced by host barriers + the
+    // host's vkCmdFillBuffer that resets the buffer between phases.
     ClusterDrawInfo draw = cluster_draw_infos[cluster_idx];
     bool is_translucent =
         (material_params[draw.material_idx].flags & BINDLESS_MAT_TRANSLUCENT) != 0;
+
+    if (params.cull_phase == 1u) {
+        // Phase A: opaque clusters only, into the phase-A indirect.
+        // Translucent material survivors are dropped here — they're
+        // handled in Phase B by the standard route.  No visibility-bit
+        // write: the host clears the buffer between A and B and Phase B
+        // is the canonical writer of "visible this frame".
+        if (!is_translucent) {
+            uint slot = atomicAdd(draw_count_phase_a, 1u);
+            uint base = slot * 5u;
+            indirect_draws_phase_a[base + 0] = draw.index_count;
+            indirect_draws_phase_a[base + 1] = 1u;
+            indirect_draws_phase_a[base + 2] = draw.index_offset;
+            indirect_draws_phase_a[base + 3] = draw.vertex_offset;
+            indirect_draws_phase_a[base + 4] = cluster_idx;
+        }
+        return;
+    }
 
     if (is_translucent) {
         uint slot = atomicAdd(trans_draw_count, 1u);
@@ -324,9 +373,11 @@ void main() {
         trans_indirect_draws[base + 1] = 1u;
         trans_indirect_draws[base + 2] = draw.index_offset;
         trans_indirect_draws[base + 3] = draw.vertex_offset;
-        trans_indirect_draws[base + 4] = cluster_idx;  // firstInstance = bindless material lookup
+        trans_indirect_draws[base + 4] = cluster_idx;
         // Translucent clusters are not appended to visible_cluster_indices —
         // that buffer is sized for opaque only and is a debug accessory.
+        // Translucents skip the visibility bit too: they don't contribute
+        // to next frame's Phase A depth set (no occluder value).
     } else {
         uint slot = atomicAdd(draw_count, 1u);
         uint base = slot * 5u;
@@ -334,7 +385,15 @@ void main() {
         indirect_draws[base + 1] = 1u;                    // instanceCount
         indirect_draws[base + 2] = draw.index_offset;     // firstIndex
         indirect_draws[base + 3] = draw.vertex_offset;    // vertexOffset (int32)
-        indirect_draws[base + 4] = cluster_idx;           // firstInstance = cluster index (for bindless material lookup)
+        indirect_draws[base + 4] = cluster_idx;           // firstInstance
         visible_cluster_indices[slot] = cluster_idx;
+
+        // Phase B sets the visibility bit for opaque survivors only.
+        // The single-pass legacy mode (cull_phase==0) leaves the bit
+        // alone — it's only meaningful in two-pass.
+        if (params.cull_phase == 2u) {
+            atomicOr(visibility_bits[cluster_idx >> 5u],
+                     1u << (cluster_idx & 31u));
+        }
     }
 }
