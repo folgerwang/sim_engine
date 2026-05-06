@@ -1,13 +1,24 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
 
 // ─── Apply SSAO to HDR color buffer ───────────────────────────
 // Multiplies the blurred AO texture into the color buffer in-place.
+//
+// When debug_mode == DEBUG_RENDER_MODE_SSAO, instead of modulating the
+// existing color we OVERWRITE it with vec3(ao) so the screen shows the
+// raw ambient-occlusion factor as a grayscale image:
+//   white  = unoccluded
+//   grey   = partial AO
+//   black  = fully occluded
+// Useful for tuning SSAO radius / sample count without scene shading
+// in the way.
 
 layout(push_constant) uniform SSAOApplyPushConstants {
     vec2  inv_screen_size;
     float ao_strength;    // 0 = no AO, 1 = full AO
-    float pad;
+    int   debug_mode;     // matches DEBUG_RENDER_MODE_*; only ==SSAO
+                          // (=11) and FINAL (=0) are special-cased here
 };
 
 layout(set = 0, binding = 0) uniform sampler2D ao_tex;
@@ -20,6 +31,28 @@ void main() {
     vec2 uv = (vec2(coords) + 0.5) * inv_screen_size;
 
     float ao = texture(ao_tex, uv).r;
+
+    if (debug_mode == DEBUG_RENDER_MODE_SSAO) {
+        // DIAGNOSTIC visualisation — colour-codes AO ranges so we can
+        // tell at a glance whether (a) this branch is even running and
+        // (b) what range of AO values the SSAO compute is producing:
+        //   red    = ao > 0.99   (effectively unoccluded / sky)
+        //   yellow = ao > 0.90
+        //   green  = ao > 0.50
+        //   blue   = ao <= 0.50  (heavy occlusion)
+        // If the screen is still uniform white after rebuilding shaders,
+        // this .comp is not being recompiled by the build system.
+        // If the screen is mostly red, the SSAO compute is producing
+        // ao ≈ 1.0 everywhere → look at ssao.comp / its inputs, not here.
+        vec3 dbg;
+        if      (ao > 0.99) dbg = vec3(1.0, 0.0, 0.0);
+        else if (ao > 0.90) dbg = vec3(1.0, 1.0, 0.0);
+        else if (ao > 0.50) dbg = vec3(0.0, 1.0, 0.0);
+        else                dbg = vec3(0.0, 0.0, 1.0);
+        imageStore(color_buf, coords, vec4(dbg, 1.0));
+        return;
+    }
+
     ao = mix(1.0, ao, ao_strength);
 
     vec4 color = imageLoad(color_buf, coords);

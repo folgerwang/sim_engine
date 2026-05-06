@@ -543,6 +543,14 @@ void main() {
         vec2 prev_ndc = v_prev_clip.xy / v_prev_clip.w;
         vec2 v        = (cur_ndc - prev_ndc) * kVelocityViewScale;
         out_color = vec4(v * 0.5 + 0.5, 0.5, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SSAO) {
+        // Output pure white so when ssao_apply.comp runs (force-enabled
+        // for this mode in application.cpp + SSAO::render) it multiplies
+        // white * ao = vec3(ao) and the screen displays the raw AO
+        // factor.  Works even when ssao_apply.comp's own debug-branch
+        // isn't recompiled, and gives a clear "SSAO is off" indicator
+        // (uniform white) if the apply pass somehow doesn't run.
+        out_color = vec4(1.0, 1.0, 1.0, 1.0);
     }
 #endif // OIT_OUTPUT
 }

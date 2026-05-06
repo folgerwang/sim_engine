@@ -188,6 +188,13 @@ void main() {
         const float kVelocityViewScale = 50.0;
         vec2 v = texture(gbuf_velocity, uv).rg * kVelocityViewScale;
         color = vec3(v * 0.5 + 0.5, 0.5);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SSAO) {
+        // Output pure white; ssao_apply.comp runs after this pass and
+        // multiplies in the AO factor, so the screen ends up showing
+        // vec3(ao) — raw AO factor as a grayscale image.  See
+        // cluster_bindless.frag's matching branch + SSAO::render's
+        // force_run gate when this mode is active.
+        color = vec3(1.0);
     }
 
     imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));

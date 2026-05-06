@@ -203,6 +203,13 @@
                                                     // in forward mode computes inline from
                                                     // cur/prev clip varyings.  Cluster geometry
                                                     // only — terrain/grass/hair stay 0.
+#define DEBUG_RENDER_MODE_SSAO                  11  // raw ambient-occlusion factor
+                                                    // (1 = unoccluded white, 0 = fully
+                                                    // occluded black).  Implemented as
+                                                    // an early-out inside ssao_apply.comp
+                                                    // — when this mode is active the apply
+                                                    // pass overwrites color with vec3(ao)
+                                                    // instead of multiplying it in.
 
 #define LIGHT_COUNT                             1
 #define CSM_CASCADE_COUNT                       4

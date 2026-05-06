@@ -1217,6 +1217,7 @@ bool Menu::draw(
                 "8: Geometric normal",
                 "9: Translucent (alpha mode)",
                 "10: Velocity (NDC delta x50)",
+                "11: SSAO (raw AO factor)",
             };
             for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
                 bool selected = (debug_render_mode_ == i);

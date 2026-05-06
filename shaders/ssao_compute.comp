@@ -43,14 +43,46 @@ vec3 viewPosFromDepth(vec2 uv, float depth) {
 }
 
 // Reconstruct normal from depth via cross product of ddx/ddy.
+// Uses 4-tap symmetric differencing and picks the closer neighbour on
+// each axis to avoid blowouts at silhouettes — single-sided ddx/ddy
+// reconstruction fires a wildly-pointing normal whenever it straddles
+// a depth edge, which then makes the SSAO hemisphere flip into the
+// surface and reports 100% occlusion for that pixel.  Symptom:
+// alternating bright/dark pixel stripes in the SSAO debug output.
 vec3 reconstructNormal(vec2 uv, vec3 pos) {
     vec2 dx = vec2(inv_screen_size.x, 0.0);
     vec2 dy = vec2(0.0, inv_screen_size.y);
+
     float dR = texture(depth_tex, uv + dx).r;
+    float dL = texture(depth_tex, uv - dx).r;
     float dU = texture(depth_tex, uv + dy).r;
-    vec3 pR = viewPosFromDepth(uv + dx, dR);
-    vec3 pU = viewPosFromDepth(uv + dy, dU);
-    return normalize(cross(pR - pos, pU - pos));
+    float dD = texture(depth_tex, uv - dy).r;
+
+    // Pick the side whose depth is closest to the centre — the other
+    // side likely straddled a silhouette and would give a bad slope.
+    vec3 pos_dx = abs(dR - texture(depth_tex, uv).r) <
+                  abs(dL - texture(depth_tex, uv).r)
+        ? viewPosFromDepth(uv + dx, dR)
+        : -viewPosFromDepth(uv - dx, dL) + 2.0 * pos;
+    vec3 pos_dy = abs(dU - texture(depth_tex, uv).r) <
+                  abs(dD - texture(depth_tex, uv).r)
+        ? viewPosFromDepth(uv + dy, dU)
+        : -viewPosFromDepth(uv - dy, dD) + 2.0 * pos;
+
+    vec3 n = normalize(cross(pos_dx - pos, pos_dy - pos));
+
+    // Sign safeguard, convention-agnostic: the surface normal must
+    // point back TOWARD the camera, i.e. its dot product with the
+    // view-space vector pointing toward the camera (= -pos, since the
+    // camera is at the view-space origin) must be non-negative.
+    // Equivalent test: dot(n, pos) <= 0.
+    // The previous `if (n.z > 0) flip` guess assumed positive view-Z =
+    // away from camera; if the engine's convention is the opposite,
+    // entire depth zones get their normals flipped into the surface
+    // and read as fully-occluded — visible as horizontal blue/green
+    // bands at specific depth ranges in the SSAO debug view.
+    if (dot(n, pos) > 0.0) n = -n;
+    return n;
 }
 
 // Simple hash for per-pixel random rotation.
@@ -115,7 +147,20 @@ void main() {
         vec3 sample_pos = frag_pos + TBN * sample_dir * radius;
 
         // Project back to screen UV.
-        vec4 proj_pos = camera_info.proj * vec4(sample_pos, 1.0);
+        // IMPORTANT sign-fix: `linearizeDepth` (and thus frag_pos.z and
+        // sample_pos.z) is POSITIVE for points in front of the camera in
+        // this engine's convention.  The projection matrix, however, is a
+        // standard right-handed perspective expecting NEGATIVE Z for the
+        // viewing direction.  Feeding it +Z values gives a divide-by-w
+        // with the wrong sign and lands sample_uv on a totally unrelated
+        // screen location — the depth read there has no correlation with
+        // sample_pos.z, so the occlusion test fires randomly and produces
+        // dark "ghost" splotches that don't follow real geometry.
+        // Negating Z just for the projection step keeps the rest of the
+        // shader's positive-Z math (range_check, sample_z compare, etc.)
+        // working as written.
+        vec4 proj_pos = camera_info.proj *
+                        vec4(sample_pos.xy, -sample_pos.z, 1.0);
         proj_pos.xy /= proj_pos.w;
         vec2 sample_uv = proj_pos.xy * 0.5 + 0.5;
 

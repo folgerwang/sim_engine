@@ -65,7 +65,13 @@ public:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const std::shared_ptr<renderer::DescriptorSet>& view_desc_set,
         const std::shared_ptr<renderer::Image>& hdr_color_image,
-        const glm::uvec2& display_size);
+        const glm::uvec2& display_size,
+        // Debug-mode passthrough.  Forwarded to ssao_apply.comp; when
+        // == DEBUG_RENDER_MODE_SSAO the apply step overwrites the
+        // colour buffer with vec3(ao) so the screen shows the raw
+        // AO factor.  Pass 0 (DEBUG_RENDER_MODE_FINAL) for normal
+        // shading.
+        int debug_mode = 0);
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 };

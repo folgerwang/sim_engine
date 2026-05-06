@@ -32,7 +32,10 @@ struct SSAOBlurPushConstants {
 struct SSAOApplyPushConstants {
     glm::vec2 inv_screen_size;
     float     ao_strength;
-    float     pad;
+    int32_t   debug_mode;     // mirrors DEBUG_RENDER_MODE_*; tells the
+                              // apply compute to overwrite color with
+                              // vec3(ao) when set to DEBUG_RENDER_MODE_
+                              // SSAO (=11), otherwise modulate normally.
 };
 
 // ── 4×4 random rotation noise texture ───────────────────────────
@@ -312,9 +315,17 @@ void SSAO::render(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::DescriptorSet>& view_desc_set,
     const std::shared_ptr<renderer::Image>& hdr_color_image,
-    const glm::uvec2& display_size) {
+    const glm::uvec2& display_size,
+    int debug_mode) {
 
-    if (!enabled) return;
+    // Normally we early-out if SSAO is disabled in the menu, but the
+    // SSAO debug-render mode REQUIRES the apply pass to run so it can
+    // overwrite the colour buffer with vec3(ao).  Force-run the full
+    // SSAO pipeline (compute → blur → apply) when the user has selected
+    // mode DEBUG_RENDER_MODE_SSAO regardless of the enabled toggle.
+    const bool force_run =
+        (debug_mode == DEBUG_RENDER_MODE_SSAO);
+    if (!enabled && !force_run) return;
 
     const glm::vec2 inv_size = {
         1.0f / float(display_size.x),
@@ -391,8 +402,21 @@ void SSAO::render(
     cmd_buf->bindPipeline(er::PipelineBindPoint::COMPUTE, apply_pipeline_);
     SSAOApplyPushConstants apply_pc;
     apply_pc.inv_screen_size = inv_size;
-    apply_pc.ao_strength = strength;
-    apply_pc.pad = 0.0f;
+    // Override ao_strength to 1.0 when the SSAO debug mode is active.
+    // Three reasons:
+    //   1. The user typically dials strength low (0–0.5) for a subtle
+    //      shading look.  The debug visualisation wants to SEE every
+    //      bit of AO, so we crank it to full.
+    //   2. The cluster fragment shader writes vec3(1.0) for this mode;
+    //      with strength<1 the apply step's mix(1, ao, strength) pulls
+    //      ao back toward 1, hiding the AO factor.
+    //   3. Even if ssao_apply.comp is running its OLD .spv (without the
+    //      debug-mode branch), strength=1.0 still produces white * ao
+    //      = vec3(ao) — so the visualisation works even when the
+    //      apply shader's debug branch isn't recompiled.
+    apply_pc.ao_strength =
+        (debug_mode == DEBUG_RENDER_MODE_SSAO) ? 1.0f : strength;
+    apply_pc.debug_mode  = debug_mode;
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         apply_pipeline_layout_, &apply_pc, sizeof(apply_pc));

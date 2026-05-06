@@ -36,8 +36,20 @@ void main() {
         float sample_depth = texture(depth_tex, sample_uv).r;
 
         // Bilateral weight: reduce contribution at depth discontinuities.
-        float depth_diff = abs(center_depth - sample_depth);
-        float w = exp(-depth_diff * 1000.0) * (1.0 / (1.0 + abs(float(i))));
+        // Use a RELATIVE depth diff so the weight scales with the depth
+        // (small absolute depth differences near far-plane geometry would
+        // otherwise look the same as real silhouette edges nearby).
+        // The previous formulation (`exp(-depth_diff * 1000)`) was so
+        // aggressive that any tilted surface — say, a ground plane viewed
+        // obliquely — looked like an edge to the blur, causing every
+        // neighbour to be rejected and the per-pixel SSAO noise to come
+        // through unsmoothed (visible as dense alternating stripes in the
+        // SSAO debug visualisation).
+        float rel_depth_diff =
+            abs(center_depth - sample_depth) /
+            max(center_depth, 1e-4);
+        float w = exp(-rel_depth_diff * 30.0) *
+                  (1.0 / (1.0 + abs(float(i))));
 
         total_ao     += sample_ao * w;
         total_weight += w;

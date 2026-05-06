@@ -241,6 +241,10 @@ void main() {
         } else {
             outColor = vec4(0.1, 0.1, 0.1, 1.0);
         }
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SSAO) {
+        // White → ssao_apply.comp multiplies by ao → vec3(ao) on screen.
+        // See cluster_bindless.frag's matching branch for the rationale.
+        outColor = vec4(1.0, 1.0, 1.0, 1.0);
     }
 #else
     outColor = baseColor;
