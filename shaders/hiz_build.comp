@@ -1,0 +1,67 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+// ─── hiz_build.comp ──────────────────────────────────────────────────────
+// Hi-Z (hierarchical Z) pyramid generation for Nanite-style two-pass
+// occlusion culling.
+//
+// Each invocation produces ONE texel of mip `dst_mip`.  The shader is
+// dispatched once per mip; the host orchestrates the chain (mip 0 is
+// produced from the scene depth buffer, mip 1 from mip 0, etc.) and
+// inserts a SHADER_WRITE → SHADER_READ barrier between dispatches.
+//
+// Reduction operator is MAX (conservative-far Z): a cluster is occluded
+// iff its NEAR plane depth > the Hi-Z FAR plane at the cluster's screen
+// footprint.  Vulkan depth runs [0,1] (GLM_FORCE_DEPTH_ZERO_TO_ONE), so
+// "far" is the LARGER value.
+//
+// For mip 0 the source is the scene depth (D24_S8 sampled as float in
+// .r through a depth-aspect view).  For higher mips the source is the
+// previous Hi-Z mip (R32F).  Both bind to the same `src_tex` slot via
+// per-mip descriptor sets the host built up-front.
+
+layout(set = 0, binding = 0) uniform sampler2D src_tex;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst_mip;
+
+layout(push_constant) uniform PushConstants {
+    // Size of the destination mip in pixels.  Threads outside this rect
+    // skip — the dispatch is rounded up to the workgroup size.
+    uvec2 dst_size;
+    // Size of the source (one mip up, or the scene depth for mip 0).
+    // Used to clamp the 2×2 sample positions so we don't read off the
+    // edge when destination is half of an odd-sized source.
+    uvec2 src_size;
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    uvec2 dst_px = gl_GlobalInvocationID.xy;
+    if (dst_px.x >= dst_size.x || dst_px.y >= dst_size.y) return;
+
+    // 2×2 source samples at the corresponding upper-left position in the
+    // higher-resolution mip / source texture.  textureLod with explicit
+    // LOD 0 reads the bound mip directly; the per-mip descriptor binds
+    // the right source (previous mip) at LOD 0.
+    uvec2 src_base = dst_px * 2u;
+    vec2  inv_src  = 1.0 / vec2(src_size);
+    // Sample at pixel centres of the four source texels.  Clamp the
+    // upper indices in case dst_size*2 > src_size by one pixel (odd
+    // source dimensions).
+    uvec2 s00 = min(src_base + uvec2(0u, 0u), src_size - 1u);
+    uvec2 s10 = min(src_base + uvec2(1u, 0u), src_size - 1u);
+    uvec2 s01 = min(src_base + uvec2(0u, 1u), src_size - 1u);
+    uvec2 s11 = min(src_base + uvec2(1u, 1u), src_size - 1u);
+    vec2 uv00 = (vec2(s00) + 0.5) * inv_src;
+    vec2 uv10 = (vec2(s10) + 0.5) * inv_src;
+    vec2 uv01 = (vec2(s01) + 0.5) * inv_src;
+    vec2 uv11 = (vec2(s11) + 0.5) * inv_src;
+    float d00 = textureLod(src_tex, uv00, 0.0).r;
+    float d10 = textureLod(src_tex, uv10, 0.0).r;
+    float d01 = textureLod(src_tex, uv01, 0.0).r;
+    float d11 = textureLod(src_tex, uv11, 0.0).r;
+
+    // Conservative-far: take the deepest of the four.  A cluster is only
+    // rejected if its closest point is still BEHIND this far value.
+    float far_z = max(max(d00, d10), max(d01, d11));
+    imageStore(dst_mip, ivec2(dst_px), vec4(far_z, 0.0, 0.0, 0.0));
+}

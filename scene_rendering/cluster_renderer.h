@@ -107,6 +107,24 @@ class ClusterRenderer {
     // (alpha blend on, depth-write off).
     renderer::BufferInfo trans_indirect_draw_buffer_;
     renderer::BufferInfo trans_draw_count_buffer_;
+
+    // ── Two-pass occlusion culling (Nanite-style) ────────────────────────
+    // Persistent per-cluster visibility bit set across frames.  Sized for
+    // ceil(total_clusters / 32) uints; bit N of element N/32 == "cluster N
+    // was drawn last frame".  Phase A reads it (and only emits clusters
+    // whose bit is set) so previously-visible clusters re-render first and
+    // produce a partial depth buffer.  Phase B clears + atomically OR-writes
+    // bits for every cluster that survives all three tests (frustum +
+    // backface + Hi-Z), so the SAME buffer becomes next frame's Phase A
+    // input.  Allocated zero-initialised in finalizeUploads — frame 1's
+    // Phase A renders nothing, Phase B (with empty Hi-Z) renders everything,
+    // and the buffer is correct from frame 2 onward.
+    renderer::BufferInfo visibility_bit_buffer_;
+    // Phase A indirect draw output.  Worst-case sized identically to the
+    // single-pass indirect_draw_buffer_ (5 uints per cluster).
+    renderer::BufferInfo indirect_draw_buffer_phase_a_;
+    renderer::BufferInfo draw_count_buffer_phase_a_;
+
     std::shared_ptr<renderer::DescriptorSet> cull_desc_set_;
 
     // ── Merged vertex/index buffers for bindless rendering ──

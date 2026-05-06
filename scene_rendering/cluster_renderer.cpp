@@ -127,8 +127,14 @@ std::shared_ptr<er::DescriptorSetLayout> createCullDescSetLayout(
     // binding 5: BindlessMaterialParams[]        (SSBO, readonly — for flags)
     // binding 6: TransIndirectDrawBuffer         (SSBO, writeonly)
     // binding 7: TransDrawCountBuffer            (SSBO, read/write — atomicAdd)
-    std::vector<er::DescriptorSetLayoutBinding> bindings(8);
-    for (int i = 0; i < 8; ++i) {
+    // binding 8: VisibilityBitBuffer             (SSBO, read+atomicOr) — Nanite-style
+    //              persistent visibility from previous frame.  Phase A reads,
+    //              Phase B writes (atomicOr per visible cluster).
+    // binding 9: IndirectDrawBuffer (Phase A)    (SSBO, writeonly) — only used by
+    //              Phase A cull; Phase B writes the regular binding 2.
+    // binding 10: DrawCountBuffer    (Phase A)   (SSBO, read/write — atomicAdd)
+    std::vector<er::DescriptorSetLayoutBinding> bindings(11);
+    for (int i = 0; i < 11; ++i) {
         bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
             i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::STORAGE_BUFFER);
@@ -148,10 +154,13 @@ void writeCullDescriptors(
     const renderer::BufferInfo& material_params_buffer,
     uint32_t                    total_materials,
     const renderer::BufferInfo& trans_indirect_draw_buffer,
-    const renderer::BufferInfo& trans_draw_count_buffer) {
+    const renderer::BufferInfo& trans_draw_count_buffer,
+    const renderer::BufferInfo& visibility_bit_buffer,
+    const renderer::BufferInfo& indirect_draw_buffer_phase_a,
+    const renderer::BufferInfo& draw_count_buffer_phase_a) {
 
     er::WriteDescriptorList writes;
-    writes.reserve(8);
+    writes.reserve(11);
 
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 0,
@@ -196,6 +205,25 @@ void writeCullDescriptors(
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 7,
         trans_draw_count_buffer.buffer,
+        sizeof(uint32_t));
+
+    // Two-pass occlusion bindings.  Sized so the buffer's whole range is
+    // visible to the shader; the cull compute decides per-cluster which
+    // 32-bit element to touch via cluster_idx >> 5.
+    const uint32_t vis_uint_count = (total_clusters + 31u) / 32u;
+    er::Helper::addOneBuffer(writes, desc_set,
+        er::DescriptorType::STORAGE_BUFFER, 8,
+        visibility_bit_buffer.buffer,
+        static_cast<uint32_t>(vis_uint_count * sizeof(uint32_t)));
+
+    er::Helper::addOneBuffer(writes, desc_set,
+        er::DescriptorType::STORAGE_BUFFER, 9,
+        indirect_draw_buffer_phase_a.buffer,
+        static_cast<uint32_t>(total_clusters * 5u * sizeof(uint32_t)));
+
+    er::Helper::addOneBuffer(writes, desc_set,
+        er::DescriptorType::STORAGE_BUFFER, 10,
+        draw_count_buffer_phase_a.buffer,
         sizeof(uint32_t));
 
     device->updateDescriptorSets(writes);
@@ -736,6 +764,29 @@ void ClusterRenderer::finalizeUploads() {
         total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
     trans_draw_count_buffer_ = createCounterBuffer(device_);
 
+    // ── Two-pass occlusion buffers ──────────────────────────────────────
+    // Persistent visibility bits — one bit per cluster.  Zero-initialised
+    // so frame 1's Phase A culls everything (renders nothing) and frame
+    // 1's Phase B (with empty Hi-Z) renders the full frustum-visible set,
+    // populating the bits for frame 2.
+    {
+        const uint32_t vis_uint_count =
+            (total_clusters_all_meshes_ + 31u) / 32u;
+        std::vector<uint32_t> zeros(vis_uint_count, 0u);
+        visibility_bit_buffer_ = createSSBO(
+            device_,
+            vis_uint_count * sizeof(uint32_t),
+            zeros.data());
+    }
+    // Phase A indirect output — same worst-case size as the single-pass
+    // opaque buffer.  In steady state Phase A's count converges on the
+    // visible-this-frame count, but we size for "all clusters were
+    // visible last frame" to avoid overflow during teleport / cut events.
+    indirect_draw_buffer_phase_a_ = createIndirectSSBO(
+        device_,
+        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+    draw_count_buffer_phase_a_ = createCounterBuffer(device_);
+
     // Allocate and write descriptor set.
     cull_desc_set_ = device_->createDescriptorSets(
         descriptor_pool_, cull_desc_set_layout_, 1)[0];
@@ -752,7 +803,10 @@ void ClusterRenderer::finalizeUploads() {
         indirect_draw_buffer_, draw_count_buffer_,
         visible_buffer_,
         material_params_buffer_, mat_count,
-        trans_indirect_draw_buffer_, trans_draw_count_buffer_);
+        trans_indirect_draw_buffer_, trans_draw_count_buffer_,
+        visibility_bit_buffer_,
+        indirect_draw_buffer_phase_a_,
+        draw_count_buffer_phase_a_);
 
     // ── DEBUG: validate merged staging data — write to file ──
     {
