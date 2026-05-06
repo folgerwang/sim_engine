@@ -541,6 +541,40 @@ std::string  initCompileGlobalShaders(
     }
     fs.close();
 
+    // Find the newest mtime among shared GLSL headers (anything ending in
+    // .glsl.h or .glsl) under the shader root.  glslc's #include directives
+    // are not tracked by the per-file mtime check below, so editing a shared
+    // header (e.g. global_definition.glsl.h) used to leave every dependent
+    // .spv stale until the corresponding .frag/.vert was also touched.  If
+    // ANY header is newer than the output SPV we rebuild — slightly
+    // pessimistic but only on the first run after a header edit.
+    std::filesystem::file_time_type newest_header_mtime{};
+    bool have_header_mtime = false;
+    {
+        std::error_code ec;
+        for (auto& entry : std::filesystem::recursive_directory_iterator(
+                 s_src_shader_path, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            const auto& p = entry.path();
+            const auto ext = p.extension().string();
+            // Match both single-extension ".glsl" files AND the doubled
+            // ".glsl.h" convention that this project uses for shared
+            // headers (e.g. global_definition.glsl.h).
+            const bool is_glsl_h =
+                p.string().size() >= 7 &&
+                p.string().compare(p.string().size() - 7, 7, ".glsl.h") == 0;
+            const bool is_glsl = ext == ".glsl";
+            if (!is_glsl_h && !is_glsl) continue;
+            auto t = std::filesystem::last_write_time(p, ec);
+            if (ec) continue;
+            if (!have_header_mtime || t > newest_header_mtime) {
+                newest_header_mtime = t;
+                have_header_mtime = true;
+            }
+        }
+    }
+
     std::istringstream buf_str(buffer);
     for (std::string line; std::getline(buf_str, line); ) {
         std::string input_name, output_name, params_str;
@@ -563,6 +597,15 @@ std::string  initCompileGlobalShaders(
             else if (
                 std::filesystem::last_write_time(input_name) >
                 std::filesystem::last_write_time(output_name)) {
+                shader_tobe_rebuilt = true;
+            }
+            // Header dependency fallback — any .glsl.h/.glsl edit
+            // invalidates every SPV.  Without this, struct layout
+            // changes in shared headers silently corrupt every shader
+            // that includes them but wasn't itself touched.
+            else if (have_header_mtime &&
+                     newest_header_mtime >
+                     std::filesystem::last_write_time(output_name)) {
                 shader_tobe_rebuilt = true;
             }
         }
