@@ -47,6 +47,12 @@
 namespace engine {
 namespace helper {
 
+// Flip to 1 to re-enable the per-mesh build/BVH summary lines that
+// otherwise print to stdout for every drawable in the scene.
+#ifndef CLUSTER_MESH_VERBOSE
+#  define CLUSTER_MESH_VERBOSE 0
+#endif
+
 namespace {
 
 // Pack a sorted (lo, hi) vertex-index pair into a single 64-bit key so we
@@ -217,6 +223,7 @@ void buildClusterBVH(ClusterMesh& cm, uint32_t leaf_threshold) {
     cm.cluster_bvh_build_time_ms =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
+#if CLUSTER_MESH_VERBOSE
     std::printf(
         "[CLUSTER] BVH: %u clusters -> %u nodes (%u leaves, depth=%u) in %.2f ms\n",
         static_cast<uint32_t>(cm.clusters.size()),
@@ -224,6 +231,7 @@ void buildClusterBVH(ClusterMesh& cm, uint32_t leaf_threshold) {
         cm.cluster_bvh_leaf_count,
         cm.cluster_bvh_depth,
         cm.cluster_bvh_build_time_ms);
+#endif
 }
 
 // ─── clusterRenderingEnabled() ──────────────────────────────────────────────
@@ -258,7 +266,9 @@ void buildClusterMesh(const Mesh& mesh,
     out.build_time_ms         = 0.0;
 
     if (!mesh.isValid() || mesh.getFaceCount() == 0) {
+#if CLUSTER_MESH_VERBOSE
         std::printf("[CLUSTER] skipped: empty or invalid mesh\n");
+#endif
         return;
     }
 
@@ -475,6 +485,7 @@ void buildClusterMesh(const Mesh& mesh,
     out.build_time_ms =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
+#if CLUSTER_MESH_VERBOSE
     std::printf(
         "[CLUSTER] built: %u tris -> %u clusters "
         "(min=%u max=%u avg=%.1f, cap=%u) in %.2f ms\n",
@@ -485,6 +496,7 @@ void buildClusterMesh(const Mesh& mesh,
         out.avg_tris_in_cluster,
         out.max_triangles_per_cluster_setting,
         out.build_time_ms);
+#endif
 
     // ── 5) cluster-level BVH ───────────────────────────────────────────────
     // Builds a binary tree over `out.clusters` for future hierarchical

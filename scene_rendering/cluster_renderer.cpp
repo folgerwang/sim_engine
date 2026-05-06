@@ -19,6 +19,15 @@ namespace er  = engine::renderer;
 namespace engine {
 namespace scene_rendering {
 
+// Flip to 1 to re-enable the diagnostic upload / finalize lines that
+// otherwise printed for every ClusterRenderer mesh upload + a few
+// per-frame fprintf'd lines.  Keep these silent in normal runs;
+// they're only useful when debugging the bindless cluster pipeline
+// at startup.
+#ifndef CLUSTER_RENDERER_VERBOSE
+#  define CLUSTER_RENDERER_VERBOSE 0
+#endif
+
 // ─── Per-source-vertex tangent computation ────────────────────────────────
 //
 // Lengyel-style accumulation: for each triangle, derive (T, B) from position
@@ -343,7 +352,9 @@ ClusterRenderer::ClusterRenderer(
         SET_FLAG_BIT(ImageAspect, COLOR_BIT),
         std::source_location::current());
 
+#if CLUSTER_RENDERER_VERBOSE
     std::printf("[CLUSTER_RENDERER] Initialized GPU cluster culling pipeline.\n");
+#endif
 }
 
 // ─── Upload mesh clusters (CPU staging only) ──────────────────────
@@ -376,9 +387,12 @@ void ClusterRenderer::uploadMeshClusters(
     const float max_scale = std::max({scale_x, scale_y, scale_z});
 
     // Diagnostic: save source data for first mesh uploaded (shown in ImGui).
-    // Always print the first 3 calls to stderr (which flushes immediately).
+    // The two fprintf summaries are guarded by CLUSTER_RENDERER_VERBOSE
+    // (default off); the bookkeeping that captures debug_first_*_bounds_
+    // for the ImGui inspector still runs unconditionally.
     if (uploaded_mesh_count_ < 3 && num_clusters > 0) {
         const auto& c0 = cluster_mesh.clusters[0];
+#if CLUSTER_RENDERER_VERBOSE
         fprintf(stderr,
             "[CLUSTER_UPLOAD #%u] mesh_idx=%u clusters=%u "
             "LOCAL center=(%.3f,%.3f,%.3f) r=%.3f "
@@ -395,6 +409,7 @@ void ClusterRenderer::uploadMeshClusters(
             model_transform[3][2], model_transform[3][3],
             c0.aabb_min.x, c0.aabb_min.y, c0.aabb_min.z,
             c0.aabb_max.x, c0.aabb_max.y, c0.aabb_max.z);
+#endif
 
         if (uploaded_mesh_count_ == 0) {
             debug_first_local_bounds_ = glm::vec4(

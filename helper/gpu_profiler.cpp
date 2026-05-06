@@ -25,8 +25,12 @@
 //  GPU_PROF_DEBUG    – 1 = verbose tracing to stderr + debugger output
 //  GPU_PROF_ASSERT   – light assertions that log instead of aborting
 // ---------------------------------------------------------------------------
+// Default to silent — the trace path emits per-frame messages from
+// collectResults / drawImGui / zoom handlers, which floods the console
+// once a build is up and stable.  Flip to 1 only when actively
+// debugging the profiler internals.
 #ifndef GPU_PROF_DEBUG
-#  define GPU_PROF_DEBUG 1
+#  define GPU_PROF_DEBUG 0
 #endif
 
 namespace engine {

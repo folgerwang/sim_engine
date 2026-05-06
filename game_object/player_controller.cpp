@@ -88,8 +88,21 @@ void PlayerController::update(
     desired_pos.x = resolved_xz.x;
     desired_pos.z = resolved_xz.y;
 
-    desired_pos.y =
-        getTerrainGroundHeight(glm::vec2(desired_pos.x, desired_pos.z));
+    // Only snap to terrain when the heightmap value is plausibly close
+    // to our current vertical level.  In bistro / static-glTF scenes the
+    // procedural terrain sits in a different coordinate system from the
+    // building geometry; an unconditional snap teleports the player
+    // tens of metres underground every frame (e.g. terrain reports
+    // y = -120 while the bistro floor is at y ≈ 0).  Skipping the snap
+    // when the heightmap is far from us keeps the spawned Y stable
+    // until the player walks onto real terrain.
+    {
+        float terrain_y = getTerrainGroundHeight(
+            glm::vec2(desired_pos.x, desired_pos.z));
+        if (std::fabs(terrain_y - desired_pos.y) < 5.0f) {
+            desired_pos.y = terrain_y;
+        }
+    }
 
     if (world && !world->empty()) {
         glm::vec3 contact_normal(0.0f);
@@ -102,9 +115,13 @@ void PlayerController::update(
                 break;
             }
         }
+        // Same guard for the post-collision floor clamp.
         float ground = getTerrainGroundHeight(
             glm::vec2(desired_pos.x, desired_pos.z));
-        if (desired_pos.y < ground) desired_pos.y = ground;
+        if (std::fabs(ground - desired_pos.y) < 5.0f &&
+            desired_pos.y < ground) {
+            desired_pos.y = ground;
+        }
     }
 
     position_ = desired_pos;
