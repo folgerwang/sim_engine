@@ -262,7 +262,16 @@ void main() {
     //                                     yet author either channel.
     out_albedo_ao      = vec4(albedo, 1.0);
     out_normal_rough   = vec4(octEncodeDir(N), 0.5, 0.0);
-    out_emissive_metal = vec4(0.0, 0.0, 0.0, 0.0);
+    // Slot 2 was emissive.rgb + metallic.a, but cluster materials don't
+    // author either yet — both default to 0 in the deferred resolve.
+    // Repurpose .rg for the octahedral-encoded GEOMETRIC normal so the
+    // resolve pass can distinguish NORMAL (perturbed by normal map)
+    // from GEOMETRIC_NORMAL in the debug visualisation.  Keep .b for
+    // future emissive intensity, .a for metallic.  A future material
+    // upgrade that wants emissive RGB will need a 4th GBuffer
+    // attachment; for now this is the cheapest place to land it.
+    vec2 oct_geom = octEncodeDir(N_geom);
+    out_emissive_metal = vec4(oct_geom.x, oct_geom.y, 0.0, 0.0);
 
     // Screen-space NDC velocity = curNDC.xy - prevNDC.xy.  Both clip
     // positions came from per-vertex matrix multiplies in the vertex

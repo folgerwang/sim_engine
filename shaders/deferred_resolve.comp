@@ -113,10 +113,19 @@ void main() {
     vec3  albedo    = albedo_ao.rgb;
     float ao        = albedo_ao.a;
     vec3  N         = octDecode(nr.xy);
+    // Geometric (un-perturbed) normal — encoded into em.xy by the GBuffer
+    // writer in cluster_bindless.frag.  See the comment there for why it
+    // was packed into the emissive slot's RG channels.  Used by the
+    // GEOMETRIC_NORMAL debug visualisation below; without it that mode
+    // would be identical to the NORMAL mode (the only normal in the
+    // GBuffer would be the perturbed one).
+    vec3  N_geom    = octDecode(em.xy);
     // (roughness in nr.z and metallic in em.a are reserved for the eventual
     // GGX path; the current resolve uses Blinn-Phong to match the legacy
     // forward output 1:1, so they're sampled but not yet consumed here.)
-    vec3  emissive  = em.rgb;
+    // em.b is reserved for emissive intensity once cluster materials
+    // start authoring it; for now treat emissive as zero.
+    vec3  emissive  = vec3(0.0);
 
     // Reconstruct world position from depth + inv_view_proj.
     vec4 ndc = vec4(uv * 2.0 - 1.0, z, 1.0);
@@ -154,7 +163,7 @@ void main() {
     } else if (dbg_mode == DEBUG_RENDER_MODE_NORMAL) {
         color = N * 0.5 + 0.5;
     } else if (dbg_mode == DEBUG_RENDER_MODE_GEOMETRIC_NORMAL) {
-        color = N * 0.5 + 0.5;   // geometric == perturbed at G-buffer level
+        color = N_geom * 0.5 + 0.5;
     } else if (dbg_mode == DEBUG_RENDER_MODE_DIFFUSE) {
         color = ambient + diffuse;
     } else if (dbg_mode == DEBUG_RENDER_MODE_SPECULAR) {
