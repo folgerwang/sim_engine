@@ -19,6 +19,29 @@ namespace er  = engine::renderer;
 namespace engine {
 namespace scene_rendering {
 
+// ─── Push-constant struct layout sanity checks ────────────────────────
+// The same ClusterCullPushConstants struct is consumed by both C++ (via
+// glsl::ClusterCullPushConstants from global_definition.glsl.h) and the
+// GLSL compute shader.  glslc + Vulkan std430 push-constant rules give
+// known offsets; if the C++ side ever drifts (e.g. someone removes a
+// pad uint, or glm changes default vec4 alignment), we want a build
+// failure rather than silent corruption — symptom is hard-to-diagnose
+// "diagnostics in Phase B's Hi-Z block don't fire even though Phase B
+// pushes cull_phase=2u".
+static_assert(offsetof(glsl::ClusterCullPushConstants, view_proj)         == 0,   "view_proj offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, camera_pos_pad)    == 64,  "camera_pos_pad offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, total_clusters)    == 80,  "total_clusters offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, total_bvh_nodes)   == 84,  "total_bvh_nodes offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, lod_error_threshold)==88,  "lod_error_threshold offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, use_bvh)           == 92,  "use_bvh offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, use_hiz_cull)      == 96,  "use_hiz_cull offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, cull_phase)        == 100, "cull_phase offset MISMATCH — std430 expects 100");
+static_assert(offsetof(glsl::ClusterCullPushConstants, pad0)              == 104, "pad0 offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, pad1)              == 108, "pad1 offset (must precede mat4 to push it to offset 112)");
+static_assert(offsetof(glsl::ClusterCullPushConstants, last_view_proj)    == 112, "last_view_proj offset (std430 mat4 alignment forces 16B-aligned start)");
+static_assert(offsetof(glsl::ClusterCullPushConstants, hiz_size_mips_pad) == 176, "hiz_size_mips_pad offset");
+static_assert(sizeof(glsl::ClusterCullPushConstants) == 192,                       "ClusterCullPushConstants total size");
+
 // Flip to 1 to re-enable the diagnostic upload / finalize lines that
 // otherwise printed for every ClusterRenderer mesh upload + a few
 // per-frame fprintf'd lines.  Keep these silent in normal runs;
@@ -147,7 +170,7 @@ std::shared_ptr<er::DescriptorSetLayout> createCullDescSetLayout(
     //              cull pass can reproject each cluster's bounding sphere
     //              through last_view_proj and reject clusters fully behind
     //              the previous frame's depth (Nanite-style occlusion).
-    //              When use_last_frame_depth_cull_ is off the shader skips
+    //              When use_hiz_occlusion_cull_ is off the shader skips
     //              the sample, so a dummy 1×1 white texture is fine — but
     //              the binding MUST be valid even then because Vulkan
     //              validates descriptor presence at dispatch time.
@@ -255,11 +278,20 @@ void writeCullDescriptors(
     // yet (e.g. very first frame) it should pass its dummy 1×1 white
     // texture and Hi-Z sample in the shader will read 1.0 (= far
     // plane) so no cluster is rejected.
+    //
+    // IMPORTANT: the Hi-Z pyramid stays in GENERAL layout for the
+    // entire frame (storage-image writes during build, sampler reads
+    // here in the cull compute, sampler reads in the deferred resolve
+    // for visualization).  The descriptor write must match — declaring
+    // SHADER_READ_ONLY_OPTIMAL when the image is actually GENERAL is
+    // a validation-layer warning AND in practice on NV produced
+    // undefined sampler results, so the test always read 1.0 and no
+    // cluster was ever rejected (toggle on/off was a no-op).
     if (hiz_sampler && hiz_view) {
         er::Helper::addOneTexture(writes, desc_set,
             er::DescriptorType::COMBINED_IMAGE_SAMPLER, 11,
             hiz_sampler, hiz_view,
-            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            er::ImageLayout::GENERAL);
     }
 
     device->updateDescriptorSets(writes);
@@ -1066,13 +1098,23 @@ void ClusterRenderer::setHiZTexture(
     // If the cull descriptor set hasn't been allocated yet (called before
     // finalizeUploads), the next writeCullDescriptors inside finalize will
     // pick up the stored handles.  Otherwise patch binding 11 in place.
+    //
+    // Layout MUST be GENERAL to match the Hi-Z pyramid's actual layout
+    // (storage-image writes during build keep it in GENERAL the whole
+    // frame; sampler reads tolerate GENERAL).  Declaring
+    // SHADER_READ_ONLY_OPTIMAL here used to silently break the cull
+    // dispatch on NV — the validation layer's complaint is non-fatal
+    // but the sampler reads come back as undefined data, and the
+    // diagnostic returns we put in the Hi-Z block never produced any
+    // visible cluster-count change because the dispatch ran in a
+    // degenerate state.
     if (cull_desc_set_ && sampler && view) {
         er::WriteDescriptorList writes;
         writes.reserve(1);
         er::Helper::addOneTexture(writes, cull_desc_set_,
             er::DescriptorType::COMBINED_IMAGE_SAMPLER, 11,
             sampler, view,
-            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            er::ImageLayout::GENERAL);
         device_->updateDescriptorSets(writes);
     }
 }
@@ -1333,7 +1375,7 @@ void ClusterRenderer::cull(
         // through end-to-end so wiring up the actual sampler later is
         // a shader-only change.
         const bool effective_hiz_cull =
-            hiz_cull_override.value_or(use_last_frame_depth_cull_);
+            hiz_cull_override.value_or(use_hiz_occlusion_cull_);
         push.use_hiz_cull = effective_hiz_cull ? 1u : 0u;
         push.pad0 = 0u;
         push.last_view_proj = last_view_proj;
@@ -1518,17 +1560,13 @@ void ClusterRenderer::cullPhaseB(
     push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
     push.total_clusters = total_clusters_all_meshes_;
     push.use_bvh = debug_distance_cull_ ? 3u : 0u;
-    // Hi-Z is the whole point of Phase B in principle, but the
-    // current shader-side test (4 mip-0 taps + 0.05 NDC centre-margin)
-    // can over-occlude — clusters whose centre dips behind a
-    // foreground edge get rejected even when the cluster's near side
-    // is still visible.  That produces 1-frame flicker (drop → next
-    // frame Hi-Z lacks the depth → drawn again → repeat).  Until the
-    // test is tightened, gate Hi-Z on the menu toggle so the default
-    // two-pass behaviour is "frustum + backface only" (stable, no
-    // occlusion benefit yet).  Flip use_last_frame_depth_cull_ in the
-    // cluster debug menu to evaluate the current Hi-Z heuristic.
-    push.use_hiz_cull = use_last_frame_depth_cull_ ? 1u : 0u;
+    // Hi-Z occlusion test is gated on the menu toggle so the default
+    // two-pass behaviour is "frustum + backface only" (stable).  Flip
+    // use_hiz_occlusion_cull_ in the cluster debug menu to evaluate the
+    // current Hi-Z heuristic.  The pyramid is built from THIS frame's
+    // Phase A depth, so the shader's reprojection uses CURRENT
+    // view_proj — no last-frame matrix needed.
+    push.use_hiz_cull = use_hiz_occlusion_cull_ ? 1u : 0u;
     push.cull_phase = 2u;
     // Phase B reprojects against the CURRENT frame's view-proj because
     // the Hi-Z pyramid was built from THIS frame's Phase A depth (not

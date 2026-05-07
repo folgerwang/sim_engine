@@ -1390,14 +1390,14 @@ bool Menu::draw(
             if (ImGui::Checkbox("Cluster Bound Box Draw", &bbox_draw)) {
                 cluster_renderer_->getDebugDrawBBox() = bbox_draw;
             }
-            // Hi-Z occlusion-cull toggle: when on, the cluster cull
-            // dispatch reprojects the last frame's depth pyramid and
-            // rejects clusters whose bounding sphere is fully occluded.
+            // Hi-Z occlusion-cull toggle: when on, Phase B samples the
+            // Hi-Z pyramid (built from this frame's Phase A depth) and
+            // rejects clusters whose bounding-sphere nearest point is
+            // BEHIND every visible surface in its screen footprint.
             // Off = plain frustum + backface cone cull (the default).
-            bool hiz_cull = cluster_renderer_->getUseLastFrameDepthCull();
-            if (ImGui::Checkbox("Use Last-Frame Depth (Hi-Z) Cull",
-                                &hiz_cull)) {
-                cluster_renderer_->getUseLastFrameDepthCull() = hiz_cull;
+            bool hiz_cull = cluster_renderer_->getUseHiZOcclusionCull();
+            if (ImGui::Checkbox("Hi-Z Occlusion Cull", &hiz_cull)) {
+                cluster_renderer_->getUseHiZOcclusionCull() = hiz_cull;
             }
             ImGui::Separator();
             const auto& vp = cluster_renderer_->getDebugVP();

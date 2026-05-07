@@ -204,15 +204,15 @@ class ClusterRenderer {
     bool cpu_cull_mode_ = false;          // true = CPU frustum cull, false = GPU compute cull
     bool debug_draw_bbox_ = false;        // draw cluster bounding boxes
     bool debug_distance_cull_ = false;    // debug: set use_bvh=3 for distance-based cull
-    // Toggle: reproject last-frame depth (Hi-Z pyramid) for cluster
-    // occlusion culling.  When true, the cull pass receives the
-    // ClusterCullPushConstants.use_hiz_cull = 1 flag and (once the
-    // shader-side sampler is wired up) will reject clusters whose
-    // bounding sphere is fully behind the previous frame's Hi-Z.
-    // When false the pass falls back to plain frustum + cone culling.
-    // Plumbed through end-to-end (menu → renderer → push constant →
-    // shader) so toggling it at runtime is enough; no rebuild needed.
-    bool use_last_frame_depth_cull_ = false;
+    // Toggle: Hi-Z occlusion culling for the cluster path.  When on,
+    // Phase B's cull dispatch samples the Hi-Z pyramid (built from
+    // Phase A's just-written depth) and rejects clusters whose
+    // bounding-sphere nearest point is BEHIND every visible surface in
+    // its screen footprint.  When off the cull pass falls back to
+    // plain frustum + cone culling.  Plumbed end-to-end (menu →
+    // renderer → push constant → shader) so toggling at runtime is
+    // enough; no rebuild needed.
+    bool use_hiz_occlusion_cull_ = false;
 
     // Hi-Z pyramid handles supplied via setHiZTexture().  view + sampler
     // get bound at descriptor binding 11 of the cull set; size + mip
@@ -277,12 +277,12 @@ public:
         const renderer::PipelineRenderbufferFormats& gbuffer_format);
 
     // Dispatch cluster culling compute shader (single dispatch for all meshes).
-    // last_view_proj is the previous frame's view-projection matrix —
-    // used to reproject cluster bounds into yesterday's screen space for
-    // the Hi-Z occlusion test.  Pass view_proj on the first frame (no
-    // history yet); the shader gates the test on use_hiz_cull anyway.
+    // last_view_proj is kept in the signature for the legacy single-pass
+    // path.  In the two-pass deferred path it's unused — Phase B
+    // reprojects against the CURRENT view_proj because the Hi-Z pyramid
+    // was built from this frame's Phase A depth, not last frame's.
     // hiz_cull_override:
-    //   nullopt → fall back to the menu toggle use_last_frame_depth_cull_
+    //   nullopt → fall back to the menu toggle use_hiz_occlusion_cull_
     //   false   → force-skip the Hi-Z test (probe / cubemap face passes
     //             that have no business sampling the main camera's pyramid)
     //   true    → force-enable (currently unused; reserved for tooling)
@@ -455,7 +455,7 @@ public:
     bool isCpuCullMode() const { return cpu_cull_mode_; }
     bool& getDebugDrawBBox() { return debug_draw_bbox_; }
     bool& getDebugDistanceCull() { return debug_distance_cull_; }
-    bool& getUseLastFrameDepthCull() { return use_last_frame_depth_cull_; }
+    bool& getUseHiZOcclusionCull() { return use_hiz_occlusion_cull_; }
     const std::vector<glsl::ClusterCullInfo>& getDebugSampleClusters() const {
         return debug_sample_clusters_;
     }

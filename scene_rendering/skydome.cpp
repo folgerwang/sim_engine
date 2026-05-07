@@ -1000,6 +1000,34 @@ void Skydome::drawEnvmap(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glm::mat4& inv_view_proj_relative) {
 
+    // ── ONE-SHOT DIAGNOSTIC ───────────────────────────────────────────────
+    // Print on the first call so we can tell whether drawEnvmap is being
+    // entered at all, and capture the pipeline / desc-set / push values
+    // — uniform sky colour without any debug-mode response usually means
+    // either this isn't called (printf will be missing in the console),
+    // OR the pipeline / desc set is null (printf will show 0x0000... ),
+    // OR the push matrix is degenerate (the printed first-row magnitude
+    // will be ≈0).  Remove once diagnosed.
+    {
+        static bool s_first = true;
+        if (s_first) {
+            s_first = false;
+            const float row0_mag =
+                std::sqrt(inv_view_proj_relative[0][0] * inv_view_proj_relative[0][0] +
+                          inv_view_proj_relative[1][0] * inv_view_proj_relative[1][0] +
+                          inv_view_proj_relative[2][0] * inv_view_proj_relative[2][0] +
+                          inv_view_proj_relative[3][0] * inv_view_proj_relative[3][0]);
+            std::fprintf(stderr,
+                "[SKYDOME] drawEnvmap first call: pipeline=%p desc_set=%p "
+                "debug_mode=%d row0|=%g\n",
+                (void*)skybox_envmap_pipeline_.get(),
+                (void*)skybox_envmap_desc_set_.get(),
+                debug_sky_mode_,
+                row0_mag);
+            std::fflush(stderr);
+        }
+    }
+
     glsl::SkyboxEnvmapParams params = {};
     params.inv_view_proj_relative = inv_view_proj_relative;
     params.debug_mode             = debug_sky_mode_;

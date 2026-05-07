@@ -604,10 +604,11 @@ struct ClusterCullPushConstants {
     uint    total_bvh_nodes;
     float   lod_error_threshold; // screen-space error threshold for LOD
     uint    use_bvh;             // 0 = flat per-cluster, 1 = BVH traversal
-    // 1 = reproject last-frame Hi-Z pyramid and reject clusters whose
-    // bounding sphere is fully occluded.  0 = skip the Hi-Z test (plain
-    // frustum + cone cull only).  Toggled at runtime from the cluster
-    // debug menu via ClusterRenderer::use_last_frame_depth_cull_.
+    // 1 = sample the Hi-Z pyramid (built this frame from Phase A's depth)
+    // and reject clusters whose bounding-sphere nearest point is behind
+    // every visible surface in its footprint.  0 = skip the Hi-Z test
+    // (plain frustum + cone cull only).  Toggled at runtime from the
+    // cluster debug menu via ClusterRenderer::use_hiz_occlusion_cull_.
     uint    use_hiz_cull;
     // Two-pass occlusion phase selector:
     //   0 = single-pass legacy cull (forward path).
@@ -621,12 +622,25 @@ struct ClusterCullPushConstants {
     // of A's emit set and B's emit set is the canonical "visible this
     // frame" signal, with no leak from the previous frame's bits.
     uint    cull_phase;
+    // Two explicit pad uints before the next mat4.  std430 requires
+    // mat4 to start on a 16-byte boundary; without these uints, GLSL
+    // would insert 8 bytes of implicit padding (advancing
+    // last_view_proj from offset 108 to 112) — but glm::mat4 in this
+    // codebase has alignas 4 (no GLM_FORCE_DEFAULT_ALIGNED_GENTYPES),
+    // so the C++ struct would put last_view_proj at 108.  Result: a
+    // 4-byte size mismatch that pushes 188 bytes from CPU into a
+    // 192-byte std430 layout — drivers handle this inconsistently and
+    // on NV the entire push-constant view can corrupt, making
+    // diagnostics like `cull_phase != 1u` evaluate the wrong way.
+    // Two explicit pads bring last_view_proj to offset 112 in BOTH
+    // layouts, eliminating the mismatch.
     uint    pad0;
-    // Last frame's view-projection matrix.  When use_hiz_cull is set we
-    // reproject each cluster's bounding sphere through this matrix to
-    // figure out where it sat on screen YESTERDAY, then sample the Hi-Z
-    // pyramid (built from that frame's depth) at that screen footprint.
-    // Set to view_proj for the first frame (no history yet).
+    uint    pad1;
+    // Reprojection matrix for the Hi-Z sample.  Named last_view_proj
+    // for historical reasons — in the two-pass deferred path it's set
+    // to the CURRENT frame's view_proj because the pyramid was built
+    // from this frame's Phase A depth.  Legacy single-pass path passes
+    // last frame's view_proj here to reproject against last-frame depth.
     mat4    last_view_proj;
     // x, y = Hi-Z mip 0 size in pixels (next-pow2 of swap-chain size).
     // z   = total mip count (so the shader can clamp the chosen mip).
