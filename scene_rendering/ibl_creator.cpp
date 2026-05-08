@@ -109,12 +109,21 @@ er::WriteDescriptorList addIblComputeTextures(
     er::WriteDescriptorList descriptor_writes;
     descriptor_writes.reserve(2);
 
+    // ibl_smooth.comp binds both src_img and dst_img as `imageCube`
+    // (STORAGE_IMAGE).  Vulkan ignores VkDescriptorImageInfo::sampler for
+    // STORAGE_IMAGE descriptors, so pass nullptr here to match the
+    // convention used elsewhere in the codebase
+    // (e.g. application.cpp:505/850, conemap_test.cpp:248).  The
+    // texture_sampler parameter is retained on the function signature in
+    // case a future caller wants to repurpose this helper for a
+    // SAMPLED_IMAGE/COMBINED_IMAGE_SAMPLER variant.
+    (void)texture_sampler;
     er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
         er::DescriptorType::STORAGE_IMAGE,
         SRC_TEX_INDEX,
-        texture_sampler,
+        nullptr,
         src_tex.view,
         er::ImageLayout::GENERAL);
 
@@ -123,7 +132,7 @@ er::WriteDescriptorList addIblComputeTextures(
         description_set,
         er::DescriptorType::STORAGE_IMAGE,
         DST_TEX_INDEX,
-        texture_sampler,
+        nullptr,
         dst_tex.view,
         er::ImageLayout::GENERAL);
 

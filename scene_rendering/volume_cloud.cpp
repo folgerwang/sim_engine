@@ -134,7 +134,10 @@ er::WriteDescriptorList addCloudFogTextures(
         description_set,
         er::DescriptorType::STORAGE_IMAGE,
         DST_FOG_CLOUD_INDEX,
-        texture_sampler,
+        nullptr,        // STORAGE_IMAGE: sampler is ignored by Vulkan; pass
+                        // nullptr to match the convention used elsewhere in
+                        // the codebase (e.g. volume_cloud.cpp:37,
+                        // application.cpp:505/850, conemap_test.cpp:248).
         cloud_fog_tex,
         er::ImageLayout::GENERAL);
 
