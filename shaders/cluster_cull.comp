@@ -7,7 +7,10 @@
 //
 // For each cluster, tests:
 //   1. Frustum culling (sphere vs 6 frustum planes)
-//   2. Backface cone culling (normal cone vs view direction)
+//   2. Backface cone culling (normal cone vs view direction) — skipped
+//      for double-sided / translucent materials
+//   3. Hi-Z occlusion culling (8-corner AABB + 4-tap, Phase B / single-pass
+//      only, skipped for translucent + alpha-masked materials)
 //
 // Visible clusters are appended to the output indirect draw buffer
 // via atomicAdd on a draw count. The indirect draw buffer is then
@@ -53,9 +56,6 @@ layout(std430, set = 0, binding = 5) readonly buffer MaterialParamsBuffer {
 };
 
 // Set 0, binding 6: output indirect draw commands for TRANSLUCENT clusters.
-// Drawn in a second pass with a separate pipeline that has alpha blending
-// enabled (and depth-write off so translucent surfaces don't occlude one
-// another in the depth buffer).
 layout(std430, set = 0, binding = 6) writeonly buffer TransIndirectDrawBuffer {
     uint trans_indirect_draws[];
 };
@@ -65,18 +65,12 @@ layout(std430, set = 0, binding = 7) buffer TransDrawCountBuffer {
     uint trans_draw_count;
 };
 
-// Set 0, binding 8: per-cluster visibility bit set (one bit per cluster,
-// packed into uints — index = cluster_idx >> 5, mask = 1u << (cluster_idx & 31)).
-// Phase A reads + atomicOr writes (so its survivors carry forward).
-// Phase B clears (caller does vkCmdFillBuffer between A and B) then
-// atomicOr writes for every cluster that survives all three tests.
-// Single-pass mode (cull_phase==0) ignores this binding.
+// Set 0, binding 8: per-cluster visibility bit set.
 layout(std430, set = 0, binding = 8) buffer VisibilityBitBuffer {
     uint visibility_bits[];
 };
 
-// Set 0, binding 9: Phase A indirect draw output.  Same 5-uint-per-command
-// packing as binding 2.  Untouched by Phase B and the single-pass mode.
+// Set 0, binding 9: Phase A indirect draw output.
 layout(std430, set = 0, binding = 9) writeonly buffer IndirectDrawBufferPhaseA {
     uint indirect_draws_phase_a[];
 };
@@ -87,50 +81,37 @@ layout(std430, set = 0, binding = 10) buffer DrawCountBufferPhaseA {
 };
 
 // Set 0, binding 11: Hi-Z pyramid (R32F max-Z, full mip chain).
-// Built each frame from last frame's depth by hiz_build.comp.  Sampled
-// here when params.use_hiz_cull == 1 to reject clusters whose bounding
-// sphere is fully behind the previous frame's depth at their screen
-// footprint.  CLAMP_TO_EDGE sampler so out-of-screen samples don't
-// wrap around and falsely occlude.  textureLod with explicit mip is
-// used (no mip-mapped filtering — we pick the mip ourselves).
+// Built each frame from THIS frame's Phase A depth by hiz_build.comp.
+// Sampled here when params.use_hiz_cull == 1 to reject clusters whose
+// nearest point is fully behind every visible surface in their screen
+// footprint.  CLAMP_TO_EDGE sampler.  textureLod with explicit mip.
 layout(set = 0, binding = 11) uniform sampler2D hiz_pyramid;
 
 layout(local_size_x = 64, local_size_y = 1) in;
 
 // ─── Shared Frustum Planes ──────────────────────────────────────
-// Extracted once per workgroup by thread 0, then shared across all
-// 64 threads. Avoids 64× redundant plane extraction per group.
 shared vec4 s_frustum_planes[6];
 
-// Extract 6 frustum planes from the view-projection matrix.
-// Each plane is vec4(normal.xyz, distance) with inward-facing normal.
 void extractFrustumPlanes(mat4 vp) {
-    // Left
     s_frustum_planes[0] = vec4(vp[0][3] + vp[0][0],
                                 vp[1][3] + vp[1][0],
                                 vp[2][3] + vp[2][0],
                                 vp[3][3] + vp[3][0]);
-    // Right
     s_frustum_planes[1] = vec4(vp[0][3] - vp[0][0],
                                 vp[1][3] - vp[1][0],
                                 vp[2][3] - vp[2][0],
                                 vp[3][3] - vp[3][0]);
     // Bottom — Gribb-Hartmann row3+row1, but proj[1].y is negated for Vulkan
-    // Y-flip, which swaps the meaning of top and bottom planes. So bottom
-    // becomes row3 - row1 and top becomes row3 + row1.
+    // Y-flip, which swaps the meaning of top and bottom planes.
     s_frustum_planes[2] = vec4(vp[0][3] - vp[0][1],
                                 vp[1][3] - vp[1][1],
                                 vp[2][3] - vp[2][1],
                                 vp[3][3] - vp[3][1]);
-    // Top (see note above)
     s_frustum_planes[3] = vec4(vp[0][3] + vp[0][1],
                                 vp[1][3] + vp[1][1],
                                 vp[2][3] + vp[2][1],
                                 vp[3][3] + vp[3][1]);
-    // Near — Vulkan depth is Z∈[0,1] (GLM_FORCE_DEPTH_ZERO_TO_ONE), so the
-    // near plane is Z_clip >= 0, which is just row2 of the VP matrix.
-    // The GL formula (row3 + row2) is wrong here and lets behind-near-plane
-    // clusters through, causing the vertex-stretching artefacts.
+    // Near — Vulkan depth Z∈[0,1], so near plane is row2 of VP.
     s_frustum_planes[4] = vec4(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
     // Far
     s_frustum_planes[5] = vec4(vp[0][3] - vp[0][2],
@@ -138,7 +119,6 @@ void extractFrustumPlanes(mat4 vp) {
                                 vp[2][3] - vp[2][2],
                                 vp[3][3] - vp[3][2]);
 
-    // Normalize planes
     for (int i = 0; i < 6; ++i) {
         float len = length(s_frustum_planes[i].xyz);
         if (len > 0.0001) {
@@ -147,46 +127,29 @@ void extractFrustumPlanes(mat4 vp) {
     }
 }
 
-// ─── Sphere vs Frustum (uses shared planes) ────────────────────
 bool sphereInFrustum(vec3 center, float radius) {
     for (int i = 0; i < 6; ++i) {
         float d = dot(s_frustum_planes[i].xyz, center) + s_frustum_planes[i].w;
         if (d < -radius) {
-            return false;  // fully outside this plane
+            return false;
         }
     }
     return true;
 }
 
 // ─── Backface Cone Cull ─────────────────────────────────────────
-// If every triangle in the cluster faces away from the camera we
-// can skip the cluster.
-//
 // cone_axis   = area-weighted average face normal (world-space, unit)
-// cone_cutoff = sin(θ_max), where θ_max is the maximum angle between
-//               the cone axis and any face normal in the cluster.
-//               (NOT cos — see cluster_mesh.cpp for derivation.)
-//
-// Derivation: let φ = angle between view_dir (cam→cluster) and cone_axis.
-//   Every face normal n satisfies dot(n, cone_axis) ≥ cos(θ_max).
-//   Minimum dot(n, view_dir) over all such n = cos(φ + θ_max).
-//   All-backfacing ↔ cos(φ + θ_max) > 0 ↔ φ + θ_max < π/2
-//                 ↔ cos(φ) > sin(θ_max) ↔ dot(view_dir, cone_axis) > sin(θ_max).
-//   So the correct threshold is sin(θ_max) = cone_cutoff as stored.
-//
-// cone_cutoff < 0 is the "never cull" sentinel (cone spans > hemisphere).
+// cone_cutoff = sin(θ_max).  Negative = "never cull" sentinel.
 bool isBackfacing(vec3 cluster_center, vec3 cone_axis, float cone_cutoff,
                   vec3 camera_pos) {
-    if (cone_cutoff < 0.0) return false;  // uncullable cluster
-
-    vec3 view_dir = normalize(cluster_center - camera_pos);  // cam → cluster
-    return dot(view_dir, cone_axis) >= cone_cutoff;          // all backfacing?
+    if (cone_cutoff < 0.0) return false;
+    vec3 view_dir = normalize(cluster_center - camera_pos);
+    return dot(view_dir, cone_axis) >= cone_cutoff;
 }
 
 // ─── Main ────────────────────────────────────────────────────────
 
 void main() {
-    // Thread 0 in each workgroup extracts frustum planes into shared memory.
     if (gl_LocalInvocationID.x == 0u) {
         extractFrustumPlanes(params.view_proj);
     }
@@ -197,13 +160,8 @@ void main() {
         return;
     }
 
-    // (top-level diagnostic removed — it confirmed push-constant
-    // plumbing works.  See Hi-Z block diagnostic below.)
-
     // Phase A entry filter: only consider clusters whose visibility bit
-    // is set (= they emitted a draw last frame).  Anything not visible
-    // last frame is deferred to Phase B, which will catch it via the
-    // Hi-Z occlusion test against Phase A's freshly-rendered depth.
+    // is set (= they emitted a draw last frame).
     if (params.cull_phase == 1u) {
         uint word = visibility_bits[cluster_idx >> 5u];
         uint mask = 1u << (cluster_idx & 31u);
@@ -214,141 +172,181 @@ void main() {
     vec3 center = cull.bounds_sphere.xyz;
     float radius = cull.bounds_sphere.w;
 
-    // Debug modes via use_bvh push constant:
-    //   0 = normal frustum + backface culling
-    //   2 = force cull every other cluster (pipeline test)
-    //   3 = distance-based cull (data validation test)
+    // Hoisted material flags — used by backface skip + Hi-Z gates
+    // below, and by the emit phase at the end.  One SSBO read per
+    // cluster.
+    ClusterDrawInfo draw          = cluster_draw_infos[cluster_idx];
+    uint   mat_flags_early        = material_params[draw.material_idx].flags;
+    float  mat_alpha_factor_early = material_params[draw.material_idx].base_color_factor.a;
+    bool   is_alpha_masked        = (mat_flags_early & BINDLESS_MAT_ALPHA_MASK)  != 0;
+    bool   is_double_sided        = (mat_flags_early & BINDLESS_MAT_DOUBLE_SIDED) != 0;
+    // is_translucent: explicit AlphaMode::Blend flag (set by the
+    // material upload at cluster_renderer.cpp:561) OR a defensive
+    // alpha-factor heuristic.  Glass meshes that ship as
+    // AlphaMode::Mask or AlphaMode::Opaque with low base_color_factor.a
+    // (a common asset bug, especially in scenes where glass was
+    // authored as alpha-cutout for legacy reasons) wouldn't get the
+    // explicit flag and would otherwise contribute their shallow
+    // depth to Phase A's pre-pass — falsely occluding everything
+    // BEHIND the glass at Hi-Z time.  Treating sub-1.0 alpha as
+    // translucent for Hi-Z purposes catches that without needing the
+    // asset to be re-tagged.
+    bool   is_translucent =
+        (mat_flags_early & BINDLESS_MAT_TRANSLUCENT) != 0 ||
+        mat_alpha_factor_early < 0.9;
+    // Skip backface cone cull for double-sided / translucent: they're
+    // expected to be visible from BOTH cone hemispheres.
+    bool skip_backface_cull = is_translucent || is_double_sided;
+    // Skip Hi-Z contribution (Phase A emit) AND Hi-Z occlusion test for
+    // translucent clusters only:
+    //   • Translucents don't write depth in the OIT pass — they aren't
+    //     Hi-Z occluders, and shouldn't be tested against the pyramid.
+    //
+    // Alpha-masked materials DO contribute legitimate occluder depth
+    // (per-fragment discards leave the cleared depth value 1.0 in tiles
+    // that contain discarded pixels; the max-Z reduction in hiz_build.comp
+    // picks 1.0 for those tiles, which causes the pyramid_max_z < 0.99999
+    // sky-skip to correctly NOT reject anything in their footprint).
+    // Excluding them from Phase A's pre-pass strips out a huge chunk of
+    // the valid occluder set — exactly the regression that turned Hi-Z
+    // into a no-op in earlier revisions of this shader.
+    bool skip_hiz_contribution = is_translucent;
+
+    // Debug modes via use_bvh push constant.
     if (params.use_bvh == 2u) {
         if ((cluster_idx & 1u) != 0u) return;
     } else if (params.use_bvh == 3u) {
-        // Simple distance cull: cull if > 50 units from camera.
-        // Tests that cluster positions and camera_pos are in the same space.
         float dist = distance(center, params.camera_pos_pad.xyz);
         if (dist > 50.0) return;
     } else {
-        // 1. Frustum cull (sphere test against shared planes)
+        // 1. Frustum cull
         if (!sphereInFrustum(center, radius)) {
-            return;  // culled by frustum
+            return;
         }
 
-        // 2. Backface cone cull
-        if (isBackfacing(center, cull.cone_axis_cutoff.xyz,
+        // 2. Backface cone cull (skipped for double-sided / translucent)
+        if (!skip_backface_cull &&
+            isBackfacing(center, cull.cone_axis_cutoff.xyz,
                          cull.cone_axis_cutoff.w,
                          params.camera_pos_pad.xyz)) {
-            return;  // all triangles face away
+            return;
         }
 
-        // 3. Hi-Z occlusion cull (4-tap at NDC-AABB corners).
+        // 3. Hi-Z occlusion test (8-corner AABB + 4-tap variant).
         //
-        // Gate `cull_phase != 1u` makes Phase A skip Hi-Z entirely —
-        // prev-visible clusters always render so they can re-establish
-        // the depth Phase B will then test against.  Phase B
-        // (cull_phase=2) and the legacy single-pass cull (cull_phase=0)
-        // both honour use_hiz_cull.
+        // Project the 8 corners of the bounding-sphere's enclosing
+        // cube into NDC, take the per-axis min/max for a conservative
+        // screen-space AABB plus the cluster's nearest NDC z (smallest
+        // z = closest, since Vulkan depth is [0,1]).  Sample the
+        // pyramid at the AABB's 4 corners.
         //
-        // Earlier this compound check appeared broken — it suppressed
-        // Hi-Z firing even with use_hiz_cull=1 — but the root cause
-        // was a 4-byte push-constant struct mismatch (glm::mat4 has
-        // alignas 4 in this build vs std430's 16).  After fixing the
-        // struct layout (extra pad uint before last_view_proj), the
-        // gate works correctly.  See static_asserts in
-        // cluster_renderer.cpp.
-        if (params.use_hiz_cull == 1u && params.cull_phase != 1u) {
-            // ── Hi-Z occlusion test (4-tap AABB-corner variant) ─────────
-            // Why 4-tap: the previous single-tap-with-coarse-mip variant
-            // failed in practice because its mip pick (ceil(log2(2*r_px)))
-            // produced a texel WIDER than the cluster's screen footprint
-            // for most clusters, and `max` reduction over that wider
-            // texel pulled in adjacent sky pixels (depth = 1.0 from
-            // clear), turning pyramid_max_z into 1.0 and making the
-            // `< 0.99999` gate skip every cluster.
-            //
-            // The 4-tap variant samples at the four corners of the
-            // cluster's NDC-AABB at the FINEST mip where 2 texels span
-            // the diameter (ceil(log2(r_px))).  Sky pollution at the
-            // cluster silhouette still pushes max to 1.0 in some
-            // corners — but that's the CORRECT conservative behaviour:
-            // if any corner reads sky we shouldn't reject, the cluster
-            // might genuinely be visible there.  Clusters fully behind
-            // other geometry will have all 4 corners hit non-sky
-            // depth and the comparison will fire.
-            vec4 clip = params.last_view_proj * vec4(center, 1.0);
-            if (clip.w > radius * 1.01) {
-                vec3 ndc = clip.xyz / clip.w;
-                bool on_screen =
-                    abs(ndc.x) <= 1.0 && abs(ndc.y) <= 1.0 &&
-                    ndc.z >= 0.0 && ndc.z <= 1.0;
-                if (on_screen) {
-                    vec2 uv = ndc.xy * 0.5 + 0.5;
+        // Skipped for:
+        //   • Phase A (cull_phase == 1)
+        //   • Translucent + alpha-masked clusters
+        //   • Sub-pixel / thin-axis AABB
+        //   • Off-screen AABB (clamping the taps would collapse them)
+        //   • Cluster spanning the near plane
+        //
+        // last_view_proj note: in two-pass mode the host populates this
+        // with the CURRENT frame's view_proj (Hi-Z built from THIS
+        // frame's Phase A depth → query reprojects with current VP).
+        if (params.use_hiz_cull == 1u &&
+            params.cull_phase != 1u &&
+            !skip_hiz_contribution) {
+            vec2  ndc_min  = vec2(  1.0);
+            vec2  ndc_max  = vec2( -1.0);
+            float ndc_z_near = 1.0;
+            bool  corners_valid = true;
+            for (int i = 0; i < 8; ++i) {
+                vec3 c_world = center + radius * vec3(
+                    ((i & 1) != 0) ?  1.0 : -1.0,
+                    ((i & 2) != 0) ?  1.0 : -1.0,
+                    ((i & 4) != 0) ?  1.0 : -1.0);
+                vec4 c_clip = params.last_view_proj * vec4(c_world, 1.0);
+                if (c_clip.w <= 1e-4) { corners_valid = false; break; }
+                vec3 c_ndc = c_clip.xyz / c_clip.w;
+                ndc_min    = min(ndc_min, c_ndc.xy);
+                ndc_max    = max(ndc_max, c_ndc.xy);
+                ndc_z_near = min(ndc_z_near, c_ndc.z);
+            }
 
-                    // Project tangent point to estimate cluster's NDC
-                    // radius.  Same approach as before — exact, no
-                    // FOV-based guesswork.
-                    vec3 cam_pos = params.camera_pos_pad.xyz;
-                    vec3 view_dir = normalize(center - cam_pos);
-                    vec3 up_ref = abs(view_dir.y) < 0.95
-                        ? vec3(0.0, 1.0, 0.0)
-                        : vec3(1.0, 0.0, 0.0);
-                    vec3 tangent = normalize(cross(up_ref, view_dir));
+            if (corners_valid) {
+                vec2 uv_min = ndc_min * 0.5 + 0.5;
+                vec2 uv_max = ndc_max * 0.5 + 0.5;
 
-                    vec4 clip_t = params.last_view_proj *
-                        vec4(center + tangent * radius, 1.0);
-                    float r_ndc = 0.05;
-                    if (clip_t.w > 0.001) {
-                        vec2 ndc_t = clip_t.xy / clip_t.w;
-                        r_ndc = max(0.001, length(ndc_t - ndc.xy));
-                    }
-                    float r_px = r_ndc * params.hiz_size_mips_pad.x;
+                // Clip the screen-space AABB to the viewport.  Most
+                // clusters partially extend outside; clipping (rather
+                // than skip-if-not-fully-inside) keeps Hi-Z firing for
+                // them.  The four taps land on the visible portion;
+                // the existing pyramid_max_z < 0.99999 sky-skip handles
+                // the case where part of the visible portion reads
+                // cleared depth.  Skip only if the AABB is ENTIRELY
+                // off-screen (frustum cull should already catch it,
+                // but defensive).
+                vec2 uv_clip_min = max(uv_min, vec2(0.0));
+                vec2 uv_clip_max = min(uv_max, vec2(1.0));
+                bool any_on_screen =
+                    uv_clip_max.x > uv_clip_min.x &&
+                    uv_clip_max.y > uv_clip_min.y;
+                // Skip if the cluster is entirely behind the near
+                // plane (ndc_z_near > 1 means it's past far plane,
+                // which is fine for the test — cluster's nearest
+                // point can be past the visible far depth without us
+                // rejecting; the test naturally evaluates false then).
+                // We DO want to skip when ndc_z_near < 0 (cluster
+                // straddles near plane) — the math is meaningless
+                // there because the projection puts the closest part
+                // behind the camera.
+                bool depth_valid = ndc_z_near >= 0.0;
 
-                    // Mip pick: smallest mip where TWO texels span the
-                    // cluster diameter (= 2*r_px mip-0 pixels).  Texel
-                    // size at mip m = 2^m mip-0 pixels.  Want
-                    // 2*2^m >= 2*r_px → m >= log2(r_px).
-                    // 4-tap at AABB corners gives effective sample
-                    // footprint of 2 texels in each axis, matching the
-                    // cluster diameter tightly without overshoot.
-                    float mip_f = ceil(log2(max(r_px, 1.0)));
-                    mip_f = clamp(mip_f, 0.0,
-                                  params.hiz_size_mips_pad.z - 1.0);
+                if (any_on_screen && depth_valid) {
+                    vec2  aabb_uv_size = uv_clip_max - uv_clip_min;
+                    vec2  aabb_px      = aabb_uv_size *
+                                          params.hiz_size_mips_pad.xy;
+                    float min_dim_px   = min(aabb_px.x, aabb_px.y);
+                    float max_dim_px   = max(aabb_px.x, aabb_px.y);
 
-                    // 4 taps at the corners of the cluster's NDC-AABB.
-                    // r_uv = r_ndc * 0.5 because UV [0,1] is the
-                    // half-extent of NDC [-1,1].
-                    float r_uv = r_ndc * 0.5;
-                    vec2 uv0 = clamp(uv + vec2(-r_uv, -r_uv), 0.0, 1.0);
-                    vec2 uv1 = clamp(uv + vec2(-r_uv,  r_uv), 0.0, 1.0);
-                    vec2 uv2 = clamp(uv + vec2( r_uv, -r_uv), 0.0, 1.0);
-                    vec2 uv3 = clamp(uv + vec2( r_uv,  r_uv), 0.0, 1.0);
-                    float pyramid_max_z = max(
-                        max(textureLod(hiz_pyramid, uv0, mip_f).r,
-                            textureLod(hiz_pyramid, uv1, mip_f).r),
-                        max(textureLod(hiz_pyramid, uv2, mip_f).r,
-                            textureLod(hiz_pyramid, uv3, mip_f).r));
+                    // SUB-PIXEL SKIP — only when BOTH axes collapse
+                    // below a texel.  When just one axis is thin
+                    // (wire / chain), the 4 corner taps still cluster
+                    // along the wider axis and meaningfully sample;
+                    // skipping these as I previously did neutered
+                    // Hi-Z for too many clusters.
+                    if (min_dim_px >= 0.5 || max_dim_px >= 2.0) {
+                        // Mip pick: smallest mip where one texel ≈
+                        // half the AABB's larger dimension, so 4
+                        // corner taps each cover ~1/4 of the AABB.
+                        float mip_f =
+                            ceil(log2(max(max_dim_px * 0.5, 1.0)));
+                        mip_f = clamp(mip_f, 0.0,
+                                      params.hiz_size_mips_pad.z - 1.0);
 
-                    // Cluster's NEAREST-point NDC z — exact, no
-                    // margin fudge.
-                    vec3 cam = params.camera_pos_pad.xyz;
-                    vec3 to_cluster = center - cam;
-                    float dist = length(to_cluster);
-                    if (dist > radius * 1.01) {
-                        vec3 nearest_world =
-                            center - (to_cluster / dist) * radius;
-                        vec4 clip_near =
-                            params.last_view_proj *
-                            vec4(nearest_world, 1.0);
-                        if (clip_near.w > 0.001) {
-                            float ndc_z_near =
-                                clip_near.z / clip_near.w;
-                            // pyramid_max_z = 1.0 means at least one
-                            // corner hit sky / cleared depth → cluster
-                            // might be visible there → don't reject.
-                            // Otherwise reject when cluster's nearest
-                            // point is BEHIND the deepest visible
-                            // surface in its footprint.
-                            if (pyramid_max_z < 0.99999 &&
-                                ndc_z_near > pyramid_max_z) {
-                                return;
-                            }
+                        // 4 taps at corners of the CLIPPED AABB —
+                        // sampling only inside the visible portion.
+                        // Off-screen clusters are entirely handled by
+                        // any_on_screen earlier; partials work because
+                        // the clipped extents are valid UV ranges.
+                        float pyramid_max_z = max(
+                            max(textureLod(hiz_pyramid,
+                                vec2(uv_clip_min.x, uv_clip_min.y), mip_f).r,
+                                textureLod(hiz_pyramid,
+                                vec2(uv_clip_min.x, uv_clip_max.y), mip_f).r),
+                            max(textureLod(hiz_pyramid,
+                                vec2(uv_clip_max.x, uv_clip_min.y), mip_f).r,
+                                textureLod(hiz_pyramid,
+                                vec2(uv_clip_max.x, uv_clip_max.y), mip_f).r));
+
+                        // Distance-scaled depth bias.  At NDC z near
+                        // 1.0 (far clusters), 24-bit depth precision
+                        // is ~3e-5 per LSB — a fixed 1e-5 epsilon is
+                        // sub-LSB and FP noise alone flips clusters
+                        // between pass/reject.  Scaling by ndc_z_near
+                        // gives more slack at depth where it matters.
+                        float kHiZBias = 1e-5 + ndc_z_near * 1e-4;
+
+                        if (pyramid_max_z < 0.99999 &&
+                            ndc_z_near > pyramid_max_z + kHiZBias) {
+                            return;
                         }
                     }
                 }
@@ -358,30 +356,17 @@ void main() {
 
     // Cluster is visible.  Routing depends on cull_phase:
     //   0 (single-pass) = standard opaque/translucent buckets — legacy.
-    //   1 (Phase A)     = phase-A indirect ONLY (translucents skipped;
-    //                     they're handled in Phase B).  Vis bit set so
-    //                     this cluster carries forward to next frame.
+    //   1 (Phase A)     = phase-A indirect ONLY (translucents + alpha-
+    //                     masked skipped; they're handled in Phase B).
     //   2 (Phase B)     = standard opaque/translucent buckets PLUS vis
     //                     bit set; this is the canonical "visible this
     //                     frame" signal for next frame's Phase A.
     //
-    // Visibility-bit write uses atomicOr.  Phase A and Phase B may both
-    // emit the same cluster (Phase A's set is a subset of Phase B's
-    // expected set in steady state), and atomicOr is idempotent so the
-    // double-write is harmless.  The ordering between Phase A's writes
-    // and Phase B's clear+rewrite is enforced by host barriers + the
-    // host's vkCmdFillBuffer that resets the buffer between phases.
-    ClusterDrawInfo draw = cluster_draw_infos[cluster_idx];
-    bool is_translucent =
-        (material_params[draw.material_idx].flags & BINDLESS_MAT_TRANSLUCENT) != 0;
-
+    // `draw` and the material flag bools were fetched up top.
     if (params.cull_phase == 1u) {
-        // Phase A: opaque clusters only, into the phase-A indirect.
-        // Translucent material survivors are dropped here — they're
-        // handled in Phase B by the standard route.  No visibility-bit
-        // write: the host clears the buffer between A and B and Phase B
-        // is the canonical writer of "visible this frame".
-        if (!is_translucent) {
+        // Phase A: skip translucents AND alpha-masked.  Only solid
+        // opaques contribute to Hi-Z's depth source.
+        if (!skip_hiz_contribution) {
             uint slot = atomicAdd(draw_count_phase_a, 1u);
             uint base = slot * 5u;
             indirect_draws_phase_a[base + 0] = draw.index_count;
@@ -401,23 +386,16 @@ void main() {
         trans_indirect_draws[base + 2] = draw.index_offset;
         trans_indirect_draws[base + 3] = draw.vertex_offset;
         trans_indirect_draws[base + 4] = cluster_idx;
-        // Translucent clusters are not appended to visible_cluster_indices —
-        // that buffer is sized for opaque only and is a debug accessory.
-        // Translucents skip the visibility bit too: they don't contribute
-        // to next frame's Phase A depth set (no occluder value).
     } else {
         uint slot = atomicAdd(draw_count, 1u);
         uint base = slot * 5u;
-        indirect_draws[base + 0] = draw.index_count;     // indexCount
-        indirect_draws[base + 1] = 1u;                    // instanceCount
-        indirect_draws[base + 2] = draw.index_offset;     // firstIndex
-        indirect_draws[base + 3] = draw.vertex_offset;    // vertexOffset (int32)
-        indirect_draws[base + 4] = cluster_idx;           // firstInstance
+        indirect_draws[base + 0] = draw.index_count;
+        indirect_draws[base + 1] = 1u;
+        indirect_draws[base + 2] = draw.index_offset;
+        indirect_draws[base + 3] = draw.vertex_offset;
+        indirect_draws[base + 4] = cluster_idx;
         visible_cluster_indices[slot] = cluster_idx;
 
-        // Phase B sets the visibility bit for opaque survivors only.
-        // The single-pass legacy mode (cull_phase==0) leaves the bit
-        // alone — it's only meaningful in two-pass.
         if (params.cull_phase == 2u) {
             atomicOr(visibility_bits[cluster_idx >> 5u],
                      1u << (cluster_idx & 31u));
