@@ -276,9 +276,9 @@ ShadowViewCameraObject::ShadowViewCameraObject(
 void ShadowViewCameraObject::computeCascadeMatrices(
     const glm::mat4& main_view,
     const glm::mat4& main_proj,
-    const glm::vec4& cascade_far_vs,
+    const std::array<float, CSM_CASCADE_COUNT>& cascade_far_vs,
     float z_near_vs,
-    std::array<glm::mat4, 4>& out_vps) {
+    std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps) {
 
     // Derive tan(half-fov) and aspect ratio from the perspective matrix.
     // GLM stores proj[col][row]; proj[1][1] was negated for Vulkan y-flip.
@@ -294,7 +294,7 @@ void ShadowViewCameraObject::computeCascadeMatrices(
 
     const glm::mat4 inv_main_view = glm::inverse(main_view);
 
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
         const float cn = (k == 0) ? z_near_vs : cascade_far_vs[k - 1];
         const float cf = cascade_far_vs[k];
 

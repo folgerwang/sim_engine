@@ -137,27 +137,108 @@ vec2 octEncodeDir(vec3 n) {
 }
 
 // ── Cheap single-cascade shadow ──────────────────────────────────────
-// Picks the tightest cascade in view-space depth and does one point
-// sample — no PCF to keep the fragment cost low.
-// Matches calculateShadowFactor() in base.frag exactly.
-const float SHADOW_BIAS = 0.001;
-float shadowFactor(vec3 world_pos) {
-    float view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
+// PCSS soft shadow with cascade-consistent WORLD-SPACE blur radius.
+// All sizes are world units; per-cascade conversion to shadow-map UV
+// happens inside shadowFactor().  Constants kept identical to
+// deferred_resolve.comp and base.frag.
+const float CSM_NORMAL_BIAS_SCALE     = 0.05;
+// Depth bias in WORLD units.  Converted to per-cascade clip-Z inside
+// shadowFactor() — see deferred_resolve.comp for full notes.  Without
+// this conversion, coarser cascades silently get 5–10× more bias than
+// fine cascades, producing a visible intensity step at boundaries.
+const float CSM_DEPTH_BIAS_BASE_WORLD  = 0.05;
+const float CSM_DEPTH_BIAS_SLOPE_WORLD = 0.20;
+const float CSM_LIGHT_SIZE_WORLD      = 0.20;
+const float CSM_BLOCKER_RADIUS_WORLD  = 0.40;
+const float CSM_MIN_PCF_RADIUS_WORLD  = 0.02;
+const float CSM_MAX_PCF_RADIUS_WORLD  = 0.80;
+const int   CSM_BLOCKER_SAMPLES       = 16;
+const int   CSM_PCF_SAMPLES           = 16;
 
+vec2 csmVogelDisk(int i, int n, float phi) {
+    const float GOLDEN_ANGLE = 2.39996323;
+    float r     = sqrt((float(i) + 0.5) / float(n));
+    float theta = GOLDEN_ANGLE * float(i) + phi;
+    return vec2(r * cos(theta), r * sin(theta));
+}
+
+float csmIGN(vec2 pixel) {
+    return fract(52.9829189 *
+                 fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
+    float view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
     int cascade = CSM_CASCADE_COUNT - 1;
     for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
-        if (view_depth < runtime_lights.cascade_splits[i]) {
+        // cascade_splits is packed vec4[2]; index as [i/4][i%4].
+        if (view_depth < runtime_lights.cascade_splits[i >> 2][i & 3]) {
             cascade = i;
             break;
         }
     }
 
-    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(world_pos, 1.0);
+    vec3  N     = normalize(world_normal);
+    vec3  L     = normalize(-runtime_lights.lights[0].direction);
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    vec3  biased_pos = world_pos + N * ((1.0 - NdotL) * CSM_NORMAL_BIAS_SCALE);
+
+    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(biased_pos, 1.0);
     vec3 lndc  = lclip.xyz / lclip.w;
     vec2 uv    = lndc.xy * 0.5 + 0.5;
     float ref  = lndc.z;
-    float map  = texture(direct_shadow_sampler, vec3(uv, float(cascade))).r;
-    return (map < 1.0 && ref > map + SHADOW_BIAS) ? 0.0 : 1.0;
+
+    // Per-cascade world→UV (XY) and world→clip-Z (depth) scale factors.
+    // See deferred_resolve.comp for the derivation.  Both are needed to
+    // make BLUR RADIUS and DEPTH BIAS cascade-consistent in physical
+    // (world) units.
+    float w2uv    = 0.5 *
+        length(runtime_lights.light_view_proj[cascade][0].xyz);
+    float z_scale = length(runtime_lights.light_view_proj[cascade][2].xyz);
+
+    float depth_bias =
+        (CSM_DEPTH_BIAS_BASE_WORLD +
+         CSM_DEPTH_BIAS_SLOPE_WORLD * (1.0 - NdotL)) * z_scale;
+
+    float blocker_radius_uv = CSM_BLOCKER_RADIUS_WORLD * w2uv;
+    float light_size_uv     = CSM_LIGHT_SIZE_WORLD     * w2uv;
+    float min_pcf_radius_uv = CSM_MIN_PCF_RADIUS_WORLD * w2uv;
+    float max_pcf_radius_uv = CSM_MAX_PCF_RADIUS_WORLD * w2uv;
+
+    float phi = csmIGN(screen_pixel) * 6.28318530718;
+
+    // PCSS step 1: blocker search.
+    float blocker_sum   = 0.0;
+    int   blocker_count = 0;
+    for (int i = 0; i < CSM_BLOCKER_SAMPLES; ++i) {
+        vec2 off = csmVogelDisk(i, CSM_BLOCKER_SAMPLES, phi)
+                       * blocker_radius_uv;
+        float d = texture(direct_shadow_sampler,
+                          vec3(uv + off, float(cascade))).r;
+        if (d < ref - depth_bias) {
+            blocker_sum += d;
+            ++blocker_count;
+        }
+    }
+    if (blocker_count == 0) return 1.0;
+    float avg_blocker_depth = blocker_sum / float(blocker_count);
+
+    // PCSS step 2: penumbra estimate.
+    float penumbra = (ref - avg_blocker_depth) /
+                     max(avg_blocker_depth, 1e-4);
+    float pcf_radius = clamp(penumbra * light_size_uv,
+                             min_pcf_radius_uv,
+                             max_pcf_radius_uv);
+
+    // PCSS step 3: PCF at the computed radius.
+    float sum = 0.0;
+    for (int i = 0; i < CSM_PCF_SAMPLES; ++i) {
+        vec2 off = csmVogelDisk(i, CSM_PCF_SAMPLES, phi) * pcf_radius;
+        float map = texture(direct_shadow_sampler,
+                            vec3(uv + off, float(cascade))).r;
+        sum += (map < 1.0 && ref > map + depth_bias) ? 0.0 : 1.0;
+    }
+    return sum * (1.0 / float(CSM_PCF_SAMPLES));
 }
 
 void main() {
@@ -299,7 +380,11 @@ void main() {
     // Respect FEATURE_INPUT_SHADOW_DISABLED, matching base.frag.
     float shad = 1.0;
     if ((camera_info.input_features & FEATURE_INPUT_SHADOW_DISABLED) == 0u) {
-        shad = shadowFactor(v_world_pos);
+        // Pass the un-perturbed vertex normal (v_normal) for shadow
+        // biasing, not N which may already include normal-map detail.
+        // gl_FragCoord.xy is the dither key for per-pixel Vogel-disk
+        // rotation.
+        shad = shadowFactor(v_world_pos, v_normal, gl_FragCoord.xy);
     }
 
     // Diffuse IBL ambient — samples the pre-convolved lambertian irradiance

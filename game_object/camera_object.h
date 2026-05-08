@@ -182,9 +182,9 @@ public:
     void computeCascadeMatrices(
         const glm::mat4& main_view,
         const glm::mat4& main_proj,
-        const glm::vec4& cascade_far_vs,
+        const std::array<float, CSM_CASCADE_COUNT>& cascade_far_vs,
         float z_near_vs,
-        std::array<glm::mat4, 4>& out_vps);
+        std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps);
 
     // Push a specific cascade view-projection matrix into the shadow camera's
     // GPU-side ViewCameraInfo buffer so that base_depthonly.vert uses it.

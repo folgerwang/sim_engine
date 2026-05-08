@@ -223,7 +223,11 @@
                                                     // instead of multiplying it in.
 
 #define LIGHT_COUNT                             1
-#define CSM_CASCADE_COUNT                       4
+// 6 cascades (was 4): smaller extent ratio between adjacent cascades
+// (~2.5× vs ~4×), which makes transition boundaries less visible because
+// the per-texel world size doesn't jump as much.  See cascade splits in
+// application.cpp for the actual far-depth values.
+#define CSM_CASCADE_COUNT                       6
 
 #define TONEMAP_DEFAULT                         0
 #define TONEMAP_UNCHARTED                       1
@@ -1048,7 +1052,12 @@ struct ViewCameraInfo {
 
 struct RuntimeLightsParams {
     mat4            light_view_proj[CSM_CASCADE_COUNT];
-    vec4            cascade_splits;   // view-space far depths for each cascade
+    // View-space far depths for each cascade.  Packed into vec4[2]
+    // (8 floats, 32 bytes) so the std140-laid-out uniform buffer
+    // doesn't bloat to one float per 16-byte slot.  CSM_CASCADE_COUNT
+    // is 6 in practice; element 6 and 7 are unused.  Shaders index
+    // as cascade_splits[i >> 2][i & 3].
+    vec4            cascade_splits[2];
     Light           lights[LIGHT_COUNT];
 };
 

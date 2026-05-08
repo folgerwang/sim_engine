@@ -76,22 +76,154 @@ vec3 octDecode(vec2 f) {
     return normalize(n);
 }
 
-const float SHADOW_BIAS = 0.001;
-float shadowFactor(vec3 world_pos) {
+// ─── PCSS soft-shadow constants ────────────────────────────────────
+// All distances are in WORLD UNITS so that the physical blur radius is
+// consistent across cascade transitions.  Per-cascade conversion to
+// shadow-map UV uses w2uv = 0.5 * length(light_view_proj[c][0].xyz),
+// which is the orthographic projection's world→clip scale folded into
+// the [-1,1]→[0,1] UV remap.  See shadowFactor() below.
+const float CSM_NORMAL_BIAS_SCALE     = 0.05;
+// Depth bias in WORLD units (meters along the light's Z axis).  The
+// shader converts to per-cascade clip-Z by multiplying by the cascade's
+// Z-scale factor (1 / (far - near)) extracted from the projection
+// matrix.  Without this conversion, a constant clip-Z bias would
+// represent (far - near) wildly different world distances per cascade
+// — coarser cascades would silently apply 5–10× more bias than fine
+// ones, producing a visible step in shadow intensity at cascade
+// boundaries.
+const float CSM_DEPTH_BIAS_BASE_WORLD  = 0.05;   // ~5 cm
+const float CSM_DEPTH_BIAS_SLOPE_WORLD = 0.20;   // ~20 cm at grazing
+// PCSS sun apparent half-size in world units.  Drives penumbra width
+// proportional to caster→receiver distance.  Real sun is ~0.005 (= a
+// few cm at 10 m caster distance) but we exaggerate for visible
+// softness.  Tunable.
+const float CSM_LIGHT_SIZE_WORLD      = 0.20;
+// Blocker search disk radius in world units — wider catches more
+// distant blockers and produces smoother penumbras at the cost of
+// more incoherent texture fetches.
+const float CSM_BLOCKER_RADIUS_WORLD  = 0.40;
+// Min/max PCF radius caps in world units.  Min keeps a small soft
+// fringe even on tight contact (anti-banding); max stops kernels from
+// blowing up to read outside the cascade on very tall casters.
+const float CSM_MIN_PCF_RADIUS_WORLD  = 0.02;
+const float CSM_MAX_PCF_RADIUS_WORLD  = 0.80;
+
+const int   CSM_BLOCKER_SAMPLES       = 16;
+const int   CSM_PCF_SAMPLES           = 16;
+
+// Vogel disk: ~uniform low-discrepancy distribution of N points in a
+// unit disk.  Per-pixel rotation phi de-correlates neighbouring
+// pixels' kernels so the soft edge is dithered rather than visibly
+// banded.  Golden-angle index ensures even coverage at any prefix.
+vec2 csmVogelDisk(int i, int n, float phi) {
+    const float GOLDEN_ANGLE = 2.39996323;  // ~137.5°
+    float r     = sqrt((float(i) + 0.5) / float(n));
+    float theta = GOLDEN_ANGLE * float(i) + phi;
+    return vec2(r * cos(theta), r * sin(theta));
+}
+
+// Interleaved Gradient Noise (Jorge Jimenez, CoD AW).  Cheap
+// per-pixel hash giving clean dither without a noise texture.
+float csmIGN(vec2 pixel) {
+    return fract(52.9829189 *
+                 fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
+    // Cascade selection — same view-space-depth split as before.
     float view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
     int cascade = CSM_CASCADE_COUNT - 1;
     for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
-        if (view_depth < runtime_lights.cascade_splits[i]) {
+        // cascade_splits is packed vec4[2]; index as [i/4][i%4].
+        if (view_depth < runtime_lights.cascade_splits[i >> 2][i & 3]) {
             cascade = i;
             break;
         }
     }
-    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(world_pos, 1.0);
+
+    // Normal-offset bias: shift the sampled position along the surface
+    // normal in world space before projecting into shadow clip.
+    vec3  N     = normalize(world_normal);
+    vec3  L     = normalize(-runtime_lights.lights[0].direction);
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    vec3  biased_pos = world_pos + N * ((1.0 - NdotL) * CSM_NORMAL_BIAS_SCALE);
+
+    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(biased_pos, 1.0);
     vec3 lndc  = lclip.xyz / lclip.w;
     vec2 uv    = lndc.xy * 0.5 + 0.5;
     float ref  = lndc.z;
-    float map  = texture(direct_shadow_sampler, vec3(uv, float(cascade))).r;
-    return (map < 1.0 && ref > map + SHADOW_BIAS) ? 0.0 : 1.0;
+
+    // Per-cascade world→UV scale.  For an orthographic projection
+    // M = ortho_diag(2/w_x, 2/w_y, 1/(f-n), 1) * R * T, the first
+    // column M[0] = (2/w_x * R_00, 2/w_y * R_10, 1/(f-n) * R_20, 0).
+    // For typical CSM setups (sun looking down) length(M[0].xyz) is
+    // dominated by 2/w, and length(M[2].xyz) by 1/(f-n).  Each cascade
+    // has different w and (f-n), so we extract both factors per cascade
+    // and use them to convert world-space constants into the cascade's
+    // local UV (XY) and clip-Z spaces.  Without these conversions the
+    // SAME constants represent different physical distances per
+    // cascade, producing visible intensity / blur steps at boundaries.
+    float w2uv    = 0.5 *
+        length(runtime_lights.light_view_proj[cascade][0].xyz);
+    float z_scale = length(runtime_lights.light_view_proj[cascade][2].xyz);
+
+    // World-space depth bias → per-cascade clip-Z bias.
+    float depth_bias =
+        (CSM_DEPTH_BIAS_BASE_WORLD +
+         CSM_DEPTH_BIAS_SLOPE_WORLD * (1.0 - NdotL)) * z_scale;
+
+    // Per-cascade UV radii derived from the world-space constants.
+    float blocker_radius_uv = CSM_BLOCKER_RADIUS_WORLD * w2uv;
+    float light_size_uv     = CSM_LIGHT_SIZE_WORLD     * w2uv;
+    float min_pcf_radius_uv = CSM_MIN_PCF_RADIUS_WORLD * w2uv;
+    float max_pcf_radius_uv = CSM_MAX_PCF_RADIUS_WORLD * w2uv;
+
+    // Per-pixel rotation phase (radians).
+    float phi = csmIGN(screen_pixel) * 6.28318530718;
+
+    // ── PCSS step 1: blocker search ─────────────────────────────────
+    // Sample CSM_BLOCKER_SAMPLES taps in a fixed-WORLD-radius disk;
+    // accumulate depths SHALLOWER than the receiver (occluders closer
+    // to the light).  Zero blockers found → fully lit, skip PCF.
+    float blocker_sum   = 0.0;
+    int   blocker_count = 0;
+    for (int i = 0; i < CSM_BLOCKER_SAMPLES; ++i) {
+        vec2 off = csmVogelDisk(i, CSM_BLOCKER_SAMPLES, phi)
+                       * blocker_radius_uv;
+        float d = texture(direct_shadow_sampler,
+                          vec3(uv + off, float(cascade))).r;
+        if (d < ref - depth_bias) {
+            blocker_sum += d;
+            ++blocker_count;
+        }
+    }
+    if (blocker_count == 0) return 1.0;
+    float avg_blocker_depth = blocker_sum / float(blocker_count);
+
+    // ── PCSS step 2: penumbra estimate ──────────────────────────────
+    // Penumbra width ∝ (d_receiver - d_blocker) / d_blocker * light_size.
+    // Multiplying by the per-cascade light_size_uv gives a UV-space
+    // penumbra whose underlying WORLD size matches across cascades,
+    // which is what makes cascade transitions invisible.
+    float penumbra = (ref - avg_blocker_depth) /
+                     max(avg_blocker_depth, 1e-4);
+    float pcf_radius = clamp(penumbra * light_size_uv,
+                             min_pcf_radius_uv,
+                             max_pcf_radius_uv);
+
+    // ── PCSS step 3: PCF at the computed radius ─────────────────────
+    // 16 Vogel-disk taps with the same per-pixel phase as the blocker
+    // search — keeps adjacent pixels' patterns decorrelated, so any
+    // residual banding is dithered into noise rather than visible
+    // contour lines.
+    float sum = 0.0;
+    for (int i = 0; i < CSM_PCF_SAMPLES; ++i) {
+        vec2 off = csmVogelDisk(i, CSM_PCF_SAMPLES, phi) * pcf_radius;
+        float map = texture(direct_shadow_sampler,
+                            vec3(uv + off, float(cascade))).r;
+        sum += (map < 1.0 && ref > map + depth_bias) ? 0.0 : 1.0;
+    }
+    return sum * (1.0 / float(CSM_PCF_SAMPLES));
 }
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -188,7 +320,12 @@ void main() {
 
     float shad = 1.0;
     if ((camera_info.input_features & FEATURE_INPUT_SHADOW_DISABLED) == 0u) {
-        shad = shadowFactor(world_pos);
+        // Use the geometric (un-perturbed) normal for shadow biasing —
+        // normal-mapped perturbations can give inconsistent bias at
+        // texel-detail scale and re-introduce acne on bumpy surfaces.
+        // Pass the compute-shader pixel coordinate as the dither key
+        // so adjacent pixels get decorrelated Vogel-disk rotations.
+        shad = shadowFactor(world_pos, N_geom, vec2(px));
     }
 
     // Lambertian diffuse + Blinn-Phong specular — bit-identical to

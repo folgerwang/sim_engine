@@ -212,7 +212,12 @@ class ClusterRenderer {
     // plain frustum + cone culling.  Plumbed end-to-end (menu →
     // renderer → push constant → shader) so toggling at runtime is
     // enough; no rebuild needed.
-    bool use_hiz_occlusion_cull_ = false;
+    //
+    // Default ON: the two-pass orchestration + 4-tap test has been
+    // verified to produce correct results in dense scenes (Bistro)
+    // and the perf win from rejecting fully-occluded clusters in
+    // Phase B easily covers the cost of the Hi-Z build dispatch.
+    bool use_hiz_occlusion_cull_ = true;
 
     // Hi-Z pyramid handles supplied via setHiZTexture().  view + sampler
     // get bound at descriptor binding 11 of the cull set; size + mip
