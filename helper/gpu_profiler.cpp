@@ -741,7 +741,13 @@ void GpuProfiler::drawImGui()
 
     // ---- Interaction -------------------------------------------------------
     // Advance cursor past the canvas for the next widget (if any).
+    // ImGui requires an item submission AFTER SetCursorScreenPos for the
+    // parent window's content rect to actually grow to include the new
+    // position; otherwise it asserts "Code uses SetCursorPos() to extend
+    // window/parent boundaries".  A zero-size Dummy is the standard way
+    // to register a no-op item there.
     ImGui::SetCursorScreenPos(ImVec2(cv_min.x, cv_max.y + kPadding));
+    ImGui::Dummy(ImVec2(0.0f, 0.0f));
 
     if (canvas_hovered) {
         float scroll = ImGui::GetIO().MouseWheel;
