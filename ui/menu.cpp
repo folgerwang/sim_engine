@@ -1273,6 +1273,17 @@ bool Menu::draw(
                     "Hi-Z Pyramid Viewer", NULL, show_hiz_debug_)) {
                 show_hiz_debug_ = !show_hiz_debug_;
             }
+            // VT pool viewer — opens a strip of the four 4096² layer
+            // pool textures so we can verify that Runtime Virtual
+            // Texture registration is actually copying texel data
+            // into the pool.  Each populated 128×128 page shows up
+            // as a patch within the atlas; empty slots stay black.
+            // Albedo + Normal panels populate; MR-AO + Emissive stay
+            // black until those layers are wired in v2.
+            if (ImGui::MenuItem(
+                    "VT Pool Viewer", NULL, show_vt_pool_debug_)) {
+                show_vt_pool_debug_ = !show_vt_pool_debug_;
+            }
             // Toggle in-scene probe icospheres.  Each sphere is colored
             // by its probe's SH-evaluated irradiance in the surface
             // normal direction — pending probes (not yet baked) draw
@@ -1829,6 +1840,51 @@ bool Menu::draw(
                     }
                 } else {
                     ImGui::Dummy(ImVec2(kThumbSize, kThumbSize));
+                }
+                ImGui::EndGroup();
+            }
+        }
+        ImGui::End();
+    }
+    // ------------------------------------------------------------------------
+
+    // ---- RVT pool viewer ---------------------------------------------------
+    // Shows the four 4096² layer pool textures.  If RVT registration
+    // is working you'll see a tiled atlas of 128×128 pages (one per
+    // registered material texture).  Empty / unregistered pages stay
+    // black.  Toggled via Tools → "Show VT Pool" in the menu.
+    if (show_vt_pool_debug_) {
+        constexpr float kThumbSize = 240.0f;
+        constexpr float kWinW = kThumbSize * 4 + 60.0f;
+        constexpr float kWinH = kThumbSize + 100.0f;
+        ImGui::SetNextWindowSize(ImVec2(kWinW, kWinH));
+        ImGui::SetNextWindowViewport(main_vp_id);
+        if (ImGui::Begin("VT Pool Debug", &show_vt_pool_debug_,
+                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
+            // Layer format labels — must match VtLayer enum order in
+            // virtual_texture.h.  ALBEDO is BC7 SRGB (encoded by the
+            // engine's Mode-6 encoder), the rest are RGBA8.
+            const char* labels[] = {
+                "Albedo (BC7 sRGB)",
+                "Normal (RGBA8)",
+                "Metal/Rough/AO (RGBA8)",
+                "Emissive (RGBA8)" };
+            for (int k = 0; k < 4; ++k) {
+                if (k > 0) ImGui::SameLine();
+                ImGui::BeginGroup();
+                ImGui::Text("%s", labels[k]);
+                if (vt_pool_tex_ids_[k]) {
+                    ImGui::Image(vt_pool_tex_ids_[k],
+                                 ImVec2(kThumbSize, kThumbSize));
+                    if (ImGui::IsItemHovered()) {
+                        // Larger preview on hover.
+                        ImGui::BeginTooltip();
+                        ImGui::Image(vt_pool_tex_ids_[k], ImVec2(600, 600));
+                        ImGui::EndTooltip();
+                    }
+                } else {
+                    ImGui::Dummy(ImVec2(kThumbSize, kThumbSize));
+                    ImGui::TextDisabled("(not bound)");
                 }
                 ImGui::EndGroup();
             }

@@ -43,6 +43,51 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = 2)
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 3)
     uniform sampler2D normal_textures[MAX_CLUSTER_TEXTURES];
 
+// ── Runtime Virtual Texture (RVT) bindings ──────────────────────────
+// The four pool textures + page table + meta SSBO live on the same
+// descriptor set as the rest of the cluster bindless data (set 2).
+// vt_sample.glsl.h's helpers (`vtSampleAlbedo`, `vtSampleNormal`, …)
+// reference the resource names declared below — the names must match
+// exactly or the included file will fail to compile.
+//
+// When a material's *_vt_id is VT_INVALID_ID (== 0xFFFFFFFF), the
+// shader falls back to the legacy bindless texture arrays declared
+// above; otherwise it routes through `vtResolve` and samples from the
+// pool texture matching the layer encoded in the upper bits of the
+// id.  See virtual_texture.h for the encoding.
+//
+// Order of declarations matters here:
+//   1. vt_types.glsl.h     — declares VirtualTextureMeta + constants.
+//   2. SSBO/sampler bindings (use the struct from step 1).
+//   3. vt_sample.glsl.h    — defines helpers that reference the
+//                            bindings from step 2.
+// GLSL needs every identifier in scope at parse time, so we cannot
+// pull in the helpers until both the struct AND the bindings exist.
+#include "vt_types.glsl.h"
+
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 4)
+    uniform sampler2D vt_pool_albedo;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 5)
+    uniform sampler2D vt_pool_normal;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 6)
+    uniform sampler2D vt_pool_mr_ao;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 7)
+    uniform sampler2D vt_pool_emissive;
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 8)
+    readonly buffer VtPageTableBuffer {
+    uint vt_page_table[];
+};
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 9)
+    readonly buffer VtMetaBuffer {
+    VirtualTextureMeta vt_meta[];
+};
+
+// Now that the resources above are in scope, pull in the VT sampling
+// helpers.  The header declares `vtSampleAlbedo / vtSampleNormal /
+// vtSampleMetalRoughAO / vtSampleEmissive` plus the `vtResolve`
+// primitive — all of which reference the bindings above by name.
+#include "vt_sample.glsl.h"
+
 // set 4 — runtime lights
 layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
     uniform RuntimeLightsUniformBufferObject {
@@ -266,7 +311,22 @@ void main() {
     }
 #endif
     vec4 albedo4    = base_color;
-    if (tex_idx >= 0) {
+    // ── Albedo sample: prefer VT, fall back to legacy bindless ─────
+    // When the material was registered with the VirtualTextureManager
+    // (mat_idx → albedo_vt_id != VT_INVALID_ID), route the sample
+    // through `vtSampleAlbedo` which translates the virtual UV through
+    // the page table to a physical pool UV.  Otherwise use the legacy
+    // bindless texture array — preserved so meshes that haven't been
+    // routed through the VT system yet (or fail to allocate a slot
+    // because the pool is full) still render correctly.
+    //
+    // Pool textures are stored in BC7_SRGB_BLOCK so the sampled value
+    // is already linear — no manual sRGBToLinear needed.  The legacy
+    // path's textures are also hardware sRGB — same story.
+    uint albedo_vt = material_params[mat_idx].albedo_vt_id;
+    if (albedo_vt != VT_INVALID_ID) {
+        albedo4 *= vtSampleAlbedo(albedo_vt, v_uv);
+    } else if (tex_idx >= 0) {
         // Texture views are hardware sRGB format — GPU auto-linearizes on sample.
         // Do NOT apply manual sRGBToLinear here (would double-convert and desaturate).
         // nonuniformEXT: tex_idx varies per cluster — the GPU must not assume it is
@@ -302,15 +362,45 @@ void main() {
     // the per-fragment dFdx/dFdy reconstruction that previously produced
     // fine-grained sparkle on shaded surfaces (visible in render-debug
     // mode 2 / 3, and in the final shaded image as specular speckle).
-    int norm_idx = material_params[mat_idx].normal_tex_idx;
-    if (norm_idx >= 0) {
+    int  norm_idx     = material_params[mat_idx].normal_tex_idx;
+    uint normal_vt    = material_params[mat_idx].normal_vt_id;
+    bool has_vt_norm  = (normal_vt != VT_INVALID_ID);
+    if (has_vt_norm || norm_idx >= 0) {
         // Sample and decode the normal map.
         // Bistro (and most DCC tools) export DirectX-convention normal maps where
         // the green channel is inverted relative to OpenGL/GLSL tangent space.
         // base.frag applies n.y = -n.y for the same reason — we must match it.
         // Z is reconstructed from XY (more robust than reading the stored Z which
         // can be degraded by DXT5nm / BC5 compression).
-        vec4 raw_n = texture(normal_textures[nonuniformEXT(norm_idx)], v_uv);
+        //
+        // VT path: route through the page table (same UV mapping as the
+        // legacy path) but inline the resolve so we keep the existing
+        // DX-convention Y-flip and z-reconstruction intact.  Falling back
+        // to the legacy bindless texture array when the page is
+        // unresident keeps the surface lit until streaming catches up.
+        vec4 raw_n;
+        bool vt_resolved = false;
+        if (has_vt_norm) {
+            VirtualTextureMeta meta = vt_meta[vtIndexOf(normal_vt)];
+            vec2 phys_uv;
+            if (vtResolve(normal_vt, v_uv, meta, phys_uv)) {
+                raw_n       = texture(vt_pool_normal, phys_uv);
+                vt_resolved = true;
+            }
+        }
+        if (!vt_resolved) {
+            // Legacy bindless path — used when (a) material isn't VT-
+            // registered for normal, or (b) the requested page isn't
+            // resident yet (v1 is eager-resident, but the fallback keeps
+            // v2 streaming graceful).
+            if (norm_idx >= 0) {
+                raw_n = texture(normal_textures[nonuniformEXT(norm_idx)], v_uv);
+            } else {
+                // No legacy slot AND no resident VT page → fall through
+                // with raw_n that decodes to a flat tangent-space normal.
+                raw_n = vec4(0.5, 0.5, 1.0, 1.0);
+            }
+        }
         vec2 nxy   = raw_n.xy * 2.0 - 1.0;
         nxy.y      = -nxy.y;   // DX → GL convention flip
         vec3 ts_n  = vec3(nxy, sqrt(max(1.0 - dot(nxy, nxy), 0.0)));

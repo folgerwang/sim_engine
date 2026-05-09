@@ -8,6 +8,7 @@
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"
 #include "game_object/drawable_object.h"
+#include "virtual_texture.h"
 
 #include <cstdio>
 #include <source_location>
@@ -41,6 +42,21 @@ static_assert(offsetof(glsl::ClusterCullPushConstants, pad1)              == 108
 static_assert(offsetof(glsl::ClusterCullPushConstants, last_view_proj)    == 112, "last_view_proj offset (std430 mat4 alignment forces 16B-aligned start)");
 static_assert(offsetof(glsl::ClusterCullPushConstants, hiz_size_mips_pad) == 176, "hiz_size_mips_pad offset");
 static_assert(sizeof(glsl::ClusterCullPushConstants) == 192,                       "ClusterCullPushConstants total size");
+
+// ─── BindlessMaterialParams layout check ──────────────────────────────
+// std430 layout (storage buffer) — vec4 needs 16-byte align, uint
+// 4-byte align.  See global_definition.glsl.h.  Misalignment between
+// C++ and GLSL would silently corrupt every material's data.
+static_assert(offsetof(glsl::BindlessMaterialParams, base_color_factor)  ==  0, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, base_color_tex_idx) == 16, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, alpha_cutoff)       == 20, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, flags)              == 24, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, normal_tex_idx)     == 28, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, albedo_vt_id)       == 32, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, normal_vt_id)       == 36, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, mr_ao_vt_id)        == 40, "");
+static_assert(offsetof(glsl::BindlessMaterialParams, emissive_vt_id)     == 44, "");
+static_assert(sizeof(glsl::BindlessMaterialParams)                       == 48, "");
 
 // Flip to 1 to re-enable the diagnostic upload / finalize lines that
 // otherwise printed for every ClusterRenderer mesh upload + a few
@@ -494,6 +510,14 @@ void ClusterRenderer::uploadMeshClusters(
         glsl::BindlessMaterialParams mp{};
         mp.base_color_tex_idx = -1;
         mp.normal_tex_idx     = -1;
+        // VT IDs default to INVALID until registerTextureFromImage
+        // assigns one.  Shader checks against kInvalidVtId to fall
+        // back to the legacy bindless path when VT registration was
+        // skipped (pool full, manager not wired, etc.).
+        mp.albedo_vt_id   = 0xFFFFFFFFu;
+        mp.normal_vt_id   = 0xFFFFFFFFu;
+        mp.mr_ao_vt_id    = 0xFFFFFFFFu;
+        mp.emissive_vt_id = 0xFFFFFFFFu;
 
         if (mesh_idx < meshes.size()) {
             const auto& prims = meshes[mesh_idx].primitives_;
@@ -529,6 +553,28 @@ void ClusterRenderer::uploadMeshClusters(
                             }
                             // else: over MAX_CLUSTER_TEXTURES — idx stays -1
                         }
+                        // ── RVT registration (parallel path) ──────────
+                        // Register the same source image with the VT pool.
+                        // Cache by Image* so duplicate references share one
+                        // registration.  The shader (once switched) uses
+                        // mp.albedo_vt_id when valid, falling back to the
+                        // bindless texture-array slot when INVALID.
+                        if (vt_manager_ && tex.image) {
+                            auto vt_it = vt_albedo_id_cache_.find(tex.image.get());
+                            if (vt_it != vt_albedo_id_cache_.end()) {
+                                mp.albedo_vt_id = vt_it->second;
+                            } else {
+                                uint32_t vid = vt_manager_->registerTextureFromImage(
+                                    VtLayer::ALBEDO,
+                                    tex.image,
+                                    tex.size.x,
+                                    tex.size.y);
+                                if (vid != kInvalidVtId) {
+                                    vt_albedo_id_cache_[tex.image.get()] = vid;
+                                    mp.albedo_vt_id = vid;
+                                }
+                            }
+                        }
                     }
                     // Stage the normal-map texture (binding 3).
                     int32_t norm_idx = mat.normal_idx_;
@@ -544,6 +590,23 @@ void ClusterRenderer::uploadMeshClusters(
                                 staging_normal_slot_map_[ntex.view.get()] = slot;
                                 staging_normal_tex_views_.push_back(ntex.view);
                                 mp.normal_tex_idx = slot;
+                            }
+                        }
+                        // RVT registration for normal layer (parallel path).
+                        if (vt_manager_ && ntex.image) {
+                            auto vt_it = vt_normal_id_cache_.find(ntex.image.get());
+                            if (vt_it != vt_normal_id_cache_.end()) {
+                                mp.normal_vt_id = vt_it->second;
+                            } else {
+                                uint32_t vid = vt_manager_->registerTextureFromImage(
+                                    VtLayer::NORMAL,
+                                    ntex.image,
+                                    ntex.size.x,
+                                    ntex.size.y);
+                                if (vid != kInvalidVtId) {
+                                    vt_normal_id_cache_[ntex.image.get()] = vid;
+                                    mp.normal_vt_id = vid;
+                                }
                             }
                         }
                     }
@@ -755,6 +818,13 @@ void ClusterRenderer::uploadMeshClusters(
 void ClusterRenderer::finalizeUploads() {
     total_clusters_all_meshes_ =
         static_cast<uint32_t>(staging_cull_infos_.size());
+
+    // Log VT registration outcome so we know the pool got populated.
+    // Counts unique source images registered (cache size).  If this is
+    // zero, vt_manager_ wasn't wired or no materials had textures.
+    std::printf("[RVT] registered %zu albedo textures, %zu normal textures with VT pool.\n",
+                vt_albedo_id_cache_.size(),
+                vt_normal_id_cache_.size());
 
     if (total_clusters_all_meshes_ == 0) {
         std::printf("[CLUSTER_RENDERER] No clusters to upload.\n");
@@ -1697,10 +1767,25 @@ void ClusterRenderer::initBindlessPipeline(
     // ── Bindless descriptor set layout ──
     // binding 0: ClusterDrawInfo[]        SSBO (index/count per cluster)
     // binding 1: BindlessMaterialParams[] SSBO (base colour + tex idx per material)
-    // binding 2: sampler2D[MAX_CLUSTER_TEXTURES]  (base colour texture array)
-    // binding 3: sampler2D[MAX_CLUSTER_TEXTURES]  (normal map texture array)
+    // binding 2: sampler2D[MAX_CLUSTER_TEXTURES]  (base colour texture array — legacy bindless)
+    // binding 3: sampler2D[MAX_CLUSTER_TEXTURES]  (normal map texture array — legacy bindless)
+    // ── RVT (Runtime Virtual Texture) bindings ──
+    // The bindings below expose the VirtualTextureManager's pool textures
+    // and page tables to the fragment shader so material samples can flow
+    // through `vtSampleAlbedo / vtSampleNormal / ...` instead of the
+    // legacy bindless arrays.  vt_sample.glsl.h declares the shader-side
+    // resource names used by the helpers (vt_pool_albedo, vt_page_table,
+    // etc.); the actual `layout(set=..., binding=...)` decorations live
+    // in cluster_bindless.frag and reference these slots.
+    //
+    // binding 4: sampler2D vt_pool_albedo
+    // binding 5: sampler2D vt_pool_normal
+    // binding 6: sampler2D vt_pool_mr_ao
+    // binding 7: sampler2D vt_pool_emissive
+    // binding 8: VtPageTable SSBO (uint[])
+    // binding 9: VtMeta      SSBO (VirtualTextureMeta[])
     {
-        std::vector<er::DescriptorSetLayoutBinding> bindings(4);
+        std::vector<er::DescriptorSetLayoutBinding> bindings(10);
         bindings[0] = er::helper::getBufferDescriptionSetLayoutBinding(
             0, SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
                SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
@@ -1720,6 +1805,21 @@ void ClusterRenderer::initBindlessPipeline(
             er::DescriptorType::COMBINED_IMAGE_SAMPLER);
         norm_binding.descriptor_count = MAX_CLUSTER_TEXTURES;
         bindings[3] = norm_binding;
+        // VT pool samplers (one per layer — albedo, normal, mr_ao, emissive).
+        for (uint32_t l = 0; l < 4; ++l) {
+            auto vt_pool_binding = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                4u + l, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER);
+            bindings[4u + l] = vt_pool_binding;
+        }
+        // VT page table SSBO.
+        bindings[8] = er::helper::getBufferDescriptionSetLayoutBinding(
+            8, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            er::DescriptorType::STORAGE_BUFFER);
+        // VT meta SSBO.
+        bindings[9] = er::helper::getBufferDescriptionSetLayoutBinding(
+            9, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            er::DescriptorType::STORAGE_BUFFER);
         bindless_desc_set_layout_ = device_->createDescriptorSetLayout(bindings);
     }
 
@@ -2066,6 +2166,59 @@ void ClusterRenderer::initBindlessPipeline(
                     ? staging_normal_tex_views_[ti]
                     : dummy_texture_.view;
             writes.push_back(nw);
+        }
+
+        // ── VT bindings 4..9 ─────────────────────────────────────────
+        // If a VT manager is wired up, point the descriptor at its pool
+        // textures + page-table / meta SSBOs.  Otherwise fall back to the
+        // dummy texture / a small placeholder buffer just so the
+        // descriptor set is fully written (Vulkan requires every binding
+        // referenced by the pipeline layout to be valid even if the
+        // shader never reads it on a given invocation).
+        if (vt_manager_) {
+            const auto vt_sampler = vt_manager_->getPoolSampler();
+            for (uint32_t l = 0; l < 4; ++l) {
+                auto layer = static_cast<VtLayer>(l);
+                er::Helper::addOneTexture(writes, bindless_desc_set_,
+                    er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    4u + l,
+                    vt_sampler,
+                    vt_manager_->getPoolImageView(layer),
+                    er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            }
+            // Page table SSBO.  Bind the full buffer (UINT32_MAX → driver
+            // clamps to actual buffer size).  Sizes match what the
+            // VirtualTextureManager allocates in its constructor.
+            er::Helper::addOneBuffer(writes, bindless_desc_set_,
+                er::DescriptorType::STORAGE_BUFFER, 8,
+                vt_manager_->getPageTableBuffer(),
+                vt_manager_->getPageTableBufferBytes());
+            // Meta SSBO.
+            er::Helper::addOneBuffer(writes, bindless_desc_set_,
+                er::DescriptorType::STORAGE_BUFFER, 9,
+                vt_manager_->getMetaBuffer(),
+                vt_manager_->getMetaBufferBytes());
+        } else {
+            // Fallback: dummy texture for the four pool slots.  No
+            // safe placeholder for the SSBOs without allocating one;
+            // shaders gate on `mat.albedo_vt_id != INVALID` so the SSBO
+            // reads are dead code in this branch — the descriptor set
+            // still has to exist though, which means we'd need a real
+            // buffer.  In practice vt_manager_ is always non-null in
+            // the engine's main flow (initialised in initVulkan), so
+            // this branch logs a warning and skips writing the SSBO
+            // bindings — the resulting validation error makes the
+            // misconfiguration obvious during development.
+            for (uint32_t l = 0; l < 4; ++l) {
+                er::Helper::addOneTexture(writes, bindless_desc_set_,
+                    er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    4u + l, default_sampler_, dummy_texture_.view,
+                    er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            }
+            std::printf("[CLUSTER_RENDERER] WARNING: vt_manager_ not set "
+                        "during writeBindlessDescriptors. VT bindings 8/9 "
+                        "left UNWRITTEN — call setVtManager() before "
+                        "initBindlessPipeline().\n");
         }
 
         device_->updateDescriptorSets(writes);
@@ -2694,6 +2847,31 @@ void ClusterRenderer::recreate(
         nw->sampler           = default_sampler_;
         nw->texture           = dummy_texture_.view;
         writes.push_back(nw);
+    }
+
+    // ── VT bindings 4..9 ─────────────────────────────────────────────
+    // Same logic as initBindlessPipeline above — the bindless layout
+    // includes these slots so the descriptor set we just allocated must
+    // write them or shaders will hit a validation error reading dangling
+    // bindings.
+    if (vt_manager_) {
+        const auto vt_sampler = vt_manager_->getPoolSampler();
+        for (uint32_t l = 0; l < 4; ++l) {
+            auto layer = static_cast<VtLayer>(l);
+            er::Helper::addOneTexture(writes, bindless_desc_set_,
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                4u + l, vt_sampler,
+                vt_manager_->getPoolImageView(layer),
+                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+        er::Helper::addOneBuffer(writes, bindless_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 8,
+            vt_manager_->getPageTableBuffer(),
+            vt_manager_->getPageTableBufferBytes());
+        er::Helper::addOneBuffer(writes, bindless_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 9,
+            vt_manager_->getMetaBuffer(),
+            vt_manager_->getMetaBufferBytes());
     }
 
     device_->updateDescriptorSets(writes);

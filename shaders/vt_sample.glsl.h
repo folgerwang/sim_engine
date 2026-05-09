@@ -10,45 +10,25 @@
 // Mirrors virtual_texture.h on the C++ side — these constants and
 // the VirtualTextureMeta layout MUST match.  Static asserts on the
 // C++ side guard against drift.
+//
+// ── Include order requirement ──────────────────────────────────────
+// The helpers below reference SSBO and sampler bindings by name, so
+// the including shader MUST declare them BEFORE this file is included.
+// The required include order is:
+//
+//   #include "vt_types.glsl.h"    // VirtualTextureMeta + constants
+//   layout(set=..., binding=..) uniform sampler2D vt_pool_albedo;
+//   layout(set=..., binding=..) uniform sampler2D vt_pool_normal;
+//   layout(set=..., binding=..) uniform sampler2D vt_pool_mr_ao;
+//   layout(set=..., binding=..) uniform sampler2D vt_pool_emissive;
+//   layout(...) readonly buffer { uint vt_page_table[]; };
+//   layout(...) readonly buffer { VirtualTextureMeta vt_meta[]; };
+//   #include "vt_sample.glsl.h"   // helpers below
+//
+// (vt_types.glsl.h is split out so the SSBO declaration can use
+// VirtualTextureMeta without forward-declaring the struct here.)
 
-const uint VT_PAGE_SIZE          = 128u;
-const uint VT_POOL_WIDTH         = 4096u;
-const uint VT_POOL_HEIGHT        = 4096u;
-const uint VT_PAGES_ACROSS       = VT_POOL_WIDTH  / VT_PAGE_SIZE;   // 32
-const uint VT_PAGES_DOWN         = VT_POOL_HEIGHT / VT_PAGE_SIZE;   // 32
-const uint VT_PAGES_PER_LAYER    = VT_PAGES_ACROSS * VT_PAGES_DOWN; // 1024
-
-const float VT_INV_POOL_WIDTH    = 1.0 / float(VT_POOL_WIDTH);
-const float VT_INV_POOL_HEIGHT   = 1.0 / float(VT_POOL_HEIGHT);
-const float VT_PAGE_TO_POOL_X    = float(VT_PAGE_SIZE) * VT_INV_POOL_WIDTH;
-const float VT_PAGE_TO_POOL_Y    = float(VT_PAGE_SIZE) * VT_INV_POOL_HEIGHT;
-
-// Layer enum — must match C++ VtLayer.
-const uint VT_LAYER_ALBEDO         = 0u;
-const uint VT_LAYER_NORMAL         = 1u;
-const uint VT_LAYER_METAL_ROUGH_AO = 2u;
-const uint VT_LAYER_EMISSIVE       = 3u;
-const uint VT_LAYER_COUNT          = 4u;
-
-// VirtualTextureId encoding — must match makeVtId/vtLayer/vtIndex
-// in virtual_texture.h.
-//   bits 30..31  layer (2 bits)
-//   bits  0..29  vt_index (30 bits)
-const uint VT_INVALID_ID = 0xFFFFFFFFu;
-uint vtLayerOf(uint vt_id) { return (vt_id >> 30) & 0x3u; }
-uint vtIndexOf(uint vt_id) { return vt_id & 0x3FFFFFFFu; }
-
-// VirtualTextureMeta — 32 B, must match C++ layout exactly.
-struct VirtualTextureMeta {
-    uint width_px;
-    uint height_px;
-    uint pages_x;
-    uint pages_y;
-    uint page_table_offset;
-    uint mip_count;
-    uint pad0;
-    uint pad1;
-};
+#include "vt_types.glsl.h"
 
 // ── Required descriptor bindings — provided by the host ─────────────
 //
@@ -65,28 +45,6 @@ struct VirtualTextureMeta {
 //   sampler2D vt_pool_emissive;  // VtLayer::EMISSIVE
 //   readonly buffer VtPageTableBuffer { uint vt_page_table[]; };
 //   readonly buffer VtMetaBuffer      { VirtualTextureMeta vt_meta[]; };
-//
-// The actual layout(set=..., binding=...) lines live in vt_bindings.glsl.h
-// (or wherever the host wires them in) so this file can be included
-// from many different pipelines without re-declaring bindings.
-
-// ── Page-table entry decode ────────────────────────────────────────
-// Matches packPageEntry() in virtual_texture.h:
-//   bits  0..7   phys_x (page coord, 0..255)
-//   bits  8..15  phys_y (page coord, 0..255)
-//   bits 16      resident (1 = mapped)
-struct VtPageEntry {
-    uint phys_x;
-    uint phys_y;
-    bool resident;
-};
-VtPageEntry vtUnpackEntry(uint packed) {
-    VtPageEntry e;
-    e.phys_x   =  packed        & 0xFFu;
-    e.phys_y   = (packed >>  8) & 0xFFu;
-    e.resident = ((packed >> 16) & 0x1u) != 0u;
-    return e;
-}
 
 // ── Core: virtual UV → physical pool UV ────────────────────────────
 // Translate a (vt_id, uv) sample request into a physical pool UV.
@@ -140,9 +98,11 @@ vec4 vtSampleAlbedo(uint vt_id, vec2 uv) {
     VirtualTextureMeta meta = vt_meta[vtIndexOf(vt_id)];
     vec2 phys_uv;
     if (!vtResolve(vt_id, uv, meta, phys_uv)) {
-        // Default: neutral grey so missing pages are visible without
-        // breaking lighting math.  v2 streams the page in.
-        return vec4(0.5, 0.5, 0.5, 1.0);
+        // ── Diagnostic: unresident page fallback ───────────────────
+        // Bright magenta so any surface that fell through to the
+        // "page is missing" branch is visually obvious.  Restore to
+        // neutral grey (0.5,0.5,0.5) once residency is debugged.
+        return vec4(1.0, 0.0, 1.0, 1.0);
     }
     return texture(vt_pool_albedo, phys_uv);
 }

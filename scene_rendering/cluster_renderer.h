@@ -58,6 +58,15 @@ class ClusterRenderer {
     std::vector<std::shared_ptr<renderer::ImageView>> staging_normal_tex_views_;
     std::unordered_map<renderer::ImageView*, int>     staging_normal_slot_map_;
 
+    // ── VT-id dedup caches ────────────────────────────────────────
+    // The same source image can be referenced by many materials.  We
+    // register it with the VT only ONCE; subsequent encounters reuse
+    // the cached VirtualTextureId.  Keyed by Image raw pointer (the
+    // source of truth for "same texture") rather than ImageView so
+    // multiple views of the same image share the registration.
+    std::unordered_map<renderer::Image*, uint32_t> vt_albedo_id_cache_;
+    std::unordered_map<renderer::Image*, uint32_t> vt_normal_id_cache_;
+
     uint32_t uploaded_mesh_count_ = 0;
 
     // ── Shared sampler + dummy 1×1 white texture (fallback for empty slots) ──
@@ -228,6 +237,15 @@ class ClusterRenderer {
     glm::uvec2                           hiz_size_      = glm::uvec2(0);
     uint32_t                             hiz_mip_count_ = 0;
 
+    // ── Runtime Virtual Texture manager ────────────────────────────
+    // Set by the host once at startup via setVtManager().  When set,
+    // uploadMeshClusters registers each material's base-colour and
+    // normal textures with the VT pool and stores the resulting
+    // VirtualTextureId in BindlessMaterialParams.{albedo,normal}_vt_id.
+    // When unset, behaviour matches pre-RVT: textures go into the
+    // legacy bindless texture-array path.
+    class VirtualTextureManager* vt_manager_ = nullptr;
+
     // Debug: last-used VP matrix and camera pos for display.
     glm::mat4 debug_last_vp_ = glm::mat4(1.0f);
     glm::vec3 debug_last_cam_pos_ = glm::vec3(0.0f);
@@ -359,6 +377,14 @@ public:
         const std::shared_ptr<renderer::ImageView>& view,
         const glm::uvec2& size,
         uint32_t mip_count);
+
+    // Hand the cluster renderer a VirtualTextureManager.  When set,
+    // subsequent uploadMeshClusters() calls will register each
+    // material's textures with the VT pool and stash the returned
+    // VirtualTextureId in the material params so the shader can
+    // resolve through the page table.  Pass nullptr to revert to
+    // the legacy bindless texture-array path (useful for A/B).
+    void setVtManager(class VirtualTextureManager* mgr) { vt_manager_ = mgr; }
 
     // Bindless draw — issues two indirect draws and a fullscreen OIT
     // composite, all sharing the same merged VB/IB and bindless desc set:

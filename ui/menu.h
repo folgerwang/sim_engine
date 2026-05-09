@@ -114,6 +114,15 @@ class Menu {
     bool show_csm_debug_ = false;
     std::array<ImTextureID, CSM_CASCADE_COUNT> csm_debug_tex_ids_ = {};
 
+    // RVT pool viewer — direct visualisation of the four 4096² layer
+    // pool textures.  Useful for verifying that registration is
+    // actually copying texel data into the pool (each populated page
+    // shows up as a 128×128 patch within the atlas; empty slots stay
+    // black).  Tex-ids are assigned once at startup by
+    // RealWorldApplication::registerVtPoolImTextureIds().
+    bool show_vt_pool_debug_ = false;
+    std::array<ImTextureID, 4> vt_pool_tex_ids_ = {};
+
     // Collision-mesh debug visualisation. When ON the application
     // skips the regular object forward pass and draws the static
     // CollisionWorld with hashed-per-triangle colours instead. Also
@@ -335,6 +344,13 @@ public:
     inline bool showCsmDebug() const { return show_csm_debug_; }
     void setCsmDebugTextureIds(const std::array<ImTextureID, CSM_CASCADE_COUNT>& ids) {
         csm_debug_tex_ids_ = ids;
+    }
+
+    // RVT pool viewer.
+    inline bool showVtPoolDebug() const { return show_vt_pool_debug_; }
+    inline void setShowVtPoolDebug(bool v) { show_vt_pool_debug_ = v; }
+    void setVtPoolTextureIds(const std::array<ImTextureID, 4>& ids) {
+        vt_pool_tex_ids_ = ids;
     }
 
     // Collision-mesh debug visualisation. The menu owns the canonical

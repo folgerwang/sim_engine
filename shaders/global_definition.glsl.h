@@ -580,12 +580,25 @@ struct ClusterDrawInfo {
                                         // a real translucent pipeline pass has the data.
 
 // Per-material colour data for the bindless cluster renderer.
+//
+// Struct size MUST stay aligned to 16 bytes (std430 needs no padding,
+// but std140 binding contexts would).  Current size: 48 bytes.
+// C++-side static_asserts in cluster_renderer.cpp guard the layout.
 struct BindlessMaterialParams {
-    vec4  base_color_factor;    // RGBA base colour (linear)
-    int   base_color_tex_idx;   // index into base_color_textures[]; -1 = no texture
-    float alpha_cutoff;         // ALPHA_MASK threshold (ignored when flag not set)
-    int   flags;                // BINDLESS_MAT_* bits
-    int   normal_tex_idx;       // index into normal_textures[]; -1 = no normal map
+    vec4  base_color_factor;    // offset  0  RGBA base colour (linear)
+    int   base_color_tex_idx;   // offset 16  index into base_color_textures[] (legacy bindless); -1 = no texture
+    float alpha_cutoff;         // offset 20  ALPHA_MASK threshold
+    int   flags;                // offset 24  BINDLESS_MAT_* bits
+    int   normal_tex_idx;       // offset 28  index into normal_textures[] (legacy); -1 = no normal map
+    // ── Runtime Virtual Texture IDs (one per layer) ──────────────
+    // 0xFFFFFFFF = no VT registration → shader falls back to legacy
+    // texture-array path.  When != INVALID, the VT path is used and
+    // the bindless texture-array indices above are ignored for that
+    // layer.  See vt_sample.glsl.h::vtSample* for the resolve.
+    uint  albedo_vt_id;         // offset 32
+    uint  normal_vt_id;         // offset 36
+    uint  mr_ao_vt_id;          // offset 40
+    uint  emissive_vt_id;       // offset 44
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).

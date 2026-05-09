@@ -49,9 +49,15 @@
 
 #include "renderer/renderer.h"
 #include "shaders/global_definition.glsl.h"
+#include "helper/thread_pool.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
 #include <vector>
 
 namespace engine {
@@ -143,11 +149,43 @@ public:
         uint32_t width,
         uint32_t height);
 
+    // Same as above, but the source pixels live on the GPU (already
+    // uploaded as a sampled image during mesh load).  This is the path
+    // used by the existing material-upload code: the loader has long
+    // since freed the CPU-side blob, but the GPU image is alive in
+    // SHADER_READ_ONLY_OPTIMAL layout.  We do GPU→GPU vkCmdCopyImage
+    // straight into the pool's sub-regions, avoiding any CPU bounce.
+    //
+    //   src_image, src_layout — must be SHADER_READ_ONLY_OPTIMAL on
+    //                           entry.  The image is restored to that
+    //                           layout on return (we transition it to
+    //                           TRANSFER_SRC and back internally).
+    //                           Must have been created with
+    //                           TRANSFER_SRC_BIT usage; loader-created
+    //                           textures do via createTextureImage.
+    //
+    // Format mismatch (e.g. source RGBA8 → pool RG8 for normals) is
+    // handled by reading only the channels Vulkan-blits naturally;
+    // for Layer::NORMAL the .b/.a are dropped on the GPU via the
+    // ImageBlit's destination format, no CPU work needed.
+    VirtualTextureId registerTextureFromImage(
+        VtLayer layer,
+        const std::shared_ptr<renderer::Image>& src_image,
+        uint32_t width,
+        uint32_t height);
+
     // Bind handles for material descriptor sets.
     std::shared_ptr<renderer::ImageView> getPoolImageView(VtLayer layer) const;
     std::shared_ptr<renderer::Sampler>   getPoolSampler() const { return pool_sampler_; }
     std::shared_ptr<renderer::Buffer>    getPageTableBuffer() const { return page_table_buffer_; }
     std::shared_ptr<renderer::Buffer>    getMetaBuffer()      const { return meta_buffer_; }
+
+    // Buffer byte sizes for descriptor writes.  Match what the
+    // constructor passes to createBuffer — the values are derived from
+    // the kMax* constants in virtual_texture.cpp; exposed here so
+    // descriptor write sites don't have to depend on those internals.
+    uint32_t getPageTableBufferBytes() const;
+    uint32_t getMetaBufferBytes() const;
 
     // Push-constant / shader-side constants (matching vt_sample.glsl.h).
     static uint32_t poolWidth()  { return kVtPoolWidth; }
@@ -163,6 +201,16 @@ private:
         uint32_t phys_y,
         const uint8_t* page_pixels,   // 128×128 × stride bytes
         uint32_t src_stride_bytes);   // bytes per row of source
+
+    // BC7 specialised registration: GPU readback the source RGBA8,
+    // encode each page to BC7 Mode 6 on the CPU, upload the BC7 blob
+    // into the ALBEDO pool via staging buffer.  Used by registerTextureFromImage
+    // when layer == ALBEDO since vkCmdCopyImage can't convert source
+    // RGBA8 → destination BC7_SRGB_BLOCK directly.
+    VirtualTextureId registerAlbedoBC7(
+        const std::shared_ptr<renderer::Image>& src_image,
+        uint32_t width,
+        uint32_t height);
 
     // Allocate the next free page slot.  v1 = monotonic counter; v2 =
     // LRU eviction.  Returns kVtPagesPerLayer when full.
@@ -194,6 +242,58 @@ private:
 
     // Free-page allocator.  v1: monotonic.  v2: replace with LRU.
     uint32_t next_free_slot_ = 0;
+    // Tail pointer into page_table_cpu_ for the next registerTexture
+    // call's contiguous window.  v1: monotonic; v2: free-list.
+    uint32_t next_page_table_tail_ = 0;
+
+    // ── CPU thread pool for parallel BC7 encoding ──────────────────
+    // Sized to hardware_concurrency().  Owned by the manager so its
+    // lifetime matches.  Used inside registerAlbedoBC7 to encode
+    // multiple pages concurrently — a 1024² albedo has 64 pages, so
+    // an 8-core machine processes ~8× faster than serial encoding.
+    std::unique_ptr<engine::helper::ThreadPool> encode_pool_;
+
+    // ── Async streaming worker ──────────────────────────────────────
+    // Single dedicated thread that drains a request queue.  Async
+    // semantics: registerTextureFromImage() pre-allocates the VT id +
+    // page-table window on the calling thread (synchronous bookkeeping
+    // — fast), pushes the GPU readback / encode / upload work onto
+    // pending_work_, then returns.  The worker thread later does the
+    // heavy lifting (parallel BC7 encode via encode_pool_) and flips
+    // page-table entries to RESIDENT once each page is uploaded.
+    //
+    // Until that flip, the shader sees pages as not-resident and uses
+    // its fallback (default colour for albedo, up-vector for normal).
+    // From the user's perspective: textures fade in over a few frames
+    // post-scene-load instead of blocking the load screen.
+    //
+    // The worker registers itself as the device's loader thread on
+    // startup, so its setupTransientCommandBuffer() calls are routed
+    // to the loader queue (separate from main thread's compute queue),
+    // avoiding cross-thread Vulkan submission races.
+    struct PendingWork {
+        VtLayer  layer;
+        std::shared_ptr<renderer::Image> src_image;
+        uint32_t width;
+        uint32_t height;
+        uint32_t table_offset;   // pre-allocated page-table window start
+        uint32_t pages_x;
+        uint32_t pages_y;
+        // Per-page allocated phys coords (one entry per page in the
+        // window).  Saved here so the worker doesn't need to re-run
+        // the slot allocator (which isn't thread-safe).
+        std::vector<uint32_t> phys_x;
+        std::vector<uint32_t> phys_y;
+        std::vector<uint8_t>  ok;     // 1 if slot was allocated, 0 if pool full
+    };
+    std::thread             worker_thread_;
+    std::queue<PendingWork> pending_work_;
+    std::mutex              work_mtx_;
+    std::condition_variable work_cv_;
+    std::atomic<bool>       worker_should_stop_{false};
+
+    void workerThreadLoop();
+    void processPendingWork(PendingWork&& w);
 };
 
 }  // namespace scene_rendering
