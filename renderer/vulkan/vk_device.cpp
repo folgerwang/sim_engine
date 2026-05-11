@@ -1,4 +1,6 @@
 #include <iostream>
+#include <cstdio>
+#include <cstring>
 
 #include "../renderer.h"
 #include "vk_device.h"
@@ -8,6 +10,104 @@
 namespace engine {
 namespace renderer {
 namespace vk {
+
+// ── Vulkan object debug naming ───────────────────────────────────────────
+// Tag every created Vulkan object with a name derived from the
+// std::source_location of the call site (file basename + line + function).
+// Result: Nsight Graphics / RenderDoc / validation messages reference each
+// resource by something human-readable like
+//     "Pipeline | cluster_renderer.cpp:2087 in initBindlessPipeline"
+//     "Image    | application.cpp:2128 in recreateRenderBuffer"
+//     "Buffer   | camera.cpp:160 in createViewCameraBuffer"
+// instead of by an opaque VkXXX handle.
+//
+// Cost is zero in release builds where the loader returns nullptr for the
+// proc address (function pointer null-checked before use) and ~one string
+// format + ioctl per create otherwise — Vulkan objects are not created on
+// the per-frame hot path, so the overhead is irrelevant.
+//
+// To extend to a new vkCreate* path, call nameVkObject(...) right after
+// the create returns VK_SUCCESS with the matching VK_OBJECT_TYPE_* enum.
+namespace {
+inline const char* fileBasename(const char* path) {
+    const char* base = path;
+    for (const char* p = path; *p; ++p) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    return base;
+}
+
+// Short human-readable label for each VK_OBJECT_TYPE we care about.
+// Prefixed onto the source-location string so Nsight users can scan/
+// filter the resource list by type at a glance.
+inline const char* objectTypeLabel(VkObjectType t) {
+    switch (t) {
+        case VK_OBJECT_TYPE_PIPELINE:              return "Pipeline";
+        case VK_OBJECT_TYPE_PIPELINE_LAYOUT:       return "PipelineLayout";
+        case VK_OBJECT_TYPE_RENDER_PASS:           return "RenderPass";
+        case VK_OBJECT_TYPE_FRAMEBUFFER:           return "Framebuffer";
+        case VK_OBJECT_TYPE_IMAGE:                 return "Image";
+        case VK_OBJECT_TYPE_IMAGE_VIEW:            return "ImageView";
+        case VK_OBJECT_TYPE_BUFFER:                return "Buffer";
+        case VK_OBJECT_TYPE_SAMPLER:               return "Sampler";
+        case VK_OBJECT_TYPE_DESCRIPTOR_POOL:       return "DescPool";
+        case VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT: return "DescSetLayout";
+        case VK_OBJECT_TYPE_DESCRIPTOR_SET:        return "DescSet";
+        case VK_OBJECT_TYPE_SHADER_MODULE:         return "Shader";
+        case VK_OBJECT_TYPE_COMMAND_POOL:          return "CmdPool";
+        case VK_OBJECT_TYPE_COMMAND_BUFFER:        return "CmdBuf";
+        case VK_OBJECT_TYPE_SEMAPHORE:             return "Semaphore";
+        case VK_OBJECT_TYPE_FENCE:                 return "Fence";
+        case VK_OBJECT_TYPE_QUERY_POOL:            return "QueryPool";
+        case VK_OBJECT_TYPE_SWAPCHAIN_KHR:         return "Swapchain";
+        case VK_OBJECT_TYPE_DEVICE_MEMORY:         return "DeviceMem";
+        case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
+                                                   return "AccelStruct";
+        default:                                   return "VkObject";
+    }
+}
+
+inline void nameVkObject(
+    VkDevice                       device,
+    VkObjectType                   type,
+    uint64_t                       handle,
+    const std::source_location&    loc) {
+    if (!vkSetDebugUtilsObjectNameEXT || handle == 0) {
+        return;
+    }
+    char name[256];
+    // Format: "<TypeLabel> | <file_basename>:<line> in <function_name>"
+    // The function name lets us distinguish e.g. multiple createBuffer
+    // calls inside the same factory function (vertex vs index vs
+    // material UBO, all in drawable_object.cpp).
+    std::snprintf(
+        name, sizeof(name), "%s | %s:%u in %s",
+        objectTypeLabel(type),
+        fileBasename(loc.file_name()),
+        static_cast<unsigned>(loc.line()),
+        loc.function_name());
+    name[sizeof(name) - 1] = '\0';
+
+    VkDebugUtilsObjectNameInfoEXT info{};
+    info.sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType   = type;
+    info.objectHandle = handle;
+    info.pObjectName  = name;
+    vkSetDebugUtilsObjectNameEXT(device, &info);
+}
+
+// Convenience wrapper preserved for the four pipeline create overloads —
+// thin shim over nameVkObject so the call sites stay short.
+inline void namePipeline(
+    VkDevice                       device,
+    VkPipeline                     pipeline,
+    const std::source_location&    loc) {
+    nameVkObject(device,
+                 VK_OBJECT_TYPE_PIPELINE,
+                 reinterpret_cast<uint64_t>(pipeline),
+                 loc);
+}
+}  // namespace
 const char* VkResultToString(
     VkResult result) {
     switch (result) {
@@ -204,6 +304,8 @@ std::shared_ptr<Buffer> VulkanDevice::createBuffer(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_BUFFER,
+                 reinterpret_cast<uint64_t>(buffer), src_location);
     auto vk_buffer =
         std::make_shared<VulkanBuffer>(
             buffer,
@@ -285,6 +387,8 @@ std::shared_ptr<Image> VulkanDevice::createImage(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_IMAGE,
+                 reinterpret_cast<uint64_t>(image), src_location);
     auto vk_image =
         std::make_shared<VulkanImage>(image);
     vk_image->setImageLayout(layout);
@@ -335,6 +439,8 @@ std::shared_ptr<ImageView> VulkanDevice::createImageView(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_IMAGE_VIEW,
+                 reinterpret_cast<uint64_t>(image_view), src_location);
     auto vk_image_view =
         std::make_shared<VulkanImageView>(image_view);
     vk_image_view->set_source_location(src_location);
@@ -389,6 +495,8 @@ VulkanDevice::createSampler(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_SAMPLER,
+                 reinterpret_cast<uint64_t>(tex_sampler), src_location);
     auto vk_tex_sampler =
         std::make_shared<VulkanSampler>(tex_sampler);
     vk_tex_sampler->set_source_location(src_location);
@@ -434,6 +542,8 @@ std::shared_ptr<Semaphore> VulkanDevice::createSemaphore(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_SEMAPHORE,
+                 reinterpret_cast<uint64_t>(semaphore), src_location);
     auto vk_semaphore =
         std::make_shared<VulkanSemaphore>(semaphore);
     vk_semaphore->set_source_location(src_location);
@@ -468,6 +578,8 @@ std::shared_ptr<Fence> VulkanDevice::createFence(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_FENCE,
+                 reinterpret_cast<uint64_t>(fence), src_location);
     auto vk_fence =
         std::make_shared<VulkanFence>(fence);
     vk_fence->set_source_location(src_location);
@@ -504,6 +616,8 @@ VulkanDevice::createShaderModule(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_SHADER_MODULE,
+                 reinterpret_cast<uint64_t>(shader_module), src_location);
     auto vk_shader_module =
         std::make_shared<VulkanShaderModule>(
             shader_module,
@@ -519,7 +633,8 @@ VulkanDevice::createShaderModule(
 
 std::shared_ptr<CommandPool> VulkanDevice::createCommandPool(
     uint32_t queue_family_index,
-    CommandPoolCreateFlags flags) {
+    CommandPoolCreateFlags flags,
+    const std::source_location& src_location) {
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.queueFamilyIndex = queue_family_index;
@@ -539,6 +654,8 @@ std::shared_ptr<CommandPool> VulkanDevice::createCommandPool(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_COMMAND_POOL,
+                 reinterpret_cast<uint64_t>(cmd_pool), src_location);
     auto vk_cmd_pool =
         std::make_shared<VulkanCommandPool>();
     vk_cmd_pool->set(cmd_pool);
@@ -558,7 +675,8 @@ std::shared_ptr<Queue> VulkanDevice::getDeviceQueue(
 }
 
 std::shared_ptr<DescriptorSetLayout> VulkanDevice::createDescriptorSetLayout(
-    const std::vector<DescriptorSetLayoutBinding>& bindings) {
+    const std::vector<DescriptorSetLayoutBinding>& bindings,
+    const std::source_location& src_location) {
     std::vector<VkDescriptorSetLayoutBinding> vk_bindings(bindings.size());
     for (auto i = 0; i < bindings.size(); i++) {
         const auto& binding = bindings[i];
@@ -590,6 +708,9 @@ std::shared_ptr<DescriptorSetLayout> VulkanDevice::createDescriptorSetLayout(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+                 reinterpret_cast<uint64_t>(descriptor_set_layout),
+                 src_location);
     auto vk_set_layout =
         std::make_shared<VulkanDescriptorSetLayout>();
     vk_set_layout->set(descriptor_set_layout);
@@ -648,6 +769,8 @@ std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_RENDER_PASS,
+                 reinterpret_cast<uint64_t>(render_pass), src_location);
     auto vk_render_pass =
         std::make_shared<VulkanRenderPass>(render_pass);
     vk_render_pass->set_source_location(src_location);
@@ -662,7 +785,8 @@ std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
 DescriptorSetList VulkanDevice::createDescriptorSets(
     std::shared_ptr<DescriptorPool> descriptor_pool,
     std::shared_ptr<DescriptorSetLayout> descriptor_set_layout,
-    uint64_t buffer_count) {
+    uint64_t buffer_count,
+    const std::source_location& src_location) {
     auto vk_descriptor_pool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool);
     auto vk_descriptor_set_layout = RENDER_TYPE_CAST(DescriptorSetLayout, descriptor_set_layout);
     std::vector<VkDescriptorSetLayout> layouts(buffer_count, vk_descriptor_set_layout->get());
@@ -689,6 +813,14 @@ DescriptorSetList VulkanDevice::createDescriptorSets(
 
     DescriptorSetList desc_sets(vk_desc_sets.size());
     for (uint32_t i = 0; i < buffer_count; i++) {
+        // Each allocated descriptor set gets the SAME source-location-
+        // derived name.  When createDescriptorSets returns more than one
+        // set (per-FIF / per-cascade allocations), they share a tag —
+        // Nsight distinguishes them by handle, the tag tells you which
+        // call site created the batch.
+        nameVkObject(device_, VK_OBJECT_TYPE_DESCRIPTOR_SET,
+                     reinterpret_cast<uint64_t>(vk_desc_sets[i]),
+                     src_location);
         auto vk_desc_set = std::make_shared<VulkanDescriptorSet>();
         vk_desc_set->set(vk_desc_sets[i]);
         desc_sets[i] = vk_desc_set;
@@ -740,6 +872,8 @@ std::shared_ptr<PipelineLayout> VulkanDevice::createPipelineLayout(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+                 reinterpret_cast<uint64_t>(pipeline_layout), src_location);
     auto vk_pipeline_layout =
         std::make_shared<VulkanPipelineLayout>(pipeline_layout);
     vk_pipeline_layout->set_source_location(src_location);
@@ -822,6 +956,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
             VkResultToString(result));
     }
 
+    namePipeline(device_, graphics_pipeline, src_location);
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(graphics_pipeline);
     vk_pipeline->set_source_location(src_location);
@@ -931,6 +1066,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
             VkResultToString(result));
     }
 
+    namePipeline(device_, graphics_pipeline, src_location);
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(graphics_pipeline);
     vk_pipeline->set_source_location(src_location);
@@ -975,6 +1111,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
             VkResultToString(result));
     }
 
+    namePipeline(device_, compute_pipeline, src_location);
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(compute_pipeline);
     vk_pipeline->set_source_location(src_location);
@@ -1025,6 +1162,7 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
             VkResultToString(result));
     }
 
+    namePipeline(device_, rt_pipeline, src_location);
     auto vk_pipeline =
         std::make_shared<VulkanPipeline>(rt_pipeline);
     vk_pipeline->set_source_location(src_location);
@@ -1045,7 +1183,8 @@ std::shared_ptr<Swapchain> VulkanDevice::createSwapchain(
     const SurfaceTransformFlagBits& transform,
     const PresentMode& present_mode,
     const ImageUsageFlags& usage,
-    const std::vector<uint32_t>& queue_index) {
+    const std::vector<uint32_t>& queue_index,
+    const std::source_location& src_location) {
 
     auto vk_surface = RENDER_TYPE_CAST(Surface, surface);
 
@@ -1083,6 +1222,8 @@ std::shared_ptr<Swapchain> VulkanDevice::createSwapchain(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_SWAPCHAIN_KHR,
+                 reinterpret_cast<uint64_t>(swap_chain), src_location);
     auto vk_swap_chain =
         std::make_shared<VulkanSwapchain>();
     vk_swap_chain->set(swap_chain);
@@ -1125,6 +1266,8 @@ std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_FRAMEBUFFER,
+                 reinterpret_cast<uint64_t>(frame_buffer), src_location);
     auto vk_frame_buffer =
         std::make_shared<VulkanFramebuffer>(frame_buffer);
     vk_frame_buffer->set_source_location(src_location);
@@ -1136,7 +1279,8 @@ std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
     return vk_frame_buffer;
 }
 
-std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool() {
+std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool(
+    const std::source_location& src_location) {
     VkDescriptorPoolSize pool_sizes[] =
     {
         { VK_DESCRIPTOR_TYPE_SAMPLER, 16 },
@@ -1173,6 +1317,8 @@ std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool() {
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_DESCRIPTOR_POOL,
+                 reinterpret_cast<uint64_t>(descriptor_pool), src_location);
     auto vk_descriptor_pool =
         std::make_shared<VulkanDescriptorPool>();
     vk_descriptor_pool->set(descriptor_pool);
@@ -1311,7 +1457,9 @@ void VulkanDevice::dumpBufferMemory(
     }
 }
 
-std::vector<std::shared_ptr<Image>> VulkanDevice::getSwapchainImages(std::shared_ptr<Swapchain> swap_chain) {
+std::vector<std::shared_ptr<Image>> VulkanDevice::getSwapchainImages(
+    std::shared_ptr<Swapchain> swap_chain,
+    const std::source_location& src_location) {
     auto vk_swap_chain = RENDER_TYPE_CAST(Swapchain, swap_chain);
     uint32_t image_count;
     std::vector<VkImage> swap_chain_images;
@@ -1321,6 +1469,13 @@ std::vector<std::shared_ptr<Image>> VulkanDevice::getSwapchainImages(std::shared
 
     std::vector<std::shared_ptr<Image>> vk_swap_chain_images(swap_chain_images.size());
     for (int i = 0; i < swap_chain_images.size(); i++) {
+        // Swapchain images are owned by the WSI implementation, not us,
+        // but they still benefit from a tag — Nsight shows the per-frame
+        // present target by name (e.g. "Image | renderer.cpp:### in
+        // createSwapChain") instead of an opaque handle.
+        nameVkObject(device_, VK_OBJECT_TYPE_IMAGE,
+                     reinterpret_cast<uint64_t>(swap_chain_images[i]),
+                     src_location);
         auto vk_image = std::make_shared<VulkanImage>(swap_chain_images[i]);
         vk_swap_chain_images[i] = vk_image;
     }
@@ -1332,7 +1487,8 @@ VulkanDevice::allocateMemory(
     const uint64_t& buf_size,
     const uint32_t& memory_type_bits,
     const MemoryPropertyFlags& properties,
-    const MemoryAllocateFlags& allocate_flags) {
+    const MemoryAllocateFlags& allocate_flags,
+    const std::source_location& src_location) {
     VkMemoryAllocateFlagsInfo alloc_flags_info{};
     alloc_flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
     alloc_flags_info.flags = helper::toVkMemoryAllocateFlags(allocate_flags);
@@ -1363,6 +1519,8 @@ VulkanDevice::allocateMemory(
             VkResultToString(result));
     }
 
+    nameVkObject(device_, VK_OBJECT_TYPE_DEVICE_MEMORY,
+                 reinterpret_cast<uint64_t>(memory), src_location);
     auto vk_device_memory =
         std::make_shared<VulkanDeviceMemory>();
     vk_device_memory->set(memory);
@@ -1419,9 +1577,10 @@ void VulkanDevice::bindImageMemory(std::shared_ptr<Image> image, std::shared_ptr
 }
 
 std::vector<std::shared_ptr<CommandBuffer>> VulkanDevice::allocateCommandBuffers(
-    std::shared_ptr<CommandPool> cmd_pool, 
-    uint32_t num_buffers, 
-    bool is_primary/* = true*/) {
+    std::shared_ptr<CommandPool> cmd_pool,
+    uint32_t num_buffers,
+    bool is_primary/* = true*/,
+    const std::source_location& src_location) {
     auto vk_cmd_pool = RENDER_TYPE_CAST(CommandPool, cmd_pool);
     std::vector<VkCommandBuffer> cmd_bufs(num_buffers);
 
@@ -1447,6 +1606,12 @@ std::vector<std::shared_ptr<CommandBuffer>> VulkanDevice::allocateCommandBuffers
 
     std::vector<std::shared_ptr<CommandBuffer>> result(num_buffers);
     for (uint32_t i = 0; i < num_buffers; i++) {
+        // All command buffers allocated in one call share the same tag.
+        // For per-FIF / per-image CB arrays this means they appear in
+        // Nsight with the same source-location label; distinguish by
+        // handle order.
+        nameVkObject(device_, VK_OBJECT_TYPE_COMMAND_BUFFER,
+                     reinterpret_cast<uint64_t>(cmd_bufs[i]), src_location);
         auto cmd_buf = std::make_shared<VulkanCommandBuffer>();
         cmd_buf->set(cmd_bufs[i]);
         result[i] = cmd_buf;

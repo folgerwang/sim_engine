@@ -23,6 +23,10 @@ extern PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT;
 extern PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT;
 extern PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
 extern PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
+// Used to tag Vulkan objects (pipelines, buffers, images, ...) with a
+// human-readable name so they show up identifiable in Nsight Graphics /
+// RenderDoc / Vulkan validation messages instead of as raw handles.
+extern PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
 extern PFN_vkCmdBeginRenderingKHR vkCmdBeginRenderingKHR;
 
 namespace helper {

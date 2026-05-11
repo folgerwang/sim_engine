@@ -89,7 +89,9 @@ public:
 
     const std::shared_ptr<PhysicalDevice>& getPhysicalDevice() {
         return physical_device_; }
-    virtual std::shared_ptr<DescriptorPool> createDescriptorPool() final;
+    virtual std::shared_ptr<DescriptorPool> createDescriptorPool(
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual void createBuffer(
         const uint64_t& buffer_size,
         const BufferUsageFlags& usage,
@@ -103,13 +105,17 @@ public:
     virtual DescriptorSetList createDescriptorSets(
         std::shared_ptr<DescriptorPool> descriptor_pool,
         std::shared_ptr<DescriptorSetLayout> descriptor_set_layout,
-        uint64_t buffer_count) final;
+        uint64_t buffer_count,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual std::shared_ptr<PipelineLayout> createPipelineLayout(
         const DescriptorSetLayoutList& desc_set_layouts,
         const std::vector<PushConstantRange>& push_const_ranges,
         const std::source_location& src_location) final;
     virtual std::shared_ptr<DescriptorSetLayout> createDescriptorSetLayout(
-        const std::vector<DescriptorSetLayoutBinding>& bindings) final;
+        const std::vector<DescriptorSetLayoutBinding>& bindings,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual std::shared_ptr<RenderPass> createRenderPass(
         const std::vector<AttachmentDescription>& attachments,
         const std::vector<SubpassDescription>& subpasses,
@@ -154,7 +160,9 @@ public:
         const SurfaceTransformFlagBits& transform,
         const PresentMode& present_mode,
         const ImageUsageFlags& usage,
-        const std::vector<uint32_t>& queue_index) final;
+        const std::vector<uint32_t>& queue_index,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual void updateBufferMemory(
         const std::shared_ptr<DeviceMemory>& memory,
         uint64_t size,
@@ -165,14 +173,23 @@ public:
         uint64_t size,
         void* dst_data,
         uint64_t offset = 0) final;
-    virtual std::vector<std::shared_ptr<Image>> getSwapchainImages(std::shared_ptr<Swapchain> swap_chain) final;
-    virtual std::shared_ptr<CommandPool> createCommandPool(uint32_t queue_family_index, CommandPoolCreateFlags flags) final;
+    virtual std::vector<std::shared_ptr<Image>> getSwapchainImages(
+        std::shared_ptr<Swapchain> swap_chain,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
+    virtual std::shared_ptr<CommandPool> createCommandPool(
+        uint32_t queue_family_index,
+        CommandPoolCreateFlags flags,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual std::shared_ptr<Queue> getDeviceQueue(uint32_t queue_family_index, uint32_t queue_index = 0) final;
     virtual std::shared_ptr<DeviceMemory> allocateMemory(
         const uint64_t& buf_size,
         const uint32_t& memory_type_bits,
         const MemoryPropertyFlags& properties,
-        const MemoryAllocateFlags& allocate_flags) final;
+        const MemoryAllocateFlags& allocate_flags,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual MemoryRequirements getBufferMemoryRequirements(std::shared_ptr<Buffer> buffer) final;
     virtual MemoryRequirements getImageMemoryRequirements(std::shared_ptr<Image> image) final;
     virtual std::shared_ptr<Buffer> createBuffer(
@@ -229,7 +246,12 @@ public:
         bool signaled = false) final;
     virtual void bindBufferMemory(std::shared_ptr<Buffer> buffer, std::shared_ptr<DeviceMemory> buffer_memory, uint64_t offset = 0) final;
     virtual void bindImageMemory(std::shared_ptr<Image> image, std::shared_ptr<DeviceMemory> image_memory, uint64_t offset = 0) final;
-    virtual std::vector<std::shared_ptr<CommandBuffer>> allocateCommandBuffers(std::shared_ptr<CommandPool> cmd_pool, uint32_t num_buffers, bool is_primary = true) final;
+    virtual std::vector<std::shared_ptr<CommandBuffer>> allocateCommandBuffers(
+        std::shared_ptr<CommandPool> cmd_pool,
+        uint32_t num_buffers,
+        bool is_primary = true,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual void* mapMemory(std::shared_ptr<DeviceMemory> memory, uint64_t size, uint64_t offset = 0) final;
     virtual void unmapMemory(std::shared_ptr<DeviceMemory> memory) final;
     virtual void destroyCommandPool(std::shared_ptr<CommandPool> cmd_pool) final;
