@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -534,6 +535,21 @@ static void setupMeshState(
                 dst_tex.image,
                 dst_tex.memory,
                 std::source_location::current());
+
+            // Populate dst_tex.size — the glTF loader had been
+            // leaving it at the default glm::uvec3(0).  Mirror what
+            // other loaders (renderer.cpp:572/830, engine_helper.cpp
+            // :161) already do.
+            dst_tex.size = glm::uvec3(
+                uint32_t(src_img.width), uint32_t(src_img.height), 1u);
+
+            // Stash the raw RGBA8 pixel data so the VT manager can
+            // build its bordered tile pyramid from CPU memory at
+            // registerMaterial time — no GPU readback needed.  Copy
+            // (not move) since tinygltf still owns the model and
+            // other code paths might read src_img.image too.
+            dst_tex.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
+                src_img.image.begin(), src_img.image.end());
 
             dst_tex.view = device->createImageView(
                 dst_tex.image,

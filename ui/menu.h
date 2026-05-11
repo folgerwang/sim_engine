@@ -13,7 +13,7 @@ namespace plugins { class PluginManager; }
 
 namespace engine {
 namespace game_object { class MeshLoadTaskManager; }
-namespace scene_rendering { class SSAO; class ClusterRenderer; }
+namespace scene_rendering { class SSAO; class ClusterRenderer; class VirtualTextureManager; }
 namespace ui {
 
 // Game-level state machine driven by the title-screen menu.
@@ -281,6 +281,11 @@ private:
     engine::scene_rendering::ClusterRenderer* cluster_renderer_ = nullptr;
     bool show_smart_mesh_window_ = false;
 
+    // Optional VirtualTextureManager — set from application after
+    // init.  The pool debug viewer reads getSlotStatusGrid() from
+    // this each frame to draw the per-slot activity heatmap.
+    engine::scene_rendering::VirtualTextureManager* vt_manager_ = nullptr;
+
 public:
     void setBackgroundEnabled(bool enabled) { bg_enabled_ = enabled; }
     bool isBackgroundEnabled() const { return bg_enabled_; }
@@ -298,6 +303,9 @@ public:
     }
     void setClusterRenderer(engine::scene_rendering::ClusterRenderer* cr) {
         cluster_renderer_ = cr;
+    }
+    void setVtManager(engine::scene_rendering::VirtualTextureManager* m) {
+        vt_manager_ = m;
     }
 
     // Game state accessors.

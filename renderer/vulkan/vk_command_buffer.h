@@ -153,6 +153,12 @@ public:
         uint64_t size,
         uint32_t data) final;
 
+    virtual void updateBuffer(
+        const std::shared_ptr<Buffer>& buffer,
+        uint64_t offset,
+        uint64_t size,
+        const void* data) final;
+
     virtual void resetQueryPool(
         const std::shared_ptr<QueryPool>& query_pool,
         uint32_t first_query,

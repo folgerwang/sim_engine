@@ -510,10 +510,11 @@ void ClusterRenderer::uploadMeshClusters(
         glsl::BindlessMaterialParams mp{};
         mp.base_color_tex_idx = -1;
         mp.normal_tex_idx     = -1;
-        // VT IDs default to INVALID until registerTextureFromImage
-        // assigns one.  Shader checks against kInvalidVtId to fall
-        // back to the legacy bindless path when VT registration was
-        // skipped (pool full, manager not wired, etc.).
+        // VT IDs default to INVALID until registerMaterial assigns
+        // one (per layer that actually had a source image).  Shader
+        // checks against kInvalidVtId to fall back to the legacy
+        // bindless path when VT registration was skipped (pool full,
+        // manager not wired, layer had no source image, etc.).
         mp.albedo_vt_id   = 0xFFFFFFFFu;
         mp.normal_vt_id   = 0xFFFFFFFFu;
         mp.mr_ao_vt_id    = 0xFFFFFFFFu;
@@ -538,75 +539,101 @@ void ClusterRenderer::uploadMeshClusters(
                     }
                     // Stage the base-color texture (binding 2).
                     int32_t tex_idx = mat.base_color_idx_;
+                    // Resolve albedo TextureInfo and add to legacy
+                    // bindless array (parallel path, see VT block
+                    // below).  Capture for the combined VT
+                    // registration call.
+                    const renderer::TextureInfo* albedo_tex = nullptr;
                     if (tex_idx >= 0 &&
                         static_cast<size_t>(tex_idx) < drawable_data.textures_.size()) {
-                        const auto& tex = drawable_data.textures_[tex_idx];
-                        if (tex.view) {
-                            auto tex_it = staging_tex_slot_map_.find(tex.view.get());
+                        albedo_tex = &drawable_data.textures_[tex_idx];
+                        if (albedo_tex->view) {
+                            auto tex_it = staging_tex_slot_map_.find(albedo_tex->view.get());
                             if (tex_it != staging_tex_slot_map_.end()) {
                                 mp.base_color_tex_idx = tex_it->second;
                             } else if (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
                                 int slot = static_cast<int>(staging_tex_views_.size());
-                                staging_tex_slot_map_[tex.view.get()] = slot;
-                                staging_tex_views_.push_back(tex.view);
+                                staging_tex_slot_map_[albedo_tex->view.get()] = slot;
+                                staging_tex_views_.push_back(albedo_tex->view);
                                 mp.base_color_tex_idx = slot;
                             }
                             // else: over MAX_CLUSTER_TEXTURES — idx stays -1
                         }
-                        // ── RVT registration (parallel path) ──────────
-                        // Register the same source image with the VT pool.
-                        // Cache by Image* so duplicate references share one
-                        // registration.  The shader (once switched) uses
-                        // mp.albedo_vt_id when valid, falling back to the
-                        // bindless texture-array slot when INVALID.
-                        if (vt_manager_ && tex.image) {
-                            auto vt_it = vt_albedo_id_cache_.find(tex.image.get());
-                            if (vt_it != vt_albedo_id_cache_.end()) {
-                                mp.albedo_vt_id = vt_it->second;
-                            } else {
-                                uint32_t vid = vt_manager_->registerTextureFromImage(
-                                    VtLayer::ALBEDO,
-                                    tex.image,
-                                    tex.size.x,
-                                    tex.size.y);
-                                if (vid != kInvalidVtId) {
-                                    vt_albedo_id_cache_[tex.image.get()] = vid;
-                                    mp.albedo_vt_id = vid;
-                                }
-                            }
-                        }
                     }
                     // Stage the normal-map texture (binding 3).
                     int32_t norm_idx = mat.normal_idx_;
+                    const renderer::TextureInfo* normal_tex = nullptr;
                     if (norm_idx >= 0 &&
                         static_cast<size_t>(norm_idx) < drawable_data.textures_.size()) {
-                        const auto& ntex = drawable_data.textures_[norm_idx];
-                        if (ntex.view) {
-                            auto n_it = staging_normal_slot_map_.find(ntex.view.get());
+                        normal_tex = &drawable_data.textures_[norm_idx];
+                        if (normal_tex->view) {
+                            auto n_it = staging_normal_slot_map_.find(normal_tex->view.get());
                             if (n_it != staging_normal_slot_map_.end()) {
                                 mp.normal_tex_idx = n_it->second;
                             } else if (staging_normal_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
                                 int slot = static_cast<int>(staging_normal_tex_views_.size());
-                                staging_normal_slot_map_[ntex.view.get()] = slot;
-                                staging_normal_tex_views_.push_back(ntex.view);
+                                staging_normal_slot_map_[normal_tex->view.get()] = slot;
+                                staging_normal_tex_views_.push_back(normal_tex->view);
                                 mp.normal_tex_idx = slot;
                             }
                         }
-                        // RVT registration for normal layer (parallel path).
-                        if (vt_manager_ && ntex.image) {
-                            auto vt_it = vt_normal_id_cache_.find(ntex.image.get());
-                            if (vt_it != vt_normal_id_cache_.end()) {
-                                mp.normal_vt_id = vt_it->second;
-                            } else {
-                                uint32_t vid = vt_manager_->registerTextureFromImage(
-                                    VtLayer::NORMAL,
-                                    ntex.image,
-                                    ntex.size.x,
-                                    ntex.size.y);
-                                if (vid != kInvalidVtId) {
-                                    vt_normal_id_cache_[ntex.image.get()] = vid;
-                                    mp.normal_vt_id = vid;
+                    }
+                    // ── Unified VT registration (per-material) ────
+                    // Single registerMaterial call uploads albedo +
+                    // (optionally) normal into the matching layer
+                    // pools at IDENTICAL physical slot positions.
+                    // The same vt_id then resolves correctly across
+                    // both layers in cluster_bindless.frag — slot N
+                    // in vt_pool_albedo is material X's albedo, slot
+                    // N in vt_pool_normal is material X's normal.
+                    //
+                    // Cache by albedo Image* — Bistro materials that
+                    // share an albedo image typically share the rest
+                    // too, so this de-dupes successfully.  If a
+                    // future asset reuses an albedo with a different
+                    // normal, the cache would return the FIRST
+                    // material's normal data; revisit with a
+                    // tuple-keyed cache when that case appears.
+                    if (vt_manager_ && albedo_tex && albedo_tex->image &&
+                        albedo_tex->size.x > 0 && albedo_tex->size.y > 0) {
+                        auto vt_it = vt_albedo_id_cache_.find(albedo_tex->image.get());
+                        uint32_t vid = kInvalidVtId;
+                        if (vt_it != vt_albedo_id_cache_.end()) {
+                            vid = vt_it->second;
+                        } else {
+                            const auto& nrm_img =
+                                (normal_tex && normal_tex->image)
+                                    ? normal_tex->image
+                                    : std::shared_ptr<renderer::Image>();
+                            // Prefer CPU pixels when the loader stashed them
+                            // (glTF + non-DDS engine_helper paths).  Fall
+                            // back to the GPU image — registerMaterial does
+                            // a one-time blit-decode + readback for BC-only
+                            // sources to materialise RGBA8.
+                            const uint8_t* px =
+                                (albedo_tex->cpu_pixels &&
+                                 !albedo_tex->cpu_pixels->empty())
+                                ? albedo_tex->cpu_pixels->data()
+                                : nullptr;
+                            vid = vt_manager_->registerMaterial(
+                                px,
+                                albedo_tex->image,
+                                nrm_img,
+                                /*mr_ao*/   nullptr,
+                                /*emissive*/nullptr,
+                                albedo_tex->size.x,
+                                albedo_tex->size.y);
+                            if (vid != kInvalidVtId) {
+                                vt_albedo_id_cache_[albedo_tex->image.get()] = vid;
+                                if (nrm_img) {
+                                    vt_normal_id_cache_[nrm_img.get()] = vid;
                                 }
+                            }
+                        }
+                        if (vid != kInvalidVtId) {
+                            mp.albedo_vt_id = vid;
+                            if (normal_tex && normal_tex->image) {
+                                mp.normal_vt_id = vid;
                             }
                         }
                     }
@@ -1134,6 +1161,12 @@ void ClusterRenderer::finalizeUploads() {
         staging_normal_tex_views_.push_back(dummy_texture_.view);
     }
 
+    // Backup material_params (with VT ids populated) so setVtEnabled()
+    // can restore them after a user-driven VT-off → VT-on transition.
+    // ~48 B per material × ~3K materials = ~150 KB CPU; trivial.
+    material_params_backup_ = staging_material_params_;
+    vt_enabled_ = true;  // freshly uploaded with VT ids → VT is on.
+
     // Free CPU staging memory.
     staging_cull_infos_.clear();
     staging_cull_infos_.shrink_to_fit();
@@ -1147,6 +1180,54 @@ void ClusterRenderer::finalizeUploads() {
     staging_vertices_.shrink_to_fit();
     staging_indices_.clear();
     staging_indices_.shrink_to_fit();
+}
+
+// ─── setVtEnabled ──────────────────────────────────────────────────────────
+// Toggle the runtime VT path on/off without restarting the scene.  Walks
+// material_params_backup_ (the original CPU copy with VT ids populated),
+// either uses it as-is (enable) or copies with all four vt_id fields
+// overwritten to VT_INVALID_ID (disable), and writes the result to the
+// HOST_VISIBLE material_params SSBO.  The shader's existing fallback to
+// the legacy bindless texture arrays handles the "all VT ids invalid"
+// case automatically — no shader rebuild, no descriptor-set rewrite.
+void ClusterRenderer::setVtEnabled(bool enabled) {
+    if (enabled == vt_enabled_) return;
+    if (material_params_backup_.empty() ||
+        !material_params_buffer_.memory) {
+        vt_enabled_ = enabled;
+        return;
+    }
+    constexpr uint32_t kInvalidVtId = 0xFFFFFFFFu;
+    const size_t bytes =
+        material_params_backup_.size() * sizeof(glsl::BindlessMaterialParams);
+    if (enabled) {
+        // Restore the original VT ids (BIN-equal copy of the upload).
+        device_->updateBufferMemory(
+            material_params_buffer_.memory,
+            bytes,
+            material_params_backup_.data());
+    } else {
+        // Build a temp copy with vt_ids cleared and upload that.  The
+        // shader sees VT_INVALID_ID for every layer and routes through
+        // base_color_textures[]/normal_textures[] bindless arrays.
+        std::vector<glsl::BindlessMaterialParams> off_copy =
+            material_params_backup_;
+        for (auto& mp : off_copy) {
+            mp.albedo_vt_id   = kInvalidVtId;
+            mp.normal_vt_id   = kInvalidVtId;
+            mp.mr_ao_vt_id    = kInvalidVtId;
+            mp.emissive_vt_id = kInvalidVtId;
+        }
+        device_->updateBufferMemory(
+            material_params_buffer_.memory,
+            bytes,
+            off_copy.data());
+    }
+    vt_enabled_ = enabled;
+    std::printf("[CLUSTER_RENDERER] VT %s — material_params re-uploaded "
+                "(%zu materials, %zu KB)\n",
+                enabled ? "ENABLED" : "DISABLED",
+                material_params_backup_.size(), bytes / 1024u);
 }
 
 // ─── setHiZTexture ─────────────────────────────────────────────────────────
@@ -1782,10 +1863,11 @@ void ClusterRenderer::initBindlessPipeline(
     // binding 5: sampler2D vt_pool_normal
     // binding 6: sampler2D vt_pool_mr_ao
     // binding 7: sampler2D vt_pool_emissive
-    // binding 8: VtPageTable SSBO (uint[])
-    // binding 9: VtMeta      SSBO (VirtualTextureMeta[])
+    // binding 8:  VtPageTable SSBO (uint[])
+    // binding 9:  VtMeta      SSBO (VirtualTextureMeta[])
+    // binding 10: VtFeedback  SSBO (uint[])  — streaming requests
     {
-        std::vector<er::DescriptorSetLayoutBinding> bindings(10);
+        std::vector<er::DescriptorSetLayoutBinding> bindings(11);
         bindings[0] = er::helper::getBufferDescriptionSetLayoutBinding(
             0, SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
                SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
@@ -1819,6 +1901,11 @@ void ClusterRenderer::initBindlessPipeline(
         // VT meta SSBO.
         bindings[9] = er::helper::getBufferDescriptionSetLayoutBinding(
             9, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            er::DescriptorType::STORAGE_BUFFER);
+        // VT feedback SSBO — fragment shader writes one tile-key per
+        // 8×8 screen block; the streamer reads at frame end.
+        bindings[10] = er::helper::getBufferDescriptionSetLayoutBinding(
+            10, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
             er::DescriptorType::STORAGE_BUFFER);
         bindless_desc_set_layout_ = device_->createDescriptorSetLayout(bindings);
     }
@@ -2198,6 +2285,13 @@ void ClusterRenderer::initBindlessPipeline(
                 er::DescriptorType::STORAGE_BUFFER, 9,
                 vt_manager_->getMetaBuffer(),
                 vt_manager_->getMetaBufferBytes());
+            // VT streaming feedback SSBO.  Fragment shader writes one
+            // tile-key per 8×8 screen block; VirtualTextureManager::tick
+            // drains the buffer at frame end.
+            er::Helper::addOneBuffer(writes, bindless_desc_set_,
+                er::DescriptorType::STORAGE_BUFFER, 10,
+                vt_manager_->getFeedbackBuffer(),
+                vt_manager_->getFeedbackBufferBytes());
         } else {
             // Fallback: dummy texture for the four pool slots.  No
             // safe placeholder for the SSBOs without allocating one;
@@ -2872,6 +2966,10 @@ void ClusterRenderer::recreate(
             er::DescriptorType::STORAGE_BUFFER, 9,
             vt_manager_->getMetaBuffer(),
             vt_manager_->getMetaBufferBytes());
+        er::Helper::addOneBuffer(writes, bindless_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 10,
+            vt_manager_->getFeedbackBuffer(),
+            vt_manager_->getFeedbackBufferBytes());
     }
 
     device_->updateDescriptorSets(writes);

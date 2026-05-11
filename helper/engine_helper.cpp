@@ -143,6 +143,9 @@ void createTextureImage(
             texture.image,
             texture.memory,
             src_location);
+        // DDS path keeps texture.cpu_pixels null — the buffer holds
+        // BC-compressed data, not the RGBA8 the VT manager expects.
+        // Materials that use DDS sources will skip VT registration.
     }
     else {
         renderer::Helper::create2DTextureImage(
@@ -154,6 +157,18 @@ void createTextureImage(
             texture.image,
             texture.memory,
             src_location);
+
+        // Stash a CPU-side copy of the just-decoded RGBA8 pixels so
+        // the Virtual Texture manager can build its bordered tile
+        // pyramid without a GPU readback.  Only meaningful for the
+        // RGBA8 (4 bytes/texel) path — R16 textures aren't sliced
+        // into VT tiles, so skip the copy.
+        if (format != engine::renderer::Format::R16_UNORM) {
+            const size_t bytes = size_t(tex_width) * size_t(tex_height) * 4u;
+            const uint8_t* src = static_cast<const uint8_t*>(void_pixels);
+            texture.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
+                src, src + bytes);
+        }
 
         stbi_image_free(void_pixels);
     }

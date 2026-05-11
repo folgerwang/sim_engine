@@ -41,5 +41,31 @@ void encodeBC7Mode6(
     uint32_t       height,
     uint8_t*       dst_bc7);
 
+// Compress a 2-channel (RG) image into BC5_UNORM (= 2× BC4 channels
+// concatenated, 16 bytes per 4×4 block).  Reads the R and G channels
+// from a tightly-packed RGBA8 source (B and A are ignored — caller
+// is responsible for placing the two normal channels in R + G).
+//
+// Output buffer must be at least:
+//     ((width + 3) / 4) * ((height + 3) / 4) * 16   bytes
+//
+// Edge padding is the same as encodeBC7Mode6: blocks past the image
+// right/bottom edge clamp to the rightmost/bottommost real texel.
+//
+// BC5 is the canonical hardware-decoded format for tangent-space
+// normal maps — RG-only with 8-bit endpoints + 3-bit per-texel
+// weights gives ~4× memory saving over RGBA8 with no visible quality
+// loss for typical normal map content (smooth angle distributions).
+//
+//   src_rgba   tightly-packed RGBA8 source, row-major.
+//   width,
+//   height     source dimensions in texels.
+//   dst_bc5    destination buffer (caller-allocated).
+void encodeBC5UNorm(
+    const uint8_t* src_rgba,
+    uint32_t       width,
+    uint32_t       height,
+    uint8_t*       dst_bc5);
+
 }  // namespace scene_rendering
 }  // namespace engine

@@ -2593,13 +2593,24 @@ void transitionImageLayout(
     uint32_t base_layer/* = 0*/,
     uint32_t layer_count/* = 1*/) {
 
+    // BUG-FIX: forward the mip / layer range to the inner cmd_buf
+    // overload.  Previously these parameters were SILENTLY DROPPED,
+    // so any multi-mip image (notably the 2-mip VT BC7 pools) only
+    // had mip 0 transitioned at creation — mip 1 stayed in UNDEFINED
+    // layout while every barrier afterwards claimed it was in
+    // SHADER_READ_ONLY_OPTIMAL.  Drivers tolerated the inconsistency
+    // most of the time but occasionally returned undefined contents.
     auto cmd_buf = device->setupTransientCommandBuffer();
     vk::helper::transitionImageLayout(
         cmd_buf,
         image,
         format,
         old_layout,
-        new_layout);
+        new_layout,
+        base_mip_idx,
+        mip_count,
+        base_layer,
+        layer_count);
     device->submitAndWaitTransientCommandBuffer();
 }
 

@@ -411,12 +411,20 @@ struct QueueFamilyList {
 struct TextureInfo {
     bool                               linear = true;
     glm::uvec3                         size = glm::uvec3(0);
-    uint32_t                           mip_levels = 1; 
+    uint32_t                           mip_levels = 1;
     std::shared_ptr<Image>             image;
     std::shared_ptr<DeviceMemory>      memory;
     std::shared_ptr<ImageView>         view;
     std::vector<std::vector<std::shared_ptr<ImageView>>> surface_views;
     std::vector<std::shared_ptr<Framebuffer>> framebuffers;
+    // Optional: source RGBA8 pixels kept in CPU memory for systems
+    // that need CPU-side access (e.g., the Virtual Texture manager
+    // slices the source into bordered tiles at registerMaterial
+    // time without doing a GPU readback).  The glTF loader fills
+    // this with the tinygltf-decoded pixel buffer; most other
+    // texture creation paths leave it null.  shared_ptr so multiple
+    // consumers can hand the buffer around without copying.
+    std::shared_ptr<std::vector<uint8_t>> cpu_pixels;
 
     void destroy(const std::shared_ptr<Device>& device);
 };

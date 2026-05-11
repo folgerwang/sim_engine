@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <chrono>
 #include <memory>
 #include "renderer/renderer.h"
 
@@ -58,8 +59,10 @@ struct ScopeDisplay {
 
 // One complete frame of collected GPU data.
 struct FrameRecord {
-    std::vector<ScopeDisplay> scopes;
-    float total_ms = 0.0f;  // sum of depth-0 scopes
+    std::vector<ScopeDisplay> scopes;       // GPU scopes (relative to GPU frame-start tick)
+    std::vector<ScopeDisplay> cpu_scopes;   // CPU scopes (relative to CPU frame-start time)
+    float total_ms = 0.0f;       // sum of depth-0 GPU scopes
+    float total_cpu_ms = 0.0f;   // sum of depth-0 CPU scopes
 };
 
 class GpuProfiler {
@@ -98,6 +101,21 @@ public:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         uint32_t frame_index);
 
+    // ── CPU scope API (parallel to the GPU one) ────────────────────
+    // Uses std::chrono::high_resolution_clock; no command buffer or
+    // query pool needed since the timing is host-side.  Call
+    // beginCpuFrame at the very start of frame N's CPU work, then
+    // wrap any CPU phase in begin/endCpuScope, then endCpuFrame
+    // before the application moves on to the next frame.  The
+    // recorded CPU scopes are stashed into the FrameState's slot
+    // for `frame_index` and merged into the FrameRecord by the
+    // matching call to collectResults — so CPU lanes line up with
+    // GPU lanes for the same logical frame in the timeline UI.
+    void beginCpuFrame(uint32_t frame_index);
+    uint32_t beginCpuScope(const char* name);
+    void endCpuScope(uint32_t scope_handle);
+    void endCpuFrame(uint32_t frame_index);
+
     // Call AFTER the GPU has finished the frame (typically with a 1-frame
     // delay to avoid stalls).  frame_index is the frame-in-flight slot.
     void collectResults(
@@ -124,6 +142,39 @@ public:
         return &m_frames_[idx];
     }
 
+    // ── Combined CPU + GPU scope (RAII) ─────────────────────────────
+    // Records a CPU scope AND a GPU scope with the same name so the
+    // profiler shows two bars at the same horizontal position — the
+    // CPU bar measures recording time, the GPU bar measures execution
+    // time.  Use:
+    //   {
+    //     auto _t = gpu_profiler_.scope(cmd_buf, "My Pass");
+    //     // ... record + execute work ...
+    //   }   // scope auto-closes both
+    class Scope {
+    public:
+        Scope(GpuProfiler& p, const std::shared_ptr<renderer::CommandBuffer>& cb,
+              const char* name)
+            : p_(p), cb_(cb) {
+            cpu_h_ = p.beginCpuScope(name);
+            gpu_h_ = p.beginScope(cb, name);
+        }
+        ~Scope() {
+            p_.endScope(cb_, gpu_h_);
+            p_.endCpuScope(cpu_h_);
+        }
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+        // No move — RAII end is bound to lexical scope.
+        Scope(Scope&&) = delete;
+        Scope& operator=(Scope&&) = delete;
+    private:
+        GpuProfiler& p_;
+        std::shared_ptr<renderer::CommandBuffer> cb_;
+        uint32_t cpu_h_ = UINT32_MAX;
+        uint32_t gpu_h_ = UINT32_MAX;
+    };
+
 private:
     // ----- Recording state (per frame-in-flight slot) ----------------------
 
@@ -140,7 +191,37 @@ private:
         uint32_t                next_query = 0;  // slot 0 = frame-start marker
         int                     open_depth = 0;
         bool                    active     = false;
+
+        // ── CPU scopes (recorded host-side via chrono) ──────────────
+        struct CpuScopeEntry {
+            std::string name;
+            int  depth = 0;
+            std::chrono::high_resolution_clock::time_point begin{};
+            std::chrono::high_resolution_clock::time_point end{};
+        };
+        std::vector<CpuScopeEntry> cpu_recorded;
+        int  cpu_open_depth = 0;
+        bool cpu_active     = false;
+        std::chrono::high_resolution_clock::time_point cpu_frame_start{};
+
+        // ── Completed snapshot, read by collectResults ──────────────
+        // endCpuFrame moves cpu_recorded into cpu_completed (and the
+        // matching cpu_frame_start into cpu_completed_frame_start),
+        // so collectResults can read FULLY CLOSED scopes from the
+        // previous use of this slot.  Without this, collectResults
+        // (called early in the frame, after the fence wait) saw the
+        // CURRENT frame's in-progress cpu_recorded — only the very
+        // first sub-scope that had finished by that point was readable;
+        // the still-open parent scopes ("drawFrame", "Fence Wait +
+        // Acquire") had end == begin and rendered as zero-width bars.
+        std::vector<CpuScopeEntry> cpu_completed;
+        std::chrono::high_resolution_clock::time_point cpu_completed_frame_start{};
     };
+
+    // Frame-in-flight slot currently being CPU-recorded.  Set by
+    // beginCpuFrame, used by begin/endCpuScope so the caller doesn't
+    // have to thread a frame_index through every scope call.
+    uint32_t m_cpu_active_frame_idx_ = 0;
 
     uint32_t m_frames_in_flight_ = 0;
     uint32_t m_max_scopes_       = kMaxScopesPerFrame;

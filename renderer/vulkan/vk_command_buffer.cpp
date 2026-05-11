@@ -628,6 +628,21 @@ void VulkanCommandBuffer::fillBuffer(
     vkCmdFillBuffer(cmd_buf_, vk_buf->get(), offset, size, data);
 }
 
+void VulkanCommandBuffer::updateBuffer(
+    const std::shared_ptr<Buffer>& buffer,
+    uint64_t offset,
+    uint64_t size,
+    const void* data) {
+    auto vk_buf = RENDER_TYPE_CAST(Buffer, buffer);
+    // vkCmdUpdateBuffer copies `data` (size bytes) into the cmd
+    // buffer's internal storage immediately, then schedules a
+    // device-side write of those bytes into vk_buf->get() at GPU
+    // TRANSFER stage when the cmd buffer executes.  Vulkan caps
+    // size at 65536 and requires both size and offset to be 4-byte
+    // aligned — caller's responsibility.
+    vkCmdUpdateBuffer(cmd_buf_, vk_buf->get(), offset, size, data);
+}
+
 void VulkanCommandBuffer::writeTimestamp(
     const std::shared_ptr<QueryPool>& query_pool,
     uint32_t query_index,

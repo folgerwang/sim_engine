@@ -562,12 +562,19 @@ void Helper::create2DTextureImage(
                 SET_FLAG_BIT(ImageAspect, COLOR_BIT),
             src_location);
 
+    // Transition ALL mip levels (not just mip 0).  Without the mip
+    // range, multi-mip images created via this path (e.g., the 2-mip
+    // VT BC7 pools) leave their non-zero mips in UNDEFINED layout,
+    // and downstream barriers that claim oldLayout=SHADER_READ_ONLY
+    // create a layout-tracking inconsistency.
     vk::helper::transitionImageLayout(
         device,
         texture_2d.image,
         format,
         ImageLayout::UNDEFINED,
-        image_layout);
+        image_layout,
+        /*base_mip*/ 0,
+        /*mip_count*/ std::max(mip_levels, 1u));
 
     texture_2d.size = glm::uvec3(size, 1);
 }
@@ -1030,7 +1037,32 @@ void Helper::submitQueue(
     }
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    // Wait-dst stage for the image_available swapchain semaphore.
+    //
+    // The TUTORIAL-stock value here is COLOR_ATTACHMENT_OUTPUT_BIT,
+    // which assumes the very first render pass in the cmd buffer
+    // writes directly to the swapchain image.  In this engine that
+    // is NOT true — every render pass writes to OFFSCREEN render
+    // targets (object_scene_view colour buffer, G-buffer, shadow
+    // atlas, etc.), and the swapchain image is only ever touched
+    // by the final vkCmdBlitImage at end-of-frame.
+    //
+    // Using COLOR_ATTACHMENT_OUTPUT_BIT therefore stalled every
+    // offscreen colour-attachment write on the swapchain semaphore
+    // — the GPU sat idle for ~5–8 ms per frame waiting for the
+    // compositor's image-release at vblank, even though it had
+    // plenty of offscreen work it could have been doing.  Visible
+    // in the profiler as a big GAP between frames on the GPU lane
+    // while the CPU lane stayed back-to-back, plus a fat "Wait
+    // Frame Fence" on the next CPU frame's start.
+    //
+    // TRANSFER_BIT is the correct minimum: it puts ONLY transfer
+    // ops in the semaphore's second sync scope, so the final blit
+    // (the one access of the swapchain image) waits, but every
+    // graphics + compute pass before it can execute immediately.
+    // Net effect: GPU idle gap collapses to ~0, frame time drops
+    // to whatever GPU work actually requires.
+    VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
     submit_info.waitSemaphoreCount = static_cast<uint32_t>(vk_wait_semaphores.size());
     submit_info.pWaitSemaphores = vk_wait_semaphores.data();
     submit_info.pWaitDstStageMask = wait_stages;

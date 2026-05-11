@@ -49,6 +49,14 @@ class ClusterRenderer {
     std::vector<glsl::ClusterCullInfo>        staging_cull_infos_;
     std::vector<glsl::ClusterDrawInfo>        staging_draw_infos_;
     std::vector<glsl::BindlessMaterialParams> staging_material_params_;
+    // CPU backup of the original material_params (with VT ids
+    // populated).  Survives finalizeUploads's clear of
+    // staging_material_params_; used by setVtEnabled() to restore
+    // the VT bindings after the user toggles VT off and on again.
+    std::vector<glsl::BindlessMaterialParams> material_params_backup_;
+    // Current state of the VT toggle (default on).  Re-uploads the
+    // material_params SSBO on transition.
+    bool vt_enabled_ = true;
     // Base-colour texture views staged for the bindless sampler array (binding 2).
     std::vector<std::shared_ptr<renderer::ImageView>> staging_tex_views_;
     // Dedup map: ImageView raw pointer → slot index in staging_tex_views_.
@@ -385,6 +393,17 @@ public:
     // resolve through the page table.  Pass nullptr to revert to
     // the legacy bindless texture-array path (useful for A/B).
     void setVtManager(class VirtualTextureManager* mgr) { vt_manager_ = mgr; }
+
+    // Toggle VT sampling at runtime.  When enabled (default), the
+    // material_params SSBO carries the VT ids assigned at upload time
+    // and the cluster_bindless.frag VT path runs.  When disabled, all
+    // vt_id fields in the SSBO are overwritten with VT_INVALID_ID and
+    // the shader's existing fallback to the legacy bindless texture
+    // arrays kicks in.  Re-uploads the material_params buffer on
+    // transition; cheap (a few hundred KB) and only happens on user
+    // click.
+    void setVtEnabled(bool enabled);
+    bool isVtEnabled() const { return vt_enabled_; }
 
     // Bindless draw — issues two indirect draws and a fullscreen OIT
     // composite, all sharing the same merged VB/IB and bindless desc set:

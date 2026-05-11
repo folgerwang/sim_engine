@@ -154,6 +154,25 @@ public:
         uint64_t size,
         uint32_t data) = 0;
 
+    // Inline-data buffer update (wraps vkCmdUpdateBuffer).  Records
+    // up to 65536 bytes of data into the command buffer itself, then
+    // copies to the destination buffer at GPU TRANSFER stage.  Use
+    // for small, sparse, sync-correct buffer updates (e.g., a few
+    // u32 indirect counts, or — what motivated adding this — page
+    // table entries for a virtual-texture system that can't use
+    // HOST_COHERENT mapped writes without racing in-flight previous-
+    // frame GPU shader reads).
+    //   * `size` and `offset` must both be 4-byte aligned.
+    //   * `size` must be > 0 and ≤ 65536.
+    //   * `data` must point to at least `size` bytes; the data is
+    //     COPIED into the command buffer immediately, so the caller
+    //     can free or reuse the source after this returns.
+    virtual void updateBuffer(
+        const std::shared_ptr<Buffer>& buffer,
+        uint64_t offset,
+        uint64_t size,
+        const void* data) = 0;
+
     // GPU timestamp queries.
     virtual void resetQueryPool(
         const std::shared_ptr<QueryPool>& query_pool,

@@ -211,6 +211,70 @@ void GpuProfiler::endFrame(
 }
 
 // ============================================================================
+//  CPU scope API — chrono-based, parallel to the GPU one
+// ============================================================================
+
+void GpuProfiler::beginCpuFrame(uint32_t frame_index)
+{
+    if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return;
+    auto& fs = m_frame_states_[frame_index % m_frames_in_flight_];
+    fs.cpu_recorded.clear();
+    fs.cpu_open_depth   = 0;
+    fs.cpu_active       = true;
+    fs.cpu_frame_start  = std::chrono::high_resolution_clock::now();
+    m_cpu_active_frame_idx_ = frame_index;
+}
+
+uint32_t GpuProfiler::beginCpuScope(const char* name)
+{
+    if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return UINT32_MAX;
+    auto& fs = m_frame_states_[m_cpu_active_frame_idx_ % m_frames_in_flight_];
+    if (!fs.cpu_active) return UINT32_MAX;
+    if (fs.cpu_recorded.size() >= m_max_scopes_) return UINT32_MAX;
+
+    uint32_t scope_idx = static_cast<uint32_t>(fs.cpu_recorded.size());
+    FrameState::CpuScopeEntry entry;
+    entry.name  = name ? name : "<null>";
+    entry.depth = fs.cpu_open_depth;
+    entry.begin = std::chrono::high_resolution_clock::now();
+    entry.end   = entry.begin;  // placeholder
+    fs.cpu_recorded.push_back(std::move(entry));
+    fs.cpu_open_depth++;
+    return scope_idx;
+}
+
+void GpuProfiler::endCpuScope(uint32_t scope_handle)
+{
+    if (scope_handle == UINT32_MAX) return;
+    if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return;
+    auto& fs = m_frame_states_[m_cpu_active_frame_idx_ % m_frames_in_flight_];
+    if (!fs.cpu_active || scope_handle >= fs.cpu_recorded.size()) return;
+
+    fs.cpu_recorded[scope_handle].end =
+        std::chrono::high_resolution_clock::now();
+    fs.cpu_open_depth = std::max(0, fs.cpu_open_depth - 1);
+}
+
+void GpuProfiler::endCpuFrame(uint32_t frame_index)
+{
+    if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return;
+    auto& fs = m_frame_states_[frame_index % m_frames_in_flight_];
+    fs.cpu_active = false;
+
+    // Snapshot the FULLY-CLOSED recording into cpu_completed so the
+    // next time this slot is hit by beginCpuFrame (FIF cycles from
+    // now), collectResults can read this complete frame's data
+    // even though cpu_recorded is about to be cleared/reused.
+    //
+    // Move (not copy) — the entries contain std::strings that we'd
+    // rather not allocate twice per frame.  cpu_recorded is left
+    // empty and ready for the next beginCpuFrame to start fresh.
+    fs.cpu_completed             = std::move(fs.cpu_recorded);
+    fs.cpu_completed_frame_start = fs.cpu_frame_start;
+    fs.cpu_recorded.clear();   // move-from leaves it valid-but-unspecified
+}
+
+// ============================================================================
 //  Result collection
 // ============================================================================
 
@@ -260,6 +324,34 @@ void GpuProfiler::collectResults(
         if (sd.depth == 0) rec.total_ms += (sd.end_ms - sd.begin_ms);
     }
 
+    // ── Merge CPU scopes for the same frame slot ─────────────────────
+    // Read from cpu_completed (snapshot taken by endCpuFrame at the
+    // end of the PREVIOUS use of this slot, FIF frames ago).  This
+    // is the matched-pair to the GPU queries we just ingested, since
+    // both the GPU's frame-N-FIF queries and the CPU's frame-N-FIF
+    // scopes ended up parked in this slot until we got around to
+    // reading them.  Reading cpu_recorded (the live one) would race
+    // the current frame's ongoing scopes — half open, half closed.
+    rec.cpu_scopes.reserve(fs.cpu_completed.size());
+    for (auto& cpu : fs.cpu_completed) {
+        ScopeDisplay sd;
+        sd.name  = cpu.name;
+        sd.depth = cpu.depth;
+        sd.color = colorForName(cpu.name);
+        const auto begin_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cpu.begin - fs.cpu_completed_frame_start).count();
+        const auto end_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cpu.end   - fs.cpu_completed_frame_start).count();
+        sd.begin_ms = float(begin_ns) * 1e-6f;
+        sd.end_ms   = float(end_ns)   * 1e-6f;
+        rec.cpu_scopes.push_back(sd);
+    }
+    for (auto& sd : rec.cpu_scopes) {
+        if (sd.depth == 0) rec.total_cpu_ms += (sd.end_ms - sd.begin_ms);
+    }
+
     // Sanity-check before committing to the ring buffer: reject any
     // frame whose timestamps produced NaN/inf or negative durations so a
     // single bad sample cannot blow up the renderer.
@@ -303,7 +395,8 @@ void GpuProfiler::collectResults(
         for (int i = 0; i < m_frame_count_; ++i) {
             int slot = (m_frame_write_idx_ - 1 - i + kHistorySize) % kHistorySize;
             float frame_end = m_frame_global_start_[slot] +
-                              m_frames_[slot].total_ms;
+                              std::max(m_frames_[slot].total_ms,
+                                       m_frames_[slot].total_cpu_ms);
             if (frame_end > total_span) total_span = frame_end;
         }
         // Keep the right edge of the view at the end of the last frame.
@@ -326,7 +419,13 @@ void GpuProfiler::recomputeGlobalPositions()
     for (int i = 0; i < count; ++i) {
         int slot = (base + i) % kHistorySize;
         m_frame_global_start_[slot] = cursor;
-        float dt = m_frames_[slot].total_ms;
+        // Frame width is the max of CPU and GPU totals — otherwise
+        // the longer side overflows into the next frame slot in the
+        // timeline.  Both stacks share the same global X axis so that
+        // the user sees CPU and GPU bars for the same frame stacked
+        // vertically with consistent horizontal extents.
+        float dt = std::max(m_frames_[slot].total_ms,
+                            m_frames_[slot].total_cpu_ms);
         if (!std::isfinite(dt) || dt < 0.0f) dt = 0.0f;
         cursor += dt + kFrameGapMs;
     }
@@ -405,6 +504,14 @@ void GpuProfiler::drawImGui()
 
     m_show_window_ = true;
 
+    // (Space-bar pause/resume is handled in the application's GLFW
+    // key callback — it sets a static flag that drawFrame consumes
+    // by calling gpu_profiler_.togglePause(), which avoids fighting
+    // with ImGui's own key state and works even when ImGui doesn't
+    // have window focus.  Don't add a second handler here — that
+    // would double-toggle every press and the pause would appear
+    // to do nothing.)
+
     // --- Sanitize view state up front (defensive) -----------------------
     if (!std::isfinite(m_view_start_ms_))  m_view_start_ms_  = 0.0f;
     if (!std::isfinite(m_view_range_ms_))  m_view_range_ms_  = 50.0f;
@@ -433,26 +540,45 @@ void GpuProfiler::drawImGui()
     const float latest_ms = (m_frame_count_ > 0)
                           ? m_frames_[latest_slot].total_ms : 0.0f;
 
-    ImGui::Text("GPU: %.3f ms  (%.1f fps)",
+    const float latest_cpu_ms = (m_frame_count_ > 0)
+                              ? m_frames_[latest_slot].total_cpu_ms : 0.0f;
+    ImGui::Text("CPU: %.3f ms (%.1f fps)   GPU: %.3f ms (%.1f fps)",
+        latest_cpu_ms,
+        (latest_cpu_ms > 0.0f) ? 1000.0f / latest_cpu_ms : 0.0f,
         latest_ms,
         (latest_ms > 0.0f) ? 1000.0f / latest_ms : 0.0f);
 
     ImGui::SameLine(0, 20);
 
+    // Pause/Resume toggle — ALWAYS visible (used to be conditionally
+    // hidden behind the LIVE label, which made it hard to click out
+    // of pause when zoom/pan auto-pause kept re-engaging).  Big
+    // colored button so it can't be missed.  Space-bar shortcut
+    // toggles the same flag (handled below).
     if (m_paused_) {
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.80f, 0.40f, 0.05f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.00f, 0.55f, 0.15f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.65f, 0.30f, 0.02f, 1.0f));
-        if (ImGui::Button("  RESUME  ")) {
+        if (ImGui::Button("  RESUME  (Space)  ")) {
             m_paused_ = false;
         }
         ImGui::PopStyleColor(3);
     } else {
-        ImGui::TextDisabled("  LIVE   ");
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.50f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.65f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.15f, 0.40f, 0.15f, 1.0f));
+        if (ImGui::Button("  PAUSE   (Space)  ")) {
+            m_paused_ = true;
+        }
+        ImGui::PopStyleColor(3);
     }
 
+    // (Space-bar shortcut handled at the very top of drawImGui,
+    // before ImGui::Begin, so it still works when this window is
+    // collapsed or unfocused.)
+
     ImGui::SameLine(0, 20);
-    ImGui::TextDisabled("Scroll=zoom  |  Drag=pan  |  Both pause");
+    ImGui::TextDisabled("Wheel=zoom (live)  |  Drag=pan (auto-pause)  |  Space=toggle");
 
     ImGui::Separator();
 
@@ -463,12 +589,18 @@ void GpuProfiler::drawImGui()
     }
 
     // ---- Layout constants --------------------------------------------------
-    const float kMinimapH  = 32.0f;   // minimap strip height
-    const float kRulerH    = 30.0f;   // time ruler height
-    const float kLaneH     = 30.0f;   // height per depth lane
-    const int   kMaxDepth  = 8;
-    const float kFlameH    = kLaneH * kMaxDepth;
-    const float kPadding   = 4.0f;
+    // Two stacks: CPU lanes on top, GPU lanes below, separated by a
+    // labelled divider so it's instantly obvious which is which.
+    const float kMinimapH      = 32.0f;   // minimap strip height
+    const float kRulerH        = 30.0f;   // time ruler height
+    const float kLaneH         = 30.0f;   // height per depth lane
+    const int   kMaxDepth      = 8;
+    const int   kCpuMaxDepth   = 6;       // CPU stacks tend shallower
+    const float kCpuFlameH     = kLaneH * kCpuMaxDepth;
+    const float kGpuFlameH     = kLaneH * kMaxDepth;
+    const float kDividerH      = 18.0f;   // CPU/GPU label strip between stacks
+    const float kFlameH        = kCpuFlameH + kDividerH + kGpuFlameH;
+    const float kPadding       = 4.0f;
 
     ImDrawList* dl    = ImGui::GetWindowDrawList();
     ImVec2      cp    = ImGui::GetCursorScreenPos();
@@ -490,13 +622,17 @@ void GpuProfiler::drawImGui()
         dl->AddRectFilled(mm_min, mm_max, IM_COL32(30, 30, 30, 220));
         dl->AddRect      (mm_min, mm_max, IM_COL32(80, 80, 80, 200));
 
-        // Compute total global span for minimap scaling.
+        // Compute total global span for minimap scaling.  Use max of
+        // CPU + GPU totals so a CPU-bound frame still extends the
+        // minimap to its full width.
         float total_span = 0.0f;
         for (int i = 0; i < m_frame_count_; ++i) {
             int slot = (m_frame_count_ < kHistorySize)
                      ? i
                      : (m_frame_write_idx_ + i) % kHistorySize;
-            float fe = m_frame_global_start_[slot] + m_frames_[slot].total_ms;
+            float fe = m_frame_global_start_[slot] +
+                       std::max(m_frames_[slot].total_ms,
+                                m_frames_[slot].total_cpu_ms);
             if (fe > total_span) total_span = fe;
         }
         if (total_span < 1e-6f) total_span = 1.0f;
@@ -513,7 +649,8 @@ void GpuProfiler::drawImGui()
                      : (m_frame_write_idx_ + i) % kHistorySize;
 
             float gs  = m_frame_global_start_[slot];
-            float dur = m_frames_[slot].total_ms;
+            float dur = std::max(m_frames_[slot].total_ms,
+                                 m_frames_[slot].total_cpu_ms);
 
             if (!std::isfinite(gs) || !std::isfinite(dur) || dur < 0.0f) continue;
             float x0 = mm_min.x + (gs       / total_span) * winW;
@@ -635,22 +772,100 @@ void GpuProfiler::drawImGui()
     }
 
     // ---- Flame chart lanes -------------------------------------------------
-    float flame_y = cv_min.y + kRulerH;
+    // Layout (top to bottom inside the timeline canvas):
+    //   ruler          (kRulerH)
+    //   CPU lanes      (kCpuFlameH)   ← new
+    //   CPU/GPU label  (kDividerH)    ← new
+    //   GPU lanes      (kGpuFlameH)
+    const float cpu_flame_y = cv_min.y + kRulerH;
+    const float divider_y   = cpu_flame_y + kCpuFlameH;
+    const float gpu_flame_y = divider_y + kDividerH;
 
-    // Lane background stripes.
+    // CPU lane background stripes.
+    for (int d = 0; d < kCpuMaxDepth; ++d) {
+        uint32_t bg = (d & 1) ? IM_COL32(20, 24, 30, 255)
+                               : IM_COL32(15, 18, 22, 255);
+        dl->AddRectFilled(ImVec2(cv_min.x, cpu_flame_y + d * kLaneH),
+                          ImVec2(cv_max.x, cpu_flame_y + (d + 1) * kLaneH),
+                          bg);
+    }
+    // CPU/GPU divider strip with labels.
+    dl->AddRectFilled(ImVec2(cv_min.x, divider_y),
+                      ImVec2(cv_max.x, divider_y + kDividerH),
+                      IM_COL32(50, 50, 60, 255));
+    dl->AddText(ImVec2(cv_min.x + 6.0f,
+                       divider_y + (kDividerH - ImGui::GetFontSize()) * 0.5f),
+                IM_COL32(180, 200, 230, 255), "CPU ↑   GPU ↓");
+    // GPU lane background stripes.
     for (int d = 0; d < kMaxDepth; ++d) {
         uint32_t bg = (d & 1) ? IM_COL32(28, 28, 28, 255)
                                : IM_COL32(22, 22, 22, 255);
-        dl->AddRectFilled(ImVec2(cv_min.x, flame_y + d * kLaneH),
-                          ImVec2(cv_max.x, flame_y + (d + 1) * kLaneH),
+        dl->AddRectFilled(ImVec2(cv_min.x, gpu_flame_y + d * kLaneH),
+                          ImVec2(cv_max.x, gpu_flame_y + (d + 1) * kLaneH),
                           bg);
     }
+    // Backwards-compat alias for the loop below — GPU lanes anchor.
+    float flame_y = gpu_flame_y;
 
     // Draw frame scopes.
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     const char*  tooltip_name = nullptr;
     float        tooltip_ms   = 0.0f;
+    const char*  tooltip_kind = nullptr;   // "CPU" or "GPU"
 
+    // ── Pass 1: CPU lanes (top half) ────────────────────────────────
+    // Same hit-testing + label logic as the GPU pass below; we just
+    // anchor at cpu_flame_y and clamp depth to kCpuMaxDepth.
+    for (int i = 0; i < m_frame_count_; ++i) {
+        int slot = (m_frame_count_ < kHistorySize)
+                 ? i
+                 : (m_frame_write_idx_ + i) % kHistorySize;
+        float frame_gs = m_frame_global_start_[slot];
+        const FrameRecord& fr = m_frames_[slot];
+        for (auto& sd : fr.cpu_scopes) {
+            if (sd.depth < 0 || sd.depth >= kCpuMaxDepth) continue;
+            if (!std::isfinite(sd.begin_ms) || !std::isfinite(sd.end_ms)) continue;
+            if (sd.end_ms < sd.begin_ms) continue;
+            float g_begin = frame_gs + sd.begin_ms;
+            float g_end   = frame_gs + sd.end_ms;
+            float x0 = timeToX(g_begin, cv_min.x, canvas_w);
+            float x1 = timeToX(g_end,   cv_min.x, canvas_w);
+            if (!std::isfinite(x0) || !std::isfinite(x1)) continue;
+            if (x1 < cv_min.x || x0 > cv_max.x) continue;
+            x0 = std::max(x0, cv_min.x);
+            x1 = std::min(x1, cv_max.x);
+            if (x1 <= x0) continue;
+            x0 = gp_sanitize_px(x0, cv_min.x);
+            x1 = gp_sanitize_px(x1, cv_max.x);
+            float y0 = cpu_flame_y + sd.depth * kLaneH + 2.0f;
+            float y1 = cpu_flame_y + (sd.depth + 1) * kLaneH - 2.0f;
+            float bx0 = x0 + 1.0f;
+            float bx1 = x1 - 1.0f;
+            if (bx1 <= bx0) { bx0 = x0; bx1 = x1; }
+            uint32_t fill_col   = sd.color;
+            uint32_t border_col = lerpColor(sd.color, IM_COL32(0, 0, 0, 255), 0.4f);
+            dl->AddRectFilled(ImVec2(bx0, y0), ImVec2(bx1, y1), fill_col, 2.0f);
+            dl->AddRect      (ImVec2(bx0, y0), ImVec2(bx1, y1), border_col, 2.0f);
+            float bar_w = bx1 - bx0;
+            if (bar_w > 30.0f) {
+                char label[128];
+                float dur_ms = sd.end_ms - sd.begin_ms;
+                snprintf(label, sizeof(label), "%s  %.2fms", sd.name.c_str(), dur_ms);
+                float text_h = ImGui::GetFontSize();
+                float text_y = y0 + (y1 - y0 - text_h) * 0.5f;
+                dl->AddText(ImVec2(bx0 + 3.0f, text_y),
+                            IM_COL32(255, 255, 255, 230), label);
+            }
+            if (mouse.x >= bx0 && mouse.x <= bx1 &&
+                mouse.y >= y0 && mouse.y <= y1) {
+                tooltip_name = sd.name.c_str();
+                tooltip_ms   = sd.end_ms - sd.begin_ms;
+                tooltip_kind = "CPU";
+            }
+        }
+    }
+
+    // ── Pass 2: GPU lanes (bottom half) ─────────────────────────────
     for (int i = 0; i < m_frame_count_; ++i) {
         int slot = (m_frame_count_ < kHistorySize)
                  ? i
@@ -659,10 +874,10 @@ void GpuProfiler::drawImGui()
         float frame_gs = m_frame_global_start_[slot];
         const FrameRecord& fr = m_frames_[slot];
 
-        // Frame separator line.
+        // Frame separator line — spans both stacks.
         float sep_x = timeToX(frame_gs, cv_min.x, canvas_w);
         if (std::isfinite(sep_x) && sep_x >= cv_min.x && sep_x <= cv_max.x) {
-            dl->AddLine(ImVec2(sep_x, flame_y),
+            dl->AddLine(ImVec2(sep_x, cpu_flame_y),
                         ImVec2(sep_x, cv_max.y),
                         IM_COL32(100, 100, 100, 120), 1.0f);
         }
@@ -725,6 +940,7 @@ void GpuProfiler::drawImGui()
                 mouse.y >= y0 && mouse.y <= y1) {
                 tooltip_name = sd.name.c_str();
                 tooltip_ms   = sd.end_ms - sd.begin_ms;
+                tooltip_kind = "GPU";
             }
         }
     }
@@ -736,7 +952,10 @@ void GpuProfiler::drawImGui()
 
     // ---- Tooltip -----------------------------------------------------------
     if (tooltip_name) {
-        ImGui::SetTooltip("%s\n%.3f ms", tooltip_name, tooltip_ms);
+        ImGui::SetTooltip("%s [%s]\n%.3f ms",
+                          tooltip_name,
+                          tooltip_kind ? tooltip_kind : "",
+                          tooltip_ms);
     }
 
     // ---- Interaction -------------------------------------------------------
@@ -778,7 +997,17 @@ void GpuProfiler::drawImGui()
 
             m_view_range_ms_ = new_range;
             m_view_start_ms_ = new_start;
-            m_paused_ = true;
+            // NOTE: deliberately do NOT auto-pause on zoom anymore.
+            // Auto-pause-on-scroll was the main reason RESUME felt
+            // broken — every accidental wheel event over the canvas
+            // would freeze the timeline, and the user had to find
+            // and click the small button to recover.  Zoom changes
+            // m_view_range_ms_ but auto-scroll (in collectResults)
+            // still keeps the right edge anchored to the latest
+            // frame, so live zoom-in works naturally — you see the
+            // last N ms of frames in detail, updating each frame.
+            // To FREEZE the view for inspection, hit Space or click
+            // the big PAUSE button.
         }
 
         // Left-drag pan.

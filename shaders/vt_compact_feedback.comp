@@ -1,0 +1,100 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+// ─── vt_compact_feedback.comp ───────────────────────────────────────────
+// GPU-side compaction of the VT streaming feedback buffer.
+//
+// Background: the cluster fragment shader writes one tile-key per 8×8
+// screen block into a fixed-pitch 2D feedback grid (512² = 262144
+// uint32s = 1 MB).  Most entries stay at VT_TILE_KEY_INVALID; only the
+// blocks that actually rendered VT-bound geometry write a real key.
+// At typical screen coverage that's tens of thousands of valid entries
+// at most, with massive duplication (many 8×8 blocks fall on the same
+// VT tile).
+//
+// The CPU streamer (VirtualTextureManager::tick) then needed to:
+//   1. Map 1 MB of HOST_VISIBLE memory and walk all 262144 entries.
+//   2. Dedupe via std::unordered_set.
+//   3. Take the resulting set and decide what to upload.
+//
+// Steps 1+2 dominated tick() at >10 ms — uncached map walks plus hash
+// inserts on a giant scratch set.  This shader moves both onto the GPU:
+//
+//   * Each invocation reads ONE feedback entry.
+//   * If the entry is non-invalid, it's appended to a compact output
+//     buffer via atomicAdd on a counter.
+//
+// CPU-side dedupe still runs on the compact output (which is tiny —
+// typically a few thousand entries vs. 262144), turning a 1 MB cold
+// map into a few-KB read.
+//
+// Note on dedupe: this shader does NOT hash-dedupe on the GPU — that
+// would require a hash table in shared/global memory and atomicCAS
+// probing.  The CPU-side dedupe over the much smaller compact list is
+// fast (<<1 ms for a few thousand entries, friendly to the cache
+// because the working set fits in L1).  If the compact buffer ever
+// overflows we'd revisit and add a true GPU hash table; until then the
+// simple counter+append wins on simplicity.
+
+layout(set = 0, binding = 0, std430) readonly buffer FeedbackIn {
+    uint feedback[];
+};
+
+layout(set = 0, binding = 1, std430) buffer CompactOut {
+    // Layout:
+    //   compact[0]                    = number of entries written (atomic)
+    //   compact[1 .. 1 + max_entries) = the entries themselves
+    // The CPU reads compact[0] first to size its dedupe pass, then
+    // copies up to min(compact[0], max_entries) entries from the
+    // contiguous tail.  Overflow (compact[0] > max_entries) is fine
+    // for the streamer — extra requests just get dropped this frame
+    // and re-requested next frame as the camera moves.
+    uint compact[];
+};
+
+layout(push_constant) uniform PushConstants {
+    // Total entries in the input feedback buffer (== VT_FEEDBACK_TOTAL
+    // = 262144 today).  Passed in so the shader doesn't bake a
+    // compile-time constant — keeps it cheap to change pitch.
+    uint feedback_total;
+    // Cap on the number of compacted entries we'll write to the output
+    // buffer.  If we overflow, atomic counter keeps incrementing but
+    // writes past the cap are dropped.  CPU clamps reads to this
+    // value too.
+    uint max_entries;
+    // Slot stride (in uint32s) inside the compact buffer for one
+    // frame's worth of output.  The host packs FRAMES_IN_FLIGHT
+    // independent slots back-to-back into one big buffer; this push
+    // constant is the (frame_index % FIF) slot's start offset.
+    // Layout per slot is identical to the single-slot case above.
+    uint compact_slot_offset_uints;
+    uint pad0;
+};
+
+const uint VT_TILE_KEY_INVALID = 0xFFFFFFFFu;
+
+// 64 threads per workgroup = one cache line of feedback per thread on
+// most GPUs.  Total dispatch is feedback_total / 64 workgroups; for
+// the 262144-entry default that's 4096 workgroups, well under any
+// vendor's per-dimension dispatch limit.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= feedback_total) return;
+
+    uint k = feedback[i];
+    if (k == VT_TILE_KEY_INVALID) return;
+
+    // Atomic bump-allocate one slot in this frame's output region.
+    // compact_slot_offset_uints points at the START of this frame's
+    // slot; compact[that] is the counter, compact[that+1..] are the
+    // entries.
+    uint base = compact_slot_offset_uints;
+    uint idx  = atomicAdd(compact[base], 1u);
+    if (idx < max_entries) {
+        compact[base + 1u + idx] = k;
+    }
+    // Overflow case: atomic counter keeps growing so the host can
+    // see how badly we exceeded the cap, but the entry itself is
+    // dropped.  No write past the slot's end region happens.
+}

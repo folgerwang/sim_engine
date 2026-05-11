@@ -81,6 +81,18 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 9)
     readonly buffer VtMetaBuffer {
     VirtualTextureMeta vt_meta[];
 };
+// VT streaming feedback — one tile-key uint per 8×8 screen block.
+// The cluster fragment shader writes its desired (vt, mip, page) key
+// from the (0,0) fragment of each 8×8 block; the CPU streamer
+// (VirtualTextureManager::tick) reads, dedupes, and acts on requests
+// at frame end.  Buffer is laid out row-major
+// (screen_w / VT_FEEDBACK_BLOCK_SIZE) × (screen_h / VT_FEEDBACK_BLOCK_SIZE)
+// — the row stride lives in the push-constant `vt_feedback_pitch`
+// below so the shader doesn't have to query the swapchain size.
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 10)
+    buffer VtFeedbackBuffer {
+    uint vt_feedback[];
+};
 
 // Now that the resources above are in scope, pull in the VT sampling
 // helpers.  The header declares `vtSampleAlbedo / vtSampleNormal /
@@ -311,29 +323,140 @@ void main() {
     }
 #endif
     vec4 albedo4    = base_color;
-    // ── Albedo sample: prefer VT, fall back to legacy bindless ─────
-    // When the material was registered with the VirtualTextureManager
-    // (mat_idx → albedo_vt_id != VT_INVALID_ID), route the sample
-    // through `vtSampleAlbedo` which translates the virtual UV through
-    // the page table to a physical pool UV.  Otherwise use the legacy
-    // bindless texture array — preserved so meshes that haven't been
-    // routed through the VT system yet (or fail to allocate a slot
-    // because the pool is full) still render correctly.
+    // ── Albedo sample: prefer VT, magenta-flag pool overflows ──────
+    // The material may carry both an `albedo_vt_id` (VT registration)
+    // and a `base_color_tex_idx` (legacy bindless slot).  Routing
+    // priority:
     //
-    // Pool textures are stored in BC7_SRGB_BLOCK so the sampled value
-    // is already linear — no manual sRGBToLinear needed.  The legacy
-    // path's textures are also hardware sRGB — same story.
-    uint albedo_vt = material_params[mat_idx].albedo_vt_id;
-    if (albedo_vt != VT_INVALID_ID) {
-        albedo4 *= vtSampleAlbedo(albedo_vt, v_uv);
-    } else if (tex_idx >= 0) {
-        // Texture views are hardware sRGB format — GPU auto-linearizes on sample.
-        // Do NOT apply manual sRGBToLinear here (would double-convert and desaturate).
-        // nonuniformEXT: tex_idx varies per cluster — the GPU must not assume it is
-        // uniform across the subgroup (wave). Without this, one texture is picked for
-        // the entire wave and adjacent clusters with different materials get wrong textures.
-        albedo4 *= texture(base_color_textures[nonuniformEXT(tex_idx)], v_uv);
+    //   1. has VT registration AND page resident  → VT (BC7 pool).
+    //   2. has VT registration AND page UNRESIDENT
+    //      → MAGENTA BLOCK (diagnostic — see below).  We deliberately
+    //        do NOT fall back to legacy in this branch.
+    //   3. no VT registration (albedo_vt == INVALID) → legacy bindless.
+    //   4. no VT registration AND no legacy slot → leave as base_color.
+    //
+    // Why magenta instead of a silent legacy fallback for case 2:
+    // the v1 pool is eager-resident with a fixed 4096-slot capacity,
+    // and large scenes (Bistro etc.) overflow it almost immediately —
+    // a single 2048² albedo eats 1024 slots, so 4 such textures fill
+    // the pool and the remaining ~200 fall through to UNRESIDENT.
+    // If we silently fell back to legacy in that case the scene
+    // looked fine but VT would be nearly idle — there was no visual
+    // signal to motivate raising the pool size, dropping tiny
+    // textures, or implementing streaming.  Showing the overflow
+    // textures as solid magenta makes the cost of being over-budget
+    // immediately obvious, while case 1 still demonstrates the VT
+    // path is structurally working for materials that do fit.
+    //
+    // Pool textures are BC7_SRGB_BLOCK so the VT-sampled value is
+    // auto-de-gammafied on read.  Legacy texture views go through
+    // hardware sRGB and are likewise linear on sample, so cases 1
+    // and 3 feed albedo4 in the same colour space.
+    uint albedo_vt       = material_params[mat_idx].albedo_vt_id;
+    bool has_vt_alb      = (albedo_vt != VT_INVALID_ID);
+    vec4 albedo_tex      = vec4(1.0);
+    bool vt_alb_handled  = false;     // true once cases 1 or 2 handle the sample
+    // Cache the picked VT mip + fractional LOD outside the if-block
+    // so the normal-map path below can reuse them — both samples
+    // share the same UV and the same source-resolution-driven LOD,
+    // so they should always pick the same level.  This keeps albedo
+    // and normal in visual lock-step (no shimmer where albedo picks
+    // mip k and normal picks mip k+1).
+    uint  vt_alb_mip  = 0u;
+    float vt_alb_frac = 0.0;
+    // Cache the resolved physical pool UV from the albedo path so the
+    // normal-map (and any future MR_AO/EMISSIVE) sample below can
+    // reuse it.  All four layer pools share a slot allocator, so the
+    // same vt_index/mip/page resolves to identical phys_uv across
+    // every layer — the redundant page-table SSBO read in each layer
+    // sample was costing several percent of fragment-shader time.
+    vec2  vt_alb_phys_uv  = vec2(0.0);
+    bool  vt_alb_resolved = false;
+    uint  vt_alb_walk_mip = 0u;
+    if (has_vt_alb) {
+        VirtualTextureMeta meta = vt_meta[vtIndexOf(albedo_vt)];
+        // Continuous LOD → integer VT-mip + fractional in-pool LOD.
+        // The frac drives the GPU's pool-mip-0/mip-1 trilinear lerp,
+        // smoothly hiding the snap as LOD crosses an integer
+        // boundary.  At the deepest VT mip there's no further mip to
+        // lerp into, so frac is forced to 0 there.
+        float lod_cont = vtComputeLod(meta, v_uv);
+        uint  mip_max  = max(1u, meta.mip_count) - 1u;
+        vt_alb_mip     = clamp(uint(lod_cont), 0u, mip_max);
+        vt_alb_frac    = (vt_alb_mip == mip_max)
+                         ? 0.0
+                         : clamp(lod_cont - float(vt_alb_mip), 0.0, 1.0);
+
+        // ── Streaming feedback ──────────────────────────────────────
+        // Emit one tile-key per 8×8 screen block, from the block's
+        // (0, 0)-corner fragment.  All four layer pools share the
+        // same slot layout (registerMaterial uses a single shared
+        // allocator), so one tile request covers albedo + normal +
+        // mr_ao + emissive of the same material/page/mip.  CPU
+        // streamer reads the buffer at frame end and decides which
+        // pages to upload before the next frame.
+        ivec2 pix = ivec2(gl_FragCoord.xy);
+        if ((pix.x & 7) == 0 && (pix.y & 7) == 0) {
+            uvec2 mip_pages = vtMipPagesXY(meta, vt_alb_mip);
+            vec2  wrapped   = fract(v_uv);
+            uvec2 page      = uvec2(floor(wrapped * vec2(mip_pages)));
+            page.x = min(page.x, mip_pages.x - 1u);
+            page.y = min(page.y, mip_pages.y - 1u);
+
+            ivec2 block  = pix >> 3;
+            uint  fb_idx = uint(block.y) * VT_FEEDBACK_PITCH + uint(block.x);
+            vt_feedback[fb_idx] = vtMakeTileKey(
+                vtIndexOf(albedo_vt), vt_alb_mip, page);
+        }
+
+        // Walk up the mip chain until we find a resident page.  The
+        // streamer pins the smallest mip per VT, so this loop is
+        // guaranteed to terminate before mip_count and we always
+        // sample SOMETHING (worst case = a heavily blurred version).
+        vec2 phys_uv;
+        bool resolved = false;
+        uint walk_mip = vt_alb_mip;
+        for (uint i = 0u; i < VT_MAX_MIPS; ++i) {
+            if (walk_mip >= meta.mip_count) break;
+            if (vtResolve(albedo_vt, v_uv, meta, walk_mip, phys_uv)) {
+                resolved = true;
+                break;
+            }
+            ++walk_mip;
+        }
+        // Stash for the normal-map path below — all four layer pools
+        // share the same slot, so the same phys_uv works for any of
+        // them.  See vt_alb_phys_uv comment above.
+        vt_alb_phys_uv  = phys_uv;
+        vt_alb_resolved = resolved;
+        vt_alb_walk_mip = walk_mip;
+        if (resolved) {
+            // If we walked up past the requested mip the in-pool
+            // mip-1 lerp no longer corresponds to the desired LOD
+            // — force frac to 0 so we just sample pool mip 0 of the
+            // fallback slot rather than blurring twice.
+            float frac = (walk_mip == vt_alb_mip) ? vt_alb_frac : 0.0;
+            albedo_tex     = textureLod(vt_pool_albedo, phys_uv, frac);
+            vt_alb_handled = true;
+        } else {
+            // No resident page anywhere up the chain (streamer hasn't
+            // even pinned the smallest mip — should be rare/transient).
+            // Magenta marker keeps it visually obvious.
+            albedo_tex     = vec4(1.0, 0.0, 1.0, 1.0);
+            vt_alb_handled = true;
+        }
     }
+    if (!vt_alb_handled && tex_idx >= 0) {
+        // Case 3: no VT registration — legacy bindless path.
+        // nonuniformEXT: tex_idx varies per cluster — the GPU must
+        // not assume it is uniform across the subgroup (wave).
+        // Without this, one texture is picked for the entire wave
+        // and adjacent clusters with different materials get wrong
+        // textures.
+        albedo_tex = texture(base_color_textures[nonuniformEXT(tex_idx)], v_uv);
+    }
+    // Case 4 falls through with albedo_tex = vec4(1.0) → albedo4 = base_color.
+    albedo4 *= albedo_tex;
 
     // Alpha mask discard — matches base.frag: if(baseColor.a < alpha_cutoff) discard.
     if ((mat_flags & BINDLESS_MAT_ALPHA_MASK) != 0) {
@@ -381,11 +504,35 @@ void main() {
         vec4 raw_n;
         bool vt_resolved = false;
         if (has_vt_norm) {
-            VirtualTextureMeta meta = vt_meta[vtIndexOf(normal_vt)];
-            vec2 phys_uv;
-            if (vtResolve(normal_vt, v_uv, meta, phys_uv)) {
-                raw_n       = texture(vt_pool_normal, phys_uv);
+            // Fast path: albedo already resolved this surface's
+            // (vt_index, mip, page) → physical pool UV.  All four
+            // layer pools share a slot allocator so that same
+            // phys_uv directly addresses the normal pool's matching
+            // slot — no second page-table SSBO read, no second LOD
+            // calc, no second mip-walk.  This is the per-fragment
+            // win the user asked for ("page-table ssbo read only one
+            // for all 4 layers").
+            if (has_vt_alb && vt_alb_resolved) {
+                float frac = (vt_alb_walk_mip == vt_alb_mip)
+                             ? vt_alb_frac : 0.0;
+                raw_n       = textureLod(vt_pool_normal, vt_alb_phys_uv, frac);
                 vt_resolved = true;
+            } else {
+                // Slow path: albedo isn't VT-registered (or didn't
+                // resolve), so do the full pick + resolve from the
+                // normal's own meta entry.  Rare in practice.
+                VirtualTextureMeta meta = vt_meta[vtIndexOf(normal_vt)];
+                float lod_cont = vtComputeLod(meta, v_uv);
+                uint  mip_max  = max(1u, meta.mip_count) - 1u;
+                uint  nrm_mip  = clamp(uint(lod_cont), 0u, mip_max);
+                float nrm_frac = (nrm_mip == mip_max)
+                                 ? 0.0
+                                 : clamp(lod_cont - float(nrm_mip), 0.0, 1.0);
+                vec2 phys_uv;
+                if (vtResolve(normal_vt, v_uv, meta, nrm_mip, phys_uv)) {
+                    raw_n       = textureLod(vt_pool_normal, phys_uv, nrm_frac);
+                    vt_resolved = true;
+                }
             }
         }
         if (!vt_resolved) {

@@ -29,6 +29,7 @@ extern "C" {
 #include "game_object/mesh_load_task_manager.h"
 #include "scene_rendering/ssao.h"
 #include "scene_rendering/cluster_renderer.h"
+#include "scene_rendering/virtual_texture.h"
 #include "helper/cluster_mesh.h"
 
 namespace er = engine::renderer;
@@ -1854,39 +1855,148 @@ bool Menu::draw(
     // registered material texture).  Empty / unregistered pages stay
     // black.  Toggled via Tools → "Show VT Pool" in the menu.
     if (show_vt_pool_debug_) {
+        // Window is sized for the activity grid up top + the four
+        // 240-px pool atlas thumbnails below.
         constexpr float kThumbSize = 240.0f;
-        constexpr float kWinW = kThumbSize * 4 + 60.0f;
-        constexpr float kWinH = kThumbSize + 100.0f;
+        constexpr float kWinW      = kThumbSize * 4 + 60.0f;
+        constexpr float kWinH      = kThumbSize + 320.0f;
         ImGui::SetNextWindowSize(ImVec2(kWinW, kWinH));
         ImGui::SetNextWindowViewport(main_vp_id);
         if (ImGui::Begin("VT Pool Debug", &show_vt_pool_debug_,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
-            // Layer format labels — must match VtLayer enum order in
-            // virtual_texture.h.  ALBEDO is BC7 SRGB (encoded by the
-            // engine's Mode-6 encoder), the rest are RGBA8.
-            const char* labels[] = {
-                "Albedo (BC7 sRGB)",
-                "Normal (RGBA8)",
-                "Metal/Rough/AO (RGBA8)",
-                "Emissive (RGBA8)" };
-            for (int k = 0; k < 4; ++k) {
-                if (k > 0) ImGui::SameLine();
-                ImGui::BeginGroup();
-                ImGui::Text("%s", labels[k]);
-                if (vt_pool_tex_ids_[k]) {
-                    ImGui::Image(vt_pool_tex_ids_[k],
-                                 ImVec2(kThumbSize, kThumbSize));
-                    if (ImGui::IsItemHovered()) {
-                        // Larger preview on hover.
-                        ImGui::BeginTooltip();
-                        ImGui::Image(vt_pool_tex_ids_[k], ImVec2(600, 600));
-                        ImGui::EndTooltip();
-                    }
-                } else {
-                    ImGui::Dummy(ImVec2(kThumbSize, kThumbSize));
-                    ImGui::TextDisabled("(not bound)");
+            // ── VT on/off toggle ───────────────────────────────────
+            // Re-uploads material_params with all vt_id fields cleared
+            // when toggled off; the shader's existing fallback to the
+            // legacy bindless texture arrays takes over.  Side-by-side
+            // toggle is the cleanest way to A/B the VT path's quality
+            // and perf against the bindless baseline.
+            if (cluster_renderer_) {
+                bool vt_on = cluster_renderer_->isVtEnabled();
+                if (ImGui::Checkbox("VT Enabled", &vt_on)) {
+                    cluster_renderer_->setVtEnabled(vt_on);
                 }
-                ImGui::EndGroup();
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "(off → legacy bindless texture arrays)");
+                ImGui::Separator();
+            }
+
+            // ── Activity grid: per-slot colour-coded heatmap ──
+            // One coloured rectangle per pool slot.  Colour mapping:
+            //   BLACK         free / unallocated
+            //   DARK GREY     resident, idle (cached but unused this frame)
+            //   BRIGHT GREEN  resident + accessed this frame (the
+            //                 working set the camera is actually
+            //                 sampling)
+            //   GOLD          pinned (always-resident smallest-mip
+            //                 fallback per VT)
+            //   BRIGHT YELLOW pinned + accessed this frame
+            // The ratio of green-to-grey tells you whether the pool
+            // is sized right: lots of grey = pool is bigger than
+            // working set (memory wasted); 100% green = thrashing
+            // boundary; pinned-only-yellow with no green means the
+            // streamer hasn't caught up to the camera.
+            if (vt_manager_) {
+                const auto& grid = vt_manager_->getSlotStatusGrid();
+                const uint32_t cols = vt_manager_->getSlotGridWidth();
+                const uint32_t rows = vt_manager_->getSlotGridHeight();
+                const uint32_t total = uint32_t(grid.size());
+                if (cols > 0 && rows > 0 && total >= cols * rows) {
+                    const uint32_t a = vt_manager_->getSlotsActive();
+                    const uint32_t r = vt_manager_->getSlotsResident();
+                    const uint32_t p = vt_manager_->getSlotsPinned();
+                    ImGui::Text("Slots: %u total | %u resident (%.1f%%) | "
+                                "%u active this frame (%.1f%% of resident) | "
+                                "%u pinned",
+                        total, r, 100.0f * float(r) / float(total),
+                        a, r > 0 ? 100.0f * float(a) / float(r) : 0.0f,
+                        p);
+
+                    // Pick a cell pixel size that fits the grid into
+                    // the available content width.  Min 4 px so the
+                    // colours are still legible at 114 cols.
+                    const float avail_w = ImGui::GetContentRegionAvail().x - 8.0f;
+                    float cell_px = std::floor(avail_w / float(cols));
+                    if (cell_px < 4.0f) cell_px = 4.0f;
+                    if (cell_px > 16.0f) cell_px = 16.0f;
+                    const float grid_w = cell_px * float(cols);
+                    const float grid_h = cell_px * float(rows);
+
+                    ImVec2 origin = ImGui::GetCursorScreenPos();
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    // Background frame.
+                    dl->AddRectFilled(origin,
+                        ImVec2(origin.x + grid_w, origin.y + grid_h),
+                        IM_COL32(20, 20, 20, 255));
+                    // Per-cell colour.
+                    for (uint32_t y = 0; y < rows; ++y) {
+                        for (uint32_t x = 0; x < cols; ++x) {
+                            uint8_t b = grid[y * cols + x];
+                            const bool resident =
+                                (b & engine::scene_rendering::
+                                       VirtualTextureManager::kSlotStatusResident);
+                            const bool active   =
+                                (b & engine::scene_rendering::
+                                       VirtualTextureManager::kSlotStatusActive);
+                            const bool pinned   =
+                                (b & engine::scene_rendering::
+                                       VirtualTextureManager::kSlotStatusPinned);
+                            ImU32 col;
+                            if (!resident) {
+                                col = IM_COL32(0, 0, 0, 255);
+                            } else if (pinned && active) {
+                                col = IM_COL32(255, 235, 0, 255);  // bright yellow
+                            } else if (pinned) {
+                                col = IM_COL32(180, 130, 0, 255);  // gold
+                            } else if (active) {
+                                col = IM_COL32(60, 220, 80, 255);  // bright green
+                            } else {
+                                col = IM_COL32(70, 70, 80, 255);   // dark grey
+                            }
+                            ImVec2 p0(origin.x + float(x) * cell_px,
+                                      origin.y + float(y) * cell_px);
+                            ImVec2 p1(p0.x + cell_px - 0.5f,
+                                      p0.y + cell_px - 0.5f);
+                            dl->AddRectFilled(p0, p1, col);
+                        }
+                    }
+                    ImGui::Dummy(ImVec2(grid_w, grid_h));
+                }
+                ImGui::Separator();
+            } else {
+                ImGui::TextDisabled("(VT manager not bound — slot grid unavailable)");
+                ImGui::Separator();
+            }
+
+            // ── Pool image atlas thumbnails (collapsible) ──
+            // Kept for content inspection — useful for confirming
+            // tiles are encoded correctly.  Less useful day-to-day
+            // than the activity grid above.
+            if (ImGui::CollapsingHeader("Pool Image Atlases")) {
+                // Layer format labels — must match VtLayer enum order.
+                const char* labels[] = {
+                    "Albedo (BC7 sRGB)",
+                    "Normal (BC5 UNorm)",
+                    "Metal/Rough/AO (RGBA8)",
+                    "Emissive (RGBA8)" };
+                for (int k = 0; k < 4; ++k) {
+                    if (k > 0) ImGui::SameLine();
+                    ImGui::BeginGroup();
+                    ImGui::Text("%s", labels[k]);
+                    if (vt_pool_tex_ids_[k]) {
+                        ImGui::Image(vt_pool_tex_ids_[k],
+                                     ImVec2(kThumbSize, kThumbSize));
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::BeginTooltip();
+                            ImGui::Image(vt_pool_tex_ids_[k], ImVec2(600, 600));
+                            ImGui::EndTooltip();
+                        }
+                    } else {
+                        ImGui::Dummy(ImVec2(kThumbSize, kThumbSize));
+                        ImGui::TextDisabled("(not bound)");
+                    }
+                    ImGui::EndGroup();
+                }
             }
         }
         ImGui::End();
