@@ -206,11 +206,33 @@ struct PipelineColorBlendAttachmentState {
 };
 
 struct PipelineColorBlendStateCreateInfo {
-    bool                                          logic_op_enable;
-    LogicOp                                       logic_op;
-    uint32_t                                      attachment_count;
-    const PipelineColorBlendAttachmentState* attachments;
-    glm::vec4                                     blend_constants;
+    bool                                                  logic_op_enable;
+    LogicOp                                               logic_op;
+    // Owned storage for the per-attachment blend states.  Previously
+    // this struct held a raw `const PipelineColorBlendAttachmentState*`
+    // that pointed into whatever vector the caller passed in.  That
+    // worked when the caller's vector outlived the struct, but the
+    // common idiom — calling fillPipelineColorBlendStateCreateInfo
+    // with an inline initializer-list `{ blend_a, blend_b }` — created
+    // a TEMPORARY vector that died at the end of the statement and
+    // left the pointer dangling.  Reading `attachments` later inside
+    // createPipeline produced undefined values for the blend state,
+    // which silently invalidated whole pipelines (most visibly: the
+    // cluster_renderer's translucent-glass pipeline went blank when
+    // a second pipeline creation reused the freed memory).
+    //
+    // Making this a value-owning vector kills the entire bug class
+    // at the source — callers can still write inline initializer-
+    // lists and the data is safely copied into this member.
+    //
+    // `attachment_count` is kept as a public synonym for
+    // `attachments.size()` so existing consumers (e.g. vk_renderer
+    // _helper's fillVkPipelineColorBlendAttachments) need no edits
+    // beyond setting it from .size().  New code can ignore it and
+    // use .attachments.size() directly.
+    std::vector<PipelineColorBlendAttachmentState>        attachments;
+    uint32_t                                              attachment_count = 0;
+    glm::vec4                                             blend_constants{ 0.0f };
 };
 
 struct PipelineRasterizationStateCreateInfo {
@@ -230,7 +252,13 @@ struct PipelineMultisampleStateCreateInfo {
     SampleCountFlagBits         rasterization_samples;
     bool                        sample_shading_enable;
     float                       min_sample_shading;
-    const SampleMask* sample_mask;
+    // Owned storage (was a raw `const SampleMask*`).  Same class of
+    // dangling-pointer hazard the color-blend attachments field had:
+    // if a caller assigned this from a temporary array's address the
+    // pointer would dangle by the time createPipeline consumed it.
+    // Empty vector means "no sample mask" (equivalent to the old
+    // nullptr default).
+    std::vector<SampleMask>     sample_mask;
     bool                        alpha_to_coverage_enable;
     bool                        alpha_to_one_enable;
 };
@@ -287,8 +315,12 @@ struct SubpassDescription {
     std::vector<AttachmentReference> color_attachments;
     std::vector<AttachmentReference> resolve_attachments;
     std::vector<AttachmentReference> depth_stencil_attachment;
-    uint32_t                        preserve_attachment_count;
-    const uint32_t* preserve_attachments;
+    // Owned storage (was `const uint32_t* preserve_attachments` paired
+    // with `preserve_attachment_count`).  Same dangling-pointer hazard
+    // as the color-blend attachments field had — preserved here for
+    // defense-in-depth even though no caller currently sets it to a
+    // non-empty list.  Use empty == "no preserve attachments".
+    std::vector<uint32_t>           preserve_attachments;
 };
 
 struct SubpassDependency {

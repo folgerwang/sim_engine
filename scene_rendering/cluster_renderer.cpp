@@ -2033,7 +2033,126 @@ void ClusterRenderer::initBindlessPipeline(
     constexpr er::Format kOitAccumFormat  = er::Format::R16G16B16A16_SFLOAT;
     constexpr er::Format kOitRevealFormat = er::Format::R8_UNORM;
     {
-        // accum attachment: additive (ONE / ONE).
+        // ── Forward alpha-blended translucent pipeline ─────────────────
+        //
+        // Replaces the prior WBOIT (Weighted Blended OIT) pipeline + the
+        // separate fullscreen composite pass.  Glass now uses standard
+        // hardware alpha blending against the scene's single colour
+        // attachment, with no OIT accum/reveal targets and no composite.
+        //
+        // Why we switched: the OIT path's accum/reveal accumulators +
+        // composite resolve were producing unpredictable results on
+        // glass — "fully translucent" frames where the discard rule
+        // (reveal > 0.99 OR accum.a < 1e-3) fired even when glass should
+        // have been visible, plus weird per-frame colour shifts from
+        // the IBL mini-cube's mip-0 temporal dither feeding the
+        // chromatic refraction lookup.  WBOIT is correct in principle
+        // but fragile here: any NaN in accum poisons the whole pixel,
+        // and reveal's multiplicative blend can saturate to 1.0 in a
+        // way that's indistinguishable from "no glass drew here."
+        //
+        // Standard alpha blending is simpler, depth-order-dependent
+        // (acceptable for a cluster scene where the translucent set is
+        // small and per-cluster sort by depth is good enough for the
+        // visual fidelity bar), and gives stable predictable output
+        // every frame.  Glass cluster z-sort happens at cull time via
+        // the per-cluster bounds; the cluster set is small enough that
+        // the residual ordering errors are rare.
+        //
+        // Blend equation (matches base.frag's translucent path):
+        //   src color:    SRC_ALPHA
+        //   dst color:    ONE_MINUS_SRC_ALPHA
+        //   src alpha:    ONE                  (so accumulated alpha is
+        //   dst alpha:    ONE_MINUS_SRC_ALPHA   reported correctly for
+        //                                       any post-effect that
+        //                                       reads dst alpha)
+        auto ab_blend = er::helper::fillPipelineColorBlendAttachmentState(
+            SET_FLAG_BIT(ColorComponent, ALL_BITS),
+            /*blend_enable*/ true,
+            /*src color*/    er::BlendFactor::SRC_ALPHA,
+            /*dst color*/    er::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            /*color op*/     er::BlendOp::ADD,
+            /*src alpha*/    er::BlendFactor::ONE,
+            /*dst alpha*/    er::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            /*alpha op*/     er::BlendOp::ADD);
+
+        // Historical note: PipelineColorBlendStateCreateInfo USED TO
+        // hold a raw pointer (color_blending.attachments = vec.data())
+        // into the input vector, which dangled when callers passed an
+        // inline initializer-list — calling with `{ ab_blend }` created
+        // a temporary that died at the end of the statement, leaving
+        // a wild pointer that createPipeline later dereferenced.  That
+        // bug made glass invisible whenever two translucent pipelines
+        // were created back-to-back (the second's temporary landed in
+        // the first's freed memory and corrupted it).  The struct was
+        // changed to OWN its attachments vector, so this is now safe
+        // either inline or via a named vector.
+        std::vector<er::PipelineColorBlendAttachmentState>
+            ab_blend_attachments = { ab_blend };
+        auto ab_blend_state =
+            std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+                er::helper::fillPipelineColorBlendStateCreateInfo(
+                    ab_blend_attachments));
+
+        // Depth test on (opaque geometry in front rejects glass behind);
+        // depth write OFF (so multiple glass surfaces in depth can all
+        // contribute via the blend — if we wrote depth, only the
+        // front-most glass would survive and any glass behind it
+        // would be rejected by the next translucent cluster's depth
+        // test, which would defeat the alpha blend entirely).
+        auto ab_depth_stencil =
+            std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+                er::helper::fillPipelineDepthStencilStateCreateInfo(
+                    /*depth_test_enable */ true,
+                    /*depth_write_enable*/ false,
+                    er::CompareOp::LESS_OR_EQUAL));
+
+        er::GraphicPipelineInfo ab_info = graphic_pipeline_info;
+        ab_info.blend_state_info   = ab_blend_state;
+        ab_info.depth_stencil_info = ab_depth_stencil;
+
+        // Same vertex shader, swap fragment to the ALPHA_BLEND_OUTPUT
+        // variant.  That variant runs the same glass IBL math as the
+        // OIT variant did, but writes a single (rgb, α) to location 0
+        // for the hardware blend above to consume.
+        er::ShaderModuleList ab_shader_modules(2);
+        ab_shader_modules[0] = shader_modules[0];   // cluster_bindless_vert.spv
+        ab_shader_modules[1] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_alphablend_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
+
+        // Framebuffer format: ONE colour attachment (the scene colour
+        // buffer's format, same as the opaque forward pipeline).
+        er::PipelineRenderbufferFormats ab_fmt;
+        ab_fmt.color_formats = { framebuffer_format.color_formats.empty()
+                                   ? er::Format::R16G16B16A16_SFLOAT
+                                   : framebuffer_format.color_formats[0] };
+        ab_fmt.depth_format  = framebuffer_format.depth_format;
+
+        bindless_translucent_pipeline_ = device_->createPipeline(
+            bindless_pipeline_layout_,   // same layout — same descriptor sets
+            binding_descs,
+            attrib_descs,
+            input_assembly,
+            ab_info,
+            ab_shader_modules,
+            ab_fmt,
+            raster_override,
+            std::source_location::current());
+    }
+
+    // ── OIT (WBOIT) translucent pipeline — McGuire & Bavoil 2013 ──────
+    // Coexists with the alpha-blend pipeline above.  Selected by the
+    // application via drawTranslucentOit() vs drawTranslucentForward()
+    // — independent code paths, no in-function dispatch.
+    //
+    // Root-cause fix: PipelineColorBlendStateCreateInfo now owns its
+    // attachments vector (previously a raw pointer into the caller's
+    // input vector — see the historical-note comment in the alpha-
+    // blend block above for what that bug looked like).  Creating
+    // this second pipeline now safely coexists with the first.
+    {
         auto accum_blend = er::helper::fillPipelineColorBlendAttachmentState(
             SET_FLAG_BIT(ColorComponent, ALL_BITS),
             /*blend_enable*/ true,
@@ -2043,9 +2162,6 @@ void ClusterRenderer::initBindlessPipeline(
             /*src alpha*/    er::BlendFactor::ONE,
             /*dst alpha*/    er::BlendFactor::ONE,
             /*alpha op*/     er::BlendOp::ADD);
-        // reveal attachment: multiplicative (ZERO / 1−SRC_COLOR).
-        // Each fragment's α multiplies the accumulated visibility, so a
-        // sequence of α₁, α₂, … produces dst = Π(1 − αᵢ).
         auto reveal_blend = er::helper::fillPipelineColorBlendAttachmentState(
             SET_FLAG_BIT(ColorComponent, R_BIT),  // single-channel
             /*blend_enable*/ true,
@@ -2055,10 +2171,16 @@ void ClusterRenderer::initBindlessPipeline(
             /*src alpha*/    er::BlendFactor::ZERO,
             /*dst alpha*/    er::BlendFactor::ONE_MINUS_SRC_ALPHA,
             /*alpha op*/     er::BlendOp::ADD);
+
+        // Named-vector pattern — see the alpha-blend block for why
+        // an inline initializer-list here would corrupt
+        // PipelineColorBlendStateCreateInfo's dangling pointer.
+        std::vector<er::PipelineColorBlendAttachmentState>
+            oit_blend_attachments = { accum_blend, reveal_blend };
         auto oit_blend_state =
             std::make_shared<er::PipelineColorBlendStateCreateInfo>(
                 er::helper::fillPipelineColorBlendStateCreateInfo(
-                    { accum_blend, reveal_blend }));
+                    oit_blend_attachments));
 
         auto oit_depth_stencil =
             std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
@@ -2071,21 +2193,19 @@ void ClusterRenderer::initBindlessPipeline(
         oit_info.blend_state_info   = oit_blend_state;
         oit_info.depth_stencil_info = oit_depth_stencil;
 
-        // OIT shader pair: reuse the existing vertex shader, swap fragment.
         er::ShaderModuleList oit_shader_modules(2);
-        oit_shader_modules[0] = shader_modules[0];   // cluster_bindless_vert.spv
+        oit_shader_modules[0] = shader_modules[0];  // vertex (shared SPV)
         oit_shader_modules[1] = er::helper::loadShaderModule(
             device_, "cluster_bindless_oit_frag.spv",
             er::ShaderStageFlagBits::FRAGMENT_BIT,
             std::source_location::current());
 
-        // OIT framebuffer format: 2 color attachments + same depth as host.
         er::PipelineRenderbufferFormats oit_fmt;
         oit_fmt.color_formats = { kOitAccumFormat, kOitRevealFormat };
         oit_fmt.depth_format  = framebuffer_format.depth_format;
 
-        bindless_translucent_pipeline_ = device_->createPipeline(
-            bindless_pipeline_layout_,   // same layout — same descriptor sets
+        bindless_translucent_oit_pipeline_ = device_->createPipeline(
+            bindless_pipeline_layout_,
             binding_descs,
             attrib_descs,
             input_assembly,
@@ -2474,144 +2594,27 @@ uint32_t ClusterRenderer::draw(
             merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
     };
 
-    // ── Pass 1: opaque + alpha-mask in caller's currently-active pass ──
+    // ── Opaque + alpha-mask only ───────────────────────────────────────
+    // ClusterRenderer::draw() is now the OPAQUE entry point only.  The
+    // translucent (alpha-blended glass) draw is issued separately by
+    // the application AFTER the sky envmap pass — see the glass-draw
+    // block in application.cpp::drawScene.  This split ensures glass
+    // alpha-blends correctly OVER the sky background at pixels where
+    // no opaque geometry sits behind the glass; if we drew glass here
+    // (before sky), the sky envmap's LESS_OR_EQUAL-vs-depth=1.0 test
+    // would overwrite glass pixels whose depth stayed at the cleared
+    // far value (depth_write is OFF on the alpha-blend pipeline, by
+    // design, so multi-layer glass can blend without depth-rejecting
+    // itself).
     bind_geometry_state(bindless_pipeline_);
     cmd_buf->drawIndexedIndirectCount(
         indirect_draw_buffer_, 0,
         draw_count_buffer_, 0,
         total_clusters_all_meshes_);
 
-    // If OIT resources aren't ready yet (e.g. shader compile failed), skip
-    // the translucent draw entirely; opaque-only is already in the buffer.
-    if (!bindless_translucent_pipeline_ || !oit_composite_pipeline_) {
-        return prev_visible;
-    }
-
-    ensureOitTargets(screen_size);
-    if (!oit_composite_desc_set_) {
-        return prev_visible;
-    }
-
-    // ── End the caller's pass; we're about to begin our own ──
-    cmd_buf->endDynamicRendering();
-
-    // ── Pass 2: WBOIT translucent ──
-    // Two color attachments (accum, reveal) + caller's depth (read-only).
-    // Clear values: accum=(0,0,0,0), reveal=(1,0,0,0).  After the OIT
-    // shaders' per-attachment blends, accum holds Σ(c·α·w, α·w) and
-    // reveal holds Π(1−α).  See cluster_bindless.frag (OIT_OUTPUT path).
-    er::RenderingAttachmentInfo accum_att;
-    accum_att.image_view   = oit_accum_tex_.view;
-    accum_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-    accum_att.load_op      = er::AttachmentLoadOp::CLEAR;
-    accum_att.store_op     = er::AttachmentStoreOp::STORE;
-    accum_att.clear_value.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-
-    er::RenderingAttachmentInfo reveal_att;
-    reveal_att.image_view   = oit_reveal_tex_.view;
-    reveal_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-    reveal_att.load_op      = er::AttachmentLoadOp::CLEAR;
-    reveal_att.store_op     = er::AttachmentStoreOp::STORE;
-    reveal_att.clear_value.color = { { 1.0f, 0.0f, 0.0f, 0.0f } };
-
-    er::RenderingAttachmentInfo oit_depth_att;
-    oit_depth_att.image_view   = depth_view;
-    oit_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    oit_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
-    oit_depth_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingInfo oit_ri = {};
-    oit_ri.render_area_offset = { 0, 0 };
-    oit_ri.render_area_extent = screen_size;
-    oit_ri.layer_count        = 1;
-    oit_ri.view_mask          = 0;
-    oit_ri.color_attachments  = { accum_att, reveal_att };
-    oit_ri.depth_attachments  = { oit_depth_att };
-    oit_ri.stencil_attachments = {};
-
-    cmd_buf->beginDynamicRendering(oit_ri);
-    bind_geometry_state(bindless_translucent_pipeline_);
-    cmd_buf->drawIndexedIndirectCount(
-        trans_indirect_draw_buffer_, 0,
-        trans_draw_count_buffer_, 0,
-        total_clusters_all_meshes_);
-    cmd_buf->endDynamicRendering();
-
-    // ── Transition accum/reveal: COLOR_ATTACHMENT → SHADER_READ_ONLY ──
-    er::ImageResourceInfo from_color_att = {
-        er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT),
-        SET_FLAG_BIT(PipelineStage, COLOR_ATTACHMENT_OUTPUT_BIT) };
-    er::ImageResourceInfo to_shader_read = {
-        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        SET_FLAG_BIT(Access, SHADER_READ_BIT),
-        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
-    cmd_buf->addImageBarrier(oit_accum_tex_.image,  from_color_att, to_shader_read, 0, 1, 0, 1);
-    cmd_buf->addImageBarrier(oit_reveal_tex_.image, from_color_att, to_shader_read, 0, 1, 0, 1);
-
-    // ── Pass 3: fullscreen composite onto the host's color buffer ──
-    // Now also attaches the host depth buffer so the composite fragment
-    // shader can stamp gl_FragDepth = 0.99999 at glass pixels — this
-    // prevents the downstream sky pass (LESS_OR_EQUAL vs depth=1.0) from
-    // painting sky over the freshly-resolved glass colour at pixels where
-    // no opaque geometry is behind the glass.
-    er::RenderingAttachmentInfo comp_color_att;
-    comp_color_att.image_view   = color_view;
-    comp_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-    comp_color_att.load_op      = er::AttachmentLoadOp::LOAD;
-    comp_color_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingAttachmentInfo comp_depth_att;
-    comp_depth_att.image_view   = depth_view;
-    comp_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    comp_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
-    comp_depth_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingInfo comp_ri = {};
-    comp_ri.render_area_offset  = { 0, 0 };
-    comp_ri.render_area_extent  = screen_size;
-    comp_ri.layer_count         = 1;
-    comp_ri.view_mask           = 0;
-    comp_ri.color_attachments   = { comp_color_att };
-    comp_ri.depth_attachments   = { comp_depth_att };
-    comp_ri.stencil_attachments = {};
-
-    cmd_buf->beginDynamicRendering(comp_ri);
-    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, oit_composite_pipeline_);
-    cmd_buf->setViewports(viewports);
-    cmd_buf->setScissors(scissors);
-    cmd_buf->bindDescriptorSets(
-        er::PipelineBindPoint::GRAPHICS,
-        oit_composite_pipeline_layout_,
-        { oit_composite_desc_set_ });
-    cmd_buf->draw(3);   // fullscreen triangle generated in full_screen.vert
-    cmd_buf->endDynamicRendering();
-
-    // ── Re-begin the caller's pass with LOAD/LOAD ──
-    // Preserves the API contract: caller's matching endDynamicRendering()
-    // still has a pass open to close.
-    er::RenderingAttachmentInfo host_color_att;
-    host_color_att.image_view   = color_view;
-    host_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-    host_color_att.load_op      = er::AttachmentLoadOp::LOAD;
-    host_color_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingAttachmentInfo host_depth_att;
-    host_depth_att.image_view   = depth_view;
-    host_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    host_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
-    host_depth_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingInfo host_ri = {};
-    host_ri.render_area_offset  = { 0, 0 };
-    host_ri.render_area_extent  = screen_size;
-    host_ri.layer_count         = 1;
-    host_ri.view_mask           = 0;
-    host_ri.color_attachments   = { host_color_att };
-    host_ri.depth_attachments   = { host_depth_att };
-    host_ri.stencil_attachments = {};
-    cmd_buf->beginDynamicRendering(host_ri);
-
+    (void)color_view;
+    (void)depth_view;
+    (void)screen_size;
     return prev_visible;
 }
 
@@ -2752,10 +2755,108 @@ uint32_t ClusterRenderer::drawTranslucentForward(
     const std::shared_ptr<renderer::ImageView>& color_view,
     const std::shared_ptr<renderer::ImageView>& depth_view,
     const glm::uvec2& screen_size) {
+    // Translucent (glass) draw path, NOW using standard alpha blending
+    // straight into the caller's color/depth pass — no WBOIT accum/reveal
+    // targets, no composite resolve.  The previous WBOIT implementation
+    // was producing unpredictable glass: "fully translucent" frames where
+    // the composite's discard rule (reveal > 0.99 OR accum.a < 1e-3)
+    // fired even when glass should have been visible, plus the
+    // chromatic refraction of the glass IBL math poisoning whole-pixel
+    // accum values via the IBL mini-cube mip-0 dither feeding NaN /
+    // wild colour deltas into the accumulator.
+    //
+    // The new design:
+    //   1. The cull pass already emits a TRANSLUCENT-only indirect draw
+    //      list (trans_indirect_draw_buffer_) keyed on the
+    //      BINDLESS_MAT_TRANSLUCENT alpha-mode tag — unchanged.
+    //   2. We bind the ALPHA_BLEND_OUTPUT shader variant + the alpha-
+    //      blend pipeline (created in initBindlessPipeline above), which
+    //      writes a single (rgb, α) to location 0.
+    //   3. The pipeline does porter-duff "over" via hardware src_alpha /
+    //      one_minus_src_alpha blending against the scene colour buffer.
+    //   4. Depth test ON, depth write OFF — see the pipeline depth-stencil
+    //      comment for why writing depth here would break multi-layer
+    //      glass.
+    //
+    // Alpha-blend only.  WBOIT was briefly re-added as a runtime-
+    // switchable second mode but caused glass to disappear (regression
+    // we couldn't pin down quickly), so it was reverted to keep the
+    // engine in a known-good state.  The OIT pipeline + composite
+    // resources still exist in this file but are no longer reachable
+    // from this draw path.  If WBOIT is needed again later, prefer
+    // adding it back as a separate explicit entry point (e.g.
+    // drawTranslucentOit) rather than dispatching inside this one —
+    // the in-place dispatch was the version that broke.
+    (void)color_view;
+    (void)depth_view;
+    (void)screen_size;
+
     if (!gpu_ready_ || !bindless_pipeline_ || !bindless_desc_set_) {
         return 0;
     }
-    if (!bindless_translucent_pipeline_ || !oit_composite_pipeline_) {
+    if (!bindless_translucent_pipeline_) {
+        // Shader compile failed at init — nothing we can do; opaque pass
+        // already drew, the frame is incomplete but won't crash.
+        return total_visible_all_meshes_;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, bindless_translucent_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_pipeline_layout_,
+        all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexedIndirectCount(
+        trans_indirect_draw_buffer_, 0,
+        trans_draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+
+    return total_visible_all_meshes_;
+}
+
+// ─── WBOIT translucent draw ────────────────────────────────────────────────
+// Standalone entry point — caller MUST NOT have a render pass open when
+// it invokes this function.  We open every pass we need internally and
+// leave NO pass open on return.  The application's caller handles its
+// own outer pass orchestration; for the glass dispatch in drawScene the
+// rule is simply "alpha-blend path opens a pass around the call, OIT
+// path does NOT" — see the glass block in application.cpp.
+//
+// This is deliberately a separate entry point from drawTranslucentForward
+// (and not a dispatch inside it) because the earlier in-function dispatch
+// design managed to regress alpha-blend glass in ways we couldn't pin
+// down quickly.  Split-entry guarantees the two pipelines stay on
+// independent code paths.
+uint32_t ClusterRenderer::drawTranslucentOit(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    const std::shared_ptr<renderer::ImageView>& color_view,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& screen_size) {
+    if (!gpu_ready_ || !bindless_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+    if (!bindless_translucent_oit_pipeline_ || !oit_composite_pipeline_) {
+        // OIT pipeline didn't init — glass simply doesn't draw in this
+        // path; opaque scene remains untouched.  Caller's outer code
+        // is responsible for falling back to alpha-blend if it wants
+        // to (typically by reading getTranslucentMode() and dispatching
+        // before calling either function).
         return total_visible_all_meshes_;
     }
 
@@ -2783,10 +2884,7 @@ uint32_t ClusterRenderer::drawTranslucentForward(
             merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
     };
 
-    // ── End host pass (caller's pass on color_view + depth_view) ──
-    cmd_buf->endDynamicRendering();
-
-    // ── WBOIT translucent into accum + reveal ──
+    // ── Pass A: WBOIT accum+reveal draw ──────────────────────────────
     er::RenderingAttachmentInfo accum_att;
     accum_att.image_view   = oit_accum_tex_.view;
     accum_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
@@ -2814,15 +2912,17 @@ uint32_t ClusterRenderer::drawTranslucentForward(
     oit_ri.view_mask          = 0;
     oit_ri.color_attachments  = { accum_att, reveal_att };
     oit_ri.depth_attachments  = { oit_depth_att };
+    oit_ri.stencil_attachments = {};
 
     cmd_buf->beginDynamicRendering(oit_ri);
-    bind_geometry_state(bindless_translucent_pipeline_);
+    bind_geometry_state(bindless_translucent_oit_pipeline_);
     cmd_buf->drawIndexedIndirectCount(
         trans_indirect_draw_buffer_, 0,
         trans_draw_count_buffer_, 0,
         total_clusters_all_meshes_);
     cmd_buf->endDynamicRendering();
 
+    // ── Transition accum + reveal: COLOR_ATTACHMENT → SHADER_READ ────
     er::ImageResourceInfo from_color_att = {
         er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         SET_FLAG_BIT(Access, COLOR_ATTACHMENT_WRITE_BIT),
@@ -2834,7 +2934,7 @@ uint32_t ClusterRenderer::drawTranslucentForward(
     cmd_buf->addImageBarrier(oit_accum_tex_.image,  from_color_att, to_shader_read, 0, 1, 0, 1);
     cmd_buf->addImageBarrier(oit_reveal_tex_.image, from_color_att, to_shader_read, 0, 1, 0, 1);
 
-    // ── Composite ──
+    // ── Pass B: fullscreen composite onto host colour buffer ────────
     er::RenderingAttachmentInfo comp_color_att;
     comp_color_att.image_view   = color_view;
     comp_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
@@ -2854,6 +2954,7 @@ uint32_t ClusterRenderer::drawTranslucentForward(
     comp_ri.view_mask           = 0;
     comp_ri.color_attachments   = { comp_color_att };
     comp_ri.depth_attachments   = { comp_depth_att };
+    comp_ri.stencil_attachments = {};
 
     cmd_buf->beginDynamicRendering(comp_ri);
     cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, oit_composite_pipeline_);
@@ -2863,30 +2964,8 @@ uint32_t ClusterRenderer::drawTranslucentForward(
         er::PipelineBindPoint::GRAPHICS,
         oit_composite_pipeline_layout_,
         { oit_composite_desc_set_ });
-    cmd_buf->draw(3);
+    cmd_buf->draw(3);   // fullscreen triangle from full_screen.vert
     cmd_buf->endDynamicRendering();
-
-    // ── Re-open caller's pass with LOAD/LOAD ──
-    er::RenderingAttachmentInfo host_color_att;
-    host_color_att.image_view   = color_view;
-    host_color_att.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-    host_color_att.load_op      = er::AttachmentLoadOp::LOAD;
-    host_color_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingAttachmentInfo host_depth_att;
-    host_depth_att.image_view   = depth_view;
-    host_depth_att.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    host_depth_att.load_op      = er::AttachmentLoadOp::LOAD;
-    host_depth_att.store_op     = er::AttachmentStoreOp::STORE;
-
-    er::RenderingInfo host_ri = {};
-    host_ri.render_area_offset  = { 0, 0 };
-    host_ri.render_area_extent  = screen_size;
-    host_ri.layer_count         = 1;
-    host_ri.view_mask           = 0;
-    host_ri.color_attachments   = { host_color_att };
-    host_ri.depth_attachments   = { host_depth_att };
-    cmd_buf->beginDynamicRendering(host_ri);
 
     return total_visible_all_meshes_;
 }
@@ -2980,6 +3059,7 @@ void ClusterRenderer::recreate(
 void ClusterRenderer::destroy() {
     bindless_pipeline_.reset();
     bindless_translucent_pipeline_.reset();
+    bindless_translucent_oit_pipeline_.reset();
     bindless_gbuffer_pipeline_.reset();
     bindless_pipeline_layout_.reset();
     bindless_desc_set_.reset();

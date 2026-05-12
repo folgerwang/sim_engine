@@ -88,7 +88,7 @@ PipelineMultisampleStateCreateInfo fillPipelineMultisampleStateCreateInfo(
     SampleCountFlagBits rasterization_samples = SampleCountFlagBits::SC_1_BIT,
     bool sample_shading_enable = false,
     float min_sample_shading = 1.0f,
-    const SampleMask* sample_mask = nullptr,
+    const std::vector<SampleMask>& sample_mask = {},
     bool alpha_to_coverage_enable = false,
     bool alpha_to_one_enable = false);
 

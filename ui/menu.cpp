@@ -1878,6 +1878,29 @@ bool Menu::draw(
                 ImGui::SameLine();
                 ImGui::TextDisabled(
                     "(off → legacy bindless texture arrays)");
+
+                // ── Glass / translucent mode picker ───────────────────
+                // Pure storage on the cluster renderer; the application's
+                // glass dispatch block in drawScene reads this and calls
+                // either drawTranslucentForward (ALPHA_BLEND) or
+                // drawTranslucentOit (WBOIT).  Switch is free at runtime
+                // — both pipelines are kept alive after init.
+                using TMode = engine::scene_rendering::
+                    ClusterRenderer::TranslucentMode;
+                TMode cur_mode = cluster_renderer_->getTranslucentMode();
+                int   mode_idx = (cur_mode == TMode::WBOIT) ? 1 : 0;
+                const char* mode_labels[] = {
+                    "Alpha Blend (forward)",
+                    "WBOIT (order-independent)"
+                };
+                if (ImGui::Combo("Glass Mode", &mode_idx,
+                                 mode_labels, IM_ARRAYSIZE(mode_labels))) {
+                    cluster_renderer_->setTranslucentMode(
+                        (mode_idx == 1) ? TMode::WBOIT : TMode::ALPHA_BLEND);
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "(WBOIT = McGuire-Bavoil weighted blend)");
                 ImGui::Separator();
             }
 

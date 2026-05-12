@@ -47,8 +47,7 @@ SubpassDescription FillSubpassDescription(
         desc.depth_stencil_attachment.resize(1);
         desc.depth_stencil_attachment[0] = *depth_stencil_attachment;
     }
-    desc.preserve_attachment_count = 0;
-    desc.preserve_attachments = nullptr;
+    desc.preserve_attachments.clear();  // empty == none
 
     return desc;
 }
@@ -252,8 +251,13 @@ PipelineColorBlendStateCreateInfo fillPipelineColorBlendStateCreateInfo(
     PipelineColorBlendStateCreateInfo color_blending{};
     color_blending.logic_op_enable = logic_op_enable;
     color_blending.logic_op = logic_op; // Optional
-    color_blending.attachment_count = static_cast<uint32_t>(color_blend_attachments.size());
-    color_blending.attachments = color_blend_attachments.data();
+    // COPY the attachments — the struct now owns its storage.  Inline
+    // initializer-list callers `fillPipelineColorBlendStateCreateInfo(
+    // { a, b })` used to dangle a pointer into a dying temporary
+    // vector; with owned storage the data lives as long as the struct.
+    color_blending.attachments = color_blend_attachments;
+    color_blending.attachment_count =
+        static_cast<uint32_t>(color_blending.attachments.size());
     color_blending.blend_constants = blend_constants; // Optional
 
     return color_blending;
@@ -289,14 +293,16 @@ PipelineMultisampleStateCreateInfo fillPipelineMultisampleStateCreateInfo(
     SampleCountFlagBits rasterization_samples/* = SampleCountFlagBits::SC_1_BIT*/,
     bool sample_shading_enable/* = false*/,
     float min_sample_shading/* = 1.0f*/,
-    const SampleMask* sample_mask/* = nullptr*/,
+    const std::vector<SampleMask>& sample_mask/* = {}*/,
     bool alpha_to_coverage_enable/* = false*/,
     bool alpha_to_one_enable/* = false*/) {
     PipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sample_shading_enable = sample_shading_enable;
     multisampling.rasterization_samples = rasterization_samples;
     multisampling.min_sample_shading = min_sample_shading; // Optional
-    multisampling.sample_mask = sample_mask; // Optional
+    // COPY the sample-mask vector — the struct owns its storage now,
+    // so even if the caller passed a temporary the data is safe.
+    multisampling.sample_mask = sample_mask; // Optional (empty == none)
     multisampling.alpha_to_coverage_enable = alpha_to_coverage_enable; // Optional
     multisampling.alpha_to_one_enable = alpha_to_one_enable; // Optional
 

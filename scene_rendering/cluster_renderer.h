@@ -36,6 +36,26 @@ namespace game_object { struct DrawableData; }
 namespace scene_rendering {
 
 class ClusterRenderer {
+public:
+    // ── Translucent (glass) rendering mode ─────────────────────────────
+    // Declared here at the top so private fields below can name it
+    // at declaration time (C++ data-member type lookup is positional).
+    //
+    // Two pipelines coexist; the application chooses which to use by
+    // checking getTranslucentMode() and calling either
+    // drawTranslucentForward (alpha-blend, expects an open colour/depth
+    // pass) OR drawTranslucentOit (WBOIT, manages its own sub-passes).
+    // The dispatch lives in the caller — NOT inside one of the draw
+    // functions.  An earlier attempt to dispatch inside a single
+    // draw call made glass disappear in alpha-blend mode for reasons
+    // we couldn't pin down quickly; splitting them into independent
+    // entry points eliminates that class of bug.
+    enum class TranslucentMode : uint32_t {
+        ALPHA_BLEND = 0,
+        WBOIT       = 1,
+    };
+
+private:
     // Compute culling pipeline.
     std::shared_ptr<renderer::DescriptorSetLayout> cull_desc_set_layout_;
     std::shared_ptr<renderer::PipelineLayout>      cull_pipeline_layout_;
@@ -57,6 +77,12 @@ class ClusterRenderer {
     // Current state of the VT toggle (default on).  Re-uploads the
     // material_params SSBO on transition.
     bool vt_enabled_ = true;
+
+    // Active translucent (glass) rendering mode.  Default = ALPHA_BLEND.
+    // Pure storage — the dispatch happens in the application's draw
+    // orchestration code, which reads this and picks either
+    // drawTranslucentForward or drawTranslucentOit.
+    TranslucentMode translucent_mode_ = TranslucentMode::ALPHA_BLEND;
     // Base-colour texture views staged for the bindless sampler array (binding 2).
     std::vector<std::shared_ptr<renderer::ImageView>> staging_tex_views_;
     // Dedup map: ImageView raw pointer → slot index in staging_tex_views_.
@@ -158,17 +184,30 @@ class ClusterRenderer {
     std::shared_ptr<renderer::DescriptorSetLayout> bindless_desc_set_layout_;
     std::shared_ptr<renderer::PipelineLayout>      bindless_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline>            bindless_pipeline_;
-    // OIT (Weighted Blended) pipeline for the translucent draw.  Same
-    // shader source as bindless_pipeline_ compiled with -DOIT_OUTPUT so
-    // it writes vec4 accum + float reveal to two separate render targets
-    // (oit_accum_tex_, oit_reveal_tex_) instead of a single colour.
-    // Per-attachment blend setup:
-    //   accum  attachment: src=ONE,  dst=ONE,                  op=ADD
-    //   reveal attachment: src=ZERO, dst=ONE_MINUS_SRC_COLOR,  op=ADD
-    // Depth test on, depth write off (translucent surfaces don't occlude
-    // one another in the depth buffer).  Resolved by oit_composite_pipeline_
-    // in a fullscreen pass after the OIT draw.
+
+    // ── Translucent (glass / windows) pipelines ──────────────────────────
+    //
+    //   bindless_translucent_pipeline_     — forward alpha-blended.
+    //     Compiled from cluster_bindless_alphablend_frag.spv; writes a
+    //     single (rgb, α) to location 0 with hardware src_alpha /
+    //     one_minus_src_alpha porter-duff "over" blending.  Depth
+    //     test ON, depth write OFF.  Drawn straight into the caller's
+    //     active colour/depth pass by drawTranslucentForward.
+    //
+    //   bindless_translucent_oit_pipeline_ — McGuire-Bavoil WBOIT.
+    //     Compiled from cluster_bindless_oit_frag.spv; writes vec4
+    //     accum + float reveal to two separate render targets
+    //     (oit_accum_tex_, oit_reveal_tex_) with the WBOIT per-
+    //     attachment blends.  Resolved by oit_composite_pipeline_
+    //     in a fullscreen pass.  Order-independent — useful for
+    //     dense glass scenes where alpha-blend's draw-order
+    //     sensitivity shows artifacts.  Used by drawTranslucentOit.
+    //
+    // Both pipelines are created in initBindlessPipeline and kept
+    // alive for the engine's lifetime.  Application picks which one
+    // to invoke by checking translucent_mode_.
     std::shared_ptr<renderer::Pipeline>            bindless_translucent_pipeline_;
+    std::shared_ptr<renderer::Pipeline>            bindless_translucent_oit_pipeline_;
 
     // ── Deferred G-buffer variant ────────────────────────────────────────
     // Same pipeline layout (and bindless descriptor set) as the forward
@@ -446,14 +485,14 @@ public:
         const std::vector<renderer::Viewport>& viewports,
         const std::vector<renderer::Scissor>& scissors);
 
-    // Forward-only translucent / OIT path for the deferred renderer.  The
-    // deferred lighting compute writes opaque pixels into hdr_color_buffer_
-    // before this is called; drawTranslucentForward() then runs the WBOIT
-    // accum + reveal passes and the fullscreen composite (the same three
-    // sub-passes draw() already runs internally), composited on top of
-    // hdr_color_buffer_.  Caller must have the host pass on color_view +
-    // depth_view OPEN (LOAD/LOAD), exactly like draw(); the function
-    // re-opens it before returning.  Returns previous-frame visible count.
+    // Forward alpha-blended translucent draw.  Caller MUST have a
+    // dynamic-rendering pass on (color_view, depth_view) currently
+    // OPEN; this function binds the alpha-blend pipeline and issues
+    // the translucent indirect draw straight into that pass, leaving
+    // the pass open on return.  The color_view / depth_view /
+    // screen_size parameters are unused by this path (kept for API
+    // symmetry with drawTranslucentOit) — caller's open render pass
+    // already references those.
     uint32_t drawTranslucentForward(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_sets,
@@ -462,6 +501,39 @@ public:
         const std::shared_ptr<renderer::ImageView>& color_view,
         const std::shared_ptr<renderer::ImageView>& depth_view,
         const glm::uvec2& screen_size);
+
+    // WBOIT translucent draw.  Caller MUST NOT have any render pass
+    // open when calling — this function manages every render pass it
+    // needs internally:
+    //   1. Open a pass on (oit_accum_tex_, oit_reveal_tex_, depth_view)
+    //      with CLEAR/CLEAR/LOAD; draw translucent clusters with the
+    //      WBOIT pipeline; end.
+    //   2. Transition accum + reveal to SHADER_READ.
+    //   3. Open a pass on (color_view, depth_view) with LOAD/LOAD;
+    //      run the fullscreen oit_composite_pipeline_ which resolves
+    //      accum/reveal over the existing scene colour buffer; end.
+    // No pass is open on return.  The application's caller wraps this
+    // call differently from drawTranslucentForward — see the glass
+    // dispatch block in drawScene for the contract.
+    //
+    // Falls back to a no-op (and returns prev_visible) if either the
+    // OIT pipeline or the composite pipeline failed to initialise —
+    // glass simply doesn't render in that case; opaque pixels remain.
+    uint32_t drawTranslucentOit(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors,
+        const std::shared_ptr<renderer::ImageView>& color_view,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& screen_size);
+
+    // ── Translucent mode get/set ──────────────────────────────────────
+    // Pure storage on this class — the application reads the mode and
+    // dispatches to the matching draw entry point.  Switching is free
+    // (no GPU resource recreation); both pipelines stay alive.
+    void setTranslucentMode(TranslucentMode mode) { translucent_mode_ = mode; }
+    TranslucentMode getTranslucentMode() const { return translucent_mode_; }
 
     // Opaque-only draw for cube face captures (DynamicCubemap).  Skips
     // OIT + composite to avoid the size-dependent OIT target

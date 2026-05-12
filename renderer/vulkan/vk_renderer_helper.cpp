@@ -3227,7 +3227,12 @@ VkPipelineMultisampleStateCreateInfo fillVkPipelineMultisampleStateCreateInfo(
     multisampling.sampleShadingEnable = ms_info.sample_shading_enable ? VK_TRUE : VK_FALSE;
     multisampling.rasterizationSamples = static_cast<VkSampleCountFlagBits>(toVkSampleCountFlags(static_cast<renderer::SampleCountFlags>(ms_info.rasterization_samples)));
     multisampling.minSampleShading = ms_info.min_sample_shading; // Optional
-    multisampling.pSampleMask = ms_info.sample_mask; // Optional
+    // ms_info.sample_mask is now an owning std::vector — pass its data
+    // pointer (or nullptr when empty, matching the old default).  The
+    // vector outlives this function via ms_info's lifetime in the
+    // caller, so the pointer is safe through vkCreateGraphicsPipelines.
+    multisampling.pSampleMask =
+        ms_info.sample_mask.empty() ? nullptr : ms_info.sample_mask.data();
     multisampling.alphaToCoverageEnable = ms_info.alpha_to_coverage_enable ? VK_TRUE : VK_FALSE; // Optional
     multisampling.alphaToOneEnable = ms_info.alpha_to_one_enable ? VK_TRUE : VK_FALSE; // Optional
 

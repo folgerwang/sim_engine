@@ -148,19 +148,44 @@ layout(location = 4) in vec4 v_tangent;
 layout(location = 5) in vec4 v_cur_clip;
 layout(location = 6) in vec4 v_prev_clip;
 
-// Three output variants compiled from this single fragment source:
-//   default        — single-RT lit colour for the legacy forward path.
-//   OIT_OUTPUT     — McGuire-Bavoil WBOIT pair (accum + reveal) for
-//                    translucent clusters; resolved by oit_composite.frag.
-//   GBUFFER_OUTPUT — 3-RT G-buffer for the deferred path:
-//                      RT0 RGBA8       albedo.rgb + ao.a
-//                      RT1 RGBA8       octahedral normal.xy + roughness.z
-//                                      + flags.w
-//                      RT2 RGBA8       emissive.rgb + metallic.a
-//                    deferred_resolve.comp consumes these to run lighting
-//                    once per pixel in compute, replacing the in-shader
-//                    PBR math below.  See ClusterRenderer::initBindless
-//                    GBufferPipeline for the pipeline blend / format setup.
+// FOUR output variants compiled from this single fragment source:
+//   default              — single-RT lit colour for the legacy forward path
+//                          (opaque + alpha-mask).  This is also where the
+//                          per-frame debug-render overrides live.
+//   OIT_OUTPUT           — McGuire-Bavoil WBOIT pair (accum + reveal) for
+//                          translucent clusters; resolved by
+//                          oit_composite.frag.  CURRENTLY UNUSED — the
+//                          engine moved glass to the simpler alpha-blend
+//                          variant below — but the variant is kept around
+//                          for future opt-in (e.g., dense translucent
+//                          scenes where order-independence matters).
+//   ALPHA_BLEND_OUTPUT   — single-RT translucent for forward alpha
+//                          blending.  Runs the same glass IBL math as
+//                          OIT_OUTPUT but emits (rgb, α) to location 0
+//                          for the pipeline's hardware src_alpha /
+//                          one_minus_src_alpha blend.  No accum/reveal,
+//                          no fullscreen composite — just porter-duff
+//                          "over" in hardware.
+//   GBUFFER_OUTPUT       — 3-RT G-buffer for the deferred path:
+//                            RT0 RGBA8  albedo.rgb + ao.a
+//                            RT1 RGBA8  octahedral normal.xy + roughness.z
+//                                       + flags.w
+//                            RT2 RGBA8  emissive.rgb + metallic.a
+//                            RT3 RG16F  screen-space velocity (NDC delta)
+//                          deferred_resolve.comp consumes these to run
+//                          lighting once per pixel in compute, replacing
+//                          the in-shader PBR math below.
+//
+// ⚠️ MAINTAINER NOTE — translucent-vs-opaque routing guard:
+//   The early-frame guard at the top of main() discards fragments whose
+//   BINDLESS_MAT_TRANSLUCENT flag doesn't match the variant's intent
+//   (translucent variants discard non-translucent; opaque variants
+//   discard translucent).  If you add a NEW variant, make sure the
+//   guard's `#if defined(...)` correctly classifies it.  Forgetting
+//   this caused the "alpha-blend glass completely missing" regression:
+//   ALPHA_BLEND_OUTPUT initially fell into the opaque branch and
+//   discarded every glass fragment.  Search for "MAINTAINER NOTE" in
+//   the guard block for the matching commentary.
 #ifdef OIT_OUTPUT
     layout(location = 0) out vec4 out_accum;   // RGBA16F: rgb = colour×alpha×w, a = alpha×w
     layout(location = 1) out float out_reveal; // R8/R16F: accumulates Π(1 − αᵢ)
@@ -176,6 +201,10 @@ layout(location = 6) in vec4 v_prev_clip;
     // "no history" and fall back to current colour.
     layout(location = 3) out vec2 out_velocity;
 #else
+    // Shared by both `default` (opaque) and ALPHA_BLEND_OUTPUT — both
+    // emit to a single colour attachment at location 0.  The pipeline
+    // (opaque vs alpha-blend) decides whether hardware blending is
+    // enabled and what the blend factors are.
     layout(location = 0) out vec4 out_color;
 #endif
 
@@ -305,19 +334,27 @@ void main() {
     int  tex_idx    = material_params[mat_idx].base_color_tex_idx;
     int  mat_flags  = material_params[mat_idx].flags;
 
-#ifdef OIT_OUTPUT
-    // Defense-in-depth: only AlphaMode::Blend materials should ever reach
-    // the OIT translucent pipeline (cull shader routes by flag).  If
-    // anything else sneaks through (e.g. a buggy material upload that left
-    // the flag stale), discard rather than write to accum/reveal so it
-    // can't darken the composite.
+#if defined(OIT_OUTPUT) || defined(ALPHA_BLEND_OUTPUT)
+    // Translucent pipelines (WBOIT or forward alpha-blend): only
+    // AlphaMode::Blend materials should ever reach this draw — the cull
+    // shader routes by the BINDLESS_MAT_TRANSLUCENT flag into a separate
+    // indirect bucket.  Defense-in-depth discard if something stale
+    // sneaks through, so it can't darken accum/reveal (OIT path) or
+    // leak into the colour buffer (alpha-blend path).
+    //
+    // NOTE: this guard MUST include ALPHA_BLEND_OUTPUT.  Without it,
+    // the alpha-blend variant would fall into the `#else` opaque guard
+    // below and discard EVERY translucent fragment — which is exactly
+    // what happened when this variant was first added and "glass went
+    // completely missing".
     if ((mat_flags & BINDLESS_MAT_TRANSLUCENT) == 0) {
         discard;
     }
 #else
     // The opaque pipeline must NEVER draw translucent clusters — those go
-    // through the OIT path.  Symmetric guard: if the cull shader miswrites
-    // a translucent cluster into the opaque indirect bucket, drop it here.
+    // through the translucent (OIT or alpha-blend) path.  Symmetric guard:
+    // if the cull shader miswrites a translucent cluster into the opaque
+    // indirect bucket, drop it here.
     if ((mat_flags & BINDLESS_MAT_TRANSLUCENT) != 0) {
         discard;
     }
@@ -660,8 +697,14 @@ void main() {
 
     vec3 color = ambient + diffuse + specular;
 
-#ifdef OIT_OUTPUT
+#if defined(OIT_OUTPUT) || defined(ALPHA_BLEND_OUTPUT)
     // ── Image-based glass shading ───────────────────────────────────────
+    // Activated for BOTH the WBOIT path (OIT_OUTPUT) and the simpler
+    // forward alpha-blended path (ALPHA_BLEND_OUTPUT).  The math is
+    // identical — the only difference downstream is whether the result
+    // accumulates into a (accum, reveal) pair for a composite pass, or
+    // gets written straight to the scene colour buffer with hardware
+    // src_alpha / one_minus_src_alpha blending.
     // Glass surfaces aren't well represented by the diffuse + Blinn-Phong
     // model used for opaque cluster geometry.  In the OIT (translucent)
     // path we replace `color` with a Fresnel-blended mix of:
@@ -700,17 +743,37 @@ void main() {
         const float glass_tint_strength  = 0.20;   // 0 = neutral, 1 = full albedo tint on transmission
         const float glass_F0             = 0.04;   // dielectric Fresnel reflectance at normal incidence
         const float glass_chromatic_aber = 0.015;  // R/B index spread (gives slight prism fringe)
+        // LOD to sample the GGX environment cube at for glass.  LOD 0
+        // (mip 0, mirror-sharp) is what flat polished glass "should"
+        // sample, BUT the runtime IBL "mini" path updates only a
+        // SPARSE DITHER of mip-0 texels per frame (~1/32 of them) and
+        // EMA-blends new samples toward the GGX-convolved target.  At
+        // any one moment, mip 0 is a checkerboard of "freshly updated"
+        // and "stale-but-converging" texels, with the dither pattern
+        // moving every frame.  On glass — which samples the cube
+        // directly with no per-fragment averaging, and on three
+        // slightly-different directions per pixel for chromatic
+        // aberration — that checkerboard turns into visible coloured
+        // flicker / sparkle that shifts as the camera moves or the
+        // dither rolls.  Opaque PBR doesn't see it because its
+        // textureLod is at a roughness-derived LOD ≥ ~0.5 and the
+        // box-filter mipgen above mip 0 averages the noise out.
+        //
+        // Sampling here at LOD 2 reads a 4×4-averaged downsample of
+        // mip 0, which collapses the per-texel jitter while keeping
+        // the reflection clearly directional.  Push to LOD 3 if any
+        // flicker remains; pull back toward LOD 1 once the IBL mini
+        // path is upgraded to dense per-frame updates.
+        const float glass_env_lod        = 2.0;
 
-        // ── Reflection — sharp env sample at the mirror direction ──────
-        // textureLod(... , 0.0) bypasses the GGX-convolved mips and reads
-        // the un-prefiltered sky cube, which is what real flat glass
-        // reflects.  Deliberately skipping getIBLRadianceGGX here: that
-        // helper multiplies by (f0·brdf.r + brdf.g) ≈ 0.04 for clear-glass
-        // f0, which collapses the reflection to nearly nothing.  We want
-        // the full sky to appear in the mirror direction with strength
-        // controlled by Fresnel below.
+        // ── Reflection — env sample at the mirror direction ────────────
+        // Deliberately skipping getIBLRadianceGGX: that helper multiplies
+        // by (f0·brdf.r + brdf.g) ≈ 0.04 for clear-glass f0, which
+        // collapses the reflection to nearly nothing.  We want the full
+        // env to appear in the mirror direction with strength controlled
+        // by Fresnel below.
         vec3 reflect_dir     = normalize(reflect(-V, N));
-        vec3 reflection_term = textureLod(ggx_env_sampler, reflect_dir, 0.0).rgb;
+        vec3 reflection_term = textureLod(ggx_env_sampler, reflect_dir, glass_env_lod).rgb;
 
         // ── Refraction — slightly bent ray to simulate pane thickness ──
         // refract() gives the direction the view ray continues *inside*
@@ -732,9 +795,9 @@ void main() {
         vec3 view_b = normalize(mix(-V, ref_dir_b, glass_thickness));
 
         vec3 refraction_term = vec3(
-            textureLod(ggx_env_sampler, view_r, 0.0).r,
-            textureLod(ggx_env_sampler, view_g, 0.0).g,
-            textureLod(ggx_env_sampler, view_b, 0.0).b);
+            textureLod(ggx_env_sampler, view_r, glass_env_lod).r,
+            textureLod(ggx_env_sampler, view_g, glass_env_lod).g,
+            textureLod(ggx_env_sampler, view_b, glass_env_lod).b);
 
         // Albedo tints what's seen through the glass — a green pane
         // greens the world behind it, clear glass leaves it untouched.
@@ -810,6 +873,21 @@ void main() {
 
     // Debug-mode override is intentionally skipped in OIT_OUTPUT — the
     // visualisation only makes sense in the single-target opaque path.
+    return;
+#elif defined(ALPHA_BLEND_OUTPUT)
+    // ── Forward alpha-blended glass ────────────────────────────────────
+    // Single colour attachment, hardware src_alpha / one_minus_src_alpha
+    // blending.  We emit (rgb, α) directly; the pipeline blends it over
+    // the scene colour buffer with the standard porter-duff "over"
+    // formula:  final = src.rgb * src.a + dst.rgb * (1 - src.a)
+    //
+    // Floor alpha at 0.15 so any asset that ships glass with
+    // base_color_factor.a ≈ 0 still gets a faint Fresnel-tinted
+    // visible pane instead of disappearing entirely.  Ceiling at 0.95
+    // so even the most opaque glass still lets a sliver of the scene
+    // behind show through (real flat glass never fully occludes).
+    float blend_a = clamp(final_color.a, 0.15, 0.95);
+    out_color = vec4(final_color.rgb, blend_a);
     return;
 #else
     out_color = final_color;
