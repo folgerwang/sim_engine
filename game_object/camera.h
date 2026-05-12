@@ -17,7 +17,9 @@ class ViewCamera {
     static std::shared_ptr<renderer::Pipeline> s_update_view_camera_pipeline_;
 
     std::shared_ptr<renderer::DescriptorSet> m_update_view_camera_desc_set_[2];
+
     std::shared_ptr<renderer::BufferInfo> m_view_camera_buffer_;
+
     glsl::ViewCameraInfo m_camera_info_;
     bool m_is_ortho_ = false;
 

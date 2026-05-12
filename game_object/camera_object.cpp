@@ -95,8 +95,10 @@ CameraObject::CameraObject(
         m_device_->createDescriptorSets(
             m_descriptor_pool_,
             CameraObject::s_view_camera_desc_set_layout_, 1)[0];
+
     er::WriteDescriptorList buffer_descs;
     buffer_descs.reserve(1);
+
     er::Helper::addOneBuffer(
         buffer_descs,
         m_view_camera_desc_set_,
@@ -104,6 +106,7 @@ CameraObject::CameraObject(
         VIEW_CAMERA_BUFFER_INDEX,
         m_view_camera_->getViewCameraBuffer()->buffer,
         sizeof(glsl::ViewCameraInfo));
+
     m_device_->updateDescriptorSets(buffer_descs);
 }
 
@@ -113,6 +116,7 @@ void CameraObject::recreateDescriptorSet() {
         m_device_->createDescriptorSets(
             m_descriptor_pool_,
             s_view_camera_desc_set_layout_, 1)[0];
+
     er::WriteDescriptorList buffer_descs;
     buffer_descs.reserve(1);
     er::Helper::addOneBuffer(
@@ -357,135 +361,6 @@ void ShadowViewCameraObject::computeCascadeMatrices(
 
         out_vps[k] = lp * lv;
     }
-}
-
-void ShadowViewCameraObject::initCascadeDescriptorSets(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
-
-    assert(CameraObject::s_view_camera_desc_set_layout_ != nullptr);
-
-    // Snapshot base camera info (position, direction, etc.) to pre-populate
-    // each cascade buffer.  The view_proj field will be overwritten per-cascade.
-    const glsl::ViewCameraInfo base_info = m_view_camera_->getCameraInfo();
-
-    for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
-        // Allocate a host-coherent storage buffer, one per cascade.
-        m_cascade_bufs_[k] = std::make_shared<er::BufferInfo>();
-        device->createBuffer(
-            sizeof(glsl::ViewCameraInfo),
-            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
-            SET_3_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_CACHED_BIT, HOST_COHERENT_BIT),
-            0,
-            m_cascade_bufs_[k]->buffer,
-            m_cascade_bufs_[k]->memory,
-            std::source_location::current());
-
-        // Write initial data so the buffer is valid before the first draw.
-        device->updateBufferMemory(
-            m_cascade_bufs_[k]->memory,
-            sizeof(glsl::ViewCameraInfo),
-            &base_info);
-
-        // Allocate a descriptor set pointing to this cascade's buffer.
-        m_cascade_desc_sets_[k] =
-            device->createDescriptorSets(
-                descriptor_pool,
-                CameraObject::s_view_camera_desc_set_layout_, 1)[0];
-
-        er::WriteDescriptorList buffer_descs;
-        buffer_descs.reserve(1);
-        er::Helper::addOneBuffer(
-            buffer_descs,
-            m_cascade_desc_sets_[k],
-            er::DescriptorType::STORAGE_BUFFER,
-            VIEW_CAMERA_BUFFER_INDEX,
-            m_cascade_bufs_[k]->buffer,
-            sizeof(glsl::ViewCameraInfo));
-        device->updateDescriptorSets(buffer_descs);
-    }
-}
-
-void ShadowViewCameraObject::recreateCascadeDescriptorSets(
-    const std::shared_ptr<renderer::Device>& device,
-    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool) {
-
-    assert(CameraObject::s_view_camera_desc_set_layout_ != nullptr);
-
-    for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
-        if (!m_cascade_bufs_[k]) continue;   // not initialised yet
-
-        m_cascade_desc_sets_[k] =
-            device->createDescriptorSets(
-                descriptor_pool,
-                CameraObject::s_view_camera_desc_set_layout_, 1)[0];
-
-        er::WriteDescriptorList buffer_descs;
-        buffer_descs.reserve(1);
-        er::Helper::addOneBuffer(
-            buffer_descs,
-            m_cascade_desc_sets_[k],
-            er::DescriptorType::STORAGE_BUFFER,
-            VIEW_CAMERA_BUFFER_INDEX,
-            m_cascade_bufs_[k]->buffer,
-            sizeof(glsl::ViewCameraInfo));
-        device->updateDescriptorSets(buffer_descs);
-    }
-}
-
-void ShadowViewCameraObject::updateCascadeBuffer(
-    int k, const glm::mat4& view_proj) {
-
-    assert(k >= 0 && k < CSM_CASCADE_COUNT);
-    assert(m_cascade_bufs_[k] != nullptr);
-
-    // Copy current base camera info, override view_proj for this cascade,
-    // and write to the cascade-specific host-coherent buffer.
-    glsl::ViewCameraInfo cam_info = m_view_camera_->getCameraInfo();
-    cam_info.view_proj = view_proj;
-
-    m_device_->updateBufferMemory(
-        m_cascade_bufs_[k]->memory,
-        sizeof(glsl::ViewCameraInfo),
-        &cam_info);
-}
-
-std::shared_ptr<er::DescriptorSet>
-ShadowViewCameraObject::getViewCameraDescriptorSet() const {
-    if (m_current_cascade_ >= 0 && m_current_cascade_ < CSM_CASCADE_COUNT
-        && m_cascade_desc_sets_[m_current_cascade_]) {
-        return m_cascade_desc_sets_[m_current_cascade_];
-    }
-    return m_view_camera_desc_set_;
-}
-
-void ShadowViewCameraObject::destroy(
-    const std::shared_ptr<renderer::Device>& device) {
-
-    // Destroy per-cascade buffers (descriptor sets are freed with the pool).
-    for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
-        if (m_cascade_bufs_[k]) {
-            m_cascade_bufs_[k]->destroy(device);
-            m_cascade_bufs_[k] = nullptr;
-        }
-    }
-
-    // Call base destroy.
-    CameraObject::destroy(device);
-}
-
-void ShadowViewCameraObject::updateCameraForCascade(
-    const glm::mat4& cascade_view_proj) {
-
-    // Copy the current camera info, override view_proj with the cascade matrix,
-    // and upload to the GPU buffer that base_depthonly.vert reads.
-    glsl::ViewCameraInfo cam_info = m_view_camera_->getCameraInfo();
-    cam_info.view_proj = cascade_view_proj;
-
-    m_device_->updateBufferMemory(
-        m_view_camera_->getViewCameraBuffer()->memory,
-        sizeof(glsl::ViewCameraInfo),
-        &cam_info);
 }
 
 } // game_object

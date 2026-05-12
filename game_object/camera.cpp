@@ -157,6 +157,13 @@ void ViewCamera::createViewCameraUpdateDescSet(
 void ViewCamera::initViewCameraBuffer(
     const std::shared_ptr<renderer::Device>& device,
     const glsl::ViewCameraParams& view_camera_params) {
+    m_camera_info_.position = view_camera_params.init_camera_pos;
+    m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
+    m_camera_info_.yaw = view_camera_params.yaw;
+    m_camera_info_.pitch = view_camera_params.pitch;
+    m_camera_info_.camera_follow_dist = view_camera_params.camera_follow_dist;
+    m_camera_info_.status |= 0x00000001;
+
     if (!m_view_camera_buffer_) {
         m_view_camera_buffer_ = std::make_shared<renderer::BufferInfo>();
         device->createBuffer(
@@ -167,18 +174,12 @@ void ViewCamera::initViewCameraBuffer(
             m_view_camera_buffer_->buffer,
             m_view_camera_buffer_->memory,
             std::source_location::current());
-
-        m_camera_info_.position = view_camera_params.init_camera_pos;
-        m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
-        m_camera_info_.yaw = view_camera_params.yaw;
-        m_camera_info_.pitch = view_camera_params.pitch;
-        m_camera_info_.camera_follow_dist = view_camera_params.camera_follow_dist;
-        m_camera_info_.status |= 0x00000001;
-        device->updateBufferMemory(
-            m_view_camera_buffer_->memory,
-            sizeof(m_camera_info_),
-            &m_camera_info_);
     }
+
+    device->updateBufferMemory(
+        m_view_camera_buffer_->memory,
+        sizeof(m_camera_info_),
+        &m_camera_info_);
 }
 
 void ViewCamera::initStaticMembers(
@@ -263,7 +264,7 @@ void ViewCamera::destroyStaticMembers(
 
 void ViewCamera::destroy(
     const std::shared_ptr<renderer::Device>& device) {
-    m_view_camera_buffer_->destroy(device);
+    if (m_view_camera_buffer_) m_view_camera_buffer_->destroy(device);
 }
 
 void ViewCamera::updateViewCameraBuffer(
@@ -458,7 +459,6 @@ void ViewCamera::setInputFeatureFlags(uint32_t flags) {
 
 void ViewCamera::readGpuCameraInfo(
     const std::shared_ptr<renderer::Device>& device) {
-
     device->dumpBufferMemory(
         m_view_camera_buffer_->memory,
         sizeof(glsl::ViewCameraInfo),
