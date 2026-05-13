@@ -175,6 +175,7 @@ VkExtent2D chooseSwapExtent(GLFWwindow* window, const VkSurfaceCapabilitiesKHR& 
 
 renderer::Format findDepthFormat(const std::shared_ptr<renderer::Device>& device);
 bool isDepthFormat(const renderer::Format& format);
+bool hasStencilComponent(const renderer::Format& format);
 
 std::vector<VkPipelineShaderStageCreateInfo> getShaderStages(
     const ShaderModuleList& shader_modules);

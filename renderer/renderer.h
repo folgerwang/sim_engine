@@ -81,6 +81,20 @@ class Image : public DeviceDebug {
 public:
     virtual ImageLayout getImageLayout() = 0;
     virtual void setImageLayout(ImageLayout layout) = 0;
+    // Extent in TEXELS at mip 0.  Set by createImage; consumers that
+    // need to bounds-check a blit / copy region against the source
+    // image's actual dimensions can read it without round-tripping
+    // through vkGetImage*.  Default zero-extent means "unknown" — old
+    // call sites that never recorded it still compile but get 0,0,0
+    // back; treat that the same as "skip the bounds check".
+    virtual glm::uvec3 getExtent() const = 0;
+    virtual void setExtent(const glm::uvec3& extent) = 0;
+    // Format the image was created with.  Recorded by createImage so
+    // barrier code can decide the right aspectMask (e.g. D24_S8 needs
+    // DEPTH_BIT | STENCIL_BIT when separateDepthStencilLayouts is off,
+    // VUID-VkImageMemoryBarrier-image-03320).
+    virtual Format getFormat() const = 0;
+    virtual void setFormat(Format format) = 0;
 };
 
 class Buffer : public DeviceDebug {
@@ -221,11 +235,17 @@ public:
 class VulkanImage : public Image {
     VkImage         image_;
     ImageLayout     layout_ = ImageLayout::UNDEFINED;
+    glm::uvec3      extent_ = glm::uvec3(0);
+    Format          format_ = Format::UNDEFINED;
 public:
     VulkanImage(const VkImage& image) : image_(image) {}
     VkImage get() { return image_; }
     virtual ImageLayout getImageLayout() { return layout_; }
     virtual void setImageLayout(ImageLayout layout) { layout_ = layout; }
+    virtual glm::uvec3 getExtent() const final { return extent_; }
+    virtual void setExtent(const glm::uvec3& extent) final { extent_ = extent; }
+    virtual Format getFormat() const final { return format_; }
+    virtual void setFormat(Format format) final { format_ = format; }
 };
 
 class VulkanBuffer : public Buffer {

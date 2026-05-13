@@ -392,6 +392,12 @@ std::shared_ptr<Image> VulkanDevice::createImage(
     auto vk_image =
         std::make_shared<VulkanImage>(image);
     vk_image->setImageLayout(layout);
+    // Record mip-0 extent so downstream consumers can bounds-check
+    // blits / copies against the source image's real dimensions.
+    vk_image->setExtent(image_size);
+    // Record format so barrier code can derive the correct aspectMask
+    // (D24_S8 etc. need DEPTH | STENCIL).
+    vk_image->setFormat(format);
     vk_image->set_source_location(src_location);
     {
         std::lock_guard<std::mutex> lock(tracking_mutex_);

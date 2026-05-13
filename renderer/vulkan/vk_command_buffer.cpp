@@ -528,8 +528,10 @@ void VulkanCommandBuffer::addImageBarrier(
     bool is_depth_buffer =
         src_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
         src_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL ||
+        src_info.image_layout == renderer::ImageLayout::DEPTH_READ_ONLY_OPTIMAL ||
         dst_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
-        dst_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+        dst_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL ||
+        dst_info.image_layout == renderer::ImageLayout::DEPTH_READ_ONLY_OPTIMAL;
 
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -538,8 +540,19 @@ void VulkanCommandBuffer::addImageBarrier(
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = vk_image->get();
-    barrier.subresourceRange.aspectMask =
-        is_depth_buffer ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    // Build aspectMask from the IMAGE's format, not from layout alone.
+    // Without separateDepthStencilLayouts enabled, the spec requires a
+    // depth+stencil-format image's barriers to include BOTH aspects
+    // (VUID-VkImageMemoryBarrier-image-03320).  Old code only set
+    // DEPTH_BIT, which fired for every D24_S8 transition.
+    if (is_depth_buffer) {
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        if (helper::hasStencilComponent(vk_image->getFormat())) {
+            barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+    } else {
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    }
     barrier.subresourceRange.baseMipLevel = base_mip;
     barrier.subresourceRange.levelCount = mip_count;
     barrier.subresourceRange.baseArrayLayer = base_layer;
@@ -574,7 +587,15 @@ void VulkanCommandBuffer::addBufferBarrier(
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.buffer = vk_buffer->get();
     barrier.offset = offset;
-    barrier.size = size;
+    // Vulkan spec: "If size is not equal to VK_WHOLE_SIZE, size must be
+    // greater than 0."  Passing 0 here is a spec violation that the
+    // validation layer flags as VUID-VkBufferMemoryBarrier-size-01188.
+    // Worse, drivers may silently treat size=0 as a no-op barrier,
+    // meaning the requested src→dst sync DOESN'T actually happen and
+    // the buffer can be read mid-overwrite → torn-data flicker.
+    // Default-zero callers intend "the whole buffer"; translate
+    // accordingly here so a single fix patches every call site.
+    barrier.size = (size == 0) ? VK_WHOLE_SIZE : size;
 
     vkCmdPipelineBarrier(
         cmd_buf_,

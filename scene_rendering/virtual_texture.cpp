@@ -1382,6 +1382,12 @@ std::vector<uint8_t> VirtualTextureManager::readbackImageToRgba8(
     // for linear data) or double-decodes (UNORM for sRGB data) the
     // values and produces wrong-coloured / wrong-direction outputs.
     er::TextureInfo temp_tex;
+    // create2DTextureImage unconditionally builds an ImageView, which
+    // requires usage to include at least one of SAMPLED / STORAGE /
+    // {COLOR,DEPTH,INPUT}_ATTACHMENT.  Adding SAMPLED_BIT satisfies
+    // the spec (VUID-VkImageViewCreateInfo-image-04441); we don't
+    // actually sample temp_tex — the blit dst + buffer copy only need
+    // TRANSFER_{SRC,DST}_BIT — but the helper insists on a view.
     er::Helper::create2DTextureImage(
         device_,
         dst_is_srgb ? er::Format::R8G8B8A8_SRGB
@@ -1389,7 +1395,7 @@ std::vector<uint8_t> VirtualTextureManager::readbackImageToRgba8(
         glm::uvec2(width, height),
         /*mip_levels*/ 1,
         temp_tex,
-        SET_2_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, TRANSFER_SRC_BIT),
+        SET_3_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, TRANSFER_SRC_BIT, SAMPLED_BIT),
         er::ImageLayout::TRANSFER_DST_OPTIMAL,
         std::source_location::current());
 
@@ -1424,15 +1430,32 @@ std::vector<uint8_t> VirtualTextureManager::readbackImageToRgba8(
 
     // Blit src → temp; LINEAR filter so BC's bilinear-ish decode is
     // sane (NEAREST would still work but might miss sub-block detail).
+    //
+    // The blit's src region must fit inside the source image (Vulkan
+    // VUID-vkCmdBlitImage-srcOffset-00243/00244/pRegions-00215).  Some
+    // call paths pass a (width, height) that exceeds the source's
+    // mip-0 extent — e.g. a 1×1 placeholder image standing in for a
+    // missing albedo while the caller still wants the VT's "logical"
+    // width × height.  Clamp the src region to the source's actual
+    // extent (recorded by Device::createImage on every Image); the
+    // LINEAR-filter blit will upscale to fill the dst.  Upscaling a
+    // 1×1 source to N×N produces a constant-colour image — the right
+    // behaviour for a placeholder, and no more validation spam.
+    const glm::uvec3 src_extent = src_image->getExtent();
+    const uint32_t src_w = src_extent.x ? src_extent.x : width;
+    const uint32_t src_h = src_extent.y ? src_extent.y : height;
+    const int32_t  src_blit_w = int32_t(std::min(width,  src_w));
+    const int32_t  src_blit_h = int32_t(std::min(height, src_h));
+
     std::vector<er::ImageBlitInfo> blits(1);
     blits[0].src_subresource.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
     blits[0].src_subresource.mip_level   = 0;
     blits[0].src_subresource.layer_count = 1;
     blits[0].src_offsets[0] = glm::ivec3(0);
-    blits[0].src_offsets[1] = glm::ivec3(int32_t(width), int32_t(height), 1);
+    blits[0].src_offsets[1] = glm::ivec3(src_blit_w, src_blit_h, 1);
     blits[0].dst_subresource = blits[0].src_subresource;
-    blits[0].dst_offsets[0] = blits[0].src_offsets[0];
-    blits[0].dst_offsets[1] = blits[0].src_offsets[1];
+    blits[0].dst_offsets[0] = glm::ivec3(0);
+    blits[0].dst_offsets[1] = glm::ivec3(int32_t(width), int32_t(height), 1);
     cmd->blitImage(src_image, er::ImageLayout::TRANSFER_SRC_OPTIMAL,
                    temp_tex.image, er::ImageLayout::TRANSFER_DST_OPTIMAL,
                    blits, er::Filter::LINEAR);

@@ -2048,6 +2048,18 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     device_features.multiViewport = VK_TRUE;
     device_features.depthClamp = VK_TRUE;  // required for CSM / depth-clamp rasterization
     device_features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;  // bindless texture array indexing
+    // fragmentStoresAndAtomics: cluster_bindless.frag's VtFeedbackBuffer
+    // SSBO is written from a fragment shader.  Without this flag, every
+    // pipeline creation that uses that shader trips
+    // VUID-RuntimeSpirv-NonWritable-06340.
+    device_features.fragmentStoresAndAtomics = VK_TRUE;
+    // independentBlend: the cluster G-buffer pipeline uses different blend
+    // states per color attachment (premultiplied vs none, etc.).  Without
+    // this, validation fires VUID-VkPipelineColorBlendStateCreateInfo-
+    // pAttachments-00605 and many drivers fall back to identical blend
+    // state across all attachments — broken visuals on any pass that
+    // relies on per-RT blend.
+    device_features.independentBlend = VK_TRUE;
 
     VkDeviceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -2118,6 +2130,12 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     enabled_vulkan12_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     enabled_vulkan12_features.descriptorIndexing                        = VK_TRUE;
+    // drawIndirectCount: cluster_renderer issues vkCmdDrawIndexedIndirect
+    // Count for its GPU-cull → indirect-draw path.  Without this flag
+    // validation flags VUID-vkCmdDrawIndexedIndirectCount-None-04445 and
+    // some drivers ignore the count buffer entirely, drawing all
+    // commands at maxDrawCount — i.e. the cull becomes a no-op.
+    enabled_vulkan12_features.drawIndirectCount                         = VK_TRUE;
     enabled_vulkan12_features.pNext = &enabled_vulkan11_features;
 
     enabled_vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -2423,6 +2441,8 @@ void createTextureImage(
         false,
         1U,
         mip_count);
+    // (Image extent is recorded inside Device::createImage; no need to
+    // call setExtent here.)
     auto mem_requirements =
         device->getImageMemoryRequirements(image);
     image_memory =
