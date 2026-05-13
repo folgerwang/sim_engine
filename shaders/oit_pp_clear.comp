@@ -1,0 +1,94 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+// ─── oit_pp_clear.comp ─────────────────────────────────────────────────
+// Per-frame reset for the per-pixel OIT path
+// (ClusterRenderer::drawTranslucentPerPixel).  Two things to reset:
+//
+//   1. u_pp_count → 0           (so atomicAdd starts fresh this frame)
+//   2. u_pp_depth → SENTINEL    (every slot's depth set to a value beyond
+//                                gl_FragCoord.z's [0..1] range, so an
+//                                uninitialised slot is "virtually far".
+//                                See big comment block below for why.)
+//
+// One workgroup invocation per pixel.  Workgroup tile is 8×8 so a 2560×1440
+// surface dispatches (320 × 180 × 1) workgroups = 57k workgroups.  Each
+// invocation does 1 imageStore for count + K imageStores for depth slots
+// (K=4 → 5 stores per pixel, ~74M stores at 1440p).  Total cost is well
+// under a millisecond on modern GPUs.
+//
+// Why sentinel-init depth slots?
+// ──────────────────────────────
+// The translucent fragment shader has a "drop-farthest" overflow policy:
+// when >K fragments hit a pixel, an overflowing invocation scans all K
+// depth slots, finds the slot with the LARGEST depth, and conditionally
+// replaces it if its own depth is smaller.  Without sentinel-init, an
+// uninitialised slot (left over from a previous frame OR currently being
+// written by an in-flight fast-path invocation) can have an arbitrary
+// depth value.  Two specific races result:
+//
+//   (a) Cross-frame contamination: if frame N-1 wrote slot 3 with
+//       depth=0.7 and frame N has no fragment landing in slot 3, slot 3
+//       still reads 0.7 — the overflow path's find-max returns the
+//       wrong slot.
+//
+//   (b) Same-frame race: fast-path invocation A starts writing slot 3
+//       (depth=0.5).  Before A's imageStore is committed to memory,
+//       overflow invocation B reads slot 3, sees the OLD value (could
+//       be a stale value from frame N-1, or undefined), and picks the
+//       wrong slot to replace.  If B picks slot 3 because its depth
+//       happens to look the largest, B's imageStore and A's imageStore
+//       both target slot 3 — last writer wins, A's contribution can
+//       be lost.
+//
+// Sentinel-init fixes (a) entirely and (b) for the common case:
+// uninitialised slots have a depth larger than ANY real fragment's
+// gl_FragCoord.z (which is in [0, 1]).  Sentinel = 2.0 is comfortably
+// outside that range and well inside FP32 precision.  The overflow
+// scan now correctly identifies uninitialised slots as "the farthest"
+// and replaces them harmlessly — exactly the behaviour we want, with
+// no race against in-flight fast-path writes (which are writing to
+// slot indices [0, K-1] that the overflow caller doesn't touch in this
+// case, because it finds the sentinel-bearing slot first).
+//
+// Residual race: when MULTIPLE overflow invocations race on the same
+// pixel and both pick the same max-depth slot to replace, one's write
+// loses.  That class needs a per-pixel critical section (atomicCompSwap
+// on the counter as a mutex) — out of scope here; documented for a
+// future tighter fix.
+
+const int K = 4;
+// Any value > 1.0 works (gl_FragCoord.z ∈ [0, 1]).  2.0 keeps the
+// numerical magnitudes small so we don't introduce FP-precision
+// surprises in the overflow path's depth comparisons.
+const float OIT_PP_SENTINEL_DEPTH = 2.0;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Per-pixel fragment counter (binding 0) and per-fragment depth slot
+// array (binding 2).  Binding 1 (color) is intentionally untouched —
+// the resolve only reads slot[i] for i < count, so stale color values
+// at slot[i] for i >= count are never observed.  Skipping the color
+// clear saves ~30 MB of bandwidth per frame at 1440p / K=4.
+layout(set = 0, binding = 0, r32ui) uniform uimage2D u_pp_count;
+layout(set = 0, binding = 2, r32f)  uniform image3D  u_pp_depth;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = imageSize(u_pp_count);
+
+    // Bounds guard for the trailing partial workgroup at non-multiple-of-8
+    // resolutions (e.g. 2560 × 1440 happens to divide by 8 but 1920 × 1080
+    // does not).  Cheap branch — predicted true for the vast majority of
+    // invocations.
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    imageStore(u_pp_count, pixel, uvec4(0u, 0u, 0u, 0u));
+
+    // Reset each depth slot to the sentinel.  Loop bound is the
+    // compile-time const K (= 4); the shader compiler unrolls cleanly.
+    for (int k = 0; k < K; ++k) {
+        imageStore(u_pp_depth, ivec3(pixel, k),
+                   vec4(OIT_PP_SENTINEL_DEPTH, 0.0, 0.0, 0.0));
+    }
+}

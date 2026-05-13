@@ -23,6 +23,23 @@ layout(location = 0) in ObjectVsPsData ps_in_data;
 
 #include "pbr_lighting.glsl.h"
 
+// NOTE: An alpha-only R8 companion sampler is bound at
+// ALPHA_ONLY_TEX_INDEX (see drawable_object.cpp), but we don't sample
+// it here.  Reason: it can only be built when the source albedo has a
+// CPU-side decoded pixel array (cpu_pixels), and the stb-loaded PNG/JPG
+// path is the only one that fills cpu_pixels.  Bistro and most pro
+// asset packs ship DDS / BC-compressed textures whose decode happens
+// on the GPU only — cpu_pixels is null for those, no companion is
+// built, and the binding becomes a 1×1 white fallback.  Sampling that
+// would never discard, and cutout foliage would cast solid-quad
+// shadows.
+//
+// Sampling getBaseColor(...).a instead pulls the alpha from the same
+// (potentially compressed) GPU texture the forward pass uses — works
+// uniformly for all source formats, at the cost of 4× more texture
+// bandwidth than a dedicated R8 sample.  When DDS-aware companion
+// extraction lands, this shader can switch to sampling the R8 view.
+
 void main() {
 #ifndef NO_MTL
     vec4 baseColor = getBaseColor(ps_in_data, material);
@@ -30,9 +47,10 @@ void main() {
     baseColor.a = 1.0;
 #endif // ALPHAMODE_OPAQUE
 #ifdef ALPHAMODE_MASK
-    // Late discard to avoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if(baseColor.a < material.alpha_cutoff)
-    {
+    // Late discard (after the texture sample is complete) to avoid
+    // sampling artifacts at neighbouring fragments.  See
+    // https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
+    if (baseColor.a < material.alpha_cutoff) {
         discard;
     }
 #endif // ALPHAMODE_MASK

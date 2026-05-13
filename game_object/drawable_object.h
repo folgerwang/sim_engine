@@ -52,6 +52,30 @@ struct MaterialInfo {
     // around so debug UIs can highlight forced-glass materials.
     bool                   glass_forced_ = false;
 
+    // ── Effective-opaque flag (texture-content-aware) ─────────────────
+    // The CPU loader sets alpha_mode_ from the asset's metadata (gltf
+    // material.alphaMode, FBX heuristics, glass-by-name overrides).
+    // That classification is conservative: many assets ship materials
+    // flagged Mask "just in case" but whose albedo texture is actually
+    // fully opaque (every texel α == 255).  For shadow rendering we
+    // can treat those as truly opaque and route them through the
+    // no-fragment-shader pipeline — a measurable win in heavy scenes.
+    //
+    // This flag is initialised to true and downgraded to false after
+    // load if EITHER:
+    //   • alpha_mode_ == Blend (real translucency, no shortcut), OR
+    //   • alpha_mode_ == Mask AND the albedo texture contains at
+    //     least one texel with α below the opacity threshold (i.e.
+    //     real cutout exists in the texture).
+    // It stays true when:
+    //   • alpha_mode_ == Opaque (the easy case), OR
+    //   • alpha_mode_ == Mask but the albedo texture has no real
+    //     translucency (every α == 255 — asset author over-flagged).
+    //
+    // Consumers: isPrimitiveOpaque() in drawable_object.cpp uses this
+    // to decide whether to bind the no-frag shadow pipeline.
+    bool                   effective_opaque_ = true;
+
     renderer::BufferInfo   uniform_buffer_;
     std::shared_ptr<renderer::DescriptorSet>  desc_set_;
 };
@@ -269,6 +293,25 @@ class DrawableObject {
 
     // static members.
     static uint32_t max_alloc_game_objects_in_buffer;
+
+public:
+    // ── Engine-wide material classification counters ──────────────────
+    // Maintained by computeEffectiveOpaqueForMaterials whenever a new
+    // mesh's materials are scanned.  Counts are CUMULATIVE — every load
+    // adds to them; we never decrement on unload (no unload path
+    // exists yet, and the counters represent "total materials ever
+    // classified" rather than "materials currently resident").
+    //
+    // Read by VirtualTextureManager::tick to include in the per-frame
+    // vt_pool.log line so the user can see, at a glance, how many of
+    // the scene's materials are taking the slow alpha-cutoff shadow
+    // path vs the fast no-frag path.
+    //
+    // Atomic because async mesh loads call computeEffectiveOpaqueForMaterials
+    // off the main thread (see Phase2Fn in drawable_object.cpp).
+    static std::atomic<int> s_total_materials_count_;
+    static std::atomic<int> s_alpha_cutoff_materials_count_;
+private:
 
     static std::shared_ptr<renderer::DescriptorSetLayout> material_desc_set_layout_;
     static std::shared_ptr<renderer::DescriptorSetLayout> skin_desc_set_layout_;

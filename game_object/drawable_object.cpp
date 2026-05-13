@@ -559,6 +559,11 @@ static void setupMeshState(
                 std::source_location::current());
         }
     }
+
+    // NOTE: effective_opaque_ scan is deferred to the DrawableObject
+    // constructor (so the FBX path gets it too) — see the
+    // computeEffectiveOpaqueForMaterials(object_) call right after the
+    // loadFbxModel/loadGltfModel branch.
 }
 
 static void setupMesh(
@@ -2176,6 +2181,41 @@ static renderer::WriteDescriptorList addDrawableTextures(
         thin_film_lut_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
+    // ── Alpha-only companion (R8) for shadow / depth-only ─────────────
+    // If this material's albedo texture has a real-cutout alpha
+    // companion (Phase 1's scan built one and stored it on TextureInfo),
+    // bind that view here so base_depthonly.frag can do its mask-discard
+    // with 4× less bandwidth than re-sampling the full RGBA albedo.
+    //
+    // For materials without a companion (Opaque, Blend, or Mask with no
+    // real cutout α), bind the global white fallback texture.  The
+    // shadow pipeline for those materials usually has no fragment shader
+    // at all (Phase 1 of the previous change), so this binding is never
+    // sampled — the only reason we write it is to keep the descriptor
+    // set complete (Vulkan rejects bound desc sets with unwritten
+    // bindings, modulo VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT which
+    // we don't use).  Reading .r of an all-white RGBA8 returns 1.0, so
+    // any inadvertent sample produces "no discard" — safe.
+    const auto* alpha_only_src = &white_tex;
+    if (material.base_color_idx_ >= 0 &&
+        material.base_color_idx_ <
+            static_cast<int32_t>(textures.size())) {
+        const auto& albedo = textures[material.base_color_idx_];
+        if (albedo.alpha_only_view) {
+            alpha_only_src = &albedo;
+        }
+    }
+    renderer::Helper::addOneTexture(
+        descriptor_writes,
+        material.desc_set_,
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        ALPHA_ONLY_TEX_INDEX,
+        texture_sampler,
+        alpha_only_src == &white_tex
+            ? white_tex.view
+            : alpha_only_src->alpha_only_view,
+        renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
     renderer::Helper::addOneBuffer(
         descriptor_writes,
         material.desc_set_,
@@ -2225,6 +2265,254 @@ static void updateDescriptorSets(
 
         device->updateDescriptorSets(skin_buffer_descs);
     }
+}
+
+// ── Depth-only pipeline hash + opaque-bit distinguisher ───────────────────
+// For the SHADOW pass we may build TWO different pipelines for what is
+// otherwise the "same" primitive: one with the alpha-mask fragment shader
+// + forced-double-sided (for Mask/Blend materials), and one with no
+// fragment shader + authored-double-sided (for Opaque).  They differ ONLY
+// in material alpha mode, so primitive.getDepthonlyHash() alone collides
+// between the two.  We OR a single sentinel bit into the hash to keep
+// them in the same map without collisions.
+//
+// The bit value is arbitrary as long as it doesn't overlap any bit
+// getDepthonlyHash() actually uses (its return is built from the
+// primitive's vertex layout flags + topology + buffer view indices, all
+// of which fit comfortably in the low ~32 bits).  Using a high bit of a
+// 64-bit size_t guarantees no collision on x86-64 / ARM64.
+//
+// Defined here (above drawMesh) so the draw-time hash lookup can call
+// them; the pipeline-build sites further down in this file reuse them.
+static constexpr size_t kDepthonlyHashOpaqueBit = size_t(1) << 63;
+
+static inline bool isPrimitiveOpaque(
+    const ego::PrimitiveInfo& primitive,
+    const std::vector<ego::MaterialInfo>& materials) {
+    // effective_opaque_ is set at material-load time by the post-load
+    // texture-content scan (computeEffectiveOpaqueForMaterials below):
+    //   • alpha_mode == Opaque  →  true
+    //   • alpha_mode == Blend   →  false
+    //   • alpha_mode == Mask    →  true iff albedo texture has no real
+    //                              cutout α (every texel α ≈ 255).
+    // No-material primitives are vacuously opaque.
+    return (primitive.material_idx_ < 0) ||
+        materials[primitive.material_idx_].effective_opaque_;
+}
+
+// ── Texture-content-aware opaque classifier ──────────────────────────────
+// Walks every material on a freshly-loaded DrawableData and decides whether
+// its shadow path can take the fast no-fragment-shader pipeline.  Runs once
+// per asset, right after textures + materials are populated.
+//
+// Mask materials with effectively-opaque textures are the most interesting
+// case: asset authors often default to AlphaMode::Mask "to be safe", but
+// the texture itself contains no transparent texels (every α == 255).  For
+// shadow purposes those behave identically to Opaque, and we want them on
+// the fast path.  Mask materials with REAL cutout α (foliage, fences, etc.)
+// stay on the alpha-discard frag-shader path so silhouettes are correct.
+//
+// The scan is O(W × H) per albedo texture and runs ONCE at load time, so
+// even a 2K-texture-heavy scene amortises to a few ms total at startup.
+//
+// Threshold: any α < kOpaqueAlphaThreshold counts as "real transparency".
+// 250/255 ≈ 0.98 leaves headroom for compression noise / JPEG-via-PNG
+// artifacts where a fully-opaque texel comes out at 254 instead of 255.
+static void computeEffectiveOpaqueForMaterials(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<ego::DrawableData>& drawable_object) {
+    if (!drawable_object) return;
+
+    constexpr uint8_t kOpaqueAlphaThreshold = 250;
+
+    // effective_opaque_ means: "the shadow / depth-only pass can skip
+    // the fragment shader entirely for this material."  It's false
+    // whenever the depth-only frag shader needs to run its alpha-cutoff
+    // discard — and importantly, we ERR ON THE SIDE OF RUNNING IT.
+    //
+    //   alpha_mode == Opaque                       → true   (no frag)
+    //   alpha_mode == Blend                        → false  (frag still
+    //                                                       discards on
+    //                                                       per-fragment α)
+    //   alpha_mode == Mask, no albedo              → true   (nothing to
+    //                                                       discard against)
+    //   alpha_mode == Mask, cpu_pixels missing     → false  (DDS / GPU-only
+    //                                                       textures — can't
+    //                                                       scan, but the
+    //                                                       frag path still
+    //                                                       samples the full
+    //                                                       albedo's α
+    //                                                       correctly.  This
+    //                                                       is the path
+    //                                                       Bistro foliage
+    //                                                       takes.)
+    //   alpha_mode == Mask, scan finds NO cutout   → true   (texture is
+    //                                                       solid α — over-
+    //                                                       flagged by author)
+    //   alpha_mode == Mask, scan finds cutout      → false  (build alpha-only
+    //                                                       companion for the
+    //                                                       Phase-2 optim
+    //                                                       once that's
+    //                                                       wired up; for
+    //                                                       now the frag
+    //                                                       shader samples
+    //                                                       baseColor.a
+    //                                                       directly)
+    //
+    // The KEY DIFFERENCE from the previous "tighten" pass: missing
+    // cpu_pixels no longer drops a Mask material into the no-frag
+    // path.  That path was incorrect for DDS-loaded foliage (the only
+    // signal of cutout is the GPU texture's alpha; skipping the frag
+    // shader means the discard never fires and foliage casts solid
+    // shadows).
+    int stats_total = 0;
+    int stats_opaque = 0, stats_mask = 0, stats_blend = 0;
+    int stats_mask_with_cutout = 0;   // Mask materials that need frag shader
+    int stats_mask_solid = 0;         // Mask materials whose texture had no α (scan upgrade)
+    int stats_mask_unscanned = 0;     // Mask materials we couldn't scan (DDS path)
+    int stats_alpha_companions_built = 0;
+    size_t alpha_companion_bytes = 0;
+
+    for (auto& mat : drawable_object->materials_) {
+        ++stats_total;
+
+        // Tally raw alpha_mode_ counts so the per-frame log line can
+        // show actual Mask / Blend / Opaque mix regardless of whether
+        // companions get built.
+        if (mat.alpha_mode_ == ego::AlphaMode::Opaque) ++stats_opaque;
+        else if (mat.alpha_mode_ == ego::AlphaMode::Blend) ++stats_blend;
+        else ++stats_mask;
+
+        // Easy classifications: Opaque is the only case where we can
+        // confidently skip the shadow frag shader.  Blend still needs
+        // the frag path so its per-fragment α can drive the discard
+        // (Blend materials don't reach the shadow draw most of the
+        // time anyway — the cull bucket filters them out — but if
+        // they DO get drawn we want correct depth output).
+        if (mat.alpha_mode_ == ego::AlphaMode::Opaque) {
+            mat.effective_opaque_ = true;
+            continue;
+        }
+        if (mat.alpha_mode_ == ego::AlphaMode::Blend) {
+            mat.effective_opaque_ = false;
+            continue;
+        }
+
+        // alpha_mode == Mask from here on.
+        // Default to needing the frag path; only upgrade to no-frag
+        // when we POSITIVELY prove there's no real cutout in the
+        // texture (which requires a scannable cpu_pixels).
+        mat.effective_opaque_ = false;
+
+        if (mat.base_color_idx_ < 0 ||
+            mat.base_color_idx_ >=
+                static_cast<int32_t>(drawable_object->textures_.size())) {
+            // No albedo — nothing to discard against, frag would be a
+            // no-op.  Take the no-frag fast path.
+            mat.effective_opaque_ = true;
+            ++stats_mask_solid;
+            continue;
+        }
+
+        auto& tex = drawable_object->textures_[mat.base_color_idx_];
+
+        // Companion already built by an earlier material sharing this
+        // texture — adopt the result.
+        if (tex.alpha_only_view) {
+            // companion exists → known real cutout
+            ++stats_mask_with_cutout;
+            continue;
+        }
+
+        if (!tex.cpu_pixels || tex.cpu_pixels->empty()) {
+            // CAN'T SCAN — typical of DDS / BC-compressed source.
+            // Stay on the frag path (effective_opaque_ already false).
+            // The shadow shader will sample the full GPU texture's α
+            // and discard correctly.  No companion is built — the 4×
+            // bandwidth win has to wait for DDS-aware extraction.
+            ++stats_mask_unscanned;
+            continue;
+        }
+
+        // Scan: every 4th byte (alpha channel of the RGBA8 source).
+        const auto& pixels = *tex.cpu_pixels;
+        bool has_transparency = false;
+        for (size_t i = 3; i < pixels.size(); i += 4) {
+            if (pixels[i] < kOpaqueAlphaThreshold) {
+                has_transparency = true;
+                break;
+            }
+        }
+
+        if (!has_transparency) {
+            // Texture is solid α — material was over-flagged.  Take
+            // the no-frag fast path.
+            mat.effective_opaque_ = true;
+            ++stats_mask_solid;
+            continue;
+        }
+
+        // Real cutout — confirmed.  Build the companion (data is
+        // ready for the Phase-2 optimization once DDS support lands;
+        // for now it's unused but harmless).
+        ++stats_mask_with_cutout;
+        if (!device) continue;
+        const uint32_t w = tex.size.x;
+        const uint32_t h = tex.size.y;
+        if (w == 0 || h == 0) continue;
+
+        std::vector<uint8_t> alpha_data(size_t(w) * h);
+        for (size_t i = 0, n = alpha_data.size(); i < n; ++i) {
+            alpha_data[i] = pixels[i * 4 + 3];
+        }
+
+        renderer::Helper::create2DTextureImage(
+            device,
+            renderer::Format::R8_UNORM,
+            static_cast<int>(w),
+            static_cast<int>(h),
+            alpha_data.data(),
+            tex.alpha_only_image,
+            tex.alpha_only_memory,
+            std::source_location::current());
+
+        tex.alpha_only_view = device->createImageView(
+            tex.alpha_only_image,
+            renderer::ImageViewType::VIEW_2D,
+            renderer::Format::R8_UNORM,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            std::source_location::current());
+
+        ++stats_alpha_companions_built;
+        alpha_companion_bytes += alpha_data.size();
+    }
+
+    std::printf(
+        "[drawable] materials: total=%d  opaque=%d  blend=%d  mask=%d "
+        "(mask: with-cutout=%d, scanned-solid=%d, unscanned/DDS=%d)  "
+        "companions built=%d (%.1f MB)\n",
+        stats_total, stats_opaque, stats_blend, stats_mask,
+        stats_mask_with_cutout, stats_mask_solid, stats_mask_unscanned,
+        stats_alpha_companions_built,
+        double(alpha_companion_bytes) / (1024.0 * 1024.0));
+
+    // Engine-wide cumulative counters for the per-frame shadow log.
+    // "Alpha-cutoff" = Mask materials that take the with-frag path
+    // (have or might have real cutout).  Blend is reported separately.
+    const int with_frag_this_call =
+        stats_mask_with_cutout + stats_mask_unscanned + stats_blend;
+    ego::DrawableObject::s_total_materials_count_.fetch_add(
+        stats_total, std::memory_order_relaxed);
+    ego::DrawableObject::s_alpha_cutoff_materials_count_.fetch_add(
+        with_frag_this_call, std::memory_order_relaxed);
+}
+
+static inline size_t getDepthonlyHashForMaterial(
+    const ego::PrimitiveInfo& primitive,
+    const std::vector<ego::MaterialInfo>& materials) {
+    return primitive.getDepthonlyHash() |
+        (isPrimitiveOpaque(primitive, materials)
+            ? kDepthonlyHashOpaqueBit : size_t(0));
 }
 
 static void drawMesh(
@@ -2350,7 +2638,15 @@ static void drawMesh(
         const auto& prim = *prim_ptr;
         const auto& attrib_list = prim.attribute_descs_;
 
-        auto cur_hash = depth_only ? prim.getDepthonlyHash() : prim.getHash();
+        // Shadow pass needs the material-aware hash so opaque vs
+        // mask/blend variants of the same vertex layout pick up the
+        // right pipeline (opaque variant has no frag shader, mask
+        // variant has the discard-capable one).  Forward pass keeps
+        // the plain hash since the forward pipelines branch on alpha
+        // mode inside the shader, not at pipeline level.
+        auto cur_hash = depth_only
+            ? getDepthonlyHashForMaterial(prim, drawable_object->materials_)
+            : prim.getHash();
         if (cur_hash != last_hash) {
             cmd_buf->bindPipeline(
                 renderer::PipelineBindPoint::GRAPHICS,
@@ -2489,6 +2785,12 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createMaterialDescriptorSe
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(EMISSIVE_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(OCCLUSION_TEX_INDEX));
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(THIN_FILM_LUT_INDEX));
+    // Alpha-only companion sampler used by base_depthonly.frag's mask
+    // discard test (Mask materials only; written by Phase 1's scan in
+    // computeEffectiveOpaqueForMaterials).  For materials without a real
+    // companion, the binding is populated with a 1×1 R8 white fallback
+    // so the layout always has a valid descriptor.
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(ALPHA_ONLY_TEX_INDEX));
 
     return device->createDescriptorSetLayout(bindings);
 }
@@ -2574,11 +2876,34 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     bool has_texcoord_0,
     bool has_skin_set_0,
     bool has_material,
-    bool csm_layered = false) {
+    bool csm_layered = false,
+    bool is_opaque = false) {
     // csm_layered: when true, add a geometry shader that broadcasts each
     // triangle to all CSM_CASCADE_COUNT depth-array layers in a single pass,
-    // eliminating the 4× redundant vertex transform overhead.
-    renderer::ShaderModuleList shader_modules(csm_layered ? 3 : 2);
+    // eliminating the per-cascade redundant vertex transform overhead.
+    //
+    // is_opaque: when true, the fragment shader is OMITTED entirely.
+    // base_depthonly.frag's only job is the alpha-mask discard (it has
+    // ALPHAMODE_MASK hardcoded — see the #define at the top of the
+    // file).  For Opaque materials that test never fires, so binding
+    // the frag shader just wastes a per-fragment base-color texture
+    // sample × CSM_CASCADE_COUNT cascades.  Skipping it entirely turns
+    // the pipeline into pure rasteriser-only depth-write, which is
+    // exactly what the cluster shadow path already does
+    // (cluster_bindless_shadow.vert + .geom, no frag).  Vulkan allows
+    // graphics pipelines with no fragment stage as long as a depth
+    // attachment is bound, which the CSM shadow render pass provides.
+    //
+    // Stage count breakdown:
+    //          csm_layered  is_opaque   stages           layout
+    //          F            F           2  (vert, frag)
+    //          F            T           1  (vert)
+    //          T            F           3  (vert, geom, frag)
+    //          T            T           2  (vert, geom)
+    const int stage_count =
+        (csm_layered ? 1 : 0) + (is_opaque ? 0 : 1) + 1;
+    renderer::ShaderModuleList shader_modules(stage_count);
+
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "");
     vert_feature_str = has_material ? vert_feature_str : "_NOMTL";
     auto frag_feature_str = vert_feature_str;
@@ -2603,12 +2928,17 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
                 std::source_location::current());
     }
 
-    shader_modules[csm_layered ? 2 : 1] =
-        renderer::helper::loadShaderModule(
-            device,
-            "base_depthonly_frag" + frag_feature_str + ".spv",
-            renderer::ShaderStageFlagBits::FRAGMENT_BIT,
-            std::source_location::current());
+    if (!is_opaque) {
+        // Mask / Blend materials: bind the frag shader so the
+        // alpha-mask discard runs.  Index = stage_count - 1
+        // (last slot) regardless of csm_layered.
+        shader_modules[stage_count - 1] =
+            renderer::helper::loadShaderModule(
+                device,
+                "base_depthonly_frag" + frag_feature_str + ".spv",
+                renderer::ShaderStageFlagBits::FRAGMENT_BIT,
+                std::source_location::current());
+    }
 
     return shader_modules;
 }
@@ -2684,13 +3014,15 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const ego::PrimitiveInfo& primitive,
-    bool csm_layered) {
+    bool csm_layered,
+    bool is_opaque) {
     auto shader_modules = getDrawableDepthonlyShaderModules(
         device,
         primitive.tag_.has_texcoord_0,
         primitive.tag_.has_skin_set_0,
         primitive.material_idx_ >= 0,
-        csm_layered);
+        csm_layered,
+        is_opaque);
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
@@ -2756,21 +3088,27 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_depth_clamp_enable = true;
     rasterization_state_override.depth_clamp_enable = true;
-    // ── Force double-sided for the SHADOW pass ─────────────────────
-    // Shadow / depth-only renders should NOT cull back faces — when a
-    // single-sided asset (a fence panel, a leaf, a fabric strip) is
-    // viewed from the shadow caster's side and its front normals face
-    // away from the light, BACK-bit culling would drop every triangle
-    // and the surface stops casting any shadow.  Forcing double_sided
-    // = true here unconditionally rasterises both sides into the depth
-    // attachment, so thin / one-sided meshes still produce correct
-    // shadow silhouettes.
+    // ── Sidedness for the SHADOW pass ──────────────────────────────
+    // For MASK / BLEND assets (foliage, fences, cloth, leaves) we
+    // FORCE double_sided = true regardless of the asset's authored
+    // flag: a single-sided thin asset viewed from the shadow caster's
+    // side may have its front normals pointing away from the light, in
+    // which case back-face culling would drop every triangle and the
+    // surface would stop casting shadow.  Double-sided rasterises
+    // both sides into the depth attachment and produces correct
+    // silhouettes.
     //
-    // The forward render pass keeps the asset's authored sidedness
-    // (see createDrawablePipelineInternal above), so visible shading
-    // still respects the original double_sided flag.
+    // For OPAQUE assets (most of Bistro — walls, columns, floors,
+    // props) those are closed-volume meshes, and respecting the
+    // asset's authored double_sided flag lets back-face culling
+    // halve rasterised triangles.  glTF assets ship double_sided
+    // accurately: thin/foliage = true, solid = false.  This is the
+    // path taken by the forward pipeline too (see
+    // createDrawablePipelineInternal above), so visual consistency
+    // is preserved.
     rasterization_state_override.override_double_sided = true;
-    rasterization_state_override.double_sided = true;
+    rasterization_state_override.double_sided =
+        is_opaque ? primitive.tag_.double_sided : true;
     auto drawable_pipeline = device->createPipeline(
         pipeline_layout,
         binding_descs,
@@ -2786,28 +3124,39 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
 }
 
 // Single-cascade (per-layer) shadow pipeline — used as fallback / debug.
+//   is_opaque = true → no fragment shader + respect authored double_sided.
+//   is_opaque = false → full path: frag shader (alpha-mask discard) + force
+//                       double_sided=true (cutout foliage safety).
 static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const ego::PrimitiveInfo& primitive) {
+    const ego::PrimitiveInfo& primitive,
+    bool is_opaque) {
     return createDrawableShadowPipelineInternal(
         device, renderbuffer_formats, pipeline_layout,
-        graphic_pipeline_info, primitive, false);
+        graphic_pipeline_info, primitive, /*csm_layered*/ false, is_opaque);
 }
 
 // All-cascade (layered GS) shadow pipeline — used for the single-pass CSM path.
+// is_opaque semantics match createDrawableShadowPipeline above.
 static std::shared_ptr<renderer::Pipeline> createDrawableCsmLayeredPipeline(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const ego::PrimitiveInfo& primitive) {
+    const ego::PrimitiveInfo& primitive,
+    bool is_opaque) {
     return createDrawableShadowPipelineInternal(
         device, renderbuffer_formats, pipeline_layout,
-        graphic_pipeline_info, primitive, true);
+        graphic_pipeline_info, primitive, /*csm_layered*/ true, is_opaque);
 }
+
+// (Helpers `isPrimitiveOpaque` and `getDepthonlyHashForMaterial` are
+// defined above drawMesh — they are needed by the draw-time hash lookup
+// at line ~2360, which sits before this section.  See the comment block
+// at that definition for details.)
 
 renderer::WriteDescriptorList addDrawableIndirectDrawBuffers(
     const std::shared_ptr<renderer::DescriptorSet>& description_set,
@@ -3042,6 +3391,13 @@ namespace game_object {
 
 // static member definition.
 uint32_t DrawableObject::max_alloc_game_objects_in_buffer = kNumDrawableInstance;
+
+// Engine-wide material classification counters — declared on
+// DrawableObject so VirtualTextureManager can pull them for the
+// per-frame vt_pool.log line.  Updated by
+// computeEffectiveOpaqueForMaterials at every mesh load.
+std::atomic<int> DrawableObject::s_total_materials_count_{0};
+std::atomic<int> DrawableObject::s_alpha_cutoff_materials_count_{0};
 
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::material_desc_set_layout_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::skin_desc_set_layout_;
@@ -3299,6 +3655,25 @@ DrawableObject::DrawableObject(
             object_ = loadGltfModel(device, file_name);
         }
 
+        // Texture-content-aware opaque classification + alpha-only
+        // companion texture extraction.  Walks every loaded material,
+        // scans its albedo texture's α channel, and:
+        //   • sets effective_opaque_ (drives the no-fragment-shader
+        //     shadow pipeline shape).
+        //   • for Mask-with-real-cutout materials, allocates an
+        //     R8_UNORM companion texture holding just the α channel
+        //     on TextureInfo::alpha_only_*.  That companion is what
+        //     the shadow / depth-only fragment shader will sample
+        //     once Phase 2 wires it through the descriptor binding.
+        //
+        // Covers FBX too (the loader populates TextureInfo.cpu_pixels
+        // for any path that runs createTextureImage / create2DTextureImage
+        // via the file-load helper) — when cpu_pixels happens to be
+        // missing, the helper degrades gracefully to the conservative
+        // (Mask-kept) classification rather than crashing, and the
+        // alpha companion is simply not built for that texture.
+        computeEffectiveOpaqueForMaterials(device, object_);
+
         updateDescriptorSets(
             device,
             descriptor_pool,
@@ -3326,7 +3701,14 @@ DrawableObject::DrawableObject(
                 }
 
                 {
-                    auto hash_value = primitive.getDepthonlyHash();
+                    // Hash distinguishes opaque vs masked variants of
+                    // the same primitive layout; is_opaque selects the
+                    // no-frag-shader pipeline shape.
+                    const bool is_opaque =
+                        isPrimitiveOpaque(primitive, object_->materials_);
+                    auto hash_value =
+                        getDepthonlyHashForMaterial(
+                            primitive, object_->materials_);
                     auto result = drawable_shadow_pipeline_list_.find(hash_value);
                     if (result == drawable_shadow_pipeline_list_.end()) {
                         drawable_shadow_pipeline_list_[hash_value] =
@@ -3335,14 +3717,19 @@ DrawableObject::DrawableObject(
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                 drawable_pipeline_layout_,
                                 graphic_pipeline_info,
-                                primitive);
+                                primitive,
+                                is_opaque);
                     }
                 }
 
                 {
                     // CSM layered pipeline: same as shadow but with GS for
                     // single-pass all-cascade rendering.
-                    auto hash_value = primitive.getDepthonlyHash();
+                    const bool is_opaque =
+                        isPrimitiveOpaque(primitive, object_->materials_);
+                    auto hash_value =
+                        getDepthonlyHashForMaterial(
+                            primitive, object_->materials_);
                     auto result = drawable_csm_layered_pipeline_list_.find(hash_value);
                     if (result == drawable_csm_layered_pipeline_list_.end()) {
                         drawable_csm_layered_pipeline_list_[hash_value] =
@@ -3351,7 +3738,8 @@ DrawableObject::DrawableObject(
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                 drawable_pipeline_layout_,
                                 graphic_pipeline_info,
-                                primitive);
+                                primitive,
+                                is_opaque);
                     }
                 }
             }
@@ -3448,6 +3836,13 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                     err_out = "unsupported mesh extension: " + ext;
                     return false;
                 }
+                // Mirror the sync constructor's effective_opaque_
+                // scan + alpha-companion-texture build so async-
+                // loaded meshes also benefit from the no-frag shadow
+                // path AND have the R8 alpha companion ready for the
+                // Phase-2 shadow shader.  Same routing comment as the
+                // sync site.
+                computeEffectiveOpaqueForMaterials(device, state->data);
                 if (!state->data) {
                     err_out = "loader returned null for '" + file_name + "'";
                     return false;
@@ -3514,7 +3909,11 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                         }
                     }
                     {
-                        auto hash_value = primitive.getDepthonlyHash();
+                        const bool is_opaque =
+                            isPrimitiveOpaque(primitive, data->materials_);
+                        auto hash_value =
+                            getDepthonlyHashForMaterial(
+                                primitive, data->materials_);
                         auto result =
                             drawable_shadow_pipeline_list_.find(hash_value);
                         if (result == drawable_shadow_pipeline_list_.end()) {
@@ -3524,11 +3923,16 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                                     renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                     drawable_pipeline_layout_,
                                     graphic_pipeline_info,
-                                    primitive);
+                                    primitive,
+                                    is_opaque);
                         }
                     }
                     {
-                        auto hash_value = primitive.getDepthonlyHash();
+                        const bool is_opaque =
+                            isPrimitiveOpaque(primitive, data->materials_);
+                        auto hash_value =
+                            getDepthonlyHashForMaterial(
+                                primitive, data->materials_);
                         auto result =
                             drawable_csm_layered_pipeline_list_.find(hash_value);
                         if (result == drawable_csm_layered_pipeline_list_.end()) {
@@ -3538,7 +3942,8 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                                     renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                     drawable_pipeline_layout_,
                                     graphic_pipeline_info,
-                                    primitive);
+                                    primitive,
+                                    is_opaque);
                         }
                     }
                 }
@@ -3888,7 +4293,11 @@ void DrawableObject::recreateStaticMembers(
         for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
             for (int i_prim = 0; i_prim < object.second->meshes_[i_mesh].primitives_.size(); i_prim++) {
                 const auto& primitive = object.second->meshes_[i_mesh].primitives_[i_prim];
-                auto hash_value = primitive.getDepthonlyHash();
+                const bool is_opaque =
+                    isPrimitiveOpaque(primitive, object.second->materials_);
+                auto hash_value =
+                    getDepthonlyHashForMaterial(
+                        primitive, object.second->materials_);
                 {
                     auto result = drawable_shadow_pipeline_list_.find(hash_value);
                     if (result == drawable_shadow_pipeline_list_.end()) {
@@ -3898,7 +4307,8 @@ void DrawableObject::recreateStaticMembers(
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                 drawable_pipeline_layout_,
                                 graphic_pipeline_info,
-                                primitive);
+                                primitive,
+                                is_opaque);
                     }
                 }
                 {
@@ -3910,7 +4320,8 @@ void DrawableObject::recreateStaticMembers(
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                 drawable_pipeline_layout_,
                                 graphic_pipeline_info,
-                                primitive);
+                                primitive,
+                                is_opaque);
                     }
                 }
             }

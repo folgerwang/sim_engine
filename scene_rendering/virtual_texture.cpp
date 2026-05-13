@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <unordered_set>
 #include <vector>
 
@@ -17,6 +18,23 @@ namespace er = engine::renderer;
 
 namespace engine {
 namespace scene_rendering {
+
+// ── vt_pool.log helper ──────────────────────────────────────────────────
+// Shared by VirtualTextureManager::tick (per-frame stats line) and
+// registerMaterial (one-shot per material registration).  Truncates on
+// the first call of the process so each run starts with a clean file.
+// Returns the same ofstream on every subsequent call — opened once,
+// closes implicitly at program exit.
+//
+// Each writer is expected to format a complete line (including '\n')
+// and call flush() so a `tail -f vt_pool.log` sees updates live.
+namespace {
+std::ofstream& vtLog() {
+    static std::ofstream s_log("vt_pool.log",
+                               std::ios::out | std::ios::trunc);
+    return s_log;
+}
+}  // namespace
 
 // Capacity assumed at startup.  Pre-allocate page-table + meta buffers
 // for this many entries; can be raised if we hit it.  With mip-aware
@@ -872,7 +890,16 @@ void VirtualTextureManager::tick(
         }
         mip_off += std::snprintf(mip_buf + mip_off,
                                  sizeof(mip_buf) - mip_off, "]");
-        std::printf("[RVT] frame=%llu unique=%zu writes=%llu uploads=%u "
+        // ── Per-frame VT stats line → vt_pool.log ──────────────────
+        // Used to printf to stdout every frame.  Now appended via the
+        // shared vtLog() helper so the registerMaterial line shows up
+        // in the same file with consistent ordering.
+        {
+            auto& log = vtLog();
+            if (log.is_open()) {
+                char line[512];
+                std::snprintf(line, sizeof(line),
+                    "[RVT] frame=%llu unique=%zu writes=%llu uploads=%u "
                     "free=%zu lru=%zu resident=%zu/%u (%.1f%%) "
                     "active=%u (%.1f%% of resident) pinned=%u  %s\n",
                     static_cast<unsigned long long>(frame_index),
@@ -885,6 +912,10 @@ void VirtualTextureManager::tick(
                     slots_active_, pct_active,
                     slots_pinned_,
                     mip_buf);
+                log << line;
+                log.flush();
+            }
+        }
     }
 
     // The feedback buffer's per-frame clear lives in compactFeedback()
@@ -2017,11 +2048,24 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
         device_->submitAndWaitTransientCommandBuffer();
         // Persistent staging buffer — no per-call destroy.
 
-        std::printf("[RVT] registerMaterial vt=%u %ux%u mip0=%ux%u mips=%u "
+        // Redirected to vt_pool.log — see vtLog() helper above for
+        // why and how.  Same line format as the original stdout
+        // printf, so any user tail/grep just needs to point at the
+        // log file instead of the console.
+        {
+            auto& log = vtLog();
+            if (log.is_open()) {
+                char line[256];
+                std::snprintf(line, sizeof(line),
+                    "[RVT] registerMaterial vt=%u %ux%u mip0=%ux%u mips=%u "
                     "pinned=%u/%u total_pages=%u free_slots=%zu\n",
                     vt_index, width, height, pages_x, pages_y, mip_count,
                     pinned_count, mip_px * mip_py, total_pages,
                     free_slots_.size());
+                log << line;
+                log.flush();
+            }
+        }
     }
 
     // Synchronously publish the page-table entry updates queued by

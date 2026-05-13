@@ -71,6 +71,16 @@
 #define CONEMAP_TEX_INDEX           (SRC_WEIGHT_TEX_INDEX + 1) // 18
 #define PRT_PACK_TEX_INDEX          (CONEMAP_TEX_INDEX + 1) // 19
 #define PRT_PACK_INFO_TEX_INDEX     (PRT_PACK_TEX_INDEX + 1) // 20
+
+// ── Alpha-only companion texture for shadow / depth-only pass ────────
+// R8_UNORM sampler containing just the albedo's α channel for materials
+// whose albedo has real cutout α (drawable_object.cpp:
+// computeEffectiveOpaqueForMaterials extracts these at material-load).
+// For materials without a real cutout (or no albedo, or scan unavailable),
+// the binding is filled with a global 1×1 R8 white fallback so the shader
+// can read it unconditionally without a discard never firing.  Only the
+// depth-only fragment shader samples this; forward shaders ignore it.
+#define ALPHA_ONLY_TEX_INDEX        (PRT_PACK_INFO_TEX_INDEX + 1) // 21
 /*#define PRT_TEX_INDEX_0             (CONEMAP_TEX_INDEX + 1)
 #define PRT_TEX_INDEX_1             (PRT_TEX_INDEX_0 + 1)
 #define PRT_TEX_INDEX_2             (PRT_TEX_INDEX_1 + 1)

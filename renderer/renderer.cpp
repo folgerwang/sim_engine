@@ -1276,6 +1276,14 @@ void TextureInfo::destroy(const std::shared_ptr<Device>& device) {
     device->destroyImageView(view);
     device->freeMemory(memory);
 
+    // Alpha-only companion (only present for textures referenced by at
+    // least one Mask-with-cutout material — see comment on the
+    // TextureInfo declaration).  Each handle is null-checked because
+    // most textures don't carry these.
+    if (alpha_only_image)  device->destroyImage(alpha_only_image);
+    if (alpha_only_view)   device->destroyImageView(alpha_only_view);
+    if (alpha_only_memory) device->freeMemory(alpha_only_memory);
+
     for (auto& s_views : surface_views) {
         for (auto& s_view : s_views) {
             device->destroyImageView(s_view);

@@ -458,6 +458,28 @@ struct TextureInfo {
     // consumers can hand the buffer around without copying.
     std::shared_ptr<std::vector<uint8_t>> cpu_pixels;
 
+    // ── Alpha-only companion (R8_UNORM) ───────────────────────────────
+    // Optional: a smaller texture holding ONLY this texture's alpha
+    // channel, used by the depth-only / shadow fragment shader for
+    // alpha-mask discard.  Allocated lazily at material-load time
+    // when at least one material using this texture is Mask-with-real-
+    // cutout (see computeEffectiveOpaqueForMaterials in
+    // drawable_object.cpp).  Multiple materials sharing the same albedo
+    // share one alpha companion.
+    //
+    // Format = R8_UNORM, dimensions = same as the main image, mip
+    // levels = 1.  The view is created with component swizzle
+    // (R,R,R,R) so the existing shadow shader (which reads .a) gets
+    // the alpha value via the swizzled .a channel, no shader change
+    // needed beyond binding this texture in place of the full albedo
+    // at the shadow descriptor set.
+    //
+    // Trade-off: 1 byte/texel vs 4 bytes/texel for the original RGBA8
+    // — 4× less VRAM, 4× less bandwidth in the shadow pass.
+    std::shared_ptr<Image>             alpha_only_image;
+    std::shared_ptr<DeviceMemory>      alpha_only_memory;
+    std::shared_ptr<ImageView>         alpha_only_view;
+
     void destroy(const std::shared_ptr<Device>& device);
 };
 
