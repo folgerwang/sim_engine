@@ -290,6 +290,38 @@ class DrawableObject {
     static std::shared_ptr<renderer::Pipeline> update_instance_buffer_pipeline_;
     static std::shared_ptr<renderer::BufferInfo> game_objects_buffer_;
 
+    // View-camera buffer the application supplies for the
+    // update_game_objects compute path.  Set once at init via the public
+    // setter below; consumed by createGameObjectUpdateDescSet (binds it
+    // at CAMERA_OBJECT_BUFFER_INDEX every time the descset is (re)created)
+    // and by updateGameObjectsCameraBuffer (for late-arrival updates).
+    // Static so the helper can find it without threading a parameter
+    // through every caller chain.
+    static std::shared_ptr<renderer::BufferInfo>
+        s_view_camera_buffer_for_update_;
+
+public:
+    // Public accessor so the application (and other compilation units) can
+    // wire the view-camera buffer into the game-objects update path before
+    // generateDescriptorSet runs.  Setting this before the descset is
+    // created causes createGameObjectUpdateDescSet to bind it atomically
+    // alongside the other slots, eliminating the
+    // VUID-vkCmdDispatch-None-08114 ("descriptor … never updated")
+    // warning that would otherwise fire every frame the
+    // update_game_objects compute fires.
+    static void setViewCameraBufferForUpdate(
+        const std::shared_ptr<renderer::BufferInfo>& buf) {
+        s_view_camera_buffer_for_update_ = buf;
+    }
+    // Read-only accessor for the file-scope addGameObjectsInfoBuffer
+    // helper to consult before deciding what buffer to bind at
+    // CAMERA_OBJECT_BUFFER_INDEX.  Free function can't reach the static
+    // directly because it lives at namespace scope (not as a class
+    // member), so it goes through this public getter.
+    static const std::shared_ptr<renderer::BufferInfo>&
+    getViewCameraBufferForUpdate() {
+        return s_view_camera_buffer_for_update_;
+    }
 
 private:
     // Used by createAsync() to build a shell whose object_ will be

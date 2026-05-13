@@ -2087,11 +2087,10 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     VkPhysicalDeviceAccelerationStructureFeaturesKHR enabled_acceleration_structure_features{};
     VkPhysicalDeviceMeshShaderFeaturesEXT enabled_mesh_shader_features{};
     VkPhysicalDeviceMaintenance4Features enabled_maintenance4_features{};
-    VkPhysicalDeviceFloat16Int8FeaturesKHR enabled_float16_int8_features{};
     VkPhysicalDeviceVulkan11Features  enabled_vulkan11_features{};
     VkPhysicalDeviceVulkan13Features  enabled_vulkan13_features{};
 
-    // Enable features required for ray tracing using feature chaining via pNext		
+    // Enable features required for ray tracing using feature chaining via pNext
     enabled_buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
     enabled_buffer_device_address_features.bufferDeviceAddress = VK_TRUE;
 
@@ -2108,10 +2107,11 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_mesh_shader_features.taskShader = VK_TRUE;
     enabled_mesh_shader_features.pNext = &enabled_acceleration_structure_features;
 
-    enabled_float16_int8_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
-    enabled_float16_int8_features.shaderFloat16 = VK_TRUE;
-    enabled_float16_int8_features.shaderInt8 = VK_TRUE;
-    enabled_float16_int8_features.pNext = &enabled_mesh_shader_features;
+    // NOTE: VkPhysicalDeviceFloat16Int8FeaturesKHR used to be in the pNext
+    // chain, but VkPhysicalDeviceVulkan12Features subsumes shaderFloat16 +
+    // shaderInt8 and the spec forbids both structs coexisting in the same
+    // chain (VUID-VkDeviceCreateInfo-pNext-02830).  The fields are set on
+    // the Vulkan12Features struct below instead.
 
     // Enable 16-bit SSBO access so shaders can declare OpVariable of
     // 16-bit types in StorageBuffer class (e.g. uint16_t index buffers
@@ -2119,7 +2119,14 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     enabled_vulkan11_features.storageBuffer16BitAccess            = VK_TRUE;
     enabled_vulkan11_features.uniformAndStorageBuffer16BitAccess  = VK_TRUE;
-    enabled_vulkan11_features.pNext = &enabled_float16_int8_features;
+    // multiview: the cluster shadow pipeline replaces its 6-cascade GS
+    // broadcast with hardware-accelerated view replication via gl_ViewIndex.
+    // The driver rasterises every primitive to every layer in the viewMask
+    // in parallel — far cheaper than GS amplification which serialises
+    // through a single execution thread per primitive group.  See
+    // cluster_bindless_shadow.vert for the consumer side.
+    enabled_vulkan11_features.multiview                           = VK_TRUE;
+    enabled_vulkan11_features.pNext = &enabled_mesh_shader_features;
 
     // Vulkan 1.2: enable non-uniform indexing of sampler arrays.
     // Required for GL_EXT_nonuniform_qualifier in the cluster bindless fragment
@@ -2136,6 +2143,13 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     // some drivers ignore the count buffer entirely, drawing all
     // commands at maxDrawCount — i.e. the cull becomes a no-op.
     enabled_vulkan12_features.drawIndirectCount                         = VK_TRUE;
+    // shaderFloat16 / shaderInt8 — folded in from the now-removed
+    // VkPhysicalDeviceFloat16Int8FeaturesKHR struct (see VUID-VkDevice
+    // CreateInfo-pNext-02830 — the 1.2 features struct cannot coexist
+    // with the standalone shaderFloat16 features struct in the pNext
+    // chain).
+    enabled_vulkan12_features.shaderFloat16                             = VK_TRUE;
+    enabled_vulkan12_features.shaderInt8                                = VK_TRUE;
     enabled_vulkan12_features.pNext = &enabled_vulkan11_features;
 
     enabled_vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;

@@ -935,6 +935,57 @@ void ClusterRenderer::finalizeUploads() {
         total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
     trans_draw_count_buffer_ = createCounterBuffer(device_);
 
+    // ── Shadow cull scratch buffers ──────────────────────────────────
+    // The shadow cull dispatch needs a separate place to land its
+    // translucent-bucket writes so they don't clobber the main path's
+    // trans_indirect_draw_buffer_ before drawTranslucentForward reads
+    // it.  drawClusterShadow never reads these — they're write-only
+    // scratch.  Worst-case sized like the regular translucent buffer.
+    shadow_cull_trans_indirect_buffer_ = createIndirectSSBO(
+        device_,
+        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+    shadow_cull_trans_count_buffer_ = createCounterBuffer(device_);
+
+    // Scratch visible-buffer for the shadow cull dispatches — see the
+    // header doc for why this is necessary (avoids clobbering the main
+    // cull's visible_buffer_, which is read back next frame for
+    // per-mesh visibility tracking).
+    shadow_cull_visible_buffer_ = createSSBO(
+        device_,
+        total_clusters_all_meshes_ * sizeof(uint32_t),
+        nullptr);
+
+    // ── Per-cascade shadow indirect buffers (Option B) ───────────────
+    // Allocate one (indirect, count) pair per CSM cascade.  cullShadow
+    // populates them per frame (one cluster_cull.comp dispatch per
+    // cascade with that cascade's tight VP); drawClusterShadow consumes
+    // each cascade's pair via vkCmdDrawIndexedIndirectCount inside its
+    // own dynamic-rendering pass on the cascade's depth layer.
+    //
+    // Each indirect buffer is worst-case sized for "all clusters land
+    // in this cascade"; in practice each cascade retains ~5-90% of
+    // clusters depending on which slab of the camera frustum it covers.
+    //
+    // The count buffers are seeded with total_clusters_all_meshes_ as a
+    // first-frame fallback — if cullShadow hasn't run yet (e.g. before
+    // clusterIndirectActive flips true), drawClusterShadow can still
+    // produce correct output by drawing every cluster.  Subsequent
+    // frames overwrite this with the actual cull-survivor count.
+    //
+    // Index/instance/vertex offsets in the indirect commands are NOT
+    // pre-populated — cluster_cull.comp writes them per surviving
+    // cluster.  The static seed at finalize would draw nothing if
+    // cullShadow never runs, but that's an acceptable startup state
+    // since clusterIndirectActive being false means the per-mesh
+    // shadow path in shadow_object_scene_view_->draw is handling the
+    // load anyway.
+    for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        shadow_indirect_draw_buffers_[k] = createIndirectSSBO(
+            device_,
+            total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+        shadow_draw_count_buffers_[k] = createCounterBuffer(device_);
+    }
+
     // ── Two-pass occlusion buffers ──────────────────────────────────────
     // Persistent visibility bits — one bit per cluster.  Zero-initialised
     // so frame 1's Phase A culls everything (renders nothing) and frame
@@ -984,6 +1035,32 @@ void ClusterRenderer::finalizeUploads() {
         // — the shader's sample is gated on use_hiz_cull anyway, so
         // a null binding is fine until the first descriptor refresh.
         hiz_sampler_, hiz_view_);
+
+    // ── Per-cascade shadow cull descriptor sets (Option B) ───────────
+    // One descriptor set per cascade; same layout as cull_desc_set_, but
+    // bindings 2/3 point at the cascade's dedicated shadow indirect+count
+    // pair (so each cascade's dispatch writes its own survivors).
+    // Bindings 6/7 point at the shared scratch trans pair — we only
+    // ever write into it, never read, so cascades sharing the scratch
+    // is fine.  Other bindings reuse the main-cull SSBOs.
+    for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        cull_desc_sets_shadow_[k] = device_->createDescriptorSets(
+            descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        writeCullDescriptors(
+            device_, cull_desc_sets_shadow_[k],
+            total_clusters_all_meshes_,
+            cull_info_buffer_, draw_info_buffer_,
+            shadow_indirect_draw_buffers_[k],
+            shadow_draw_count_buffers_[k],
+            shadow_cull_visible_buffer_,  // scratch, not visible_buffer_
+            material_params_buffer_, mat_count,
+            shadow_cull_trans_indirect_buffer_,
+            shadow_cull_trans_count_buffer_,
+            visibility_bit_buffer_,
+            indirect_draw_buffer_phase_a_,
+            draw_count_buffer_phase_a_,
+            hiz_sampler_, hiz_view_);
+    }
 
     // ── DEBUG: validate merged staging data — write to file ──
     {
@@ -1570,6 +1647,132 @@ void ClusterRenderer::cull(
             trans_draw_count_buffer_.buffer,
             ssbo_compute_rw,
             indirect_read);
+    }
+}
+
+// ─── Per-cascade shadow cull (Option B) ──────────────────────────────────
+// CSM_CASCADE_COUNT compute dispatches, each running cluster_cull.comp
+// against one cascade's tight VP and emitting survivors into that
+// cascade's dedicated shadow indirect/count buffer.  This is the
+// optimisation that makes per-cascade rendering a win: cascade 0 only
+// retains ~5% of clusters, cascade 5 retains most; summed across all
+// cascades the total triangle work is ~2× the union, not 6× as it
+// would be for any "draw everything to every layer" approach (GS
+// broadcast, multiview).
+//
+// Each dispatch shares pipeline / per-cluster SSBOs with the main cull
+// but binds its own cull_desc_sets_shadow_[k], whose bindings 2/3
+// point at shadow_indirect_draw_buffers_[k] / shadow_draw_count_
+// buffers_[k].  Translucent emits all land in the shared scratch trans
+// pair which drawClusterShadow ignores.
+//
+// light_dir = FROM-sun-TO-scene unit vector.  Translated into a
+// synthetic camera_pos at infinity along -light_dir so the shader's
+// cone test becomes a directional-light backface check (a cluster
+// whose normals all face away from the sun is self-occluded by its
+// own front face and is safe to drop from shadow rendering).
+void ClusterRenderer::cullShadow(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::array<glm::mat4, CSM_CASCADE_COUNT>& cascade_vps,
+    const glm::vec3& light_dir) {
+
+    if (!enabled_ || !gpu_ready_) return;
+    if (cpu_cull_mode_) return;  // CPU cull path doesn't currently support shadow output
+    if (!cull_desc_sets_shadow_[0]) return;  // never finalized
+
+    er::BufferResourceInfo ssbo_transfer_write = {
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    er::BufferResourceInfo ssbo_compute_rw = {
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    er::BufferResourceInfo prev_indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+    er::BufferResourceInfo indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+
+    // Zero EVERY cascade's counter once before any dispatch — the shared
+    // scratch translucent counter too.  Using vkCmdFillBuffer keeps the
+    // resets in the GPU command stream (proper ordering against prior
+    // indirect reads from last frame's draw).
+    for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        cmd_buf->fillBuffer(shadow_draw_count_buffers_[k].buffer,
+                            0, sizeof(uint32_t), 0);
+    }
+    cmd_buf->fillBuffer(shadow_cull_trans_count_buffer_.buffer,
+                        0, sizeof(uint32_t), 0);
+
+    // Sync those resets, plus last frame's indirect reads on every
+    // cascade's indirect buffer, with the compute work that follows.
+    for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        cmd_buf->addBufferBarrier(
+            shadow_draw_count_buffers_[k].buffer,
+            ssbo_transfer_write, ssbo_compute_rw);
+        cmd_buf->addBufferBarrier(
+            shadow_indirect_draw_buffers_[k].buffer,
+            prev_indirect_read, ssbo_compute_rw);
+    }
+    cmd_buf->addBufferBarrier(
+        shadow_cull_trans_count_buffer_.buffer,
+        ssbo_transfer_write, ssbo_compute_rw);
+    cmd_buf->addBufferBarrier(
+        shadow_cull_trans_indirect_buffer_.buffer,
+        prev_indirect_read, ssbo_compute_rw);
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::COMPUTE,
+        cull_pipeline_);
+
+    // Synthetic camera_pos for directional-light backface culling — see
+    // function header for the derivation.  1e6 is comfortably beyond any
+    // plausible world bounds without overflowing the cone-test dot.
+    const glm::vec3 light_unit = glm::normalize(light_dir);
+    const glm::vec3 synth_cam = -light_unit * 1.0e6f;
+
+    const uint32_t groups = (total_clusters_all_meshes_ + 63) / 64;
+
+    // One dispatch per cascade.  Push constants change per dispatch
+    // (view_proj only); descriptor set changes per dispatch (each
+    // cascade has its own indirect/count target).
+    for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        glsl::ClusterCullPushConstants push{};
+        push.view_proj           = cascade_vps[k];
+        push.camera_pos_pad      = glm::vec4(synth_cam, 0.0f);
+        push.total_clusters      = total_clusters_all_meshes_;
+        push.total_bvh_nodes     = 0;
+        push.lod_error_threshold = 1.0f;
+        push.use_bvh             = 0;
+        push.use_hiz_cull        = 0;     // no shadow-space Hi-Z yet
+        push.cull_phase          = 0;
+        push.pad0                = 0;
+        push.pad1                = 0;
+        push.last_view_proj      = glm::mat4(1.0f);
+        push.hiz_size_mips_pad   = glm::vec4(0.0f);
+
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            cull_pipeline_layout_,
+            &push, sizeof(push));
+
+        cmd_buf->bindDescriptorSets(
+            er::PipelineBindPoint::COMPUTE,
+            cull_pipeline_layout_,
+            { cull_desc_sets_shadow_[k] });
+
+        cmd_buf->dispatch(groups, 1);
+    }
+
+    // Make every cascade's cull writes visible to the subsequent
+    // drawIndexedIndirectCount in drawClusterShadow.
+    for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        cmd_buf->addBufferBarrier(
+            shadow_indirect_draw_buffers_[k].buffer,
+            ssbo_compute_rw, indirect_read);
+        cmd_buf->addBufferBarrier(
+            shadow_draw_count_buffers_[k].buffer,
+            ssbo_compute_rw, indirect_read);
     }
 }
 
@@ -2747,6 +2950,202 @@ uint32_t ClusterRenderer::drawOpaqueGBuffer(
     return total_visible_all_meshes_;
 }
 
+// ─── Cluster CSM shadow pipeline + draw ──────────────────────────────────
+// Depth-only single-pass CSM rendering for cluster-owned meshes.  Replaces
+// the per-mesh shadow draw loop in shadow_object_scene_view_->draw() with
+// ONE drawIndexedIndirectCount call broadcasting to all CSM_CASCADE_COUNT
+// layers via the geometry shader (cluster_bindless_shadow.geom).
+//
+// Why a separate pipeline / layout (not reusing initBindlessGBufferPipeline):
+//   • No fragment shader (depth-only).
+//   • No bindless material descriptor set needed — only VIEW_PARAMS_SET
+//     (the VS doesn't actually read from it, but the layout slot has to
+//     be present for compatibility with the desc-set list the caller
+//     passes in) and RUNTIME_LIGHTS_PARAMS_SET (the GS reads
+//     light_view_proj[cascade]).
+//   • Different framebuffer format (a single depth-array attachment).
+//   • Geometry-shader stage activates the layered broadcast — initBindless*
+//     pipelines don't have a GS.
+//
+// Slimming the layout drops the bindless desc-set lifecycle overhead from
+// the shadow path and keeps the pipeline's descriptor count down to the
+// minimum the GS+VS actually touch.
+void ClusterRenderer::initBindlessShadowPipeline(
+    const renderer::DescriptorSetLayoutList& shadow_desc_set_layouts,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const renderer::Format& shadow_depth_format) {
+
+    // No-op if the cluster GPU state isn't ready (no merged geometry → no
+    // indirect buffer to draw against anyway).
+    if (!gpu_ready_) {
+        return;
+    }
+    if (bindless_shadow_pipeline_) {
+        return;   // already built
+    }
+
+    // ── Pipeline layout ──────────────────────────────────────────────
+    // Build a slim layout that exposes only the descriptor sets this
+    // depth-only pipeline actually touches:
+    //   set VIEW_PARAMS_SET           — present for set-list compatibility
+    //   set RUNTIME_LIGHTS_PARAMS_SET — GS reads light_view_proj[cascade]
+    //
+    // Vulkan requires every set slot in the pipeline layout to have a
+    // valid (non-null) descriptor set layout — gaps are not allowed.
+    // Replace any nullptr slots with an empty layout so createPipelineLayout
+    // doesn't crash on .get().
+    er::DescriptorSetLayoutList all_layouts;
+    for (uint32_t i = 0; i < RUNTIME_LIGHTS_PARAMS_SET + 1; ++i) {
+        all_layouts.push_back(
+            i < static_cast<uint32_t>(shadow_desc_set_layouts.size())
+                ? shadow_desc_set_layouts[i] : nullptr);
+    }
+    auto empty_layout = device_->createDescriptorSetLayout({});
+    for (auto& layout : all_layouts) {
+        if (!layout) layout = empty_layout;
+    }
+
+    bindless_shadow_pipeline_layout_ = device_->createPipelineLayout(
+        all_layouts, {}, std::source_location::current());
+
+    // ── Vertex input description ─────────────────────────────────────
+    // The depth-only VS (cluster_bindless_shadow.vert) only reads
+    // position; tangent/normal/uv are present in the merged VB but
+    // unused.  Declare only position to avoid validation warnings about
+    // unconsumed attributes.
+    std::vector<er::VertexInputBindingDescription> binding_descs(1);
+    binding_descs[0].binding    = 0;
+    binding_descs[0].stride     = sizeof(BindlessVertex);
+    binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
+
+    std::vector<er::VertexInputAttributeDescription> attrib_descs(1);
+    attrib_descs[0].binding  = 0;
+    attrib_descs[0].location = 0;
+    attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
+    attrib_descs[0].offset   = offsetof(BindlessVertex, position);
+
+    er::PipelineInputAssemblyStateCreateInfo input_assembly;
+    input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
+    input_assembly.restart_enable = false;
+
+    // ── Rasterization state ──────────────────────────────────────────
+    // depth_clamp_enable=true: keep fragments outside the cascade depth
+    // range from being clipped (matches createDrawableShadowPipelineInternal).
+    // double_sided=true: shadow pass should never cull back faces, single-
+    // sided thin geometry (fences, leaves) viewed from the light's side
+    // would otherwise stop casting shadows.
+    er::RasterizationStateOverride raster_override{};
+    raster_override.override_depth_clamp_enable = true;
+    raster_override.depth_clamp_enable          = true;
+    raster_override.override_double_sided       = true;
+    raster_override.double_sided                = true;
+
+    // ── Depth-stencil state ─────────────────────────────────────────
+    // Standard shadow depth-pass state: test + write enabled, LESS_OR_EQUAL.
+    auto shadow_depth_stencil =
+        std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+            er::helper::fillPipelineDepthStencilStateCreateInfo(
+                /*depth_test_enable */ true,
+                /*depth_write_enable*/ true,
+                er::CompareOp::LESS_OR_EQUAL));
+
+    // No colour attachments → an empty blend state with zero attachments.
+    std::vector<er::PipelineColorBlendAttachmentState> shadow_no_blend;
+    auto shadow_blend_state =
+        std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+            er::helper::fillPipelineColorBlendStateCreateInfo(shadow_no_blend));
+
+    er::GraphicPipelineInfo shadow_info = graphic_pipeline_info;
+    shadow_info.blend_state_info   = shadow_blend_state;
+    shadow_info.depth_stencil_info = shadow_depth_stencil;
+
+    // ── Shader modules: VS + GS, no fragment ─────────────────────────
+    // See cluster_bindless_shadow.vert's comment block for the perf
+    // history of the alternatives.  GS broadcast is the winner on
+    // desktop NVIDIA — its dedicated hardware path beats both multi-
+    // view (VS replication → 6× cost) and per-cascade rendering
+    // (command-processor overhead × cascade-count).
+    er::ShaderModuleList shader_modules(2);
+    shader_modules[0] = er::helper::loadShaderModule(
+        device_, "cluster_bindless_shadow_vert.spv",
+        er::ShaderStageFlagBits::VERTEX_BIT,
+        std::source_location::current());
+    shader_modules[1] = er::helper::loadShaderModule(
+        device_, "cluster_bindless_shadow_geom.spv",
+        er::ShaderStageFlagBits::GEOMETRY_BIT,
+        std::source_location::current());
+
+    // ── Framebuffer format ──────────────────────────────────────────
+    // No colour attachments; single depth-array attachment.
+    // view_mask stays at 0 (no multiview); the GS writes gl_Layer
+    // per-cascade and the matching RenderingInfo uses
+    // layer_count = CSM_CASCADE_COUNT.
+    er::PipelineRenderbufferFormats shadow_fmt;
+    shadow_fmt.color_formats = {};
+    shadow_fmt.depth_format  = shadow_depth_format;
+
+    bindless_shadow_pipeline_ = device_->createPipeline(
+        bindless_shadow_pipeline_layout_,
+        binding_descs,
+        attrib_descs,
+        input_assembly,
+        shadow_info,
+        shader_modules,
+        shadow_fmt,
+        raster_override,
+        std::source_location::current());
+}
+
+// ─── Cluster CSM shadow draw (GS broadcast + single drawIndexed) ────────
+// One drawIndexed over the entire merged VB/IB.  GS broadcasts each
+// triangle to all CSM_CASCADE_COUNT depth-array layers in a single
+// pass — the GS hits dedicated hardware on most desktop GPUs and is
+// substantially faster than the alternatives we measured (multiview,
+// per-cascade rendering).  See cluster_bindless_shadow.vert's comment
+// block for the perf history.
+//
+// Caller MUST have an active dynamic-rendering pass with the full
+// CSM_CASCADE_COUNT-layer depth attachment bound and
+// layer_count = CSM_CASCADE_COUNT on the RenderingInfo so the GS's
+// gl_Layer writes land on the right cascade.  No fragment shader runs.
+uint32_t ClusterRenderer::drawClusterShadow(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !bindless_shadow_pipeline_) {
+        return 0;
+    }
+
+    // Pad the descset list to the pipeline layout's slot count.
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= RUNTIME_LIGHTS_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets.resize(RUNTIME_LIGHTS_PARAMS_SET + 1);
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, bindless_shadow_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_shadow_pipeline_layout_,
+        all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexed(
+        total_merged_indices_,
+        /*instance_count*/ 1,
+        /*first_index*/    0,
+        /*vertex_offset*/  0,
+        /*first_instance*/ 0);
+    return total_clusters_all_meshes_;
+}
+
 uint32_t ClusterRenderer::drawTranslucentForward(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_sets,
@@ -3061,12 +3460,15 @@ void ClusterRenderer::destroy() {
     bindless_translucent_pipeline_.reset();
     bindless_translucent_oit_pipeline_.reset();
     bindless_gbuffer_pipeline_.reset();
+    bindless_shadow_pipeline_.reset();
+    bindless_shadow_pipeline_layout_.reset();
     bindless_pipeline_layout_.reset();
     bindless_desc_set_.reset();
     bindless_desc_set_layout_.reset();
     cull_pipeline_.reset();
     cull_pipeline_layout_.reset();
     cull_desc_set_.reset();
+    for (auto& s : cull_desc_sets_shadow_) s.reset();
     cull_desc_set_layout_.reset();
 
     // ── OIT resources ──

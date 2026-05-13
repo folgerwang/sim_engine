@@ -1013,7 +1013,12 @@ std::shared_ptr<Pipeline> VulkanDevice::createPipeline(
 
     VkPipelineRenderingCreateInfoKHR pipelineRenderingCreateInfo = {};
     pipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
-    pipelineRenderingCreateInfo.viewMask = 0; // Set for multiview if used, otherwise 0
+    // viewMask = 0 → single-layer (default).  Non-zero opts into multiview;
+    // the matching RenderingInfo at draw time must set the same mask, and
+    // the VS can read gl_ViewIndex to specialise per-view.  Used by the
+    // cluster shadow pipeline to replace its 6-cascade GS broadcast with
+    // hardware view replication.
+    pipelineRenderingCreateInfo.viewMask = frame_buffer_format.view_mask;
 
     uint32_t num_color_buffers =
         uint32_t(frame_buffer_format.color_formats.size());

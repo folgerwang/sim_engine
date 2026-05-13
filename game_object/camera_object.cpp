@@ -282,7 +282,8 @@ void ShadowViewCameraObject::computeCascadeMatrices(
     const glm::mat4& main_proj,
     const std::array<float, CSM_CASCADE_COUNT>& cascade_far_vs,
     float z_near_vs,
-    std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps) {
+    std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps,
+    glm::mat4* out_union_vp) {
 
     // Derive tan(half-fov) and aspect ratio from the perspective matrix.
     // GLM stores proj[col][row]; proj[1][1] was negated for Vulkan y-flip.
@@ -297,6 +298,62 @@ void ShadowViewCameraObject::computeCascadeMatrices(
     up = glm::normalize(glm::cross(light_right, light_dir));
 
     const glm::mat4 inv_main_view = glm::inverse(main_view);
+
+    // ── Union VP across all cascades ─────────────────────────────────
+    // Compute one light-space orthographic VP fitted to the FULL main
+    // camera frustum (z_near_vs → last-cascade far).  All cascades are
+    // slices of this same view frustum, so any cluster intersecting ANY
+    // cascade volume must intersect this union — exactly what the
+    // single-cull cluster shadow path needs (see
+    // ClusterRenderer::cullShadow).  Same algorithm as the per-cascade
+    // fit below, just with one big slab spanning the whole view depth.
+    if (out_union_vp) {
+        const float cn = z_near_vs;
+        const float cf = cascade_far_vs[CSM_CASCADE_COUNT - 1];
+        const float nh = cn * tan_half_fov_y, nw = nh * aspect;
+        const float fh = cf * tan_half_fov_y, fw = fh * aspect;
+
+        glm::vec3 vs_corners[8] = {
+            { -nw,  nh, -cn }, {  nw,  nh, -cn },
+            { -nw, -nh, -cn }, {  nw, -nh, -cn },
+            { -fw,  fh, -cf }, {  fw,  fh, -cf },
+            { -fw, -fh, -cf }, {  fw, -fh, -cf },
+        };
+
+        glm::vec3 ws_centre(0.0f);
+        for (int i = 0; i < 8; ++i)
+            ws_centre += glm::vec3(inv_main_view * glm::vec4(vs_corners[i], 1.0f));
+        ws_centre /= 8.0f;
+
+        constexpr float kPullBack = 200.0f;
+        const glm::vec3 light_eye = ws_centre - light_dir * kPullBack;
+        const glm::mat4 lv = glm::lookAt(light_eye, ws_centre, up);
+
+        glm::vec3 ls_min( 1e30f);
+        glm::vec3 ls_max(-1e30f);
+        for (int i = 0; i < 8; ++i) {
+            glm::vec4 ws = inv_main_view * glm::vec4(vs_corners[i], 1.0f);
+            glm::vec3 ls = glm::vec3(lv * ws);
+            ls_min = glm::min(ls_min, ls);
+            ls_max = glm::max(ls_max, ls);
+        }
+
+        // Generous padding — this is a cull volume, not a tight cascade
+        // fit, so the extra margin costs nothing and recovers a few
+        // edge-of-frustum shadow casters that a tight fit might reject.
+        constexpr float kPad = 4.0f;
+        ls_min.x -= kPad;  ls_max.x += kPad;
+        ls_min.y -= kPad;  ls_max.y += kPad;
+
+        const float ortho_near = std::max(-ls_max.z, 0.1f);
+        const float ortho_far  = std::max(-ls_min.z + 10.0f, ortho_near + 1.0f);
+
+        const glm::mat4 lp = glm::ortho(
+            ls_min.x, ls_max.x,
+            ls_min.y, ls_max.y,
+            ortho_near, ortho_far);
+        *out_union_vp = lp * lv;
+    }
 
     for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
         const float cn = (k == 0) ? z_near_vs : cascade_far_vs[k - 1];

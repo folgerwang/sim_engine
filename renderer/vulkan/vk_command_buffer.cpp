@@ -221,16 +221,27 @@ void VulkanCommandBuffer::bindDescriptorSets(
             vk_desc_sets.push_back(RENDER_TYPE_CAST(DescriptorSet, desc_sets[i])->get());
         }
         else {
-            vkCmdBindDescriptorSets(
-                cmd_buf_,
-                helper::toVkPipelineBindPoint(bind_point),
-                vk_pipeline_layout->get(),
-                start_set_idx,
-                static_cast<uint32_t>(vk_desc_sets.size()),
-                vk_desc_sets.data(),
-                0,
-                nullptr);
-            vk_desc_sets.clear();
+            // Only emit a vkCmdBindDescriptorSets call if we have accumulated
+            // at least one valid set since the last flush.  Without this
+            // guard, callers that pass a desc-set list with nullptr slots
+            // (typical when binding a sparse subset of sets — e.g. just
+            // VIEW_PARAMS_SET + RUNTIME_LIGHTS_PARAMS_SET with the slots
+            // between them null) trigger VUID
+            // VkCmdBindDescriptorSets-descriptorSetCount-arraylength
+            // ("descriptorSetCount must be greater than 0") on every leading
+            // / consecutive nullptr.
+            if (!vk_desc_sets.empty()) {
+                vkCmdBindDescriptorSets(
+                    cmd_buf_,
+                    helper::toVkPipelineBindPoint(bind_point),
+                    vk_pipeline_layout->get(),
+                    start_set_idx,
+                    static_cast<uint32_t>(vk_desc_sets.size()),
+                    vk_desc_sets.data(),
+                    0,
+                    nullptr);
+                vk_desc_sets.clear();
+            }
         }
 
         i++;
@@ -529,9 +540,11 @@ void VulkanCommandBuffer::addImageBarrier(
         src_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
         src_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL ||
         src_info.image_layout == renderer::ImageLayout::DEPTH_READ_ONLY_OPTIMAL ||
+        src_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL ||
         dst_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
         dst_info.image_layout == renderer::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL ||
-        dst_info.image_layout == renderer::ImageLayout::DEPTH_READ_ONLY_OPTIMAL;
+        dst_info.image_layout == renderer::ImageLayout::DEPTH_READ_ONLY_OPTIMAL ||
+        dst_info.image_layout == renderer::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;

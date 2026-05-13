@@ -638,11 +638,32 @@ void Skydome::bindMiniSkyBoxTargets(
             std::source_location::current());
     }
 
+    // Build a mip-0-only cube view of rt_envmap_tex for the STORAGE_IMAGE
+    // descriptor.  rt_envmap_tex.view covers the FULL mip chain — binding
+    // that as a storage image makes validation check every mip's layout
+    // against the declared one (GENERAL).  The compute dispatch only
+    // writes mip 0 (then a separate mip-chain regen pass leaves mips 1+
+    // in SHADER_READ_ONLY_OPTIMAL), so mips 1+ would never satisfy GENERAL
+    // and validation fires VUID-vkCmdDraw-None-09600 every frame.  A
+    // mip-0-only view restricts the subresource range to the level the
+    // shader actually touches.
+    if (!cube_skybox_mini_envmap_dst_view_) {
+        cube_skybox_mini_envmap_dst_view_ =
+            device->createImageView(
+                rt_envmap_tex.image,
+                er::ImageViewType::VIEW_CUBE,
+                er::Format::R16G16B16A16_SFLOAT,
+                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                std::source_location::current(),
+                /*base_mip*/ 0, /*mip_count*/ 1,
+                /*base_layer*/ 0, /*layer_count*/ 6);
+    }
+
     auto descs = addCubeSkyBoxMiniTextures(
         cube_skybox_mini_desc_set_,
         s_clamp_sampler,
         mini_envmap_tex_.view,
-        rt_envmap_tex.view,
+        cube_skybox_mini_envmap_dst_view_,
         sky_scattering_lut_tex_.view);
     device->updateDescriptorSets(descs);
 }

@@ -662,6 +662,14 @@ enum class RenderPasses {
 struct PipelineRenderbufferFormats {
     std::vector<Format> color_formats;
     Format depth_format;
+    // Multiview viewMask for VkPipelineRenderingCreateInfo.  Default 0
+    // means single-layer (no multiview).  A non-zero bitmask (one bit per
+    // layer) opts the pipeline into hardware view replication — must be
+    // matched by RenderingInfo::view_mask at draw time.  Used by the
+    // cluster shadow pipeline to render all CSM cascades in one pass
+    // without a geometry shader (the VS reads gl_ViewIndex to pick the
+    // per-cascade VP).
+    uint32_t view_mask = 0;
 };
 
 struct StridedDeviceAddressRegion {

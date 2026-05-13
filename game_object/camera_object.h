@@ -155,7 +155,16 @@ public:
         const glm::mat4& main_proj,
         const std::array<float, CSM_CASCADE_COUNT>& cascade_far_vs,
         float z_near_vs,
-        std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps);
+        std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps,
+        // Optional out param: a single "union" light-space view-projection
+        // matrix that covers all CSM cascade volumes — i.e. a light-space
+        // orthographic projection fitted to the full main-camera frustum
+        // from z_near_vs to cascade_far_vs.back(), with the same 200 m
+        // pull-back along the light direction as the per-cascade VPs.
+        // Used by ClusterRenderer::cullShadow to do a single shadow-frustum
+        // cull dispatch whose survivor set covers every cascade.  Pass
+        // nullptr if not needed (legacy callers).
+        glm::mat4* out_union_vp = nullptr);
 };
 
 } // game_object

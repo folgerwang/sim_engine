@@ -2276,16 +2276,20 @@ static void drawMesh(
     // When the CLI flag is live and this MeshInfo actually had its cluster
     // sidecar + GPU expansion built (only the FBX-path static meshes do so
     // far), bypass the whole primitive loop and paint the mesh with the
-    // per-cluster flat-color helper. Depth-only passes (shadow / pre-z)
-    // fall through to the normal path so they still write valid depth.
+    // per-cluster flat-color helper.
     // When the cluster indirect draw is active this mesh is handled by the
-    // cluster renderer pass — skip it entirely in the forward pass (avoids
-    // double-rendering with z-fighting between the two draws).
+    // cluster renderer pass — skip it entirely in BOTH the forward AND
+    // shadow passes (the cluster renderer now provides drawClusterShadow,
+    // a single drawIndexedIndirectCount that broadcasts to every cascade
+    // via a GS, replacing the ~2400 individual per-mesh shadow draws that
+    // used to dominate the shadow pass at ~17 ms CPU).  The shadow draw
+    // is dispatched by the application around the existing shadow render
+    // pass.  Both the forward and shadow paths read the same cull-output
+    // indirect buffer, so consistency is automatic.
     // Use cluster_global_mesh_idx_ >= 0 (set during cluster upload) as the
     // "this mesh is owned by the cluster renderer" flag — independent of
     // whether debug GPU buffers happen to exist.
-    if (!depth_only &&
-        engine::helper::clusterIndirectActive() &&
+    if (engine::helper::clusterIndirectActive() &&
         mesh_info.cluster_global_mesh_idx_ >= 0) {
         return;
     }
@@ -2868,13 +2872,35 @@ renderer::WriteDescriptorList addGameObjectsInfoBuffer(
         game_object_buffer.buffer,
         game_object_buffer.buffer->getSize());
 
-/*    renderer::Helper::addOneBuffer(
+    // Always write a buffer at CAMERA_OBJECT_BUFFER_INDEX — the shader
+    // (update_game_objects.comp) declares CameraInfoBuffer at this slot
+    // and validation will fire VUID-vkCmdDispatch-None-08114 ("descriptor
+    // … never updated") if the slot is left unwritten, regardless of
+    // whether the dispatch actually reads from it at runtime.  Prefer
+    // the app-supplied view-camera buffer (set via
+    // DrawableObject::setViewCameraBufferForUpdate); if the application
+    // hasn't called the setter yet (e.g. initStaticMembers runs before
+    // the camera buffer is wired up), fall back to game_object_buffer
+    // itself — wrong contents semantically, but it's a valid bound
+    // STORAGE_BUFFER so validation is satisfied.  Once the application
+    // calls updateGameObjectsCameraBuffer with the real camera buffer,
+    // the binding is overwritten with the correct one.
+    //
+    // Read through the public getter — this function lives in an
+    // anonymous namespace inside `engine::` (NOT `engine::game_object::`)
+    // so it must qualify DrawableObject with its full namespace path to
+    // reach the static method.
+    const auto& view_cam_buf =
+        engine::game_object::DrawableObject::getViewCameraBufferForUpdate();
+    const auto& camera_slot_buffer =
+        view_cam_buf ? view_cam_buf->buffer : game_object_buffer.buffer;
+    renderer::Helper::addOneBuffer(
         descriptor_writes,
         description_set,
         engine::renderer::DescriptorType::STORAGE_BUFFER,
         CAMERA_OBJECT_BUFFER_INDEX,
-        game_camera_buffer.buffer,
-        game_camera_buffer.buffer->getSize());*/
+        camera_slot_buffer,
+        camera_slot_buffer->getSize());
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -3035,6 +3061,8 @@ std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::update_instance_b
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::update_instance_buffer_pipeline_layout_;
 std::shared_ptr<renderer::Pipeline> DrawableObject::update_instance_buffer_pipeline_;
 std::shared_ptr<renderer::BufferInfo> DrawableObject::game_objects_buffer_;
+std::shared_ptr<renderer::BufferInfo>
+    DrawableObject::s_view_camera_buffer_for_update_;
 
 void PrimitiveInfo::generateHash() {
     hash_ = std::hash<uint32_t>{}(tag_.data);
@@ -3600,6 +3628,12 @@ void DrawableObject::createGameObjectUpdateDescSet(
                 descriptor_pool, update_game_objects_desc_set_layout_, 1)[0];
 
         assert(game_objects_buffer_);
+        // addGameObjectsInfoBuffer writes the CameraInfoBuffer slot
+        // unconditionally — using s_view_camera_buffer_for_update_ when the
+        // application has supplied it (via setViewCameraBufferForUpdate),
+        // otherwise falling back to game_objects_buffer_ to keep the slot
+        // bound to *something* valid so validation is satisfied even on
+        // the early initStaticMembers path.
         auto write_descs = addGameObjectsInfoBuffer(
             update_game_objects_buffer_desc_set_[soil_water],
             texture_sampler,

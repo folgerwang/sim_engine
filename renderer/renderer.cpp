@@ -128,8 +128,18 @@ void Helper::init(const std::shared_ptr<Device>& device) {
         SET_FLAG_BIT(Access, SHADER_READ_BIT),
         SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
 
+    // DEPTH_STENCIL_READ_ONLY_OPTIMAL rather than DEPTH_READ_ONLY_OPTIMAL —
+    // most depth buffers in this engine use D24_UNORM_S8_UINT (combined
+    // depth+stencil).  Without the separateDepthStencilLayouts device
+    // feature enabled, DEPTH_READ_ONLY_OPTIMAL applies only to the depth
+    // aspect; validation tracks the stencil aspect independently and
+    // treats DEPTH_READ_ONLY as SHADER_READ_ONLY for stencil, which then
+    // mismatches any subsequent DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    // transition.  DEPTH_STENCIL_READ_ONLY_OPTIMAL covers both aspects
+    // cleanly on a combined format and is the safer default for the
+    // shared "depth-as-sampler" template.
     depth_as_shader_sampler_ = {
-        ImageLayout::DEPTH_READ_ONLY_OPTIMAL,
+        ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
         SET_FLAG_BIT(Access, SHADER_READ_BIT),
         SET_2_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, COMPUTE_SHADER_BIT) };
 }
@@ -784,6 +794,28 @@ void Helper::createCubemapTexture(
             6);
         device->submitAndWaitTransientCommandBuffer();
     }
+    else {
+        // No source data — this cube is being used as a framebuffer / storage
+        // target.  Without this transition the image stays in UNDEFINED for
+        // every mip and face.  Descriptors written by the IBL/skydome paths
+        // declare layout=GENERAL (the layout they sample/store with), and
+        // validation fires a vkQueueSubmit error for mip >= 1 because those
+        // subresources are still in UNDEFINED.  Prime ALL mips and ALL faces
+        // to GENERAL once at create time so subsequent sampler reads and
+        // storeImage writes see the layout the descriptors promised.
+        auto cmd_buf = device->setupTransientCommandBuffer();
+        vk::helper::transitionImageLayout(
+            cmd_buf,
+            texture.image,
+            format,
+            ImageLayout::UNDEFINED,
+            ImageLayout::GENERAL,
+            /*base_mip*/ 0,
+            /*mip_count*/ mip_count,
+            /*base_layer*/ 0,
+            /*layer_count*/ 6);
+        device->submitAndWaitTransientCommandBuffer();
+    }
 
     texture.view = device->createImageView(
         texture.image,
@@ -860,13 +892,42 @@ void Helper::blitImage(
     auto src_aspect_mask = vk::helper::toVkImageAspectFlags(src_aspect_flags);
     auto dst_aspect_mask = vk::helper::toVkImageAspectFlags(dst_aspect_flags);
 
+    // ── Barrier-vs-blit aspect mask divergence ──────────────────────────
+    // Vulkan permits a blit subresource that names only DEPTH (or only
+    // STENCIL) of a combined depth/stencil image — i.e. copy_region's
+    // aspect can legally be DEPTH_BIT alone.  But the image-memory
+    // barriers that surround the blit must, without the
+    // separateDepthStencilLayouts feature, name BOTH the depth and
+    // stencil aspects when the image's format has both
+    // (VUID-VkImageMemoryBarrier-image-03320).  Callers pass DEPTH_BIT
+    // meaning "blit the depth aspect"; we honour that for the blit
+    // subresource but expand the barrier aspect to include the stencil
+    // aspect when the image format carries it, so the surrounding
+    // transitions stay legal.
+    auto src_barrier_aspect = src_aspect_flags;
+    auto dst_barrier_aspect = dst_aspect_flags;
+    if (vk::helper::isDepthFormat(src_image->getFormat()) &&
+        vk::helper::hasStencilComponent(src_image->getFormat())) {
+        src_barrier_aspect |= SET_FLAG_BIT(ImageAspect, DEPTH_BIT) |
+                              SET_FLAG_BIT(ImageAspect, STENCIL_BIT);
+    }
+    if (vk::helper::isDepthFormat(dst_image->getFormat()) &&
+        vk::helper::hasStencilComponent(dst_image->getFormat())) {
+        dst_barrier_aspect |= SET_FLAG_BIT(ImageAspect, DEPTH_BIT) |
+                              SET_FLAG_BIT(ImageAspect, STENCIL_BIT);
+    }
+    auto src_barrier_aspect_mask =
+        vk::helper::toVkImageAspectFlags(src_barrier_aspect);
+    auto dst_barrier_aspect_mask =
+        vk::helper::toVkImageAspectFlags(dst_barrier_aspect);
+
     ImageMemoryBarrier barrier;
     barrier.image = src_image;
     barrier.old_layout = src_old_info.image_layout;
     barrier.new_layout = ImageLayout::TRANSFER_SRC_OPTIMAL;
     barrier.src_access_mask = src_old_info.access_flags;
     barrier.dst_access_mask = SET_FLAG_BIT(Access, TRANSFER_READ_BIT);
-    barrier.subresource_range.aspect_mask = src_aspect_mask;
+    barrier.subresource_range.aspect_mask = src_barrier_aspect_mask;
     barrier_list.image_barriers.push_back(barrier);
     if (src_old_info.stage_flags != dst_old_info.stage_flags) {
         cmd_buf->addBarriers(
@@ -881,7 +942,7 @@ void Helper::blitImage(
     barrier.new_layout = ImageLayout::TRANSFER_DST_OPTIMAL;
     barrier.src_access_mask = dst_old_info.access_flags;
     barrier.dst_access_mask = SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT);
-    barrier.subresource_range.aspect_mask = dst_aspect_mask;
+    barrier.subresource_range.aspect_mask = dst_barrier_aspect_mask;
     barrier_list.image_barriers.push_back(barrier);
     cmd_buf->addBarriers(
         barrier_list,
@@ -910,7 +971,7 @@ void Helper::blitImage(
     barrier.new_layout = src_new_info.image_layout;
     barrier.src_access_mask = SET_FLAG_BIT(Access, TRANSFER_READ_BIT);
     barrier.dst_access_mask = src_new_info.access_flags;
-    barrier.subresource_range.aspect_mask = src_aspect_mask;
+    barrier.subresource_range.aspect_mask = src_barrier_aspect_mask;
     barrier_list.image_barriers.push_back(barrier);
     if (src_new_info.stage_flags != dst_new_info.stage_flags) {
         cmd_buf->addBarriers(
@@ -925,7 +986,7 @@ void Helper::blitImage(
     barrier.new_layout = dst_new_info.image_layout;
     barrier.src_access_mask = SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT);
     barrier.dst_access_mask = dst_new_info.access_flags;
-    barrier.subresource_range.aspect_mask = dst_aspect_mask;
+    barrier.subresource_range.aspect_mask = dst_barrier_aspect_mask;
     barrier_list.image_barriers.push_back(barrier);
     cmd_buf->addBarriers(
         barrier_list,

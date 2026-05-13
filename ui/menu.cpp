@@ -1825,12 +1825,25 @@ bool Menu::draw(
         ImGui::SetNextWindowSize(ImVec2(kWinW, kWinH));
         ImGui::SetNextWindowViewport(main_vp_id);
         if (ImGui::Begin("CSM Debug", &show_csm_debug_, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
-            const char* labels[] = { "Cascade 0\n(near)", "Cascade 1", "Cascade 2", "Cascade 3\n(far)" };
+            // Build the cascade label per-iteration so this scales with
+            // CSM_CASCADE_COUNT.  The previous code hard-coded a 4-entry
+            // labels[] array, which crashed (OOB read → garbage pointer
+            // fed into ImGui::Text("%s", ...) → CRT format-string parse
+            // crash) once CSM_CASCADE_COUNT was bumped to 6 — see the
+            // csm_cascade_splits array in application.cpp.
+            char label_buf[32];
             for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
                 if (k > 0) ImGui::SameLine();
                 ImGui::BeginGroup();
-                // Label above each image
-                ImGui::Text("%s", labels[k]);
+                // Label above each image — mark the ends so the user
+                // can orient at a glance.
+                const char* suffix =
+                    (k == 0) ? "\n(near)"
+                    : (k == CSM_CASCADE_COUNT - 1) ? "\n(far)"
+                    : "";
+                std::snprintf(label_buf, sizeof(label_buf),
+                              "Cascade %d%s", k, suffix);
+                ImGui::Text("%s", label_buf);
                 if (csm_debug_tex_ids_[k]) {
                     ImGui::Image(csm_debug_tex_ids_[k], ImVec2(kThumbSize, kThumbSize));
                     if (ImGui::IsItemHovered()) {

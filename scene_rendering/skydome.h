@@ -59,6 +59,13 @@ class Skydome {
     std::shared_ptr<renderer::PipelineLayout> cube_skybox_mini_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline> cube_skybox_mini_pipeline_;
 
+    // Mip-0-only cube view of rt_envmap_tex_ for the storage-image
+    // binding in cube_skybox_mini_desc_set_.  Created once on first
+    // bindMiniSkyBoxTargets; restricts the subresource range that
+    // validation enforces the GENERAL layout for to just the mip the
+    // compute shader actually writes (mip 0).
+    std::shared_ptr<renderer::ImageView> cube_skybox_mini_envmap_dst_view_;
+
     std::shared_ptr<renderer::DescriptorSet> sky_scattering_lut_first_pass_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> sky_scattering_lut_sum_pass_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> sky_scattering_lut_final_pass_desc_set_;
