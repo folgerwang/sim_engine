@@ -7,25 +7,27 @@
 // base_depthonly_csm.task as one workgroup per cascade
 // (gl_WorkGroupID.x = cascade index).  Reads the primitive's vertex
 // and index data, plus the per-instance transform, from set-0 SSBO
-// bindings (bound per-primitive by DrawableObject::createDrawableData).
+// bindings bound per-primitive in buildMeshShaderShadowResources.
 //
-// Phase B MVP scope (opaque, non-skinned, single instance):
-//   - Up to 256 vertices and 256 triangles per primitive.  Larger
-//     primitives need host-side meshlet subdivision (future work).
-//   - One instance per drawcall (reads instance_data[0]).  Skinning
-//     and cutout-alpha discard handled by GS fallback inside
-//     DrawableObject::draw for now.
+// Eligibility (enforced CPU-side in buildMeshShaderShadowResources;
+// ineligible primitives fall back to the GS pipeline inside drawMesh):
+//   - opaque material (no alpha-cutout discard needed)
+//   - non-skinned (no joint matrices)
+//   - UINT32 indices
+//   - vertex_count ≤ 256 AND tri_count ≤ 256 (the EXT_mesh_shader
+//     minimum max-output limits).  Larger primitives would need host-
+//     side meshlet subdivision.
+//   - one instance per drawcall (reads instance_data slot 0).
 //
 // SSBO bindings (set 0 — bound per-primitive):
 //   binding 0: VB (raw float array; position is at offset
 //              pc.vb_position_offset_floats with stride
-//              pc.vb_stride_floats — matches existing BindlessVertex /
-//              packed-position layouts the engine ships).
+//              pc.vb_stride_floats — matches every BindlessVertex /
+//              packed-position layout the engine ships).
 //   binding 1: IB (uint indices, tri_count*3 entries starting at
 //              pc.ib_first_index).
 //   binding 2: instance_buffer (InstanceDataInfo entries, GPU-resident
-//              and updated by update_instance_buffer.comp — we read
-//              slot 0 since drawables draw 1 instance per call).
+//              and updated by update_instance_buffer.comp — slot 0).
 //
 // Runtime-lights UBO read for cascade VP:
 //   set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX

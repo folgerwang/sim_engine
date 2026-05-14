@@ -119,17 +119,17 @@ public:
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs_;
 
     // ── Mesh-shader CSM path (DrawMode::kCsmMeshShader) ─────────────
-    // Set when the primitive is eligible for the mesh-shader shadow
-    // path (opaque, non-skinned, vertex_count <= 256, tri_count <= 256)
-    // AND a mesh-shader pipeline was successfully built.  Bound at
-    // set 0 of the mesh-shader-shadow pipeline layout; references the
-    // primitive's VB + IB + the owning drawable's instance_buffer as
-    // storage buffers.  nullptr means "not eligible — dispatch falls
-    // back to the GS path".
+    // Non-null when the primitive is eligible for the mesh-shader
+    // shadow path (opaque, non-skinned, UINT32 indices, vertex_count
+    // and tri_count both <= 256) AND a mesh-shader pipeline was
+    // successfully built.  Bound at set 0 of the mesh-shader-shadow
+    // pipeline layout; references the primitive's VB + IB + the owning
+    // drawable's instance_buffer as storage buffers.  nullptr means
+    // "not eligible — drawMesh falls back to the GS pipeline".
     std::shared_ptr<renderer::DescriptorSet> mesh_shader_shadow_desc_set_;
-    // Layout descriptors used by the mesh-shader push constant.  All
-    // in FLOATS (not bytes) — divide source byte offsets by 4.  Filled
-    // alongside mesh_shader_shadow_desc_set_ at pipeline-build time.
+    // Layout descriptors consumed by the MeshShadowPC push constant.
+    // All values in FLOATS (not bytes) — buildMeshShaderShadowResources
+    // converts byte offsets to float strides at pipeline-build time.
     uint32_t mesh_shader_vb_stride_floats_          = 0;
     uint32_t mesh_shader_vb_position_offset_floats_ = 0;
     uint32_t mesh_shader_ib_first_index_            = 0;
@@ -346,9 +346,10 @@ private:
     // Mesh-shader CSM shadow pipeline (task+mesh stages, no VS/GS).
     // Selected by DrawMode::kCsmMeshShader.  Per-primitive descriptor
     // sets (binding 0=VB SSBO, 1=IB SSBO, 2=instance_buffer SSBO) are
-    // allocated at pipeline build time and stored on PrimitiveInfo.
-    // Phase B MVP supports opaque non-skinned static primitives only;
-    // skinned + cutout primitives fall back to GS at dispatch.
+    // allocated at pipeline-build time and stored on PrimitiveInfo.
+    // Supports opaque non-skinned UINT32-indexed primitives with
+    // <=256 verts/tris; everything else falls back to the GS pipeline
+    // inside drawMesh.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_mesh_shader_pipeline_list_;
     static std::shared_ptr<renderer::DescriptorSetLayout> mesh_shader_shadow_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout>      mesh_shader_shadow_pipeline_layout_;
@@ -482,11 +483,13 @@ public:
                         // light_view_proj[ModelParams.cascade_idx] from
                         // the runtime-lights UBO.  Used by the "Regular"
                         // option on the shadow draw-mode menu.
-        kCsmMeshShader, // single-pass depth-only with task+mesh shaders.
-                        // task amplifies 1 dispatch → CSM_CASCADE_COUNT
-                        // mesh workgroups; mesh fetches VB/IB/instance
-                        // via per-primitive SSBOs.  Opaque non-skinned
-                        // only — others fall back to GS at dispatch.
+        kCsmMeshShader, // Single-pass depth-only via task+mesh shaders.
+                        // task amplifies one drawcall into
+                        // CSM_CASCADE_COUNT mesh workgroups; the mesh
+                        // shader fetches VB/IB/instance via per-primitive
+                        // SSBOs.  Ineligible primitives (skinned,
+                        // cutout, UINT16 indices, >256 verts/tris) fall
+                        // back to the GS pipeline inside drawMesh.
     };
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

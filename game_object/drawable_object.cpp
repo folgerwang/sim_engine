@@ -2602,16 +2602,16 @@ static void drawMesh(
     bool depth_only,
     size_t& last_hash,
     // ── Mesh-shader CSM dispatch (DrawMode::kCsmMeshShader) ─────────
-    // mesh_shader_csm_mode = true: primary pipelines map IS the
-    //   mesh-shader pipeline list.  For each primitive, if a mesh-
-    //   shader descriptor set is present (mesh_shader_shadow_desc_set_
-    //   non-null) AND pipelines[hash] is non-null, dispatch via
-    //   drawMeshTasksEXT through DrawableObject::mesh_shader_shadow_
-    //   pipeline_layout_.  Otherwise fall back to the GS pipeline
-    //   (mesh_shader_fallback_pipelines[hash]) + drawIndexedIndirect.
-    // mesh_shader_csm_mode = false: legacy behaviour — pipelines is the
-    //   relevant pipeline list and the GS-style dispatch is used for
-    //   every primitive (fallback param ignored).
+    // mesh_shader_csm_mode = true: `pipelines` IS the mesh-shader
+    //   pipeline list.  For each primitive: if it has a mesh-shader
+    //   descriptor set (mesh_shader_shadow_desc_set_ non-null) AND a
+    //   hash-cached pipeline exists, dispatch via drawMeshTasks
+    //   through the mesh-shader-shadow pipeline layout; otherwise
+    //   fall back to mesh_shader_fallback_pipelines[hash] +
+    //   drawIndexedIndirect using the standard pipeline layout.
+    // mesh_shader_csm_mode = false: legacy behaviour — `pipelines` is
+    //   the active list and the GS-style dispatch is used for every
+    //   primitive.  fallback param ignored.
     bool mesh_shader_csm_mode = false,
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines = nullptr) {
 
@@ -2735,29 +2735,30 @@ static void drawMesh(
             : prim.getHash();
 
         // ── Mesh-shader CSM dispatch (eligible primitives only) ─────
-        // Eligible if we're in mesh-shader mode AND this primitive has
-        // a populated per-primitive descriptor set AND a hash-cached
-        // mesh-shader pipeline exists.  Otherwise we fall through to
-        // the GS-style dispatch below using the fallback pipeline list.
+        // Take this branch only when mesh-shader mode is active AND
+        // this primitive has a populated per-primitive descriptor set
+        // AND a hash-cached mesh-shader pipeline exists.  Otherwise
+        // fall through to the GS-style dispatch below (using the
+        // fallback pipeline list when in mesh-shader mode).
         const bool ms_eligible =
             mesh_shader_csm_mode &&
             prim.mesh_shader_shadow_desc_set_ != nullptr &&
             pipelines.find(cur_hash) != pipelines.end() &&
             pipelines[cur_hash] != nullptr;
         if (ms_eligible) {
-            // Mesh-shader pipeline + layout.  Bind set 0 (per-primitive
+            // Mesh-shader pipeline + layout.  Bind set 0 (this primitive's
             // VB/IB/instance SSBOs) and set RUNTIME_LIGHTS_PARAMS_SET
-            // (cascade VPs).  No IA bindings, no material / skin sets,
-            // no node descriptor — the mesh shader needs none of them.
+            // (cascade VPs UBO).  No IA bindings, no material / skin / PBR
+            // sets — the mesh shader doesn't reference any of them.
             cmd_buf->bindPipeline(
                 renderer::PipelineBindPoint::GRAPHICS,
                 pipelines[cur_hash]);
             cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
             cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
-            // Reset last_hash so the next non-mesh-shader primitive
-            // re-binds its pipeline (since we just bound a different
-            // pipeline layout, the previous binding is invalidated for
-            // the GS path's perspective).
+            // Force re-bind on the next non-mesh-shader primitive: the
+            // pipeline layout we're about to bind differs from the GS
+            // path's, so a same-hash fallback primitive after us must
+            // still re-bind to refresh its descriptor-set bindings.
             last_hash = 0;
 
             const auto& ms_layout =
@@ -2806,9 +2807,9 @@ static void drawMesh(
             continue;
         }
 
-        // ── GS-style dispatch (legacy path + mesh-shader fallback) ──
-        // When mesh_shader_csm_mode is true and this primitive is
-        // ineligible, the caller's primary pipelines map (the mesh-
+        // ── GS-style dispatch (default + mesh-shader fallback) ──────
+        // When mesh_shader_csm_mode is true and this primitive isn't
+        // eligible, the caller's primary `pipelines` map (the mesh-
         // shader list) won't have an entry for cur_hash.  Substitute
         // the GS pipeline list passed via mesh_shader_fallback_pipelines.
         auto* dispatch_pipelines = &pipelines;
@@ -3118,28 +3119,27 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     bool csm_layered = false,
     bool is_opaque = false,
     bool csm_per_cascade = false) {
-    // csm_layered: when true, add a geometry shader that broadcasts each
-    // triangle to all CSM_CASCADE_COUNT depth-array layers in a single pass,
-    // eliminating the per-cascade redundant vertex transform overhead.
+    // csm_layered: when true, add the geometry shader that broadcasts
+    // each input triangle to all CSM_CASCADE_COUNT depth-array layers
+    // in a single pass, eliminating the per-cascade vertex transform.
     //
     // csm_per_cascade: when true, load the _CSMCASC permutation of the
-    // vertex shader, which reads light_view_proj[model_params.cascade_idx]
-    // from the runtime-lights UBO instead of camera_info.view_proj from
-    // the view-camera SSBO.  The host loops over CSM_CASCADE_COUNT
-    // cascades and pushes cascade_idx via ModelParams; no GS, no mesh
-    // shader.  Mutually exclusive with csm_layered (caller's contract).
+    // VS, which reads light_view_proj[model_params.cascade_idx] from
+    // the runtime-lights UBO instead of camera_info.view_proj from the
+    // view-camera SSBO.  The host loops cascades and pushes cascade_idx
+    // via ModelParams; no GS, no mesh shader.  Mutually exclusive with
+    // csm_layered (caller's contract).
     //
     // is_opaque: when true, the fragment shader is OMITTED entirely.
-    // base_depthonly.frag's only job is the alpha-mask discard (it has
-    // ALPHAMODE_MASK hardcoded — see the #define at the top of the
-    // file).  For Opaque materials that test never fires, so binding
-    // the frag shader just wastes a per-fragment base-color texture
-    // sample × CSM_CASCADE_COUNT cascades.  Skipping it entirely turns
-    // the pipeline into pure rasteriser-only depth-write, which is
-    // exactly what the cluster shadow path already does
-    // (cluster_bindless_shadow.vert + .geom, no frag).  Vulkan allows
-    // graphics pipelines with no fragment stage as long as a depth
-    // attachment is bound, which the CSM shadow render pass provides.
+    // base_depthonly.frag's only job is the alpha-mask discard
+    // (ALPHAMODE_MASK is hardcoded at the top of the file).  For
+    // Opaque materials that test never fires, so binding the frag
+    // shader just wastes a per-fragment base-color texture sample ×
+    // CSM_CASCADE_COUNT cascades.  Skipping it turns the pipeline into
+    // a pure rasterizer-only depth-write, matching the cluster shadow
+    // path (no frag stage).  Vulkan permits graphics pipelines with no
+    // fragment stage as long as a depth attachment is bound — which
+    // the CSM shadow render pass provides.
     //
     // Stage count breakdown (csm_per_cascade has the same stage count
     // as csm_layered=false; it just swaps the VS permutation):
@@ -3432,16 +3432,16 @@ static std::shared_ptr<renderer::Pipeline> createDrawableCsmPerCascadePipeline(
 
 // CSM mesh-shader shadow pipeline — used for DrawMode::kCsmMeshShader
 // (the "Mesh Shader" option on the shadow draw-mode menu).  Loads
-// base_depthonly_csm.task + .mesh, no VS / GS / FS.  No vertex input
+// base_depthonly_csm.task + .mesh; no VS / GS / FS.  No vertex input
 // state: the mesh shader fetches all data via the per-primitive SSBO
 // descriptor set bound at set 0.  Uses the mesh-shader-shadow pipeline
-// layout (NOT the standard drawable_pipeline_layout_) so its set
-// assignments don't collide with the regular forward / shadow paths.
+// layout (NOT drawable_pipeline_layout_) so its set assignments don't
+// collide with the forward / GS / per-cascade pipelines.
 //
 // Caller responsibility: only invoke for primitives that meet the
-// mesh-shader eligibility criteria (opaque, non-skinned, vertex_count
-// <= 256, tri_count <= 256).  Otherwise the dispatch will produce
-// clamped / wrong output.
+// mesh-shader eligibility criteria (see buildMeshShaderShadowResources).
+// Ineligible primitives produce clamped / wrong output if dispatched
+// through this pipeline.
 static std::shared_ptr<renderer::Pipeline> createDrawableCsmMeshShaderPipeline(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
@@ -3472,10 +3472,11 @@ static std::shared_ptr<renderer::Pipeline> createDrawableCsmMeshShaderPipeline(
         static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
 
     renderer::RasterizationStateOverride raster;
-    // Same shadow-side sidedness rule as the GS / per-cascade pipelines.
-    // For opaque, the mesh shader can respect authored double-sided —
-    // but the Phase-B MVP only builds this pipeline for opaque-non-
-    // skinned, so authored is the safe choice.
+    // The eligibility gate in buildMeshShaderShadowResources only lets
+    // opaque primitives through, so we can respect the asset's authored
+    // double_sided flag here (closed solids cull back faces, foliage-
+    // class assets keep both sides) — matching the GS / per-cascade
+    // opaque rule.
     raster.override_double_sided = true;
     raster.double_sided = primitive.tag_.double_sided;
     raster.override_depth_clamp_enable = true;
@@ -3516,8 +3517,8 @@ static std::shared_ptr<renderer::Pipeline> createDrawableCsmMeshShaderPipeline(
 //   - vertex_count <= 256 AND tri_count <= 256
 //   - position buffer view has a usable stride (>0)
 //
-// Phase B3 MVP — skinning and cutout fall back; we extend in B4 if the
-// drawable mesh-shader path actually shows a perf delta worth pursuing.
+// Skinning and cutout fall back to the GS path; extend the shader and
+// the eligibility gate together if those need real mesh-shader support.
 static void buildMeshShaderShadowResources(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
@@ -4293,7 +4294,10 @@ DrawableObject::DrawableObject(
         // ── Mesh-shader CSM resources ─────────────────────────────────
         // Builds the hash-cached mesh-shader pipeline + per-primitive
         // descriptor sets for eligible primitives (opaque, non-skinned,
-        // UINT32 indices, <=256 verts/tris).  Ineligible primitives
+        // UINT32 indices, <=256 verts/tris).  Must run AFTER the
+        // instance_buffer_ createBuffer above — buildMeshShaderShadow-
+        // Resources writes instance_buffer_.buffer into binding 2 of
+        // each per-primitive descriptor set.  Ineligible primitives
         // leave mesh_shader_shadow_desc_set_ null and dispatch falls
         // back to the GS path inside drawMesh.
         buildMeshShaderShadowResources(
@@ -4719,11 +4723,11 @@ void DrawableObject::createStaticMembers(
     }
 
     // ── Mesh-shader shadow descriptor + pipeline layout ───────────────
-    // Independent of the regular drawable pipeline layout — uses its
-    // own set-0 (VB/IB/instance SSBOs) and shares set RUNTIME_LIGHTS_
-    // PARAMS_SET (cascade VPs).  Built lazily; left null if Phase B
-    // mesh-shader path isn't expected to be exercised this run, but
-    // dispatched-from setup cost is trivial so we always build them.
+    // Independent of drawable_pipeline_layout_: uses its own set 0
+    // (VB/IB/instance SSBOs) and shares set RUNTIME_LIGHTS_PARAMS_SET
+    // (cascade VPs).  Built unconditionally — setup cost is trivial and
+    // it lets buildMeshShaderShadowResources allocate per-primitive
+    // descriptor sets without a separate guard.
     {
         if (mesh_shader_shadow_desc_set_layout_ == nullptr) {
             mesh_shader_shadow_desc_set_layout_ =
@@ -5216,9 +5220,10 @@ void DrawableObject::draw(
     num_draw_meshes = 0;
     size_t last_hash = 0;
 
-    // Mesh-shader CSM mode: when active, drawMesh needs the GS pipeline
-    // list as a fallback for primitives that didn't qualify for the
-    // mesh-shader path (skinned, cutout, large, UINT16 indices, etc).
+    // In mesh-shader mode, drawMesh needs the GS pipeline list as a
+    // fallback for ineligible primitives (skinned, cutout, UINT16
+    // indices, oversized).  Outside mesh-shader mode the fallback is
+    // unused.
     const bool mesh_shader_csm_mode = (draw_mode == DrawMode::kCsmMeshShader);
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>*
         mesh_shader_fallback =
