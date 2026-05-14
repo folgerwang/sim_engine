@@ -1164,17 +1164,22 @@ void ClusterRenderer::finalizeUploads() {
 
     // ── Cluster mesh-shader descriptor set ───────────────────────────
     // The mesh-shader CSM path reads these SSBOs.  Visible to both
-    // TASK_BIT_EXT (task shader's per-cluster cull reads cull_info,
-    // binding 0) and MESH_BIT_EXT (mesh shader's emission reads all 4).
-    //   binding 0  cluster cull infos    (frustum cull bounds)
-    //   binding 1  cluster draw infos    (index offset/count per cluster)
-    //   binding 2  merged vertex buffer  (BindlessVertex[] — read as float[])
-    //   binding 3  merged index buffer   (uint[])
+    // TASK_BIT_EXT (task shader's per-cluster cull) and MESH_BIT_EXT
+    // (mesh shader's emission).
+    //   binding 0  cluster cull infos       (frustum + cone bounds)
+    //   binding 1  cluster draw infos       (index off/cnt + material_idx)
+    //   binding 2  merged vertex buffer     (BindlessVertex[] as float[])
+    //   binding 3  merged index buffer      (uint[])
+    //   binding 4  bindless material params (flags for double-sided /
+    //                                        translucent backface-cull
+    //                                        skip — same source the
+    //                                        cluster_cull.comp main-camera
+    //                                        path reads)
     // The layout is independent of the cull compute's layout (which has
     // 12 bindings and is COMPUTE-visible only).
     if (total_merged_vertices_ > 0 && total_merged_indices_ > 0) {
-        std::vector<er::DescriptorSetLayoutBinding> mesh_bindings(4);
-        for (int i = 0; i < 4; ++i) {
+        std::vector<er::DescriptorSetLayoutBinding> mesh_bindings(5);
+        for (int i = 0; i < 5; ++i) {
             mesh_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
                 i, SET_2_FLAG_BITS(ShaderStage, TASK_BIT_EXT, MESH_BIT_EXT),
                 er::DescriptorType::STORAGE_BUFFER);
@@ -1186,7 +1191,7 @@ void ClusterRenderer::finalizeUploads() {
             descriptor_pool_, cluster_mesh_data_desc_set_layout_, 1)[0];
 
         er::WriteDescriptorList mesh_writes;
-        mesh_writes.reserve(4);
+        mesh_writes.reserve(5);
         er::Helper::addOneBuffer(mesh_writes, cluster_mesh_data_desc_set_,
             er::DescriptorType::STORAGE_BUFFER, 0,
             cull_info_buffer_.buffer,
@@ -1206,6 +1211,17 @@ void ClusterRenderer::finalizeUploads() {
             er::DescriptorType::STORAGE_BUFFER, 3,
             merged_index_buffer_.buffer,
             static_cast<uint32_t>(total_merged_indices_ * sizeof(uint32_t)));
+        // Material params (same buffer the cluster_cull.comp main-camera
+        // cull reads at its set=0, binding=5).  Always has at least one
+        // entry (white-fallback in the early branch above).
+        const uint32_t mat_count_safe = std::max(
+            static_cast<uint32_t>(staging_material_params_.size()),
+            1u);
+        er::Helper::addOneBuffer(mesh_writes, cluster_mesh_data_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 4,
+            material_params_buffer_.buffer,
+            static_cast<uint32_t>(
+                mat_count_safe * sizeof(glsl::BindlessMaterialParams)));
         device_->updateDescriptorSets(mesh_writes);
     }
 

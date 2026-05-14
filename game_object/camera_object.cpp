@@ -394,23 +394,43 @@ void ShadowViewCameraObject::computeCascadeMatrices(
             ls_max = glm::max(ls_max, ls);
         }
 
-        // Small padding to avoid shadow acne at cascade boundaries.
+        // Small XY padding to avoid shadow acne at cascade boundaries.
         constexpr float kPad = 1.0f;
         ls_min.x -= kPad;  ls_max.x += kPad;
         ls_min.y -= kPad;  ls_max.y += kPad;
 
-        // GLM ortho: near/far are positive distances from the camera along -Z.
-        // ls.z for scene corners in front of the light eye is negative,
-        // so near = -ls_max.z  (closest corners have z closest to 0),
-        //    far  = -ls_min.z  (farthest corners have most-negative z).
-        // Extend the far plane a bit to capture shadow casters just outside
-        // the camera frustum (e.g., objects right behind the camera).
+        // ── Tight orthographic Z range ────────────────────────────────
+        // Auto-scaled: the depth slab covers EXACTLY the cascade's
+        // light-space frustum bounds.  Combined with the D16_UNORM
+        // shadow texture and the Vulkan ortho projection (which produces
+        // linear-in-view-space depth in [0, 1] NDC), every UNORM step
+        // ≈ (ortho_far - ortho_near) / 65535 world units of precision.
+        //
+        // No far-side padding — shadow casters past `ortho_far` are
+        // physically behind the cascade slab from the light's POV and
+        // cannot shadow any in-slab pixel anyway, so clamping them to
+        // z=1 (via depthClampEnable on the shadow pipeline) is correct
+        // behaviour, not lost coverage.
+        //
+        // No near-side extension either — shadow casters BETWEEN the
+        // light and the cascade slab (clip_z < 0) get clamped to z=0 by
+        // depthClampEnable, which correctly shadows pixels in the slab.
+        // See cluster_renderer.cpp's initBindlessShadowPipeline +
+        // drawable_object.cpp's createDrawableShadowPipelineInternal
+        // for the two pipelines that own that override.
+        //
+        // GLM ortho: near/far are positive distances from the camera
+        // along -Z.  ls.z for scene corners in front of the light eye
+        // is negative, so near = -ls_max.z (closest to light), far =
+        // -ls_min.z (furthest from light).
         const float ortho_near = std::max(-ls_max.z, 0.1f);
-        const float ortho_far  = std::max(-ls_min.z + 10.0f, ortho_near + 1.0f);
+        const float ortho_far  = std::max(-ls_min.z, ortho_near + 1.0f);
 
-        // Build orthographic projection.  No y-flip: the existing single-cascade
-        // shadow code uses glm::ortho without flipping, and both the depth write
-        // (base_depthonly.vert) and the lookup (base.frag) use the same matrix.
+        // Build orthographic projection.  No y-flip: the existing
+        // single-cascade shadow code uses glm::ortho without flipping,
+        // and both the depth write (base_depthonly.vert /
+        // cluster_bindless_shadow.mesh) and the lookup (base.frag) use
+        // the same matrix.
         const glm::mat4 lp = glm::ortho(
             ls_min.x, ls_max.x,
             ls_min.y, ls_max.y,

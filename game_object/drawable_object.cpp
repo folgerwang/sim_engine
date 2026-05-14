@@ -2300,6 +2300,69 @@ static inline bool isPrimitiveOpaque(
         materials[primitive.material_idx_].effective_opaque_;
 }
 
+// ── Format-based alpha-channel detector ──────────────────────────────────
+// Returns true iff `format` carries an alpha channel.  A texture stored in
+// an RGB-only format (R8G8B8_UNORM, BC1_RGB, BC4_UNORM_BLOCK, etc.) cannot
+// possibly contain cutout alpha — every "texel α" is implicitly 1.0 in the
+// shader.  We use this to short-circuit the CPU-pixel scan for DDS/BC
+// textures where cpu_pixels is unavailable: if the GPU format has no α
+// channel, the material is definitively no-cutout regardless of how the
+// asset author flagged its AlphaMode.
+//
+// Default for unknown formats is `true` (assume α present) so we stay on
+// the safe side and force the frag-shader path.
+static bool formatHasAlphaChannel(renderer::Format f) {
+    using F = renderer::Format;
+    switch (f) {
+        // Single / two / three-channel uncompressed formats.
+        case F::R8_UNORM:        case F::R8_SNORM:
+        case F::R8_USCALED:      case F::R8_SSCALED:
+        case F::R8_UINT:         case F::R8_SINT:        case F::R8_SRGB:
+        case F::R8G8_UNORM:      case F::R8G8_SNORM:
+        case F::R8G8_USCALED:    case F::R8G8_SSCALED:
+        case F::R8G8_UINT:       case F::R8G8_SINT:      case F::R8G8_SRGB:
+        case F::R8G8B8_UNORM:    case F::R8G8B8_SNORM:
+        case F::R8G8B8_USCALED:  case F::R8G8B8_SSCALED:
+        case F::R8G8B8_UINT:     case F::R8G8B8_SINT:    case F::R8G8B8_SRGB:
+        case F::B8G8R8_UNORM:    case F::B8G8R8_SNORM:
+        case F::B8G8R8_USCALED:  case F::B8G8R8_SSCALED:
+        case F::B8G8R8_UINT:     case F::B8G8R8_SINT:    case F::B8G8R8_SRGB:
+        case F::R5G6B5_UNORM_PACK16:  case F::B5G6R5_UNORM_PACK16:
+        case F::R16_UNORM:       case F::R16_SNORM:
+        case F::R16_USCALED:     case F::R16_SSCALED:
+        case F::R16_UINT:        case F::R16_SINT:       case F::R16_SFLOAT:
+        case F::R16G16_UNORM:    case F::R16G16_SNORM:
+        case F::R16G16_USCALED:  case F::R16G16_SSCALED:
+        case F::R16G16_UINT:     case F::R16G16_SINT:    case F::R16G16_SFLOAT:
+        case F::R16G16B16_UNORM:    case F::R16G16B16_SNORM:
+        case F::R16G16B16_USCALED:  case F::R16G16B16_SSCALED:
+        case F::R16G16B16_UINT:     case F::R16G16B16_SINT:
+        case F::R16G16B16_SFLOAT:
+        case F::R32_UINT:    case F::R32_SINT:    case F::R32_SFLOAT:
+        case F::R32G32_UINT: case F::R32G32_SINT: case F::R32G32_SFLOAT:
+        case F::R32G32B32_UINT: case F::R32G32B32_SINT: case F::R32G32B32_SFLOAT:
+        case F::B10G11R11_UFLOAT_PACK32:
+        case F::E5B9G9R9_UFLOAT_PACK32:
+        // BC1 RGB-only variants (BC1_RGBA_* DO carry 1-bit α).
+        case F::BC1_RGB_UNORM_BLOCK:  case F::BC1_RGB_SRGB_BLOCK:
+        // BC4 = single channel.  BC5 = two channel.  BC6H = RGB float.
+        case F::BC4_UNORM_BLOCK: case F::BC4_SNORM_BLOCK:
+        case F::BC5_UNORM_BLOCK: case F::BC5_SNORM_BLOCK:
+        case F::BC6H_UFLOAT_BLOCK: case F::BC6H_SFLOAT_BLOCK:
+        // ETC2 RGB-only (ETC2_R8G8B8A1 / A8 carry α).
+        case F::ETC2_R8G8B8_UNORM_BLOCK: case F::ETC2_R8G8B8_SRGB_BLOCK:
+        case F::EAC_R11_UNORM_BLOCK:  case F::EAC_R11_SNORM_BLOCK:
+        case F::EAC_R11G11_UNORM_BLOCK: case F::EAC_R11G11_SNORM_BLOCK:
+            return false;
+        default:
+            // RGBA8, BGRA8, BC1_RGBA, BC2/3/7, ETC2_R8G8B8A*, ASTC,
+            // A*-prefixed packed formats, all 4-channel R*G*B*A* — they
+            // all carry α.  Same for unknown / depth / stencil formats
+            // (which don't appear in the albedo path anyway).
+            return true;
+    }
+}
+
 // ── Texture-content-aware opaque classifier ──────────────────────────────
 // Walks every material on a freshly-loaded DrawableData and decides whether
 // its shadow path can take the fast no-fragment-shader pipeline.  Runs once
@@ -2425,11 +2488,21 @@ static void computeEffectiveOpaqueForMaterials(
         }
 
         if (!tex.cpu_pixels || tex.cpu_pixels->empty()) {
-            // CAN'T SCAN — typical of DDS / BC-compressed source.
-            // Stay on the frag path (effective_opaque_ already false).
-            // The shadow shader will sample the full GPU texture's α
-            // and discard correctly.  No companion is built — the 4×
-            // bandwidth win has to wait for DDS-aware extraction.
+            // CAN'T SCAN content — typical of DDS / BC-compressed source.
+            // BUT the texture's FORMAT alone is a perfect proxy: an RGB
+            // (no-α) format physically cannot store cutout transparency,
+            // so the AlphaMode::Mask flag is over-conservative.  Take
+            // the no-frag fast path in that case.
+            //
+            // For α-bearing formats (RGBA8, BC1_RGBA, BC2/3/7, etc.)
+            // we still can't tell whether the α channel actually has
+            // cutout texels without scanning, so stay on the safe frag
+            // path until a DDS-aware extractor lands.
+            if (tex.image && !formatHasAlphaChannel(tex.image->getFormat())) {
+                mat.effective_opaque_ = true;
+                ++stats_mask_solid;
+                continue;
+            }
             ++stats_mask_unscanned;
             continue;
         }
