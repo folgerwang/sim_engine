@@ -1188,6 +1188,28 @@ bool Menu::draw(
                     !csm_silhouette_prepass_enabled_;
             }
 
+            // ── CSM drawable-shadow draw mode ─────────────────────────
+            // Three mutually-exclusive picks for how the drawable shadow
+            // path amplifies geometry across the cascades.  See the enum
+            // comment in menu.h for the per-mode trade-offs.  The cluster
+            // shadow path is unaffected — it always uses task+mesh.
+            if (ImGui::BeginMenu("Drawable shadow draw mode")) {
+                const CsmDrawMode cur = csm_draw_mode_;
+                if (ImGui::MenuItem("Regular (per-cascade passes)", NULL,
+                                     cur == CsmDrawMode::kRegular)) {
+                    csm_draw_mode_ = CsmDrawMode::kRegular;
+                }
+                if (ImGui::MenuItem("Geometry shader (layered)", NULL,
+                                     cur == CsmDrawMode::kGeometryShader)) {
+                    csm_draw_mode_ = CsmDrawMode::kGeometryShader;
+                }
+                if (ImGui::MenuItem("Mesh shader (task+mesh)", NULL,
+                                     cur == CsmDrawMode::kMeshShader)) {
+                    csm_draw_mode_ = CsmDrawMode::kMeshShader;
+                }
+                ImGui::EndMenu();
+            }
+
             ImGui::Separator();
 
             if (ImGui::MenuItem("Debug Cascades", NULL, show_csm_debug_)) {

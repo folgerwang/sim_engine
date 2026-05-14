@@ -10,6 +10,25 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 	ViewCameraInfo camera_info;
 };
 
+#ifdef CSM_PER_CASCADE
+// ─── CSM_PER_CASCADE permutation ──────────────────────────────────────────
+// "Regular" CSM mode: the host loops over CSM_CASCADE_COUNT cascades and
+// renders each into a single-layer view of the shadow array.  Each draw
+// pushes a per-cascade cascade_idx into ModelParams; the VS uses it to
+// index lights_params.light_view_proj[] instead of reading the main
+// shadow camera's view_proj from VIEW_PARAMS_SET.  This is the no-GS,
+// no-mesh-shader baseline path on the shadow draw-mode menu.
+//
+// RUNTIME_LIGHTS_PARAMS_SET is already bound to the shadow pass for the
+// GS path (base_depthonly_csm.geom reads light_view_proj[gl_Layer]).
+// The pipeline layout owner adds VERTEX_BIT to that set's stage flags so
+// this VS permutation can read the same UBO.
+layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
+    uniform RuntimeLightsUBO {
+    RuntimeLightsParams lights_params;
+};
+#endif
+
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
 layout(std430, set = SKIN_PARAMS_SET, binding = JOINT_CONSTANT_INDEX) readonly buffer JointMatrices {
 	mat4 joint_matrices[];
@@ -69,7 +88,17 @@ void main() {
         local_world_rot_mat *
         position_ls +
         in_loc_pos_scale.xyz;
+#ifdef CSM_PER_CASCADE
+    // Per-cascade VP picked by model_params.cascade_idx (written by
+    // drawMesh before each cascade pass).  The host has already uploaded
+    // light_view_proj[0..CSM_CASCADE_COUNT-1] this frame for the GS path,
+    // so we re-use the same UBO without any extra upload work.
+    gl_Position =
+        lights_params.light_view_proj[model_params.cascade_idx]
+        * vec4(position_ws, 1.0);
+#else
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
+#endif
     out_data.vertex_position = position_ws;
     out_data.vertex_tex_coord = vec4(0);
 #ifdef HAS_UV_SET0

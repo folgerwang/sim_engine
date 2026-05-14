@@ -118,6 +118,24 @@ public:
     std::vector<renderer::VertexInputBindingDescription> binding_descs_;
     std::vector<renderer::VertexInputAttributeDescription> attribute_descs_;
 
+    // ── Mesh-shader CSM path (DrawMode::kCsmMeshShader) ─────────────
+    // Set when the primitive is eligible for the mesh-shader shadow
+    // path (opaque, non-skinned, vertex_count <= 256, tri_count <= 256)
+    // AND a mesh-shader pipeline was successfully built.  Bound at
+    // set 0 of the mesh-shader-shadow pipeline layout; references the
+    // primitive's VB + IB + the owning drawable's instance_buffer as
+    // storage buffers.  nullptr means "not eligible — dispatch falls
+    // back to the GS path".
+    std::shared_ptr<renderer::DescriptorSet> mesh_shader_shadow_desc_set_;
+    // Layout descriptors used by the mesh-shader push constant.  All
+    // in FLOATS (not bytes) — divide source byte offsets by 4.  Filled
+    // alongside mesh_shader_shadow_desc_set_ at pipeline-build time.
+    uint32_t mesh_shader_vb_stride_floats_          = 0;
+    uint32_t mesh_shader_vb_position_offset_floats_ = 0;
+    uint32_t mesh_shader_ib_first_index_            = 0;
+    uint32_t mesh_shader_vertex_count_              = 0;
+    uint32_t mesh_shader_tri_count_                 = 0;
+
     // (Per-primitive cluster_mesh_ removed — see MeshInfo::cluster_prim_map_)
 
     void generateHash();
@@ -320,6 +338,20 @@ private:
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_shadow_pipeline_list_;
     // Single-pass CSM shadow pipeline — geometry shader broadcasts to all layers.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_layered_pipeline_list_;
+    // Per-cascade CSM shadow pipeline (no GS, no mesh shader).  The host
+    // loops cascades and pushes ModelParams.cascade_idx per draw; the VS
+    // reads light_view_proj[cascade_idx] from the runtime-lights UBO.
+    // Selected by DrawMode::kCsmPerCascade ("Regular" shadow draw mode).
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_per_cascade_pipeline_list_;
+    // Mesh-shader CSM shadow pipeline (task+mesh stages, no VS/GS).
+    // Selected by DrawMode::kCsmMeshShader.  Per-primitive descriptor
+    // sets (binding 0=VB SSBO, 1=IB SSBO, 2=instance_buffer SSBO) are
+    // allocated at pipeline build time and stored on PrimitiveInfo.
+    // Phase B MVP supports opaque non-skinned static primitives only;
+    // skinned + cutout primitives fall back to GS at dispatch.
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_mesh_shader_pipeline_list_;
+    static std::shared_ptr<renderer::DescriptorSetLayout> mesh_shader_shadow_desc_set_layout_;
+    static std::shared_ptr<renderer::PipelineLayout>      mesh_shader_shadow_pipeline_layout_;
     static std::unordered_map<std::string, std::shared_ptr<DrawableData>> drawable_object_list_;
     static std::shared_ptr<renderer::DescriptorSetLayout> drawable_indirect_draw_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout> drawable_indirect_draw_pipeline_layout_;
@@ -446,6 +478,15 @@ public:
         kForward,       // regular lit forward pass
         kShadow,        // per-cascade depth-only pass (legacy, 4 separate draws)
         kCsmLayered,    // single-pass depth-only with GS broadcasting to all CSM layers
+        kCsmPerCascade, // per-cascade depth-only pass; VS reads
+                        // light_view_proj[ModelParams.cascade_idx] from
+                        // the runtime-lights UBO.  Used by the "Regular"
+                        // option on the shadow draw-mode menu.
+        kCsmMeshShader, // single-pass depth-only with task+mesh shaders.
+                        // task amplifies 1 dispatch → CSM_CASCADE_COUNT
+                        // mesh workgroups; mesh fetches VB/IB/instance
+                        // via per-primitive SSBOs.  Opaque non-skinned
+                        // only — others fall back to GS at dispatch.
     };
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
@@ -453,7 +494,20 @@ public:
         const std::vector<renderer::Viewport>& viewports,
         const std::vector<renderer::Scissor>& scissors,
         bool depth_only = false,
-        DrawMode draw_mode = DrawMode::kForward);
+        DrawMode draw_mode = DrawMode::kForward,
+        // Only consumed by DrawMode::kCsmPerCascade — written into each
+        // drawcall's ModelParams.cascade_idx so the _CSMCASC vertex
+        // shader picks the right cascade VP from the runtime-lights UBO.
+        // Ignored by every other DrawMode.
+        uint32_t csm_cascade_idx = 0);
+
+    // Static accessor for the mesh-shader shadow pipeline layout.
+    // Needed by drawMesh (file-scope static) which can't reach the
+    // private static directly.
+    static const std::shared_ptr<renderer::PipelineLayout>&
+        getMeshShaderShadowPipelineLayout() {
+        return mesh_shader_shadow_pipeline_layout_;
+    }
 
     void update(
         const std::shared_ptr<renderer::Device>& device,

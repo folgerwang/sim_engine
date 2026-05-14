@@ -1,0 +1,164 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "global_definition.glsl.h"
+
+// ─── base_depthonly_csm.mesh ────────────────────────────────────────────
+// Drawable-path mesh-shader CSM mesh shader.  Dispatched by
+// base_depthonly_csm.task as one workgroup per cascade
+// (gl_WorkGroupID.x = cascade index).  Reads the primitive's vertex
+// and index data, plus the per-instance transform, from set-0 SSBO
+// bindings (bound per-primitive by DrawableObject::createDrawableData).
+//
+// Phase B MVP scope (opaque, non-skinned, single instance):
+//   - Up to 256 vertices and 256 triangles per primitive.  Larger
+//     primitives need host-side meshlet subdivision (future work).
+//   - One instance per drawcall (reads instance_data[0]).  Skinning
+//     and cutout-alpha discard handled by GS fallback inside
+//     DrawableObject::draw for now.
+//
+// SSBO bindings (set 0 — bound per-primitive):
+//   binding 0: VB (raw float array; position is at offset
+//              pc.vb_position_offset_floats with stride
+//              pc.vb_stride_floats — matches existing BindlessVertex /
+//              packed-position layouts the engine ships).
+//   binding 1: IB (uint indices, tri_count*3 entries starting at
+//              pc.ib_first_index).
+//   binding 2: instance_buffer (InstanceDataInfo entries, GPU-resident
+//              and updated by update_instance_buffer.comp — we read
+//              slot 0 since drawables draw 1 instance per call).
+//
+// Runtime-lights UBO read for cascade VP:
+//   set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX
+// ─────────────────────────────────────────────────────────────────────────
+
+// 32-lane workgroup (one NVIDIA warp).  Vertex- and primitive-emit
+// loops iterate so the lane count doesn't have to match the output
+// count.  EXT mesh shader spec mandates at least 256 max-output-
+// vertices and max-output-primitives — we cap at those values.
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 256, max_primitives = 256) out;
+
+out gl_MeshPerVertexEXT {
+    vec4 gl_Position;
+} gl_MeshVerticesEXT[];
+
+out perprimitiveEXT gl_MeshPerPrimitiveEXT {
+    int gl_Layer;
+} gl_MeshPrimitivesEXT[];
+
+// Per-primitive vertex + index + instance SSBOs (set 0).
+#define DRAWABLE_MESH_SHADOW_SET 0
+layout(std430, set = DRAWABLE_MESH_SHADOW_SET, binding = 0) readonly buffer VBBuffer {
+    float vb_floats[];
+};
+layout(std430, set = DRAWABLE_MESH_SHADOW_SET, binding = 1) readonly buffer IBBuffer {
+    uint ib_indices[];
+};
+// InstanceDataInfo layout (matches the IA inputs IINPUT_MAT_ROT_0..2 +
+// IINPUT_MAT_POS_SCALE).  std430-compatible float array view to avoid
+// strict alignment concerns across drivers.  16 floats per instance:
+//   [0..2]   = mat_rot_0   (vec3 row 0)
+//   [3]      = pad
+//   [4..6]   = mat_rot_1   (vec3 row 1)
+//   [7]      = pad
+//   [8..10]  = mat_rot_2   (vec3 row 2)
+//   [11]     = pad
+//   [12..15] = mat_pos_scale (vec4 — xyz=translation, w=uniform scale)
+//
+// (The C++ struct may pack more tightly, but std430 vec3 attributes
+// align to 16 bytes; the renderer's binding setup uses single-attr
+// vec3 bindings which place each at a 16-byte stride.  If the actual
+// layout differs at runtime we'll adjust this view.)
+layout(std430, set = DRAWABLE_MESH_SHADOW_SET, binding = 2) readonly buffer InstanceBuffer {
+    float instance_floats[];
+};
+
+// Cascade VPs.  RUNTIME_LIGHTS_PARAMS_SET is already populated by the
+// host for the GS path — we reuse the same UBO.
+layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
+    uniform RuntimeLightsUBO {
+    RuntimeLightsParams lights_params;
+};
+
+// Per-drawcall push constant.  model_mat is the source node's
+// hierarchy-composed local matrix (from drawNodes).  The instance
+// transform is read from the SSBO above, NOT pushed (it lives in
+// GPU memory and is updated by a compute pass).  vertex_count /
+// tri_count + the VB layout descriptors (stride + position offset,
+// in FLOATS) let one mesh shader serve every BindlessVertex /
+// packed-position layout the engine ships without recompilation.
+layout(push_constant) uniform MeshShadowPC {
+    mat4 model_mat;                 // 64 bytes — node local transform
+    uint vertex_count;              // 68
+    uint tri_count;                 // 72
+    uint vb_stride_floats;          // 76
+    uint vb_position_offset_floats; // 80
+    uint ib_first_index;            // 84
+    uint instance_stride_floats;    // 88 — typically 16 (see comment above)
+    uint pad0;                      // 92
+    uint pad1;                      // 96  -- total 96 bytes, well under 128
+} pc;
+
+vec3 fetchPosition(uint vertex_idx) {
+    uint base = vertex_idx * pc.vb_stride_floats + pc.vb_position_offset_floats;
+    return vec3(
+        vb_floats[base + 0u],
+        vb_floats[base + 1u],
+        vb_floats[base + 2u]);
+}
+
+// Read instance 0's TRS.  pc.instance_stride_floats lets the caller
+// override the default 16-float stride if needed.
+void readInstance(out mat3 rot_mat, out vec3 translation) {
+    uint base = 0u;  // instance 0
+    rot_mat = mat3(
+        vec3(instance_floats[base +  0u],
+             instance_floats[base +  1u],
+             instance_floats[base +  2u]),
+        vec3(instance_floats[base +  4u],
+             instance_floats[base +  5u],
+             instance_floats[base +  6u]),
+        vec3(instance_floats[base +  8u],
+             instance_floats[base +  9u],
+             instance_floats[base + 10u]));
+    translation = vec3(
+        instance_floats[base + 12u],
+        instance_floats[base + 13u],
+        instance_floats[base + 14u]);
+}
+
+void main() {
+    uint cascade = gl_WorkGroupID.x;
+    uint lane    = gl_LocalInvocationID.x;
+    mat4 vp      = lights_params.light_view_proj[cascade];
+
+    mat3 R;
+    vec3 t;
+    readInstance(R, t);
+
+    uint vcount = min(pc.vertex_count, 256u);
+    uint tcount = min(pc.tri_count,    256u);
+
+    SetMeshOutputsEXT(vcount, tcount);
+
+    // ── Emit unique vertices (strided per lane) ───────────────────────
+    // Vertex transform mirrors base_depthonly.vert exactly:
+    //   pos_ls = (model_mat * vec4(in_position, 1)).xyz
+    //   pos_ws = R * pos_ls + t
+    //   gl_Position = vp * vec4(pos_ws, 1)
+    for (uint v = lane; v < vcount; v += gl_WorkGroupSize.x) {
+        vec3 pos_in = fetchPosition(v);
+        vec3 pos_ls = (pc.model_mat * vec4(pos_in, 1.0)).xyz;
+        vec3 pos_ws = R * pos_ls + t;
+        gl_MeshVerticesEXT[v].gl_Position = vp * vec4(pos_ws, 1.0);
+    }
+
+    // ── Emit triangles (strided per lane) ─────────────────────────────
+    for (uint tri = lane; tri < tcount; tri += gl_WorkGroupSize.x) {
+        uint i0 = ib_indices[pc.ib_first_index + tri * 3u + 0u];
+        uint i1 = ib_indices[pc.ib_first_index + tri * 3u + 1u];
+        uint i2 = ib_indices[pc.ib_first_index + tri * 3u + 2u];
+        gl_PrimitiveTriangleIndicesEXT[tri] = uvec3(i0, i1, i2);
+        gl_MeshPrimitivesEXT[tri].gl_Layer  = int(cascade);
+    }
+}

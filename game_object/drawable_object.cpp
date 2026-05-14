@@ -2600,7 +2600,20 @@ static void drawMesh(
     const std::vector<renderer::Viewport>& viewports,
     const std::vector<renderer::Scissor>& scissors,
     bool depth_only,
-    size_t& last_hash) {
+    size_t& last_hash,
+    // ── Mesh-shader CSM dispatch (DrawMode::kCsmMeshShader) ─────────
+    // mesh_shader_csm_mode = true: primary pipelines map IS the
+    //   mesh-shader pipeline list.  For each primitive, if a mesh-
+    //   shader descriptor set is present (mesh_shader_shadow_desc_set_
+    //   non-null) AND pipelines[hash] is non-null, dispatch via
+    //   drawMeshTasksEXT through DrawableObject::mesh_shader_shadow_
+    //   pipeline_layout_.  Otherwise fall back to the GS pipeline
+    //   (mesh_shader_fallback_pipelines[hash]) + drawIndexedIndirect.
+    // mesh_shader_csm_mode = false: legacy behaviour — pipelines is the
+    //   relevant pipeline list and the GS-style dispatch is used for
+    //   every primitive (fallback param ignored).
+    bool mesh_shader_csm_mode = false,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines = nullptr) {
 
     // ── Per-mesh frustum culling (forward pass only) ────────────────────────
     // Transform the mesh's local-space bounding sphere into world space
@@ -2720,10 +2733,92 @@ static void drawMesh(
         auto cur_hash = depth_only
             ? getDepthonlyHashForMaterial(prim, drawable_object->materials_)
             : prim.getHash();
-        if (cur_hash != last_hash) {
+
+        // ── Mesh-shader CSM dispatch (eligible primitives only) ─────
+        // Eligible if we're in mesh-shader mode AND this primitive has
+        // a populated per-primitive descriptor set AND a hash-cached
+        // mesh-shader pipeline exists.  Otherwise we fall through to
+        // the GS-style dispatch below using the fallback pipeline list.
+        const bool ms_eligible =
+            mesh_shader_csm_mode &&
+            prim.mesh_shader_shadow_desc_set_ != nullptr &&
+            pipelines.find(cur_hash) != pipelines.end() &&
+            pipelines[cur_hash] != nullptr;
+        if (ms_eligible) {
+            // Mesh-shader pipeline + layout.  Bind set 0 (per-primitive
+            // VB/IB/instance SSBOs) and set RUNTIME_LIGHTS_PARAMS_SET
+            // (cascade VPs).  No IA bindings, no material / skin sets,
+            // no node descriptor — the mesh shader needs none of them.
             cmd_buf->bindPipeline(
                 renderer::PipelineBindPoint::GRAPHICS,
                 pipelines[cur_hash]);
+            cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+            cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
+            // Reset last_hash so the next non-mesh-shader primitive
+            // re-binds its pipeline (since we just bound a different
+            // pipeline layout, the previous binding is invalidated for
+            // the GS path's perspective).
+            last_hash = 0;
+
+            const auto& ms_layout =
+                ego::DrawableObject::getMeshShaderShadowPipelineLayout();
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::GRAPHICS,
+                ms_layout,
+                { prim.mesh_shader_shadow_desc_set_ },
+                /*first_set*/ 0);
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::GRAPHICS,
+                ms_layout,
+                { desc_set_list[RUNTIME_LIGHTS_PARAMS_SET] },
+                /*first_set*/ RUNTIME_LIGHTS_PARAMS_SET);
+
+            // Push the MeshShadowPC (96 bytes — mat4 + 8 uints).
+            struct MeshShadowPC {
+                glm::mat4 model_mat;
+                uint32_t  vertex_count;
+                uint32_t  tri_count;
+                uint32_t  vb_stride_floats;
+                uint32_t  vb_position_offset_floats;
+                uint32_t  ib_first_index;
+                uint32_t  instance_stride_floats;
+                uint32_t  pad0;
+                uint32_t  pad1;
+            } pc;
+            pc.model_mat                 = model_params.model_mat;
+            pc.vertex_count              = prim.mesh_shader_vertex_count_;
+            pc.tri_count                 = prim.mesh_shader_tri_count_;
+            pc.vb_stride_floats          = prim.mesh_shader_vb_stride_floats_;
+            pc.vb_position_offset_floats = prim.mesh_shader_vb_position_offset_floats_;
+            pc.ib_first_index            = prim.mesh_shader_ib_first_index_;
+            pc.instance_stride_floats    =
+                uint32_t(sizeof(glsl::InstanceDataInfo) / 4u);
+            pc.pad0 = 0; pc.pad1 = 0;
+
+            cmd_buf->pushConstants(
+                SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT),
+                ms_layout,
+                &pc,
+                sizeof(pc));
+
+            // Task shader amplifies (1,1,1) → CSM_CASCADE_COUNT mesh WGs.
+            cmd_buf->drawMeshTasks(1u, 1u, 1u);
+            continue;
+        }
+
+        // ── GS-style dispatch (legacy path + mesh-shader fallback) ──
+        // When mesh_shader_csm_mode is true and this primitive is
+        // ineligible, the caller's primary pipelines map (the mesh-
+        // shader list) won't have an entry for cur_hash.  Substitute
+        // the GS pipeline list passed via mesh_shader_fallback_pipelines.
+        auto* dispatch_pipelines = &pipelines;
+        if (mesh_shader_csm_mode && mesh_shader_fallback_pipelines) {
+            dispatch_pipelines = mesh_shader_fallback_pipelines;
+        }
+        if (cur_hash != last_hash) {
+            cmd_buf->bindPipeline(
+                renderer::PipelineBindPoint::GRAPHICS,
+                (*dispatch_pipelines)[cur_hash]);
 
             cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
             cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
@@ -2796,7 +2891,10 @@ static void drawNodes(
     const std::vector<renderer::Viewport>& viewports,
     const std::vector<renderer::Scissor>& scissors,
     bool depth_only,
-    size_t& last_hash) {
+    size_t& last_hash,
+    uint32_t csm_cascade_idx,
+    bool mesh_shader_csm_mode,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines) {
     if (node_idx >= 0) {
         const auto& node = drawable_object->nodes_[node_idx];
         if (node.mesh_idx_ >= 0) {
@@ -2805,6 +2903,10 @@ static void drawNodes(
             model_params.flip_uv_coord =
                 (drawable_object->m_flip_u_ ? 0x01 : 0x00) |
                 (drawable_object->m_flip_v_ ? 0x02 : 0x00);
+            // Only consumed by the _CSMCASC vertex-shader permutation
+            // (DrawMode::kCsmPerCascade pipelines).  Other pipelines
+            // ignore this field — it sits in former-pad bytes.
+            model_params.cascade_idx = csm_cascade_idx;
 
             drawMesh(cmd_buf,
                 drawable_object,
@@ -2817,7 +2919,9 @@ static void drawNodes(
                 viewports,
                 scissors,
                 depth_only,
-                last_hash);
+                last_hash,
+                mesh_shader_csm_mode,
+                mesh_shader_fallback_pipelines);
 
             num_draw_meshes++;
         }
@@ -2832,7 +2936,10 @@ static void drawNodes(
                 viewports,
                 scissors,
                 depth_only,
-                last_hash);
+                last_hash,
+                csm_cascade_idx,
+                mesh_shader_csm_mode,
+                mesh_shader_fallback_pipelines);
         }
     }
 }
@@ -2876,6 +2983,65 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createSkinDescriptorSetLay
             JOINT_CONSTANT_INDEX,
             SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
             renderer::DescriptorType::STORAGE_BUFFER) });
+}
+
+// ─── Mesh-shader shadow descriptor set layout ──────────────────────────
+// Used by the DrawMode::kCsmMeshShader pipeline (base_depthonly_csm.task
+// + .mesh).  Set is bound at "set 0" of that pipeline's *own* layout —
+// it does NOT collide with PBR_GLOBAL_PARAMS_SET because mesh-shader
+// shadow pipelines have an isolated pipeline layout that doesn't expose
+// the PBR / view / material / skin sets at all.  All three bindings
+// are storage buffers consumed by the mesh shader stage:
+//   binding 0: VB (position-only float view of the primitive's VB)
+//   binding 1: IB (uint indices for the primitive's tri list)
+//   binding 2: instance_buffer (per-instance TRS, slot 0 used)
+static std::shared_ptr<renderer::DescriptorSetLayout> createMeshShaderShadowDescSetLayout(
+    const std::shared_ptr<renderer::Device>& device) {
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings;
+    bindings.reserve(3);
+    for (uint32_t b = 0; b < 3; ++b) {
+        bindings.push_back(
+            renderer::helper::getBufferDescriptionSetLayoutBinding(
+                b,
+                SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT),
+                renderer::DescriptorType::STORAGE_BUFFER));
+    }
+    return device->createDescriptorSetLayout(bindings);
+}
+
+// Pipeline layout for the mesh-shader CSM shadow path.  Two descriptor
+// sets:
+//   set 0                          : mesh-shader VB/IB/instance SSBOs
+//   set RUNTIME_LIGHTS_PARAMS_SET  : runtime-lights UBO (cascade VPs)
+// Plus a 96-byte push constant range (MeshShadowPC) covering the
+// MESH_BIT_EXT stage only.  Empty descriptor-set layouts fill the slots
+// between 0 and RUNTIME_LIGHTS_PARAMS_SET to keep the layout list well
+// formed (Vulkan requires every slot in the list to be a valid layout
+// handle).
+static std::shared_ptr<renderer::PipelineLayout> createMeshShaderShadowPipelineLayout(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& mesh_shadow_desc_set_layout,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& runtime_lights_desc_set_layout) {
+
+    renderer::PushConstantRange pc{};
+    pc.stage_flags = SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT);
+    pc.offset = 0;
+    // Must match the push_constant block in base_depthonly_csm.mesh —
+    // mat4 model_mat + 8 uints = 64 + 32 = 96 bytes.
+    pc.size = 96;
+
+    renderer::DescriptorSetLayoutList layouts(RUNTIME_LIGHTS_PARAMS_SET + 1);
+    layouts[0] = mesh_shadow_desc_set_layout;
+    layouts[RUNTIME_LIGHTS_PARAMS_SET] = runtime_lights_desc_set_layout;
+    // Fill nulls with empty layouts so Vulkan sees a valid handle at
+    // every set index between 0 and RUNTIME_LIGHTS_PARAMS_SET.
+    for (size_t i = 0; i < layouts.size(); ++i) {
+        if (!layouts[i]) {
+            layouts[i] = device->createDescriptorSetLayout({});
+        }
+    }
+    return device->createPipelineLayout(
+        layouts, { pc }, std::source_location::current());
 }
 
 static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
@@ -2950,10 +3116,18 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     bool has_skin_set_0,
     bool has_material,
     bool csm_layered = false,
-    bool is_opaque = false) {
+    bool is_opaque = false,
+    bool csm_per_cascade = false) {
     // csm_layered: when true, add a geometry shader that broadcasts each
     // triangle to all CSM_CASCADE_COUNT depth-array layers in a single pass,
     // eliminating the per-cascade redundant vertex transform overhead.
+    //
+    // csm_per_cascade: when true, load the _CSMCASC permutation of the
+    // vertex shader, which reads light_view_proj[model_params.cascade_idx]
+    // from the runtime-lights UBO instead of camera_info.view_proj from
+    // the view-camera SSBO.  The host loops over CSM_CASCADE_COUNT
+    // cascades and pushes cascade_idx via ModelParams; no GS, no mesh
+    // shader.  Mutually exclusive with csm_layered (caller's contract).
     //
     // is_opaque: when true, the fragment shader is OMITTED entirely.
     // base_depthonly.frag's only job is the alpha-mask discard (it has
@@ -2967,7 +3141,8 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     // graphics pipelines with no fragment stage as long as a depth
     // attachment is bound, which the CSM shadow render pass provides.
     //
-    // Stage count breakdown:
+    // Stage count breakdown (csm_per_cascade has the same stage count
+    // as csm_layered=false; it just swaps the VS permutation):
     //          csm_layered  is_opaque   stages           layout
     //          F            F           2  (vert, frag)
     //          F            T           1  (vert)
@@ -2982,6 +3157,12 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     auto frag_feature_str = vert_feature_str;
     if (has_skin_set_0) {
         vert_feature_str += "_SKIN";
+    }
+    // CSMCASC suffix only exists for the four permutations the CSM
+    // shadow path actually uses (HAS_UV_SET0 / HAS_SKIN_SET_0 matrix,
+    // no NOMTL).  See shaders-compile.cfg / CompileShaders.cmake.
+    if (csm_per_cascade) {
+        vert_feature_str += "_CSMCASC";
     }
 
     shader_modules[0] =
@@ -3088,14 +3269,16 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const ego::PrimitiveInfo& primitive,
     bool csm_layered,
-    bool is_opaque) {
+    bool is_opaque,
+    bool csm_per_cascade = false) {
     auto shader_modules = getDrawableDepthonlyShaderModules(
         device,
         primitive.tag_.has_texcoord_0,
         primitive.tag_.has_skin_set_0,
         primitive.material_idx_ >= 0,
         csm_layered,
-        is_opaque);
+        is_opaque,
+        csm_per_cascade);
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
@@ -3224,6 +3407,252 @@ static std::shared_ptr<renderer::Pipeline> createDrawableCsmLayeredPipeline(
     return createDrawableShadowPipelineInternal(
         device, renderbuffer_formats, pipeline_layout,
         graphic_pipeline_info, primitive, /*csm_layered*/ true, is_opaque);
+}
+
+// CSM per-cascade shadow pipeline — used for DrawMode::kCsmPerCascade,
+// the "Regular" option on the shadow draw-mode menu.  Like
+// createDrawableShadowPipeline (csm_layered=false, no GS), but the
+// vertex shader is the _CSMCASC permutation that reads
+// light_view_proj[model_params.cascade_idx] from the runtime-lights
+// UBO — letting the host loop cascades and push cascade_idx per draw
+// without rebinding view-camera descriptors.  is_opaque semantics
+// match the other two helpers.
+static std::shared_ptr<renderer::Pipeline> createDrawableCsmPerCascadePipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive,
+    bool is_opaque) {
+    return createDrawableShadowPipelineInternal(
+        device, renderbuffer_formats, pipeline_layout,
+        graphic_pipeline_info, primitive, /*csm_layered*/ false, is_opaque,
+        /*csm_per_cascade*/ true);
+}
+
+// CSM mesh-shader shadow pipeline — used for DrawMode::kCsmMeshShader
+// (the "Mesh Shader" option on the shadow draw-mode menu).  Loads
+// base_depthonly_csm.task + .mesh, no VS / GS / FS.  No vertex input
+// state: the mesh shader fetches all data via the per-primitive SSBO
+// descriptor set bound at set 0.  Uses the mesh-shader-shadow pipeline
+// layout (NOT the standard drawable_pipeline_layout_) so its set
+// assignments don't collide with the regular forward / shadow paths.
+//
+// Caller responsibility: only invoke for primitives that meet the
+// mesh-shader eligibility criteria (opaque, non-skinned, vertex_count
+// <= 256, tri_count <= 256).  Otherwise the dispatch will produce
+// clamped / wrong output.
+static std::shared_ptr<renderer::Pipeline> createDrawableCsmMeshShaderPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+
+    renderer::ShaderModuleList shader_modules(2);
+    shader_modules[0] = renderer::helper::loadShaderModule(
+        device,
+        "base_depthonly_csm_task.spv",
+        renderer::ShaderStageFlagBits::TASK_BIT_EXT,
+        std::source_location::current());
+    shader_modules[1] = renderer::helper::loadShaderModule(
+        device,
+        "base_depthonly_csm_mesh.spv",
+        renderer::ShaderStageFlagBits::MESH_BIT_EXT,
+        std::source_location::current());
+
+    // Mesh-shader pipelines don't use the input assembler.  Empty
+    // binding / attribute lists.
+    std::vector<renderer::VertexInputBindingDescription> binding_descs;
+    std::vector<renderer::VertexInputAttributeDescription> attribute_descs;
+
+    renderer::PipelineInputAssemblyStateCreateInfo topology_info;
+    topology_info.restart_enable = primitive.tag_.restart_enable;
+    topology_info.topology =
+        static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
+
+    renderer::RasterizationStateOverride raster;
+    // Same shadow-side sidedness rule as the GS / per-cascade pipelines.
+    // For opaque, the mesh shader can respect authored double-sided —
+    // but the Phase-B MVP only builds this pipeline for opaque-non-
+    // skinned, so authored is the safe choice.
+    raster.override_double_sided = true;
+    raster.double_sided = primitive.tag_.double_sided;
+    raster.override_depth_clamp_enable = true;
+    raster.depth_clamp_enable = true;
+
+    return device->createPipeline(
+        pipeline_layout,
+        binding_descs,
+        attribute_descs,
+        topology_info,
+        graphic_pipeline_info,
+        shader_modules,
+        renderbuffer_formats,
+        raster,
+        std::source_location::current());
+}
+
+// ─── Mesh-shader CSM resources — per-primitive build ────────────────────
+// For each primitive in the drawable, decide whether it's eligible for
+// the mesh-shader CSM path and, if so:
+//   • derive vb_stride_floats / vb_position_offset_floats from
+//     attribute_descs_ + matching binding_descs_;
+//   • derive ib_first_index from index_desc_[0] + the buffer view's
+//     own offset (UINT32 indices only — UINT16 falls back to GS);
+//   • derive vertex_count from the position buffer view's range;
+//   • derive tri_count from index_count / 3;
+//   • build a hash-cached mesh-shader pipeline;
+//   • allocate a 3-binding descriptor set (VB, IB, instance) and write
+//     the primitive's actual buffers into it.
+//
+// Eligibility gate (anything FAILS → leave mesh_shader_shadow_desc_set_
+// null → drawMesh falls back to drawIndexedIndirect on the GS path for
+// this primitive):
+//   - opaque (no alpha-cutout discard needed)
+//   - non-skinned (no joint matrices)
+//   - has a POSITION attribute
+//   - UINT32 indices
+//   - vertex_count <= 256 AND tri_count <= 256
+//   - position buffer view has a usable stride (>0)
+//
+// Phase B3 MVP — skinning and cutout fall back; we extend in B4 if the
+// drawable mesh-shader path actually shows a perf delta worth pursuing.
+static void buildMeshShaderShadowResources(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& mesh_shadow_desc_set_layout,
+    const std::shared_ptr<renderer::PipelineLayout>& mesh_shadow_pipeline_layout,
+    const renderer::PipelineRenderbufferFormats& shadow_rb_formats,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const std::shared_ptr<ego::DrawableData>& drawable,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipeline_list) {
+
+    if (!drawable || !mesh_shadow_desc_set_layout ||
+        !mesh_shadow_pipeline_layout ||
+        !drawable->instance_buffer_.buffer) {
+        return;
+    }
+
+    for (auto& mesh : drawable->meshes_) {
+        for (auto& prim : mesh.primitives_) {
+            // ── Eligibility checks ────────────────────────────────────
+            const bool is_opaque = isPrimitiveOpaque(prim, drawable->materials_);
+            if (!is_opaque) continue;
+            if (prim.tag_.has_skin_set_0) continue;
+            if (prim.index_desc_.empty()) continue;
+            const auto& idesc = prim.index_desc_[0];
+            if (idesc.index_type != renderer::IndexType::UINT32) continue;
+            if (idesc.index_count == 0 || idesc.index_count % 3 != 0) continue;
+            const uint32_t tri_count = uint32_t(idesc.index_count / 3);
+            if (tri_count > 256u) continue;
+
+            // Find POSITION attribute.
+            const renderer::VertexInputAttributeDescription* pos_attr = nullptr;
+            for (auto& a : prim.attribute_descs_) {
+                if (a.location == VINPUT_POSITION) { pos_attr = &a; break; }
+            }
+            if (!pos_attr) continue;
+
+            // Find the binding descriptor matching the POSITION attr's binding.
+            const renderer::VertexInputBindingDescription* pos_binding = nullptr;
+            for (auto& b : prim.binding_descs_) {
+                if (b.binding == pos_attr->binding) { pos_binding = &b; break; }
+            }
+            if (!pos_binding || pos_binding->stride == 0) continue;
+            const uint32_t vb_stride_floats = uint32_t(pos_binding->stride / 4u);
+            if (vb_stride_floats * 4u != pos_binding->stride) continue; // not float-aligned
+
+            // VB buffer view (for position).
+            if (pos_attr->buffer_view >= drawable->buffer_views_.size()) continue;
+            const auto& vb_bv = drawable->buffer_views_[pos_attr->buffer_view];
+            if (vb_bv.buffer_idx >= drawable->buffers_.size()) continue;
+            auto vb_buffer = drawable->buffers_[vb_bv.buffer_idx].buffer;
+            if (!vb_buffer) continue;
+            // vertex_count from the buffer view's range; if range is 0 we
+            // cannot bound the vertex emit loop safely, so skip.
+            if (vb_bv.range == 0) continue;
+            const uint32_t vb_view_stride =
+                (vb_bv.stride > 0)
+                    ? uint32_t(vb_bv.stride)
+                    : uint32_t(pos_binding->stride);
+            if (vb_view_stride == 0) continue;
+            const uint32_t vertex_count =
+                uint32_t(vb_bv.range / vb_view_stride);
+            if (vertex_count == 0 || vertex_count > 256u) continue;
+
+            // IB buffer view.
+            if (idesc.buffer_view >= drawable->buffer_views_.size()) continue;
+            const auto& ib_bv = drawable->buffer_views_[idesc.buffer_view];
+            if (ib_bv.buffer_idx >= drawable->buffers_.size()) continue;
+            auto ib_buffer = drawable->buffers_[ib_bv.buffer_idx].buffer;
+            if (!ib_buffer) continue;
+            // ib_first_index in uint32 strides; sums view + per-LOD byte
+            // offsets, divided by 4 (sizeof uint32).
+            const uint64_t ib_byte_off = ib_bv.offset + idesc.offset;
+            if (ib_byte_off % 4u != 0) continue;
+            const uint32_t ib_first_index = uint32_t(ib_byte_off / 4u);
+
+            // Layout offsets (in FLOATS) for the position read inside
+            // the shader.  attribute.buffer_offset is the array's start
+            // in the buffer; attribute.offset is the offset within each
+            // vertex (e.g. 0 for position-first interleaved).
+            const uint64_t vb_byte_off = pos_attr->buffer_offset + pos_attr->offset;
+            if (vb_byte_off % 4u != 0) continue;
+            const uint32_t vb_position_offset_floats = uint32_t(vb_byte_off / 4u);
+
+            // ── All checks passed — build pipeline (hash-cached) ─────
+            const size_t hash_value =
+                getDepthonlyHashForMaterial(prim, drawable->materials_);
+            auto pl_it = pipeline_list.find(hash_value);
+            if (pl_it == pipeline_list.end()) {
+                pipeline_list[hash_value] =
+                    createDrawableCsmMeshShaderPipeline(
+                        device,
+                        shadow_rb_formats,
+                        mesh_shadow_pipeline_layout,
+                        graphic_pipeline_info,
+                        prim);
+            }
+
+            // ── Allocate per-primitive descriptor set + write bindings ─
+            prim.mesh_shader_shadow_desc_set_ =
+                device->createDescriptorSets(
+                    descriptor_pool, mesh_shadow_desc_set_layout, 1)[0];
+
+            renderer::WriteDescriptorList writes;
+            renderer::Helper::addOneBuffer(
+                writes,
+                prim.mesh_shader_shadow_desc_set_,
+                renderer::DescriptorType::STORAGE_BUFFER,
+                /*binding*/ 0,
+                vb_buffer,
+                static_cast<uint32_t>(vb_buffer->getSize()));
+            renderer::Helper::addOneBuffer(
+                writes,
+                prim.mesh_shader_shadow_desc_set_,
+                renderer::DescriptorType::STORAGE_BUFFER,
+                /*binding*/ 1,
+                ib_buffer,
+                static_cast<uint32_t>(ib_buffer->getSize()));
+            renderer::Helper::addOneBuffer(
+                writes,
+                prim.mesh_shader_shadow_desc_set_,
+                renderer::DescriptorType::STORAGE_BUFFER,
+                /*binding*/ 2,
+                drawable->instance_buffer_.buffer,
+                static_cast<uint32_t>(
+                    drawable->instance_buffer_.buffer->getSize()));
+            device->updateDescriptorSets(writes);
+
+            // Cache per-primitive layout descriptors for the push constant.
+            prim.mesh_shader_vb_stride_floats_          = vb_stride_floats;
+            prim.mesh_shader_vb_position_offset_floats_ = vb_position_offset_floats;
+            prim.mesh_shader_ib_first_index_            = ib_first_index;
+            prim.mesh_shader_vertex_count_              = vertex_count;
+            prim.mesh_shader_tri_count_                 = tri_count;
+        }
+    }
 }
 
 // (Helpers `isPrimitiveOpaque` and `getDepthonlyHashForMaterial` are
@@ -3478,6 +3907,10 @@ std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_pipeline_layo
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_shadow_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_layered_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_per_cascade_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_mesh_shader_pipeline_list_;
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::mesh_shader_shadow_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout>      DrawableObject::mesh_shader_shadow_pipeline_layout_;
 std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::drawable_indirect_draw_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_indirect_draw_pipeline_layout_;
@@ -3815,6 +4248,29 @@ DrawableObject::DrawableObject(
                                 is_opaque);
                     }
                 }
+
+                {
+                    // CSM per-cascade pipeline: depth-only VS (no GS) that
+                    // reads light_view_proj[model_params.cascade_idx].
+                    // Backs DrawMode::kCsmPerCascade — the "Regular"
+                    // option on the shadow draw-mode menu.
+                    const bool is_opaque =
+                        isPrimitiveOpaque(primitive, object_->materials_);
+                    auto hash_value =
+                        getDepthonlyHashForMaterial(
+                            primitive, object_->materials_);
+                    auto result = drawable_csm_per_cascade_pipeline_list_.find(hash_value);
+                    if (result == drawable_csm_per_cascade_pipeline_list_.end()) {
+                        drawable_csm_per_cascade_pipeline_list_[hash_value] =
+                            createDrawableCsmPerCascadePipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive,
+                                is_opaque);
+                    }
+                }
             }
         }
 
@@ -3833,6 +4289,22 @@ DrawableObject::DrawableObject(
             drawable_indirect_draw_desc_set_layout_,
             update_instance_buffer_desc_set_layout_,
             game_objects_buffer_);
+
+        // ── Mesh-shader CSM resources ─────────────────────────────────
+        // Builds the hash-cached mesh-shader pipeline + per-primitive
+        // descriptor sets for eligible primitives (opaque, non-skinned,
+        // UINT32 indices, <=256 verts/tris).  Ineligible primitives
+        // leave mesh_shader_shadow_desc_set_ null and dispatch falls
+        // back to the GS path inside drawMesh.
+        buildMeshShaderShadowResources(
+            device,
+            descriptor_pool,
+            mesh_shader_shadow_desc_set_layout_,
+            mesh_shader_shadow_pipeline_layout_,
+            renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+            graphic_pipeline_info,
+            object_,
+            drawable_csm_mesh_shader_pipeline_list_);
 
         drawable_object_list_[file_name] = object_;
 
@@ -4011,6 +4483,26 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                         if (result == drawable_csm_layered_pipeline_list_.end()) {
                             drawable_csm_layered_pipeline_list_[hash_value] =
                                 createDrawableCsmLayeredPipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive,
+                                    is_opaque);
+                        }
+                    }
+                    {
+                        // CSM per-cascade pipeline (DrawMode::kCsmPerCascade).
+                        const bool is_opaque =
+                            isPrimitiveOpaque(primitive, data->materials_);
+                        auto hash_value =
+                            getDepthonlyHashForMaterial(
+                                primitive, data->materials_);
+                        auto result =
+                            drawable_csm_per_cascade_pipeline_list_.find(hash_value);
+                        if (result == drawable_csm_per_cascade_pipeline_list_.end()) {
+                            drawable_csm_per_cascade_pipeline_list_[hash_value] =
+                                createDrawableCsmPerCascadePipeline(
                                     device,
                                     renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                     drawable_pipeline_layout_,
@@ -4226,6 +4718,35 @@ void DrawableObject::createStaticMembers(
         }
     }
 
+    // ── Mesh-shader shadow descriptor + pipeline layout ───────────────
+    // Independent of the regular drawable pipeline layout — uses its
+    // own set-0 (VB/IB/instance SSBOs) and shares set RUNTIME_LIGHTS_
+    // PARAMS_SET (cascade VPs).  Built lazily; left null if Phase B
+    // mesh-shader path isn't expected to be exercised this run, but
+    // dispatched-from setup cost is trivial so we always build them.
+    {
+        if (mesh_shader_shadow_desc_set_layout_ == nullptr) {
+            mesh_shader_shadow_desc_set_layout_ =
+                createMeshShaderShadowDescSetLayout(device);
+        }
+        if (mesh_shader_shadow_pipeline_layout_) {
+            device->destroyPipelineLayout(mesh_shader_shadow_pipeline_layout_);
+            mesh_shader_shadow_pipeline_layout_ = nullptr;
+        }
+        // global_desc_set_layouts[RUNTIME_LIGHTS_PARAMS_SET] is the
+        // runtime_lights_desc_set_layout_ populated by application
+        // before createStaticMembers is called.
+        if (mesh_shader_shadow_pipeline_layout_ == nullptr) {
+            assert(global_desc_set_layouts.size() > RUNTIME_LIGHTS_PARAMS_SET);
+            assert(global_desc_set_layouts[RUNTIME_LIGHTS_PARAMS_SET]);
+            mesh_shader_shadow_pipeline_layout_ =
+                createMeshShaderShadowPipelineLayout(
+                    device,
+                    mesh_shader_shadow_desc_set_layout_,
+                    global_desc_set_layouts[RUNTIME_LIGHTS_PARAMS_SET]);
+        }
+    }
+
     {
         if (drawable_indirect_draw_pipeline_layout_) {
             device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
@@ -4362,6 +4883,16 @@ void DrawableObject::recreateStaticMembers(
     }
     drawable_csm_layered_pipeline_list_.clear();
 
+    for (auto& pipeline : drawable_csm_per_cascade_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_csm_per_cascade_pipeline_list_.clear();
+
+    for (auto& pipeline : drawable_csm_mesh_shader_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_csm_mesh_shader_pipeline_list_.clear();
+
     for (auto& object : drawable_object_list_) {
         for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
             for (int i_prim = 0; i_prim < object.second->meshes_[i_mesh].primitives_.size(); i_prim++) {
@@ -4389,6 +4920,20 @@ void DrawableObject::recreateStaticMembers(
                     if (result == drawable_csm_layered_pipeline_list_.end()) {
                         drawable_csm_layered_pipeline_list_[hash_value] =
                             createDrawableCsmLayeredPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive,
+                                is_opaque);
+                    }
+                }
+                {
+                    // CSM per-cascade pipeline (DrawMode::kCsmPerCascade).
+                    auto result = drawable_csm_per_cascade_pipeline_list_.find(hash_value);
+                    if (result == drawable_csm_per_cascade_pipeline_list_.end()) {
+                        drawable_csm_per_cascade_pipeline_list_[hash_value] =
+                            createDrawableCsmPerCascadePipeline(
                                 device,
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
                                 drawable_pipeline_layout_,
@@ -4462,6 +5007,22 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_csm_layered_pipeline_list_.clear();
+    for (auto& pipeline : drawable_csm_per_cascade_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_csm_per_cascade_pipeline_list_.clear();
+    for (auto& pipeline : drawable_csm_mesh_shader_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_csm_mesh_shader_pipeline_list_.clear();
+    if (mesh_shader_shadow_pipeline_layout_) {
+        device->destroyPipelineLayout(mesh_shader_shadow_pipeline_layout_);
+        mesh_shader_shadow_pipeline_layout_ = nullptr;
+    }
+    if (mesh_shader_shadow_desc_set_layout_) {
+        device->destroyDescriptorSetLayout(mesh_shader_shadow_desc_set_layout_);
+        mesh_shader_shadow_desc_set_layout_ = nullptr;
+    }
     drawable_object_list_.clear();
     device->destroyDescriptorSetLayout(drawable_indirect_draw_desc_set_layout_);
     device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
@@ -4629,7 +5190,8 @@ void DrawableObject::draw(
     const std::vector<renderer::Viewport>& viewports,
     const std::vector<renderer::Scissor>& scissors,
     bool depth_only/* = false */,
-    DrawMode draw_mode/* = DrawMode::kForward */) {
+    DrawMode draw_mode/* = DrawMode::kForward */,
+    uint32_t csm_cascade_idx/* = 0 */) {
 
     // Skip while the async load is still in flight. The menu spinner
     // (see application.cpp HUD wiring) is the user-visible signal; the
@@ -4639,9 +5201,11 @@ void DrawableObject::draw(
     }
 
     auto& pipeline_list =
-        (draw_mode == DrawMode::kCsmLayered) ? drawable_csm_layered_pipeline_list_ :
-        depth_only                           ? drawable_shadow_pipeline_list_ :
-                                               drawable_pipeline_list_;
+        (draw_mode == DrawMode::kCsmLayered)    ? drawable_csm_layered_pipeline_list_     :
+        (draw_mode == DrawMode::kCsmPerCascade) ? drawable_csm_per_cascade_pipeline_list_ :
+        (draw_mode == DrawMode::kCsmMeshShader) ? drawable_csm_mesh_shader_pipeline_list_ :
+        depth_only                              ? drawable_shadow_pipeline_list_           :
+                                                  drawable_pipeline_list_;
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);
@@ -4651,6 +5215,14 @@ void DrawableObject::draw(
 
     num_draw_meshes = 0;
     size_t last_hash = 0;
+
+    // Mesh-shader CSM mode: when active, drawMesh needs the GS pipeline
+    // list as a fallback for primitives that didn't qualify for the
+    // mesh-shader path (skinned, cutout, large, UINT16 indices, etc).
+    const bool mesh_shader_csm_mode = (draw_mode == DrawMode::kCsmMeshShader);
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>*
+        mesh_shader_fallback =
+            mesh_shader_csm_mode ? &drawable_csm_layered_pipeline_list_ : nullptr;
 
     int32_t root_node =
         object_->default_scene_ >= 0 ? object_->default_scene_ : 0;
@@ -4665,7 +5237,10 @@ void DrawableObject::draw(
             viewports,
             scissors,
             depth_only,
-            last_hash);
+            last_hash,
+            csm_cascade_idx,
+            mesh_shader_csm_mode,
+            mesh_shader_fallback);
     }
 }
 

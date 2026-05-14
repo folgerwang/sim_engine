@@ -62,7 +62,22 @@ public:
         // depth=1 over a 0-clear) is preserved.  Caller is responsible
         // for having initialised the depth contents.  Color attachment
         // load behaviour is unaffected.
-        bool preserve_depth = false);
+        bool preserve_depth = false,
+        // Set to >=0 to drive the CSM per-cascade pipeline (DrawMode
+        // ::kCsmPerCascade — "Regular" shadow draw mode).  When >=0,
+        // layer_count MUST be 1, depth_layer_view MUST point at a
+        // single-layer view of the right cascade, and the host is
+        // expected to loop k=0..CSM_CASCADE_COUNT-1 calling this draw
+        // once per cascade.  Default -1 = "not a per-cascade pass",
+        // legacy dispatch (kShadow / kCsmLayered / kForward) applies.
+        int32_t csm_cascade_idx = -1,
+        // When true AND layer_count > 1 (i.e. layered CSM draw),
+        // selects DrawMode::kCsmMeshShader instead of kCsmLayered so
+        // DrawableObject::draw routes through the task+mesh shader
+        // path.  Ineligible primitives (skinned, cutout, etc.) fall
+        // back to the GS pipeline inside drawMesh.  Ignored unless
+        // layered CSM is in effect.
+        bool csm_use_mesh_shader = false);
 
     // Re-allocate descriptor sets from the (new) descriptor pool and
     // resize render buffers after a swap chain recreation.

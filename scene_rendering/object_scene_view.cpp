@@ -99,11 +99,24 @@ void ObjectSceneView::draw(
     bool depth_only/* = false */,
     const std::shared_ptr<er::ImageView>& depth_layer_view/* = nullptr */,
     uint32_t layer_count/* = 1 */,
-    bool preserve_depth/* = false */) {
+    bool preserve_depth/* = false */,
+    int32_t csm_cascade_idx/* = -1 */,
+    bool csm_use_mesh_shader/* = false */) {
 
     // layer_count > 1 means a single-pass layered CSM draw: the geometry shader
     // broadcasts each triangle to all layers; no per-layer view needed.
     const bool csm_layered = (layer_count > 1);
+    // csm_cascade_idx >= 0 means a single-cascade per-pass draw using the
+    // _CSMCASC pipeline (DrawMode::kCsmPerCascade — "Regular" shadow
+    // draw mode).  Caller is responsible for setting up the per-cascade
+    // depth_layer_view and looping k=0..CSM_CASCADE_COUNT-1.
+    const bool csm_per_cascade = (csm_cascade_idx >= 0);
+    // Mesh-shader CSM only applies to layered draws (single dispatch
+    // amplified by task+mesh shaders to all cascade layers).  Ignored
+    // when csm_per_cascade is requested (those two modes are mutually
+    // exclusive — per-cascade does its own host-side cascade loop).
+    const bool csm_mesh_shader =
+        csm_use_mesh_shader && csm_layered && !csm_per_cascade;
 
     renderer::DescriptorSetList desc_set_list = desc_sets;
     // For CSM layered pass there is no per-cascade camera descriptor — the GS
@@ -164,10 +177,15 @@ void ObjectSceneView::draw(
     scissors[0].offset = glm::ivec2(0);
     scissors[0].extent = m_buffer_size_;
 
-    const auto draw_mode = csm_layered
-        ? ego::DrawableObject::DrawMode::kCsmLayered
-        : (depth_only ? ego::DrawableObject::DrawMode::kShadow
-                      : ego::DrawableObject::DrawMode::kForward);
+    const auto draw_mode =
+        csm_per_cascade ? ego::DrawableObject::DrawMode::kCsmPerCascade :
+        csm_mesh_shader ? ego::DrawableObject::DrawMode::kCsmMeshShader :
+        csm_layered     ? ego::DrawableObject::DrawMode::kCsmLayered :
+        depth_only      ? ego::DrawableObject::DrawMode::kShadow
+                        : ego::DrawableObject::DrawMode::kForward;
+
+    const uint32_t cascade_idx_arg =
+        csm_per_cascade ? uint32_t(csm_cascade_idx) : 0u;
 
     for (auto& drawable_obj : m_drawable_objects_) {
         drawable_obj->draw(
@@ -176,7 +194,8 @@ void ObjectSceneView::draw(
             viewports,
             scissors,
             depth_only,
-            draw_mode);
+            draw_mode,
+            cascade_idx_arg);
     }
 
     if (sphere) {

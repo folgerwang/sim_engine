@@ -1,0 +1,26 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "global_definition.glsl.h"
+
+// ─── base_depthonly_csm.task ────────────────────────────────────────────
+// Drawable-path mesh-shader CSM task shader.  The host issues one
+// vkCmdDrawMeshTasksEXT per primitive; this task workgroup amplifies
+// that single dispatch into CSM_CASCADE_COUNT mesh workgroups, one
+// per cascade layer.  No per-cascade culling is performed at the task
+// level (the primitive-level frustum culling is done CPU-side in
+// DrawableObject::drawMesh's existing path; for the shadow pass we
+// rely on the silhouette prepass + LESS_OR_EQUAL Hi-Z to reject
+// out-of-view casters at the rasterizer).
+//
+// Future enhancement: per-cascade sphere-vs-frustum cull here, mirror
+// of cluster_bindless_shadow.task's pattern.  Would reduce mesh-WG
+// count when a primitive only contributes to a subset of cascades.
+// ─────────────────────────────────────────────────────────────────────────
+
+layout(local_size_x = 1) in;
+
+void main() {
+    // One mesh workgroup per cascade.  No payload needed — the mesh
+    // shader reads its cascade index from gl_WorkGroupID.x.
+    EmitMeshTasksEXT(uint(CSM_CASCADE_COUNT), 1u, 1u);
+}

@@ -362,7 +362,16 @@ struct ViewParams {
 struct ModelParams {
     mat4 model_mat;
     uint flip_uv_coord;
-    vec3 pad;
+    // cascade_idx: only consumed by the CSM_PER_CASCADE permutation of
+    // base_depthonly.vert (DrawMode::kCsmPerCascade — the "Regular"
+    // option on the shadow draw-mode menu).  In every other pipeline
+    // this field is unused (and either zero-initialised by drawNodes or
+    // left at whatever drawMesh writes — readers ignore it).  Sits in
+    // the old vec3 pad's first 4 bytes so the overall struct size and
+    // alignment are unchanged (mat4 + uint + uint + uvec2 = 80 bytes,
+    // matching the previous mat4 + uint + vec3 layout).
+    uint cascade_idx;
+    uvec2 pad;
 };
 
 struct PrtLightParams {

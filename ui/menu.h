@@ -38,6 +38,38 @@ class Menu {
     // turn off to measure baseline shadow pass cost without the
     // optimization.  See csm_silhouette_prepass.mesh for details.
     bool csm_silhouette_prepass_enabled_ = true;
+
+public:
+    // ─── CSM drawable-shadow draw mode ────────────────────────────────────
+    // Toggles how the drawable shadow path amplifies geometry across the
+    // CSM_CASCADE_COUNT cascades.  All three modes draw the same set of
+    // shadow casters; they differ in HOW the per-cascade VP is applied:
+    //
+    //   kRegular         — N separate single-layer draws, one per cascade.
+    //                      VS transforms with that cascade's VP.  No GS,
+    //                      no mesh shader.  Baseline; portable, slowest in
+    //                      the typical case but on Blackwell may end up
+    //                      competitive vs GS amplification.
+    //   kGeometryShader  — Single layered draw; base_depthonly_csm.geom
+    //                      broadcasts each tri to every cascade layer.
+    //                      Historical default; cheap on Ada, expensive on
+    //                      Blackwell where GS is emulated on top of the
+    //                      mesh-shader frontend.
+    //   kMeshShader      — Single layered draw; task+mesh shaders perform
+    //                      the per-cascade amplification natively.
+    //                      Mirrors the cluster shadow path which already
+    //                      uses task+mesh and benchmarks well across
+    //                      Ada / Blackwell.
+    //
+    // Exposed via the Shadow menu so the user can A/B in-app.
+    enum class CsmDrawMode : int {
+        kRegular        = 0,
+        kGeometryShader = 1,
+        kMeshShader     = 2,
+    };
+
+private:
+    CsmDrawMode csm_draw_mode_ = CsmDrawMode::kGeometryShader;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;
     // PBR / forward-pass debug visualisation; values match
@@ -504,6 +536,10 @@ public:
     inline bool isCsmSilhouettePrepassEnabled() const {
         return csm_silhouette_prepass_enabled_;
     }
+
+    // Current selected CSM drawable-shadow draw-mode (see enum comment above).
+    inline CsmDrawMode getCsmDrawMode() const { return csm_draw_mode_; }
+    inline void setCsmDrawMode(CsmDrawMode m) { csm_draw_mode_ = m; }
 
     // Render-debug visualisation for the forward + cluster bindless paths.
     // Returned value is one of DEBUG_RENDER_MODE_* (defined in
