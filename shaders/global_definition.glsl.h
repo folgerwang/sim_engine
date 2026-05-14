@@ -1081,6 +1081,19 @@ struct RuntimeLightsParams {
     // is 6 in practice; element 6 and 7 are unused.  Shaders index
     // as cascade_splits[i >> 2][i & 3].
     vec4            cascade_splits[2];
+    // World-space corners of each cascade's main-camera frustum slab.
+    // Indexed as cascade_slab_corners_ws[cascade * 8 + corner].  Order
+    // matches computeCascadeMatrices's vs_corners layout:
+    //   0 = near top-left      1 = near top-right
+    //   2 = near bottom-left   3 = near bottom-right
+    //   4 = far  top-left      5 = far  top-right
+    //   6 = far  bottom-left   7 = far  bottom-right
+    // Used by csm_silhouette_prepass.mesh to fill the in-frustum region
+    // of each cascade's shadow map with depth=1 so that out-of-frustum
+    // texels (still at the cleared 0.0) reject every shadow caster via
+    // the LESS_OR_EQUAL depth test.  Hi-Z then propagates those rejects
+    // to whole-tile primitive culling at the PD.
+    vec4            cascade_slab_corners_ws[CSM_CASCADE_COUNT * 8];
     Light           lights[LIGHT_COUNT];
 };
 

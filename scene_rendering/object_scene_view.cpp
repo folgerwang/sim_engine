@@ -98,7 +98,8 @@ void ObjectSceneView::draw(
     float cur_time,
     bool depth_only/* = false */,
     const std::shared_ptr<er::ImageView>& depth_layer_view/* = nullptr */,
-    uint32_t layer_count/* = 1 */) {
+    uint32_t layer_count/* = 1 */,
+    bool preserve_depth/* = false */) {
 
     // layer_count > 1 means a single-pass layered CSM draw: the geometry shader
     // broadcasts each triangle to all layers; no per-layer view needed.
@@ -129,7 +130,14 @@ void ObjectSceneView::draw(
         depth_attachment_info.image_view =
             depth_layer_view ? depth_layer_view : m_depth_buffer_->view;
         depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+        // preserve_depth=true: the caller ran the CSM silhouette prepass
+        // (or some other depth-priming pass) in its own dynamic-rendering
+        // scope before us, and the depth buffer already contains the
+        // intended pre-fill (0 outside silhouette, 1 inside).  Switch to
+        // LOAD so we don't wipe that out.
+        depth_attachment_info.load_op = preserve_depth
+            ? er::AttachmentLoadOp::LOAD
+            : er::AttachmentLoadOp::CLEAR;
         depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
         depth_attachment_info.clear_value.depth_stencil = { 1.0f, 0 };
 

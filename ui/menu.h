@@ -32,6 +32,12 @@ class Menu {
     bool turn_off_ray_tracing_ = false;
     bool turn_off_volume_moist_ = false;
     bool turn_off_shadow_pass_ = false;
+    // CSM silhouette prepass — fills each cascade's in-camera-frustum
+    // region with depth=1 over a 0-cleared depth buffer so out-of-frustum
+    // texels reject every shadow caster via LESS_OR_EQUAL.  Default ON;
+    // turn off to measure baseline shadow pass cost without the
+    // optimization.  See csm_silhouette_prepass.mesh for details.
+    bool csm_silhouette_prepass_enabled_ = true;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;
     // PBR / forward-pass debug visualisation; values match
@@ -493,6 +499,10 @@ public:
 
     inline bool isShadowPassTurnOff() const {
         return turn_off_shadow_pass_;
+    }
+
+    inline bool isCsmSilhouettePrepassEnabled() const {
+        return csm_silhouette_prepass_enabled_;
     }
 
     // Render-debug visualisation for the forward + cluster bindless paths.

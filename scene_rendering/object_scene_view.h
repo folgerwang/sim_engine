@@ -55,7 +55,14 @@ public:
         float cur_time,
         bool depth_only = false,
         const std::shared_ptr<er::ImageView>& depth_layer_view = nullptr,
-        uint32_t layer_count = 1);
+        uint32_t layer_count = 1,
+        // When true, the depth attachment is opened with LOAD_OP_LOAD
+        // instead of LOAD_OP_CLEAR so a prior render pass (e.g. the
+        // CSM silhouette prepass that fills in-frustum texels with
+        // depth=1 over a 0-clear) is preserved.  Caller is responsible
+        // for having initialised the depth contents.  Color attachment
+        // load behaviour is unaffected.
+        bool preserve_depth = false);
 
     // Re-allocate descriptor sets from the (new) descriptor pool and
     // resize render buffers after a swap chain recreation.

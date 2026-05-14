@@ -52,7 +52,8 @@ out gl_MeshPerVertexEXT {
 } gl_MeshVerticesEXT[];
 
 out perprimitiveEXT gl_MeshPerPrimitiveEXT {
-    int gl_Layer;
+    int  gl_Layer;
+    bool gl_CullPrimitiveEXT;
 } gl_MeshPrimitivesEXT[];
 
 layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
@@ -73,6 +74,9 @@ layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 2) readonly buffer MergedV
 };
 layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 3) readonly buffer MergedIndexBuffer {
     uint merged_indices[];
+};
+layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 4) readonly buffer MaterialParamsBuffer {
+    BindlessMaterialParams material_params[];
 };
 
 #define CLUSTERS_PER_TASK_WG 32u
@@ -100,6 +104,12 @@ shared uint s_index_count;
 shared uint s_vertex_base;
 shared uint s_vertex_count;
 shared uint s_tri_count;
+// 0 = don't per-tri backface cull (double-sided / translucent clusters,
+// or clusters whose cluster-level cone test was inconclusive); 1 = do.
+// The task-shader already culled fully-backfacing clusters at the cone
+// level, so most survivors here have MIXED orientation and the per-tri
+// cull catches the remaining backfaces before they hit the PD.
+shared uint s_per_tri_cull;
 
 void main() {
     uint lane         = gl_LocalInvocationID.x;
@@ -117,6 +127,19 @@ void main() {
         s_tri_count    = draw.index_count / 3u;
         s_vertex_base  = merged_indices[draw.index_offset];
         s_vertex_count = 0u;  // seeded for atomicMax below
+
+        // Decide whether to apply per-primitive backface cull below.
+        // Matches the task shader's gate: skip for double-sided and
+        // translucent materials so foliage / glass still casts both
+        // sides.  Reading the material here costs one extra SSBO fetch
+        // per workgroup but saves potentially dozens of primitive-
+        // setups that the PD would otherwise pay for.
+        BindlessMaterialParams mat = material_params[draw.material_idx];
+        bool is_double_sided = (mat.flags & BINDLESS_MAT_DOUBLE_SIDED) != 0;
+        bool is_translucent =
+            (mat.flags & BINDLESS_MAT_TRANSLUCENT) != 0 ||
+            mat.base_color_factor.a < 0.9;
+        s_per_tri_cull = (is_double_sided || is_translucent) ? 0u : 1u;
     }
     barrier();
 
@@ -149,12 +172,37 @@ void main() {
         gl_MeshVerticesEXT[v].gl_Position = vp * vec4(world_pos, 1.0);
     }
 
-    // ── Emit triangles (each lane handles one or more triangles) ──────
+    // ── Emit triangles + per-primitive backface cull ──────────────────
+    // gl_CullPrimitiveEXT lets the mesh shader drop primitives BEFORE
+    // they hit the Primitive Distributor.  The previous-capture profile
+    // showed the PD as the dominant bottleneck (Top-Level Throughput
+    // pinned blue, SMs 86% idle waiting on geometry).  Removing
+    // backfaces here saves both the PD setup AND the rasterizer time
+    // that would otherwise discard them post-setup.
+    bool do_per_tri_cull = (s_per_tri_cull != 0u);
+    vec3 light_dir = normalize(lights_params.lights[0].direction);
     for (uint t = lane; t < tri_count; t += gl_WorkGroupSize.x) {
         uint i0 = merged_indices[idx_offset + t * 3u + 0u] - vbase;
         uint i1 = merged_indices[idx_offset + t * 3u + 1u] - vbase;
         uint i2 = merged_indices[idx_offset + t * 3u + 2u] - vbase;
         gl_PrimitiveTriangleIndicesEXT[t] = uvec3(i0, i1, i2);
         gl_MeshPrimitivesEXT[t].gl_Layer  = int(cascade_idx);
+
+        bool cull = false;
+        if (do_per_tri_cull) {
+            // Re-fetch world-space positions to compute the geometric
+            // face normal.  These three SSBO reads should hit L1/L2 —
+            // the same vertices were just fetched by the vertex-emit
+            // loop above.  Sign-only test: no normalize needed.
+            vec3 p0 = fetchVertexPosition(vbase + i0);
+            vec3 p1 = fetchVertexPosition(vbase + i1);
+            vec3 p2 = fetchVertexPosition(vbase + i2);
+            vec3 n  = cross(p1 - p0, p2 - p0);
+            // dot(n, light_dir) > 0 means the face points along the
+            // sun's direction of travel → it's the back of the geometry
+            // from the sun's POV → safe to drop for shadow rendering.
+            cull = dot(n, light_dir) > 0.0;
+        }
+        gl_MeshPrimitivesEXT[t].gl_CullPrimitiveEXT = cull;
     }
 }

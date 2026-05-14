@@ -3186,6 +3186,129 @@ void ClusterRenderer::initBindlessShadowPipeline(
         std::source_location::current());
 }
 
+// ─── CSM silhouette prepass pipeline + draw ──────────────────────────────
+// See csm_silhouette_prepass.mesh for the algorithm rationale.  This is
+// a small mesh-shader pipeline that fills each cascade's in-camera-
+// frustum interior with depth=1.0 so that out-of-frustum texels (still
+// at the cleared 0.0) reject every later shadow caster via LESS_OR_EQUAL.
+//
+// The depth-test state for this pipeline is ALWAYS (so the forced z=1
+// unconditionally replaces the cleared 0.0).  Subsequent shadow draws
+// must use load_op = LOAD so the prepass result is preserved.
+void ClusterRenderer::initCsmSilhouettePrepassPipeline(
+    const std::shared_ptr<renderer::DescriptorSetLayout>&
+        runtime_lights_desc_set_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const renderer::Format& shadow_depth_format) {
+
+    if (silhouette_prepass_pipeline_) {
+        return;   // already built
+    }
+    if (!runtime_lights_desc_set_layout) {
+        return;
+    }
+
+    // ── Pipeline layout ──────────────────────────────────────────────
+    // The mesh shader only reads from RUNTIME_LIGHTS_PARAMS_SET (cascade
+    // VPs + slab corners).  Pad earlier set slots with an empty layout
+    // so createPipelineLayout doesn't choke on null entries.
+    er::DescriptorSetLayoutList all_layouts;
+    auto empty_layout = device_->createDescriptorSetLayout({});
+    for (uint32_t i = 0; i <= RUNTIME_LIGHTS_PARAMS_SET; ++i) {
+        all_layouts.push_back(
+            i == RUNTIME_LIGHTS_PARAMS_SET
+                ? runtime_lights_desc_set_layout
+                : empty_layout);
+    }
+
+    silhouette_prepass_pipeline_layout_ = device_->createPipelineLayout(
+        all_layouts, {}, std::source_location::current());
+
+    // No vertex input — mesh shader fetches everything from the UBO.
+    std::vector<er::VertexInputBindingDescription>   binding_descs;
+    std::vector<er::VertexInputAttributeDescription> attrib_descs;
+
+    er::PipelineInputAssemblyStateCreateInfo input_assembly;
+    input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
+    input_assembly.restart_enable = false;
+
+    // Cull none: we want both hex faces to cover the silhouette.  Depth
+    // clamp on so any vertex projected outside [0,1] is clamped rather
+    // than clipped (the mesh shader forces z=w → 1.0 NDC, so this is
+    // belt-and-suspenders against future shader changes).
+    er::RasterizationStateOverride raster_override{};
+    raster_override.override_depth_clamp_enable = true;
+    raster_override.depth_clamp_enable          = true;
+    raster_override.override_double_sided       = true;
+    raster_override.double_sided                = true;
+
+    // Depth test ALWAYS: the prepass unconditionally writes 1.0 over
+    // the cleared 0.0 inside the silhouette.  Depth write ON.
+    auto silhouette_depth_stencil =
+        std::make_shared<er::PipelineDepthStencilStateCreateInfo>(
+            er::helper::fillPipelineDepthStencilStateCreateInfo(
+                /*depth_test_enable */ true,
+                /*depth_write_enable*/ true,
+                er::CompareOp::ALWAYS));
+
+    std::vector<er::PipelineColorBlendAttachmentState> no_blend;
+    auto blend_state =
+        std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+            er::helper::fillPipelineColorBlendStateCreateInfo(no_blend));
+
+    er::GraphicPipelineInfo info = graphic_pipeline_info;
+    info.blend_state_info   = blend_state;
+    info.depth_stencil_info = silhouette_depth_stencil;
+
+    // Single mesh shader stage.
+    er::ShaderModuleList shader_modules(1);
+    shader_modules[0] = er::helper::loadShaderModule(
+        device_, "csm_silhouette_prepass_mesh.spv",
+        er::ShaderStageFlagBits::MESH_BIT_EXT,
+        std::source_location::current());
+
+    er::PipelineRenderbufferFormats fmt;
+    fmt.color_formats = {};
+    fmt.depth_format  = shadow_depth_format;
+
+    silhouette_prepass_pipeline_ = device_->createPipeline(
+        silhouette_prepass_pipeline_layout_,
+        binding_descs,
+        attrib_descs,
+        input_assembly,
+        info,
+        shader_modules,
+        fmt,
+        raster_override,
+        std::source_location::current());
+}
+
+void ClusterRenderer::drawCsmSilhouettePrepass(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<renderer::DescriptorSet>& runtime_lights_desc_set,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!silhouette_prepass_pipeline_ || !runtime_lights_desc_set) {
+        return;
+    }
+
+    er::DescriptorSetList all_desc_sets(RUNTIME_LIGHTS_PARAMS_SET + 1, nullptr);
+    all_desc_sets[RUNTIME_LIGHTS_PARAMS_SET] = runtime_lights_desc_set;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, silhouette_prepass_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        silhouette_prepass_pipeline_layout_,
+        all_desc_sets);
+
+    // CSM_CASCADE_COUNT workgroups (one per cascade), each emits the
+    // 12 hex faces of its slab.
+    cmd_buf->drawMeshTasks(static_cast<uint32_t>(CSM_CASCADE_COUNT), 1u, 1u);
+}
+
 // ─── Cluster CSM shadow draw (mesh-shader path) ──────────────────────────
 // Dispatches one (cluster, cascade) mesh-shader workgroup per pair.
 // Each workgroup frustum-culls against its cascade's VP and emits the
@@ -3581,6 +3704,10 @@ void ClusterRenderer::destroy() {
     // Mesh-shader CSM cluster data set (allocated in finalizeUploads).
     cluster_mesh_data_desc_set_.reset();
     cluster_mesh_data_desc_set_layout_.reset();
+
+    // CSM silhouette prepass pipeline.
+    silhouette_prepass_pipeline_.reset();
+    silhouette_prepass_pipeline_layout_.reset();
 
     // ── OIT resources ──
     oit_composite_pipeline_.reset();

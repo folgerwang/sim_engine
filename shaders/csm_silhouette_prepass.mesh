@@ -1,0 +1,102 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "global_definition.glsl.h"
+
+// ─── csm_silhouette_prepass.mesh ────────────────────────────────────────
+// Per-cascade "in-frustum silhouette fill" prepass.
+//
+// Goal: pre-fill every shadow-map texel that the main camera's frustum
+// CANNOT see with a depth value (0.0) that makes the standard LESS_OR_
+// EQUAL shadow test reject every real caster.  Equivalently, fill the
+// texels the camera CAN see with depth=1.0, leaving the rest at the
+// render-pass clear value (0.0).
+//
+// This is the classical CSM "silhouette mask" optimization: shadow
+// casters whose projected fragments land outside the camera's footprint
+// in the shadow map contribute zero useful pixels (no main-view pixel
+// will ever sample those texels).  Pre-rejecting them lets Hi-Z prune
+// whole primitives at PD setup time before they reach the rasterizer —
+// which is the dominant bottleneck the Nsight capture revealed for this
+// pass (blue Top-Level Throughput, ~86% unallocated warps).
+//
+// Geometry: one workgroup per cascade emits the 12 triangles of that
+// cascade's main-camera frustum slab (a hexahedron in world space).
+// Vertex transform: cascade_VP * corner_ws, then we FORCE z = w so the
+// final NDC z is exactly 1.0 — independent of where the actual slab
+// projects on the depth axis.  That guarantees the prepass writes the
+// MAX depth value the buffer supports, so any later real-caster write
+// (z < 1.0) passes LESS_OR_EQUAL inside the silhouette.
+//
+// Depth state for this pipeline (in cluster_renderer.cpp):
+//   depth test  = ALWAYS  (so the forced 1.0 always replaces clear 0.0)
+//   depth write = ON
+//   cull mode   = NONE    (we want both sides of the hex to cover the
+//                          silhouette regardless of vertex winding)
+// ─────────────────────────────────────────────────────────────────────────
+
+layout(local_size_x = 8) in;            // 8 lanes = 8 hex corners
+layout(triangles, max_vertices = 8, max_primitives = 12) out;
+
+out gl_MeshPerVertexEXT {
+    vec4 gl_Position;
+} gl_MeshVerticesEXT[];
+
+out perprimitiveEXT gl_MeshPerPrimitiveEXT {
+    int gl_Layer;
+} gl_MeshPrimitivesEXT[];
+
+layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
+    uniform RuntimeLightsUBO {
+    RuntimeLightsParams lights_params;
+};
+
+// 12 triangles covering a hexahedron's 6 faces.  Each face is a quad
+// triangulated as two tris.  Vertex indices reference the 8 corners
+// in the same order computeCascadeMatrices exports them:
+//   0 = near TL  1 = near TR  2 = near BL  3 = near BR
+//   4 = far  TL  5 = far  TR  6 = far  BL  7 = far  BR
+const uvec3 kHexTris[12] = uvec3[12](
+    // Near face (z = -near in view space, towards camera in world space).
+    uvec3(0u, 1u, 3u), uvec3(0u, 3u, 2u),
+    // Far face.
+    uvec3(4u, 6u, 7u), uvec3(4u, 7u, 5u),
+    // Left face.
+    uvec3(0u, 2u, 6u), uvec3(0u, 6u, 4u),
+    // Right face.
+    uvec3(1u, 5u, 7u), uvec3(1u, 7u, 3u),
+    // Top face.
+    uvec3(0u, 4u, 5u), uvec3(0u, 5u, 1u),
+    // Bottom face.
+    uvec3(2u, 3u, 7u), uvec3(2u, 7u, 6u)
+);
+
+void main() {
+    uint cascade_idx = gl_WorkGroupID.x;
+    uint lane        = gl_LocalInvocationID.x;
+    mat4 vp          = lights_params.light_view_proj[cascade_idx];
+
+    // Uniform call across the workgroup — EXT_mesh_shader requires
+    // SetMeshOutputsEXT to be in dynamically uniform control flow.
+    SetMeshOutputsEXT(8u, 12u);
+
+    // Each of the 8 lanes emits one hex corner.
+    if (lane < 8u) {
+        vec3 corner_ws = lights_params.cascade_slab_corners_ws[
+            cascade_idx * 8u + lane].xyz;
+        vec4 clip = vp * vec4(corner_ws, 1.0);
+        // Force NDC z = 1.0 (far in Vulkan [0,1] depth range) so the
+        // entire silhouette interior gets the MAX possible depth, which
+        // every real shadow caster (z < 1.0) can subsequently overwrite
+        // via LESS_OR_EQUAL.
+        clip.z = clip.w;
+        gl_MeshVerticesEXT[lane].gl_Position = clip;
+    }
+
+    // Lanes 0..11 each emit one of the 12 hex triangles.  Workgroup
+    // size is 8, so the loop covers the remaining triangles using
+    // strided iteration.
+    for (uint t = lane; t < 12u; t += gl_WorkGroupSize.x) {
+        gl_PrimitiveTriangleIndicesEXT[t] = kHexTris[t];
+        gl_MeshPrimitivesEXT[t].gl_Layer  = int(cascade_idx);
+    }
+}

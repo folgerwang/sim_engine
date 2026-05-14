@@ -1177,6 +1177,17 @@ bool Menu::draw(
                 turn_off_shadow_pass_ = !turn_off_shadow_pass_;
             }
 
+            // CSM silhouette prepass — see comment on the member field in
+            // menu.h and the rationale at csm_silhouette_prepass.mesh's
+            // header.  Turning it off makes the shadow pass clear depth
+            // to 1.0 (the legacy behaviour) and skip the prepass dispatch,
+            // so the user can A/B-compare shadow-pass timing.
+            if (ImGui::MenuItem("CSM silhouette prepass", NULL,
+                                 csm_silhouette_prepass_enabled_)) {
+                csm_silhouette_prepass_enabled_ =
+                    !csm_silhouette_prepass_enabled_;
+            }
+
             ImGui::Separator();
 
             if (ImGui::MenuItem("Debug Cascades", NULL, show_csm_debug_)) {

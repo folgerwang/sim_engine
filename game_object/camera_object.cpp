@@ -283,7 +283,8 @@ void ShadowViewCameraObject::computeCascadeMatrices(
     const std::array<float, CSM_CASCADE_COUNT>& cascade_far_vs,
     float z_near_vs,
     std::array<glm::mat4, CSM_CASCADE_COUNT>& out_vps,
-    glm::mat4* out_union_vp) {
+    glm::mat4* out_union_vp,
+    std::array<glm::vec3, CSM_CASCADE_COUNT * 8>* out_slab_corners_ws) {
 
     // Derive tan(half-fov) and aspect ratio from the perspective matrix.
     // GLM stores proj[col][row]; proj[1][1] was negated for Vulkan y-flip.
@@ -376,6 +377,16 @@ void ShadowViewCameraObject::computeCascadeMatrices(
         for (int i = 0; i < 8; ++i)
             ws_centre += glm::vec3(inv_main_view * glm::vec4(vs_corners[i], 1.0f));
         ws_centre /= 8.0f;
+
+        // Export the 8 world-space slab corners for the silhouette
+        // prepass.  Reuses the inverse view transform — no extra work
+        // beyond a few stores.
+        if (out_slab_corners_ws) {
+            for (int i = 0; i < 8; ++i) {
+                (*out_slab_corners_ws)[k * 8 + i] =
+                    glm::vec3(inv_main_view * glm::vec4(vs_corners[i], 1.0f));
+            }
+        }
 
         // Position the light eye far enough behind the centre so all scene
         // geometry (shadow casters) is in front of the camera.

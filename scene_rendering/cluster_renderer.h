@@ -286,6 +286,19 @@ private:
     std::shared_ptr<renderer::DescriptorSet>
         cluster_mesh_data_desc_set_;
 
+    // ── CSM silhouette prepass pipeline ─────────────────────────────────
+    // Pre-fills each cascade's main-camera-frustum interior with depth=1
+    // before the real shadow draws.  Combined with a render-pass clear
+    // value of 0.0, out-of-frustum texels reject every shadow caster via
+    // LESS_OR_EQUAL depth test, and Hi-Z propagates that to whole-tile
+    // primitive culling at the PD.
+    //
+    // Layout: RUNTIME_LIGHTS_PARAMS_SET only (mesh shader reads cascade
+    // VPs + slab corners from the UBO).  No push constants, no merged
+    // VB / cluster SSBOs — this pass touches none of that.
+    std::shared_ptr<renderer::PipelineLayout>      silhouette_prepass_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            silhouette_prepass_pipeline_;
+
     // (Re)create the OIT accum + reveal targets at the requested size,
     // and update the composite descriptor set to point at the new views.
     // Lazy: no-op when the size hasn't changed.  Called from draw() so
@@ -424,6 +437,31 @@ public:
         const renderer::DescriptorSetLayoutList& shadow_desc_set_layouts,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::Format& shadow_depth_format);
+
+    // Initialise the CSM silhouette-prepass pipeline.  Independent of
+    // initBindlessShadowPipeline — only needs the RUNTIME_LIGHTS desc
+    // set layout (provides cascade VPs + slab corners through the UBO)
+    // and the shadow depth format.  drawCsmSilhouettePrepass() no-ops
+    // if this hasn't been called.
+    void initCsmSilhouettePrepassPipeline(
+        const std::shared_ptr<renderer::DescriptorSetLayout>&
+            runtime_lights_desc_set_layout,
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const renderer::Format& shadow_depth_format);
+
+    // Run the CSM silhouette prepass.  Caller MUST have an active
+    // dynamic-rendering pass with the full CSM_CASCADE_COUNT-layer
+    // depth attachment bound, layer_count = CSM_CASCADE_COUNT, and the
+    // depth attachment cleared to 0.0 on load.  Bind runtime_lights at
+    // RUNTIME_LIGHTS_PARAMS_SET so the mesh shader can read cascade VPs
+    // + slab corners.  Dispatches CSM_CASCADE_COUNT mesh workgroups
+    // (one per cascade), each emitting the 12 hex faces of its slab
+    // with depth forced to 1.0 — fills the silhouette interior.
+    void drawCsmSilhouettePrepass(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const std::shared_ptr<renderer::DescriptorSet>& runtime_lights_desc_set,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
 
     // Dispatch cluster culling compute shader (single dispatch for all meshes).
     // last_view_proj is kept in the signature for the legacy single-pass

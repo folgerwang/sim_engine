@@ -164,7 +164,15 @@ public:
         // Used by ClusterRenderer::cullShadow to do a single shadow-frustum
         // cull dispatch whose survivor set covers every cascade.  Pass
         // nullptr if not needed (legacy callers).
-        glm::mat4* out_union_vp = nullptr);
+        glm::mat4* out_union_vp = nullptr,
+        // Optional out param: world-space corners of each cascade's
+        // main-camera frustum slab.  Layout: [cascade * 8 + corner],
+        // where corner indices match the vs_corners order inside
+        // computeCascadeMatrices (near TL/TR/BL/BR, far TL/TR/BL/BR).
+        // Used by csm_silhouette_prepass.mesh to fill the in-frustum
+        // region of each cascade's shadow map with depth=1.  Pass
+        // nullptr if not needed.
+        std::array<glm::vec3, CSM_CASCADE_COUNT * 8>* out_slab_corners_ws = nullptr);
 };
 
 } // game_object
