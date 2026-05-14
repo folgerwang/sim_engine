@@ -265,16 +265,26 @@ private:
     std::shared_ptr<renderer::Pipeline>            bindless_gbuffer_pipeline_;
 
     // ── CSM shadow variant ───────────────────────────────────────────────
-    // Depth-only single-pass CSM pipeline + its own slim layout (only the
-    // VIEW_PARAMS_SET + RUNTIME_LIGHTS_PARAMS_SET descriptor sets — no
-    // bindless material set needed for depth).  Created by
-    // initBindlessShadowPipeline().  drawClusterShadow() replaces the
-    // per-mesh shadow draw loop in shadow_object_scene_view_->draw() for
-    // cluster-owned meshes: 326k clusters in one indirect draw instead of
-    // 2400+ CPU draw calls.  Big CPU recording win — see the comment at
-    // drawClusterShadow's implementation for the perf rationale.
+    // Depth-only single-pass CSM pipeline + its own slim layout.  Built
+    // from a mesh shader (cluster_bindless_shadow.mesh) — see the comment
+    // at initBindlessShadowPipeline for the perf history that landed on
+    // the mesh-shader path.  drawClusterShadow() replaces the per-mesh
+    // shadow draw loop in shadow_object_scene_view_->draw() for cluster-
+    // owned meshes: dispatches one (cluster × cascade) mesh workgroup
+    // instead of 2400+ CPU draw calls.
     std::shared_ptr<renderer::PipelineLayout>      bindless_shadow_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline>             bindless_shadow_pipeline_;
+
+    // Cluster mesh-shader data descriptor set.  Exposes the cull-info,
+    // draw-info, merged-vertex, and merged-index SSBOs to the mesh
+    // shader stage (MESH_BIT_EXT visibility, set index =
+    // RUNTIME_LIGHTS_PARAMS_SET + 1).  Allocated once at the end of
+    // finalizeUploads() and bound by drawClusterShadow alongside the
+    // existing VIEW_PARAMS + RUNTIME_LIGHTS sets.
+    std::shared_ptr<renderer::DescriptorSetLayout>
+        cluster_mesh_data_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet>
+        cluster_mesh_data_desc_set_;
 
     // (Re)create the OIT accum + reveal targets at the requested size,
     // and update the composite descriptor set to point at the new views.

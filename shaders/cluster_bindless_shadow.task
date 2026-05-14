@@ -1,0 +1,135 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_KHR_shader_subgroup_ballot      : require
+#extension GL_KHR_shader_subgroup_arithmetic  : require
+#include "global_definition.glsl.h"
+
+// ─── cluster_bindless_shadow.task ───────────────────────────────────────
+// Task shader for the cluster CSM shadow path.  Replaces the per-(cluster,
+// cascade) mesh-workgroup cull with a coarser-grained task pass:
+//
+//   • 1 task workgroup processes CLUSTERS_PER_TASK_WG (= 32) clusters.
+//   • Each task lane = one cluster; it tests its cluster's bounding
+//     sphere against all CSM_CASCADE_COUNT cascade VPs and produces a
+//     local "surviving (cluster, cascade) pairs" list in the payload.
+//   • EmitMeshTasksEXT then dispatches one mesh workgroup PER surviving
+//     pair — culled pairs cost nothing past the task-shader bitmask.
+//
+// Before this task pass we dispatched (total_clusters × CSM_CASCADE_COUNT)
+// = ~1.96M mesh workgroups for the Bistro scene and relied on the mesh
+// shader to early-out culled ones.  That left ~75% of mesh workgroups
+// doing only frustum test + SetMeshOutputsEXT(0,0); the per-workgroup
+// dispatch overhead alone added ~7 ms over the legacy VS+GS path.
+//
+// With this task shader:
+//   task workgroups  = ceil(total_clusters / 32)           ≈ 10k
+//   mesh workgroups  = sum over clusters of #passing cascades ≈ 400k
+//
+// Net workgroup count drops ~2.7×, AND every mesh workgroup that does
+// launch is doing real emit work — no wasted dispatches.
+// ─────────────────────────────────────────────────────────────────────────
+
+#define CLUSTERS_PER_TASK_WG 32u
+#define MAX_SURVIVORS        (CLUSTERS_PER_TASK_WG * CSM_CASCADE_COUNT)
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform ShadowTaskPC {
+    uint total_clusters;
+} pc;
+
+layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
+    uniform RuntimeLightsUBO {
+    RuntimeLightsParams lights_params;
+};
+
+#define CLUSTER_MESH_DATA_SET (RUNTIME_LIGHTS_PARAMS_SET + 1)
+
+layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 0) readonly buffer ClusterCullBuffer {
+    ClusterCullInfo cluster_cull_infos[];
+};
+
+// Payload sent to the mesh shader: one entry per surviving (cluster, cascade)
+// pair.  Each pair packs into a single uint to halve payload bandwidth
+// (bits 0..7 = cascade index, bits 8..31 = cluster index — 24 bits gives
+// up to ~16M clusters, comfortably above the Bistro 326k working set).
+struct ShadowEmitPair {
+    uint packed;
+};
+taskPayloadSharedEXT ShadowEmitPair payload[MAX_SURVIVORS];
+
+// Shadow-caster frustum test.  Differs from a regular camera-frustum
+// cull in ONE crucial way: we skip the near-plane test.
+//
+// Why: for CSM, each cascade VP is an orthographic projection from the
+// light's POV.  The near plane of that ortho is at the cascade's
+// closest extent to the light.  A cluster that's BETWEEN the light
+// source and the cascade's visible slab (i.e. in front of the near
+// plane) is still a valid shadow caster — its shadow would land
+// inside the cascade.  Culling against the near plane drops these
+// clusters and causes shadow pop-in as objects approach the cascade
+// boundary.
+//
+// The side planes (L/R/T/B) still cull correctly: a cluster outside
+// the lateral extent of the cascade can't cast a shadow into it.  The
+// far plane is also safe: clusters past it are behind the visible
+// volume from the light's POV and cannot cast shadows into it.
+bool sphereInShadowFrustum(mat4 vp, vec3 center, float radius) {
+    vec4 planes[5];
+    // Left / Right / Bottom / Top sides.
+    planes[0] = vec4(vp[0][3] + vp[0][0], vp[1][3] + vp[1][0], vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]);
+    planes[1] = vec4(vp[0][3] - vp[0][0], vp[1][3] - vp[1][0], vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]);
+    planes[2] = vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1], vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]);
+    planes[3] = vec4(vp[0][3] + vp[0][1], vp[1][3] + vp[1][1], vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]);
+    // Far plane (no near plane — see comment above).
+    planes[4] = vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2], vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]);
+    for (int i = 0; i < 5; ++i) {
+        float len = length(planes[i].xyz);
+        if (len > 0.0001) planes[i] /= len;
+        float d = dot(planes[i].xyz, center) + planes[i].w;
+        if (d < -radius) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint lane         = gl_LocalInvocationID.x;
+    uint cluster_idx  = gl_WorkGroupID.x * CLUSTERS_PER_TASK_WG + lane;
+
+    // Per-lane: how many cascades this cluster passes + bitmask of which.
+    uint local_pass_mask  = 0u;
+    uint local_pass_count = 0u;
+    if (cluster_idx < pc.total_clusters) {
+        ClusterCullInfo cull = cluster_cull_infos[cluster_idx];
+        vec3 center  = cull.bounds_sphere.xyz;
+        float radius = cull.bounds_sphere.w;
+        for (uint c = 0u; c < uint(CSM_CASCADE_COUNT); ++c) {
+            if (sphereInShadowFrustum(lights_params.light_view_proj[c], center, radius)) {
+                local_pass_mask |= (1u << c);
+                local_pass_count += 1u;
+            }
+        }
+    }
+
+    // Workgroup-wide prefix sum: each lane's `base_slot` is the slot in
+    // payload where this lane's surviving cascades begin writing.  With
+    // local_size_x = 32 = subgroup size on NVIDIA, the subgroup primitive
+    // covers the entire workgroup — no need for shared-memory scan.
+    uint base_slot  = subgroupExclusiveAdd(local_pass_count);
+    uint total_emit = subgroupAdd(local_pass_count);
+
+    // Each lane writes its surviving (cluster, cascade) pairs.
+    uint write_slot = base_slot;
+    for (uint c = 0u; c < uint(CSM_CASCADE_COUNT); ++c) {
+        if ((local_pass_mask & (1u << c)) != 0u) {
+            payload[write_slot].packed = (cluster_idx << 8u) | c;
+            write_slot += 1u;
+        }
+    }
+
+    // Lane 0 emits the mesh dispatch covering all this workgroup's survivors.
+    if (lane == 0u) {
+        EmitMeshTasksEXT(total_emit, 1u, 1u);
+    }
+}

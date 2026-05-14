@@ -1,0 +1,160 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_KHR_shader_subgroup_arithmetic  : require
+#include "global_definition.glsl.h"
+
+// ─── cluster_bindless_shadow.mesh ───────────────────────────────────────
+// Mesh-shader depth-only CSM path, driven by the task shader
+// cluster_bindless_shadow.task.  The task shader runs frustum cull on
+// the CPU's cluster set against every CSM_CASCADE_COUNT cascade and
+// emits one mesh workgroup PER surviving (cluster, cascade) pair.  By
+// the time we run, the workgroup is guaranteed to need real emission
+// work — no cull, no early-out.
+//
+// Payload contract (matches cluster_bindless_shadow.task):
+//   payload[gl_WorkGroupID.x].packed encodes:
+//     bits  0.. 7  cascade_idx (0..CSM_CASCADE_COUNT-1)
+//     bits  8..31  cluster_idx (up to ~16M)
+//
+// Perf history (Bistro, desktop NVIDIA):
+//   A. Per-cluster vkCmdDrawIndexedIndirectCount + GS broadcast   ~28 ms
+//   B. Single drawIndexed over merged VB/IB + GS broadcast       ~10 ms
+//   C. Single drawIndexed + multiview                             ~56 ms
+//   D. Per-cascade rendering + per-cascade cull                   ~26 ms
+//   E. Mesh shader, per-(cluster, cascade) workgroup + cull       ~17 ms
+//      (after cull-failed early-out optimization, was ~30 ms before)
+//   F. Task + Mesh: task culls + emits, mesh emits only           ←
+//
+// Vertex sharing:
+//   Each cluster's vertices live in a contiguous range
+//   [vertex_base, vertex_base + vertex_count) of the merged VB.  We
+//   derive vertex_base / vertex_count on-the-fly:
+//     vertex_base  = staging_indices[index_offset]    // first index
+//     vertex_count = max(indices in cluster) - vertex_base + 1
+//   We assume vertex_count <= 256 (the EXT mesh shader minimum required
+//   maxMeshOutputVertices), which buildClusterMesh's max-tris=128 setting
+//   satisfies in practice for the Bistro test scene.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Workgroup size = 32 (one NVIDIA warp).  Vertex (≤256) and primitive
+// (≤128) emit loops iterate so the thread count doesn't have to match
+// the output count.
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 256, max_primitives = 128) out;
+
+// Explicit output-block declarations.  Required when we need to write
+// per-primitive built-ins (gl_Layer in particular) — the implicit
+// gl_MeshPrimitivesEXT[] doesn't expose gl_Layer unless we redeclare
+// the block with the member listed.
+out gl_MeshPerVertexEXT {
+    vec4 gl_Position;
+} gl_MeshVerticesEXT[];
+
+out perprimitiveEXT gl_MeshPerPrimitiveEXT {
+    int gl_Layer;
+} gl_MeshPrimitivesEXT[];
+
+layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
+    uniform RuntimeLightsUBO {
+    RuntimeLightsParams lights_params;
+};
+
+#define CLUSTER_MESH_DATA_SET (RUNTIME_LIGHTS_PARAMS_SET + 1)
+
+layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 0) readonly buffer ClusterCullBuffer {
+    ClusterCullInfo cluster_cull_infos[];
+};
+layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 1) readonly buffer ClusterDrawBuffer {
+    ClusterDrawInfo cluster_draw_infos[];
+};
+layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 2) readonly buffer MergedVertexBuffer {
+    float merged_vertex_floats[];
+};
+layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 3) readonly buffer MergedIndexBuffer {
+    uint merged_indices[];
+};
+
+#define CLUSTERS_PER_TASK_WG 32u
+#define MAX_SURVIVORS        (CLUSTERS_PER_TASK_WG * CSM_CASCADE_COUNT)
+
+struct ShadowEmitPair {
+    uint packed;
+};
+taskPayloadSharedEXT ShadowEmitPair payload[MAX_SURVIVORS];
+
+// BindlessVertex stride in floats (sizeof(BindlessVertex) / 4).
+// position(3) + normal(3) + uv(2) + tangent(4) = 12 floats = 48 bytes.
+#define BINDLESS_VERTEX_FLOAT_STRIDE 12u
+
+vec3 fetchVertexPosition(uint vertex_idx) {
+    uint base = vertex_idx * BINDLESS_VERTEX_FLOAT_STRIDE;
+    return vec3(
+        merged_vertex_floats[base + 0u],
+        merged_vertex_floats[base + 1u],
+        merged_vertex_floats[base + 2u]);
+}
+
+shared uint s_index_offset;
+shared uint s_index_count;
+shared uint s_vertex_base;
+shared uint s_vertex_count;
+shared uint s_tri_count;
+
+void main() {
+    uint lane         = gl_LocalInvocationID.x;
+    uint slot         = gl_WorkGroupID.x;
+    uint packed       = payload[slot].packed;
+    uint cascade_idx  = packed & 0xFFu;
+    uint cluster_idx  = packed >> 8u;
+    mat4 vp           = lights_params.light_view_proj[cascade_idx];
+
+    // ── Lane 0 fetches draw info + initializes shared state ───────────
+    if (lane == 0u) {
+        ClusterDrawInfo draw = cluster_draw_infos[cluster_idx];
+        s_index_offset = draw.index_offset;
+        s_index_count  = draw.index_count;
+        s_tri_count    = draw.index_count / 3u;
+        s_vertex_base  = merged_indices[draw.index_offset];
+        s_vertex_count = 0u;  // seeded for atomicMax below
+    }
+    barrier();
+
+    // ── Compute vertex_count via subgroup-max over cluster's indices ──
+    uint idx_offset      = s_index_offset;
+    uint local_idx_count = s_index_count;
+    uint vbase           = s_vertex_base;
+    uint my_max_offset   = 0u;
+    for (uint i = lane; i < local_idx_count; i += gl_WorkGroupSize.x) {
+        uint global_idx  = merged_indices[idx_offset + i];
+        uint local_off   = global_idx - vbase;
+        my_max_offset    = max(my_max_offset, local_off);
+    }
+    uint sg_max = subgroupMax(my_max_offset);
+    if (subgroupElect()) {
+        atomicMax(s_vertex_count, sg_max);
+    }
+    barrier();
+
+    // Clamp safety against degenerate (no-share) clusters that would
+    // exceed the 256-vertex output limit.
+    uint vcount    = min(s_vertex_count + 1u, 256u);
+    uint tri_count = s_tri_count;
+
+    SetMeshOutputsEXT(vcount, tri_count);
+
+    // ── Emit unique vertices (each lane handles strided range) ────────
+    for (uint v = lane; v < vcount; v += gl_WorkGroupSize.x) {
+        vec3 world_pos = fetchVertexPosition(vbase + v);
+        gl_MeshVerticesEXT[v].gl_Position = vp * vec4(world_pos, 1.0);
+    }
+
+    // ── Emit triangles (each lane handles one or more triangles) ──────
+    for (uint t = lane; t < tri_count; t += gl_WorkGroupSize.x) {
+        uint i0 = merged_indices[idx_offset + t * 3u + 0u] - vbase;
+        uint i1 = merged_indices[idx_offset + t * 3u + 1u] - vbase;
+        uint i2 = merged_indices[idx_offset + t * 3u + 2u] - vbase;
+        gl_PrimitiveTriangleIndicesEXT[t] = uvec3(i0, i1, i2);
+        gl_MeshPrimitivesEXT[t].gl_Layer  = int(cascade_idx);
+    }
+}

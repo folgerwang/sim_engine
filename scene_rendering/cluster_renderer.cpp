@@ -1127,9 +1127,14 @@ void ClusterRenderer::finalizeUploads() {
     if (total_merged_vertices_ > 0) {
         // HOST_VISIBLE for debugging — bypass staging transfer to rule out
         // GPU upload corruption.
+        // STORAGE_BUFFER_BIT lets the cluster mesh-shader CSM path read
+        // the merged VB as an SSBO (cluster_bindless_shadow.mesh).  The
+        // forward / G-buffer paths still bind it through VERTEX_BUFFER_BIT
+        // via the input assembler.
         er::Helper::createBuffer(
             device_,
-            SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, TRANSFER_DST_BIT),
+            SET_3_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT,
+                            STORAGE_BUFFER_BIT, TRANSFER_DST_BIT),
             SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
             0,
             merged_vertex_buffer_.buffer,
@@ -1140,9 +1145,12 @@ void ClusterRenderer::finalizeUploads() {
     }
 
     if (total_merged_indices_ > 0) {
+        // STORAGE_BUFFER_BIT for the mesh-shader shadow path (reads indices
+        // as a plain uint[] SSBO and computes its own primitive emission).
         er::Helper::createBuffer(
             device_,
-            SET_2_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT, TRANSFER_DST_BIT),
+            SET_3_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT,
+                            STORAGE_BUFFER_BIT, TRANSFER_DST_BIT),
             SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
             0,
             merged_index_buffer_.buffer,
@@ -1153,6 +1161,53 @@ void ClusterRenderer::finalizeUploads() {
     }
 
     gpu_ready_ = true;
+
+    // ── Cluster mesh-shader descriptor set ───────────────────────────
+    // The mesh-shader CSM path reads these SSBOs.  Visible to both
+    // TASK_BIT_EXT (task shader's per-cluster cull reads cull_info,
+    // binding 0) and MESH_BIT_EXT (mesh shader's emission reads all 4).
+    //   binding 0  cluster cull infos    (frustum cull bounds)
+    //   binding 1  cluster draw infos    (index offset/count per cluster)
+    //   binding 2  merged vertex buffer  (BindlessVertex[] — read as float[])
+    //   binding 3  merged index buffer   (uint[])
+    // The layout is independent of the cull compute's layout (which has
+    // 12 bindings and is COMPUTE-visible only).
+    if (total_merged_vertices_ > 0 && total_merged_indices_ > 0) {
+        std::vector<er::DescriptorSetLayoutBinding> mesh_bindings(4);
+        for (int i = 0; i < 4; ++i) {
+            mesh_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
+                i, SET_2_FLAG_BITS(ShaderStage, TASK_BIT_EXT, MESH_BIT_EXT),
+                er::DescriptorType::STORAGE_BUFFER);
+        }
+        cluster_mesh_data_desc_set_layout_ =
+            device_->createDescriptorSetLayout(mesh_bindings);
+
+        cluster_mesh_data_desc_set_ = device_->createDescriptorSets(
+            descriptor_pool_, cluster_mesh_data_desc_set_layout_, 1)[0];
+
+        er::WriteDescriptorList mesh_writes;
+        mesh_writes.reserve(4);
+        er::Helper::addOneBuffer(mesh_writes, cluster_mesh_data_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 0,
+            cull_info_buffer_.buffer,
+            static_cast<uint32_t>(
+                total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo)));
+        er::Helper::addOneBuffer(mesh_writes, cluster_mesh_data_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 1,
+            draw_info_buffer_.buffer,
+            static_cast<uint32_t>(
+                total_clusters_all_meshes_ * sizeof(glsl::ClusterDrawInfo)));
+        er::Helper::addOneBuffer(mesh_writes, cluster_mesh_data_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 2,
+            merged_vertex_buffer_.buffer,
+            static_cast<uint32_t>(
+                total_merged_vertices_ * sizeof(BindlessVertex)));
+        er::Helper::addOneBuffer(mesh_writes, cluster_mesh_data_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 3,
+            merged_index_buffer_.buffer,
+            static_cast<uint32_t>(total_merged_indices_ * sizeof(uint32_t)));
+        device_->updateDescriptorSets(mesh_writes);
+    }
 
     std::printf(
         "[CLUSTER_RENDERER] Finalized: %u clusters from %u meshes, "
@@ -2951,25 +3006,38 @@ uint32_t ClusterRenderer::drawOpaqueGBuffer(
 }
 
 // ─── Cluster CSM shadow pipeline + draw ──────────────────────────────────
-// Depth-only single-pass CSM rendering for cluster-owned meshes.  Replaces
-// the per-mesh shadow draw loop in shadow_object_scene_view_->draw() with
-// ONE drawIndexedIndirectCount call broadcasting to all CSM_CASCADE_COUNT
-// layers via the geometry shader (cluster_bindless_shadow.geom).
+// Depth-only single-pass CSM rendering for cluster-owned meshes via a
+// mesh shader (cluster_bindless_shadow.mesh).  One mesh-shader workgroup
+// per (cluster, cascade) pair; each workgroup frustum-culls against its
+// cascade's VP and emits the cluster's surviving triangles directly to
+// the matching depth-array layer (gl_Layer = cascade_idx).
+//
+// Perf history that landed on the mesh-shader path (Bistro, desktop NV):
+//   A. Per-cluster vkCmdDrawIndexedIndirectCount + GS broadcast    ~28 ms
+//   B. Single drawIndexed over merged VB/IB + GS broadcast        ~10 ms
+//   C. Single drawIndexed + multiview                              ~56 ms (VS replication)
+//   D. Per-cascade rendering + per-cascade cull                    ~26 ms
+//   E. Mesh shader, one workgroup per (cluster, cascade)            ←
+//
+// Why mesh shader wins:
+//   • Bypasses the GS amplification stage entirely — no triangle
+//     duplication through fixed-function output, no GS invocation
+//     overhead per input primitive.
+//   • Per-(cluster, cascade) frustum cull skips ~75% of total
+//     workgroups outright (each cascade keeps ~5-90% of clusters; the
+//     union across cascades is ~2× a single frustum-culled set, vs 6×
+//     for any "broadcast everything to every layer" path).
+//   • One workgroup = one cluster of up to 128 triangles with private
+//     vertex output; mesh-shader hardware schedules them in parallel.
 //
 // Why a separate pipeline / layout (not reusing initBindlessGBufferPipeline):
 //   • No fragment shader (depth-only).
-//   • No bindless material descriptor set needed — only VIEW_PARAMS_SET
-//     (the VS doesn't actually read from it, but the layout slot has to
-//     be present for compatibility with the desc-set list the caller
-//     passes in) and RUNTIME_LIGHTS_PARAMS_SET (the GS reads
-//     light_view_proj[cascade]).
-//   • Different framebuffer format (a single depth-array attachment).
-//   • Geometry-shader stage activates the layered broadcast — initBindless*
-//     pipelines don't have a GS.
-//
-// Slimming the layout drops the bindless desc-set lifecycle overhead from
-// the shadow path and keeps the pipeline's descriptor count down to the
-// minimum the GS+VS actually touch.
+//   • No bindless material descriptor set needed.  The slim layout
+//     carries: VIEW_PARAMS_SET (compatibility), RUNTIME_LIGHTS_PARAMS_
+//     SET (mesh reads light_view_proj[cascade]), and
+//     CLUSTER_MESH_DATA_SET (mesh reads cull-info / draw-info /
+//     merged VB / merged IB SSBOs).
+//   • Mesh-shader stage replaces VS+GS; no vertex input bindings.
 void ClusterRenderer::initBindlessShadowPipeline(
     const renderer::DescriptorSetLayoutList& shadow_desc_set_layouts,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
@@ -2983,46 +3051,52 @@ void ClusterRenderer::initBindlessShadowPipeline(
     if (bindless_shadow_pipeline_) {
         return;   // already built
     }
+    if (!cluster_mesh_data_desc_set_layout_) {
+        // The mesh-shader data set wasn't allocated (e.g. zero clusters
+        // uploaded) — no point building a pipeline that can't draw.
+        return;
+    }
 
     // ── Pipeline layout ──────────────────────────────────────────────
-    // Build a slim layout that exposes only the descriptor sets this
-    // depth-only pipeline actually touches:
-    //   set VIEW_PARAMS_SET           — present for set-list compatibility
-    //   set RUNTIME_LIGHTS_PARAMS_SET — GS reads light_view_proj[cascade]
+    // Build a slim layout that exposes only the descriptor sets the
+    // mesh shader actually touches:
+    //   set VIEW_PARAMS_SET             — present for set-list compatibility
+    //   set RUNTIME_LIGHTS_PARAMS_SET   — light_view_proj[cascade] UBO
+    //   set CLUSTER_MESH_DATA_SET (+1)  — cluster SSBOs (cull/draw/VB/IB)
     //
     // Vulkan requires every set slot in the pipeline layout to have a
     // valid (non-null) descriptor set layout — gaps are not allowed.
     // Replace any nullptr slots with an empty layout so createPipelineLayout
     // doesn't crash on .get().
+    const uint32_t cluster_mesh_data_set = RUNTIME_LIGHTS_PARAMS_SET + 1;
     er::DescriptorSetLayoutList all_layouts;
-    for (uint32_t i = 0; i < RUNTIME_LIGHTS_PARAMS_SET + 1; ++i) {
-        all_layouts.push_back(
-            i < static_cast<uint32_t>(shadow_desc_set_layouts.size())
-                ? shadow_desc_set_layouts[i] : nullptr);
+    for (uint32_t i = 0; i <= cluster_mesh_data_set; ++i) {
+        std::shared_ptr<er::DescriptorSetLayout> layout;
+        if (i == cluster_mesh_data_set) {
+            layout = cluster_mesh_data_desc_set_layout_;
+        } else if (i < shadow_desc_set_layouts.size()) {
+            layout = shadow_desc_set_layouts[i];
+        }
+        all_layouts.push_back(layout);
     }
     auto empty_layout = device_->createDescriptorSetLayout({});
     for (auto& layout : all_layouts) {
         if (!layout) layout = empty_layout;
     }
 
+    // Push constants: task shader needs total_clusters to clamp its
+    // per-lane cluster_idx (last task workgroup is partial when the
+    // cluster count isn't a multiple of CLUSTERS_PER_TASK_WG = 32).
+    er::PushConstantRange shadow_pc{};
+    shadow_pc.stage_flags = SET_FLAG_BIT(ShaderStage, TASK_BIT_EXT);
+    shadow_pc.offset      = 0;
+    shadow_pc.size        = sizeof(uint32_t);  // one uint: total_clusters
     bindless_shadow_pipeline_layout_ = device_->createPipelineLayout(
-        all_layouts, {}, std::source_location::current());
+        all_layouts, { shadow_pc }, std::source_location::current());
 
-    // ── Vertex input description ─────────────────────────────────────
-    // The depth-only VS (cluster_bindless_shadow.vert) only reads
-    // position; tangent/normal/uv are present in the merged VB but
-    // unused.  Declare only position to avoid validation warnings about
-    // unconsumed attributes.
-    std::vector<er::VertexInputBindingDescription> binding_descs(1);
-    binding_descs[0].binding    = 0;
-    binding_descs[0].stride     = sizeof(BindlessVertex);
-    binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
-
-    std::vector<er::VertexInputAttributeDescription> attrib_descs(1);
-    attrib_descs[0].binding  = 0;
-    attrib_descs[0].location = 0;
-    attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
-    attrib_descs[0].offset   = offsetof(BindlessVertex, position);
+    // ── Vertex input: none (mesh shader fetches vertices from SSBO) ──
+    std::vector<er::VertexInputBindingDescription>   binding_descs;
+    std::vector<er::VertexInputAttributeDescription> attrib_descs;
 
     er::PipelineInputAssemblyStateCreateInfo input_assembly;
     input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
@@ -3059,26 +3133,26 @@ void ClusterRenderer::initBindlessShadowPipeline(
     shadow_info.blend_state_info   = shadow_blend_state;
     shadow_info.depth_stencil_info = shadow_depth_stencil;
 
-    // ── Shader modules: VS + GS, no fragment ─────────────────────────
-    // See cluster_bindless_shadow.vert's comment block for the perf
-    // history of the alternatives.  GS broadcast is the winner on
-    // desktop NVIDIA — its dedicated hardware path beats both multi-
-    // view (VS replication → 6× cost) and per-cascade rendering
-    // (command-processor overhead × cascade-count).
+    // ── Shader modules: TASK + MESH, no fragment ─────────────────────
+    // Task shader culls clusters against all CSM_CASCADE_COUNT cascade
+    // frustums in one pass and emits mesh workgroups ONLY for surviving
+    // (cluster, cascade) pairs.  Mesh shader then emits triangles
+    // without any further cull.  See cluster_bindless_shadow.task and
+    // .mesh for the per-stage rationale.
     er::ShaderModuleList shader_modules(2);
     shader_modules[0] = er::helper::loadShaderModule(
-        device_, "cluster_bindless_shadow_vert.spv",
-        er::ShaderStageFlagBits::VERTEX_BIT,
+        device_, "cluster_bindless_shadow_task.spv",
+        er::ShaderStageFlagBits::TASK_BIT_EXT,
         std::source_location::current());
     shader_modules[1] = er::helper::loadShaderModule(
-        device_, "cluster_bindless_shadow_geom.spv",
-        er::ShaderStageFlagBits::GEOMETRY_BIT,
+        device_, "cluster_bindless_shadow_mesh.spv",
+        er::ShaderStageFlagBits::MESH_BIT_EXT,
         std::source_location::current());
 
     // ── Framebuffer format ──────────────────────────────────────────
     // No colour attachments; single depth-array attachment.
-    // view_mask stays at 0 (no multiview); the GS writes gl_Layer
-    // per-cascade and the matching RenderingInfo uses
+    // view_mask stays at 0 (no multiview); the mesh shader writes
+    // gl_Layer per-primitive and the matching RenderingInfo uses
     // layer_count = CSM_CASCADE_COUNT.
     er::PipelineRenderbufferFormats shadow_fmt;
     shadow_fmt.color_formats = {};
@@ -3096,18 +3170,19 @@ void ClusterRenderer::initBindlessShadowPipeline(
         std::source_location::current());
 }
 
-// ─── Cluster CSM shadow draw (GS broadcast + single drawIndexed) ────────
-// One drawIndexed over the entire merged VB/IB.  GS broadcasts each
-// triangle to all CSM_CASCADE_COUNT depth-array layers in a single
-// pass — the GS hits dedicated hardware on most desktop GPUs and is
-// substantially faster than the alternatives we measured (multiview,
-// per-cascade rendering).  See cluster_bindless_shadow.vert's comment
-// block for the perf history.
+// ─── Cluster CSM shadow draw (mesh-shader path) ──────────────────────────
+// Dispatches one (cluster, cascade) mesh-shader workgroup per pair.
+// Each workgroup frustum-culls against its cascade's VP and emits the
+// cluster's surviving triangles directly to the matching depth-array
+// layer (gl_Layer = cascade_idx).  Replaces the prior VS+GS broadcast
+// path — see the comment at initBindlessShadowPipeline for the perf
+// history.
 //
 // Caller MUST have an active dynamic-rendering pass with the full
 // CSM_CASCADE_COUNT-layer depth attachment bound and
-// layer_count = CSM_CASCADE_COUNT on the RenderingInfo so the GS's
-// gl_Layer writes land on the right cascade.  No fragment shader runs.
+// layer_count = CSM_CASCADE_COUNT on the RenderingInfo so the mesh
+// shader's gl_Layer writes land on the right cascade.  No fragment
+// shader runs.
 uint32_t ClusterRenderer::drawClusterShadow(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_sets,
@@ -3116,13 +3191,19 @@ uint32_t ClusterRenderer::drawClusterShadow(
     if (!gpu_ready_ || !bindless_shadow_pipeline_) {
         return 0;
     }
+    if (!cluster_mesh_data_desc_set_) {
+        return 0;
+    }
 
-    // Pad the descset list to the pipeline layout's slot count.
+    // Pad the desc-set list to include the cluster mesh-data set at
+    // index RUNTIME_LIGHTS_PARAMS_SET + 1.
+    const uint32_t cluster_mesh_data_set = RUNTIME_LIGHTS_PARAMS_SET + 1;
     er::DescriptorSetList all_desc_sets = desc_sets;
-    while (all_desc_sets.size() <= RUNTIME_LIGHTS_PARAMS_SET) {
+    while (all_desc_sets.size() <= cluster_mesh_data_set) {
         all_desc_sets.push_back(nullptr);
     }
-    all_desc_sets.resize(RUNTIME_LIGHTS_PARAMS_SET + 1);
+    all_desc_sets.resize(cluster_mesh_data_set + 1);
+    all_desc_sets[cluster_mesh_data_set] = cluster_mesh_data_desc_set_;
 
     cmd_buf->bindPipeline(
         er::PipelineBindPoint::GRAPHICS, bindless_shadow_pipeline_);
@@ -3132,17 +3213,27 @@ uint32_t ClusterRenderer::drawClusterShadow(
         er::PipelineBindPoint::GRAPHICS,
         bindless_shadow_pipeline_layout_,
         all_desc_sets);
-    cmd_buf->bindVertexBuffers(
-        0, { merged_vertex_buffer_.buffer }, { 0 });
-    cmd_buf->bindIndexBuffer(
-        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
 
-    cmd_buf->drawIndexed(
-        total_merged_indices_,
-        /*instance_count*/ 1,
-        /*first_index*/    0,
-        /*vertex_offset*/  0,
-        /*first_instance*/ 0);
+    // Push total_clusters so the task shader can clamp lane_idx on the
+    // last (partial) task workgroup.
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, TASK_BIT_EXT),
+        bindless_shadow_pipeline_layout_,
+        &total_clusters_all_meshes_,
+        sizeof(uint32_t),
+        0);
+
+    // Task workgroup count = ceil(total_clusters / CLUSTERS_PER_TASK_WG).
+    // CLUSTERS_PER_TASK_WG = 32, matching the task shader's local_size_x.
+    // Each task workgroup tests its 32 clusters against all 6 cascades,
+    // emits mesh workgroups only for the surviving pairs.  Cull-failed
+    // (cluster, cascade) pairs cost only the task-shader bit test, no
+    // mesh-workgroup launch.
+    constexpr uint32_t kClustersPerTaskWg = 32u;
+    const uint32_t task_wg_count =
+        (total_clusters_all_meshes_ + kClustersPerTaskWg - 1u) /
+        kClustersPerTaskWg;
+    cmd_buf->drawMeshTasks(task_wg_count, 1u, 1u);
     return total_clusters_all_meshes_;
 }
 
@@ -3470,6 +3561,10 @@ void ClusterRenderer::destroy() {
     cull_desc_set_.reset();
     for (auto& s : cull_desc_sets_shadow_) s.reset();
     cull_desc_set_layout_.reset();
+
+    // Mesh-shader CSM cluster data set (allocated in finalizeUploads).
+    cluster_mesh_data_desc_set_.reset();
+    cluster_mesh_data_desc_set_layout_.reset();
 
     // ── OIT resources ──
     oit_composite_pipeline_.reset();
