@@ -1420,6 +1420,48 @@ void ClusterRenderer::setHiZTexture(
 
 // ─── Cull (single dispatch for ALL clusters) ──────────────────────
 
+// ── Debug-readback prologue ─────────────────────────────────────────────
+// Pulled out of cull() so the deferred path — which now skips the legacy
+// cull dispatches entirely in favor of cullPhaseA/B — can still refresh
+// the Smart Mesh ImGui stats once per frame.  Reads HOST_VISIBLE memory
+// only; no command-buffer recording.  Safe to call at the same point in
+// the frame as cull() used to be (after the previous-frame fence wait).
+void ClusterRenderer::pollDebugReadback() {
+    if (!enabled_ || !gpu_ready_) return;
+
+    // Read visible count (4 bytes).
+    void* mapped = device_->mapMemory(
+        draw_count_buffer_.memory, sizeof(uint32_t), 0);
+    if (mapped) {
+        std::memcpy(&total_visible_all_meshes_, mapped, sizeof(uint32_t));
+        device_->unmapMemory(draw_count_buffer_.memory);
+    }
+
+    // Read visible cluster indices for per-mesh visibility + triangle stats.
+    visible_triangles_ = 0;
+    if (!mesh_cluster_ranges_.empty() && !cluster_to_mesh_.empty()) {
+        mesh_visible_.assign(mesh_cluster_ranges_.size(), false);
+        const uint32_t vis_count = std::min(
+            total_visible_all_meshes_, total_clusters_all_meshes_);
+        if (vis_count > 0) {
+            void* vis_mapped = device_->mapMemory(
+                visible_buffer_.memory,
+                vis_count * sizeof(uint32_t), 0);
+            if (vis_mapped) {
+                auto* vis_indices = reinterpret_cast<const uint32_t*>(vis_mapped);
+                for (uint32_t i = 0; i < vis_count; ++i) {
+                    uint32_t ci = vis_indices[i];
+                    if (ci < cluster_to_mesh_.size())
+                        mesh_visible_[cluster_to_mesh_[ci]] = true;
+                    if (ci < cluster_tri_counts_.size())
+                        visible_triangles_ += cluster_tri_counts_[ci];
+                }
+                device_->unmapMemory(visible_buffer_.memory);
+            }
+        }
+    }
+}
+
 void ClusterRenderer::cull(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const glm::mat4& view_proj,
@@ -1433,45 +1475,11 @@ void ClusterRenderer::cull(
     debug_last_vp_ = view_proj;
     debug_last_cam_pos_ = camera_pos;
 
-    // ── Debug readback (every frame, non-blocking) ────────────────────
-    // Read back PREVIOUS frame's results for debug UI stats.
-    // The GPU has finished the previous frame by the time we begin
-    // recording the current frame (fence waited), so this is safe.
-    // Reading HOST_VISIBLE memory does NOT stall the GPU pipeline —
-    // it only reads already-complete data.
-    {
-        // Read visible count (4 bytes).
-        void* mapped = device_->mapMemory(
-            draw_count_buffer_.memory, sizeof(uint32_t), 0);
-        if (mapped) {
-            std::memcpy(&total_visible_all_meshes_, mapped, sizeof(uint32_t));
-            device_->unmapMemory(draw_count_buffer_.memory);
-        }
-
-        // Read visible cluster indices for per-mesh visibility + triangle stats.
-        visible_triangles_ = 0;
-        if (!mesh_cluster_ranges_.empty() && !cluster_to_mesh_.empty()) {
-            mesh_visible_.assign(mesh_cluster_ranges_.size(), false);
-            const uint32_t vis_count = std::min(
-                total_visible_all_meshes_, total_clusters_all_meshes_);
-            if (vis_count > 0) {
-                void* vis_mapped = device_->mapMemory(
-                    visible_buffer_.memory,
-                    vis_count * sizeof(uint32_t), 0);
-                if (vis_mapped) {
-                    auto* vis_indices = reinterpret_cast<const uint32_t*>(vis_mapped);
-                    for (uint32_t i = 0; i < vis_count; ++i) {
-                        uint32_t ci = vis_indices[i];
-                        if (ci < cluster_to_mesh_.size())
-                            mesh_visible_[cluster_to_mesh_[ci]] = true;
-                        if (ci < cluster_tri_counts_.size())
-                            visible_triangles_ += cluster_tri_counts_[ci];
-                    }
-                    device_->unmapMemory(visible_buffer_.memory);
-                }
-            }
-        }
-    }
+    // Debug-readback prologue.  Kept inline here so existing callers
+    // (probe per-face cull, forward path's main cull) get stats refresh
+    // for free without an extra explicit call.  Deferred path now skips
+    // cull() entirely and calls pollDebugReadback() directly instead.
+    pollDebugReadback();
 
     if (cpu_cull_mode_) {
         // ── CPU frustum culling path ─────────────────────────────────

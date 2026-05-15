@@ -27,6 +27,13 @@ class Menu {
     std::vector<std::string> gltf_file_names_;
     std::vector<std::string> to_load_gltf_names_;
     std::string spawn_gltf_name_;
+    // One-shot "snap the player to the camera" request — drained by
+    // consumeResetPlayerPosition() from application.cpp.  Set by the
+    // "Reset player position" Game Objects menu item; the application
+    // calls PlayerController::spawnAt() with the current camera pose
+    // when this is true, which re-anchors the character to wherever
+    // the user is currently looking.
+    bool reset_player_position_requested_ = false;
     bool turn_off_water_pass_ = false;
     bool turn_off_grass_pass_ = false;
     bool turn_off_ray_tracing_ = false;
@@ -384,6 +391,20 @@ public:
         auto result = spawn_gltf_name_;
         spawn_gltf_name_ = "";
         return result;
+    }
+
+    // One-shot "snap the player to where the camera is looking" request.
+    // The menu sets this when the user picks "Reset player position";
+    // application.cpp reads it each frame, clears it, and (if set) calls
+    // PlayerController::spawnAt() with the current camera + facing.  Used
+    // as the recovery path when the player ends up off-screen — either
+    // because the auto-spawn block fired before the player asset was
+    // fully ready, or because the user wandered the camera away from
+    // wherever the character actually stands.
+    bool consumeResetPlayerPosition() {
+        bool v = reset_player_position_requested_;
+        reset_player_position_requested_ = false;
+        return v;
     }
 
     // CSM debug visualisation

@@ -504,6 +504,20 @@ public:
         const glm::mat4& last_view_proj = glm::mat4(1.0f),
         std::optional<bool> hiz_cull_override = std::nullopt);
 
+    // ── Debug-readback prologue (split out of cull()) ────────────────
+    // Maps last frame's draw_count_buffer_ + visible_buffer_ to refresh
+    // the Smart Mesh ImGui stats (total visible clusters, per-mesh
+    // visibility flags, total visible triangle count).  Strictly a
+    // host-side read of already-completed GPU data — no command-buffer
+    // recording, no GPU work.
+    //
+    // Originally lived at the top of cull(), which meant if a frame
+    // skipped cull() (e.g. deferred mode's Phase A/B path now bypasses
+    // the legacy cull entirely), the stats would freeze.  Exposed as
+    // its own method so the deferred path can keep stats up to date
+    // without re-running the now-redundant cull dispatch.
+    void pollDebugReadback();
+
     // ── Per-cascade shadow cull ──────────────────────────────────────
     // Runs cluster_cull.comp CSM_CASCADE_COUNT times, each dispatch
     // testing every cluster against ONE cascade's tight VP (frustum +

@@ -1099,6 +1099,16 @@ bool Menu::draw(
                 s_spawn_player = true;
             }
 
+            // Recovery option for the "I can't find my character" case:
+            // re-anchors the player to a point ~3m in front of the
+            // current camera, on the ground.  Cheap to invoke — just
+            // sets a flag the application drains and forwards to
+            // PlayerController::spawnAt().  See the menu's
+            // reset_player_position_requested_ field for details.
+            if (ImGui::MenuItem("Reset player position", NULL)) {
+                reset_player_position_requested_ = true;
+            }
+
             if (ImGui::MenuItem("Load gltf", NULL)) {
                 s_select_load_gltf = true;
             }
@@ -1326,6 +1336,33 @@ bool Menu::draw(
             if (ImGui::MenuItem(
                     "Show Probes (in scene)", NULL, show_probe_debug_)) {
                 show_probe_debug_ = !show_probe_debug_;
+            }
+
+            // ── Glass / translucent rendering mode ───────────────────────
+            // Pure storage on the cluster renderer; the application's
+            // glass dispatch block in drawScene reads this and calls
+            // either drawTranslucentForward (ALPHA_BLEND) or
+            // drawTranslucentOit (WBOIT).  Both pipelines are kept alive
+            // after init, so switching is free at runtime.  Previously
+            // lived inside the VT Pool Debug window, which made it
+            // invisible unless that unrelated viewer happened to be open.
+            if (cluster_renderer_) {
+                ImGui::Separator();
+                using TMode = engine::scene_rendering::
+                    ClusterRenderer::TranslucentMode;
+                TMode cur_mode = cluster_renderer_->getTranslucentMode();
+                if (ImGui::MenuItem(
+                        "Glass: Alpha Blend (forward)", NULL,
+                        cur_mode == TMode::ALPHA_BLEND)) {
+                    cluster_renderer_->setTranslucentMode(
+                        TMode::ALPHA_BLEND);
+                }
+                if (ImGui::MenuItem(
+                        "Glass: WBOIT (order-independent)", NULL,
+                        cur_mode == TMode::WBOIT)) {
+                    cluster_renderer_->setTranslucentMode(
+                        TMode::WBOIT);
+                }
             }
             ImGui::EndMenu();
         }
@@ -1924,29 +1961,9 @@ bool Menu::draw(
                 ImGui::SameLine();
                 ImGui::TextDisabled(
                     "(off → legacy bindless texture arrays)");
-
-                // ── Glass / translucent mode picker ───────────────────
-                // Pure storage on the cluster renderer; the application's
-                // glass dispatch block in drawScene reads this and calls
-                // either drawTranslucentForward (ALPHA_BLEND) or
-                // drawTranslucentOit (WBOIT).  Switch is free at runtime
-                // — both pipelines are kept alive after init.
-                using TMode = engine::scene_rendering::
-                    ClusterRenderer::TranslucentMode;
-                TMode cur_mode = cluster_renderer_->getTranslucentMode();
-                int   mode_idx = (cur_mode == TMode::WBOIT) ? 1 : 0;
-                const char* mode_labels[] = {
-                    "Alpha Blend (forward)",
-                    "WBOIT (order-independent)"
-                };
-                if (ImGui::Combo("Glass Mode", &mode_idx,
-                                 mode_labels, IM_ARRAYSIZE(mode_labels))) {
-                    cluster_renderer_->setTranslucentMode(
-                        (mode_idx == 1) ? TMode::WBOIT : TMode::ALPHA_BLEND);
-                }
-                ImGui::SameLine();
-                ImGui::TextDisabled(
-                    "(WBOIT = McGuire-Bavoil weighted blend)");
+                // (The Glass translucent-mode picker lives in the main
+                // menu bar under Render Debug → Glass: ... — it was
+                // previously parked here but is unrelated to VT.)
                 ImGui::Separator();
             }
 
