@@ -49,6 +49,10 @@ layout(std140, set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTAN
 layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 0) readonly buffer ClusterCullBuffer {
     ClusterCullInfo cluster_cull_infos[];
 };
+// Cluster draw infos + material params — used to look up each cluster's
+// material's double_sided / translucent flags, which gate the cone cull
+// below (we don't cone-cull clusters whose material is authored as
+// double-sided since they intentionally need both sides drawn).
 layout(std430, set = CLUSTER_MESH_DATA_SET, binding = 1) readonly buffer ClusterDrawBuffer {
     ClusterDrawInfo cluster_draw_infos[];
 };
@@ -66,18 +70,15 @@ struct ShadowEmitPair {
 taskPayloadSharedEXT ShadowEmitPair payload[MAX_SURVIVORS];
 
 // ── Directional-light cone (backface) cull ───────────────────────────
-// For an infinite directional light, the per-cluster cone test that the
-// main-camera cluster_cull.comp performs simplifies dramatically: the
-// "camera position" is at infinity along -light_dir, which means the
-// per-cluster view direction collapses to a single constant —
-// view_dir = light_dir (the sun ray's direction of travel).
+// For an infinite directional light, the per-cluster cone test that
+// cluster_cull.comp uses on the main camera simplifies to a single dot
+// product against the sun ray direction.  Cull if dot(light_dir,
+// cone_axis) >= cone_cutoff, i.e. the cluster's outward-normal cone is
+// fully aligned with the sun rays — every face of the cluster faces
+// away from the sun, so the rasterizer's back-face cull would drop
+// them all anyway.  Pre-rejecting at the cluster level saves PD setup.
 //
-// The test then becomes:
-//     cull if dot(light_dir, cone_axis) >= cone_cutoff
-//
-// where cone_axis is the cluster's area-weighted average outward face
-// normal (unit) and cone_cutoff = sin(θ_max).  cone_cutoff < 0 means
-// "cone too wide / degenerate" — don't cull.
+// cone_cutoff < 0 means "cone too wide / degenerate"; don't cull.
 bool isBackfacingDirectional(vec3 cone_axis, float cone_cutoff, vec3 light_dir) {
     if (cone_cutoff < 0.0) return false;
     return dot(light_dir, cone_axis) >= cone_cutoff;
@@ -129,47 +130,25 @@ void main() {
         vec3 center  = cull.bounds_sphere.xyz;
         float radius = cull.bounds_sphere.w;
 
-        // ── Cone (backface) cull against sun direction ────────────────
-        // The sun's direction of travel is lights_params.lights[0]
-        // .direction (FROM the sun TO the scene; base.frag negates it
-        // to get the "L" vector pointing to-light).  A cluster whose
-        // outward-normal cone is aligned with the sun ray is entirely
-        // self-occluded by its own front faces — the back faces would
-        // get z-write-rejected by their own fronts.  Skip the whole
-        // cluster for ALL cascades in that case (the cone test is
-        // cascade-independent for directional light).
+        // ── No cone cull — GS-mode parity ────────────────────────────
+        // The cluster GS shadow path (drawClusterShadowGs) does NOT do
+        // any per-cluster cone cull — it just renders every cluster's
+        // tris and lets the rasterizer's back-face cull drop wrong-
+        // facing tris.  For MeshShader-mode parity with GS-mode
+        // visuals, this task shader skips the cone cull too: the
+        // rasterizer will drop the same back-faces a cone cull would
+        // have rejected.  Re-enable the cone cull here only when its
+        // perf win demonstrably outweighs the rare correctness pitfalls
+        // (e.g. cone-axis precision near the cutoff, or assets with
+        // mis-derived cones from the offline cluster builder).
         //
-        // Material-flag gate: double-sided geometry (foliage, fences)
-        // and translucent materials (glass-without-cull-flag) still
-        // need both sides drawn — skip the cone test for those, same
-        // as cluster_cull.comp's main-camera path.
-        bool cone_cull = false;
-        {
-            // ClusterDrawInfo carries the material index; one fetch per
-            // lane.  Material flags read identically to cluster_cull.comp.
-            ClusterDrawInfo            draw = cluster_draw_infos[cluster_idx];
-            BindlessMaterialParams      mat = material_params[draw.material_idx];
-            uint   mat_flags        = mat.flags;
-            float  mat_alpha_factor = mat.base_color_factor.a;
-            bool   is_double_sided  = (mat_flags & BINDLESS_MAT_DOUBLE_SIDED) != 0;
-            bool   is_translucent =
-                (mat_flags & BINDLESS_MAT_TRANSLUCENT) != 0 ||
-                mat_alpha_factor < 0.9;
-            if (!is_double_sided && !is_translucent) {
-                vec3 light_dir = normalize(lights_params.lights[0].direction);
-                cone_cull = isBackfacingDirectional(
-                    cull.cone_axis_cutoff.xyz,
-                    cull.cone_axis_cutoff.w,
-                    light_dir);
-            }
-        }
+        // Frustum cull is still safe — it's purely cascade-driven, no
+        // face-orientation involved.
 
-        if (!cone_cull) {
-            for (uint c = 0u; c < uint(CSM_CASCADE_COUNT); ++c) {
-                if (sphereInShadowFrustum(lights_params.light_view_proj[c], center, radius)) {
-                    local_pass_mask |= (1u << c);
-                    local_pass_count += 1u;
-                }
+        for (uint c = 0u; c < uint(CSM_CASCADE_COUNT); ++c) {
+            if (sphereInShadowFrustum(lights_params.light_view_proj[c], center, radius)) {
+                local_pass_mask |= (1u << c);
+                local_pass_count += 1u;
             }
         }
     }

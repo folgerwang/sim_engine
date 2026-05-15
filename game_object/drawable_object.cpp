@@ -3345,26 +3345,13 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     rasterization_state_override.override_depth_clamp_enable = true;
     rasterization_state_override.depth_clamp_enable = true;
     // ── Sidedness for the SHADOW pass ──────────────────────────────
-    // For MASK / BLEND assets (foliage, fences, cloth, leaves) we
-    // FORCE double_sided = true regardless of the asset's authored
-    // flag: a single-sided thin asset viewed from the shadow caster's
-    // side may have its front normals pointing away from the light, in
-    // which case back-face culling would drop every triangle and the
-    // surface would stop casting shadow.  Double-sided rasterises
-    // both sides into the depth attachment and produces correct
-    // silhouettes.
-    //
-    // For OPAQUE assets (most of Bistro — walls, columns, floors,
-    // props) those are closed-volume meshes, and respecting the
-    // asset's authored double_sided flag lets back-face culling
-    // halve rasterised triangles.  glTF assets ship double_sided
-    // accurately: thin/foliage = true, solid = false.  This is the
-    // path taken by the forward pipeline too (see
-    // createDrawablePipelineInternal above), so visual consistency
-    // is preserved.
+    // Always respect the asset's authored double_sided flag — no more
+    // is_opaque-vs-mask defensive override.  Asset bugs (single-sided
+    // thin geometry not flagged double-sided) are the asset's problem;
+    // the engine trusts the flag.  This matches the forward pass and
+    // halves rasterised triangles for closed-solid materials.
     rasterization_state_override.override_double_sided = true;
-    rasterization_state_override.double_sided =
-        is_opaque ? primitive.tag_.double_sided : true;
+    rasterization_state_override.double_sided = primitive.tag_.double_sided;
     auto drawable_pipeline = device->createPipeline(
         pipeline_layout,
         binding_descs,
@@ -4534,6 +4521,26 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                 update_instance_buffer_desc_set_layout_,
                 game_objects_buffer_);
 
+            // ── Mesh-shader CSM resources (parity with sync path) ─────
+            // Builds the hash-cached mesh-shader pipeline + per-primitive
+            // descriptor sets for eligible primitives (opaque, non-skinned,
+            // UINT32 indices, ≤256 verts/tris).  MUST run AFTER the
+            // instance_buffer_ createBuffer above — buildMeshShaderShadow-
+            // Resources writes instance_buffer_.buffer into binding 2 of
+            // each per-primitive descriptor set.  Without this call,
+            // async-loaded primitives leave mesh_shader_shadow_desc_set_
+            // null and dispatch falls back to the GS pipeline inside
+            // drawMesh.  Sync path mirror at line ~4290.
+            buildMeshShaderShadowResources(
+                device,
+                descriptor_pool,
+                mesh_shader_shadow_desc_set_layout_,
+                mesh_shader_shadow_pipeline_layout_,
+                renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                graphic_pipeline_info,
+                data,
+                drawable_csm_mesh_shader_pipeline_list_);
+
             // Publish into the global cache so subsequent loads of
             // the same file short-circuit in createAsync's cache
             // check above.
@@ -5113,9 +5120,17 @@ void DrawableObject::updateInstanceBuffer(
         return;
     }
 
+    // Pre-dispatch barrier: WAR — the previous frame's reads of this
+    // buffer must complete before we overwrite it.  Both consumers of
+    // the instance buffer must be covered:
+    //   • GS / Regular path  : input assembler reads at VERTEX_INPUT
+    //   • Mesh-shader path   : storage-buffer reads at MESH_SHADER_BIT_EXT
+    // Without MESH stage in the src mask, the compute write would race
+    // the previous frame's mesh-shader read of the same buffer.
     cmd_buf->addBufferBarrier(
         object_->instance_buffer_.buffer,
-        { SET_FLAG_BIT(Access, VERTEX_ATTRIBUTE_READ_BIT), SET_FLAG_BIT(PipelineStage, VERTEX_INPUT_BIT) },
+        { SET_2_FLAG_BITS(Access, VERTEX_ATTRIBUTE_READ_BIT, SHADER_READ_BIT),
+          SET_2_FLAG_BITS(PipelineStage, VERTEX_INPUT_BIT, MESH_SHADER_BIT_EXT) },
         { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
         object_->instance_buffer_.buffer->getSize());
 
@@ -5138,10 +5153,20 @@ void DrawableObject::updateInstanceBuffer(
 
     cmd_buf->dispatch((params.num_instances + 63) / 64, 1);
 
+    // Post-dispatch barrier: RAW — compute writes must be visible to
+    // EVERY downstream consumer of the instance buffer this frame:
+    //   • GS / Regular path  : input assembler reads at VERTEX_INPUT
+    //   • Mesh-shader path   : storage-buffer reads at MESH_SHADER_BIT_EXT
+    // Without MESH stage in the dst mask the mesh shader can race the
+    // compute write and read STALE / UNDEFINED instance transforms,
+    // which manifests as missing or mis-positioned shadow casters in
+    // the kCsmMeshShader draw mode (the GS / Regular paths are fine
+    // because their VERTEX_INPUT_BIT dst is covered).
     cmd_buf->addBufferBarrier(
         object_->instance_buffer_.buffer,
         { SET_FLAG_BIT(Access, SHADER_WRITE_BIT), SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) },
-        { SET_FLAG_BIT(Access, VERTEX_ATTRIBUTE_READ_BIT), SET_FLAG_BIT(PipelineStage, VERTEX_INPUT_BIT) },
+        { SET_2_FLAG_BITS(Access, VERTEX_ATTRIBUTE_READ_BIT, SHADER_READ_BIT),
+          SET_2_FLAG_BITS(PipelineStage, VERTEX_INPUT_BIT, MESH_SHADER_BIT_EXT) },
         object_->instance_buffer_.buffer->getSize());
 }
 

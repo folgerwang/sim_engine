@@ -69,7 +69,7 @@ public:
     };
 
 private:
-    CsmDrawMode csm_draw_mode_ = CsmDrawMode::kGeometryShader;
+    CsmDrawMode csm_draw_mode_ = CsmDrawMode::kMeshShader;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;
     // PBR / forward-pass debug visualisation; values match

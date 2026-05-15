@@ -3121,14 +3121,26 @@ void ClusterRenderer::initBindlessShadowPipeline(
     // ── Rasterization state ──────────────────────────────────────────
     // depth_clamp_enable=true: keep fragments outside the cascade depth
     // range from being clipped (matches createDrawableShadowPipelineInternal).
-    // double_sided=true: shadow pass should never cull back faces, single-
-    // sided thin geometry (fences, leaves) viewed from the light's side
-    // would otherwise stop casting shadows.
+    //
+    // No more force-double-sided override.  The cluster shadow pipeline
+    // is shared across all cluster materials (single pipeline per CSM
+    // draw mode, no per-material variant), so the rasterizer ends up at
+    // its default cull mode (back-face cull).  This matches the drawable
+    // shadow path's per-material behaviour for single-sided assets and
+    // gives us cluster-level back-face dropping for free.
+    //
+    // Trade-off: any cluster whose material is authored as double_sided
+    // (foliage, fences) loses its back-face shadow on this path because
+    // the rasterizer here can't tell per-cluster what the material
+    // flag says.  Asset authors who need double-sided shadow coverage
+    // for thin geometry should keep that geometry on the drawable
+    // (non-cluster) path, which has per-material pipelines.  In the
+    // MeshShader path the task shader additionally cone-culls clusters
+    // whose normal cone is fully aligned with the sun (perf), gated on
+    // the material flag — see cluster_bindless_shadow.task.
     er::RasterizationStateOverride raster_override{};
     raster_override.override_depth_clamp_enable = true;
     raster_override.depth_clamp_enable          = true;
-    raster_override.override_double_sided       = true;
-    raster_override.double_sided                = true;
 
     // ── Depth-stencil state ─────────────────────────────────────────
     // Standard shadow depth-pass state: test + write enabled, LESS_OR_EQUAL.
