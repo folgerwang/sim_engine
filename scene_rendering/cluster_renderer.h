@@ -299,6 +299,30 @@ private:
     std::shared_ptr<renderer::PipelineLayout>      silhouette_prepass_pipeline_layout_;
     std::shared_ptr<renderer::Pipeline>            silhouette_prepass_pipeline_;
 
+    // ── Cluster shadow pipeline variants for the 3-way menu toggle ──────
+    // bindless_shadow_pipeline_         (above) — task+mesh, layered FB.
+    //                                              "MeshShader" mode.
+    // bindless_shadow_gs_pipeline_      — VS+GS, layered FB.
+    //                                              "GeometryShader" mode.
+    //                                              Uses cluster_bindless
+    //                                              _shadow.vert + .geom
+    //                                              (the legacy-shape-B
+    //                                              shaders kept in tree).
+    // bindless_shadow_per_cascade_pipeline_ — VS-only, single-layer FB.
+    //                                              "Regular" mode.  Host
+    //                                              loops cascades, each
+    //                                              iteration pushes its
+    //                                              cascade_idx and renders
+    //                                              into csm_layer_views_[k].
+    //
+    // Both new pipelines use a slim layout (RUNTIME_LIGHTS_PARAMS_SET
+    // only — no cluster mesh-data set, no SSBOs — they bind the merged
+    // VB/IB through the input assembler the classic way).
+    std::shared_ptr<renderer::PipelineLayout>      bindless_shadow_gs_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            bindless_shadow_gs_pipeline_;
+    std::shared_ptr<renderer::PipelineLayout>      bindless_shadow_per_cascade_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            bindless_shadow_per_cascade_pipeline_;
+
     // (Re)create the OIT accum + reveal targets at the requested size,
     // and update the composite descriptor set to point at the new views.
     // Lazy: no-op when the size hasn't changed.  Called from draw() so
@@ -649,6 +673,34 @@ public:
         const renderer::DescriptorSetList& desc_sets,
         const std::vector<renderer::Viewport>& viewports,
         const std::vector<renderer::Scissor>& scissors);
+
+    // Cluster CSM shadow draw — VS+GS variant ("GeometryShader" mode).
+    // Caller MUST have an active dynamic-rendering pass with the full
+    // CSM_CASCADE_COUNT-layer depth attachment bound and
+    // layer_count = CSM_CASCADE_COUNT so the GS's gl_Layer writes land
+    // on the right cascade.  Single drawIndexed over the merged VB/IB;
+    // the GS broadcasts each triangle to all CSM_CASCADE_COUNT layers.
+    // Returns total cluster count (no per-cluster cull on this path).
+    uint32_t drawClusterShadowGs(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
+    // Cluster CSM shadow draw — VS-only per-cascade variant ("Regular"
+    // mode).  Caller MUST have an active dynamic-rendering pass with a
+    // SINGLE-layer view of cascade `cascade_idx` (typically
+    // csm_layer_views_[cascade_idx]) bound and layer_count = 1.  Caller
+    // is expected to loop k=0..CSM_CASCADE_COUNT-1, opening a fresh
+    // single-layer scope each iteration and calling this with k.
+    // Pushes cascade_idx to the VS as a uint push constant; the VS
+    // looks up lights_params.light_view_proj[cascade_idx].
+    uint32_t drawClusterShadowPerCascade(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors,
+        uint32_t cascade_idx);
 
     // Forward alpha-blended translucent draw.  Caller MUST have a
     // dynamic-rendering pass on (color_view, depth_view) currently

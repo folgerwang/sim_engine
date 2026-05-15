@@ -37,6 +37,25 @@
 layout(local_size_x = 8) in;            // 8 lanes = 8 hex corners
 layout(triangles, max_vertices = 8, max_primitives = 12) out;
 
+// World-space margin we push every slab corner outward by (relative to
+// the slab's centroid) before projecting.  Has to be ≥ the maximum PCF
+// kernel radius used at shadow lookup, otherwise a receiver near the
+// silhouette edge will have PCF taps that land in the cleared 0-region
+// just outside the silhouette and read shadow-depth = 0 → "in shadow"
+// → harsh dark fringe on the silhouette boundary.
+//
+// Sources for the PCF radius cap:
+//   base.frag             : CSM_MAX_PCF_RADIUS_WORLD = 0.80
+//   cluster_bindless.frag : CSM_MAX_PCF_RADIUS_WORLD = 0.80
+//   deferred_resolve.comp : CSM_MAX_PCF_RADIUS_WORLD = 0.80
+//
+// We add ~25% headroom for bilinear filter footprint and to absorb a
+// future PCF-radius bump without having to re-tune this shader.  All
+// units are world-space metres; the same value works across every
+// cascade because PCF reaches the same physical distance regardless of
+// which cascade is in use.
+#define SILHOUETTE_MARGIN_WS 1.0
+
 out gl_MeshPerVertexEXT {
     vec4 gl_Position;
 } gl_MeshVerticesEXT[];
@@ -70,6 +89,8 @@ const uvec3 kHexTris[12] = uvec3[12](
     uvec3(2u, 3u, 7u), uvec3(2u, 7u, 6u)
 );
 
+shared vec3 s_centroid_ws;
+
 void main() {
     uint cascade_idx = gl_WorkGroupID.x;
     uint lane        = gl_LocalInvocationID.x;
@@ -79,10 +100,33 @@ void main() {
     // SetMeshOutputsEXT to be in dynamically uniform control flow.
     SetMeshOutputsEXT(8u, 12u);
 
-    // Each of the 8 lanes emits one hex corner.
+    // Lane 0 averages the 8 world-space slab corners so every other
+    // lane can push its own corner outward from this centroid.  Doing
+    // this in lane 0 avoids relying on subgroup ops that may include
+    // inactive lanes when the workgroup (8) is smaller than the warp
+    // size (32 on NV).
+    if (lane == 0u) {
+        vec3 sum = vec3(0.0);
+        for (uint i = 0u; i < 8u; ++i) {
+            sum += lights_params.cascade_slab_corners_ws[
+                cascade_idx * 8u + i].xyz;
+        }
+        s_centroid_ws = sum / 8.0;
+    }
+    barrier();
+
+    // Each of the 8 lanes emits one hex corner, pushed outward from
+    // the slab centroid by SILHOUETTE_MARGIN_WS world metres so the
+    // projected silhouette grows by at least the PCF kernel radius in
+    // every direction.  See the #define block above for the rationale.
     if (lane < 8u) {
         vec3 corner_ws = lights_params.cascade_slab_corners_ws[
             cascade_idx * 8u + lane].xyz;
+        vec3 dir = corner_ws - s_centroid_ws;
+        float len = length(dir);
+        if (len > 1e-5) {
+            corner_ws += (dir / len) * SILHOUETTE_MARGIN_WS;
+        }
         vec4 clip = vp * vec4(corner_ws, 1.0);
         // Force NDC z = 1.0 (far in Vulkan [0,1] depth range) so the
         // entire silhouette interior gets the MAX possible depth, which

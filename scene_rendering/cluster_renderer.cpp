@@ -3184,6 +3184,106 @@ void ClusterRenderer::initBindlessShadowPipeline(
         shadow_fmt,
         raster_override,
         std::source_location::current());
+
+    // ── Auxiliary cluster shadow pipelines (GS + per-cascade) ────────
+    // Built alongside the task+mesh pipeline so the menu's "Drawable
+    // shadow draw mode" 3-way toggle can drive the cluster path too.
+    // Both share the renderbuffer format / depth-stencil / blend /
+    // raster-override scaffolding above.
+
+    // Slim layout for both — RUNTIME_LIGHTS_PARAMS_SET only (the GS
+    // and per-cascade VS read light_view_proj from the UBO).  We do
+    // NOT include CLUSTER_MESH_DATA_SET here: these pipelines bind the
+    // merged VB/IB through the input assembler, not as SSBOs.
+    er::DescriptorSetLayoutList aux_layouts;
+    auto aux_empty_layout = device_->createDescriptorSetLayout({});
+    for (uint32_t i = 0; i <= RUNTIME_LIGHTS_PARAMS_SET; ++i) {
+        std::shared_ptr<er::DescriptorSetLayout> layout =
+            (i < shadow_desc_set_layouts.size())
+                ? shadow_desc_set_layouts[i]
+                : nullptr;
+        aux_layouts.push_back(layout ? layout : aux_empty_layout);
+    }
+
+    // Vertex input: position only (matches BindlessVertex.position
+    // location 0).  Same layout the mesh path uses internally; the
+    // input assembler simply pulls position from the merged VB.
+    std::vector<er::VertexInputBindingDescription> aux_binding_descs(1);
+    aux_binding_descs[0].binding    = 0;
+    aux_binding_descs[0].stride     = sizeof(BindlessVertex);
+    aux_binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
+
+    std::vector<er::VertexInputAttributeDescription> aux_attrib_descs(1);
+    aux_attrib_descs[0].binding  = 0;
+    aux_attrib_descs[0].location = 0;
+    aux_attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
+    aux_attrib_descs[0].offset   = offsetof(BindlessVertex, position);
+
+    // ─── GS pipeline (kGeometryShader) ─────────────────────────────
+    // VS passes world position; GS broadcasts each tri to all 6 layers
+    // applying lights_params.light_view_proj[cascade] per emit.  Layered
+    // FB (CSM_CASCADE_COUNT) — same as the mesh-shader pipeline.
+    {
+        bindless_shadow_gs_pipeline_layout_ = device_->createPipelineLayout(
+            aux_layouts, {}, std::source_location::current());
+
+        er::ShaderModuleList gs_modules(2);
+        gs_modules[0] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_shadow_vert.spv",
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+        gs_modules[1] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_shadow_geom.spv",
+            er::ShaderStageFlagBits::GEOMETRY_BIT,
+            std::source_location::current());
+
+        bindless_shadow_gs_pipeline_ = device_->createPipeline(
+            bindless_shadow_gs_pipeline_layout_,
+            aux_binding_descs,
+            aux_attrib_descs,
+            input_assembly,
+            shadow_info,
+            gs_modules,
+            shadow_fmt,
+            raster_override,
+            std::source_location::current());
+    }
+
+    // ─── Per-cascade VS pipeline (kRegular) ───────────────────────
+    // Push constant: uint cascade_idx (4 bytes, VS visibility).  Host
+    // loops cascades, each iteration pushes its index and renders into
+    // a single-layer view of csm_shadow_tex_.
+    {
+        er::PushConstantRange per_cascade_pc{};
+        per_cascade_pc.stage_flags = SET_FLAG_BIT(ShaderStage, VERTEX_BIT);
+        per_cascade_pc.offset      = 0;
+        per_cascade_pc.size        = sizeof(uint32_t);
+
+        bindless_shadow_per_cascade_pipeline_layout_ =
+            device_->createPipelineLayout(
+                aux_layouts, { per_cascade_pc },
+                std::source_location::current());
+
+        er::ShaderModuleList vs_modules(1);
+        vs_modules[0] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_shadow_per_cascade_vert.spv",
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+
+        // Per-cascade FB has only ONE layer (csm_layer_views_[k]).  No
+        // change to shadow_fmt is needed for that — the format struct
+        // doesn't carry layer count; that's a runtime RenderingInfo field.
+        bindless_shadow_per_cascade_pipeline_ = device_->createPipeline(
+            bindless_shadow_per_cascade_pipeline_layout_,
+            aux_binding_descs,
+            aux_attrib_descs,
+            input_assembly,
+            shadow_info,
+            vs_modules,
+            shadow_fmt,
+            raster_override,
+            std::source_location::current());
+    }
 }
 
 // ─── CSM silhouette prepass pipeline + draw ──────────────────────────────
@@ -3373,6 +3473,114 @@ uint32_t ClusterRenderer::drawClusterShadow(
         (total_clusters_all_meshes_ + kClustersPerTaskWg - 1u) /
         kClustersPerTaskWg;
     cmd_buf->drawMeshTasks(task_wg_count, 1u, 1u);
+    return total_clusters_all_meshes_;
+}
+
+// ─── Cluster CSM shadow draw — VS+GS broadcast (kGeometryShader) ────────
+// Single drawIndexed over the entire merged VB/IB; the GS broadcasts
+// each triangle to all CSM_CASCADE_COUNT depth-array layers.  No per-
+// cluster cull on this path — every cluster's tris go to every cascade
+// (the per-cascade rasterizer eventually clips fragments outside the
+// cascade XY extent + the silhouette-prepass depth-rejection takes care
+// of out-of-frustum waste).
+//
+// Caller MUST have an active dynamic-rendering pass with the full
+// CSM_CASCADE_COUNT-layer depth attachment bound and
+// layer_count = CSM_CASCADE_COUNT on the RenderingInfo so the GS's
+// gl_Layer writes land on the right cascade.
+uint32_t ClusterRenderer::drawClusterShadowGs(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !bindless_shadow_gs_pipeline_) {
+        return 0;
+    }
+
+    // Pad / truncate to the GS pipeline layout's slot count
+    // (RUNTIME_LIGHTS_PARAMS_SET + 1 entries, no cluster mesh-data set).
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= RUNTIME_LIGHTS_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets.resize(RUNTIME_LIGHTS_PARAMS_SET + 1);
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, bindless_shadow_gs_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_shadow_gs_pipeline_layout_,
+        all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexed(
+        total_merged_indices_,
+        /*instance_count*/ 1,
+        /*first_index*/    0,
+        /*vertex_offset*/  0,
+        /*first_instance*/ 0);
+    return total_clusters_all_meshes_;
+}
+
+// ─── Cluster CSM shadow draw — VS-only per-cascade (kRegular) ──────────
+// Single-cascade single-layer draw.  Caller MUST have an active dynamic-
+// rendering pass with a SINGLE-LAYER view (csm_layer_views_[cascade_idx])
+// bound and layer_count = 1.  Caller is expected to loop k=0..N-1, opening
+// a fresh single-layer scope each iteration and calling this with k.
+//
+// VS reads lights_params.light_view_proj[cascade_idx] — picked via the
+// uint push constant.  No cull, no GS, no mesh shader.  Same triangle
+// work as the GS path, but split across CSM_CASCADE_COUNT separate
+// drawIndexed calls + render passes.
+uint32_t ClusterRenderer::drawClusterShadowPerCascade(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    uint32_t cascade_idx) {
+    if (!gpu_ready_ || !bindless_shadow_per_cascade_pipeline_) {
+        return 0;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= RUNTIME_LIGHTS_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets.resize(RUNTIME_LIGHTS_PARAMS_SET + 1);
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_shadow_per_cascade_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_shadow_per_cascade_pipeline_layout_,
+        all_desc_sets);
+
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
+        bindless_shadow_per_cascade_pipeline_layout_,
+        &cascade_idx,
+        sizeof(uint32_t),
+        0);
+
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexed(
+        total_merged_indices_,
+        /*instance_count*/ 1,
+        /*first_index*/    0,
+        /*vertex_offset*/  0,
+        /*first_instance*/ 0);
     return total_clusters_all_meshes_;
 }
 
@@ -3708,6 +3916,12 @@ void ClusterRenderer::destroy() {
     // CSM silhouette prepass pipeline.
     silhouette_prepass_pipeline_.reset();
     silhouette_prepass_pipeline_layout_.reset();
+
+    // Cluster shadow GS + per-cascade pipelines (kGeometryShader / kRegular).
+    bindless_shadow_gs_pipeline_.reset();
+    bindless_shadow_gs_pipeline_layout_.reset();
+    bindless_shadow_per_cascade_pipeline_.reset();
+    bindless_shadow_per_cascade_pipeline_layout_.reset();
 
     // ── OIT resources ──
     oit_composite_pipeline_.reset();
