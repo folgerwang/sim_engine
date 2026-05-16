@@ -277,11 +277,19 @@ public:
     DrawableData(const std::shared_ptr<renderer::Device>& device) : device_(device) {}
     ~DrawableData() {}
 
+    // skip_animations: when true, the imported glTF animation channels
+    // are NOT evaluated for this frame.  Node transforms keep whatever
+    // values the caller has just written (e.g. PlayerController::
+    // applyPose for procedurally-driven rigs).  Joint matrices are still
+    // recomputed from the current node hierarchy, so the rig still
+    // animates — just from the caller's writes instead of the imported
+    // animation timeline.
     void update(
         const std::shared_ptr<renderer::Device>& device,
         const uint32_t& active_anim_idx,
         const float& time,
-        bool use_local_matrix_only);
+        bool use_local_matrix_only,
+        bool skip_animations = false);
 
     glm::mat4 getNodeMatrix(
         const int32_t& node_idx,
@@ -308,6 +316,10 @@ class DrawableObject {
     };
     std::shared_ptr<DrawableData>   object_;
     glm::mat4                   location_;
+
+    // See setUseNodeTransformOnly() in the public section for what this
+    // flag does and why the player controller has to set it.
+    bool                        use_node_transform_only_ = false;
 
     // static members.
     static uint32_t max_alloc_game_objects_in_buffer;
@@ -458,6 +470,34 @@ public:
     void setRootNodeTransform(
         const glm::vec3& translation,
         const glm::quat& rotation);
+
+    // Opt the drawable into "external code fully owns the rig" mode.
+    // PlayerController-driven drawables (and any future similar
+    // procedurally-posed character) MUST enable this.  Has TWO effects,
+    // both required to make the player render at the controller's
+    // spawn position with the controller's procedural pose:
+    //
+    //  1. updateInstanceBuffer's compute pass writes an IDENTITY
+    //     instance transform (zero translation, unit rotation, scale 1)
+    //     instead of reading the shared game_objects_buffer_'s slot 0
+    //     position.  That slot is initialised to camera_pos on frame 0
+    //     and then drifts via gravity — without this flag, base.vert
+    //     compounds it with the node translation, double-transforming
+    //     the drawable and pushing it 2× the camera offset off-screen.
+    //
+    //  2. The imported glTF animation channels are NOT evaluated each
+    //     frame.  For rigs with baked animations (e.g. CesiumMan's walk
+    //     cycle), the animation update would otherwise run AFTER
+    //     PlayerController::applyPose and clobber the controller's just-
+    //     written root translation + limb rotations — making the
+    //     character render at the animation's authored origin (~0,0,0)
+    //     and replay its imported limb pose on top of the controller's.
+    //     Joint matrices are still recomputed from the current node
+    //     hierarchy, so the rig still animates — just from the
+    //     controller's writes instead of the imported timeline.
+    void setUseNodeTransformOnly(bool v) { use_node_transform_only_ = v; }
+    bool getUseNodeTransformOnly() const { return use_node_transform_only_; }
+
     int  findNodeIndexByName(const std::string& name) const;
     bool setNodeRotationByName(
         const std::string& name,

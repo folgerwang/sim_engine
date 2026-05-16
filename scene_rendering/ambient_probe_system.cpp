@@ -151,6 +151,56 @@ void AmbientProbeSystem::createProjectPipeline(
     device->updateDescriptorSets(writes);
 }
 
+// ─── Pool-owned descriptor cleanup / re-allocation ─────────────────────
+//
+// Counterpart of the same-named helpers on ClusterRenderer.  Without
+// these the per-frame writeProjectDescriptorsForCube call would touch a
+// dangling Vulkan descriptor-set handle after the application's main
+// descriptor pool is destroyed in cleanupSwapChain (typically triggered
+// by window resize / alt-tab / device-format change).  NVIDIA's driver
+// crashes deep inside vkUpdateDescriptorSets when that happens.
+void AmbientProbeSystem::onDescriptorPoolDestroyed() {
+    probe_desc_set_.reset();
+    project_desc_set_.reset();
+}
+
+void AmbientProbeSystem::recreateDescriptorSets(
+    const std::shared_ptr<er::Device>& device,
+    const std::shared_ptr<er::DescriptorPool>& descriptor_pool) {
+    // Only meaningful once createProbeBuffer + createProjectPipeline
+    // have built the layouts — i.e. after AmbientProbeSystem::create.
+    // Before that there's nothing to re-allocate.
+    if (probe_desc_set_layout_ && probe_buffer_.buffer) {
+        probe_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, probe_desc_set_layout_, 1)[0];
+        // Re-bind the probe SSBO at binding 0.  Mirrors the write
+        // issued at the bottom of createProbeBuffer.
+        const auto buffer_size =
+            static_cast<uint32_t>(sizeof(ProbeData) * getProbeCount());
+        er::WriteDescriptorList writes;
+        er::Helper::addOneBuffer(writes, probe_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, 0,
+            probe_buffer_.buffer, buffer_size);
+        device->updateDescriptorSets(writes);
+    }
+
+    if (project_desc_set_layout_ && probe_buffer_.buffer) {
+        project_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, project_desc_set_layout_, 1)[0];
+        // Permanent SSBO binding only — the cube source/depth views
+        // are refreshed every frame by writeProjectDescriptorsForCube.
+        // Mirrors the SSBO write at the bottom of createProjectPipeline.
+        const auto buffer_size =
+            static_cast<uint32_t>(sizeof(ProbeData) * getProbeCount());
+        er::WriteDescriptorList writes;
+        er::Helper::addOneBuffer(writes, project_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER,
+            kShProjectProbesBinding,
+            probe_buffer_.buffer, buffer_size);
+        device->updateDescriptorSets(writes);
+    }
+}
+
 void AmbientProbeSystem::writeProjectDescriptorsForCube(
     const std::shared_ptr<er::Device>& device,
     const std::shared_ptr<er::ImageView>& color_cube_view,

@@ -836,6 +836,18 @@ struct GameObjectsUpdateParams {
 
 struct InstanceBufferUpdateParams {
     uint            num_instances;
+    // When non-zero, the compute pass IGNORES game_objects_buffer_ and
+    // writes an identity instance transform (zero translation, unit
+    // rotation, scale 1) to every slot.  Used for drawables whose world
+    // placement is driven entirely by the node-hierarchy root transform
+    // (PlayerController-controlled player, hand-placed gltfs) — without
+    // this, the shared game_objects_buffer_'s slot 0 (initialised to
+    // camera_pos on frame 0 and drifting via gravity) gets re-applied
+    // on top of the node translation, producing a double-transform that
+    // throws the visible position 2× the camera offset away.
+    uint            force_identity;
+    uint            pad0;
+    uint            pad1;
 };
 
 struct NoiseInitParams {

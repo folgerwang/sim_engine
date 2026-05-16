@@ -693,6 +693,105 @@ bool Menu::draw(
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
+    // ── Player debug overlay ──────────────────────────────────────────
+    // Always-on locator widget — paints a red square at the player's
+    // projected screen position plus a HUD readout of the world coords
+    // and camera-relative distance.  Surface for when the 3D character
+    // doesn't appear visually but the controller state is fine: lets
+    // the user see at a glance whether the player is off-screen, behind
+    // them, or just very far away.
+    if (has_player_debug_info_) {
+        // Non-const because GetForegroundDrawList takes a non-const
+        // ImGuiViewport*.  The viewport returned by GetMainViewport()
+        // is owned by Dear ImGui — we're only reading from it.
+        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        const float sw = mvp->Size.x, sh = mvp->Size.y;
+        const ImVec2 spos = mvp->Pos;
+
+        // Project world position to clip space.
+        glm::vec4 clip = player_view_proj_ *
+                         glm::vec4(player_world_pos_, 1.0f);
+        bool on_screen = (clip.w > 0.0f);
+        ImVec2 screen_px(0, 0);
+        if (on_screen) {
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            // NDC in [-1,1] → pixel coords.  Vulkan's clip-space Y is
+            // negated by the projection's flip, so ndc.y already has
+            // image-down-positive direction; just remap [-1,1]→[0,1].
+            float px = (ndc.x * 0.5f + 0.5f) * sw + spos.x;
+            float py = (ndc.y * 0.5f + 0.5f) * sh + spos.y;
+            screen_px = ImVec2(px, py);
+            // Off-screen check: only the XY frustum bounds matter for
+            // "is the point inside the rendered image".  Don't reject
+            // on ndc.z — when the player straddles the near plane (e.g.
+            // you turn around fast and the spawn point's projection is
+            // just past z=1) the marker would flicker out for a frame
+            // even though the screen-space position is still meaningful.
+            // We still rejected clip.w <= 0 above, which covers
+            // "behind the camera" — the only z-related case that
+            // actually invalidates the screen position.
+            on_screen = on_screen &&
+                ndc.x >= -1.0f && ndc.x <= 1.0f &&
+                ndc.y >= -1.0f && ndc.y <= 1.0f;
+        }
+
+        ImDrawList* fg = ImGui::GetForegroundDrawList(mvp);
+        const ImU32 kRed     = IM_COL32(255,  40,  40, 255);
+        const ImU32 kRedSoft = IM_COL32(255,  40,  40, 120);
+
+        if (on_screen) {
+            // 24×24 px hollow red square + filled centre dot, plus a
+            // larger faint halo so it's findable even against busy
+            // backgrounds.
+            const float half  = 12.0f;
+            const float halo  = 32.0f;
+            fg->AddCircleFilled(screen_px, halo, kRedSoft, 24);
+            fg->AddRect(
+                ImVec2(screen_px.x - half, screen_px.y - half),
+                ImVec2(screen_px.x + half, screen_px.y + half),
+                kRed, 0.0f, 0, 3.0f);
+            fg->AddCircleFilled(screen_px, 3.0f, kRed, 12);
+        } else {
+            // Player is off-screen — pin the marker to the centre of
+            // the matching screen edge with an arrow nub pointing at
+            // the player.  Compute direction in camera space.
+            glm::vec4 cs = player_view_proj_ *
+                           glm::vec4(player_world_pos_, 1.0f);
+            // Behind camera or way off — fall back to using the X/Y of
+            // the clip-space coordinate (clamped to ±1) so the marker
+            // sticks to an edge facing the player's azimuth.
+            glm::vec2 dir(cs.x, cs.y);
+            float L = glm::length(dir);
+            if (L > 1e-4f) dir /= L;
+            else dir = glm::vec2(1.0f, 0.0f);
+            float edge_x = spos.x + sw * (0.5f + dir.x * 0.45f);
+            float edge_y = spos.y + sh * (0.5f + dir.y * 0.45f);
+            ImVec2 edge_px(edge_x, edge_y);
+            fg->AddCircle(edge_px, 16.0f, kRed, 16, 3.0f);
+            fg->AddText(
+                ImVec2(edge_x + 18.0f, edge_y - 8.0f),
+                kRed, "Player off-screen");
+        }
+
+        // HUD text — top-right corner, always visible.
+        const float dist = glm::length(
+            player_world_pos_ - player_cam_pos_);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "Player: (%.2f, %.2f, %.2f)  dist=%.2fm  %s",
+            player_world_pos_.x, player_world_pos_.y, player_world_pos_.z,
+            dist, on_screen ? "[on-screen]" : "[off-screen]");
+        const ImVec2 ts = ImGui::CalcTextSize(buf);
+        const ImVec2 pad(8.0f, 4.0f);
+        ImVec2 pos(spos.x + sw - ts.x - pad.x * 2.0f - 12.0f,
+                   spos.y + 36.0f);
+        fg->AddRectFilled(
+            ImVec2(pos.x - pad.x, pos.y - pad.y),
+            ImVec2(pos.x + ts.x + pad.x, pos.y + ts.y + pad.y),
+            IM_COL32(0, 0, 0, 160), 4.0f);
+        fg->AddText(pos, IM_COL32(255, 255, 255, 255), buf);
+    }
+
     std::vector<er::ClearValue> clear_values;
     clear_values.resize(2);
     clear_values[0].color = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -902,7 +1001,6 @@ bool Menu::draw(
         screen_size,
         clear_values);
 
-    static bool s_spawn_player = false;
     static bool s_select_load_gltf = false;
     static bool s_show_skydome = false;
     static bool s_show_weather = false;
@@ -1095,12 +1193,16 @@ bool Menu::draw(
 
         if (ImGui::BeginMenu("Game Objects"))
         {
-            if (ImGui::MenuItem("Spawn player", NULL)) {
-                s_spawn_player = true;
-            }
+            // (The legacy "Spawn player" menu item was removed: the
+            // player is now eager-loaded at application startup with
+            // a single asset, so an on-demand spawn would either
+            // reload the same rig or substitute a different asset
+            // whose joint names PlayerController doesn't know how to
+            // pose.  Use "Reset player position" below to re-snap the
+            // existing character to the current camera view.)
 
             // Recovery option for the "I can't find my character" case:
-            // re-anchors the player to a point ~3m in front of the
+            // re-anchors the player to a point in front of the
             // current camera, on the ground.  Cheap to invoke — just
             // sets a flag the application drains and forwards to
             // PlayerController::spawnAt().  See the menu's
@@ -1737,10 +1839,9 @@ bool Menu::draw(
         }
     }
 
-    if (s_spawn_player) {
-        spawn_gltf_name_ = "assets/CesiumMan.gltf";
-        s_spawn_player = false;
-    }
+    // (Legacy s_spawn_player → spawn_gltf_name_ trigger removed along
+    // with the menu item that set it; the player is eager-loaded once
+    // at application startup with a fixed asset.)
 
     if (compile_shaders) {
         auto error_strings = engine::helper::compileGlobalShaders();

@@ -782,6 +782,24 @@ public:
     void recreate(
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
 
+    // Called from the application's cleanupSwapChain RIGHT AFTER
+    // vkDestroyDescriptorPool.  Every descriptor set ClusterRenderer
+    // allocated from that pool now holds a dangling Vulkan handle —
+    // any subsequent vkUpdateDescriptorSets against them crashes deep
+    // in the driver (we've seen it manifest as an nvoglv64.dll crash
+    // inside the validation layer's UpdateDescriptorSets dispatch).
+    //
+    // Null every pool-owned set so any code path that runs between
+    // cleanup and the post-pool-recreate descriptor-rewrites (notably
+    // recreateRenderBuffer → createGBuffer → setHiZTexture, which fires
+    // BEFORE recreate() gets called again) hits its existing "set is
+    // null" early-out instead of writing through a dead handle.
+    //
+    // The set handles are restored by recreate() (for bindless_desc_set_)
+    // and by the next finalizeUploads / setHiZTexture pass once
+    // descriptors are written into the freshly-allocated sets.
+    void onDescriptorPoolDestroyed();
+
     void destroy();
 
     // ── Indirect draw verification ────────────────────────────────────────

@@ -4095,9 +4095,18 @@ void DrawableData::update(
     const std::shared_ptr<renderer::Device>& device,
     const uint32_t& active_anim_idx,
     const float& time,
-    bool use_local_matrix_only) {
-    // update all animations
-    if (animations_.size() > 0) {
+    bool use_local_matrix_only,
+    bool skip_animations) {
+    // ── Animation channels ───────────────────────────────────────────
+    // Skipped when the caller owns the node transforms (e.g. the
+    // PlayerController-driven character).  Without this gate, an
+    // animated rig like CesiumMan.gltf will replay its imported walk
+    // animation every frame and CLOBBER whatever node values
+    // setRootNodeTransform / setNodeRotationByName just wrote — making
+    // the player render at the animation's authored origin instead of
+    // its controller-driven spawn position, AND replaying the imported
+    // limb pose on top of the controller's procedural arms/legs pose.
+    if (!skip_animations && animations_.size() > 0) {
         assert(active_anim_idx < animations_.size());
         auto& anim = animations_[active_anim_idx];
         for (auto& channel : anim.channels_) {
@@ -5140,6 +5149,15 @@ void DrawableObject::updateInstanceBuffer(
 
     glsl::InstanceBufferUpdateParams params;
     params.num_instances = kNumDrawableInstance;
+    // See setUseNodeTransformOnly() — when true, force the compute pass
+    // to write identity transforms instead of reading the shared
+    // game_objects_buffer_ position.  This is what fixes the player /
+    // hand-placed-gltf double-transform bug: without it, every drawable
+    // gets an additional (camera_pos@frame0 + physics drift) world-
+    // space offset stacked on top of its node-hierarchy translation.
+    params.force_identity = use_node_transform_only_ ? 1u : 0u;
+    params.pad0 = 0u;
+    params.pad1 = 0u;
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         update_instance_buffer_pipeline_layout_,
@@ -5278,11 +5296,26 @@ void DrawableObject::update(
     const std::shared_ptr<renderer::Device>& device,
     const float& time) {
     if (object_ && object_->ready_.load(std::memory_order_acquire)) {
+        // use_node_transform_only_ is the same flag that opts the
+        // drawable into identity-instance mode (see setUseNodeTransform-
+        // Only).  Conceptually it means "external code owns the node
+        // transforms" — for the player, that external code is
+        // PlayerController::applyPose, which writes the root translation
+        // and procedural limb rotations every frame.  If the imported
+        // glTF animation channels also fire, they OVERWRITE those writes
+        // (animation update runs AFTER applyPose, before joint matrices
+        // are baked).  Net symptom: character renders at the animation's
+        // authored origin (~0,0,0) instead of the spawn point — the
+        // "character missing" bug.  Forwarding the flag as skip_anima-
+        // tions stops the imported animation timeline from running while
+        // still letting joint matrices be rebuilt from the controller's
+        // node writes.
         object_->update(
             device,
             0,
             time,
-            object_->m_use_local_matrix_only_);
+            object_->m_use_local_matrix_only_,
+            /*skip_animations=*/use_node_transform_only_);
     }
 }
 

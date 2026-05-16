@@ -54,81 +54,24 @@ void PlayerController::update(
     // pose instead of teleporting it to the world origin.
     if (!initialized_) return;
 
-    bool key_w = glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
-    bool key_s = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
-    bool key_a = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
-    bool key_d = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
-
-    float yaw_rad = glm::radians(-camera_yaw_deg);
-    glm::vec3 fwd  ( std::cos(yaw_rad), 0.0f, std::sin(yaw_rad));
-    glm::vec3 right(-std::sin(yaw_rad), 0.0f, std::cos(yaw_rad));
-
-    glm::vec3 input_dir(0.0f);
-    if (key_w) input_dir += fwd;
-    if (key_s) input_dir -= fwd;
-    if (key_d) input_dir += right;
-    if (key_a) input_dir -= right;
+    // ── Stationary mode ──────────────────────────────────────────────
+    // The character stays at whatever spawnAt() pinned it to: no WASD
+    // movement, no terrain snap, no collision resolution, no idle/walk
+    // animation phase advance.  applyPose() is still called every
+    // frame so the gltf root node carries the spawn translation +
+    // facing into the joint hierarchy (otherwise an external write to
+    // the node transforms — e.g. asset reload — could leave the rig
+    // posed at the wrong location for a frame).  Keeping the function
+    // params (window / delta_t / camera_yaw / obstacles / world) means
+    // we don't have to touch the caller; they're intentionally unused
+    // here.
+    (void)window;
+    (void)delta_t;
+    (void)camera_yaw_deg;
+    (void)obstacles;
+    (void)world;
 
     walking_ = false;
-    glm::vec3 desired_pos = position_;
-    if (glm::length(input_dir) > 1e-4f) {
-        input_dir = glm::normalize(input_dir);
-        desired_pos += input_dir * walk_speed_ * delta_t;
-        walking_ = true;
-        float target_yaw =
-            -glm::degrees(std::atan2(input_dir.z, input_dir.x));
-        yaw_deg_ = chaseAngleDeg(
-            yaw_deg_, target_yaw, turn_speed_ * delta_t);
-    }
-
-    glm::vec2 resolved_xz = resolveXzCollisions(
-        glm::vec2(position_.x, position_.z),
-        glm::vec2(desired_pos.x, desired_pos.z),
-        obstacles);
-    desired_pos.x = resolved_xz.x;
-    desired_pos.z = resolved_xz.y;
-
-    // Only snap to terrain when the heightmap value is plausibly close
-    // to our current vertical level.  In bistro / static-glTF scenes the
-    // procedural terrain sits in a different coordinate system from the
-    // building geometry; an unconditional snap teleports the player
-    // tens of metres underground every frame (e.g. terrain reports
-    // y = -120 while the bistro floor is at y ≈ 0).  Skipping the snap
-    // when the heightmap is far from us keeps the spawned Y stable
-    // until the player walks onto real terrain.
-    {
-        float terrain_y = getTerrainGroundHeight(
-            glm::vec2(desired_pos.x, desired_pos.z));
-        if (std::fabs(terrain_y - desired_pos.y) < 5.0f) {
-            desired_pos.y = terrain_y;
-        }
-    }
-
-    if (world && !world->empty()) {
-        glm::vec3 contact_normal(0.0f);
-        for (int outer = 0; outer < 2; ++outer) {
-            if (!world->resolveCapsule(
-                    desired_pos,
-                    player_radius_,
-                    player_height_,
-                    contact_normal)) {
-                break;
-            }
-        }
-        // Same guard for the post-collision floor clamp.
-        float ground = getTerrainGroundHeight(
-            glm::vec2(desired_pos.x, desired_pos.z));
-        if (std::fabs(ground - desired_pos.y) < 5.0f &&
-            desired_pos.y < ground) {
-            desired_pos.y = ground;
-        }
-    }
-
-    position_ = desired_pos;
-
-    if (walking_) anim_phase_ += delta_t * 6.5f;
-    idle_phase_ += delta_t * 1.5f;
-
     applyPose(player);
 }
 

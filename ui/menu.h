@@ -26,7 +26,6 @@ enum class GameState {
 class Menu {
     std::vector<std::string> gltf_file_names_;
     std::vector<std::string> to_load_gltf_names_;
-    std::string spawn_gltf_name_;
     // One-shot "snap the player to the camera" request — drained by
     // consumeResetPlayerPosition() from application.cpp.  Set by the
     // "Reset player position" Game Objects menu item; the application
@@ -34,6 +33,12 @@ class Menu {
     // when this is true, which re-anchors the character to wherever
     // the user is currently looking.
     bool reset_player_position_requested_ = false;
+
+    // Per-frame debug overlay data — see setPlayerDebugInfo().
+    bool      has_player_debug_info_ = false;
+    glm::vec3 player_world_pos_     = glm::vec3(0.0f);
+    glm::vec3 player_cam_pos_       = glm::vec3(0.0f);
+    glm::mat4 player_view_proj_     = glm::mat4(1.0f);
     bool turn_off_water_pass_ = false;
     bool turn_off_grass_pass_ = false;
     bool turn_off_ray_tracing_ = false;
@@ -387,10 +392,26 @@ public:
         return result;
     }
 
-    std::string getToLoadPlayerNameAndClear() {
-        auto result = spawn_gltf_name_;
-        spawn_gltf_name_ = "";
-        return result;
+    // (getToLoadPlayerNameAndClear / spawn_gltf_name_ were removed
+    // with the legacy "Spawn player" menu item — the player is now
+    // eager-loaded once at startup with a fixed asset.)
+
+    // ── Player debug overlay state ────────────────────────────────────
+    // Application stashes the player's world position + camera view-
+    // projection here each frame; the menu's draw() projects the world
+    // point onto the screen and paints a red marker so the user can
+    // visually locate the character even if the 3D draw is broken.
+    // has_player_debug_info_ is false until the player is spawned,
+    // keeping the overlay invisible during loading.
+    void setPlayerDebugInfo(
+        bool has_player,
+        const glm::vec3& world_pos,
+        const glm::mat4& view_proj,
+        const glm::vec3& cam_pos) {
+        has_player_debug_info_ = has_player;
+        player_world_pos_      = world_pos;
+        player_view_proj_      = view_proj;
+        player_cam_pos_        = cam_pos;
     }
 
     // One-shot "snap the player to where the camera is looking" request.

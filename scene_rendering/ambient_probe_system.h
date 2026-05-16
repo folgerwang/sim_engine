@@ -146,6 +146,27 @@ public:
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 
+    // ── Swap-chain teardown hook ───────────────────────────────────
+    // probe_desc_set_ and project_desc_set_ are allocated FROM the
+    // application's main descriptor pool.  When the pool is destroyed
+    // in cleanupSwapChain, those handles become dangling — calling
+    // vkUpdateDescriptorSets against them (the per-frame
+    // writeProjectDescriptorsForCube path) crashes inside the NVIDIA
+    // driver dispatch.  Null the handles so consumers can't write to
+    // them between pool destruction and recreate.
+    void onDescriptorPoolDestroyed();
+
+    // ── Re-allocate pool-owned descriptor sets from the fresh pool ──
+    // Called from the application's recreateSwapChain after the new
+    // descriptor pool has been built but before any consumer code
+    // writes to a probe descriptor set.  Reallocates both sets and
+    // re-issues their permanent SSBO bindings (probe_buffer_); the
+    // cube-source bindings are refreshed every frame by
+    // writeProjectDescriptorsForCube once these handles are alive.
+    void recreateDescriptorSets(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
+
     // ── Debug origin lock ──────────────────────────────────────────────
     // When enabled, ALL probes share the same world position (instead
     // of being distributed across the grid).  Useful for verifying the

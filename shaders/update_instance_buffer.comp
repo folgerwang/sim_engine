@@ -44,11 +44,25 @@ void main()
 {
   // get index in global work group i.e x,y position
   uint inst_idx = gl_GlobalInvocationID.x;
-  if (inst_idx < params.num_instances) {
-    UnpackedGameObjectInfo info = unpackGameObjectInfo(items[inst_idx]);
-    insts[inst_idx].mat_rot_0 = vec4(cross(info.up_vector, info.facing_dir) * info.scale, 0.0f);
-    insts[inst_idx].mat_rot_1 = vec4(info.up_vector * info.scale, 0.0f);
-    insts[inst_idx].mat_rot_2 = vec4(info.facing_dir * info.scale, 0.0f);
-    insts[inst_idx].mat_pos_scale = vec4(info.position, 1.0f);
+  if (inst_idx >= params.num_instances) return;
+
+  // ── Identity-instance path ────────────────────────────────────────
+  // Drawables that get their world placement from the gltf node
+  // hierarchy (player, manually-loaded gltfs) push force_identity=1 so
+  // the per-frame compute writes a no-op transform instead of the
+  // shared game_objects_buffer_ position.  See the struct comment in
+  // global_definition.glsl.h for why this matters.
+  if (params.force_identity != 0u) {
+    insts[inst_idx].mat_rot_0     = vec4(1.0, 0.0, 0.0, 0.0);
+    insts[inst_idx].mat_rot_1     = vec4(0.0, 1.0, 0.0, 0.0);
+    insts[inst_idx].mat_rot_2     = vec4(0.0, 0.0, 1.0, 0.0);
+    insts[inst_idx].mat_pos_scale = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
   }
+
+  UnpackedGameObjectInfo info = unpackGameObjectInfo(items[inst_idx]);
+  insts[inst_idx].mat_rot_0 = vec4(cross(info.up_vector, info.facing_dir) * info.scale, 0.0f);
+  insts[inst_idx].mat_rot_1 = vec4(info.up_vector * info.scale, 0.0f);
+  insts[inst_idx].mat_rot_2 = vec4(info.facing_dir * info.scale, 0.0f);
+  insts[inst_idx].mat_pos_scale = vec4(info.position, 1.0f);
 }

@@ -3827,6 +3827,34 @@ uint32_t ClusterRenderer::drawTranslucentOit(
     return total_visible_all_meshes_;
 }
 
+// ─── Pool-owned descriptor cleanup (swap chain teardown) ──────────────────
+//
+// When the application destroys the descriptor pool every descriptor set
+// allocated from it becomes a dangling Vulkan handle.  C++ shared_ptr
+// reference counts don't keep the Vulkan object alive — vkDestroy-
+// DescriptorPool is unconditional.  Any subsequent vkUpdateDescriptor-
+// Sets that touches one of those dead handles is undefined behaviour
+// (NVIDIA's driver crashes inside the validation layer's dispatch
+// shim — the backtrace surfaces as nvoglv64.dll → UpdateDescriptorSets).
+//
+// The recreateSwapChain flow in application.cpp inadvertently writes
+// to several of these sets BEFORE recreate() repopulates them: the
+// recreateRenderBuffer → createGBuffer → createHiZPyramid chain calls
+// setHiZTexture (which patches cull_desc_set_'s binding 11) WAY before
+// the new descriptor_pool_ + cluster_renderer_->recreate(...) pair
+// runs later in recreateSwapChain.  We null the handles here so the
+// "if (cull_desc_set_ && ...)" guard at the top of setHiZTexture
+// short-circuits during that window, then the freshly-allocated set
+// from recreate() / the next finalizeUploads picks up the cached
+// hiz_sampler_ / hiz_view_ stored on this object.
+void ClusterRenderer::onDescriptorPoolDestroyed() {
+    bindless_desc_set_.reset();
+    cull_desc_set_.reset();
+    for (auto& s : cull_desc_sets_shadow_) s.reset();
+    cluster_mesh_data_desc_set_.reset();
+    oit_composite_desc_set_.reset();
+}
+
 // ─── Recreate (swap chain resize) ─────────────────────────────────────────
 
 void ClusterRenderer::recreate(
@@ -3909,6 +3937,34 @@ void ClusterRenderer::recreate(
     }
 
     device_->updateDescriptorSets(writes);
+
+    // ── Reallocate the cull descriptor set ──────────────────────────
+    // cull_desc_set_ was nulled by onDescriptorPoolDestroyed because
+    // its parent pool was destroyed; without re-allocating it here the
+    // cluster cull dispatch would skip silently every frame after a
+    // resize (cull() / cullPhaseA / cullPhaseB all bind cull_desc_set_).
+    // Only proceed if finalizeUploads has run — its layout is built
+    // there alongside the per-cluster buffers.  All the source state
+    // (cluster counts, indirect buffers, visibility bits, Hi-Z view
+    // and sampler) is cached on this object and survives the swap
+    // chain teardown.
+    if (cull_desc_set_layout_ && total_clusters_all_meshes_ > 0) {
+        cull_desc_set_ = device_->createDescriptorSets(
+            descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        const uint32_t mat_count = std::max<uint32_t>(1u, total_materials_);
+        writeCullDescriptors(
+            device_, cull_desc_set_,
+            total_clusters_all_meshes_,
+            cull_info_buffer_, draw_info_buffer_,
+            indirect_draw_buffer_, draw_count_buffer_,
+            visible_buffer_,
+            material_params_buffer_, mat_count,
+            trans_indirect_draw_buffer_, trans_draw_count_buffer_,
+            visibility_bit_buffer_,
+            indirect_draw_buffer_phase_a_,
+            draw_count_buffer_phase_a_,
+            hiz_sampler_, hiz_view_);
+    }
 }
 
 // ─── Destroy ──────────────────────────────────────────────────────────────
