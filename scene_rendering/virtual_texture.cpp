@@ -470,6 +470,47 @@ void VirtualTextureManager::initFeedbackCompactPipeline() {
     device_->updateDescriptorSets(writes);
 }
 
+// ─── Pool-owned descriptor cleanup / re-allocation ─────────────────────
+//
+// Same playbook as ClusterRenderer::onDescriptorPoolDestroyed /
+// recreateDescriptorSets.  When the application's main descriptor pool
+// is torn down in cleanupSwapChain, compact_desc_set_ becomes a
+// dangling Vulkan handle.  tick() and compactFeedback() bind that set
+// every frame, so the very first frame after a resize crashes inside
+// the NVIDIA driver dispatch with an `EXCEPTION_ACCESS_VIOLATION_READ`
+// at a tiny offset (e.g. 0x38) — reading a member of a destroyed
+// descriptor-pool internal struct via a handle that's been freed.
+void VirtualTextureManager::onDescriptorPoolDestroyed() {
+    compact_desc_set_.reset();
+}
+
+void VirtualTextureManager::recreateDescriptorSets(
+    const std::shared_ptr<er::DescriptorPool>& descriptor_pool) {
+    // Skip if init never happened (VT pipeline not built yet) — the
+    // layout is constructed by the same code that allocated the
+    // original set, so its absence means there's nothing to restore.
+    if (!compact_desc_set_layout_) return;
+    descriptor_pool_ = descriptor_pool;
+    compact_desc_set_ = device_->createDescriptorSets(
+        descriptor_pool_, compact_desc_set_layout_, 1)[0];
+    // Re-write the (stable) feedback-buffer bindings — same writes
+    // the initial allocation site issues.  feedback_buffer_ and
+    // feedback_compact_buffer_ are owned by this manager and survive
+    // the swap-chain teardown, so the same buffer handles are valid.
+    er::WriteDescriptorList writes;
+    writes.reserve(2);
+    er::Helper::addOneBuffer(
+        writes, compact_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 0,
+        feedback_buffer_, feedback_buffer_->getSize());
+    er::Helper::addOneBuffer(
+        writes, compact_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 1,
+        feedback_compact_buffer_,
+        feedback_compact_buffer_->getSize());
+    device_->updateDescriptorSets(writes);
+}
+
 void VirtualTextureManager::destroy() {
     // Async worker is currently disabled (see constructor).  When it's
     // re-enabled, the shutdown sequence is: set worker_should_stop_,

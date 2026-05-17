@@ -109,7 +109,14 @@ public:
     int32_t                 indirect_draw_cmd_ofs_;
     PrimitiveHashTag        tag_;
     glm::vec3               bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
-    glm::vec3               bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+    // NOTE: numeric_limits<float>::min() is the smallest POSITIVE
+    // normalized float (~1.18e-38), NOT the most negative — using it
+    // as a "lower than any real max" init silently breaks the
+    // max-aggregation for any axis whose true max is negative, leaving
+    // bbox_max stuck at that ~0 sentinel.  Use ::lowest() (the most
+    // negative finite float) so the standard max(bbox, vert) update
+    // correctly overrides on the first vertex.
+    glm::vec3               bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
     std::shared_ptr<renderer::AccelerationStructureGeometry>  as_geometry;
     std::shared_ptr<std::vector<int32_t>> vertex_indices_;
     std::shared_ptr<helper::BVHNode> bvh_root_;
@@ -188,7 +195,9 @@ struct MeshInfo {
     std::vector<PrimitiveInfo>  primitives_;
     std::shared_ptr<std::vector<glm::vec3>> vertex_position_;
     glm::vec3                   bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
-    glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+    // See PrimitiveInfo::bbox_max_ comment — ::min() is the smallest
+    // positive normalized float, NOT the most negative.  Use ::lowest().
+    glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
 
     // "Nanite-lite" cluster sidecar. Built at load time *only* when
     // engine::helper::clusterRenderingEnabled() is true (i.e. the
@@ -238,7 +247,9 @@ struct NodeInfo {
 struct SceneInfo {
     std::vector<int32_t>        nodes_;
     glm::vec3                   bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
-    glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+    // See PrimitiveInfo::bbox_max_ comment — ::min() is the smallest
+    // positive normalized float, NOT the most negative.  Use ::lowest().
+    glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
 };
 
 struct DrawableData {
@@ -246,6 +257,49 @@ struct DrawableData {
     bool m_use_local_matrix_only_ = false;
     bool m_flip_u_ = false;
     bool m_flip_v_ = false;
+    // Mirror of DrawableObject::use_node_transform_only_, kept on
+    // DrawableData so the static drawMesh helper (which only receives
+    // DrawableData*) can read it for the skinned-character per-mesh
+    // frustum-cull bypass.  Written by DrawableObject::setUseNode-
+    // TransformOnly.  See that setter's doc-comment for the full
+    // semantics (identity instance buffer + skip imported animations).
+    bool m_use_node_transform_only_ = false;
+    // "Force red" debug override — when set, drawNodes pushes
+    // model_params.debug_force_red=1 for every primitive draw belonging
+    // to this DrawableData.  base.frag's final pass overrides outColor
+    // with vec4(1,0,0,1) when that flag is non-zero.  Used to verify
+    // that a "missing" drawable's draw is actually reaching the
+    // rasterizer (versus being silently culled / never bound).  Set
+    // via DrawableObject::setDebugForceRed.
+    bool m_debug_force_red_ = false;
+    // "Skip skinning" debug override — when set, drawNodes pushes
+    // model_params.debug_skip_skinning=1 for every primitive draw on
+    // this drawable.  base.vert then renders the mesh in its glTF
+    // bind pose (skin_matrix collapses to identity) instead of
+    // deforming it through joint matrices.  Useful when a skinned
+    // character is invisible — bypasses every potential skin-math
+    // bug (degenerate inv_bind, mis-sized joint_matrices, bad node
+    // hierarchy) and renders the raw bind-pose mesh at the root
+    // node's world transform, so the only thing that can hide the
+    // draw is genuine culling / pipeline / material breakage.
+    bool m_debug_skip_skinning_ = false;
+    // Force-override the root node's local scale when > 0.  Wired by
+    // setRootNodeTransform so the override travels through every
+    // subsequent applyPose call from PlayerController without needing
+    // a separate sync path.  See DrawableObject::setDebugScale.
+    float m_debug_scale_ = 0.0f;
+    // Counter of indirect-draw submissions issued for THIS drawable
+    // per DrawableObject::draw() call.  Only incremented when
+    // m_debug_force_red_ is set (currently the player).  Reset at the
+    // top of DrawableObject::draw, read at the bottom for the per-
+    // second diagnostic print.
+    uint32_t m_debug_draw_call_count_ = 0;
+    // Independent "log this drawable's draw calls to stdout" flag.
+    // Decoupled from m_debug_force_red_ so we can see the per-second
+    // [player.draw] indirect-draws-issued tally WITHOUT also tinting
+    // the character red.  setDebugLogDraws(true) wires both the
+    // counter increment and the per-second print.
+    bool m_debug_log_draws_ = false;
 
     int32_t                     default_scene_ = 0;
     std::vector<SceneInfo>      scenes_;
@@ -319,6 +373,12 @@ class DrawableObject {
 
     // See setUseNodeTransformOnly() in the public section for what this
     // flag does and why the player controller has to set it.
+    // NOTE: the canonical storage lives on DrawableData as
+    // m_use_node_transform_only_ so the static drawMesh helpers (which
+    // only receive DrawableData*) can read it for the skinned-character
+    // frustum-cull bypass.  This field on the outer wrapper is kept as
+    // a cache to make getUseNodeTransformOnly() valid even before
+    // object_ is populated; the setter writes both.
     bool                        use_node_transform_only_ = false;
 
     // static members.
@@ -495,8 +555,69 @@ public:
     //     Joint matrices are still recomputed from the current node
     //     hierarchy, so the rig still animates — just from the
     //     controller's writes instead of the imported timeline.
-    void setUseNodeTransformOnly(bool v) { use_node_transform_only_ = v; }
+    void setUseNodeTransformOnly(bool v) {
+        use_node_transform_only_ = v;          // cache on outer wrapper
+        if (object_) object_->m_use_node_transform_only_ = v;  // mirror to data
+    }
     bool getUseNodeTransformOnly() const { return use_node_transform_only_; }
+
+    // ── Debug "force red" override ──────────────────────────────────
+    // When true, every primitive of this drawable renders as a flat
+    // bright red pixel through base.frag (debug_force_red is pushed
+    // via model_params).  Smoke test for "is this draw actually
+    // reaching the rasterizer?".  Safe to leave on indefinitely —
+    // affects only this object's color output, nothing else.
+    void setDebugForceRed(bool v) {
+        if (object_) object_->m_debug_force_red_ = v;
+    }
+    bool getDebugForceRed() const {
+        return object_ ? object_->m_debug_force_red_ : false;
+    }
+
+    // ── Debug "skip skinning" override ───────────────────────────────
+    // When true, every primitive of this drawable renders in its
+    // glTF bind pose (base.vert's skin_matrix multiplication is
+    // gated off via the matching push-constant flag).  Useful to
+    // isolate whether a missing skinned character is failing in the
+    // skin math vs. the draw not running.  The mesh appears at its
+    // node's world transform with no bone deformation — looks like a
+    // statue in the T-pose / bind pose the asset was authored at.
+    void setDebugSkipSkinning(bool v) {
+        if (object_) object_->m_debug_skip_skinning_ = v;
+    }
+    bool getDebugSkipSkinning() const {
+        return object_ ? object_->m_debug_skip_skinning_ : false;
+    }
+
+    // ── Debug giant-size override ────────────────────────────────────
+    // Force-overrides the root node's scale to (s, s, s) on every
+    // subsequent setRootNodeTransform call (which PlayerController
+    // invokes every frame).  Combined with whatever scale the asset's
+    // own root matrix bakes in (0.1 for scene-skinned.gltf), the
+    // rendered size becomes 0.1 × s × asset_units.  Pass 0 to disable
+    // the override and let the asset's authored scale stand.  Use 30
+    // to "blow the character up so it pokes through any wall" when
+    // visibility-debugging.
+    void setDebugScale(float s) {
+        if (object_) object_->m_debug_scale_ = s;
+    }
+    float getDebugScale() const {
+        return object_ ? object_->m_debug_scale_ : 0.0f;
+    }
+
+    // ── Debug: log per-second [player.draw] tally ───────────────────
+    // When true, DrawableObject::draw prints the indirect-draws-
+    // issued count (and "SKIPPED !isReady" if applicable) once every
+    // ~60 frames.  Independent of setDebugForceRed (which affects
+    // visual output).  Use this to confirm whether all primitives are
+    // being culled vs. truly reaching the rasterizer, without
+    // tinting the character.
+    void setDebugLogDraws(bool v) {
+        if (object_) object_->m_debug_log_draws_ = v;
+    }
+    bool getDebugLogDraws() const {
+        return object_ ? object_->m_debug_log_draws_ : false;
+    }
 
     int  findNodeIndexByName(const std::string& name) const;
     bool setNodeRotationByName(

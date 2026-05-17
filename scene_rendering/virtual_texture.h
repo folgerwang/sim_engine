@@ -233,6 +233,25 @@ public:
 
     void destroy();
 
+    // ── Swap-chain teardown hook ───────────────────────────────────
+    // compact_desc_set_ is allocated from the application's main
+    // descriptor pool.  When the pool is destroyed in cleanupSwapChain
+    // the handle becomes dangling — and tick() / compactFeedback()
+    // run every frame writing to it, so the next frame after a resize
+    // crashes inside vkCmdBindDescriptorSets / vkUpdateDescriptorSets.
+    // Null the handle here so the lazy re-allocation in
+    // recreateDescriptorSets can pick it up.
+    void onDescriptorPoolDestroyed();
+
+    // Re-allocate compact_desc_set_ from the fresh pool and re-write
+    // the (stable) feedback-buffer bindings.  Called from the
+    // application's recreateSwapChain after the new descriptor pool
+    // has been built but before tick / compactFeedback fires.  No-op
+    // if VT pipeline wasn't initialised (compact_desc_set_layout_
+    // null), so callers don't need to guard.
+    void recreateDescriptorSets(
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
+
     // Register a single material with the VT system.  The four
     // source images (any of which may be null for "this material
     // doesn't have that layer") are uploaded into the matching layer

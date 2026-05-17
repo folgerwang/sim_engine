@@ -158,6 +158,31 @@ public:
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 
+    // ── Swap-chain teardown hook ───────────────────────────────────
+    // DynamicCubemap allocates THREE families of descriptor sets from
+    // the application's main descriptor pool: face_view_desc_sets_,
+    // depth_to_linear_desc_sets_, reproject_desc_sets_.  When the pool
+    // is destroyed in cleanupSwapChain every one of these handles
+    // becomes dangling.  AmbientProbeSystem::update calls into
+    // DynamicCubemap::update every frame and binds those dangling
+    // sets — release builds crash inside the NVIDIA driver the first
+    // frame after a window resize.  Debug builds usually escape
+    // because the validation layer detects the bad-set bind and
+    // aborts the call before the driver gets it.  Null the handles
+    // so the matching recreateDescriptorSets after the new pool is
+    // built can re-allocate cleanly.
+    void onDescriptorPoolDestroyed();
+
+    // Re-allocate all three descriptor-set families from the fresh
+    // pool and re-write their (stable) bindings.  The pipelines,
+    // layouts, sampler, image views, and buffers all survive the
+    // swap-chain teardown (they're owned by this manager and size-
+    // independent), so the writes can reuse the same source handles
+    // the original init code did.
+    void recreateDescriptorSets(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool);
+
 private:
     // ── Resources ──────────────────────────────────────────────────────
     uint32_t edge_         = kDefaultEdge;

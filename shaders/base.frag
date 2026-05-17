@@ -17,6 +17,15 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 	ViewCameraInfo camera_info;
 };
 
+// Push constant — shared with base.vert.  We only read debug_force_red
+// here; the vertex shader is the canonical reader of the matrix +
+// flip_uv_coord + cascade_idx fields.  Declaring the whole struct
+// keeps the layout identical across stages so the driver doesn't
+// complain about a layout mismatch.
+layout(push_constant) uniform ModelUniformBufferObject {
+    ModelParams model_params;
+};
+
 #ifndef NO_MTL
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = PBR_CONSTANT_INDEX) uniform MaterialUniformBufferObject {
     PbrMaterialParams material;
@@ -331,4 +340,15 @@ void main() {
 #else
     outColor = baseColor;
 #endif // NO_MTL
+
+    // ── Debug "force red" override ─────────────────────────────────
+    // Last thing in the shader so it wins over every shaded / debug
+    // branch above.  Drives "is this drawable actually rendering?"
+    // smoke tests — the application sets debug_force_red=1 on a
+    // specific DrawableObject (currently the PlayerController player)
+    // via setDebugForceRed(true); every other drawable keeps the
+    // field at 0 and is unaffected.
+    if (model_params.debug_force_red != 0u) {
+        outColor = vec4(1.0, 0.0, 0.0, 1.0);
+    }
 }

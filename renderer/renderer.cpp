@@ -1272,32 +1272,58 @@ void Helper::initImgui(
 }
 
 void TextureInfo::destroy(const std::shared_ptr<Device>& device) {
-    device->destroyImage(image);
-    device->destroyImageView(view);
-    device->freeMemory(memory);
+    // NOTE: we must null out the shared_ptr handles after destroy.  Several
+    // call sites guard re-destruction with `if (tex.image) tex.destroy(...)`
+    // and would otherwise double-free across recreate cycles (e.g. hiz_pyramid_
+    // gets cleaned up in cleanupSwapChain, then createHiZPyramid runs again
+    // via recreateSwapChain → createGBuffer; without these resets the second
+    // `if (hiz_pyramid_.image) hiz_pyramid_.destroy(device_)` reuses a stale
+    // VkImage handle and crashes inside the NVIDIA driver).
+    if (image) {
+        device->destroyImage(image);
+        image.reset();
+    }
+    if (view) {
+        device->destroyImageView(view);
+        view.reset();
+    }
+    if (memory) {
+        device->freeMemory(memory);
+        memory.reset();
+    }
 
     // Alpha-only companion (only present for textures referenced by at
     // least one Mask-with-cutout material — see comment on the
     // TextureInfo declaration).  Each handle is null-checked because
     // most textures don't carry these.
-    if (alpha_only_image)  device->destroyImage(alpha_only_image);
-    if (alpha_only_view)   device->destroyImageView(alpha_only_view);
-    if (alpha_only_memory) device->freeMemory(alpha_only_memory);
+    if (alpha_only_image)  { device->destroyImage(alpha_only_image);     alpha_only_image.reset();  }
+    if (alpha_only_view)   { device->destroyImageView(alpha_only_view);  alpha_only_view.reset();   }
+    if (alpha_only_memory) { device->freeMemory(alpha_only_memory);      alpha_only_memory.reset(); }
 
     for (auto& s_views : surface_views) {
         for (auto& s_view : s_views) {
-            device->destroyImageView(s_view);
+            if (s_view) device->destroyImageView(s_view);
         }
     }
+    surface_views.clear();
 
     for (auto& framebuffer : framebuffers) {
-        device->destroyFramebuffer(framebuffer);
+        if (framebuffer) device->destroyFramebuffer(framebuffer);
     }
+    framebuffers.clear();
 }
 
 void BufferInfo::destroy(const std::shared_ptr<Device>& device) {
-    device->destroyBuffer(buffer);
-    device->freeMemory(memory);
+    // Same null-after-destroy contract as TextureInfo::destroy — guards
+    // double-free for buffers that go through cleanup → recreate paths.
+    if (buffer) {
+        device->destroyBuffer(buffer);
+        buffer.reset();
+    }
+    if (memory) {
+        device->freeMemory(memory);
+        memory.reset();
+    }
 }
 
 } // namespace renderer

@@ -678,6 +678,31 @@ void Menu::init(
         bg_texture_id_ = renderer::Helper::addImTextureID(
             sampler_, bg_texture_info_->view);
     }
+
+    // Same hazard for the analog-clock face texture.  clock_tex_id_ is
+    // built once in the title-screen constructor from a pool-allocated
+    // VkDescriptorSet, and the always-on-top clock block in Menu::draw
+    // (~line 2437) uses it on EVERY frame.  After cleanupSwapChain
+    // destroys descriptor_pool_, this descriptor handle is dangling;
+    // the next ImGui_ImplVulkan_RenderDrawData binds it and faults in
+    // the NVIDIA driver (most reliably reproduced via fullscreen ↔
+    // windowed toggles, which trigger several rapid resizes).
+    if (clock_tex_info_ && clock_tex_info_->view && sampler_) {
+        clock_tex_id_ = renderer::Helper::addImTextureID(
+            sampler_, clock_tex_info_->view);
+    } else {
+        // No clock face image available — null out so the fallback
+        // circle in Menu::draw is used instead of a stale handle.
+        clock_tex_id_ = ImTextureID(0);
+    }
+
+    // rt_texture_id_ and main_texture_id_ are also pool-allocated and
+    // would be dangling here.  They're only referenced inside `#if 0`
+    // blocks today (drawViewport for the disabled raytrace preview),
+    // but null them out defensively so any future re-enabling doesn't
+    // accidentally bind a dead handle from the old pool.
+    rt_texture_id_   = ImTextureID(0);
+    main_texture_id_ = ImTextureID(0);
 }
 
 bool Menu::draw(

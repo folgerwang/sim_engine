@@ -1148,7 +1148,9 @@ static void setupMesh(
 
         ego::PrimitiveInfo primitive_info;
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
-        primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::min());
+        // ::lowest() (most negative finite float), NOT ::min() (smallest
+        // positive normalized).  See bbox_max_ comment in drawable_object.h.
+        primitive_info.bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
 
         // Range of indices contributed by this primitive within
         // `new_indices`.  Captured here (before the face loop) and used
@@ -2620,7 +2622,22 @@ static void drawMesh(
     // using model_params.model_mat, then test against the frustum planes
     // set by application.cpp. Shadow / depth-only passes are NOT culled
     // so off-screen geometry still casts correct shadows.
-    if (!depth_only && s_frustum_cull_active) {
+    if (!depth_only && s_frustum_cull_active &&
+        !drawable_object->m_use_node_transform_only_) {
+        // ── Skinned-character bypass ────────────────────────────────
+        // m_use_node_transform_only_ marks drawables whose world
+        // pose is driven by PlayerController (or equivalent) and
+        // typically contain a single skinned mesh.  For skinned meshes
+        // the bind-pose `mesh_info.bbox_min_/bbox_max_` does NOT
+        // necessarily bound the skinned vertices after the joint
+        // matrices fire — even modest bone rotations can push verts
+        // outside that bbox, and this sphere-vs-frustum test then
+        // rejects the whole mesh while the shadow pass (which skips
+        // the cull via depth_only) keeps drawing it.  That's the
+        // root cause of "shadow stays, body disappears when I rotate
+        // the camera".  We trade a few extra GPU vertices on this
+        // single character for visual correctness.
+        //
         // Compute local-space bounding sphere from AABB.
         glm::vec3 local_center = (mesh_info.bbox_min_ + mesh_info.bbox_max_) * 0.5f;
         glm::vec3 local_half   = (mesh_info.bbox_max_ - mesh_info.bbox_min_) * 0.5f;
@@ -2869,11 +2886,37 @@ static void drawMesh(
                 SKIN_PARAMS_SET);
         }
 
+        // Push constants must list every stage that READS the range.
+        // base.frag now reads model_params.debug_force_red /
+        // debug_skip_skinning, so we must include FRAGMENT_BIT here —
+        // otherwise the spec leaves fragment-stage reads of bytes
+        // updated by a vertex-only push UNDEFINED.  Validation layers
+        // may not catch the mismatch (the pipeline layout's range
+        // includes both stages, and a subset-push is technically
+        // legal), but on real hardware the fragment shader reads
+        // garbage for the field and the debug_force_red override
+        // silently does nothing.  This was the root cause of the
+        // "no red even with debug_force_red set" symptom: the
+        // pipeline layout's range correctly covered VERTEX+FRAGMENT,
+        // but the per-draw push only updated VERTEX.
         cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
+            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             drawable_pipeline_layout,
             &model_params,
             sizeof(model_params));
+
+        // Debug counter: when this drawable has the debug-force-red
+        // flag set (currently only the PlayerController player),
+        // tally how many primitive draws actually reach this point.
+        // Reset at start of DrawableObject::draw, printed at end of
+        // that function once per ~60 frames.  Confirms whether the
+        // forward draw is firing N indirect draws for the player or
+        // being entirely skipped upstream (frustum cull, isReady,
+        // pipeline binding, etc.).
+        if (drawable_object->m_debug_force_red_ ||
+            drawable_object->m_debug_log_draws_) {
+            ++drawable_object->m_debug_draw_call_count_;
+        }
 
         //cmd_buf->drawIndexed(static_cast<uint32_t>(prim.index_desc_.index_count));
         cmd_buf->drawIndexedIndirect(
@@ -2908,6 +2951,20 @@ static void drawNodes(
             // (DrawMode::kCsmPerCascade pipelines).  Other pipelines
             // ignore this field — it sits in former-pad bytes.
             model_params.cascade_idx = csm_cascade_idx;
+            // Debug "force red" override — see DrawableData::
+            // m_debug_force_red_ comment.  Forwarded to base.frag via
+            // push constants; depth-only / shadow / mesh-shader CSM
+            // pipelines simply ignore the field (they don't read
+            // model_params).
+            model_params.debug_force_red =
+                drawable_object->m_debug_force_red_ ? 1u : 0u;
+            // base.vert's skin-matrix multiplication is skipped when
+            // this is set (see DrawableData::m_debug_skip_skinning_).
+            // For depth-only / shadow / mesh-shader CSM permutations
+            // the field is simply unread (those shaders don't include
+            // the skinning branch).
+            model_params.debug_skip_skinning =
+                drawable_object->m_debug_skip_skinning_ ? 1u : 0u;
 
             drawMesh(cmd_buf,
                 drawable_object,
@@ -3051,7 +3108,15 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
     const std::shared_ptr<renderer::DescriptorSetLayout>& material_desc_set_layout,
     const std::shared_ptr<renderer::DescriptorSetLayout>& skin_desc_set_layout) {
     renderer::PushConstantRange push_const_range{};
-    push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, VERTEX_BIT);
+    // base.frag reads model_params.debug_force_red (and declares the
+    // full ModelParams block to keep layouts identical across stages),
+    // so the push-constant range must be visible to both VERTEX and
+    // FRAGMENT.  Without the fragment bit the shader would compile
+    // but the driver would reject the bind / produce a validation
+    // error about a fragment-stage push-constant access outside the
+    // declared range.
+    push_const_range.stage_flags =
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
     push_const_range.offset = 0;
     push_const_range.size = sizeof(glsl::ModelParams);
 
@@ -5240,10 +5305,30 @@ void DrawableObject::draw(
     DrawMode draw_mode/* = DrawMode::kForward */,
     uint32_t csm_cascade_idx/* = 0 */) {
 
+    // Reset per-call debug counter BEFORE the isReady() guard so that
+    // a not-ready drawable also prints "0 draws" rather than carrying
+    // last frame's count.  Cheap; only used when m_debug_force_red_
+    // is set on the drawable.
+    if (object_ &&
+        (object_->m_debug_force_red_ || object_->m_debug_log_draws_)) {
+        object_->m_debug_draw_call_count_ = 0;
+    }
+
     // Skip while the async load is still in flight. The menu spinner
     // (see application.cpp HUD wiring) is the user-visible signal; the
     // object simply pops in the first frame after phase 3 finalizes.
     if (!isReady()) {
+        if (object_ &&
+            (object_->m_debug_force_red_ ||
+             object_->m_debug_log_draws_)) {
+            static uint64_t s_not_ready_frame = 0;
+            if ((s_not_ready_frame++ % 60u) == 0u) {
+                std::cout << "[player.draw] SKIPPED — !isReady() ("
+                          << "draw_mode=" << int(draw_mode)
+                          << " depth_only=" << depth_only << ")"
+                          << std::endl;
+            }
+        }
         return;
     }
 
@@ -5290,6 +5375,26 @@ void DrawableObject::draw(
             mesh_shader_csm_mode,
             mesh_shader_fallback);
     }
+
+    // Per-second tally of how many indirect-draw submissions actually
+    // reached the rasterizer for this drawable.  Confirms whether
+    // missing pixels are upstream (no draws issued — all primitives
+    // culled) or downstream (draws issued but pixels never reach the
+    // screen — depth fail, blend, wrong RT).  Gated on
+    // m_debug_force_red_ so only flagged drawables (currently the
+    // player when its debug flag is on) print.
+    if (object_->m_debug_force_red_ || object_->m_debug_log_draws_) {
+        static uint64_t s_draw_log_frame = 0;
+        if ((s_draw_log_frame++ % 60u) == 0u) {
+            std::cout << "[player.draw] mode=" << int(draw_mode)
+                      << " depth_only=" << depth_only
+                      << " indirect_draws_issued="
+                      << object_->m_debug_draw_call_count_
+                      << " (of " << object_->meshes_.size()
+                      << " meshes)"
+                      << std::endl;
+        }
+    }
 }
 
 void DrawableObject::update(
@@ -5334,6 +5439,18 @@ void DrawableObject::setRootNodeTransform(
     auto& n = object_->nodes_[root];
     n.translation_ = translation;
     n.rotation_ = rotation;
+    // ── Debug giant-size override ────────────────────────────────────
+    // When m_debug_scale_ > 0, force the root node's local scale to
+    // that value.  Combined with the asset's own root-node matrix
+    // (which for scene-skinned.gltf bakes a 0.1 uniform scale + 90°
+    // axis swap), the final on-screen size is 0.1 × m_debug_scale_ ×
+    // (asset units).  Useful as a "blow the character up so it pokes
+    // through any Bistro wall that might be hiding it" test — at
+    // 30× the bind-pose body is ~57 m tall and physically impossible
+    // to occlude.  Set to 0 (or below) to leave scale alone.
+    if (object_->m_debug_scale_ > 0.0f) {
+        n.scale_ = glm::vec3(object_->m_debug_scale_);
+    }
 }
 
 int DrawableObject::findNodeIndexByName(const std::string& name) const {

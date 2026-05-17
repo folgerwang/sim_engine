@@ -736,6 +736,99 @@ void DynamicCubemap::generateMipsForRead(
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 }
 
+// ─── Pool-owned descriptor cleanup / re-allocation ─────────────────────
+//
+// Same pattern as ClusterRenderer / VirtualTextureManager / AmbientProbe-
+// System.  When the application's main descriptor pool is destroyed in
+// cleanupSwapChain every descriptor set allocated from it becomes a
+// dangling Vulkan handle.  AmbientProbeSystem::update calls
+// DynamicCubemap::update each frame, which binds these sets — the
+// first frame after a resize crashes inside the NVIDIA driver in
+// release builds (debug builds usually escape because the validation
+// layer aborts the bad-descriptor-set bind before the driver gets it).
+//
+// onDescriptorPoolDestroyed nulls the handles.  recreateDescriptorSets
+// re-allocates them from the fresh pool and re-writes the same
+// (stable) bindings the original create*Pipeline / createFaceCamera-
+// Resources / writeReprojectDescriptors paths issue.
+void DynamicCubemap::onDescriptorPoolDestroyed() {
+    for (uint32_t f = 0; f < kNumFaces; ++f) {
+        face_view_desc_sets_[f].reset();
+        depth_to_linear_desc_sets_[f].reset();
+    }
+    for (int p = 0; p < 2; ++p) {
+        for (uint32_t f = 0; f < kNumFaces; ++f) {
+            reproject_desc_sets_[p][f].reset();
+        }
+    }
+}
+
+void DynamicCubemap::recreateDescriptorSets(
+    const std::shared_ptr<er::Device>& device,
+    const std::shared_ptr<er::DescriptorPool>& descriptor_pool) {
+    // ── face_view_desc_sets_ ────────────────────────────────────────
+    // Re-allocated from the new pool; binding 0 = the face's camera
+    // SSBO.  Mirrors createFaceCameraResources's per-face write loop.
+    // Uses CameraObject's shared static layout (the same one the
+    // original allocation used) — no DynamicCubemap-owned layout
+    // member exists for this set.
+    {
+        const auto face_view_layout =
+            engine::game_object::CameraObject::
+                getViewCameraDescriptorSetLayout();
+        if (face_view_layout && face_camera_buffers_[0].buffer) {
+            for (uint32_t f = 0; f < kNumFaces; ++f) {
+                face_view_desc_sets_[f] = device->createDescriptorSets(
+                    descriptor_pool, face_view_layout, 1)[0];
+                er::WriteDescriptorList writes;
+                er::Helper::addOneBuffer(writes, face_view_desc_sets_[f],
+                    er::DescriptorType::STORAGE_BUFFER,
+                    VIEW_CAMERA_BUFFER_INDEX,
+                    face_camera_buffers_[f].buffer,
+                    sizeof(glsl::ViewCameraInfo));
+                device->updateDescriptorSets(writes);
+            }
+        }
+    }
+
+    // ── depth_to_linear_desc_sets_ ──────────────────────────────────
+    // Re-allocated; binding 0 = sampled face_depth_target_, binding 1
+    // = the matching face slice of depth_cube_ as storage image.
+    // Mirrors createDepthToLinearPipeline's per-face write loop.
+    if (depth_to_linear_desc_set_layout_) {
+        for (uint32_t f = 0; f < kNumFaces; ++f) {
+            depth_to_linear_desc_sets_[f] = device->createDescriptorSets(
+                descriptor_pool, depth_to_linear_desc_set_layout_, 1)[0];
+            er::WriteDescriptorList writes;
+            er::Helper::addOneTexture(writes, depth_to_linear_desc_sets_[f],
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER, 0,
+                depth_to_linear_depth_sampler_,
+                face_depth_target_.view,
+                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            er::Helper::addOneTexture(writes, depth_to_linear_desc_sets_[f],
+                er::DescriptorType::STORAGE_IMAGE, 1,
+                nullptr,
+                depth_face_views_[f],
+                er::ImageLayout::GENERAL);
+            device->updateDescriptorSets(writes);
+        }
+    }
+
+    // ── reproject_desc_sets_ ────────────────────────────────────────
+    // Allocated for 2 ping-pong reads × 6 faces.  Bindings come from
+    // writeReprojectDescriptors, which we re-invoke after this
+    // reallocation to populate them.
+    if (reproject_desc_set_layout_) {
+        for (int p = 0; p < 2; ++p) {
+            for (uint32_t f = 0; f < kNumFaces; ++f) {
+                reproject_desc_sets_[p][f] = device->createDescriptorSets(
+                    descriptor_pool, reproject_desc_set_layout_, 1)[0];
+            }
+        }
+        writeReprojectDescriptors(device);
+    }
+}
+
 // ─── Cleanup ────────────────────────────────────────────────────────────
 void DynamicCubemap::destroy(const std::shared_ptr<er::Device>& device) {
     for (int p = 0; p < 2; ++p) {

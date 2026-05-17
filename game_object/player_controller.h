@@ -53,6 +53,20 @@ public:
         initialized_ = true;
     }
 
+    // Per-frame "follow the camera" hook.  Updates ONLY position +
+    // yaw, without resetting animation phases (which spawnAt would).
+    // The application calls this every frame after the one-shot
+    // spawn block to keep the character glued to the camera (e.g.
+    // 2 m in front, on the ground).  No-op until initialized_ has
+    // been set by a prior spawnAt — otherwise we'd race against the
+    // async player load.
+    void setPositionAndYaw(const glm::vec3& world_position,
+                           float yaw_deg) {
+        if (!initialized_) return;
+        position_ = world_position;
+        yaw_deg_  = yaw_deg;
+    }
+
     // Capsule shape — exposed so the caller can tune it without
     // recompiling.  `height` includes the two hemispheres.
     void setCapsule(float radius, float height) {

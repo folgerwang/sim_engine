@@ -371,7 +371,22 @@ struct ModelParams {
     // alignment are unchanged (mat4 + uint + uint + uvec2 = 80 bytes,
     // matching the previous mat4 + uint + vec3 layout).
     uint cascade_idx;
-    uvec2 pad;
+    // Per-draw debug flag — when non-zero, base.frag overrides its
+    // final color with bright red regardless of material / lighting.
+    // Used as a "is this mesh actually rendering?" smoke test for the
+    // PlayerController-driven character; set by DrawableObject::draw
+    // when the drawable has setDebugForceRed(true) on it.  Sits in
+    // what used to be pad.x so the struct's 80-byte size + 16-byte
+    // alignment are preserved.
+    uint debug_force_red;
+    // Per-draw debug flag — when non-zero, base.vert SKIPS the
+    // skin_matrix multiplication for skinned primitives, rendering
+    // the mesh in its glTF bind pose (no bone deformation).  Lets us
+    // verify whether a "missing" skinned drawable is actually missing
+    // because the skinning math is producing degenerate vertices vs.
+    // the draw not running at all.  drawNodes pushes this for every
+    // primitive of a drawable that has setDebugSkipSkinning(true).
+    uint debug_skip_skinning;
 };
 
 struct PrtLightParams {

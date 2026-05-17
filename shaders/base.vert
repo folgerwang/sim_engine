@@ -125,21 +125,34 @@ void main() {
 	// Calculate skinned matrix from weights and joint indices of the current vertex
     mat4 matrix_ls = model_params.model_mat;
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
+    // ── Runtime skip-skinning bypass ──────────────────────────────
+    // model_params.debug_skip_skinning != 0 forces this primitive to
+    // render in its glTF bind pose (skin_matrix collapses to identity
+    // i.e. matrix_ls stays = model_params.model_mat).  Used as a smoke
+    // test for whether a "missing" skinned drawable is failing due to
+    // bad skin math (degenerate joint matrices, broken bind matrices,
+    // etc.) versus the draw not running at all.  We still consume the
+    // joint / weight vertex inputs because they're declared in the
+    // pipeline layout; we just don't index into joint_matrices when
+    // skipping, which also keeps the path safe if joint_matrices is
+    // empty or mis-sized.
+    if (model_params.debug_skip_skinning == 0u) {
 #ifdef HAS_SKIN_SET_0
-	mat4 skin_matrix =
-		in_weights_0.x * joint_matrices[int(in_joints_0.x)] +
-		in_weights_0.y * joint_matrices[int(in_joints_0.y)] +
-		in_weights_0.z * joint_matrices[int(in_joints_0.z)] +
-		in_weights_0.w * joint_matrices[int(in_joints_0.w)];
+        mat4 skin_matrix =
+            in_weights_0.x * joint_matrices[int(in_joints_0.x)] +
+            in_weights_0.y * joint_matrices[int(in_joints_0.y)] +
+            in_weights_0.z * joint_matrices[int(in_joints_0.z)] +
+            in_weights_0.w * joint_matrices[int(in_joints_0.w)];
 #endif
 #ifdef HAS_SKIN_SET_1
-	skin_matrix +=
-		in_weights_1.x * joint_matrices[int(in_joints_1.x)] +
-		in_weights_1.y * joint_matrices[int(in_joints_1.y)] +
-		in_weights_1.z * joint_matrices[int(in_joints_1.z)] +
-		in_weights_1.w * joint_matrices[int(in_joints_1.w)];
+        skin_matrix +=
+            in_weights_1.x * joint_matrices[int(in_joints_1.x)] +
+            in_weights_1.y * joint_matrices[int(in_joints_1.y)] +
+            in_weights_1.z * joint_matrices[int(in_joints_1.z)] +
+            in_weights_1.w * joint_matrices[int(in_joints_1.w)];
 #endif
-    matrix_ls = matrix_ls * skin_matrix;
+        matrix_ls = matrix_ls * skin_matrix;
+    }
 #endif
     vec3 position_ls = (matrix_ls * vec4(in_position, 1.0f)).xyz;
 
