@@ -755,9 +755,19 @@ bool Menu::draw(
             // We still rejected clip.w <= 0 above, which covers
             // "behind the camera" — the only z-related case that
             // actually invalidates the screen position.
+            //
+            // Hysteresis pad on the edge: a stationary character near
+            // the viewport edge oscillates between [on-screen marker]
+            // and [edge arrow] when ndc.x/y wiggles past ±1 due to
+            // floating-point noise.  Pad the on-screen bound out to
+            // ±1.02 (and keep the off-screen state until truly past
+            // ±1.1 in the AddText branch below if we add it later).
+            // Without this the marker flickers at the edges every
+            // frame.
+            constexpr float kOnScreenPad = 0.02f;
             on_screen = on_screen &&
-                ndc.x >= -1.0f && ndc.x <= 1.0f &&
-                ndc.y >= -1.0f && ndc.y <= 1.0f;
+                ndc.x >= -1.0f - kOnScreenPad && ndc.x <= 1.0f + kOnScreenPad &&
+                ndc.y >= -1.0f - kOnScreenPad && ndc.y <= 1.0f + kOnScreenPad;
         }
 
         ImDrawList* fg = ImGui::GetForegroundDrawList(mvp);
@@ -798,14 +808,102 @@ bool Menu::draw(
                 kRed, "Player off-screen");
         }
 
-        // HUD text — top-right corner, always visible.
+        // ── World-space AABB wireframe overlay ───────────────────────
+        // Projects the 8 corners of the player's world AABB through
+        // the same view_proj used for the position marker and draws
+        // the 12 edges as ImGui lines.  We CLIP each edge against
+        // the camera near plane (w = w_eps) before projecting — the
+        // earlier "skip the whole edge if either endpoint has w <= 0"
+        // approach made edges pop in/out every time the camera
+        // wiggled past a corner, which read as flickering even
+        // though the box itself was stable.  Proper clipping draws
+        // a partial line up to the near plane so the wireframe
+        // stays continuous as the camera moves.
+        const ImU32 kBoxColor = IM_COL32( 60, 220, 255, 220);
+        if (player_bbox_valid_) {
+            const glm::vec3& bmin = player_bbox_min_;
+            const glm::vec3& bmax = player_bbox_max_;
+            // Corner ordering: bit 0 = X (min/max), bit 1 = Y, bit 2 = Z.
+            // So corner i's coords are (X[i&1], Y[(i>>1)&1], Z[(i>>2)&1]).
+            const float Xc[2] = { bmin.x, bmax.x };
+            const float Yc[2] = { bmin.y, bmax.y };
+            const float Zc[2] = { bmin.z, bmax.z };
+            // Stash clip-space (not NDC) for all 8 corners.  Clipping
+            // happens per-edge below before we divide by w.
+            glm::vec4 clip[8];
+            for (int i = 0; i < 8; ++i) {
+                glm::vec3 wc(Xc[i & 1],
+                             Yc[(i >> 1) & 1],
+                             Zc[(i >> 2) & 1]);
+                clip[i] = player_view_proj_ * glm::vec4(wc, 1.0f);
+            }
+            // Near-plane epsilon: anything with w smaller than this
+            // is treated as "behind" and gets clipped.  Picked to be
+            // tighter than any reasonable camera near plane (= 0.01m)
+            // so we don't accidentally clip valid geometry.
+            constexpr float kWEps = 1e-3f;
+
+            // Helper: project a (post-clip) clip-space point to
+            // pixel coordinates.  Caller must guarantee cc.w >= kWEps.
+            auto toPx = [&](const glm::vec4& cc) -> ImVec2 {
+                glm::vec3 ndc = glm::vec3(cc) / cc.w;
+                return ImVec2(
+                    (ndc.x * 0.5f + 0.5f) * sw + spos.x,
+                    (ndc.y * 0.5f + 0.5f) * sh + spos.y);
+            };
+
+            // 12 edges by corner-index pairs.  An edge connects two
+            // corners that differ in exactly one bit of the index.
+            const int edges[12][2] = {
+                {0,1},{2,3},{4,5},{6,7},   // X-axis edges
+                {0,2},{1,3},{4,6},{5,7},   // Y-axis edges
+                {0,4},{1,5},{2,6},{3,7},   // Z-axis edges
+            };
+            for (int e = 0; e < 12; ++e) {
+                glm::vec4 a = clip[edges[e][0]];
+                glm::vec4 b = clip[edges[e][1]];
+                const bool a_in = a.w >= kWEps;
+                const bool b_in = b.w >= kWEps;
+                if (!a_in && !b_in) continue; // whole edge behind camera
+                if (!a_in) {
+                    // Clip A to the near plane: find t in [0,1] on the
+                    // line A → B where (1-t)*a.w + t*b.w = kWEps.
+                    // (b.w - a.w) is non-zero because b is in front.
+                    float t = (kWEps - a.w) / (b.w - a.w);
+                    a = a + t * (b - a);
+                }
+                if (!b_in) {
+                    float t = (kWEps - b.w) / (a.w - b.w);
+                    b = b + t * (a - b);
+                }
+                fg->AddLine(toPx(a), toPx(b), kBoxColor, 2.0f);
+            }
+        }
+
+        // HUD text — top-right corner, always visible.  Adds the
+        // bbox range when valid so we can read the actual numbers
+        // alongside the wireframe.
         const float dist = glm::length(
             player_world_pos_ - player_cam_pos_);
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-            "Player: (%.2f, %.2f, %.2f)  dist=%.2fm  %s",
-            player_world_pos_.x, player_world_pos_.y, player_world_pos_.z,
-            dist, on_screen ? "[on-screen]" : "[off-screen]");
+        char buf[512];
+        if (player_bbox_valid_) {
+            std::snprintf(buf, sizeof(buf),
+                "Player: (%.2f, %.2f, %.2f)  dist=%.2fm  %s\n"
+                "BBox:   (%.2f, %.2f, %.2f) .. (%.2f, %.2f, %.2f)\n"
+                "Size:    %.2f x %.2f x %.2f m",
+                player_world_pos_.x, player_world_pos_.y, player_world_pos_.z,
+                dist, on_screen ? "[on-screen]" : "[off-screen]",
+                player_bbox_min_.x, player_bbox_min_.y, player_bbox_min_.z,
+                player_bbox_max_.x, player_bbox_max_.y, player_bbox_max_.z,
+                player_bbox_max_.x - player_bbox_min_.x,
+                player_bbox_max_.y - player_bbox_min_.y,
+                player_bbox_max_.z - player_bbox_min_.z);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "Player: (%.2f, %.2f, %.2f)  dist=%.2fm  %s",
+                player_world_pos_.x, player_world_pos_.y, player_world_pos_.z,
+                dist, on_screen ? "[on-screen]" : "[off-screen]");
+        }
         const ImVec2 ts = ImGui::CalcTextSize(buf);
         const ImVec2 pad(8.0f, 4.0f);
         ImVec2 pos(spos.x + sw - ts.x - pad.x * 2.0f - 12.0f,

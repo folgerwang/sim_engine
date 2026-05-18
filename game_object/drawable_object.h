@@ -294,6 +294,24 @@ struct DrawableData {
     // top of DrawableObject::draw, read at the bottom for the per-
     // second diagnostic print.
     uint32_t m_debug_draw_call_count_ = 0;
+    // ── "where did the draw go?" reach counters ────────────────────
+    // Companion to m_debug_draw_call_count_.  When m_debug_log_draws_
+    // is set, every gating point in the draw path that can early-out
+    // a primitive bumps the matching counter.  Printed alongside
+    // indirect_draws_issued in the per-second [player.draw] log so
+    // we can see WHY an invisible drawable issued 0 draws.  Reset at
+    // the top of DrawableObject::draw().
+    uint32_t m_debug_draw_called_         = 0; // entered draw() at all
+    uint32_t m_debug_draw_not_ready_      = 0; // exited via !isReady() guard
+    uint32_t m_debug_draw_nodes_visited_  = 0; // drawNodes() entries (any node)
+    uint32_t m_debug_draw_nodes_with_mesh_ = 0; // nodes that had mesh_idx_ >= 0
+    uint32_t m_debug_draw_mesh_entered_   = 0; // drawMesh() entries
+    uint32_t m_debug_draw_mesh_culled_frustum_      = 0;
+    uint32_t m_debug_draw_mesh_taken_by_cluster_    = 0; // cluster_global_mesh_idx_ >= 0
+    uint32_t m_debug_draw_mesh_cluster_debug_path_  = 0; // cluster_debug GPU path
+    uint32_t m_debug_draw_prims_iterated_           = 0; // primitive loop iterations
+    uint32_t m_debug_draw_prim_pipeline_null_       = 0; // (*pipelines)[cur_hash] == null
+    uint32_t m_debug_draw_prim_mesh_shader_         = 0; // dispatched via drawMeshTasks
     // Independent "log this drawable's draw calls to stdout" flag.
     // Decoupled from m_debug_force_red_ so we can see the per-second
     // [player.draw] indirect-draws-issued tally WITHOUT also tinting
@@ -620,6 +638,17 @@ public:
     }
 
     int  findNodeIndexByName(const std::string& name) const;
+    // Read the current local rotation of a node by its asset-side
+    // name.  Returns identity when the name doesn't resolve OR when
+    // the drawable shell isn't ready yet (object_ == nullptr or
+    // async load still in flight) — caller decides whether identity
+    // is acceptable.  Used by PlayerController to snapshot each
+    // named bone's bind-pose rotation on first frame so subsequent
+    // animation writes can COMPOSE against the bind rather than
+    // overwriting it (raw `setNodeRotationByName(bone, swing_q)`
+    // discards the asset's authored bone orientation and produces
+    // distorted poses — twist where it should be swing, etc.).
+    glm::quat getNodeRotationByName(const std::string& name) const;
     bool setNodeRotationByName(
         const std::string& name,
         const glm::quat& rotation);

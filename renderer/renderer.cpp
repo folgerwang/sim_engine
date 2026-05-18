@@ -404,8 +404,54 @@ void Helper::create2DTextureImage(
     std::shared_ptr<DeviceMemory>& texture_image_memory,
     const std::source_location& src_location) {
 
+    // Bytes-per-pixel by format.  Previously hardcoded to 4 for
+    // everything except R16_UNORM, which meant any caller passing a
+    // single-channel format (R8_UNORM for the alpha-mask companion
+    // textures built by computeEffectiveOpaqueForMaterials) staged
+    // 4× too much data — the updateBufferMemory copy ran off the end
+    // of the caller's `pixels` buffer and crashed inside vcruntime
+    // memcpy.  Latent for a long time because no asset until now
+    // (scene-skinned.gltf's hair_inner spec-gloss MASK material) had
+    // actually triggered the companion-build path with a scannable
+    // RGBA8 source.
+    uint32_t bytes_per_pixel = 4;
+    switch (format) {
+    case Format::R8_UNORM:
+    case Format::R8_SNORM:
+    case Format::R8_UINT:
+    case Format::R8_SINT:
+        bytes_per_pixel = 1;
+        break;
+    case Format::R16_UNORM:
+    case Format::R16_SNORM:
+    case Format::R16_UINT:
+    case Format::R16_SINT:
+    case Format::R16_SFLOAT:
+    case Format::R8G8_UNORM:
+    case Format::R8G8_SNORM:
+        bytes_per_pixel = 2;
+        break;
+    case Format::R16G16_UNORM:
+    case Format::R16G16_SFLOAT:
+    case Format::R32_SFLOAT:
+        bytes_per_pixel = 4;
+        break;
+    case Format::R16G16B16A16_SFLOAT:
+    case Format::R32G32_SFLOAT:
+        bytes_per_pixel = 8;
+        break;
+    case Format::R32G32B32A32_SFLOAT:
+        bytes_per_pixel = 16;
+        break;
+    default:
+        // RGBA8 family + most other uncompressed formats land here.
+        bytes_per_pixel = 4;
+        break;
+    }
     VkDeviceSize image_size =
-        static_cast<VkDeviceSize>(tex_width * tex_height * (format == Format::R16_UNORM ? 2 : 4));
+        static_cast<VkDeviceSize>(tex_width) *
+        static_cast<VkDeviceSize>(tex_height) *
+        static_cast<VkDeviceSize>(bytes_per_pixel);
 
     std::shared_ptr<Buffer> staging_buffer;
     std::shared_ptr<DeviceMemory> staging_buffer_memory;

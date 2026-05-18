@@ -39,6 +39,15 @@ class Menu {
     glm::vec3 player_world_pos_     = glm::vec3(0.0f);
     glm::vec3 player_cam_pos_       = glm::vec3(0.0f);
     glm::mat4 player_view_proj_     = glm::mat4(1.0f);
+    // Player world-space AABB (post-cached-matrix transform of the
+    // mesh bind-pose AABBs).  When player_bbox_valid_ is true the
+    // menu paints a wireframe box overlay so we can visually verify
+    // where the character's renderable volume actually sits — useful
+    // for the "feet sunk below floor" diagnostic.  Set via the new
+    // setPlayerDebugInfo overload that takes bbox_min/bbox_max.
+    bool      player_bbox_valid_   = false;
+    glm::vec3 player_bbox_min_     = glm::vec3(0.0f);
+    glm::vec3 player_bbox_max_     = glm::vec3(0.0f);
     bool turn_off_water_pass_ = false;
     bool turn_off_grass_pass_ = false;
     bool turn_off_ray_tracing_ = false;
@@ -412,6 +421,27 @@ public:
         player_world_pos_      = world_pos;
         player_view_proj_      = view_proj;
         player_cam_pos_        = cam_pos;
+        // Don't invalidate the bbox here — overloaded version sets it
+        // and we want to allow callers to drive the box independently.
+    }
+
+    // Extended overload that ALSO carries the player's world-space
+    // AABB so the menu's overlay can draw a wireframe box around the
+    // character.  Pass bbox_valid=false when the bbox isn't ready yet
+    // (e.g. async load hasn't finished) — the overlay falls back to
+    // just the position marker + HUD line in that case.
+    void setPlayerDebugInfo(
+        bool has_player,
+        const glm::vec3& world_pos,
+        const glm::mat4& view_proj,
+        const glm::vec3& cam_pos,
+        bool bbox_valid,
+        const glm::vec3& bbox_min,
+        const glm::vec3& bbox_max) {
+        setPlayerDebugInfo(has_player, world_pos, view_proj, cam_pos);
+        player_bbox_valid_ = bbox_valid;
+        player_bbox_min_   = bbox_min;
+        player_bbox_max_   = bbox_max;
     }
 
     // One-shot "snap the player to where the camera is looking" request.

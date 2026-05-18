@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <map>
 #include "renderer/renderer.h"
 
 struct GLFWwindow;
@@ -85,6 +86,36 @@ private:
         const std::vector<std::shared_ptr<DrawableObject>>& obstacles) const;
 
     glm::vec3 position_      = glm::vec3(0.0f, 0.0f, 0.0f);
+    // Previous frame's position_ — used to detect motion driven by
+    // external code (the application's per-frame setPositionAndYaw
+    // follow block).  When the controller is in stationary mode and
+    // doesn't own movement, this is the only way it can tell whether
+    // to play the walking animation vs. the idle sway.  Set to
+    // position_ at first update() so frame 1 doesn't false-positive
+    // a "huge teleport" as walking.
+    glm::vec3 last_position_  = glm::vec3(0.0f, 0.0f, 0.0f);
+    bool      last_position_valid_ = false;
+
+    // ── Bind-pose rotation cache for named bones ─────────────────
+    // applyPose() drives the rig procedurally by writing each named
+    // bone's local rotation each frame.  The asset's bind pose has
+    // its own rotations baked into node.rotation_ (orienting bones
+    // along their local "down-the-arm" axes etc.) — overwriting
+    // those with a raw axis-angle wipes the bind orientation and
+    // distorts the pose (one frame "twist where it should be swing",
+    // next frame the wrong axis pivots an entire limb sideways).
+    //
+    // Solution: snapshot each named bone's bind rotation on first
+    // applyPose() call after isReady() flips, then on every subsequent
+    // call compose:  final_rot = bind_rot * swing_delta_in_local_frame.
+    // The swing delta is what we author each frame (axisAngleDeg(X, deg)
+    // etc.) and the bind preserves the bone's orientation.
+    struct BoneBindRot {
+        glm::quat rot;
+        int       node_idx = -1;   // cached for fast re-lookup
+    };
+    bool                          bind_rots_captured_ = false;
+    std::map<std::string, BoneBindRot> bind_rots_;
     float     yaw_deg_       = 0.0f;
     float     anim_phase_    = 0.0f;
     float     idle_phase_    = 0.0f;

@@ -419,6 +419,66 @@ static void setupMeshState(
             dst_material.metallic_roughness_idx_ = src_material.pbrMetallicRoughness.metallicRoughnessTexture.index;
             dst_material.emissive_idx_ = src_material.emissiveTexture.index;
             dst_material.occlusion_idx_ = src_material.occlusionTexture.index;
+
+            // ── KHR_materials_pbrSpecularGlossiness fallback ──────────
+            // The standard glTF PBR workflow is pbrMetallicRoughness +
+            // baseColorTexture.  Older Sketchfab / Mixamo / Substance
+            // exports often ship with the KHR_materials_pbrSpecularGlossiness
+            // extension instead, which puts the albedo under
+            //   material.extensions["KHR_materials_pbrSpecularGlossiness"]
+            //     .diffuseTexture.index
+            // …and leaves pbrMetallicRoughness.baseColorTexture absent
+            // (index == -1).  Without this fallback the material's
+            // base_color_idx_ stays at -1, no albedo binds, and the
+            // mesh renders with the default white baseColorFactor —
+            // exactly the "untextured porcelain doll" symptom we hit on
+            // scene-skinned.gltf.  Treat the spec-gloss diffuse* fields
+            // as the albedo source when the standard fields are absent.
+            //
+            // We deliberately do NOT translate full spec-gloss lighting
+            // into metallic-roughness here (proper conversion needs the
+            // GGX→Phong remap which the renderer doesn't carry CPU-side).
+            // The character still won't have correct specular/roughness
+            // response under this fallback, but it WILL have the right
+            // diffuse/albedo colour — which is what the user is asking
+            // about ("fix texture issue on character").
+            {
+                auto ext_it = src_material.extensions.find(
+                    "KHR_materials_pbrSpecularGlossiness");
+                if (ext_it != src_material.extensions.end() &&
+                    ext_it->second.IsObject()) {
+                    const auto& sg = ext_it->second;
+
+                    // diffuseTexture → base_color (only if standard
+                    // baseColorTexture is absent, so a properly-authored
+                    // dual-workflow asset wins through the standard path).
+                    if (dst_material.base_color_idx_ < 0 &&
+                        sg.Has("diffuseTexture")) {
+                        const auto& dt = sg.Get("diffuseTexture");
+                        if (dt.IsObject() && dt.Has("index") &&
+                            dt.Get("index").IsNumber()) {
+                            dst_material.base_color_idx_ =
+                                dt.Get("index").GetNumberAsInt();
+                        }
+                    }
+
+                    // specularGlossinessTexture → reuse the metallic-
+                    // roughness slot (alpha = glossiness, RGB = specular
+                    // colour).  The fragment shader's MR sampling will
+                    // pull wrong channels but at least lights the surface
+                    // instead of leaving the slot empty.  Better than
+                    // nothing for a debug-mode character.
+                    if (dst_material.metallic_roughness_idx_ < 0 &&
+                        sg.Has("specularGlossinessTexture")) {
+                        const auto& st = sg.Get("specularGlossinessTexture");
+                        if (st.IsObject() && st.Has("index") &&
+                            st.Get("index").IsNumber()) {
+                            dst_material.metallic_roughness_idx_ =
+                                st.Get("index").GetNumberAsInt();
+                        }
+                    }
+                }
+            }
             dst_material.alpha_cutoff_ = static_cast<float>(src_material.alphaCutoff);
             // ── Alpha mode (Opaque / Mask / Blend) ─────────────────────
             // Authoritative source: glTF alphaMode field. We then layer
@@ -472,6 +532,45 @@ static void setupMeshState(
                 src_material.pbrMetallicRoughness.baseColorFactor[2],
                 src_material.pbrMetallicRoughness.baseColorFactor[3]);
 
+            // Spec-gloss diffuseFactor override (paired with the
+            // diffuseTexture fallback above).  Only applies when the
+            // material has the KHR_materials_pbrSpecularGlossiness
+            // extension AND we already pulled an albedo from it (or
+            // when the standard baseColorFactor is the default white
+            // sentinel and the extension supplies a colour).
+            {
+                auto ext_it = src_material.extensions.find(
+                    "KHR_materials_pbrSpecularGlossiness");
+                if (ext_it != src_material.extensions.end() &&
+                    ext_it->second.IsObject()) {
+                    const auto& sg = ext_it->second;
+                    if (sg.Has("diffuseFactor")) {
+                        const auto& df = sg.Get("diffuseFactor");
+                        if (df.IsArray() && df.ArrayLen() >= 4) {
+                            glm::vec4 dv(
+                                (float)df.Get(0).GetNumberAsDouble(),
+                                (float)df.Get(1).GetNumberAsDouble(),
+                                (float)df.Get(2).GetNumberAsDouble(),
+                                (float)df.Get(3).GetNumberAsDouble());
+                            // Replace base_color_factor when the
+                            // standard slot is still at its (1,1,1,1)
+                            // default (meaning the material author
+                            // didn't fill in a base color factor).
+                            // Otherwise both factors are present and we
+                            // honor the standard one.
+                            const auto& bc =
+                                src_material.pbrMetallicRoughness.baseColorFactor;
+                            const bool standard_is_default =
+                                bc[0] == 1.0 && bc[1] == 1.0 &&
+                                bc[2] == 1.0 && bc[3] == 1.0;
+                            if (standard_is_default) {
+                                ubo.base_color_factor = dv;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Force glass-tagged materials translucent if the asset
             // author left them at full alpha. 0.4 reads as obvious
             // glass without going invisible.
@@ -497,8 +596,14 @@ static void setupMeshState(
 
             ubo.uv_set_flags = glm::vec4(0, 0, 0, 0);
             ubo.exposure = 1.0f;
-            ubo.material_features = (src_material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
-            ubo.material_features |= (src_material.pbrMetallicRoughness.baseColorTexture.index >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0);
+            // Check dst_material.* (already populated with the
+            // spec-gloss fallback) rather than the raw src_material
+            // fields — otherwise a KHR_materials_pbrSpecularGlossiness
+            // asset has the texture bound at the descriptor level but
+            // FEATURE_HAS_BASE_COLOR_MAP unset, so the fragment shader
+            // skips sampling it and falls back to base_color_factor.
+            ubo.material_features = (dst_material.metallic_roughness_idx_ >= 0 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP | FEATURE_HAS_METALLIC_CHANNEL) : 0) | FEATURE_MATERIAL_METALLICROUGHNESS;
+            ubo.material_features |= (dst_material.base_color_idx_ >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0);
             ubo.material_features |= (src_material.emissiveTexture.index >= 0 ? FEATURE_HAS_EMISSIVE_MAP : 0);
             ubo.material_features |= (src_material.occlusionTexture.index >= 0 ? FEATURE_HAS_OCCLUSION_MAP : 0);
             ubo.material_features |= (src_material.normalTexture.index >= 0 ? FEATURE_HAS_NORMAL_MAP : 0);
@@ -2617,6 +2722,14 @@ static void drawMesh(
     bool mesh_shader_csm_mode = false,
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines = nullptr) {
 
+    // ── Debug reach: drawMesh entered ───────────────────────────────
+    // Only one drawable in the scene has this flag (the player today),
+    // so the branch is essentially never taken for other geometry.
+    if (drawable_object->m_debug_force_red_ ||
+        drawable_object->m_debug_log_draws_) {
+        ++drawable_object->m_debug_draw_mesh_entered_;
+    }
+
     // ── Per-mesh frustum culling (forward pass only) ────────────────────────
     // Transform the mesh's local-space bounding sphere into world space
     // using model_params.model_mat, then test against the frustum planes
@@ -2660,7 +2773,13 @@ static void drawMesh(
                        + s_frustum_planes[p].w;
             if (dist < -world_radius) { outside = true; break; }
         }
-        if (outside) return;
+        if (outside) {
+            if (drawable_object->m_debug_force_red_ ||
+                drawable_object->m_debug_log_draws_) {
+                ++drawable_object->m_debug_draw_mesh_culled_frustum_;
+            }
+            return;
+        }
     }
 
     // ── --cluster-debug override (forward pass only) ──────────────────────
@@ -2682,6 +2801,10 @@ static void drawMesh(
     // whether debug GPU buffers happen to exist.
     if (engine::helper::clusterIndirectActive() &&
         mesh_info.cluster_global_mesh_idx_ >= 0) {
+        if (drawable_object->m_debug_force_red_ ||
+            drawable_object->m_debug_log_draws_) {
+            ++drawable_object->m_debug_draw_mesh_taken_by_cluster_;
+        }
         return;
     }
 
@@ -2689,6 +2812,10 @@ static void drawMesh(
         engine::helper::clusterRenderingEnabled() &&
         mesh_info.cluster_debug_gpu_.ready() &&
         ego::ClusterDebugDraw::ready()) {
+        if (drawable_object->m_debug_force_red_ ||
+            drawable_object->m_debug_log_draws_) {
+            ++drawable_object->m_debug_draw_mesh_cluster_debug_path_;
+        }
         // Cluster-debug pipeline layout only declares PBR_GLOBAL_PARAMS_SET
         // and VIEW_PARAMS_SET (same layout list as ShapeBase). Slice just
         // those two from the incoming list so the validation layers don't
@@ -2740,6 +2867,10 @@ static void drawMesh(
     for (const auto* prim_ptr : sorted_prims) {
         const auto& prim = *prim_ptr;
         const auto& attrib_list = prim.attribute_descs_;
+        if (drawable_object->m_debug_force_red_ ||
+            drawable_object->m_debug_log_draws_) {
+            ++drawable_object->m_debug_draw_prims_iterated_;
+        }
 
         // Shadow pass needs the material-aware hash so opaque vs
         // mask/blend variants of the same vertex layout pick up the
@@ -2821,6 +2952,10 @@ static void drawMesh(
 
             // Task shader amplifies (1,1,1) → CSM_CASCADE_COUNT mesh WGs.
             cmd_buf->drawMeshTasks(1u, 1u, 1u);
+            if (drawable_object->m_debug_force_red_ ||
+                drawable_object->m_debug_log_draws_) {
+                ++drawable_object->m_debug_draw_prim_mesh_shader_;
+            }
             continue;
         }
 
@@ -2834,9 +2969,23 @@ static void drawMesh(
             dispatch_pipelines = mesh_shader_fallback_pipelines;
         }
         if (cur_hash != last_hash) {
+            auto pipe_it = dispatch_pipelines->find(cur_hash);
+            if (pipe_it == dispatch_pipelines->end() || !pipe_it->second) {
+                // No pipeline cached for this primitive's hash.  Skip
+                // the bind (and the eventual draw) — bindPipeline with
+                // a null shared_ptr would crash inside the renderer.
+                // Counts the case so the per-second [player.draw.reach]
+                // print exposes "primitives reached the loop but had
+                // no pipeline" as a distinct gating reason.
+                if (drawable_object->m_debug_force_red_ ||
+                    drawable_object->m_debug_log_draws_) {
+                    ++drawable_object->m_debug_draw_prim_pipeline_null_;
+                }
+                continue;
+            }
             cmd_buf->bindPipeline(
                 renderer::PipelineBindPoint::GRAPHICS,
-                (*dispatch_pipelines)[cur_hash]);
+                pipe_it->second);
 
             cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
             cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
@@ -2940,8 +3089,16 @@ static void drawNodes(
     bool mesh_shader_csm_mode,
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines) {
     if (node_idx >= 0) {
+        if (drawable_object->m_debug_force_red_ ||
+            drawable_object->m_debug_log_draws_) {
+            ++drawable_object->m_debug_draw_nodes_visited_;
+        }
         const auto& node = drawable_object->nodes_[node_idx];
         if (node.mesh_idx_ >= 0) {
+            if (drawable_object->m_debug_force_red_ ||
+                drawable_object->m_debug_log_draws_) {
+                ++drawable_object->m_debug_draw_nodes_with_mesh_;
+            }
             glsl::ModelParams model_params{};
             model_params.model_mat = node.cached_matrix_;
             model_params.flip_uv_coord =
@@ -5311,7 +5468,18 @@ void DrawableObject::draw(
     // is set on the drawable.
     if (object_ &&
         (object_->m_debug_force_red_ || object_->m_debug_log_draws_)) {
-        object_->m_debug_draw_call_count_ = 0;
+        object_->m_debug_draw_call_count_           = 0;
+        object_->m_debug_draw_called_               = 1;
+        object_->m_debug_draw_not_ready_            = 0;
+        object_->m_debug_draw_nodes_visited_        = 0;
+        object_->m_debug_draw_nodes_with_mesh_      = 0;
+        object_->m_debug_draw_mesh_entered_         = 0;
+        object_->m_debug_draw_mesh_culled_frustum_  = 0;
+        object_->m_debug_draw_mesh_taken_by_cluster_= 0;
+        object_->m_debug_draw_mesh_cluster_debug_path_ = 0;
+        object_->m_debug_draw_prims_iterated_       = 0;
+        object_->m_debug_draw_prim_pipeline_null_   = 0;
+        object_->m_debug_draw_prim_mesh_shader_     = 0;
     }
 
     // Skip while the async load is still in flight. The menu spinner
@@ -5321,6 +5489,7 @@ void DrawableObject::draw(
         if (object_ &&
             (object_->m_debug_force_red_ ||
              object_->m_debug_log_draws_)) {
+            object_->m_debug_draw_not_ready_ = 1;
             static uint64_t s_not_ready_frame = 0;
             if ((s_not_ready_frame++ % 60u) == 0u) {
                 std::cout << "[player.draw] SKIPPED — !isReady() ("
@@ -5377,22 +5546,64 @@ void DrawableObject::draw(
     }
 
     // Per-second tally of how many indirect-draw submissions actually
-    // reached the rasterizer for this drawable.  Confirms whether
-    // missing pixels are upstream (no draws issued — all primitives
-    // culled) or downstream (draws issued but pixels never reach the
-    // screen — depth fail, blend, wrong RT).  Gated on
-    // m_debug_force_red_ so only flagged drawables (currently the
-    // player when its debug flag is on) print.
+    // reached the rasterizer for this drawable, plus every gating
+    // counter that explains where draws were dropped if the count is
+    // 0.  Gated on m_debug_log_draws_ (independent of force-red).
     if (object_->m_debug_force_red_ || object_->m_debug_log_draws_) {
         static uint64_t s_draw_log_frame = 0;
         if ((s_draw_log_frame++ % 60u) == 0u) {
-            std::cout << "[player.draw] mode=" << int(draw_mode)
-                      << " depth_only=" << depth_only
-                      << " indirect_draws_issued="
-                      << object_->m_debug_draw_call_count_
-                      << " (of " << object_->meshes_.size()
-                      << " meshes)"
-                      << std::endl;
+            // Resolve the root node's world-space translation so we
+            // can spot "draws issued but model_mat sends it to NaN /
+            // off into the next ZIP code" cases cheaply.
+            glm::vec3 root_T(0.0f);
+            int32_t root_node_idx = -1;
+            if (!object_->scenes_.empty() &&
+                object_->default_scene_ >= 0 &&
+                object_->default_scene_ < (int)object_->scenes_.size() &&
+                !object_->scenes_[object_->default_scene_].nodes_.empty()) {
+                root_node_idx =
+                    object_->scenes_[object_->default_scene_].nodes_[0];
+                if (root_node_idx >= 0 &&
+                    root_node_idx < (int)object_->nodes_.size()) {
+                    const auto& cm =
+                        object_->nodes_[root_node_idx].cached_matrix_;
+                    root_T = glm::vec3(cm[3]);
+                }
+            }
+            std::cout
+                << "[player.draw] mode=" << int(draw_mode)
+                << " depth_only=" << depth_only
+                << " indirect_draws_issued="
+                << object_->m_debug_draw_call_count_
+                << " (of " << object_->meshes_.size() << " meshes)"
+                << std::endl;
+            std::cout
+                << "[player.draw.reach]"
+                << " called="          << object_->m_debug_draw_called_
+                << " not_ready="       << object_->m_debug_draw_not_ready_
+                << " nodes_visited="   << object_->m_debug_draw_nodes_visited_
+                << " nodes_w_mesh="    << object_->m_debug_draw_nodes_with_mesh_
+                << " mesh_entered="    << object_->m_debug_draw_mesh_entered_
+                << " culled_frustum="  << object_->m_debug_draw_mesh_culled_frustum_
+                << " cluster_indirect="<< object_->m_debug_draw_mesh_taken_by_cluster_
+                << " cluster_debug="   << object_->m_debug_draw_mesh_cluster_debug_path_
+                << " prims_iter="      << object_->m_debug_draw_prims_iterated_
+                << " pipe_null="       << object_->m_debug_draw_prim_pipeline_null_
+                << " mesh_shader="     << object_->m_debug_draw_prim_mesh_shader_
+                << std::endl;
+            std::cout
+                << "[player.draw.ctx] root_node=" << root_node_idx
+                << " root_T=(" << root_T.x << "," << root_T.y
+                << "," << root_T.z << ")"
+                << " use_node_xform_only="
+                << (object_->m_use_node_transform_only_ ? 1 : 0)
+                << " frustum_cull_active="
+                << (s_frustum_cull_active ? 1 : 0)
+                << " cluster_indirect_active="
+                << (engine::helper::clusterIndirectActive() ? 1 : 0)
+                << " cluster_rendering_enabled="
+                << (engine::helper::clusterRenderingEnabled() ? 1 : 0)
+                << std::endl;
         }
     }
 }
@@ -5430,26 +5641,56 @@ void DrawableObject::setRootNodeTransform(
     if (!object_ || !object_->ready_.load(std::memory_order_acquire))
         return;
     if (object_->nodes_.empty()) return;
-    int32_t root = 0;
-    if (object_->default_scene_ < (int32_t)object_->scenes_.size()) {
-        const auto& scene = object_->scenes_[object_->default_scene_];
-        if (!scene.nodes_.empty()) root = scene.nodes_[0];
-    }
-    if (root < 0 || (size_t)root >= object_->nodes_.size()) return;
-    auto& n = object_->nodes_[root];
-    n.translation_ = translation;
-    n.rotation_ = rotation;
-    // ── Debug giant-size override ────────────────────────────────────
-    // When m_debug_scale_ > 0, force the root node's local scale to
-    // that value.  Combined with the asset's own root-node matrix
-    // (which for scene-skinned.gltf bakes a 0.1 uniform scale + 90°
-    // axis swap), the final on-screen size is 0.1 × m_debug_scale_ ×
-    // (asset units).  Useful as a "blow the character up so it pokes
-    // through any Bistro wall that might be hiding it" test — at
-    // 30× the bind-pose body is ~57 m tall and physically impossible
-    // to occlude.  Set to 0 (or below) to leave scale alone.
-    if (object_->m_debug_scale_ > 0.0f) {
-        n.scale_ = glm::vec3(object_->m_debug_scale_);
+    if (object_->default_scene_ < 0 ||
+        object_->default_scene_ >= (int32_t)object_->scenes_.size()) return;
+    const auto& scene = object_->scenes_[object_->default_scene_];
+
+    // ── Apply override to EVERY scene root, not just nodes_[0] ──────
+    // glTF allows multiple root nodes per scene.  A very common
+    // export pattern (Blender, Mixamo, etc.) places the mesh node as
+    // one root and the armature/skeleton as a SIBLING root rather
+    // than a descendant.  Skinned meshes render through joint.cached_
+    // matrix * inverse_bind, which means the bones — NOT the mesh
+    // node — determine where the body actually appears on screen.  If
+    // we only translate nodes_[0] (the mesh root), the mesh node's
+    // cached_matrix moves but the skeleton stays at origin, and the
+    // character renders wherever the bones were authored (typically
+    // (0,0,0)) while our CPU-side bbox (which transforms mesh.bbox
+    // through mesh_node.cached_matrix) reports the new spawn
+    // location.  Net result: bbox / red marker high up, body on the
+    // floor — exactly the symptom we just observed.
+    //
+    // Translating every root in the scene moves the mesh AND every
+    // sibling armature in lockstep, so the rendered body follows.
+    std::set<int32_t> touched_roots;
+    auto apply_to_node = [&](int32_t idx) {
+        if (idx < 0 || (size_t)idx >= object_->nodes_.size()) return;
+        if (!touched_roots.insert(idx).second) return;
+        auto& n = object_->nodes_[idx];
+        n.translation_ = translation;
+        n.rotation_    = rotation;
+        // ── Debug giant-size override ────────────────────────────
+        // When m_debug_scale_ > 0, force this root node's local
+        // scale to that value.  Combined with the asset's own root-
+        // node matrix (which for scene-skinned.gltf bakes a 0.1
+        // uniform scale + 90° axis swap), the final on-screen size
+        // is 0.1 × m_debug_scale_ × (asset units).  Set to 0 (or
+        // below) to leave scale alone.
+        if (object_->m_debug_scale_ > 0.0f) {
+            n.scale_ = glm::vec3(object_->m_debug_scale_);
+        }
+    };
+    for (auto root_idx : scene.nodes_) apply_to_node(root_idx);
+
+    // Belt-and-braces: some exporters (older Mixamo, certain Maya
+    // setups) reference the skeleton root via skin.skeleton_root_
+    // but don't include it in scene.nodes_.  If we miss it, the
+    // bones stay at origin and the rendered body follows them — the
+    // exact symptom this override is meant to eliminate.  Walk the
+    // skins and apply the same override to any skeleton_root_ we
+    // haven't already touched (the set dedupes).
+    for (const auto& skin : object_->skins_) {
+        apply_to_node(skin.skeleton_root_);
     }
 }
 
@@ -5469,6 +5710,13 @@ bool DrawableObject::setNodeRotationByName(
     if (idx < 0) return false;
     object_->nodes_[idx].rotation_ = rotation;
     return true;
+}
+
+glm::quat DrawableObject::getNodeRotationByName(
+    const std::string& name) const {
+    int idx = findNodeIndexByName(name);
+    if (idx < 0) return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    return object_->nodes_[idx].rotation_;
 }
 
 glm::vec3 DrawableObject::getModelBboxMin() const {
