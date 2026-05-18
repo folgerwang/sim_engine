@@ -5719,6 +5719,21 @@ glm::quat DrawableObject::getNodeRotationByName(
     return object_->nodes_[idx].rotation_;
 }
 
+glm::mat4 DrawableObject::getNodeWorldMatrixByName(
+    const std::string& name) const {
+    // findNodeIndexByName() already guards on object_ != nullptr +
+    // async-load-complete; -1 from it means either condition failed
+    // or the name didn't resolve.
+    int idx = findNodeIndexByName(name);
+    if (idx < 0) return glm::mat4(1.0f);
+    // cached_matrix_ is written by DrawableData::update() each frame
+    // as the parent-chain product of every ancestor's local matrix.
+    // It's the same matrix the skinning path consumes when building
+    // joint_matrices, so it's guaranteed in sync with the on-screen
+    // pose.  No need to recompute here.
+    return object_->nodes_[idx].cached_matrix_;
+}
+
 glm::vec3 DrawableObject::getModelBboxMin() const {
     if (!object_ || !object_->ready_.load(std::memory_order_acquire))
         return glm::vec3(0.0f);

@@ -168,10 +168,21 @@ private:
     }
 };
 
-inline bool rayAABBIntersect(const Ray& ray, const AABB& box, float& t_near_hit, float& t_far_hit);
+// NOTE: these four ray-test entry points used to be marked `inline`
+// in the forward declarations below, but the definitions in bvh.cpp
+// are not inline.  When the only call sites were inside bvh.cpp
+// itself the mismatch was harmless (MSVC just resolves the call
+// in-TU), but as soon as another .cpp pulls in this header and calls
+// e.g. intersectBVHRecursive (collision_mesh.cpp does, for the
+// foot-IK raycast) the linker errors with LNK2019 â€” the including
+// TU sees an `inline` forward decl with no body and expects to find
+// an inline definition somewhere.  Dropping the `inline` keyword
+// here makes them regular external functions, which is what their
+// bvh.cpp definitions already are.
+bool rayAABBIntersect(const Ray& ray, const AABB& box, float& t_near_hit, float& t_far_hit);
 
 /**
- * @brief Checks if a ray intersects a triangle using the Möller–Trumbore algorithm.
+ * @brief Checks if a ray intersects a triangle using the MÃ¶ller-Trumbore algorithm.
  *
  * @param ray The ray to test.
  * @param v0 The first vertex of the triangle.
@@ -182,7 +193,7 @@ inline bool rayAABBIntersect(const Ray& ray, const AABB& box, float& t_near_hit,
  * @param out_v Output parameter for the barycentric coordinate 'v'.
  * @return true if the ray intersects the triangle within its bounds, false otherwise.
  */
-inline bool rayTriangleIntersect(
+bool rayTriangleIntersect(
     const Ray& ray,
     const glm::vec3& v0,
     const glm::vec3& v1,
@@ -202,7 +213,7 @@ struct HitInfo {
 
 // Forward declaration if rayTriangleIntersect is in another file/scope
 // bool rayTriangleIntersect(const Ray& ray, const Vec3& v0, const Vec3& v1, const Vec3& v2, float& out_t, float& out_u, float& out_v);
-inline void intersectBVHRecursive(
+void intersectBVHRecursive(
     const Ray& ray,
     const std::shared_ptr<BVHNode>& node,
     const std::vector<glm::vec3>& vertices,      // Your global vertex stream
@@ -211,7 +222,11 @@ inline void intersectBVHRecursive(
 );
 
 // --- Main function to start the process ---
-inline HitInfo findClosestHit(
+// (declared without `inline` to match the external linkage of the
+// definitions; findClosestHit currently has no body in bvh.cpp â€” keep
+// the forward decl so any future implementation can be wired up
+// without re-touching the header.)
+HitInfo findClosestHit(
     const Ray& ray,
     const BVHBuilder& bvh, // Assuming BVHBuilder holds the root and prim info
     const std::vector<glm::vec3>& vertices,

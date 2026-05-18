@@ -652,6 +652,22 @@ public:
     bool setNodeRotationByName(
         const std::string& name,
         const glm::quat& rotation);
+
+    // Returns the WORLD-space transform of the named node as of the
+    // most recent DrawableObject::update().  This is the cached
+    // parent-chain product that the skinning path already maintains
+    // (DrawableData::update writes nodes_[i].cached_matrix_ each
+    // frame).  Returns identity when:
+    //   - the drawable shell isn't ready (object_ == nullptr or
+    //     async load still in flight), or
+    //   - no node with that name exists on this rig.
+    // Caller is responsible for combining with any external "root
+    // node override" if it cares — the cached matrix already
+    // includes the setRootNodeTransform override applied in the
+    // last frame, so for the player rig this returns positions in
+    // world space that match the on-screen render.  Used by the
+    // foot-marker debug visualization in application.cpp.
+    glm::mat4 getNodeWorldMatrixByName(const std::string& name) const;
     glm::vec3 getModelBboxMin() const;
     glm::vec3 getModelBboxMax() const;
 

@@ -1,7 +1,9 @@
 #include "collision_mesh.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stack>
@@ -255,25 +257,59 @@ bool CollisionMesh::buildFromDrawable(
         // so skip the multithreaded BVH build (seconds on Bistro-sized
         // input). The mesh is still drawable -- only resolveCapsule()
         // becomes a no-op for this mesh because bvh_root_ stays null.
+        // Callers can invoke buildBVH() later (e.g. CollisionWorld::
+        // buildBVHsAsync()) to populate it off the render thread.
         bvh_root_ = nullptr;
+        bvh_ready_.store(false, std::memory_order_release);
         return true;
     }
 
+    return buildBVH();
+}
+
+bool CollisionMesh::buildBVH() {
+    // Idempotent: a mesh whose BVH is already ready short-circuits.
+    if (bvh_ready_.load(std::memory_order_acquire)) return true;
+    if (indices_.empty() || vertices_.empty()) return false;
+
+    // Run the SAH build outside the lock — vertices_ / indices_ are
+    // immutable after the initial buildFromDrawable* call, so the
+    // builder doesn't need synchronisation for its inputs.  Only the
+    // final bvh_root_ pointer publication needs to be guarded.
     BVHBuilder builder(vertices_, indices_, /*debug_mode=*/false);
     builder.build();
-    bvh_root_ = builder.getRoot();
-    return bvh_root_ != nullptr;
+    auto root = builder.getRoot();
+    if (!root) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(bvh_mutex_);
+        bvh_root_ = std::move(root);
+    }
+    // Release-store: any thread that observes bvh_ready_==true via
+    // an acquire-load is guaranteed to see the bvh_root_ write above.
+    bvh_ready_.store(true, std::memory_order_release);
+    return true;
 }
 
 void CollisionMesh::queryBVH(
     const AABB& query_box,
     std::vector<int>& out_tri_indices) const {
-    if (!bvh_root_) return;
-    if (!aabbOverlap(query_box, bvh_root_->bounds)) return;
+    // See raycastDown for the rationale on this acquire-then-copy
+    // pattern.  Briefly: a concurrent async build may publish
+    // bvh_root_ at any moment; we publish via bvh_ready_, so reads
+    // gate on the flag and hold a strong reference for the
+    // duration of the traversal.
+    std::shared_ptr<BVHNode> root_local;
+    if (bvh_ready_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(bvh_mutex_);
+        root_local = bvh_root_;
+    }
+    if (!root_local) return;
+    if (!aabbOverlap(query_box, root_local->bounds)) return;
 
     std::vector<const BVHNode*> stack;
     stack.reserve(64);
-    stack.push_back(bvh_root_.get());
+    stack.push_back(root_local.get());
     while (!stack.empty()) {
         const BVHNode* node = stack.back();
         stack.pop_back();
@@ -295,7 +331,12 @@ bool CollisionMesh::resolveCapsuleStep(
     float height,
     glm::vec3& accum_normal,
     int& contact_count) const {
-    if (indices_.empty() || !bvh_root_) return false;
+    // Capsule physics has no brute-force fallback — queryBVH() is
+    // the only producer of candidate triangles.  Skip cleanly when
+    // the BVH for this mesh hasn't been built yet (early in startup,
+    // before CollisionWorld::buildBVHsAsync completes).  isBVHReady
+    // is an atomic acquire-load, no lock.
+    if (indices_.empty() || !isBVHReady()) return false;
 
     const float seg_top_y = std::max(height - radius, radius);
     const glm::vec3 seg_a = position + glm::vec3(0.0f, radius,    0.0f);
@@ -843,13 +884,11 @@ bool CollisionMesh::buildFromDrawablePrimitive(
 
     if (!build_bvh) {
         bvh_root_ = nullptr;
+        bvh_ready_.store(false, std::memory_order_release);
         return true;
     }
 
-    BVHBuilder builder(vertices_, indices_, /*debug_mode=*/false);
-    builder.build();
-    bvh_root_ = builder.getRoot();
-    return bvh_root_ != nullptr;
+    return buildBVH();
 }
 
 bool CollisionMesh::buildFromDrawableMesh(
@@ -908,13 +947,11 @@ bool CollisionMesh::buildFromDrawableMesh(
 
     if (!build_bvh) {
         bvh_root_ = nullptr;
+        bvh_ready_.store(false, std::memory_order_release);
         return true;
     }
 
-    BVHBuilder builder(vertices_, indices_, /*debug_mode=*/false);
-    builder.build();
-    bvh_root_ = builder.getRoot();
-    return bvh_root_ != nullptr;
+    return buildBVH();
 }
 
 void CollisionWorld::drawDebug(
@@ -992,6 +1029,279 @@ bool CollisionWorld::resolveCapsule(
         out_normal = glm::vec3(0, 1, 0);
     }
     return any;
+}
+
+// ── Vertical raycast ────────────────────────────────────────────────
+// CollisionMesh::raycastDown walks this mesh's per-mesh SAH BVH for a
+// straight-down ray.  intersectBVHRecursive (helper/bvh.cpp) does the
+// AABB-vs-ray pruning + Möller-Trumbore triangle intersection; we just
+// hand it the ray + root and pick the face normal out of the closest
+// hit's triangle indices.
+
+bool CollisionMesh::raycastDown(
+    const glm::vec3& from,
+    float max_distance,
+    glm::vec3& out_hit,
+    glm::vec3& out_normal) const {
+    if (indices_.empty()) return false;
+
+    Ray ray;
+    ray.origin    = from;
+    ray.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+
+    HitInfo hit;
+
+    // BVH-when-ready: acquire-load the ready flag, then copy the
+    // shared_ptr under the mutex so we hold a strong reference for
+    // the duration of the traversal even if some other thread were
+    // to swap bvh_root_.  In practice the build is one-shot and the
+    // pointer never changes after publication, but copying the
+    // shared_ptr is cheap (one atomic ref-count bump) and makes the
+    // pattern exception-safe.
+    //
+    // While the async build hasn't completed for this mesh yet we
+    // fall back to brute force so foot IK works from frame zero --
+    // the cost is bounded because CollisionWorld::raycastDown has
+    // already AABB-culled the mesh list to the foot's column, and
+    // the async build replaces brute-force with O(log N) per mesh
+    // within a few hundred ms.
+    std::shared_ptr<BVHNode> bvh_root_local;
+    if (bvh_ready_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(bvh_mutex_);
+        bvh_root_local = bvh_root_;
+    }
+
+    if (bvh_root_local) {
+        intersectBVHRecursive(ray, bvh_root_local, vertices_, indices_, hit);
+    } else {
+        // Brute-force fallback (used until buildBVH completes for
+        // this mesh).
+        const int tri_count = (int)(indices_.size() / 3);
+        for (int tri = 0; tri < tri_count; ++tri) {
+            const glm::vec3& v0 = vertices_[indices_[3 * tri + 0]];
+            const glm::vec3& v1 = vertices_[indices_[3 * tri + 1]];
+            const glm::vec3& v2 = vertices_[indices_[3 * tri + 2]];
+            float t, u, v;
+            if (rayTriangleIntersect(ray, v0, v1, v2, t, u, v)) {
+                if (t < hit.t && t > 1e-6f) {
+                    hit.hit = true;
+                    hit.t = t;
+                    hit.triangle_index = tri;
+                    hit.u = u;
+                    hit.v = v;
+                }
+            }
+        }
+    }
+
+    if (!hit.hit) return false;
+    if (hit.t > max_distance) return false;
+
+    out_hit = ray.origin + ray.direction * hit.t;
+
+    // Face normal from the triangle's vertex winding.  The collision
+    // mesh's triangle list comes from VoxelCube / Decimate output and
+    // is consistently CCW-from-outside, so cross((v1-v0),(v2-v0))
+    // points away from the solid for a hit on the underside of a
+    // floor → +Y, which is what foot IK wants.  Caller can flip the
+    // sign if it needs a guaranteed up-pointing normal.
+    const int tri = hit.triangle_index;
+    if (tri >= 0 && 3 * tri + 2 < (int)indices_.size()) {
+        const glm::vec3& v0 = vertices_[indices_[3 * tri + 0]];
+        const glm::vec3& v1 = vertices_[indices_[3 * tri + 1]];
+        const glm::vec3& v2 = vertices_[indices_[3 * tri + 2]];
+        glm::vec3 n   = glm::cross(v1 - v0, v2 - v0);
+        float     len = glm::length(n);
+        out_normal = (len > 1e-12f) ? (n / len) : glm::vec3(0, 1, 0);
+    } else {
+        out_normal = glm::vec3(0, 1, 0);
+    }
+    return true;
+}
+
+bool CollisionWorld::raycastDown(
+    const glm::vec3& from,
+    float max_distance,
+    glm::vec3& out_hit,
+    glm::vec3& out_normal) const {
+    // The "closest hit going DOWN" is the one with the largest Y
+    // (least far below `from`).  We track the highest hit Y seen so
+    // far and replace whenever a mesh produces a closer one.
+    bool      any         = false;
+    glm::vec3 best_hit    (0.0f);
+    glm::vec3 best_normal (0.0f, 1.0f, 0.0f);
+    float     best_y      = -std::numeric_limits<float>::max();
+
+    // Vertical-column AABB used for per-mesh early rejection.  Most
+    // meshes in a Bistro-sized world don't overlap a given foot's
+    // column at all, so this cuts the loop body to ~0 work in the
+    // common case before we descend any BVH.
+    const float col_top = from.y;
+    const float col_bot = from.y - max_distance;
+
+    // Throttled diagnostic — every 256th call print:
+    //   • how many meshes passed the AABB column overlap test
+    //   • of those, how many produced a triangle hit
+    //   • for the first 5 candidates that PASSED AABB but produced
+    //     NO hit, their tri count and full bounds so we can tell at a
+    //     glance whether they're "floor-shaped" (wide XZ, thin Y) or
+    //     "wall-shaped" (thin in one of XZ, tall Y) — the former
+    //     should hit a downward ray, the latter typically won't.
+    static uint64_t s_call = 0;
+    const bool log_now = ((s_call++ % 256u) == 0u);
+    int n_total = 0, n_aabb_pass = 0, n_hit = 0;
+    struct CandidateDump { AABB b; size_t tri_count; bool hit; };
+    std::vector<CandidateDump> dump;
+    if (log_now) {
+        n_total = (int)meshes_.size();
+        dump.reserve(8);
+    }
+
+    for (const auto& m : meshes_) {
+        if (!m || m->empty()) continue;
+        const AABB& b = m->bounds();
+        // XZ overlap with the foot's column.
+        if (from.x < b.min_bounds.x || from.x > b.max_bounds.x) continue;
+        if (from.z < b.min_bounds.z || from.z > b.max_bounds.z) continue;
+        // Y overlap with the [col_bot, col_top] segment.
+        if (b.max_bounds.y < col_bot)  continue;
+        if (b.min_bounds.y > col_top)  continue;
+        if (log_now) ++n_aabb_pass;
+
+        glm::vec3 hit, normal;
+        bool mesh_hit = m->raycastDown(from, max_distance, hit, normal);
+        if (mesh_hit) {
+            if (log_now) ++n_hit;
+            if (!any || hit.y > best_y) {
+                best_hit    = hit;
+                best_normal = normal;
+                best_y      = hit.y;
+                any         = true;
+            }
+        }
+        if (log_now && dump.size() < 5 && !mesh_hit) {
+            dump.push_back({b, m->triangleCount(), false});
+        }
+    }
+
+    if (log_now) {
+        std::cout << "[cw.raycastDown] from=("
+                  << from.x << "," << from.y << "," << from.z << ")"
+                  << " max_d=" << max_distance
+                  << " meshes_total=" << n_total
+                  << " aabb_pass=" << n_aabb_pass
+                  << " hit=" << n_hit << std::endl;
+        for (size_t i = 0; i < dump.size(); ++i) {
+            const auto& c = dump[i];
+            const glm::vec3 ext = c.b.max_bounds - c.b.min_bounds;
+            std::cout << "  miss[" << i << "] tris=" << c.tri_count
+                      << " bounds_min=("
+                      << c.b.min_bounds.x << "," << c.b.min_bounds.y << "," << c.b.min_bounds.z
+                      << ") bounds_max=("
+                      << c.b.max_bounds.x << "," << c.b.max_bounds.y << "," << c.b.max_bounds.z
+                      << ") ext=("
+                      << ext.x << "," << ext.y << "," << ext.z << ")" << std::endl;
+        }
+    }
+
+    if (any) {
+        out_hit    = best_hit;
+        out_normal = best_normal;
+    }
+    return any;
+}
+
+// ── Async BVH build ────────────────────────────────────────────────
+// Build BVHs off the render thread.  Triggered by application.cpp
+// after the collision world is populated from the bistro drawables.
+// The render thread keeps running; foot IK falls back to brute
+// force per mesh until that mesh's BVH lands, then transparently
+// switches to O(log N) descent.
+
+void CollisionWorld::buildBVHsAsync() {
+    // Re-entry guard: don't spin up a second worker if one is
+    // already running (or if a prior build completed and we
+    // haven't joined yet — joining is the caller's job via
+    // waitForBVHs()).
+    bool expected = false;
+    if (!bvh_build_in_flight_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    // Make sure any stale thread handle is joined before we
+    // replace it.  buildBVHsAsync() may be called again after a
+    // previous build completed but before clear()/dtor ran; in
+    // that case the thread is joinable but not running.
+    if (bvh_builder_thread_.joinable()) {
+        bvh_builder_thread_.join();
+    }
+
+    // Snapshot the mesh list so the worker doesn't iterate against
+    // a vector that the main thread might mutate (addMesh/clear).
+    // shared_ptr copy keeps each mesh alive for the worker's
+    // duration even if the world is destroyed mid-build (the
+    // destructor joins us first, but the snapshot is still the
+    // safer pattern).
+    std::vector<std::shared_ptr<CollisionMesh>> snapshot = meshes_;
+    if (snapshot.empty()) {
+        bvh_build_in_flight_.store(false);
+        return;
+    }
+
+    bvh_builder_thread_ = std::thread([snap = std::move(snapshot), this]() {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        size_t built  = 0;
+        size_t failed = 0;
+        size_t skipped = 0;
+        for (const auto& m : snap) {
+            if (!m || m->empty()) {
+                ++skipped;
+                continue;
+            }
+            if (m->isBVHReady()) {
+                ++skipped;
+                continue;
+            }
+            const auto t_m0 = std::chrono::high_resolution_clock::now();
+            const bool ok = m->buildBVH();
+            const auto t_m1 = std::chrono::high_resolution_clock::now();
+            const double ms =
+                std::chrono::duration<double, std::milli>(t_m1 - t_m0).count();
+            if (ok) {
+                ++built;
+                if (ms > 50.0) {
+                    // Log only the slow ones; otherwise the
+                    // per-mesh log floods on a Bistro-sized world.
+                    std::cout
+                        << "[collision.bvh] mesh tris="
+                        << m->triangleCount()
+                        << " built in " << ms << " ms" << std::endl;
+                }
+            } else {
+                ++failed;
+                std::cout
+                    << "[collision.bvh] BUILD FAILED for mesh tris="
+                    << m->triangleCount() << std::endl;
+            }
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout
+            << "[collision.bvh] async build done in " << total_ms
+            << " ms: " << built << " built, " << failed
+            << " failed, " << skipped << " skipped"
+            << std::endl;
+
+        bvh_build_in_flight_.store(false);
+    });
+}
+
+void CollisionWorld::waitForBVHs() {
+    if (bvh_builder_thread_.joinable()) {
+        bvh_builder_thread_.join();
+    }
+    bvh_build_in_flight_.store(false);
 }
 
 } // namespace helper

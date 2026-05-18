@@ -1,6 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include "renderer/renderer.h"
 #include "helper/bvh.h"
@@ -121,6 +124,43 @@ public:
         glm::vec3& out_normal,
         int max_iterations = 4) const;
 
+    // Cast a vertical ray straight down from `from` and return the
+    // closest triangle hit within `max_distance`.  Walks this mesh's
+    // BVH so the cost is O(log N) per leaf descent rather than O(N)
+    // over the full triangle list.
+    //
+    // Returns false (and leaves out_hit / out_normal untouched) when:
+    //   - the BVH wasn't built for this mesh (build_bvh=false at
+    //     construction), or
+    //   - the ray misses every triangle, or
+    //   - the closest hit is further than max_distance below `from`.
+    //
+    // out_normal is the geometric face normal of the hit triangle,
+    // computed from its vertex order — note: not necessarily the
+    // "up-pointing" normal; for a downward ray hitting a floor it
+    // typically points up, but for a ceiling it'll point down.
+    // Caller should renormalize if it cares about sign.
+    bool raycastDown(
+        const glm::vec3& from,
+        float max_distance,
+        glm::vec3& out_hit,
+        glm::vec3& out_normal) const;
+
+    // Synchronously build the per-mesh SAH BVH from the already-
+    // populated `vertices_` / `indices_` arrays. Safe to call from a
+    // worker thread; uses a per-mesh mutex + an atomic ready flag so
+    // concurrent raycastDown calls can either see a fully-built tree
+    // or fall back to brute force without tearing on a half-set
+    // shared_ptr. Returns true on success.  No-op (returns true) if
+    // the BVH is already ready; returns false if the mesh is empty.
+    bool buildBVH();
+
+    // Cheap atomic test used by raycastDown to pick BVH vs brute
+    // force.  Becomes true after buildBVH() finishes successfully.
+    bool isBVHReady() const {
+        return bvh_ready_.load(std::memory_order_acquire);
+    }
+
     bool empty() const { return indices_.empty(); }
     size_t triangleCount() const { return indices_.size() / 3; }
     const AABB& bounds() const { return bounds_; }
@@ -138,7 +178,16 @@ public:
 private:
     std::vector<glm::vec3>      vertices_;
     std::vector<int>            indices_;
+    // `bvh_root_` is written exactly once (by buildBVH()) and read
+    // many times (raycastDown / resolveCapsule).  The write must
+    // happen-before any read that uses the tree, so we publish it
+    // through `bvh_ready_` (release on set, acquire on test) and
+    // copy the shared_ptr under `bvh_mutex_` to avoid tearing the
+    // control-block pointer on platforms where shared_ptr
+    // assignment isn't atomic.
     std::shared_ptr<BVHNode>    bvh_root_;
+    mutable std::mutex          bvh_mutex_;
+    std::atomic<bool>           bvh_ready_{false};
     AABB                        bounds_;
 
     // Source-asset material name for the primitive that produced
@@ -165,17 +214,60 @@ private:
 
 class CollisionWorld {
 public:
+    ~CollisionWorld() { waitForBVHs(); }
+
     void addMesh(std::shared_ptr<CollisionMesh> mesh) {
         if (mesh && !mesh->empty()) meshes_.push_back(std::move(mesh));
     }
-    void clear() { meshes_.clear(); }
+    // clear() tears down the mesh list; the async builder (if any)
+    // could still be holding shared_ptrs to those meshes, so we have
+    // to wait it out before releasing them.  Otherwise a concurrent
+    // build would resurrect the mesh and we'd end up with a BVH for
+    // a world that no longer exists.
+    void clear() {
+        waitForBVHs();
+        meshes_.clear();
+    }
     bool empty() const { return meshes_.empty(); }
     size_t meshCount() const { return meshes_.size(); }
+
+    // Kick off a background thread that calls m->buildBVH() on every
+    // mesh currently in this world.  Non-blocking: returns immediately.
+    // While the build runs, CollisionMesh::raycastDown / resolveCapsule
+    // fall back to brute force per mesh whose BVH isn't ready yet, so
+    // foot IK keeps working from frame one and just speeds up as the
+    // worker drains the list.  Safe to call multiple times; subsequent
+    // calls while a build is in flight are silently ignored.  The
+    // worker logs per-mesh + total build time.
+    void buildBVHsAsync();
+
+    // Join the async builder thread if it's running.  Called by
+    // clear() and the destructor.  Safe to call when no build is in
+    // flight (returns immediately).
+    void waitForBVHs();
 
     bool resolveCapsule(
         glm::vec3& position,
         float radius,
         float height,
+        glm::vec3& out_normal) const;
+
+    // Cast a vertical ray downward from `from` against every mesh in
+    // the world and return the closest hit within `max_distance`.
+    // Uses per-mesh AABB early rejection (XZ overlap + Y range) before
+    // descending each mesh's BVH, so meshes nowhere near the foot
+    // column are skipped in O(1).  Cost scales with the number of
+    // meshes that overlap the foot's vertical column, which for a
+    // typical scene is a small handful even though the world holds
+    // thousands of meshes.
+    //
+    // Returns false when no mesh is hit within `max_distance` below
+    // `from`.  On hit, out_hit is the world-space intersection point
+    // and out_normal is the hit triangle's face normal.
+    bool raycastDown(
+        const glm::vec3& from,
+        float max_distance,
+        glm::vec3& out_hit,
         glm::vec3& out_normal) const;
 
     // Draw every collision mesh as flat-shaded debug triangles.
@@ -191,6 +283,13 @@ public:
 
 private:
     std::vector<std::shared_ptr<CollisionMesh>> meshes_;
+
+    // Async BVH builder bookkeeping.  `bvh_build_in_flight_` gates
+    // re-entry from buildBVHsAsync() so a second call while a build
+    // is already running is a no-op.  The thread is joined in
+    // waitForBVHs() (called from clear() and the destructor).
+    std::thread       bvh_builder_thread_;
+    std::atomic<bool> bvh_build_in_flight_{false};
 };
 
 } // namespace helper
