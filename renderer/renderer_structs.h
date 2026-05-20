@@ -441,6 +441,15 @@ struct QueueFamilyList {
 };
 
 struct TextureInfo {
+    // Original on-disk filename (e.g. "BistroFloor_BaseColor.png" or
+    // "..\\textures\\Wood_Brown_BaseColor.png") preserved from the
+    // asset loader so debug / classifier code can read the texture's
+    // semantic name without going back to the source FBX / glTF.
+    // Empty when the texture was created programmatically (LUTs,
+    // shadow companions, GPU-only render targets, etc.).  Populated
+    // by the FBX loader path in drawable_object.cpp; glTF path is a
+    // future addition.
+    std::string                        source_filename_;
     bool                               linear = true;
     glm::uvec3                         size = glm::uvec3(0);
     uint32_t                           mip_levels = 1;

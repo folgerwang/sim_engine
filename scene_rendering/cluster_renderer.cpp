@@ -7,6 +7,7 @@
 #include "cluster_renderer.h"
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"
+#include "helper/material_classifier.h"
 #include "game_object/drawable_object.h"
 #include "virtual_texture.h"
 
@@ -502,6 +503,20 @@ void ClusterRenderer::uploadMeshClusters(
     std::unordered_map<uint32_t, uint32_t> prim_to_mat_idx;
     const auto& meshes = drawable_data.meshes_;
 
+    // First node that references this mesh wins as the "object name"
+    // for every primitive inside it.  Same convention used by
+    // CollisionMesh::buildFromDrawablePrimitive — keeps the AI
+    // classifier's per-mesh lookup consistent across the collision
+    // proxy and the cluster-rendered draw.  Empty when no node owns
+    // the mesh (rare but possible for procedurally-generated meshes).
+    std::string mesh_object_name;
+    for (const auto& node : drawable_data.nodes_) {
+        if (node.mesh_idx_ == static_cast<int32_t>(mesh_idx)) {
+            mesh_object_name = node.name_;
+            break;
+        }
+    }
+
     auto getMaterialIdx = [&](uint32_t prim_idx) -> uint32_t {
         auto cache_it = prim_to_mat_idx.find(prim_idx);
         if (cache_it != prim_to_mat_idx.end()) return cache_it->second;
@@ -662,6 +677,28 @@ void ClusterRenderer::uploadMeshClusters(
         mp.base_color_factor = base_color;
         uint32_t idx = static_cast<uint32_t>(staging_material_params_.size());
         staging_material_params_.push_back(mp);
+
+        // Capture (material_name, object_name) alongside the params
+        // entry so applyMaterialCategories() can later look up the
+        // category from the LLM classifier without re-walking the
+        // drawable data.  Material name comes from MaterialInfo; the
+        // object name is the first owning-node's name resolved above.
+        std::string material_name;
+        if (mesh_idx < meshes.size()) {
+            const auto& prims = meshes[mesh_idx].primitives_;
+            if (prim_idx < prims.size()) {
+                const int32_t mat_idx = prims[prim_idx].material_idx_;
+                if (mat_idx >= 0 &&
+                    static_cast<size_t>(mat_idx) <
+                        drawable_data.materials_.size()) {
+                    material_name =
+                        drawable_data.materials_[mat_idx].name_;
+                }
+            }
+        }
+        staging_material_names_.emplace_back(
+            std::move(material_name), mesh_object_name);
+
         prim_to_mat_idx[prim_idx] = idx;
         return idx;
     };
@@ -1376,6 +1413,90 @@ void ClusterRenderer::setVtEnabled(bool enabled) {
                 "(%zu materials, %zu KB)\n",
                 enabled ? "ENABLED" : "DISABLED",
                 material_params_backup_.size(), bytes / 1024u);
+}
+
+// ─── applyMaterialCategories ───────────────────────────────────────────────
+// Re-upload the per-material flags SSBO with MeshCategory bits packed
+// into bits 8..15.  Lookups go through the LLM-backed classifier; the
+// (material_name, object_name) pair to query is recorded in
+// staging_material_names_[i] alongside staging_material_params_[i] at
+// upload time.  The shader's DEBUG_RENDER_MODE_CATEGORY branch reads
+// the bits via BINDLESS_MAT_CATEGORY_SHIFT / _MASK and maps each enum
+// value to a fixed RGB (same table as collision_debug.frag).
+//
+// We patch the CPU-side material_params_backup_ (the source of truth
+// post-finalize) and then re-upload the GPU buffer in one shot.
+//
+// Idempotent and safe to call repeatedly; each call wipes the previous
+// category bits before OR-ing in the fresh lookup.
+void ClusterRenderer::applyMaterialCategories(
+    const helper::MaterialClassifier& cls) {
+    if (material_params_backup_.empty() ||
+        !material_params_buffer_.memory) {
+        std::printf(
+            "[CLUSTER_RENDERER] applyMaterialCategories: no params to "
+            "patch (backup_empty=%d memory_null=%d)\n",
+            static_cast<int>(material_params_backup_.empty()),
+            static_cast<int>(!material_params_buffer_.memory));
+        return;
+    }
+
+    // staging_material_names_ should match material_params_backup_ in
+    // length and order — they were filled side-by-side in
+    // uploadMeshClusters().  Defend against mismatch (e.g. partial
+    // upload) by truncating to the shorter length and logging.
+    const size_t pair_count = std::min(
+        material_params_backup_.size(), staging_material_names_.size());
+    if (pair_count != material_params_backup_.size() ||
+        pair_count != staging_material_names_.size()) {
+        std::printf(
+            "[CLUSTER_RENDERER] applyMaterialCategories: name list "
+            "length mismatch (params=%zu names=%zu), patching first %zu\n",
+            material_params_backup_.size(),
+            staging_material_names_.size(),
+            pair_count);
+    }
+
+    int patched = 0;
+    int matched = 0;
+    std::array<int, 11> per_cat{};
+    for (size_t i = 0; i < pair_count; ++i) {
+        const auto& [mat_name, obj_name] = staging_material_names_[i];
+        const auto cat = cls.lookup(mat_name, obj_name);
+        // Always wipe the previous category bits before writing, so
+        // a second call with a different classifier overrides cleanly.
+        int& flags = material_params_backup_[i].flags;
+        flags &= ~BINDLESS_MAT_CATEGORY_MASK;
+        const uint32_t cat_u = static_cast<uint32_t>(cat);
+        flags |= static_cast<int>(
+            (cat_u << BINDLESS_MAT_CATEGORY_SHIFT) &
+            BINDLESS_MAT_CATEGORY_MASK);
+        if (cat_u < per_cat.size()) ++per_cat[cat_u];
+        if (cat != helper::MeshCategory::Unknown) ++matched;
+        ++patched;
+    }
+
+    // Re-upload the patched backup to the live SSBO.  Same path the
+    // VT toggle uses; the buffer is HOST_VISIBLE | HOST_COHERENT so
+    // the write is visible to the next draw without a barrier (apart
+    // from the swapchain's natural per-frame synchronisation).
+    const size_t bytes =
+        material_params_backup_.size() * sizeof(glsl::BindlessMaterialParams);
+    device_->updateBufferMemory(
+        material_params_buffer_.memory,
+        bytes,
+        material_params_backup_.data());
+
+    std::printf(
+        "[CLUSTER_RENDERER] applyMaterialCategories: patched %d / %d "
+        "entries (%d classified non-Unknown). "
+        "Unknown=%d Floor=%d Wall=%d Door=%d Object=%d Glass=%d "
+        "Ceiling=%d Stairs=%d Vegetation=%d Elevator=%d Ladder=%d\n",
+        patched, static_cast<int>(material_params_backup_.size()),
+        matched,
+        per_cat[0], per_cat[1], per_cat[2], per_cat[3], per_cat[4],
+        per_cat[5], per_cat[6], per_cat[7], per_cat[8], per_cat[9],
+        per_cat[10]);
 }
 
 // ─── setHiZTexture ─────────────────────────────────────────────────────────

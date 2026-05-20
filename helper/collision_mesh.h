@@ -23,8 +23,8 @@ namespace helper {
 //                   mesh of axis-aligned cubes for every occupied
 //                   cell, culling the faces between two occupied
 //                   cells. Result is a "Minecraft" view of the
-//                   primitive -- chunky, simple, gap-free. Default
-//                   shape; default voxel_size is 5cm.
+//                   primitive -- chunky, simple, gap-free.
+//                   Default voxel_size is 5cm.
 //   VoxelSphere  -- same voxelisation, but each occupied cell emits
 //                   a low-poly octahedron centered on the cell.
 //                   Useful when the cube faces feel too rigid;
@@ -36,6 +36,60 @@ enum class CollisionShape {
     VoxelCube,
     VoxelSphere,
 };
+
+// Semantic role of a CollisionMesh in the gameplay world.  Inferred at
+// build time from the source material name plus a face-normal majority
+// vote (see classifyCategory in collision_mesh.cpp).  Gameplay code can
+// branch on this — Floor for navigation / foot IK targets, Wall for
+// blocking, Door for interactable openings, Object for the per-thing
+// physics pile (tables, chairs, bottles, …).  Also the colour key used
+// by the segmentation debug draw, so the values double as the shader
+// "category id".  Order matters: the values are reused as a stable
+// integer key the fragment shader hashes / switches on.
+enum class MeshCategory : uint32_t {
+    Unknown    = 0,
+    Floor      = 1,  // walkable: roads, sidewalks, interior floors, doormats
+    Wall       = 2,  // vertical blocking: brick, plaster, stucco, cladding
+    Door       = 3,  // openings: explicit door / gate / rollup
+    Object     = 4,  // gameplay props: tables, chairs, bottles, lamps, signs
+    Glass      = 5,  // see-through-but-blocking (window / glass)
+    Ceiling    = 6,  // blocks-from-below: ceilings, interior roof underside
+    Stairs     = 7,  // walkable but step-aware navigation (different gait)
+    Vegetation = 8,  // non-collidable or soft: foliage, ivy, leaves, grass
+    Elevator   = 9,  // walkable + vertical traversal (lift platforms)
+    Ladder     = 10, // vertical traversal with hand-over-hand gait
+};
+
+// Stable, all-caps tags used for serialization (LLM responses, JSON
+// caches, log lines).  Keep in lockstep with the enum above; the LLM
+// is prompted to emit one of these exact strings.
+const char* meshCategoryTag(MeshCategory c);
+MeshCategory meshCategoryFromTag(const std::string& tag);
+
+// Best-effort classification of one primitive from its material name
+// and triangle normals.  Pure function so application.cpp can override
+// the result if it wants a custom rule per-drawable (Bistro vs custom
+// scenes); the default heuristic is:
+//
+//   1. material-name substring match wins for unambiguous tags:
+//        "Door" / "Gate" / "Rollup"     → Door
+//        "Glass" / "Window" / "Frosted" → Glass
+//        "Doormat"                      → Floor
+//   2. geometric vote: dominant face-normal direction picks Floor (mostly
+//      +Y) vs Wall (mostly horizontal) for the remaining unambiguous
+//      cases.
+//   3. small AABB extents in all three axes → Object (table/chair/prop),
+//      since walls and floors always span at least a metre or two.
+//   4. otherwise Unknown.
+//
+// vertices / indices are the FINAL collision triangle list (post weld
+// + shape finalisation) so the vote reflects what physics will see, not
+// the un-simplified source.
+MeshCategory classifyCategory(
+    const std::string& material_name,
+    const std::vector<glm::vec3>& vertices,
+    const std::vector<int>& indices,
+    const AABB& bounds);
 
 // CollisionMesh — static-mesh CPU collision representation.
 class CollisionMesh {
@@ -95,10 +149,16 @@ public:
     // entirely.
     //
     // shape selects how the welded triangle list is finalised. The
-    // default `VoxelCube` voxelises the primitive into 5cm cells and
-    // emits a chunky surface mesh -- much simpler than the source
-    // and gap-free. See the `CollisionShape` doc comment for
-    // alternatives.
+    // default `Decimate` runs OpenMesh QEM simplification on the
+    // welded triangle list, producing a low-poly mesh that still
+    // looks like the original. Compared to VoxelCube it preserves
+    // the silhouette (good for capsule sliding along thin walls)
+    // but can leave hairline gaps where (a) two primitives meet
+    // and only weld within each side, or (b) authoring-time
+    // vertex pairs straddle the weld grid boundary -- see the
+    // 3x3x3 neighbour lookup below for the latter mitigation, and
+    // the `CollisionShape` doc comment for alternatives if a
+    // gap-free shell is required.
     //
     // voxel_size: edge length of each voxel cell, in scene units
     // (metres for Bistro). Only consulted by the VoxelCube /
@@ -111,11 +171,32 @@ public:
         size_t mesh_idx,
         size_t prim_idx,
         bool build_bvh = true,
-        CollisionShape shape = CollisionShape::VoxelCube,
+        CollisionShape shape = CollisionShape::Decimate,
         float weld_eps = 0.1f,
         float voxel_size = 0.05f);
 
     const std::string& materialName() const { return material_name_; }
+
+    // FBX/glTF node name of the first node referencing the mesh this
+    // primitive belongs to (e.g. "Bistro_Research_Exterior_Linde_
+    // Tree_Large_linde_tree_large_4051").  Captured during the same
+    // node-scan that bakes the world transform; an empty string means
+    // no node referenced the mesh.  Useful as a SECOND classification
+    // signal — bistro material names are sometimes generic ("Wood",
+    // "Metal_Worn") while the node names carry the actual semantics
+    // ("Stairs", "Linde_Tree", "Elevator_Shaft").
+    const std::string& objectName() const { return object_name_; }
+
+    // Semantic category — Floor / Wall / Door / Object / Glass /
+    // Ceiling / Stairs / Vegetation / Elevator / Ladder / Unknown.
+    // Set automatically at the end of buildFromDrawablePrimitive by
+    // classifyCategory(); the other build paths (buildFromDrawable,
+    // buildFromDrawableMesh) leave it at Unknown since they aggregate
+    // multiple materials and no single category would be honest.
+    // Application code can also overwrite it via setCategory() for
+    // scene-specific rules and AI-classifier overrides.
+    MeshCategory category() const { return category_; }
+    void setCategory(MeshCategory c) { category_ = c; }
 
     bool resolveCapsule(
         glm::vec3& position,
@@ -195,6 +276,15 @@ private:
     // Empty for the multi-mesh / multi-primitive build paths since
     // a single name can't summarise an aggregated triangle list.
     std::string                 material_name_;
+
+    // Source-asset node name (NodeInfo::name_) of the first node
+    // referencing this mesh.  Same population path as the world
+    // transform — set by buildFromDrawablePrimitive only.
+    std::string                 object_name_;
+
+    // Semantic classification — see MeshCategory above.  Default
+    // Unknown until buildFromDrawablePrimitive resolves it.
+    MeshCategory                category_ = MeshCategory::Unknown;
 
     // Debug GPU buffers — `mutable` so const draw paths can populate
     // them on first use.

@@ -1,6 +1,10 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <string>
+#include <utility>
+#include <vector>
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
@@ -189,13 +193,67 @@ private:
     // forwards through toggleCollisionDebug() below).
     bool show_collision_debug_ = false;
 
+    // ── Mesh-Category inspector window ───────────────────────────────
+    // Snapshot of the LLM classifier's verdicts pushed by application
+    // via setMaterialCategorySnapshot() once the async classify
+    // finishes.  Each entry is (name, MeshCategory cast to uint32_t)
+    // — uint32_t in the pair instead of the enum keeps menu.h free
+    // of a collision_mesh.h include (the colour switch in draw()
+    // hardcodes the same RGB table to stay in lockstep with the
+    // shader, so we don't actually need the enum type here).
+    bool show_mesh_category_inspector_ = false;
+    bool mesh_category_snapshot_valid_ = false;
+    std::vector<std::pair<std::string, uint32_t>>
+        mesh_category_materials_;
+    std::vector<std::pair<std::string, uint32_t>>
+        mesh_category_objects_;
+    // Search box text — filters both tables by case-insensitive
+    // substring match.  Cleared on first frame the inspector opens.
+    char mesh_category_filter_[64] = {0};
+
+    // ── Classifier status banner (always-on top-right overlay) ───────
+    // Application pushes the current classifier state every frame via
+    // setClassifierStatus().  draw() then paints a small text label
+    // at the top of the viewport ("LLM: pending (12s)", "LLM: ready
+    // 193/193", "LLM: failed") so the user has visual confirmation
+    // even when the console output is hidden / scrolled past.  Values
+    // mirror what the [mat.cls] log lines say.
+    //
+    // The enum has to be PUBLIC because application.cpp names it
+    // when calling setClassifierStatus(); the storage fields below
+    // stay private.
+public:
+    enum class ClassifierStatus : int {
+        Idle    = 0,  // not kicked off yet
+        Pending = 1,  // worker running
+        Ready   = 2,  // succeeded
+        Failed  = 3,  // future returned false
+    };
+private:
+    ClassifierStatus classifier_status_ = ClassifierStatus::Idle;
+    float            classifier_elapsed_s_ = 0.0f;
+    int              classifier_mats_done_ = 0;
+    int              classifier_objs_done_ = 0;
+    // Live byte-progress counters published by the worker thread
+    // and pushed in through setClassifierStatus() each frame.
+    // Bytes-received / estimated-total drives the on-screen
+    // ProgressBar.  estimated_total is a heuristic baked from
+    // collected name counts in application.cpp — overshoots cap at
+    // 100 % so the bar never reads ridiculous.
+    size_t           classifier_bytes_received_ = 0;
+    size_t           classifier_bytes_estimated_total_ = 0;
+
     // Which CollisionShape mode application.cpp should pass to
     // CollisionMesh::buildFromDrawablePrimitive when (re)building
     // the collision world for visualisation. Three user-facing
     // options live in the Physics submenu; the application maps
     // them onto the engine's CollisionShape enum at build time.
-    // Default is Volume (5cm voxel cubes) -- the cleanest read
-    // for inspecting what gameplay actually collides against.
+    // Default is Simplified (QEM-decimated triangles) — keeps the
+    // source silhouette so capsule physics slides naturally along
+    // thin walls and stairs.  Gaps can appear where neighbouring
+    // primitives don't share vertices (see the 3x3x3 weld in
+    // collision_mesh.cpp); switch to Volume for a gap-free shell
+    // when inspecting coverage of low-detail props.
 public:
     enum class CollisionDebugShape : int {
         Original   = 0,   // CollisionShape::None
@@ -204,7 +262,7 @@ public:
     };
 private:
     CollisionDebugShape collision_debug_shape_ =
-        CollisionDebugShape::Volume;
+        CollisionDebugShape::Simplified;
     // Set by setCollisionDebugShape() whenever the menu choice
     // changes; the application clears it after rebuilding the
     // collision world to match.
@@ -442,6 +500,57 @@ public:
         player_bbox_valid_ = bbox_valid;
         player_bbox_min_   = bbox_min;
         player_bbox_max_   = bbox_max;
+    }
+
+    // ── Material / Object → MeshCategory inspector ────────────────────
+    // Application pushes a snapshot of the LLM classifier's tables
+    // here ONCE, the first frame after the async classifyAll() lands.
+    // The menu then renders an ImGui inspector window when
+    // show_mesh_category_inspector_ is true (toggled from the Render
+    // Debug menu) — two scrollable tables, one for materials and one
+    // for objects, each row showing a colour swatch + the name + the
+    // category tag.  Sorted alphabetically by name within each table.
+    //
+    // The pair vectors are stored, not the source unordered_maps, so
+    // we keep deterministic ordering across draws and don't depend on
+    // hash-map iteration order changing between frames.
+    void setMaterialCategorySnapshot(
+        const std::vector<std::pair<std::string, uint32_t>>& materials,
+        const std::vector<std::pair<std::string, uint32_t>>& objects) {
+        mesh_category_materials_ = materials;
+        mesh_category_objects_   = objects;
+        // Sort alphabetically so the user can scroll through and the
+        // order doesn't depend on hash-map iteration.
+        auto by_name = [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        };
+        std::sort(mesh_category_materials_.begin(),
+                  mesh_category_materials_.end(), by_name);
+        std::sort(mesh_category_objects_.begin(),
+                  mesh_category_objects_.end(), by_name);
+        mesh_category_snapshot_valid_ = true;
+    }
+    bool meshCategorySnapshotValid() const {
+        return mesh_category_snapshot_valid_;
+    }
+
+    // Per-frame push of the classifier's current state so the banner
+    // can render without each frame re-reading anything from the
+    // async machinery.  Application calls this from the same place
+    // it polls s_mat_classifier_future.
+    void setClassifierStatus(
+        ClassifierStatus status,
+        float elapsed_s,
+        int mats_done,
+        int objs_done,
+        size_t bytes_received,
+        size_t bytes_estimated_total) {
+        classifier_status_   = status;
+        classifier_elapsed_s_ = elapsed_s;
+        classifier_mats_done_ = mats_done;
+        classifier_objs_done_ = objs_done;
+        classifier_bytes_received_ = bytes_received;
+        classifier_bytes_estimated_total_ = bytes_estimated_total;
     }
 
     // One-shot "snap the player to where the camera is looking" request.

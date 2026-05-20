@@ -951,6 +951,29 @@ void main() {
         // isn't recompiled, and gives a clear "SSAO is off" indicator
         // (uniform white) if the apply pass somehow doesn't run.
         out_color = vec4(1.0, 1.0, 1.0, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_CATEGORY) {
+        // MeshCategory solid-colour overlay.  Category id is packed
+        // into mat_flags bits 8..15 by ClusterRenderer::applyMaterial
+        // Categories after the LLM classifier runs; if it hasn't run
+        // yet (or this material wasn't classified) the field reads
+        // zero and we display Unknown=grey.  Colour table must match
+        // categoryColor() in collision_debug.frag so the rendered-mesh
+        // overlay and the collision-proxy overlay read identically.
+        uint cat = (uint(mat_flags) & uint(BINDLESS_MAT_CATEGORY_MASK))
+                       >> BINDLESS_MAT_CATEGORY_SHIFT;
+        vec3 cat_color;
+        if      (cat == 1u)  cat_color = vec3(0.20, 0.75, 0.30); // Floor
+        else if (cat == 2u)  cat_color = vec3(0.80, 0.20, 0.20); // Wall
+        else if (cat == 3u)  cat_color = vec3(0.95, 0.75, 0.10); // Door
+        else if (cat == 4u)  cat_color = vec3(0.55, 0.25, 0.80); // Object
+        else if (cat == 5u)  cat_color = vec3(0.40, 0.85, 0.95); // Glass
+        else if (cat == 6u)  cat_color = vec3(0.25, 0.45, 0.85); // Ceiling
+        else if (cat == 7u)  cat_color = vec3(0.95, 0.50, 0.10); // Stairs
+        else if (cat == 8u)  cat_color = vec3(0.55, 0.65, 0.20); // Vegetation
+        else if (cat == 9u)  cat_color = vec3(0.95, 0.20, 0.65); // Elevator
+        else if (cat == 10u) cat_color = vec3(0.75, 0.55, 0.35); // Ladder
+        else                 cat_color = vec3(0.55, 0.55, 0.55); // Unknown
+        out_color = vec4(cat_color, 1.0);
     }
 #endif // OIT_OUTPUT
 }

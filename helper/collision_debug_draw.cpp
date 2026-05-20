@@ -247,7 +247,7 @@ void CollisionDebugDraw::destroyStaticMembers(
 void CollisionDebugDraw::uploadForMesh(
     const std::shared_ptr<renderer::Device>& device,
     const CollisionMesh& mesh,
-    uint32_t mesh_id,
+    uint32_t seg_id,
     CollisionDebugMeshBuffers& out_gpu) {
 
     if (out_gpu.ready()) return;          // already uploaded
@@ -269,10 +269,10 @@ void CollisionDebugDraw::uploadForMesh(
 
     for (size_t t = 0; t < tri_count; ++t) {
         // Pull all three corners and tag every vertex with the SAME
-        // mesh_id. Each CollisionMesh becomes one solid colour after the
-        // fragment shader hashes the id, so adjacent meshes appear as
-        // distinct flat regions -- "instance segmentation" of the
-        // physics world.
+        // seg_id (conventionally a MeshCategory enum value). The
+        // fragment shader maps known category ids to fixed solid
+        // colours, so the whole mesh resolves to one semantic colour
+        // (Floor green, Wall red, Door yellow, ...).
         for (int k = 0; k < 3; ++k) {
             int v_idx = indices[3 * t + k];
             if (v_idx < 0 || (size_t)v_idx >= vertices.size()) {
@@ -283,7 +283,7 @@ void CollisionDebugDraw::uploadForMesh(
                 goto stop;
             }
             positions.push_back(vertices[v_idx]);
-            seg_ids.push_back(mesh_id);
+            seg_ids.push_back(seg_id);
         }
     }
 stop:

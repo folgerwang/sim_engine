@@ -76,15 +76,19 @@ public:
     // vertex buffers:
     //   - positions   (vec3, triangle_count * 3)
     //   - segmentation ids (uint, triangle_count * 3, ALL vertices of ALL
-    //                       triangles within this mesh share `mesh_id`)
-    // The fragment shader hashes the id into an RGB colour; using the
-    // same `mesh_id` for every vertex makes each CollisionMesh paint as
-    // a single solid segmentation colour.
+    //                       triangles within this mesh share `seg_id`)
+    // `seg_id` is conventionally the MeshCategory enum value (Floor /
+    // Wall / Door / Object / Glass / Unknown).  The fragment shader
+    // maps each known category to a fixed solid colour (Floor green,
+    // Wall red, Door yellow, Object purple, Glass cyan) and falls back
+    // to a procedural hash for anything else, so the debug overlay
+    // reads as a semantic map of the world rather than an instance-id
+    // patchwork.
     // Idempotent: if `out_gpu` is already populated, this is a no-op.
     static void uploadForMesh(
         const std::shared_ptr<renderer::Device>& device,
         const CollisionMesh& mesh,
-        uint32_t mesh_id,
+        uint32_t seg_id,
         CollisionDebugMeshBuffers& out_gpu);
 
     // Draw one collision mesh with per-triangle hashed colour.

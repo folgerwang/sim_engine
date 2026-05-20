@@ -231,6 +231,21 @@
                                                     // — when this mode is active the apply
                                                     // pass overwrites color with vec3(ao)
                                                     // instead of multiplying it in.
+#define DEBUG_RENDER_MODE_CATEGORY              13  // MeshCategory solid-colour overlay.
+                                                    // Reads the category bits packed in
+                                                    // BindlessMaterialParams.flags
+                                                    // (BINDLESS_MAT_CATEGORY_SHIFT /
+                                                    // _MASK) and maps each known enum
+                                                    // value to a fixed RGB so the user
+                                                    // sees the same Floor=green / Wall=
+                                                    // red / Door=amber / … overlay the
+                                                    // collision-debug draw uses, but on
+                                                    // the actual rendered geometry.
+                                                    // Categories are populated by
+                                                    // ClusterRenderer::applyMaterial
+                                                    // Categories() after the LLM
+                                                    // classifier runs; unclassified
+                                                    // materials read as 0=Unknown=grey.
 
 #define LIGHT_COUNT                             1
 // 6 cascades (was 4): smaller extent ratio between adjacent cascades
@@ -603,7 +618,11 @@ struct ClusterDrawInfo {
 // without blowing the descriptor pool budget.
 #define MAX_CLUSTER_TEXTURES 256
 
-// Flags for BindlessMaterialParams.flags
+// Flags for BindlessMaterialParams.flags — bits 0..7 are dedicated to
+// boolean material flags; bits 8..15 store the MeshCategory enum value
+// (0..255, plenty for the 11 current categories) packed by
+// ClusterRenderer::applyMaterialCategories() after the LLM classifier
+// runs.  Higher bits are reserved.
 #define BINDLESS_MAT_DOUBLE_SIDED   1   // bit 0: accept both face orientations (flip N on back face)
 #define BINDLESS_MAT_ALPHA_MASK     2   // bit 1: discard if alpha < alpha_cutoff
 #define BINDLESS_MAT_TRANSLUCENT    4   // bit 2: AlphaMode::Blend (glass / windows).
@@ -612,6 +631,13 @@ struct ClusterDrawInfo {
                                         // "Translucent" render-debug mode can highlight
                                         // these materials, and so future work that adds
                                         // a real translucent pipeline pass has the data.
+
+// MeshCategory bit-pack — extract with
+//   uint cat = (flags & MASK) >> SHIFT;
+// Must match the MeshCategory enum in collision_mesh.h.  The shift +
+// mask layout leaves room for 5 more boolean flags in bits 3..7.
+#define BINDLESS_MAT_CATEGORY_SHIFT 8
+#define BINDLESS_MAT_CATEGORY_MASK  0x0000FF00
 
 // Per-material colour data for the bindless cluster renderer.
 //

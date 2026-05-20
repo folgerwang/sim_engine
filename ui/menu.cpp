@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <cmath>
 #include <algorithm>
+#include <cctype>
 #include <source_location>
 #include <cstdlib>
 
@@ -915,6 +916,104 @@ bool Menu::draw(
         fg->AddText(pos, IM_COL32(255, 255, 255, 255), buf);
     }
 
+    // ── Classifier progress bar (top-pinned overlay) ─────────────────
+    // Full-width ImGui window pinned to the very top of the viewport
+    // so it's the first thing the user sees during a long classify.
+    // Two rows:
+    //   1. ImGui::ProgressBar driven by bytes_received / estimated
+    //      total.  Capped at 100 % so an overshoot doesn't render
+    //      wildly.  Shows a 0.0 fraction at the moment kick-off
+    //      happens but BEFORE the daemon has produced any bytes;
+    //      jumps to the upload-size fraction the moment the
+    //      WinHttpSendRequest completes.
+    //   2. A summary line ("LLM: pending — 12.4s, 4096/77000 bytes
+    //      (5%)" etc.).
+    // Drawn unconditionally except in the Idle state so the title
+    // screen stays clean.
+    if (classifier_status_ == ClassifierStatus::Pending ||
+        classifier_status_ == ClassifierStatus::Ready   ||
+        classifier_status_ == ClassifierStatus::Failed) {
+        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        const float bar_h = 44.0f;  // two rows + padding
+        ImGui::SetNextWindowPos(
+            ImVec2(mvp->Pos.x, mvp->Pos.y + ImGui::GetFrameHeight()),
+            ImGuiCond_Always);
+        ImGui::SetNextWindowSize(
+            ImVec2(mvp->Size.x, bar_h),
+            ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.80f);
+        if (ImGui::Begin("##llm_progress_bar", nullptr,
+            ImGuiWindowFlags_NoTitleBar  |
+            ImGuiWindowFlags_NoResize    |
+            ImGuiWindowFlags_NoMove      |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav))
+        {
+            // Progress fraction — cap at 1.0 so overshoots don't
+            // render past the bar end.  When estimated_total is 0
+            // (kick-off frame), show an "indeterminate" feel by
+            // forcing 0.05 so the bar is visibly alive.
+            float frac = 0.0f;
+            char overlay[96] = {0};
+            if (classifier_status_ == ClassifierStatus::Ready) {
+                frac = 1.0f;
+                std::snprintf(overlay, sizeof(overlay),
+                    "%d materials + %d objects classified",
+                    classifier_mats_done_, classifier_objs_done_);
+            } else if (classifier_status_ == ClassifierStatus::Failed) {
+                frac = 1.0f;
+                std::snprintf(overlay, sizeof(overlay), "FAILED");
+            } else {
+                if (classifier_bytes_estimated_total_ > 0) {
+                    frac = float(classifier_bytes_received_) /
+                           float(classifier_bytes_estimated_total_);
+                    if (frac > 0.99f) frac = 0.99f;  // never claim
+                                                      // done until
+                                                      // status flips
+                                                      // to Ready
+                }
+                if (frac < 0.02f) frac = 0.02f;  // visible kick-off
+                std::snprintf(overlay, sizeof(overlay),
+                    "%zu / %zu items",
+                    classifier_bytes_received_,
+                    classifier_bytes_estimated_total_);
+            }
+
+            // Colour the bar fill the same way the text banner is
+            // coloured (amber / green / red) so the two overlays
+            // read as one widget.
+            ImVec4 bar_col;
+            switch (classifier_status_) {
+                case ClassifierStatus::Ready:
+                    bar_col = ImVec4(0.31f, 0.86f, 0.47f, 1.0f); break;
+                case ClassifierStatus::Failed:
+                    bar_col = ImVec4(1.0f,  0.35f, 0.35f, 1.0f); break;
+                default:
+                    bar_col = ImVec4(1.0f,  0.78f, 0.31f, 1.0f); break;
+            }
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, bar_col);
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
+            ImGui::PopStyleColor();
+
+            // Summary line below the bar.
+            const char* status_word =
+                classifier_status_ == ClassifierStatus::Ready  ? "ready"   :
+                classifier_status_ == ClassifierStatus::Failed ? "failed"  :
+                                                                  "classifying";
+            ImGui::Text(
+                "LLM: %s — %.1fs elapsed, %d mats + %d objs classified",
+                status_word, classifier_elapsed_s_,
+                classifier_mats_done_, classifier_objs_done_);
+        }
+        ImGui::End();
+    }
+
+    // (The earlier centred text-only banner was superseded by the
+    // top-pinned ProgressBar window above; same data, denser layout,
+    // can't be hidden by other windows.)
+
     std::vector<er::ClearValue> clear_values;
     clear_values.resize(2);
     clear_values[0].color = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -1474,26 +1573,117 @@ bool Menu::draw(
         // and dispatch on this value; mode 0 = the normal shaded path.
         if (ImGui::BeginMenu("Render Debug"))
         {
-            static const char* kRenderDebugItems[] = {
-                "0: Final shaded",
-                "1: Albedo (baseColor)",
-                "2: Normal (perturbed)",
-                "3: Diffuse term",
-                "4: Specular term",
-                "5: Shadow factor",
-                "6: Roughness (perceptual)",
-                "7: Metallic",
-                "8: Geometric normal",
-                "9: Translucent (alpha mode)",
-                "10: Velocity (NDC delta x50)",
-                "11: SSAO (raw AO factor)",
-                "12: Hi-Z pyramid (mip)",
+            // Modes 0..12 are the original PBR / G-buffer debug overlays
+            // baked into base.frag and cluster_bindless.frag.  Mode 13
+            // is the MeshCategory solid-colour overlay added when the
+            // AI-backed material classifier landed — it reads category
+            // bits packed into BindlessMaterialParams.flags and paints
+            // every rendered mesh with the same colour the collision
+            // debug overlay uses (Floor green, Wall red, Door amber, …).
+            // The enum value MUST match DEBUG_RENDER_MODE_CATEGORY in
+            // global_definition.glsl.h.
+            struct RenderDebugItem {
+                int         mode_id;
+                const char* label;
+            };
+            static const RenderDebugItem kRenderDebugItems[] = {
+                {  0, "0: Final shaded"            },
+                {  1, "1: Albedo (baseColor)"      },
+                {  2, "2: Normal (perturbed)"      },
+                {  3, "3: Diffuse term"            },
+                {  4, "4: Specular term"           },
+                {  5, "5: Shadow factor"           },
+                {  6, "6: Roughness (perceptual)"  },
+                {  7, "7: Metallic"                },
+                {  8, "8: Geometric normal"        },
+                {  9, "9: Translucent (alpha mode)"},
+                { 10, "10: Velocity (NDC delta x50)"},
+                { 11, "11: SSAO (raw AO factor)"   },
+                { 12, "12: Hi-Z pyramid (mip)"     },
+                { 13, "13: Mesh category (solid)"  },
             };
             for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
-                bool selected = (debug_render_mode_ == i);
-                if (ImGui::MenuItem(kRenderDebugItems[i], NULL, selected)) {
-                    debug_render_mode_ = i;
+                const auto& item = kRenderDebugItems[i];
+                bool selected = (debug_render_mode_ == item.mode_id);
+                if (ImGui::MenuItem(item.label, NULL, selected)) {
+                    debug_render_mode_ = item.mode_id;
                 }
+            }
+
+            // ── Colour legend for the Mesh-Category mode ─────────────────
+            // Inline 11-row swatch so users can read the overlay without
+            // remembering the colour mapping.  Swatch RGBs MUST match
+            // the categoryColor() switch in collision_debug.frag and the
+            // DEBUG_RENDER_MODE_CATEGORY branch in cluster_bindless.frag
+            // — drift will mis-label the legend.  Rendered as a small
+            // child block so it doesn't bloat the menu when collapsed;
+            // only shown while mode 13 is the active selection.
+            if (debug_render_mode_ == 13) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Mesh-Category colour key");
+                // The G-buffer doesn't carry per-material flag bits,
+                // so deferred_resolve.comp can't read the category.
+                // application.cpp force-flips to forward rendering
+                // while this mode is active; surfacing the fact here
+                // so it's not surprising when the toggle "doesn't do
+                // anything" in Deferred (it does -- it just also
+                // bypasses Deferred).
+                ImGui::TextDisabled(
+                    "(forces Forward rendering — Deferred drops the "
+                    "category bits in the G-buffer)");
+                struct CatLegend {
+                    const char* name;
+                    float       r, g, b;
+                };
+                static const CatLegend kLegend[] = {
+                    {"Floor",      0.20f, 0.75f, 0.30f},
+                    {"Wall",       0.80f, 0.20f, 0.20f},
+                    {"Door",       0.95f, 0.75f, 0.10f},
+                    {"Object",     0.55f, 0.25f, 0.80f},
+                    {"Glass",      0.40f, 0.85f, 0.95f},
+                    {"Ceiling",    0.25f, 0.45f, 0.85f},
+                    {"Stairs",     0.95f, 0.50f, 0.10f},
+                    {"Vegetation", 0.55f, 0.65f, 0.20f},
+                    {"Elevator",   0.95f, 0.20f, 0.65f},
+                    {"Ladder",     0.75f, 0.55f, 0.35f},
+                    {"Unknown",    0.55f, 0.55f, 0.55f},
+                };
+                for (const auto& row : kLegend) {
+                    // ImGui::ColorButton draws a non-interactive swatch
+                    // when the NoTooltip+NoPicker flags are set; pair
+                    // it with a label on the same line for a compact
+                    // 11-row key.
+                    ImGui::ColorButton(
+                        row.name,
+                        ImVec4(row.r, row.g, row.b, 1.0f),
+                        ImGuiColorEditFlags_NoTooltip |
+                            ImGuiColorEditFlags_NoPicker |
+                            ImGuiColorEditFlags_NoLabel,
+                        ImVec2(16, 16));
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(row.name);
+                }
+                // Toggle to open the per-name inspector window so the
+                // user can see the actual material / object → category
+                // verdicts the LLM produced (511 rows would not fit
+                // on the menu, so it opens as a separate scrollable
+                // window).  Only enabled once the classifier snapshot
+                // has been pushed from application.cpp — before then
+                // the window has nothing to show.
+                ImGui::Separator();
+                if (mesh_category_snapshot_valid_) {
+                    if (ImGui::MenuItem(
+                            "Open Category Inspector",
+                            NULL,
+                            show_mesh_category_inspector_)) {
+                        show_mesh_category_inspector_ =
+                            !show_mesh_category_inspector_;
+                    }
+                } else {
+                    ImGui::TextDisabled(
+                        "Category Inspector (waiting for LLM)");
+                }
+                ImGui::Separator();
             }
             // Hi-Z mip selector — only meaningful when DEBUG_RENDER_MODE_HIZ
             // is the active mode.  Range is 0..15 (the field carries 4 bits
@@ -2370,6 +2560,124 @@ bool Menu::draw(
                     w *= 0.5f;
                 }
             }
+        }
+        ImGui::End();
+    }
+
+    // ---- Mesh-Category inspector window ------------------------------------
+    // Two scrollable ImGui tables showing the LLM classifier's verdict
+    // for every collected (material, object) name.  Snapshot pushed
+    // from application.cpp once the async classifyAll() finishes;
+    // entries are pre-sorted alphabetically in setMaterialCategory
+    // Snapshot so the order is stable across frames.
+    //
+    // Each row: a 12x12 colour swatch + the source name + the
+    // category tag string ("FLOOR", "WALL", …).  Colour table is
+    // duplicated from the shader / collision_debug.frag so the
+    // inspector reads identically to the on-screen overlay; the
+    // comment on each case calls this out as a drift hazard.
+    //
+    // Filter box at the top runs a case-insensitive substring match
+    // against the name column so the user can pinpoint a specific
+    // material in the 500+-row scrollback.
+    if (show_mesh_category_inspector_ && mesh_category_snapshot_valid_) {
+        const ImVec2 vp_centre = {
+            vp_pos.x + float(screen_size.x) * 0.5f,
+            vp_pos.y + float(screen_size.y) * 0.5f };
+        ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing,
+                                ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(620.0f, 540.0f),
+                                 ImGuiCond_Appearing);
+
+        if (ImGui::Begin("Mesh-Category Inspector",
+                         &show_mesh_category_inspector_)) {
+            ImGui::TextDisabled(
+                "%zu materials  •  %zu objects classified",
+                mesh_category_materials_.size(),
+                mesh_category_objects_.size());
+
+            ImGui::InputTextWithHint(
+                "##filter", "Filter by substring (case-insensitive)",
+                mesh_category_filter_,
+                sizeof(mesh_category_filter_));
+
+            // Colour table — uint32_t MeshCategory cast → RGB.  KEEP
+            // IN SYNC with categoryColor() in collision_debug.frag
+            // and the switch in cluster_bindless.frag, OR every
+            // colour-coded debug surface stops agreeing with each
+            // other.
+            auto cat_color_and_tag = [](uint32_t cat,
+                                        ImVec4& out_rgb,
+                                        const char*& out_tag) {
+                switch (cat) {
+                    case 1:  out_rgb = ImVec4(0.20f, 0.75f, 0.30f, 1.0f); out_tag = "FLOOR";      break;
+                    case 2:  out_rgb = ImVec4(0.80f, 0.20f, 0.20f, 1.0f); out_tag = "WALL";       break;
+                    case 3:  out_rgb = ImVec4(0.95f, 0.75f, 0.10f, 1.0f); out_tag = "DOOR";       break;
+                    case 4:  out_rgb = ImVec4(0.55f, 0.25f, 0.80f, 1.0f); out_tag = "OBJECT";     break;
+                    case 5:  out_rgb = ImVec4(0.40f, 0.85f, 0.95f, 1.0f); out_tag = "GLASS";      break;
+                    case 6:  out_rgb = ImVec4(0.25f, 0.45f, 0.85f, 1.0f); out_tag = "CEILING";    break;
+                    case 7:  out_rgb = ImVec4(0.95f, 0.50f, 0.10f, 1.0f); out_tag = "STAIRS";     break;
+                    case 8:  out_rgb = ImVec4(0.55f, 0.65f, 0.20f, 1.0f); out_tag = "VEGETATION"; break;
+                    case 9:  out_rgb = ImVec4(0.95f, 0.20f, 0.65f, 1.0f); out_tag = "ELEVATOR";   break;
+                    case 10: out_rgb = ImVec4(0.75f, 0.55f, 0.35f, 1.0f); out_tag = "LADDER";     break;
+                    default: out_rgb = ImVec4(0.55f, 0.55f, 0.55f, 1.0f); out_tag = "UNKNOWN";    break;
+                }
+            };
+
+            // Case-insensitive substring filter.  Build a lowered
+            // needle once per frame; per-row test lower-cases the
+            // name into a local buffer (names are short so a 256-byte
+            // stack buffer is fine; longer names truncate which is
+            // acceptable for a filter).
+            std::string needle = mesh_category_filter_;
+            std::transform(needle.begin(), needle.end(), needle.begin(),
+                [](unsigned char c){ return std::tolower(c); });
+            auto matches = [&](const std::string& name) {
+                if (needle.empty()) return true;
+                std::string low = name;
+                std::transform(low.begin(), low.end(), low.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                return low.find(needle) != std::string::npos;
+            };
+
+            auto draw_table = [&](
+                const char* title,
+                const std::vector<std::pair<std::string, uint32_t>>& rows) {
+                ImGui::Spacing();
+                ImGui::SeparatorText(title);
+                // Fixed-height child for a nested scroll region so the
+                // user can scroll materials independently of objects.
+                // NB: spelling is `ImGuiChildFlags_Borders` (plural).
+                // It was renamed from `_Border` in ImGui 1.91.1
+                // (August 2024) — the legacy spelling no longer
+                // resolves in this project's 1.92.8 build.
+                if (ImGui::BeginChild(
+                        title, ImVec2(0.0f, 220.0f),
+                        ImGuiChildFlags_Borders,
+                        ImGuiWindowFlags_HorizontalScrollbar)) {
+                    for (const auto& [name, cat] : rows) {
+                        if (!matches(name)) continue;
+                        ImVec4 rgb;
+                        const char* tag = nullptr;
+                        cat_color_and_tag(cat, rgb, tag);
+                        ImGui::ColorButton(
+                            "##sw", rgb,
+                            ImGuiColorEditFlags_NoTooltip |
+                                ImGuiColorEditFlags_NoPicker |
+                                ImGuiColorEditFlags_NoLabel,
+                            ImVec2(12, 12));
+                        ImGui::SameLine();
+                        // Category tag in fixed-width column then name.
+                        ImGui::Text("%-10s", tag);
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(name.c_str());
+                    }
+                }
+                ImGui::EndChild();
+            };
+
+            draw_table("Materials", mesh_category_materials_);
+            draw_table("Objects",   mesh_category_objects_);
         }
         ImGui::End();
     }

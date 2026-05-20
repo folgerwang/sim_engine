@@ -28,11 +28,14 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace engine {
 
 namespace game_object { struct DrawableData; }
+namespace helper      { class MaterialClassifier; }
 
 namespace scene_rendering {
 
@@ -70,6 +73,15 @@ private:
     std::vector<glsl::ClusterCullInfo>        staging_cull_infos_;
     std::vector<glsl::ClusterDrawInfo>        staging_draw_infos_;
     std::vector<glsl::BindlessMaterialParams> staging_material_params_;
+    // Parallel to staging_material_params_: one (material_name, object_
+    // name) pair per entry, captured during uploadMeshClusters from the
+    // source MaterialInfo + the first node referencing the owning mesh.
+    // Survives finalizeUploads' clear of the params vector so the
+    // post-classifier applyMaterialCategories() patch can look up each
+    // entry's category by name even though staging_material_params_
+    // has already been moved to GPU.
+    std::vector<std::pair<std::string, std::string>>
+                                              staging_material_names_;
     // CPU backup of the original material_params (with VT ids
     // populated).  Survives finalizeUploads's clear of
     // staging_material_params_; used by setVtEnabled() to restore
@@ -432,6 +444,18 @@ public:
     // Create merged GPU SSBOs + descriptor set from all staged data.
     // Call once after all uploadMeshClusters() calls are done.
     void finalizeUploads();
+
+    // Patch the per-material flags SSBO with MeshCategory bits taken
+    // from the supplied LLM-backed classifier.  Walks
+    // staging_material_names_ (captured at upload time), looks each
+    // (material, object) pair up in the classifier, and updates the
+    // bits-8..15 slice of every BindlessMaterialParams.flags before
+    // re-uploading the material_params SSBO.  Idempotent — call again
+    // when the classifier verdict changes (e.g. after a scene reload).
+    // Materials the classifier didn't tag keep their current bits
+    // (which means they continue to read as Unknown / grey in the
+    // DEBUG_RENDER_MODE_CATEGORY overlay).
+    void applyMaterialCategories(const helper::MaterialClassifier& cls);
 
     // Initialise the bindless graphics pipeline. Call once after
     // finalizeUploads() and after descriptor-set layouts / render

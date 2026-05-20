@@ -482,8 +482,20 @@ static bool buildVoxelGrid(
 
     // Coarsen cell_size if the requested resolution would exceed the
     // global voxel cap. We pick the smallest scale factor s such that
-    // (ext / (cell_size * s))^3 <= kMaxVoxels.
+    // (ext / (cell_size * s))^3 <= kMaxVoxels, then iteratively bump
+    // by 10 % until the post-ceil grid actually fits — the analytic
+    // scale assumes float cell counts, but the real grid uses
+    // ceil(ext/cell_size) on each axis, which can put us 1–6 % over
+    // the cap from rounding alone.  Without the retry, oversized
+    // primitives were silently dropped at the `total_cells >
+    // kMaxVoxels` guard below.
     float cell_size = requested_cell_size;
+    auto compute_grid = [&](float cs) {
+        return glm::ivec3(
+            std::max(1, static_cast<int>(std::ceil(ext.x / cs))),
+            std::max(1, static_cast<int>(std::ceil(ext.y / cs))),
+            std::max(1, static_cast<int>(std::ceil(ext.z / cs))));
+    };
     {
         const double total =
             static_cast<double>(ext.x) *
@@ -498,14 +510,20 @@ static bool buildVoxelGrid(
                 total / (per_cell * static_cast<double>(kMaxVoxels)));
             cell_size = static_cast<float>(cell_size * scale);
         }
+        // Now ceil-fit and retry if rounding pushed us over.
+        for (int retry = 0; retry < 8; ++retry) {
+            const glm::ivec3 gs = compute_grid(cell_size);
+            const size_t tc = static_cast<size_t>(gs.x) *
+                              static_cast<size_t>(gs.y) *
+                              static_cast<size_t>(gs.z);
+            if (tc <= kMaxVoxels) break;
+            cell_size *= 1.1f;
+        }
     }
 
     out.cell_size = cell_size;
     out.origin    = lo;
-    out.grid_size = glm::ivec3(
-        std::max(1, static_cast<int>(std::ceil(ext.x / cell_size))),
-        std::max(1, static_cast<int>(std::ceil(ext.y / cell_size))),
-        std::max(1, static_cast<int>(std::ceil(ext.z / cell_size))));
+    out.grid_size = compute_grid(cell_size);
     const size_t total_cells =
         static_cast<size_t>(out.grid_size.x) *
         static_cast<size_t>(out.grid_size.y) *
@@ -641,21 +659,49 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     float weld_eps,
     float voxel_size) {
 
-    if (!drawable.isReady()) return false;
+    // Throttled diagnostic for each silent-drop reason.  Coverage
+    // gaps in the collision overlay almost always come from one of
+    // the early-returns below; logging the first 10 hits per cause
+    // makes it obvious which axis is too aggressive (welding,
+    // voxel cap, decimation, etc).  Set to 0 to silence completely.
+    static constexpr int kDropLogMax = 10;
+    auto log_drop = [&](const char* reason, size_t extra_n = 0) {
+        static std::atomic<int> s_counts[16]{};
+        // Crude per-reason counter keyed by the reason pointer's
+        // low bits — good enough for our handful of cases.
+        const size_t key = (reinterpret_cast<size_t>(reason) >> 3) & 0xF;
+        const int n = s_counts[key].fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= kDropLogMax) {
+            std::cout << "[collision.drop] mesh=" << mesh_idx
+                      << " prim=" << prim_idx
+                      << " reason=" << reason;
+            if (extra_n) std::cout << " n=" << extra_n;
+            std::cout << " (#" << n << "/" << kDropLogMax << ")"
+                      << std::endl;
+        }
+    };
+
+    if (!drawable.isReady()) { log_drop("drawable_not_ready"); return false; }
     const auto& data = drawable.getDrawableData();
-    if (mesh_idx >= data.meshes_.size()) return false;
+    if (mesh_idx >= data.meshes_.size()) {
+        log_drop("mesh_idx_oob"); return false;
+    }
     const auto& mesh = data.meshes_[mesh_idx];
-    if (prim_idx >= mesh.primitives_.size()) return false;
+    if (prim_idx >= mesh.primitives_.size()) {
+        log_drop("prim_idx_oob"); return false;
+    }
     const auto& prim = mesh.primitives_[prim_idx];
-    if (!prim.vertex_indices_) return false;
-    if (!mesh.vertex_position_) return false;
+    if (!prim.vertex_indices_) { log_drop("null_vertex_indices"); return false; }
+    if (!mesh.vertex_position_) { log_drop("null_vertex_position"); return false; }
 
     const auto& src_indices = *prim.vertex_indices_;
     const auto& src_positions = *mesh.vertex_position_;
     if (src_indices.size() < 3 || (src_indices.size() % 3) != 0) {
-        return false;
+        log_drop("src_indices_bad_size", src_indices.size()); return false;
     }
-    if (src_positions.empty()) return false;
+    if (src_positions.empty()) {
+        log_drop("src_positions_empty"); return false;
+    }
 
     // Material name comes straight from the drawable's MaterialInfo
     // (populated at FBX/GLTF load). Negative material_idx_ is a
@@ -672,6 +718,14 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     for (const auto& node : data.nodes_) {
         if (node.mesh_idx_ == static_cast<int32_t>(mesh_idx)) {
             xform = node.cached_matrix_;
+            // Capture the node's name on the same pass we use for
+            // the world transform.  Downstream classifiers (the AI
+            // path in particular) get a SECOND identifier to look up
+            // when the material name is too generic; bistro node
+            // names like "Bistro_Research_Exterior_Linde_Tree_Large_
+            // linde_tree_large_4051" carry far more semantics than
+            // the "Wood_Brown" material the same primitive uses.
+            object_name_ = node.name_;
             break;
         }
     }
@@ -711,14 +765,31 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         packed_indices.push_back(new_idx);
     }
 
-    if (packed_indices.size() < 3) return false;
+    if (packed_indices.size() < 3) {
+        log_drop("packed_indices_lt3_after_remap", packed_indices.size());
+        return false;
+    }
+
+    // Snapshot pre-weld tri count for diagnostics: if welding wipes
+    // out the primitive entirely (very likely culprit for missing
+    // small props with the default 10cm eps), the drop log shows
+    // how many real triangles we lost.
+    const size_t pre_weld_tris = packed_indices.size() / 3;
 
     // ── Vertex welding ────────────────────────────────────────────────
     // Authored / exported geometry frequently has sub-mm gaps where
     // two parts meet (separate FBX nodes, floating-point quantisation
     // at part boundaries, asset-pipeline rounding). Quantise each
-    // vertex position to a `weld_eps`-sized grid and dedupe -- vertices
-    // that round to the same cell collapse into one, closing the gap.
+    // vertex position to a `weld_eps`-sized grid, then for every
+    // candidate look up all 27 (3x3x3) neighbouring cells and snap
+    // to the nearest existing representative within `weld_eps`.
+    // The 3x3x3 scan is what makes the welding actually honour the
+    // weld_eps contract: a single-cell lookup misses any pair of
+    // vertices < weld_eps apart that straddle a cell boundary
+    // (e.g. x=0.04 and x=0.06 with eps=0.1 round to cells 0 and 1
+    // and would never merge), which on the Decimate path leaves
+    // hairline gaps exactly where two authored parts meet --
+    // precisely the "gap-filled simplified" promise the menu makes.
     // Then drop triangles whose three corners welded to <=2 distinct
     // vertices (they have zero area and would confuse the decimater).
     //
@@ -738,6 +809,7 @@ bool CollisionMesh::buildFromDrawablePrimitive(
             }
         };
         const float inv_eps = 1.0f / weld_eps;
+        const float eps2    = weld_eps * weld_eps;
         auto quantize = [inv_eps](const glm::vec3& p) {
             return glm::ivec3(
                 static_cast<int32_t>(std::lround(p.x * inv_eps)),
@@ -745,23 +817,82 @@ bool CollisionMesh::buildFromDrawablePrimitive(
                 static_cast<int32_t>(std::lround(p.z * inv_eps)));
         };
 
-        std::unordered_map<glm::ivec3, uint32_t, IVec3Hash> spatial;
+        // Bucket-per-cell rather than single-rep-per-cell: with the
+        // 3x3x3 lookup a cell can legitimately hold multiple welded
+        // representatives (think two distinct surfaces that pass
+        // within weld_eps of each other -- floor and joist meeting
+        // at a corner). Storing all of them and picking the closest
+        // keeps the welding correct in that case.
+        std::unordered_map<glm::ivec3, std::vector<uint32_t>, IVec3Hash>
+            spatial;
         spatial.reserve(packed_positions.size());
         std::vector<uint32_t> remap_to_welded(packed_positions.size());
         std::vector<glm::vec3> welded_positions;
         welded_positions.reserve(packed_positions.size());
 
+        // Diagnostic: count how many merges came from the centre
+        // cell vs a neighbour cell. If neighbour_merges >> 0 the
+        // 3x3x3 scan is paying its rent -- those are exactly the
+        // hairline gaps the old single-cell hash missed.
+        size_t centre_merges    = 0;
+        size_t neighbour_merges = 0;
+
         for (size_t i = 0; i < packed_positions.size(); ++i) {
-            const glm::ivec3 key = quantize(packed_positions[i]);
-            auto it = spatial.find(key);
-            if (it == spatial.end()) {
+            const glm::vec3& p = packed_positions[i];
+            const glm::ivec3 key = quantize(p);
+
+            uint32_t best_idx = UINT32_MAX;
+            float    best_d2  = eps2;
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const glm::ivec3 nk = key + glm::ivec3(dx, dy, dz);
+                auto it = spatial.find(nk);
+                if (it == spatial.end()) continue;
+                for (uint32_t cand : it->second) {
+                    const glm::vec3 d = welded_positions[cand] - p;
+                    const float d2 = glm::dot(d, d);
+                    if (d2 < best_d2) {
+                        best_d2  = d2;
+                        best_idx = cand;
+                    }
+                }
+            }
+
+            if (best_idx == UINT32_MAX) {
                 const uint32_t new_idx =
                     static_cast<uint32_t>(welded_positions.size());
-                welded_positions.push_back(packed_positions[i]);
-                spatial.emplace(key, new_idx);
+                welded_positions.push_back(p);
+                spatial[key].push_back(new_idx);
                 remap_to_welded[i] = new_idx;
             } else {
-                remap_to_welded[i] = it->second;
+                // Track whether the merge came from the centre
+                // cell or a neighbour for the diagnostic counter.
+                const glm::ivec3 match_key =
+                    quantize(welded_positions[best_idx]);
+                if (match_key == key) ++centre_merges;
+                else                  ++neighbour_merges;
+                remap_to_welded[i] = best_idx;
+            }
+        }
+
+        // Throttled per-primitive log of the welding outcome. The
+        // ratio of neighbour merges to total merges tells you at a
+        // glance whether the 3x3x3 scan mattered for this asset.
+        // Log only when there were enough merges to be informative.
+        if (centre_merges + neighbour_merges >= 16) {
+            static std::atomic<int> s_weld_log_count{0};
+            const int n = s_weld_log_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (n <= 20) {
+                std::cout << "[collision.weld] mesh=" << mesh_idx
+                          << " prim=" << prim_idx
+                          << " in_verts=" << packed_positions.size()
+                          << " out_verts=" << welded_positions.size()
+                          << " centre_merges=" << centre_merges
+                          << " neighbour_merges=" << neighbour_merges
+                          << " (#" << n << "/20)"
+                          << std::endl;
             }
         }
 
@@ -778,7 +909,16 @@ bool CollisionMesh::buildFromDrawablePrimitive(
             welded_indices.push_back(b);
             welded_indices.push_back(c);
         }
-        if (welded_indices.size() < 3) return false;
+        if (welded_indices.size() < 3) {
+            // Welding collapsed (almost) the entire primitive to a
+            // single vertex.  Most common cause: weld_eps (default
+            // 10cm) is larger than the primitive's extent — tiny
+            // props (lamps, props, foliage instances) get
+            // pancaked.  log_drop carries the pre-weld tri count
+            // so we can see how much real geometry was lost.
+            log_drop("welded_lt3_collapsed_primitive", pre_weld_tris);
+            return false;
+        }
 
         packed_positions = std::move(welded_positions);
         packed_indices   = std::move(welded_indices);
@@ -850,6 +990,17 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         VoxelGrid grid;
         if (!buildVoxelGrid(packed_positions, packed_indices,
                             voxel_size, grid)) {
+            // Voxel grid build failed.  Cases:
+            //   - input positions empty / indices < 3 (already
+            //     guarded above, shouldn't fire here),
+            //   - total_cells == 0 (degenerate extent),
+            //   - total_cells > kMaxVoxels (1M) even after the
+            //     coarsen pass — typically primitives whose
+            //     bounds-product overflows the cap by a ceiling-
+            //     rounding margin.  That's the "big floor
+            //     primitive silently dropped" path.
+            log_drop("voxel_grid_build_failed",
+                     packed_indices.size() / 3);
             return false;
         }
         std::vector<glm::vec3> vox_pos;
@@ -859,7 +1010,11 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         } else {
             emitVoxelSphereCloud(grid, vox_pos, vox_ind);
         }
-        if (vox_ind.size() < 3) return false;
+        if (vox_ind.size() < 3) {
+            log_drop("vox_emit_lt3_no_occupied_cells",
+                     packed_indices.size() / 3);
+            return false;
+        }
         packed_positions = std::move(vox_pos);
         packed_indices   = std::move(vox_ind);
         break;
@@ -877,10 +1032,18 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     for (const auto& v : vertices_) bounds_.extend(v);
 
     if (indices_.size() < 3) {
+        log_drop("final_indices_lt3", indices_.size());
         vertices_.clear();
         indices_.clear();
         return false;
     }
+
+    // Classify into a semantic category from the source material name
+    // plus a face-normal majority vote against the FINAL (post weld,
+    // post shape) triangle list — what physics will actually see.
+    // setCategory keeps the field writable from application code if
+    // the heuristic gets a primitive wrong for a particular scene.
+    category_ = classifyCategory(material_name_, vertices_, indices_, bounds_);
 
     if (!build_bvh) {
         bvh_root_ = nullptr;
@@ -889,6 +1052,165 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     }
 
     return buildBVH();
+}
+
+const char* meshCategoryTag(MeshCategory c) {
+    switch (c) {
+        case MeshCategory::Floor:      return "FLOOR";
+        case MeshCategory::Wall:       return "WALL";
+        case MeshCategory::Door:       return "DOOR";
+        case MeshCategory::Object:     return "OBJECT";
+        case MeshCategory::Glass:      return "GLASS";
+        case MeshCategory::Ceiling:    return "CEILING";
+        case MeshCategory::Stairs:     return "STAIRS";
+        case MeshCategory::Vegetation: return "VEGETATION";
+        case MeshCategory::Elevator:   return "ELEVATOR";
+        case MeshCategory::Ladder:     return "LADDER";
+        case MeshCategory::Unknown:
+        default:                       return "UNKNOWN";
+    }
+}
+
+MeshCategory meshCategoryFromTag(const std::string& tag) {
+    // Case-insensitive — the LLM occasionally returns mixed case
+    // ("Floor", "floor", "FLOOR") despite the prompt asking for all caps.
+    std::string up;
+    up.reserve(tag.size());
+    for (char c : tag) up.push_back(static_cast<char>(std::toupper(c)));
+    if (up == "FLOOR")      return MeshCategory::Floor;
+    if (up == "WALL")       return MeshCategory::Wall;
+    if (up == "DOOR")       return MeshCategory::Door;
+    if (up == "OBJECT")     return MeshCategory::Object;
+    if (up == "GLASS")      return MeshCategory::Glass;
+    if (up == "CEILING")    return MeshCategory::Ceiling;
+    if (up == "STAIRS")     return MeshCategory::Stairs;
+    if (up == "VEGETATION") return MeshCategory::Vegetation;
+    if (up == "ELEVATOR")   return MeshCategory::Elevator;
+    if (up == "LADDER")     return MeshCategory::Ladder;
+    return MeshCategory::Unknown;
+}
+
+// ── classifyCategory ──────────────────────────────────────────────────
+// Three-stage heuristic; see the doc comment in collision_mesh.h for
+// the exact rules.  Order matters: material-name override wins over
+// geometric vote so a horizontal door panel doesn't become a Floor.
+MeshCategory classifyCategory(
+    const std::string& material_name,
+    const std::vector<glm::vec3>& vertices,
+    const std::vector<int>& indices,
+    const AABB& bounds) {
+    if (vertices.empty() || indices.size() < 3) return MeshCategory::Unknown;
+
+    // ── case-insensitive substring match helper.  Bistro material
+    // names are MixedCase ("MASTER_Bistro_Main_Door"); player-named
+    // assets vary.  Pre-lowercase once.
+    std::string lname;
+    lname.reserve(material_name.size());
+    for (char c : material_name) lname.push_back(static_cast<char>(std::tolower(c)));
+    auto has = [&](const char* needle) {
+        return lname.find(needle) != std::string::npos;
+    };
+
+    // ── Stage 1: unambiguous material-name tags ──────────────────────
+    // Door variants come FIRST -- "Bistro_Main_Door" also contains
+    // nothing else, but glass/window/floor checks below would never
+    // accidentally match "door".  Doormat is special-cased to Floor
+    // because the substring "door" appears inside it but it's clearly
+    // a walkable surface.
+    if (has("doormat"))                     return MeshCategory::Floor;
+    if (has("door") || has("gate") ||
+        has("rollup"))                      return MeshCategory::Door;
+    if (has("glass") || has("window") ||
+        has("frosted"))                     return MeshCategory::Glass;
+    // Explicit floor/road tags before the geometric fallback so a
+    // hexagonal floor-tile primitive with mixed normals (chamfered
+    // edges drag the vote toward Wall) still classifies as Floor.
+    if (has("floor") || has("road") ||
+        has("street") || has("sidewalk") ||
+        has("pavement"))                    return MeshCategory::Floor;
+    if (has("stair") || has("step"))        return MeshCategory::Stairs;
+    if (has("elevator") || has("lift"))     return MeshCategory::Elevator;
+    if (has("ladder") || has("rung"))       return MeshCategory::Ladder;
+    if (has("ceiling"))                     return MeshCategory::Ceiling;
+    // Vegetation: foliage in the broad sense — anything plant-derived.
+    // The list looks long but each entry is a substring that's rare in
+    // non-vegetation material names (deliberately omitting "wood", which
+    // collides with planks/furniture; cut-lumber stays OBJECT).
+    // Bistro's tree-bark materials surface as "MASTER_Bark_Linde" /
+    // "Bistro_Research_Exterior_Linde_Tree_Large", so "bark", "linde",
+    // and "branch" all carry their weight.  Atlas-billboard cards
+    // ("Foliage_Atlas", "LeafCard") get caught by "foliage" / "leaf".
+    if (has("ivy")       || has("foliage")  ||
+        has("leaf")      || has("leaves")   ||
+        has("plant")     || has("tree")     ||
+        has("vegetation")|| has("grass")    ||
+        has("linde")     || has("oak")      ||
+        has("maple")     || has("pine")     ||
+        has("palm")      || has("bark")     ||
+        has("branch")    || has("twig")     ||
+        has("hedge")     || has("bush")     ||
+        has("shrub")     || has("fern")     ||
+        has("moss")      || has("vine")     ||
+        has("flower")    || has("petal")    ||
+        has("sapling")   || has("lawn")     ||
+        has("turf")      || has("weed"))    return MeshCategory::Vegetation;
+    // Explicit wall / cladding materials.  Roofing is intentionally
+    // grouped with Wall (it blocks the same way from gameplay
+    // perspective and isn't a walkable surface).
+    if (has("wall") || has("plaster") ||
+        has("brick") || has("stucco") ||
+        has("trim_cornice") ||
+        has("roofing") || has("roof"))      return MeshCategory::Wall;
+
+    // ── Stage 2: face-normal majority vote ───────────────────────────
+    // Sum |normal_y| * area for every triangle, then compare against a
+    // total-area baseline.  We weight by area so a single big floor
+    // panel beats a hundred tiny detail triangles.  area-thresholds:
+    //   horizontal_ratio > 0.55    → Floor
+    //   vertical_ratio   > 0.55    → Wall
+    //   otherwise the geometry is mixed / leaning -- defer to size
+    //   below.
+    double area_total      = 0.0;
+    double area_horizontal = 0.0;  // |normal.y| > 0.7
+    double area_vertical   = 0.0;  // |normal.y| < 0.3
+    const size_t tri_count = indices.size() / 3;
+    for (size_t t = 0; t < tri_count; ++t) {
+        const int i0 = indices[3*t + 0];
+        const int i1 = indices[3*t + 1];
+        const int i2 = indices[3*t + 2];
+        if (i0 < 0 || i1 < 0 || i2 < 0) continue;
+        if ((size_t)i0 >= vertices.size() ||
+            (size_t)i1 >= vertices.size() ||
+            (size_t)i2 >= vertices.size()) continue;
+        const glm::vec3& v0 = vertices[i0];
+        const glm::vec3& v1 = vertices[i1];
+        const glm::vec3& v2 = vertices[i2];
+        const glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+        const double area = 0.5 * glm::length(n);
+        if (area <= 0.0) continue;
+        const double ny_abs = std::abs(n.y) / (2.0 * area);
+        area_total += area;
+        if (ny_abs > 0.7) area_horizontal += area;
+        if (ny_abs < 0.3) area_vertical   += area;
+    }
+    if (area_total > 0.0) {
+        const double horiz_ratio = area_horizontal / area_total;
+        const double vert_ratio  = area_vertical   / area_total;
+        if (horiz_ratio > 0.55) return MeshCategory::Floor;
+        if (vert_ratio  > 0.55) return MeshCategory::Wall;
+    }
+
+    // ── Stage 3: bounding-box size ───────────────────────────────────
+    // Genuinely small primitives in all three axes are gameplay props
+    // (chair, bottle, lamp, plate).  Threshold 2 m matches the bistro
+    // scale -- furniture < 2m, walls / floors always exceed it on at
+    // least one axis.
+    const glm::vec3 ext = bounds.max_bounds - bounds.min_bounds;
+    if (ext.x < 2.0f && ext.y < 2.0f && ext.z < 2.0f) {
+        return MeshCategory::Object;
+    }
+
+    return MeshCategory::Unknown;
 }
 
 bool CollisionMesh::buildFromDrawableMesh(
@@ -972,12 +1294,17 @@ void CollisionWorld::drawDebug(
     for (size_t i = 0; i < meshes_.size(); ++i) {
         const auto& m = meshes_[i];
         if (!m || m->empty()) continue;
-        // Lazy upload of per-mesh GPU debug buffers on first draw. The
-        // mesh_id we pass is just the world-list index -- stable across
-        // frames, unique per mesh -- which the fragment shader hashes
-        // into a flat segmentation colour.
+        // Lazy upload of per-mesh GPU debug buffers on first draw. We
+        // pass the mesh's MeshCategory as the segmentation id so the
+        // fragment shader paints every Floor / Wall / Door / Object /
+        // Glass with a fixed solid colour rather than a hash of the
+        // world-list index. Adjacent meshes of the same category now
+        // share a colour intentionally -- that's the semantic-map
+        // read of the physics world that motivated the category split
+        // in the first place.
+        const uint32_t seg_id = static_cast<uint32_t>(m->category());
         CollisionDebugDraw::uploadForMesh(
-            device, *m, static_cast<uint32_t>(i), m->debugBuffers());
+            device, *m, seg_id, m->debugBuffers());
         if (!m->debugBuffers().ready()) continue;
         // Triangles are already in world space (node transforms baked
         // in during buildFromDrawablePrimitive), so the per-draw model

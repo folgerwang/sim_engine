@@ -892,10 +892,18 @@ static void setupMeshState(
         auto& dst_tex = drawable_object->textures_[i_tex];
         const auto& src_tex = fbx_scene->textures[i_tex];
 
+        // Preserve the on-disk filename string for downstream debug /
+        // classifier code.  src_tex->filename.data is the absolute or
+        // texture-pack-relative path captured by ufbx; we keep the
+        // whole thing rather than basenaming so callers can do their
+        // own basename extraction if they prefer.
+        dst_tex.source_filename_ = src_tex->filename.data
+            ? std::string(src_tex->filename.data) : std::string();
+
         glm::uvec3 size(0);
         auto format = renderer::Format::R8G8B8A8_UNORM;
         helper::createTextureImage(
-            device, 
+            device,
             src_tex->filename.data,
             format,
             texture_is_srgb[i_tex],
@@ -5549,9 +5557,51 @@ void DrawableObject::draw(
     // reached the rasterizer for this drawable, plus every gating
     // counter that explains where draws were dropped if the count is
     // 0.  Gated on m_debug_log_draws_ (independent of force-red).
+    //
+    // ── File mirror ──────────────────────────────────────────────────
+    // Every [player.draw*] line we emit to stdout is ALSO written to
+    // logs/player_draw_YYYY-MM-DD_HH-MM-SS.log so a long session can
+    // be analysed offline without scrollback-hunting.  Opened lazily
+    // on first hit, one fresh file per launch (matching the existing
+    // logs/2026-05-18_*.log naming convention), flushed every line so
+    // a crash doesn't lose the last second of data.  Static local
+    // ofstream — no class-field change.
     if (object_->m_debug_force_red_ || object_->m_debug_log_draws_) {
         static uint64_t s_draw_log_frame = 0;
+        static std::ofstream s_draw_log_file;
+        static bool          s_draw_log_opened = false;
+        auto open_draw_log = [&]() {
+            if (s_draw_log_opened) return;
+            s_draw_log_opened = true;
+            std::error_code ec;
+            std::filesystem::create_directories("logs", ec);
+            auto now_t = std::chrono::system_clock::to_time_t(
+                std::chrono::system_clock::now());
+            std::tm tm_local{};
+            localtime_s(&tm_local, &now_t);
+            char fname[256];
+            std::strftime(
+                fname, sizeof(fname),
+                "logs/player_draw_%Y-%m-%d_%H-%M-%S.log",
+                &tm_local);
+            s_draw_log_file.open(fname,
+                                 std::ios::out | std::ios::app);
+            if (s_draw_log_file.is_open()) {
+                std::filesystem::path abs = std::filesystem::absolute(
+                    fname, ec);
+                s_draw_log_file
+                    << "# [player.draw] tally stream\n"
+                    << "# one block per ~60 frames, three lines per "
+                       "block:\n"
+                    << "#   [player.draw]       indirect_draws_issued\n"
+                    << "#   [player.draw.reach] gating counters\n"
+                    << "#   [player.draw.ctx]   root xform + flags\n";
+                std::cout << "[player.draw] streaming to "
+                          << abs.string() << std::endl;
+            }
+        };
         if ((s_draw_log_frame++ % 60u) == 0u) {
+            open_draw_log();
             // Resolve the root node's world-space translation so we
             // can spot "draws issued but model_mat sends it to NaN /
             // off into the next ZIP code" cases cheaply.
@@ -5570,40 +5620,60 @@ void DrawableObject::draw(
                     root_T = glm::vec3(cm[3]);
                 }
             }
-            std::cout
-                << "[player.draw] mode=" << int(draw_mode)
-                << " depth_only=" << depth_only
-                << " indirect_draws_issued="
-                << object_->m_debug_draw_call_count_
-                << " (of " << object_->meshes_.size() << " meshes)"
-                << std::endl;
-            std::cout
-                << "[player.draw.reach]"
-                << " called="          << object_->m_debug_draw_called_
-                << " not_ready="       << object_->m_debug_draw_not_ready_
-                << " nodes_visited="   << object_->m_debug_draw_nodes_visited_
-                << " nodes_w_mesh="    << object_->m_debug_draw_nodes_with_mesh_
-                << " mesh_entered="    << object_->m_debug_draw_mesh_entered_
-                << " culled_frustum="  << object_->m_debug_draw_mesh_culled_frustum_
-                << " cluster_indirect="<< object_->m_debug_draw_mesh_taken_by_cluster_
-                << " cluster_debug="   << object_->m_debug_draw_mesh_cluster_debug_path_
-                << " prims_iter="      << object_->m_debug_draw_prims_iterated_
-                << " pipe_null="       << object_->m_debug_draw_prim_pipeline_null_
-                << " mesh_shader="     << object_->m_debug_draw_prim_mesh_shader_
-                << std::endl;
-            std::cout
-                << "[player.draw.ctx] root_node=" << root_node_idx
-                << " root_T=(" << root_T.x << "," << root_T.y
-                << "," << root_T.z << ")"
-                << " use_node_xform_only="
-                << (object_->m_use_node_transform_only_ ? 1 : 0)
-                << " frustum_cull_active="
-                << (s_frustum_cull_active ? 1 : 0)
-                << " cluster_indirect_active="
-                << (engine::helper::clusterIndirectActive() ? 1 : 0)
-                << " cluster_rendering_enabled="
-                << (engine::helper::clusterRenderingEnabled() ? 1 : 0)
-                << std::endl;
+            // Tee helper — emits one line to stdout AND the file
+            // mirror.  Built via ostringstream so the formatting
+            // happens once and both sinks see the same bytes; cheap
+            // because it fires only once every 60 frames.  Each
+            // file write flushes so a crash mid-session doesn't
+            // truncate the last second of data.
+            auto emit = [&](const std::string& line) {
+                std::cout << line << std::endl;
+                if (s_draw_log_file.is_open()) {
+                    s_draw_log_file << line << '\n';
+                    s_draw_log_file.flush();
+                }
+            };
+
+            {
+                std::ostringstream ss;
+                ss << "[player.draw] mode=" << int(draw_mode)
+                   << " depth_only=" << depth_only
+                   << " indirect_draws_issued="
+                   << object_->m_debug_draw_call_count_
+                   << " (of " << object_->meshes_.size() << " meshes)";
+                emit(ss.str());
+            }
+            {
+                std::ostringstream ss;
+                ss << "[player.draw.reach]"
+                   << " called="          << object_->m_debug_draw_called_
+                   << " not_ready="       << object_->m_debug_draw_not_ready_
+                   << " nodes_visited="   << object_->m_debug_draw_nodes_visited_
+                   << " nodes_w_mesh="    << object_->m_debug_draw_nodes_with_mesh_
+                   << " mesh_entered="    << object_->m_debug_draw_mesh_entered_
+                   << " culled_frustum="  << object_->m_debug_draw_mesh_culled_frustum_
+                   << " cluster_indirect="<< object_->m_debug_draw_mesh_taken_by_cluster_
+                   << " cluster_debug="   << object_->m_debug_draw_mesh_cluster_debug_path_
+                   << " prims_iter="      << object_->m_debug_draw_prims_iterated_
+                   << " pipe_null="       << object_->m_debug_draw_prim_pipeline_null_
+                   << " mesh_shader="     << object_->m_debug_draw_prim_mesh_shader_;
+                emit(ss.str());
+            }
+            {
+                std::ostringstream ss;
+                ss << "[player.draw.ctx] root_node=" << root_node_idx
+                   << " root_T=(" << root_T.x << "," << root_T.y
+                   << "," << root_T.z << ")"
+                   << " use_node_xform_only="
+                   << (object_->m_use_node_transform_only_ ? 1 : 0)
+                   << " frustum_cull_active="
+                   << (s_frustum_cull_active ? 1 : 0)
+                   << " cluster_indirect_active="
+                   << (engine::helper::clusterIndirectActive() ? 1 : 0)
+                   << " cluster_rendering_enabled="
+                   << (engine::helper::clusterRenderingEnabled() ? 1 : 0);
+                emit(ss.str());
+            }
         }
     }
 }
