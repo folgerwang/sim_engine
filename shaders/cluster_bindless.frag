@@ -961,6 +961,23 @@ void main() {
         // overlay and the collision-proxy overlay read identically.
         uint cat = (uint(mat_flags) & uint(BINDLESS_MAT_CATEGORY_MASK))
                        >> BINDLESS_MAT_CATEGORY_SHIFT;
+
+        // Per-fragment Floor/Wall disambiguation by TRUE surface
+        // orientation.  The per-material category is a single name-based
+        // verdict, but Bistro reuses the same concrete material on both
+        // the ground and building facades, so any one verdict is wrong
+        // on the other.  Geometry resolves it unambiguously: among
+        // Floor/Wall, an up- or down-facing fragment (|N.y| high) is a
+        // horizontal surface -> Floor; a sideways-facing fragment
+        // (|N.y| low) is vertical -> Wall.  N_geom is the un-perturbed
+        // geometric world normal (before normal mapping), Y-up, so its
+        // y component is the orientation we want.  Scoped to Floor<->
+        // Wall ONLY: Door / Glass / Object / Vegetation / Ceiling /
+        // Stairs / etc. keep their semantic colour regardless of facing.
+        if (cat == 1u || cat == 2u) {
+            cat = (abs(N_geom.y) >= 0.5) ? 1u : 2u;
+        }
+
         vec3 cat_color;
         if      (cat == 1u)  cat_color = vec3(0.20, 0.75, 0.30); // Floor
         else if (cat == 2u)  cat_color = vec3(0.80, 0.20, 0.20); // Wall

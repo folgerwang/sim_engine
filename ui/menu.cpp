@@ -935,11 +935,17 @@ bool Menu::draw(
         classifier_status_ == ClassifierStatus::Failed) {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
         const float bar_h = 44.0f;  // two rows + padding
+        // Half-width, horizontally centred on the viewport top edge
+        // (just below the main menu bar).  Was full-width; the user
+        // wanted it 50% shorter and centred so it sits as a compact
+        // pill rather than spanning the whole screen.
+        const float bar_w = mvp->Size.x * 0.5f;
+        const float bar_x = mvp->Pos.x + (mvp->Size.x - bar_w) * 0.5f;
         ImGui::SetNextWindowPos(
-            ImVec2(mvp->Pos.x, mvp->Pos.y + ImGui::GetFrameHeight()),
+            ImVec2(bar_x, mvp->Pos.y + ImGui::GetFrameHeight()),
             ImGuiCond_Always);
         ImGui::SetNextWindowSize(
-            ImVec2(mvp->Size.x, bar_h),
+            ImVec2(bar_w, bar_h),
             ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.80f);
         if (ImGui::Begin("##llm_progress_bar", nullptr,

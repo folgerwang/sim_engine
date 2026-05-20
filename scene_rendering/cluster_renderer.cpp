@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <source_location>
 #include <cstring>
+#include <cctype>
+#include <string>
 #include <unordered_map>
 
 namespace er  = engine::renderer;
@@ -1429,6 +1431,107 @@ void ClusterRenderer::setVtEnabled(bool enabled) {
 //
 // Idempotent and safe to call repeatedly; each call wipes the previous
 // category bits before OR-ing in the fresh lookup.
+namespace {
+
+// Deterministic surface guard for the per-material category overlay.
+// This overlay path is LLM-ONLY (no face-normal vote, unlike the
+// collision-mesh classifier), so a small model regularly confuses big
+// flat surfaces — a road tagged CEILING, or worse, vertical plaster /
+// concrete facades tagged FLOOR (observed in Bistro: MASTER_Concrete_
+// White / _Plaster / Interior_01_Plaster all came back FLOOR).  The
+// bare material/object name doesn't tell the model which way a surface
+// faces, so we hard-pin the unambiguous cases by name here.
+//
+// Precedence: explicit WALL finishes that are vertical by definition
+// (plaster, stucco, brick, facade, cladding, barrier, railing, fence)
+// force Wall.  Otherwise walkable-ground tokens (road, street,
+// pavement, sidewalk, cobble, …) force Floor.  We deliberately do NOT
+// hard-pin ambiguous materials like "concrete" here — concrete is
+// reused on both Bistro's ground and its facades under one name, so a
+// name rule is wrong on one of them; the category shader resolves
+// Floor vs Wall per-fragment from the surface normal instead.  We only
+// override the failure modes that actually occur (Floor / Ceiling /
+// Unknown); a confident Door / Glass / Object / Vegetation verdict is
+// always left intact.  Props that merely contain a surface word
+// ("Floor_Lamp", "Street_Light") are excluded up front so we never
+// drag furniture onto a wall or floor.
+helper::MeshCategory guardSurfaceCategory(
+    const std::string& material_name,
+    const std::string& object_name,
+    helper::MeshCategory llm_cat) {
+    using helper::MeshCategory;
+    auto lower = [](std::string s) {
+        for (char& c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::string m = lower(material_name);
+    const std::string o = lower(object_name);
+    auto has = [&](const char* needle) {
+        return m.find(needle) != std::string::npos ||
+               o.find(needle) != std::string::npos;
+    };
+
+    // Don't touch obvious props that merely contain a surface word.
+    if (has("lamp")  || has("light")   || has("sign")    ||
+        has("pole")  || has("hydrant") || has("bench")   ||
+        has("planter")|| has("pot")    || has("chair")   ||
+        has("table")) {
+        return llm_cat;
+    }
+
+    // Only Floor / Ceiling / Unknown are ever "wrong" in a way these
+    // name rules can confidently correct; leave any other verdict alone.
+    const bool correctable =
+        llm_cat == MeshCategory::Floor   ||
+        llm_cat == MeshCategory::Ceiling ||
+        llm_cat == MeshCategory::Unknown;
+    if (!correctable) return llm_cat;
+
+    // Walkable-ground tokens (always horizontal underfoot).
+    const bool floor_tok =
+        has("road")     || has("street")  || has("pavement") ||
+        has("sidewalk") || has("asphalt") || has("cobble")   ||
+        has("tarmac")   || has("walkway") || has("doormat")  ||
+        has("floor_tile")|| has("floor tile");
+    // Bare ground/terrain/"floor" also lean Floor, but are weaker (a
+    // building's "ground floor wall" carries them too) so they only
+    // count when no wall token is present — handled below.
+    const bool soft_floor_tok =
+        has("ground") || has("terrain");
+
+    // Unambiguous vertical wall finishes.  NOTE: "concrete" is
+    // deliberately NOT here — it's reused on both Bistro's ground and
+    // its facades under the same material name, so a name-only rule
+    // ("bare concrete → Wall") wrongly turns real floor-concrete into
+    // wall.  The DEBUG_RENDER_MODE_CATEGORY shader now disambiguates
+    // Floor vs Wall per-fragment from the surface normal, which handles
+    // the concrete case correctly regardless of the stored verdict; we
+    // only hard-pin finishes that are vertical by definition.
+    const bool wall_tok =
+        has("plaster")  || has("stucco")   || has("brick")   ||
+        has("facade")   || has("cladding") || has("drywall")  ||
+        has("wallpaper")|| has("wainscot") || has("barrier")  ||
+        has("railing")  || has("balustrade")|| has("fence");
+
+    // WALL wins first for explicit vertical finishes.
+    if (wall_tok) {
+        return MeshCategory::Wall;
+    }
+    // FLOOR for walkable ground.
+    if (floor_tok || soft_floor_tok) {
+        // Never Ceiling, never left Unknown; a confident Floor stays.
+        if (llm_cat == MeshCategory::Ceiling ||
+            llm_cat == MeshCategory::Unknown) {
+            return MeshCategory::Floor;
+        }
+        return llm_cat;
+    }
+    return llm_cat;
+}
+
+} // namespace
+
 void ClusterRenderer::applyMaterialCategories(
     const helper::MaterialClassifier& cls) {
     if (material_params_backup_.empty() ||
@@ -1459,10 +1562,15 @@ void ClusterRenderer::applyMaterialCategories(
 
     int patched = 0;
     int matched = 0;
+    int guarded = 0;
     std::array<int, 11> per_cat{};
     for (size_t i = 0; i < pair_count; ++i) {
         const auto& [mat_name, obj_name] = staging_material_names_[i];
-        const auto cat = cls.lookup(mat_name, obj_name);
+        const auto raw_cat = cls.lookup(mat_name, obj_name);
+        // Surface guard: stop the LLM-only overlay from painting a road
+        // as Ceiling, or a plaster / concrete facade as Floor.
+        const auto cat = guardSurfaceCategory(mat_name, obj_name, raw_cat);
+        if (cat != raw_cat) ++guarded;
         // Always wipe the previous category bits before writing, so
         // a second call with a different classifier overrides cleanly.
         int& flags = material_params_backup_[i].flags;
@@ -1489,11 +1597,11 @@ void ClusterRenderer::applyMaterialCategories(
 
     std::printf(
         "[CLUSTER_RENDERER] applyMaterialCategories: patched %d / %d "
-        "entries (%d classified non-Unknown). "
+        "entries (%d classified non-Unknown, %d surface-guard corrected). "
         "Unknown=%d Floor=%d Wall=%d Door=%d Object=%d Glass=%d "
         "Ceiling=%d Stairs=%d Vegetation=%d Elevator=%d Ladder=%d\n",
         patched, static_cast<int>(material_params_backup_.size()),
-        matched,
+        matched, guarded,
         per_cat[0], per_cat[1], per_cat[2], per_cat[3], per_cat[4],
         per_cat[5], per_cat[6], per_cat[7], per_cat[8], per_cat[9],
         per_cat[10]);

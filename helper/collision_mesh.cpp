@@ -1276,6 +1276,108 @@ bool CollisionMesh::buildFromDrawableMesh(
     return buildBVH();
 }
 
+std::shared_ptr<CollisionMesh> CollisionMesh::splitOffVerticalFaces(
+    float up_threshold) {
+    // Only Floor patches get split — every other category keeps its
+    // mixed-normal geometry intact (a Wall legitimately has the odd
+    // horizontal cap, a prop has faces in every direction, etc.).
+    if (category_ != MeshCategory::Floor) return nullptr;
+    if (indices_.size() < 3) return nullptr;
+
+    std::vector<int> floor_idx;
+    std::vector<int> wall_idx;
+    floor_idx.reserve(indices_.size());
+
+    const size_t tri_count = indices_.size() / 3;
+    for (size_t t = 0; t < tri_count; ++t) {
+        const int i0 = indices_[3 * t + 0];
+        const int i1 = indices_[3 * t + 1];
+        const int i2 = indices_[3 * t + 2];
+
+        // Degenerate / out-of-range indices: keep them on the Floor
+        // side verbatim rather than silently dropping geometry.  They
+        // contribute zero area to physics either way.
+        if (i0 < 0 || i1 < 0 || i2 < 0 ||
+            (size_t)i0 >= vertices_.size() ||
+            (size_t)i1 >= vertices_.size() ||
+            (size_t)i2 >= vertices_.size()) {
+            floor_idx.push_back(i0);
+            floor_idx.push_back(i1);
+            floor_idx.push_back(i2);
+            continue;
+        }
+
+        const glm::vec3& v0 = vertices_[i0];
+        const glm::vec3& v1 = vertices_[i1];
+        const glm::vec3& v2 = vertices_[i2];
+        const glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+        const float len = glm::length(n);
+        // A zero-area sliver has no meaningful normal; leave it with
+        // the floor side (up_threshold is the "keep" test so default
+        // ny_abs=1 keeps it).
+        const float ny_abs = (len > 0.0f) ? std::abs(n.y) / len : 1.0f;
+
+        if (ny_abs >= up_threshold) {
+            floor_idx.push_back(i0);
+            floor_idx.push_back(i1);
+            floor_idx.push_back(i2);
+        } else {
+            wall_idx.push_back(i0);
+            wall_idx.push_back(i1);
+            wall_idx.push_back(i2);
+        }
+    }
+
+    // Nothing vertical → no split needed.
+    if (wall_idx.empty()) return nullptr;
+
+    // Helper: recompute an AABB over only the vertices referenced by an
+    // index list (the vertex array is shared whole, so we can't just
+    // extend over all of vertices_).
+    auto boundsOf = [this](const std::vector<int>& idx) {
+        AABB b;
+        for (int vi : idx) {
+            if (vi >= 0 && (size_t)vi < vertices_.size()) {
+                b.extend(vertices_[vi]);
+            }
+        }
+        return b;
+    };
+
+    // Everything was vertical → just re-tag this mesh as Wall in place;
+    // no second mesh required.
+    if (floor_idx.empty()) {
+        category_ = MeshCategory::Wall;
+        bounds_   = boundsOf(indices_);
+        bvh_root_ = nullptr;
+        bvh_ready_.store(false, std::memory_order_release);
+        return nullptr;
+    }
+
+    // Build the Wall sub-mesh.  It copies the FULL vertex array (index
+    // remapping would shrink it but adds complexity for no correctness
+    // gain — unused vertices never spawn triangles in the BVH or the
+    // debug expansion, both of which iterate the index list).
+    auto wall = std::make_shared<CollisionMesh>();
+    wall->vertices_      = vertices_;            // shared geometry (copy)
+    wall->indices_       = std::move(wall_idx);
+    wall->material_name_ = material_name_;
+    wall->object_name_   = object_name_;
+    wall->category_      = MeshCategory::Wall;
+    wall->bounds_        = boundsOf(wall->indices_);
+    wall->bvh_root_      = nullptr;
+    wall->bvh_ready_.store(false, std::memory_order_release);
+
+    // Shrink THIS mesh down to the walkable faces only; recompute its
+    // bounds and invalidate the (now stale) BVH.
+    indices_  = std::move(floor_idx);
+    bounds_   = boundsOf(indices_);
+    bvh_root_ = nullptr;
+    bvh_ready_.store(false, std::memory_order_release);
+
+    return wall;
+}
+
 void CollisionWorld::drawDebug(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

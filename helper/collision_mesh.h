@@ -198,6 +198,34 @@ public:
     MeshCategory category() const { return category_; }
     void setCategory(MeshCategory c) { category_ = c; }
 
+    // Floor patches authored as a single primitive routinely bundle
+    // non-walkable VERTICAL faces — curb sides, step risers, planter
+    // and fountain walls, road-edge kerbs — into the same "road" /
+    // "sidewalk" / "floor" material.  Those faces have a horizontal
+    // surface normal (|normal.y| ~ 0) and must NOT be treated as
+    // Floor: they block like a wall and would otherwise pollute
+    // navigation / foot-IK raycasts with phantom walkable surfaces.
+    //
+    // This partitions the triangle list by per-face normal:
+    //   |normal.y| >= up_threshold  → walkable, stays in THIS mesh
+    //   |normal.y| <  up_threshold  → vertical, moved into a new mesh
+    // and returns that new mesh (category Wall, same material / object
+    // name, BVH not yet built) holding the vertical faces.
+    //
+    // Returns nullptr when no split is warranted:
+    //   - this mesh is not currently classified Floor, or
+    //   - every face is walkable (no vertical faces to peel off).
+    // Special case: if EVERY face is vertical, this mesh is re-tagged
+    // Wall in place and nullptr is returned (no second mesh needed).
+    //
+    // After a split THIS mesh's bounds are recomputed and any existing
+    // BVH is invalidated (bvh_root_ cleared, ready flag reset) so the
+    // caller must (re)build BVHs afterwards.  up_threshold defaults to
+    // 0.5 — i.e. any face leaning more than 45° from horizontal is
+    // considered a wall.
+    std::shared_ptr<CollisionMesh> splitOffVerticalFaces(
+        float up_threshold = 0.5f);
+
     bool resolveCapsule(
         glm::vec3& position,
         float radius,
