@@ -8,17 +8,14 @@
 //   OLLAMA_HOST  — e.g. "localhost:11434" (default) or "192.168.1.5:11434"
 //                  Hostname[:port] only; no scheme.  HTTPS is not
 //                  supported because Ollama doesn't ship one by default.
-//   OLLAMA_MODEL — e.g. "qwen2.5:3b" (default).  Whatever tag is
+//   OLLAMA_MODEL — e.g. "qwen3.5:2b" (default).  Whatever tag is
 //                  installed locally; the prompt expects a model
-//                  competent at producing valid JSON output.  Note
-//                  that the default must be a REAL Ollama tag — a
-//                  non-existent tag ("qwen3.5:2b" doesn't exist, for
-//                  example) makes Ollama accept the POST connection
-//                  but stall the request body read while it tries
-//                  to resolve the missing manifest, which manifests
-//                  as a multi-minute WinHttpSendRequest hang on the
-//                  client side.  Pre-flight via /api/tags catches
-//                  this case cleanly before we hit /api/chat.
+//                  competent at producing valid JSON output.  The
+//                  default tag must be pulled locally (`ollama pull
+//                  qwen3.5:2b`); if the daemon can't resolve the
+//                  manifest, the /api/tags pre-flight below logs the
+//                  installed tags and the procedural classifier carries
+//                  the day instead of blocking the run.
 //
 // On failure (daemon unreachable, model not pulled, malformed reply)
 // classifyAll() returns false and the procedural classifier carries
@@ -433,8 +430,9 @@ Rules:
 
     json body;
     body["model"]    = model;
-    body["stream"]   = false;
+    body["stream"]   = true;
     body["format"]   = "json";
+    body["think"]    = false;
     // num_ctx must cover BOTH the input prompt AND the generated reply
     // for a SINGLE batch.  With batching at 10 items per request, a
     // request body is ~3 KB ≈ ~2k tokens of prompt, and the reply
@@ -487,31 +485,57 @@ struct ParsedReply {
 ParsedReply parseResponse(const std::string& body) {
     using nlohmann::json;
     ParsedReply out;
-    try {
-        json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
-        if (j.is_discarded()) {
-            std::cout << "[mat.cls] response not valid JSON" << std::endl;
-            return out;
-        }
-        if (!j.contains("message") || !j["message"].is_object() ||
-            !j["message"].contains("content") ||
-            !j["message"]["content"].is_string()) {
-            std::cout << "[mat.cls] response missing message.content"
-                      << std::endl;
-            // If Ollama returned an error envelope, surface it.
-            if (j.contains("error") && j["error"].is_string()) {
-                std::cout << "[mat.cls] ollama error: "
-                          << j["error"].get<std::string>() << std::endl;
-            }
-            return out;
-        }
-        std::string text = j["message"]["content"].get<std::string>();
-        if (text.empty()) {
-            std::cout << "[mat.cls] message.content was empty"
-                      << std::endl;
-            return out;
-        }
 
+    // Reassemble the assistant reply from NDJSON frames.  Walk the body
+    // line by line; each non-blank line should be one streaming frame.
+    // Accumulate every frame's message.content into `text`.  Surface any
+    // {"error":...} envelope.  A stream:false body is a single line, so
+    // this also covers the non-streaming case.
+    std::string text;
+    bool saw_frame = false;
+    {
+        size_t pos = 0;
+        while (pos <= body.size()) {
+            const size_t nl = body.find('\n', pos);
+            std::string line = (nl == std::string::npos)
+                ? body.substr(pos)
+                : body.substr(pos, nl - pos);
+            pos = (nl == std::string::npos) ? body.size() + 1 : nl + 1;
+            // Trim trailing CR/space and skip blank lines.
+            while (!line.empty() &&
+                   (line.back() == '\r' || line.back() == ' ')) {
+                line.pop_back();
+            }
+            if (line.empty()) continue;
+
+            json frame = json::parse(line, nullptr,
+                                     /*allow_exceptions=*/false);
+            if (frame.is_discarded()) continue;  // partial / non-JSON line
+            saw_frame = true;
+            if (frame.contains("error") && frame["error"].is_string()) {
+                std::cout << "[mat.cls] ollama error: "
+                          << frame["error"].get<std::string>() << std::endl;
+            }
+            if (frame.contains("message") && frame["message"].is_object() &&
+                frame["message"].contains("content") &&
+                frame["message"]["content"].is_string()) {
+                text += frame["message"]["content"].get<std::string>();
+            }
+        }
+    }
+
+    if (!saw_frame) {
+        std::cout << "[mat.cls] response had no parseable JSON frames"
+                  << std::endl;
+        return out;
+    }
+    if (text.empty()) {
+        std::cout << "[mat.cls] accumulated message.content was empty"
+                  << std::endl;
+        return out;
+    }
+
+    try {
         // Strip ```json ... ``` fences if the model added them.
         const auto strip_fence = [](std::string s) {
             auto t0 = s.find("```");
@@ -631,15 +655,17 @@ bool MaterialClassifier::classifyAll(const std::string& scene_label) {
 
     const OllamaTarget target =
         parseHost(getEnv("OLLAMA_HOST", "localhost:11434"));
-    // Default model: qwen2.5:3b — a small, fast, JSON-competent tag
-    // that actually exists on the Ollama registry.  Earlier we
-    // defaulted to "qwen3.5:2b" which was a typo / hallucination:
-    // Qwen 3.5 was never released, so the daemon accepted /api/chat
-    // POSTs but then wedged trying to resolve a missing manifest,
-    // producing a multi-minute first-batch hang inside
-    // WinHttpSendRequest.  Override with OLLAMA_MODEL if you want
-    // a different local tag.
-    const std::string model = getEnv("OLLAMA_MODEL", "qwen2.5:3b");
+    // Default model: qwen3.5:2b — small and fast.  NOTE: this tag must
+    // be pulled locally (`ollama pull qwen3.5:2b`) for classification to
+    // run; if Ollama can't resolve the manifest the model-availability
+    // check below logs the installed tags and skips the LLM pass.
+    // History: an earlier multi-minute first-batch hang inside
+    // WinHttpSendRequest was caused by the request using stream:false
+    // (the WinHttp call stalled waiting for the whole response) — NOT by
+    // the model tag.  That was fixed by switching /api/chat to
+    // stream:true + NDJSON frame parsing, so the model default is free to
+    // be whatever local tag you prefer.  Override with OLLAMA_MODEL.
+    const std::string model = getEnv("OLLAMA_MODEL", "qwen3.5:2b");
 
     // Batch size — environment-overridable, default 10.  Smaller
     // batches give finer progress granularity and faster per-request
@@ -693,13 +719,13 @@ bool MaterialClassifier::classifyAll(const std::string& scene_label) {
     //   1. The Ollama daemon is actually listening on OLLAMA_HOST, and
     //   2. The requested OLLAMA_MODEL is pulled locally.
     //
-    // Without this, a missing or mis-typed tag (we used to default to
-    // "qwen3.5:2b" which Alibaba never released) makes /api/chat
-    // accept the POST and then wedge during manifest resolution.
-    // From the client's side that looks like a 2+ minute hang inside
+    // Without this, a tag that isn't pulled locally makes /api/chat
+    // accept the POST and then wedge during manifest resolution.  From
+    // the client's side that can look like a long hang inside
     // WinHttpSendRequest with no error or diagnostic to act on.
     // /api/tags, by contrast, returns instantly with the list of
-    // locally-pulled models, so we can fail loudly and helpfully.
+    // locally-pulled models, so we can fail loudly and helpfully and
+    // fall back to the procedural classifier rather than blocking.
     {
         std::cout << "[mat.cls] pre-flight: GET /api/tags ..." << std::endl;
         const auto t_pf_0 = std::chrono::steady_clock::now();
@@ -908,20 +934,19 @@ size_t MaterialClassifier::bytesReceived() {
 MeshCategory MaterialClassifier::lookup(
     const std::string& material_name,
     const std::string& object_name) const {
-    // Object verdict wins when it has an opinion -- it's the more
-    // specific signal (a "Linde_Tree" object always wants
-    // Vegetation regardless of which material its leaves use).
+    // Category is derived SOLELY from the object name.  One material
+    // (concrete, glass, plaster) is reused across floors, walls and
+    // props, so a single material verdict is necessarily wrong on every
+    // surface but the one it was judged for; the object name is the unit
+    // that actually maps to a category.  material_name is intentionally
+    // ignored (kept in the signature so call sites need not change).
+    (void)material_name;
     if (!object_name.empty()) {
         const std::string norm = normalizeObjectName(object_name);
         auto it = obj_classified_.find(norm);
-        if (it != obj_classified_.end() &&
-            it->second != MeshCategory::Unknown) {
-            return it->second;
+        if (it != obj_classified_.end()) {
+            return it->second;  // object has the only say (incl. Unknown)
         }
-    }
-    if (!material_name.empty()) {
-        auto it = mat_classified_.find(material_name);
-        if (it != mat_classified_.end()) return it->second;
     }
     return MeshCategory::Unknown;
 }

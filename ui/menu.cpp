@@ -1607,6 +1607,7 @@ bool Menu::draw(
                 { 11, "11: SSAO (raw AO factor)"   },
                 { 12, "12: Hi-Z pyramid (mip)"     },
                 { 13, "13: Mesh category (solid)"  },
+                { 14, "14: Object ID (per mesh)"   },
             };
             for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
                 const auto& item = kRenderDebugItems[i];

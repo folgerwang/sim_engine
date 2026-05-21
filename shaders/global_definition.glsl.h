@@ -246,6 +246,19 @@
                                                     // Categories() after the LLM
                                                     // classifier runs; unclassified
                                                     // materials read as 0=Unknown=grey.
+#define DEBUG_RENDER_MODE_OBJECT_ID             14  // Per-object solid colour.
+                                                    // Hashes ClusterDrawInfo.
+                                                    // object_idx (one value per
+                                                    // uploaded scene mesh) to a
+                                                    // saturated hue so each object
+                                                    // gets a unique flat colour and
+                                                    // the same mesh always paints
+                                                    // identically.  Forward-only,
+                                                    // like CATEGORY — the deferred
+                                                    // G-buffer doesn't carry the
+                                                    // per-cluster object id, so
+                                                    // application.cpp force-flips to
+                                                    // forward while it's active.
 
 #define LIGHT_COUNT                             1
 // 6 cascades (was 4): smaller extent ratio between adjacent cascades
@@ -610,6 +623,15 @@ struct ClusterDrawInfo {
     uint    index_count;         // number of indices (triangles * 3)
     uint    vertex_offset;       // base vertex (added to each index)
     uint    material_idx;        // material index for the cluster
+    uint    object_idx;          // per-mesh object id (global mesh upload
+                                 // counter at upload time) — every cluster
+                                 // of the same scene mesh shares this value
+                                 // so DEBUG_RENDER_MODE_OBJECT_ID can paint
+                                 // each object a unique solid colour.  All
+                                 // ClusterDrawInfo SSBO bindings are std430,
+                                 // so the array stride stays packed at 20 B
+                                 // and matches the C++ sizeof used for the
+                                 // buffer uploads.
 };
 
 // Maximum textures that can be bound in the cluster bindless pass.

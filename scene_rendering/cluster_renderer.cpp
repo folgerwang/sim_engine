@@ -777,6 +777,11 @@ void ClusterRenderer::uploadMeshClusters(
             cluster_mesh.source->vertex_data_ptr->empty()) {
             // Still need a draw info entry to keep cluster indexing consistent.
             glsl::ClusterDrawInfo draw_info{};
+            // Tag with this mesh's object id even though the cluster draws
+            // nothing (index_count == 0) — keeps object_idx meaningful for
+            // every entry and avoids a stale/garbage value if the cluster
+            // is ever revived.
+            draw_info.object_idx = uploaded_mesh_count_;
             staging_draw_infos_.push_back(draw_info);
             continue;
         }
@@ -867,6 +872,14 @@ void ClusterRenderer::uploadMeshClusters(
                 ? cluster_prim_map[c] : 0u;
             draw_info.material_idx = getMaterialIdx(prim_idx);
         }
+        // Per-object id for DEBUG_RENDER_MODE_OBJECT_ID.  uploaded_mesh_count_
+        // is the running global mesh-upload counter (incremented once at the
+        // end of this call), so it's stable for every cluster of this mesh
+        // and unique across all meshes of all drawables — unlike mesh_idx,
+        // which restarts at 0 per drawable and would collide between the
+        // exterior and interior scenes.  draw_info here is NOT
+        // zero-initialised, so this assignment is required (not just tidy).
+        draw_info.object_idx = uploaded_mesh_count_;
         staging_draw_infos_.push_back(draw_info);
     }
 

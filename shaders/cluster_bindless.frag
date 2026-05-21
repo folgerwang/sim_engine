@@ -974,8 +974,31 @@ void main() {
         // y component is the orientation we want.  Scoped to Floor<->
         // Wall ONLY: Door / Glass / Object / Vegetation / Ceiling /
         // Stairs / etc. keep their semantic colour regardless of facing.
-        if (cat == 1u || cat == 2u) {
-            cat = (abs(N_geom.y) >= 0.5) ? 1u : 2u;
+        // Geometry-classify the STRUCTURAL categories (Unknown / Floor /
+        // Wall) directly from the true surface orientation, independent
+        // of the name verdict — the 2B classifier often returns Unknown
+        // for generic building/object names, and a material name alone
+        // can't tell ground from facade.  Per-fragment geometry can:
+        // a vertical surface is a Wall, up-facing is Floor, down-facing
+        // is a Ceiling.  Semantic categories (Door / Glass / Object /
+        // Vegetation / Stairs / Elevator / Ladder) keep their name-based
+        // colour and are NOT touched here.
+        if (cat == 0u || cat == 1u || cat == 2u) {
+            // Resolve by TRUE orientation using the SIGN of N_geom.y
+            // (the un-perturbed geometric normal):
+            //   horizontal + up   -> Floor   (1)
+            //   horizontal + down -> Ceiling (6)  overhead; you can't
+            //                                stand on an underside, so
+            //                                it is NEVER Floor
+            //   sideways          -> Wall    (2)
+            // The sign is what separates a ceiling from the floor it
+            // shares a material/name with (per-fragment, so it works
+            // even when floor + ceiling are one mesh).
+            if (abs(N_geom.y) >= 0.5) {
+                cat = (N_geom.y >= 0.0) ? 1u : 6u;
+            } else {
+                cat = 2u;
+            }
         }
 
         vec3 cat_color;
@@ -991,6 +1014,27 @@ void main() {
         else if (cat == 10u) cat_color = vec3(0.75, 0.55, 0.35); // Ladder
         else                 cat_color = vec3(0.55, 0.55, 0.55); // Unknown
         out_color = vec4(cat_color, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_OBJECT_ID) {
+        // Per-object solid colour.  Every uploaded scene mesh carries a
+        // unique object_idx (the global mesh-upload counter), packed into
+        // ClusterDrawInfo by ClusterRenderer::uploadMeshClusters, so every
+        // cluster of one object shares it.  Hash that id to a saturated
+        // hue: the golden-ratio step spreads consecutive ids around the
+        // colour wheel (adjacent objects get well-separated colours), and
+        // a small per-id wobble in saturation/value keeps two objects that
+        // happen to hash to a near-identical hue still distinguishable.
+        // The same mesh always paints the same colour across frames.
+        // Forward-only (draw_infos / v_cluster_idx don't exist in the
+        // deferred resolve) — application.cpp force-flips to forward.
+        uint  oid = draw_infos[v_cluster_idx].object_idx;
+        float hue = fract(float(oid) * 0.6180339887 + 0.12);
+        float sat = 0.65 + 0.35 * fract(float(oid) * 0.1031);
+        float val = 0.78 + 0.22 * fract(float(oid) * 0.0973);
+        // Compact HSV->RGB (Inigo Quilez): K = (1, 2/3, 1/3).
+        vec3 K = vec3(1.0, 2.0 / 3.0, 1.0 / 3.0);
+        vec3 p = abs(fract(vec3(hue) + K) * 6.0 - 3.0);
+        vec3 obj_color = val * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), sat);
+        out_color = vec4(obj_color, 1.0);
     }
 #endif // OIT_OUTPUT
 }
