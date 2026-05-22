@@ -1016,6 +1016,112 @@ bool Menu::draw(
         ImGui::End();
     }
 
+    // ── Collision-mesh build progress bar (stacked below the LLM bar) ─
+    // Second top-pinned overlay, same width/centering as the classifier
+    // bar but pinned one row lower so the two read as a stacked pair.
+    // Driven by setCollisionBuildStatus() (done/total primitives + the
+    // running Floor-mesh count), pushed every frame by application.cpp
+    // while the collision world builds incrementally.  Shown while
+    // Building and after Done (full green, as confirmation); hidden in
+    // Idle so the pre-classify phase stays clean.
+    if (collision_build_status_ == CollisionBuildStatus::Building ||
+        collision_build_status_ == CollisionBuildStatus::Done) {
+        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        const float bar_h = 44.0f;
+        const float bar_w = mvp->Size.x * 0.5f;
+        const float bar_x = mvp->Pos.x + (mvp->Size.x - bar_w) * 0.5f;
+        // The LLM bar sits at GetFrameHeight(); this one sits one bar
+        // height + a small gap lower so they stack without overlapping.
+        const float gap = 6.0f;
+        const float bar_y =
+            mvp->Pos.y + ImGui::GetFrameHeight() + bar_h + gap;
+        ImGui::SetNextWindowPos(ImVec2(bar_x, bar_y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(bar_w, bar_h), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.80f);
+        if (ImGui::Begin("##collision_build_bar", nullptr,
+            ImGuiWindowFlags_NoTitleBar  |
+            ImGuiWindowFlags_NoResize    |
+            ImGuiWindowFlags_NoMove      |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav))
+        {
+            // Fraction = primitives processed / total queued.  Force a
+            // visible sliver at kick-off and a full bar once Done.
+            float frac = 0.0f;
+            if (collision_build_total_ > 0) {
+                frac = float(collision_build_done_) /
+                       float(collision_build_total_);
+                if (frac > 1.0f) frac = 1.0f;
+            }
+            if (collision_build_status_ == CollisionBuildStatus::Done) {
+                frac = 1.0f;
+            } else if (frac < 0.02f) {
+                frac = 0.02f;
+            }
+
+            char overlay[96] = {0};
+            std::snprintf(overlay, sizeof(overlay),
+                "%zu / %zu primitives",
+                collision_build_done_, collision_build_total_);
+
+            // Blue while building, green when done — distinct from the
+            // LLM bar's amber so the two bars are easy to tell apart.
+            ImVec4 bar_col =
+                (collision_build_status_ == CollisionBuildStatus::Done)
+                    ? ImVec4(0.31f, 0.86f, 0.47f, 1.0f)   // green
+                    : ImVec4(0.30f, 0.68f, 0.95f, 1.0f);  // blue
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, bar_col);
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
+            ImGui::PopStyleColor();
+
+            const char* word =
+                (collision_build_status_ == CollisionBuildStatus::Done)
+                    ? "ready" : "building";
+            ImGui::Text(
+                "Collision: %s — %zu floor mesh(es) from %zu/%zu prims",
+                word, collision_build_meshes_,
+                collision_build_done_, collision_build_total_);
+        }
+        ImGui::End();
+    }
+
+    // ── Isolate-mesh identity overlay ────────────────────────────────
+    // When the isolate-debug slider is on, show the currently-isolated
+    // collision mesh's identity (index / category / tris / material /
+    // object), pushed each frame by the app.  Pinned top-left so it
+    // doesn't fight the centred progress bars.  Lets you read off the
+    // index of the broken mesh while scrubbing the slider.
+    if (collision_isolate_enabled_ && !collision_isolate_info_.empty()) {
+        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        // Pinned left, but pushed DOWN well below the on-screen clock
+        // widget (which sits in the top-left corner) so the two don't
+        // overlap.  Use Left/Right arrow keys to scrub the mesh index.
+        ImGui::SetNextWindowPos(
+            ImVec2(mvp->Pos.x + 12.0f,
+                   mvp->Pos.y + ImGui::GetFrameHeight() + 150.0f),
+            ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        if (ImGui::Begin("##coll_isolate_info", nullptr,
+            ImGuiWindowFlags_NoTitleBar  |
+            ImGuiWindowFlags_NoResize    |
+            ImGuiWindowFlags_NoMove      |
+            ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav))
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(1.0f, 0.85f, 0.30f, 1.0f));
+            ImGui::TextUnformatted("ISOLATED COLLISION MESH");
+            ImGui::PopStyleColor();
+            ImGui::TextUnformatted(collision_isolate_info_.c_str());
+        }
+        ImGui::End();
+    }
+
     // (The earlier centred text-only banner was superseded by the
     // top-pinned ProgressBar window above; same data, denser layout,
     // can't be hidden by other windows.)
@@ -1489,6 +1595,37 @@ bool Menu::draw(
                         CollisionDebugShape::Volume);
                 }
                 ImGui::EndMenu();
+            }
+
+            // ── Isolate single mesh (debug slider) ───────────────────
+            // Scrub one collision mesh at a time to hunt down a broken /
+            // missing one.  When enabled, drawDebug shows ONLY the mesh
+            // at the slider index; the top overlay shows that mesh's
+            // identity (index / category / tris / material / object) so
+            // you can read off the index of the bad one.
+            ImGui::Separator();
+            ImGui::MenuItem("Isolate single mesh", NULL,
+                            &collision_isolate_enabled_);
+            if (collision_isolate_enabled_ && collision_mesh_count_ > 0) {
+                const int max_idx =
+                    static_cast<int>(collision_mesh_count_) - 1;
+                if (collision_isolate_index_ > max_idx)
+                    collision_isolate_index_ = max_idx;
+                if (collision_isolate_index_ < 0)
+                    collision_isolate_index_ = 0;
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderInt("##coll_iso_idx",
+                                 &collision_isolate_index_,
+                                 0, max_idx, "mesh %d");
+                if (ImGui::SmallButton("- prev") &&
+                    collision_isolate_index_ > 0)
+                    --collision_isolate_index_;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("next +") &&
+                    collision_isolate_index_ < max_idx)
+                    ++collision_isolate_index_;
+                ImGui::SameLine();
+                ImGui::Text("/ %d", max_idx);
             }
 
             ImGui::EndMenu();

@@ -1,5 +1,7 @@
 #include "collision_debug_draw.h"
 
+#include <iostream>
+
 #include "shaders/global_definition.glsl.h"
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"   // createUnifiedMeshBuffer
@@ -267,26 +269,50 @@ void CollisionDebugDraw::uploadForMesh(
     positions.reserve(tri_count * 3);
     seg_ids.reserve(tri_count * 3);
 
+    size_t dropped_tris = 0;
     for (size_t t = 0; t < tri_count; ++t) {
         // Pull all three corners and tag every vertex with the SAME
         // seg_id (conventionally a MeshCategory enum value). The
         // fragment shader maps known category ids to fixed solid
         // colours, so the whole mesh resolves to one semantic colour
         // (Floor green, Wall red, Door yellow, ...).
+        const size_t committed = positions.size();  // valid full tris so far
+        bool malformed = false;
         for (int k = 0; k < 3; ++k) {
             int v_idx = indices[3 * t + k];
             if (v_idx < 0 || (size_t)v_idx >= vertices.size()) {
-                // Malformed index — skip the whole triangle to keep
-                // 3-vertex alignment in the non-indexed draw.
-                positions.resize(t * 3);
-                seg_ids.resize(t * 3);
-                goto stop;
+                malformed = true;
+                break;
             }
             positions.push_back(vertices[v_idx]);
             seg_ids.push_back(seg_id);
         }
+        if (malformed) {
+            // Drop ONLY this triangle, then keep going.  The old code
+            // did `goto stop` here, which aborted the WHOLE loop and
+            // silently dropped this triangle PLUS every triangle after
+            // it in the mesh -- one stray index turned into a big
+            // missing wedge in the overlay.  Roll back this triangle's
+            // partial corners to the last committed full triangle (NOT
+            // t*3 -- after an earlier drop the array is compacted
+            // shorter than t*3, so t*3 would GROW it with garbage) and
+            // continue with the next triangle.
+            positions.resize(committed);
+            seg_ids.resize(committed);
+            ++dropped_tris;
+        }
     }
-stop:
+    if (dropped_tris > 0) {
+        // Diagnostic: if this ever fires, the overlay holes are (at
+        // least partly) this debug-expansion drop -- the mesh's index
+        // array carried out-of-range values -- NOT a real gap in the
+        // collision geometry.  If the floor holes vanish once this stops
+        // logging, the bug above was the cause.
+        std::cout << "[collision.dbgdraw] dropped " << dropped_tris
+                  << " triangle(s) with out-of-range indices during debug "
+                     "expansion (seg_id=" << seg_id << ", of "
+                  << tri_count << " tris)" << std::endl;
+    }
     if (positions.empty()) return;
 
     out_gpu.position_buffer =

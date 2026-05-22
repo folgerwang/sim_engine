@@ -1205,7 +1205,12 @@ static void setupMesh(
     auto& vertex_buffer = drawable_object->buffers_[vertex_buffer_idx];
     auto& indice_buffer = drawable_object->buffers_[indice_buffer_idx];
 
-    assert(src_mesh->num_faces == src_mesh->num_triangles);
+    // ufbx is loaded WITHOUT triangulation (opts = {0}), so faces can be
+    // n-gons and num_faces != num_triangles in general.  The face loop
+    // below fan-triangulates each face, so the old all-triangle assert is
+    // gone -- it fired in debug and, worse, was compiled out in release
+    // where the previous raw-push silently corrupted the index list for
+    // any quad / n-gon (the missing triangles in the collision overlay).
     assert(src_mesh->num_indices == src_mesh->vertex_position.indices.count);
     assert(src_mesh->num_indices == src_mesh->vertex_normal.indices.count);
     assert(src_mesh->num_indices == src_mesh->vertex_uv.indices.count);
@@ -1224,7 +1229,8 @@ static void setupMesh(
     indice_match_table.reserve(src_mesh->num_indices * 3);
 
     helper::VertexStruct vertex_data;
-    assert(src_mesh->num_faces * 3 == src_mesh->num_indices);
+    // (Removed: assert(num_faces * 3 == num_indices) -- only holds for an
+    // all-triangle mesh; n-gons are fan-triangulated in the loop below.)
 
     size_t num_traingles = 0;
     size_t num_indices = 0;
@@ -1259,6 +1265,82 @@ static void setupMesh(
             has_bvh_trees = true;
         }
 
+        // ── DEBUG: verify the RAW ufbx source for Pavement_Brick parts.
+        // Mesh 46 (Pavement_Brick/Street_6185) came out as TWO disconnected
+        // strips with a ~3m gap.  Compute the connected-component count of
+        // each raw ufbx Pavement_Brick part (union-find over shared POSITION
+        // indices -- transform-independent).  If a large part is ONE
+        // connected piece, the source is continuous and our pipeline split
+        // it (a real bug); if it is already two pieces, the source genuinely
+        // has two strips.  Large parts (>200 faces) are also dumped raw to a
+        // numbered OBJ for off-line inspection.  Remove when done.
+        if (mat_name_string.find("Pavement_Brick") != std::string::npos &&
+            part.num_faces > 50) {
+            std::unordered_map<uint32_t,uint32_t> parent;
+            auto find = [&](uint32_t x) -> uint32_t {
+                while (parent[x]!=x){ parent[x]=parent[parent[x]]; x=parent[x]; }
+                return x; };
+            auto uni = [&](uint32_t a, uint32_t b){
+                if (!parent.count(a)) parent[a]=a;
+                if (!parent.count(b)) parent[b]=b;
+                parent[find(a)] = find(b);
+            };
+            double mnz=1e30,mxz=-1e30,mnx=1e30,mxx=-1e30;
+            for (int fi = 0; fi < part.num_faces; ++fi) {
+                const auto& fc = src_mesh->faces[part.face_indices[fi]];
+                if (fc.num_indices < 1) continue;
+                uint32_t p0 = src_mesh->vertex_position.indices[fc.index_begin];
+                for (uint32_t k = 0; k < fc.num_indices; ++k) {
+                    uint32_t pidx = src_mesh->vertex_position.indices[fc.index_begin + k];
+                    uni(p0, pidx);
+                    const auto& pp = src_mesh->vertex_position.values[pidx];
+                    mnz=std::min(mnz,(double)pp.z); mxz=std::max(mxz,(double)pp.z);
+                    mnx=std::min(mnx,(double)pp.x); mxx=std::max(mxx,(double)pp.x);
+                }
+            }
+            int components = 0;
+            for (auto& kv : parent) if (find(kv.first) == kv.first) ++components;
+            std::cout << "[mesh.fbx.raw] Pavement part faces=" << part.num_faces
+                      << " positions=" << parent.size()
+                      << " components=" << components
+                      << " local_bbox x[" << mnx << "," << mxx << "] z["
+                      << mnz << "," << mxz << "]"
+                      << (components > 1 ? "  <== SOURCE ALREADY SPLIT" :
+                                           "  (source connected)")
+                      << std::endl;
+            if (part.num_faces > 200) {
+                static int s_pav = 0;
+                std::ofstream raw(
+                    "G:/work/procedure-world-sim/debug_source_raw_" +
+                    std::to_string(s_pav++) + ".obj");
+                if (raw.is_open()) {
+                    raw << "# RAW ufbx, mat=" << mat_name_string
+                        << " faces=" << part.num_faces
+                        << " components=" << components << "\n";
+                    std::unordered_map<uint32_t,uint32_t> pos_to_obj;
+                    uint32_t next_obj = 1;
+                    for (int fi = 0; fi < part.num_faces; ++fi) {
+                        const auto& fc = src_mesh->faces[part.face_indices[fi]];
+                        for (uint32_t k = 0; k < fc.num_indices; ++k) {
+                            uint32_t pidx = src_mesh->vertex_position.indices[fc.index_begin + k];
+                            if (!pos_to_obj.count(pidx)) {
+                                const auto& p = src_mesh->vertex_position.values[pidx];
+                                raw << "v " << p.x << " " << p.y << " " << p.z << "\n";
+                                pos_to_obj[pidx] = next_obj++;
+                            }
+                        }
+                    }
+                    for (int fi = 0; fi < part.num_faces; ++fi) {
+                        const auto& fc = src_mesh->faces[part.face_indices[fi]];
+                        raw << "f";
+                        for (uint32_t k = 0; k < fc.num_indices; ++k)
+                            raw << " " << pos_to_obj[src_mesh->vertex_position.indices[fc.index_begin + k]];
+                        raw << "\n";
+                    }
+                }
+            }
+        }
+
         ego::PrimitiveInfo primitive_info;
         primitive_info.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
         // ::lowest() (most negative finite float), NOT ::min() (smallest
@@ -1272,10 +1354,41 @@ static void setupMesh(
         // gate above, so foliage / lights / banners do not contribute.
         const size_t part_index_start = new_indices.size();
 
+        // ufbx is loaded WITHOUT triangulation (opts = {0}), so a face may
+        // be an n-gon (quad / polygon) with face.num_indices > 3.  We cache
+        // every corner, THEN fan-triangulate from corner 0:
+        //   (0,1,2), (0,2,3), ..., (0, n-2, n-1)   -- n-2 triangles,
+        // INCLUDING the closing (0, n-2, n-1).  The previous code pushed
+        // all corners RAW and only asserted num_indices == 3; in release
+        // (asserts compiled out) every n-gon's extra corners straddled the
+        // group-of-3 boundary and corrupted / dropped triangles -- the
+        // source of the missing triangles in the collision overlay.  For a
+        // genuine triangle (num_indices == 3) this emits exactly one
+        // triangle with the same three indices, i.e. byte-identical to the
+        // old behaviour.
+        std::vector<uint32_t> face_verts;
         for (int i_face = 0; i_face < part.num_faces; i_face++) {
             const auto& face_indice = part.face_indices[i_face];
             const auto& face = src_mesh->faces[face_indice];
-            assert(face.num_indices == 3);
+
+            // Diagnostic: confirm whether this asset actually contains
+            // n-gons (i.e. whether the missing-triangle bug was firing).
+            // Throttled to the first 20 occurrences.
+            if (face.num_indices != 3) {
+                static int s_ngon_log = 0;
+                if (s_ngon_log < 20) {
+                    ++s_ngon_log;
+                    std::cout << "[mesh.fbx] non-triangle face: num_indices="
+                              << face.num_indices
+                              << " -> fan-triangulated into "
+                              << (face.num_indices >= 2
+                                      ? face.num_indices - 2 : 0)
+                              << " tri(s) (#" << s_ngon_log << "/20)"
+                              << std::endl;
+                }
+            }
+
+            face_verts.clear();
             for (uint32_t i_vert = 0; i_vert < face.num_indices; i_vert++) {
                 const auto src_vert_index = face.index_begin + i_vert;
                 auto pos_indice = src_mesh->vertex_position.indices[src_vert_index];
@@ -1311,7 +1424,15 @@ static void setupMesh(
                         vertex_data,
                         src_vert_index);
 
-                new_indices.push_back(new_indice);
+                face_verts.push_back(new_indice);
+            }
+
+            // Fan-triangulate the cached corners.  Skips degenerate faces
+            // (< 3 corners) automatically since the loop body never runs.
+            for (size_t t = 1; t + 1 < face_verts.size(); ++t) {
+                new_indices.push_back(face_verts[0]);
+                new_indices.push_back(face_verts[t]);
+                new_indices.push_back(face_verts[t + 1]);
             }
         }
 

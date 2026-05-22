@@ -243,6 +243,25 @@ private:
     size_t           classifier_bytes_received_ = 0;
     size_t           classifier_bytes_estimated_total_ = 0;
 
+    // ── Collision-mesh build progress (second bar, below the LLM one) ─
+    // The collision world is built incrementally across frames (a batch
+    // of primitives per frame) once the classifier has landed.
+    // application.cpp pushes done/total each frame via
+    // setCollisionBuildStatus(); draw() paints a ProgressBar pinned
+    // directly under the classifier bar.  meshes_ is the running count
+    // of Floor collision meshes actually added to the world.
+public:
+    enum class CollisionBuildStatus : int {
+        Idle     = 0,  // not started (classifier not done yet)
+        Building = 1,  // incremental build in progress
+        Done     = 2,  // every queued primitive processed
+    };
+private:
+    CollisionBuildStatus collision_build_status_ = CollisionBuildStatus::Idle;
+    size_t               collision_build_done_   = 0;
+    size_t               collision_build_total_  = 0;
+    size_t               collision_build_meshes_ = 0;
+
     // Which CollisionShape mode application.cpp should pass to
     // CollisionMesh::buildFromDrawablePrimitive when (re)building
     // the collision world for visualisation. Three user-facing
@@ -267,6 +286,17 @@ private:
     // changes; the application clears it after rebuilding the
     // collision world to match.
     bool collision_world_dirty_ = false;
+
+    // ── Isolate-debug slider ─────────────────────────────────────────
+    // When enabled, the collision debug draw shows ONLY the single mesh
+    // at collision_isolate_index_ (scrub it to find a broken/missing
+    // mesh, then read its index + identity off the overlay).  The app
+    // pushes the live mesh count (for the slider range) and the
+    // isolated mesh's identity string each frame.
+    bool        collision_isolate_enabled_ = false;
+    int         collision_isolate_index_   = 0;
+    size_t      collision_mesh_count_      = 0;
+    std::string collision_isolate_info_;
 
     // ---- Time-of-day -------------------------------------------------------
     // Hours in [0, 24) in the player's **local timezone**.  Initialised
@@ -553,6 +583,21 @@ public:
         classifier_bytes_estimated_total_ = bytes_estimated_total;
     }
 
+    // Per-frame push of the incremental collision-build progress so the
+    // second (lower) progress bar can render.  Called from the build
+    // block in application.cpp every frame while the world is being
+    // generated, and once more with Done when the last primitive lands.
+    void setCollisionBuildStatus(
+        CollisionBuildStatus status,
+        size_t done,
+        size_t total,
+        size_t meshes) {
+        collision_build_status_ = status;
+        collision_build_done_   = done;
+        collision_build_total_  = total;
+        collision_build_meshes_ = meshes;
+    }
+
     // One-shot "snap the player to where the camera is looking" request.
     // The menu sets this when the user picks "Reset player position";
     // application.cpp reads it each frame, clears it, and (if set) calls
@@ -601,6 +646,35 @@ public:
     }
     inline bool collisionWorldDirty() const {
         return collision_world_dirty_;
+    }
+
+    // Isolate-debug slider accessors.  collisionIsolateIndex() is only
+    // meaningful when collisionIsolateEnabled() is true.  The app pushes
+    // the mesh count (slider range) and the isolated mesh's identity.
+    inline bool collisionIsolateEnabled() const {
+        return collision_isolate_enabled_;
+    }
+    inline int collisionIsolateIndex() const {
+        return collision_isolate_index_;
+    }
+    inline void setCollisionMeshCount(size_t n) {
+        collision_mesh_count_ = n;
+    }
+    inline void setCollisionIsolateInfo(const std::string& s) {
+        collision_isolate_info_ = s;
+    }
+    // Step the isolated mesh index by `delta` (Left/Right arrow hotkeys).
+    // Auto-enables isolate mode so the keys work even when the menu /
+    // slider is hidden, and clamps to [0, mesh_count-1].
+    inline void stepCollisionIsolate(int delta) {
+        collision_isolate_enabled_ = true;
+        collision_isolate_index_ += delta;
+        if (collision_isolate_index_ < 0) collision_isolate_index_ = 0;
+        if (collision_mesh_count_ > 0) {
+            const int max_idx = static_cast<int>(collision_mesh_count_) - 1;
+            if (collision_isolate_index_ > max_idx)
+                collision_isolate_index_ = max_idx;
+        }
     }
     inline void clearCollisionWorldDirty() {
         collision_world_dirty_ = false;

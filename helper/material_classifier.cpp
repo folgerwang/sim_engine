@@ -332,10 +332,14 @@ HttpResult httpRequest(
         // requirements with anything else.
         g_classifier_bytes_received.store(
             total_bytes, std::memory_order_relaxed);
-        std::cout << "[mat.cls.http] chunk #" << chunk_idx
-                  << " size=" << read
-                  << " total=" << total_bytes << " bytes"
-                  << std::endl;
+        // Per-chunk progress is published to g_classifier_bytes_received
+        // above (drives the UI bar).  The console line below was emitting
+        // one row per network chunk -- thousands of lines per response --
+        // so it is silenced.  Re-enable for low-level transport debugging.
+        // std::cout << "[mat.cls.http] chunk #" << chunk_idx
+        //           << " size=" << read
+        //           << " total=" << total_bytes << " bytes"
+        //           << std::endl;
     }
 
     WinHttpCloseHandle(hRequest);
@@ -446,9 +450,18 @@ Rules:
     // batch stall with zero visible response progress.  At 4K it's
     // ~400 MB, allocates in seconds, and easily fits in any modern
     // GPU's VRAM.
+    // DETERMINISM: the collision "simplification" (floor-only build) runs
+    // AFTER classification and keys on each material/object verdict, so any
+    // run-to-run variation in the classifier shows up as collision floor
+    // meshes appearing/disappearing (the "holes flicker between runs" bug).
+    // temperature 0 + a FIXED seed makes the model commit to the same tag
+    // every run for the same prompt, so the verdicts -- and therefore the
+    // floor set and the collision overlay -- are reproducible.
     body["options"]  = {
         {"num_ctx",     4096},
-        {"temperature", 0.1},
+        {"temperature", 0.0},
+        {"seed",        1337},
+        {"top_k",       1},
     };
     // Pin the model in VRAM for 10 minutes between requests.  Ollama's
     // default keep_alive is 5 minutes, which is normally fine, but a

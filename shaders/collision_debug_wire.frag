@@ -6,7 +6,7 @@
 // --- collision_debug_wire.frag ----------------------------------------
 // Wireframe-overlay fragment shader for the collision-mesh debug pass.
 // Pairs with collision_debug.vert (so the vertex layout matches the
-// solid-fill pipeline 1:1) and emits a flat opaque white. Drawn after
+// solid-fill pipeline 1:1) and emits a flat opaque red. Drawn after
 // collision_debug.frag has filled each mesh with its hashed
 // segmentation colour, with depth_bias pushing lines toward the camera
 // so they win the LESS depth test against the fill they ride on. The
@@ -24,7 +24,8 @@ layout(location = 0) flat in uint v_triangle_id;
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    // Slightly off-pure-white so it reads cleanly on saturated hash
-    // colours without burning out against pale segmentation tints.
-    outColor = vec4(linearTosRGB(vec3(0.92)), 1.0);
+    // Bright red — the off-white wireframe was too low-contrast against
+    // the green Floor fill to read.  Red pops against green (and against
+    // the other segmentation tints) so the triangulation is easy to see.
+    outColor = vec4(linearTosRGB(vec3(1.0, 0.0, 0.0)), 1.0);
 }

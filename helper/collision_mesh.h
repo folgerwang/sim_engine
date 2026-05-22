@@ -349,6 +349,13 @@ public:
     bool empty() const { return meshes_.empty(); }
     size_t meshCount() const { return meshes_.size(); }
 
+    // Read-only access to a single mesh by world-list index, for the
+    // isolate-debug slider (scrub one mesh at a time to find a broken
+    // one).  Returns nullptr if the index is out of range.
+    const CollisionMesh* meshAt(size_t i) const {
+        return (i < meshes_.size()) ? meshes_[i].get() : nullptr;
+    }
+
     // Kick off a background thread that calls m->buildBVH() on every
     // mesh currently in this world.  Non-blocking: returns immediately.
     // While the build runs, CollisionMesh::raycastDown / resolveCapsule
@@ -389,12 +396,16 @@ public:
         glm::vec3& out_normal) const;
 
     // Draw every collision mesh as flat-shaded debug triangles.
+    // isolate_index >= 0 draws ONLY meshes_[isolate_index] (the
+    // isolate-debug slider) so a single mesh can be inspected in
+    // isolation; -1 (default) draws the whole world.
     void drawDebug(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,
         const std::vector<renderer::Viewport>& viewports,
-        const std::vector<renderer::Scissor>& scissors) const;
+        const std::vector<renderer::Scissor>& scissors,
+        int isolate_index = -1) const;
 
     void destroyDebugBuffers(
         const std::shared_ptr<renderer::Device>& device);

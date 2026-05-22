@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -730,6 +731,51 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         }
     }
 
+    // ── DEBUG: per-stage surface-area summary ────────────────────────
+    // Total triangle area should be PRESERVED through gather -> weld ->
+    // decimate (simplification keeps the surface, it doesn't shrink it).
+    // If the area drops sharply at one stage, that stage is dropping
+    // geometry.  Logged only for the mesh under investigation
+    // (Street_6185 / Pavement_Brick) to keep the output readable.
+    // Remove this block when done.
+    const bool dbg_area =
+        object_name_.find("6185") != std::string::npos &&
+        material_name_.find("Brick") != std::string::npos;
+    auto totalTriArea = [](const std::vector<glm::vec3>& pos,
+                           const std::vector<uint32_t>& idx) -> double {
+        double a = 0.0;
+        for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+            if (idx[t] >= pos.size() || idx[t+1] >= pos.size() ||
+                idx[t+2] >= pos.size()) continue;
+            const glm::vec3& p0 = pos[idx[t]];
+            const glm::vec3& p1 = pos[idx[t+1]];
+            const glm::vec3& p2 = pos[idx[t+2]];
+            a += 0.5 * glm::length(glm::cross(p1 - p0, p2 - p0));
+        }
+        return a;
+    };
+    // Dump one simplification stage's full geometry to its own OBJ in the
+    // workspace so each step can be analysed off-line (area, connectivity,
+    // interior holes) to see exactly where geometry is lost.  The header
+    // carries the stage name, tri count and total area.  Debug-only.
+    auto dumpStage = [&](const char* stage,
+                         const std::vector<glm::vec3>& pos,
+                         const std::vector<uint32_t>& idx) {
+        if (!dbg_area) return;
+        std::ofstream f(std::string(
+            "G:/work/procedure-world-sim/debug_stage_") + stage + ".obj");
+        if (!f.is_open()) return;
+        f << "# stage=" << stage << " obj=" << object_name_
+          << " mat=" << material_name_ << " tris=" << idx.size() / 3
+          << " verts=" << pos.size()
+          << " area=" << totalTriArea(pos, idx) << "\n";
+        for (const auto& v : pos)
+            f << "v " << v.x << " " << v.y << " " << v.z << "\n";
+        for (size_t t = 0; t + 2 < idx.size(); t += 3)
+            f << "f " << (idx[t] + 1) << " " << (idx[t+1] + 1) << " "
+              << (idx[t+2] + 1) << "\n";
+    };
+
     // Build a tightly packed (vertices, indices) for just this
     // primitive's referenced subset. src_positions covers the WHOLE
     // mesh (all primitives), so we walk src_indices, dedupe via a
@@ -775,6 +821,15 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     // small props with the default 10cm eps), the drop log shows
     // how many real triangles we lost.
     const size_t pre_weld_tris = packed_indices.size() / 3;
+
+    if (dbg_area) {
+        std::cout << "[area] mesh=" << mesh_idx << " prim=" << prim_idx
+                  << " obj=" << object_name_ << "  STAGE=gather  tris="
+                  << pre_weld_tris << "  area="
+                  << totalTriArea(packed_positions, packed_indices)
+                  << " m^2" << std::endl;
+        dumpStage("gather", packed_positions, packed_indices);
+    }
 
     // ── Vertex welding ────────────────────────────────────────────────
     // Authored / exported geometry frequently has sub-mm gaps where
@@ -924,6 +979,14 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         packed_indices   = std::move(welded_indices);
     }
 
+    if (dbg_area) {
+        std::cout << "[area] mesh=" << mesh_idx << " prim=" << prim_idx
+                  << "  STAGE=weld    tris=" << packed_indices.size() / 3
+                  << "  area=" << totalTriArea(packed_positions, packed_indices)
+                  << " m^2" << std::endl;
+        dumpStage("weld", packed_positions, packed_indices);
+    }
+
     // Shape finalisation: turn the welded triangle list into the
     // requested debug / collision proxy.
     switch (shape) {
@@ -1019,6 +1082,17 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         packed_indices   = std::move(vox_ind);
         break;
     }
+    }
+
+    if (dbg_area) {
+        std::cout << "[area] mesh=" << mesh_idx << " prim=" << prim_idx
+                  << "  STAGE=final   tris=" << packed_indices.size() / 3
+                  << "  area=" << totalTriArea(packed_positions, packed_indices)
+                  << " m^2  (shape="
+                  << (shape == CollisionShape::None ? "None" :
+                      shape == CollisionShape::Decimate ? "Decimate" : "Voxel")
+                  << ")" << std::endl;
+        dumpStage("final", packed_positions, packed_indices);
     }
 
     // Move into the CollisionMesh's storage (signed int32 to match
@@ -1383,7 +1457,8 @@ void CollisionWorld::drawDebug(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
     const std::vector<renderer::Viewport>& viewports,
-    const std::vector<renderer::Scissor>& scissors) const {
+    const std::vector<renderer::Scissor>& scissors,
+    int isolate_index) const {
     if (!CollisionDebugDraw::ready()) return;
     // Two passes per CollisionMesh: solid hashed-colour fill first,
     // then a white wireframe overlay so the user can see each mesh's
@@ -1394,6 +1469,10 @@ void CollisionWorld::drawDebug(
     // depth-bias behaviour because the relevant fill is the most
     // recent thing in the depth buffer.
     for (size_t i = 0; i < meshes_.size(); ++i) {
+        // Isolate-debug slider: when an index is selected, draw ONLY
+        // that mesh so it can be inspected on its own.
+        if (isolate_index >= 0 && i != static_cast<size_t>(isolate_index))
+            continue;
         const auto& m = meshes_[i];
         if (!m || m->empty()) continue;
         // Lazy upload of per-mesh GPU debug buffers on first draw. We

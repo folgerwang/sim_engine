@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <queue>
 #include <cmath>
+#include <iostream>
 #include <OpenMesh/Core/Mesh/TriMesh_ArrayKernelT.hh>
 #include <OpenMesh/Core/IO/MeshIO.hh>
 #include <OpenMesh/Tools/Decimater/DecimaterT.hh>
@@ -373,15 +374,48 @@ void decimateMesh(
             edge_face_map[edgeKey(a,b)].push_back(fi);
         }
 
-    // ── Lock boundary and inter-part seam vertices ────────────────────────────
-    // Boundary edge  : appears in only 1 face  → lock both endpoints
+    // ── Lock boundary, inter-part seam, and SHARP FEATURE edges ───────────────
+    // Boundary edge  : appears in only 1 face            → lock both endpoints
     // Seam edge      : shared by faces of different parts → lock both endpoints
+    // Sharp edge     : the two faces meeting at it form a large dihedral
+    //                  angle (a slab's top-to-side corner, the outline /
+    //                  silhouette of the surface)         → lock both endpoints
+    //
+    // Without the sharp-edge case, QEM happily collapses across a mesh's
+    // outline and the EDGE SHAPE drifts (e.g. the pavement slab in
+    // Pavement_Brick_BLENDSHADER lost its original perimeter).  Locking
+    // feature edges keeps the silhouette while still decimating the flat
+    // interior.
+    //
+    // cos(threshold) on the angle between the two face NORMALS.  We use
+    // |cos| so the test is winding-immune: coplanar faces give |cos|~1
+    // (collapse), a ~90deg corner gives |cos|~0 (lock), regardless of
+    // whether one face was wound backwards.  cos(45 deg) ~= 0.707, so any
+    // crease sharper than ~45deg is preserved.
+    constexpr double kCosSharpEdge = 0.707; // 45 deg between face normals
     for (auto& [key, flist] : edge_face_map) {
         bool lock = (flist.size() == 1); // open boundary
-        if (!lock) {
+        if (!lock && flist.size() >= 2) {
             int32_t p0 = faces[flist[0]].part_id;
             for (size_t i = 1; i < flist.size(); ++i)
                 if (faces[flist[i]].part_id != p0) { lock = true; break; }
+        }
+        // Sharp feature edge (exactly two faces, same part): lock if the
+        // faces meet at a steep dihedral so the outline keeps its shape.
+        if (!lock && flist.size() == 2) {
+            const auto& fa = faces[flist[0]];
+            const auto& fb = faces[flist[1]];
+            const glm::dvec3 na = glm::cross(
+                verts[fa.v[1]].pos - verts[fa.v[0]].pos,
+                verts[fa.v[2]].pos - verts[fa.v[0]].pos);
+            const glm::dvec3 nb = glm::cross(
+                verts[fb.v[1]].pos - verts[fb.v[0]].pos,
+                verts[fb.v[2]].pos - verts[fb.v[0]].pos);
+            const double la = glm::length(na), lb = glm::length(nb);
+            if (la > 1e-15 && lb > 1e-15) {
+                const double cosang = glm::dot(na, nb) / (la * lb);
+                if (std::abs(cosang) < kCosSharpEdge) lock = true;
+            }
         }
         if (lock) {
             int va = (int)(key >> 32);
@@ -488,9 +522,30 @@ void decimateMesh(
                 double area2 = glm::length(new_n); // = 2 * area
                 if (area2 < 1e-12) return true;
 
-                // 1. Normal flip (skip if old face was already degenerate)
+                // 1. Normal DEVIATION (was: full-flip only).  Reject a
+                //    collapse that rotates a SURVIVING face's normal more
+                //    than kMaxNormalDev from its pre-collapse orientation.
+                //    The old test rejected only a full flip (dot < 0, i.e.
+                //    >90 deg), which let QEM tilt a near-flat floor
+                //    triangle by up to ~89 deg in one collapse.  Those
+                //    tilted triangles then fell below the
+                //    splitOffVerticalFaces walkable threshold (|n.y| < 0.5)
+                //    and were peeled off into the discarded Wall mesh,
+                //    leaving the triangular holes / "broken triangles" in
+                //    the floor overlay.  Capping the per-collapse rotation
+                //    keeps floor faces near-flat so they survive the split.
+                //    cos(40 deg) ~= 0.766; raise the angle (lower the cos)
+                //    to allow more aggressive simplification of curved
+                //    surfaces, lower it to keep collision proxies flatter.
+                static constexpr double kCosMaxNormalDev = 0.766; // 40 deg
                 double old_area2 = glm::length(old_n);
-                if (old_area2 > 1e-12 && glm::dot(old_n, new_n) < 0.0) return true;
+                if (old_area2 > 1e-12) {
+                    // area2 is guaranteed >= 1e-12 here (checked above), so
+                    // the denominator is safe.
+                    const double cos_dev =
+                        glm::dot(old_n, new_n) / (old_area2 * area2);
+                    if (cos_dev < kCosMaxNormalDev) return true;
+                }
 
                 // 3. Aspect ratio: max_edge² / (2·area) > threshold
                 double e0sq = glm::dot(p[1]-p[0], p[1]-p[0]);
@@ -606,6 +661,44 @@ void decimateMesh(
             (uint32_t)old_to_new[faces[fi].v[1]],
             (uint32_t)old_to_new[faces[fi].v[2]]));
         output_face_part_ids.push_back(faces[fi].part_id);
+    }
+
+    // ── Hole diagnostic ──────────────────────────────────────────────
+    // A correct edge-collapse decimation PRESERVES the surface: every
+    // interior edge stays shared by two faces; only the original
+    // (locked) perimeter is a boundary edge.  Count boundary edges
+    // (used by exactly one face) in the INPUT vs the OUTPUT.  If the
+    // OUTPUT has materially more, the decimation tore interior holes --
+    // exactly the "missing triangle" wedges in the collision overlay.
+    // Logged to std::cout (the `log` stream is discarded at the call
+    // site) and throttled so it can't spam across hundreds of prims.
+    {
+        size_t in_boundary = 0;
+        for (const auto& kv : edge_face_map)
+            if (kv.second.size() == 1) ++in_boundary;
+        std::unordered_map<uint64_t, int> out_edge_count;
+        out_edge_count.reserve(output_mesh.faces_ptr->size() * 3);
+        for (const auto& f : *output_mesh.faces_ptr)
+            for (int k = 0; k < 3; ++k) {
+                const int a = (int)f.v_indices[k];
+                const int b = (int)f.v_indices[(k + 1) % 3];
+                ++out_edge_count[edgeKey(a, b)];
+            }
+        size_t out_boundary = 0;
+        for (const auto& kv : out_edge_count)
+            if (kv.second == 1) ++out_boundary;
+        if (out_boundary > in_boundary) {
+            static int s_hole_log = 0;
+            if (s_hole_log < 30) {
+                ++s_hole_log;
+                std::cout << "[QEM.holes] decimation OPENED holes: boundary "
+                             "edges in=" << in_boundary << " out="
+                          << out_boundary << " (+"
+                          << (out_boundary - in_boundary) << "), faces "
+                          << nf << "->" << alive << " (#" << s_hole_log
+                          << "/30)" << std::endl;
+            }
+        }
     }
 }
 
