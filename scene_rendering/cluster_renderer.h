@@ -375,6 +375,7 @@ private:
 
     bool enabled_ = true;   // master toggle (GPU cluster culling on by default)
     bool cpu_cull_mode_ = false;          // true = CPU frustum cull, false = GPU compute cull
+    bool categories_applied_ = false;     // set by applyMaterialCategories once category bits are populated
     bool debug_draw_bbox_ = false;        // draw cluster bounding boxes
     bool debug_distance_cull_ = false;    // debug: set use_bvh=3 for distance-based cull
     // Toggle: Hi-Z occlusion culling for the cluster path.  When on,
@@ -456,6 +457,11 @@ public:
     // (which means they continue to read as Unknown / grey in the
     // DEBUG_RENDER_MODE_CATEGORY overlay).
     void applyMaterialCategories(const helper::MaterialClassifier& cls);
+
+    // True once applyMaterialCategories has patched the per-material
+    // category bits.  Gates the floor-only debug background so it does
+    // not blank the scene before the classifier finishes.
+    bool categoriesApplied() const { return categories_applied_; }
 
     // Initialise the bindless graphics pipeline. Call once after
     // finalizeUploads() and after descriptor-set layouts / render

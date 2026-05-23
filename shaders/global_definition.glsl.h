@@ -181,6 +181,10 @@
 
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
 #define FEATURE_INPUT_SHADOW_DISABLED           0x00000002
+// Debug-only: when set, cluster_bindless.frag discards every fragment
+// whose material category (bits 8..15) is not Floor, so the textured
+// background matches the floor-only collision-LOD overlay.
+#define FEATURE_INPUT_FLOOR_ONLY                0x00000004
 
 // Debug render mode is packed into bits 16..23 of camera_info.input_features
 // (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack

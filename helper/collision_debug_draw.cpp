@@ -78,13 +78,41 @@ static auto createPipeline(
     renderer::RasterizationStateOverride rasterization_state_info;
     rasterization_state_info.override_double_sided = true;
     rasterization_state_info.double_sided          = true;
+    // Push the fill slightly toward the camera so it wins the
+    // depth test against the coincident ORIGINAL surface it
+    // approximates -- the LOD overlay LOADs the scene depth, so
+    // without this bias the fill z-fights the textured surface.
+    rasterization_state_info.override_depth_bias = true;
+    rasterization_state_info.depth_bias_enable = true;
+    rasterization_state_info.depth_bias_constant_factor = -2.0f;
+    rasterization_state_info.depth_bias_slope_factor    = -2.0f;
+
+    // Alpha-blend the solid fill so the collision-LOD overlay is
+    // translucent over the textured scene (the fragment shader
+    // emits per-category colour at alpha 0.8).  Standard src-over
+    // blend; all other pipeline state (depth test, etc.) is
+    // inherited from the app's GraphicPipelineInfo.
+    renderer::GraphicPipelineInfo blended_info = graphic_pipeline_info;
+    blended_info.blend_state_info =
+        std::make_shared<renderer::PipelineColorBlendStateCreateInfo>(
+            renderer::helper::fillPipelineColorBlendStateCreateInfo({
+                renderer::helper::fillPipelineColorBlendAttachmentState(
+                    SET_FLAG_BIT(ColorComponent, ALL_BITS),
+                    /*blend_enable=*/true,
+                    renderer::BlendFactor::SRC_ALPHA,
+                    renderer::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                    renderer::BlendOp::ADD,
+                    renderer::BlendFactor::ONE,
+                    renderer::BlendFactor::ZERO,
+                    renderer::BlendOp::ADD)
+            }));
 
     return device->createPipeline(
         pipeline_layout,
         binding_descs,
         attribute_descs,
         input_assembly,
-        graphic_pipeline_info,
+        blended_info,
         getShaderModules(device),
         frame_buffer_format,
         rasterization_state_info,
@@ -133,8 +161,10 @@ static auto createWirePipeline(
     rasterization_state_info.double_sided          = true;
     rasterization_state_info.override_depth_bias = true;
     rasterization_state_info.depth_bias_enable = true;
-    rasterization_state_info.depth_bias_constant_factor = -2.0f;
-    rasterization_state_info.depth_bias_slope_factor    = -2.0f;
+    // Larger bias than the solid fill (-2) so the wireframe lines
+    // stay in front of the translucent fill in the LOD overlay.
+    rasterization_state_info.depth_bias_constant_factor = -4.0f;
+    rasterization_state_info.depth_bias_slope_factor    = -4.0f;
 
     return device->createPipeline(
         pipeline_layout,

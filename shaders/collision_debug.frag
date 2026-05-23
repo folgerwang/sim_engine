@@ -77,5 +77,8 @@ vec3 categoryColor(uint id) {
 
 void main() {
     vec3 color = categoryColor(v_triangle_id);
-    outColor = vec4(linearTosRGB(color), 1.0);
+    // Alpha 0.8: the solid-fill pipeline is alpha-blended for the
+    // translucent collision-LOD overlay drawn over the textured
+    // scene.  (Ignored when the bound pipeline has blending off.)
+    outColor = vec4(linearTosRGB(color), 0.8);
 }

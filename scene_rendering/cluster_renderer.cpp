@@ -1608,6 +1608,8 @@ void ClusterRenderer::applyMaterialCategories(
         bytes,
         material_params_backup_.data());
 
+    categories_applied_ = true;
+
     std::printf(
         "[CLUSTER_RENDERER] applyMaterialCategories: patched %d / %d "
         "entries (%d classified non-Unknown, %d surface-guard corrected). "

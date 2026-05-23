@@ -334,6 +334,21 @@ void main() {
     int  tex_idx    = material_params[mat_idx].base_color_tex_idx;
     int  mat_flags  = material_params[mat_idx].flags;
 
+    // Floor-only debug view: when the collision-LOD overlay is active
+    // the CPU sets FEATURE_INPUT_FLOOR_ONLY so the textured background
+    // is limited to Floor-category geometry (matching the floor-only
+    // collision overlay drawn on top).  Category is packed into
+    // mat_flags bits 8..15 by ClusterRenderer::applyMaterialCategories;
+    // MeshCategory::Floor == 1.  Done before the translucent guards so
+    // it applies to every pipeline variant (opaque / G-buffer / OIT /
+    // alpha-blend).
+    if ((camera_info.input_features & FEATURE_INPUT_FLOOR_ONLY) != 0u) {
+        uint floor_only_cat =
+            (uint(mat_flags) & uint(BINDLESS_MAT_CATEGORY_MASK))
+                >> BINDLESS_MAT_CATEGORY_SHIFT;
+        if (floor_only_cat != 1u) discard;
+    }
+
 #if defined(OIT_OUTPUT) || defined(ALPHA_BLEND_OUTPUT)
     // Translucent pipelines (WBOIT or forward alpha-blend): only
     // AlphaMode::Blend materials should ever reach this draw — the cull
