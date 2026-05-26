@@ -39,5 +39,17 @@ layout(location = 0) flat out uint v_triangle_id;
 void main() {
     vec3 position_ws = (params.transform * vec4(in_position, 1.0f)).xyz;
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
+    // Pull the collision overlay slightly toward the camera in CLIP space
+    // so it reliably wins the (LESS) depth test against the coincident
+    // textured background it was built from -- this kills the z-fighting
+    // that made the green flicker out in patches ("mesh disappeared").
+    // Multiplying by gl_Position.w makes the shift a constant offset in
+    // NDC after the perspective divide, so it's uniform at ALL distances
+    // -- unlike the rasterizer's constant depth bias, which is too weak
+    // far from the camera.  ~0.0012 NDC clears depth quantisation without
+    // letting the overlay poke through geometry that genuinely occludes
+    // it.  Tune up if z-fighting persists at extreme distance, down if the
+    // overlay shows through nearby walls.
+    gl_Position.z -= 0.0012 * gl_Position.w;
     v_triangle_id = in_triangle_id;
 }

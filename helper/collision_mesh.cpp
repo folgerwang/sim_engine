@@ -848,10 +848,45 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     // Then drop triangles whose three corners welded to <=2 distinct
     // vertices (they have zero area and would confuse the decimater).
     //
-    // Done BEFORE decimation so what were boundary edges across a gap
-    // become interior edges in the welded mesh, which the QEM pass
-    // can then collapse across.
+    // CRITICAL CHANGE vs the old "merge the whole node" path: the
+    // ORIGINAL boundary vertices of this primitive (its outline and
+    // the seam it shares with the adjacent material part) are HELD
+    // FIXED — never welded, moved, or used as a merge target (see
+    // is_orig_boundary below).  Welding therefore can never drag a
+    // part's outer edge, and decimateMesh re-locks the same edges from
+    // topology, so two adjacent parts that were authored coincident
+    // stay watertight instead of drifting apart into a hairline crack.
+    // We lock the shared edge instead of fusing across it.
     if (weld_eps > 0.0f && packed_indices.size() >= 3) {
+        // ── Lock ORIGINAL boundary / seam vertices ────────────────
+        // A boundary edge of THIS primitive appears in exactly one
+        // triangle; its endpoints are the primitive's silhouette AND
+        // the seam shared with the neighbouring part (per-primitive,
+        // that shared seam is a boundary on each side).  Mark them so
+        // the weld loop passes them through untouched.
+        std::vector<bool> is_orig_boundary(packed_positions.size(), false);
+        {
+            auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+                const uint32_t lo = a < b ? a : b;
+                const uint32_t hi = a < b ? b : a;
+                return (static_cast<uint64_t>(lo) << 32) | hi;
+            };
+            std::unordered_map<uint64_t, uint32_t> edge_count;
+            edge_count.reserve(packed_indices.size());
+            for (size_t t = 0; t + 2 < packed_indices.size(); t += 3) {
+                const uint32_t v[3] = {packed_indices[t + 0],
+                                       packed_indices[t + 1],
+                                       packed_indices[t + 2]};
+                for (int k = 0; k < 3; ++k)
+                    ++edge_count[ekey(v[k], v[(k + 1) % 3])];
+            }
+            for (const auto& kv : edge_count) {
+                if (kv.second != 1) continue;  // interior / shared edge
+                is_orig_boundary[static_cast<uint32_t>(kv.first >> 32)]   = true;
+                is_orig_boundary[static_cast<uint32_t>(kv.first & 0xffffffffu)]
+                    = true;
+            }
+        }
         struct IVec3Hash {
             size_t operator()(const glm::ivec3& v) const noexcept {
                 // 3-way mix from boost::hash_combine -- adequate
@@ -894,6 +929,21 @@ bool CollisionMesh::buildFromDrawablePrimitive(
 
         for (size_t i = 0; i < packed_positions.size(); ++i) {
             const glm::vec3& p = packed_positions[i];
+
+            // Boundary / seam vertex: pass through UNWELDED.  It keeps
+            // its exact authored position and is deliberately NOT added
+            // to `spatial`, so no interior vertex can snap onto it
+            // either — the original outline stays exactly where the
+            // asset author put it (decimateMesh re-locks it from
+            // topology, so it survives QEM too).
+            if (is_orig_boundary[i]) {
+                const uint32_t new_idx =
+                    static_cast<uint32_t>(welded_positions.size());
+                welded_positions.push_back(p);
+                remap_to_welded[i] = new_idx;
+                continue;
+            }
+
             const glm::ivec3 key = quantize(p);
 
             uint32_t best_idx = UINT32_MAX;
