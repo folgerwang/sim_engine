@@ -27,6 +27,21 @@ enum class GameState {
     InGame         // meshes loaded, gameplay active
 };
 
+// Live-tunable parameters for PlayerController's two-bone foot IK.
+// Owned by the menu so the ImGui sliders bind directly to the
+// fields; the application copies them into the controller every
+// frame and pushes the resulting pelvis drop back for display.
+// Defaults MUST match PlayerController's own initial values so a
+// fresh session behaves identically until the user changes them.
+struct FootIkParams {
+    bool  enabled         = true;
+    float stride_amp      = 0.18f;   // walking fwd/back foot travel (m)
+    float lift_amp        = 0.10f;   // max foot lift mid-swing (m)
+    float sole_drop       = 0.08f;   // ankle-bone -> sole distance (m)
+    float tilt_weight     = 0.6f;    // 0=flat foot, 1=full align to normal
+    float pelvis_drop_max = 0.6f;    // clamp on the IK pelvis drop (m)
+};
+
 class Menu {
     std::vector<std::string> gltf_file_names_;
     std::vector<std::string> to_load_gltf_names_;
@@ -52,6 +67,9 @@ class Menu {
     bool      player_bbox_valid_   = false;
     glm::vec3 player_bbox_min_     = glm::vec3(0.0f);
     glm::vec3 player_bbox_max_     = glm::vec3(0.0f);
+    // ── Foot-IK tuning (bound to the Physics > Foot IK menu) ──────────
+    FootIkParams foot_ik_params_;
+    float        foot_ik_pelvis_drop_live_ = 0.0f;  // read-only readout
     bool turn_off_water_pass_ = false;
     bool turn_off_grass_pass_ = false;
     bool turn_off_ray_tracing_ = false;
@@ -616,6 +634,13 @@ public:
         reset_player_position_requested_ = false;
         return v;
     }
+
+    // Live foot-IK params edited by the Physics > Foot IK menu; the
+    // application reads these each frame and applies them to the
+    // PlayerController.  setFootIkPelvisDrop feeds the read-only
+    // pelvis-drop value shown beneath the sliders.
+    const FootIkParams& footIkParams() const { return foot_ik_params_; }
+    void setFootIkPelvisDrop(float v) { foot_ik_pelvis_drop_live_ = v; }
 
     // CSM debug visualisation
     inline bool showCsmDebug() const { return show_csm_debug_; }

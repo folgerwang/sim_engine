@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <functional>
 #include "renderer/renderer.h"
 
 struct GLFWwindow;
@@ -77,8 +78,65 @@ public:
     float capsuleRadius() const { return player_radius_; }
     float capsuleHeight() const { return player_height_; }
 
+    // ── Foot inverse-kinematics ─────────────────────────────
+    // The application owns the scene + collision data, so it supplies a
+    // ground-query callback: given a world XZ column and a Y "hint"
+    // (roughly the expected foot level) it returns the ground height and
+    // surface normal beneath that column.  PlayerController uses it to
+    // plant each foot independently via a two-bone (hip+knee) solve, tilt
+    // the foot to the surface, and drop the pelvis when a foot can't
+    // reach.  With no callback set (or foot IK disabled) the legs fall
+    // back to the pure procedural swing.
+    //   x, z    — world-space column to probe.
+    //   y_hint  — expected foot Y (lets the probe pick the nearest
+    //             surface and ignore an upper storey above the player).
+    //   out_y   — world Y of the ground hit.
+    //   out_nrm — unit surface normal at the hit.
+    //   returns — true on a hit; false leaves out_* untouched.
+    using GroundQueryFn = std::function<
+        bool(float x, float z, float y_hint,
+             float& out_y, glm::vec3& out_nrm)>;
+    void setGroundQuery(GroundQueryFn fn) { ground_query_ = std::move(fn); }
+    void setFootIkEnabled(bool e) { foot_ik_enabled_ = e; }
+    bool footIkEnabled() const    { return foot_ik_enabled_; }
+    // Live-tunable IK knobs (wired to the Physics > Foot IK menu).
+    void setFootStrideAmp(float v)  { foot_stride_amp_  = v; }
+    void setFootLiftAmp(float v)    { foot_lift_amp_    = v; }
+    void setFootSoleDrop(float v)   { foot_sole_drop_   = v; }
+    void setFootTiltWeight(float v) { foot_tilt_weight_ = v; }
+    void setPelvisDropMax(float v)  { pelvis_drop_max_  = v; }
+    // Amount the rig root was lowered this frame because a foot could
+    // not otherwise reach its ground target (>= 0).  For diagnostics.
+    float pelvisDrop() const      { return pelvis_drop_; }
+
 private:
     void applyPose(const std::shared_ptr<DrawableObject>& player);
+
+    // Plants both feet on the ground via two-bone IK and updates
+    // pelvis_drop_.  Returns true when it took ownership of the legs
+    // (so applyPose skips the procedural leg/knee swing).  Returns
+    // false — a no-op — when disabled, no ground_query_ is set, or
+    // the rig lacks the *_upper_leg / *_lower_leg / *_foot bones.
+    bool applyFootIk(const std::shared_ptr<DrawableObject>& player);
+
+    // Snapshot the rig's initialized (bind) leg pose ONCE: per-leg bone
+    // lengths, bind local rotations, and reference axes.  Everything the
+    // stateless solver needs is captured here so the per-frame solve
+    // never depends on the previous frame's (possibly drifted) pose.
+    void captureLegBind(const std::shared_ptr<DrawableObject>& player);
+
+    // Stateless pole-vector two-bone solve for one leg: places the foot
+    // bone on `target` in a single pass using the frozen bind bone
+    // lengths, then orients the foot toward `ground_normal`.  Reads only
+    // the hip world position + parent rotation (neither depends on the
+    // leg's own IK), so it cannot diverge.  out_deficit = how far the
+    // target lay beyond reach (0 if reachable) -> pelvis-drop signal.
+    void solveLegIk(const std::shared_ptr<DrawableObject>& player,
+                    int leg_idx, const char* hip_name,
+                    const char* knee_name, const char* foot_name,
+                    const glm::vec3& target,
+                    const glm::vec3& ground_normal,
+                    float foot_tilt_w, float& out_deficit);
 
     glm::vec2 resolveXzCollisions(
         const glm::vec2& current_xz,
@@ -125,6 +183,45 @@ private:
     float     player_height_ = 1.8f;     // total capsule height (incl. hemispheres)
     bool      walking_       = false;
     bool      initialized_   = false;
+
+    // ── Foot IK state ────────────────────────────────
+    GroundQueryFn ground_query_;          // app-supplied ground probe
+    bool   foot_ik_enabled_ = true;       // master toggle
+    // Horizontal facing of motion, captured in update() from the
+    // per-frame XZ velocity (kept from the last non-trivial step so
+    // it stays valid while standing).  Used to place the walking
+    // foot-step offsets along the direction of travel.
+    glm::vec2 gait_fwd_xz_ = glm::vec2(0.0f, 1.0f);
+    // Smoothed amount the pelvis (root) is lowered this frame because a
+    // foot couldn't otherwise reach its ground target.  Applied as a
+    // negative-Y offset inside applyPose's setRootNodeTransform call and
+    // lerped toward its target each frame to avoid popping.
+    float  pelvis_drop_      = 0.0f;
+    // Tuning (metres / unitless).  Conservative defaults so the primary
+    // goal (feet on the ground) still reads well even if the gait is
+    // slightly off; edit + recompile to tweak.
+    float  foot_stride_amp_  = 0.18f;     // fwd/back foot travel, walking
+    float  foot_lift_amp_    = 0.10f;     // max foot lift mid-swing
+    float  foot_sole_drop_   = 0.08f;     // ankle bone -> sole distance
+    float  foot_tilt_weight_ = 0.6f;      // 0=flat, 1=full align to normal
+    float  pelvis_drop_max_  = 0.6f;      // clamp so a bug can't sink her
+
+    // ── Captured bind (default-pose) leg reference for the IK ─────────
+    // Filled once by captureLegBind() from the initialized skeleton.
+    // The solver treats this as the canonical default pose and uses the
+    // frozen bone lengths; nothing here changes after capture.
+    struct LegIkBind {
+        bool      valid = false;
+        float     L1 = 0.0f, L2 = 0.0f;     // bind bone lengths (world)
+        glm::quat qh0{1,0,0,0};             // bind hip  local rotation
+        glm::quat qk0{1,0,0,0};             // bind knee local rotation
+        glm::quat qf0{1,0,0,0};             // bind foot local rotation
+        glm::vec3 ahx{0.0f,-1.0f,0.0f};     // upper-leg axis, hip-local
+        glm::vec3 akx{0.0f,-1.0f,0.0f};     // lower-leg axis, knee-local
+        glm::vec3 bend_hp{0.0f,0.0f,1.0f};  // knee hinge axis, hip-parent
+    };
+    LegIkBind leg_bind_[2];               // 0 = left, 1 = right
+    bool      leg_bind_captured_ = false;
 };
 
 } // namespace game_object

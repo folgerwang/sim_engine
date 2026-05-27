@@ -37,9 +37,9 @@ enum class CollisionShape {
     VoxelSphere,
 };
 
-// Semantic role of a CollisionMesh in the gameplay world.  Inferred at
-// build time from the source material name plus a face-normal majority
-// vote (see classifyCategory in collision_mesh.cpp).  Gameplay code can
+// Semantic role of a CollisionMesh in the gameplay world.  Assigned at
+// build time by the LLM material classifier (see MaterialClassifier);
+// application code can override it via setCategory().  Gameplay code can
 // branch on this — Floor for navigation / foot IK targets, Wall for
 // blocking, Door for interactable openings, Object for the per-thing
 // physics pile (tables, chairs, bottles, …).  Also the colour key used
@@ -65,31 +65,6 @@ enum class MeshCategory : uint32_t {
 // is prompted to emit one of these exact strings.
 const char* meshCategoryTag(MeshCategory c);
 MeshCategory meshCategoryFromTag(const std::string& tag);
-
-// Best-effort classification of one primitive from its material name
-// and triangle normals.  Pure function so application.cpp can override
-// the result if it wants a custom rule per-drawable (Bistro vs custom
-// scenes); the default heuristic is:
-//
-//   1. material-name substring match wins for unambiguous tags:
-//        "Door" / "Gate" / "Rollup"     → Door
-//        "Glass" / "Window" / "Frosted" → Glass
-//        "Doormat"                      → Floor
-//   2. geometric vote: dominant face-normal direction picks Floor (mostly
-//      +Y) vs Wall (mostly horizontal) for the remaining unambiguous
-//      cases.
-//   3. small AABB extents in all three axes → Object (table/chair/prop),
-//      since walls and floors always span at least a metre or two.
-//   4. otherwise Unknown.
-//
-// vertices / indices are the FINAL collision triangle list (post weld
-// + shape finalisation) so the vote reflects what physics will see, not
-// the un-simplified source.
-MeshCategory classifyCategory(
-    const std::string& material_name,
-    const std::vector<glm::vec3>& vertices,
-    const std::vector<int>& indices,
-    const AABB& bounds);
 
 // CollisionMesh — static-mesh CPU collision representation.
 class CollisionMesh {
@@ -202,12 +177,9 @@ public:
 
     // Semantic category — Floor / Wall / Door / Object / Glass /
     // Ceiling / Stairs / Vegetation / Elevator / Ladder / Unknown.
-    // Set automatically at the end of buildFromDrawablePrimitive by
-    // classifyCategory(); the other build paths (buildFromDrawable,
-    // buildFromDrawableMesh) leave it at Unknown since they aggregate
-    // multiple materials and no single category would be honest.
-    // Application code can also overwrite it via setCategory() for
-    // scene-specific rules and AI-classifier overrides.
+    // Left at the default Unknown by the build paths; the collision build
+    // (application.cpp) stamps the final value from the LLM material
+    // classifier's verdict via setCategory().
     MeshCategory category() const { return category_; }
     void setCategory(MeshCategory c) { category_ = c; }
 

@@ -1650,6 +1650,35 @@ bool Menu::draw(
                 ImGui::Text("/ %d", max_idx);
             }
 
+            // ── Foot IK (live tuning) ────────────────────────────────
+            // Two-bone (hip+knee) inverse kinematics that plants each
+            // foot on the ground, tilts it to the surface, and drops the
+            // pelvis when a foot cannot reach.  application.cpp reads
+            // these every frame and pushes them into PlayerController.
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Foot IK")) {
+                ImGui::Checkbox("Enabled", &foot_ik_params_.enabled);
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderFloat("Stride", &foot_ik_params_.stride_amp,
+                                   0.0f, 0.6f, "%.2f m");
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderFloat("Lift", &foot_ik_params_.lift_amp,
+                                   0.0f, 0.4f, "%.2f m");
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderFloat("Sole drop", &foot_ik_params_.sole_drop,
+                                   0.0f, 0.3f, "%.3f m");
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderFloat("Foot tilt", &foot_ik_params_.tilt_weight,
+                                   0.0f, 1.0f, "%.2f");
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderFloat("Pelvis drop max",
+                                   &foot_ik_params_.pelvis_drop_max,
+                                   0.0f, 1.5f, "%.2f m");
+                ImGui::Text("Live pelvis drop: %.3f m",
+                            foot_ik_pelvis_drop_live_);
+                ImGui::EndMenu();
+            }
+
             ImGui::EndMenu();
         }
 
@@ -2776,7 +2805,7 @@ bool Menu::draw(
                                         ImVec4& out_rgb,
                                         const char*& out_tag) {
                 switch (cat) {
-                    case 1:  out_rgb = ImVec4(0.20f, 0.75f, 0.30f, 1.0f); out_tag = "FLOOR";      break;
+                    case 1:  out_rgb = ImVec4(0.20f, 0.75f, 0.30f, 1.0f); out_tag = "WALKABLE_SURFACE";      break;
                     case 2:  out_rgb = ImVec4(0.80f, 0.20f, 0.20f, 1.0f); out_tag = "WALL";       break;
                     case 3:  out_rgb = ImVec4(0.95f, 0.75f, 0.10f, 1.0f); out_tag = "DOOR";       break;
                     case 4:  out_rgb = ImVec4(0.55f, 0.25f, 0.80f, 1.0f); out_tag = "OBJECT";     break;

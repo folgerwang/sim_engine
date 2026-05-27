@@ -1178,12 +1178,11 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         return false;
     }
 
-    // Classify into a semantic category from the source material name
-    // plus a face-normal majority vote against the FINAL (post weld,
-    // post shape) triangle list — what physics will actually see.
-    // setCategory keeps the field writable from application code if
-    // the heuristic gets a primitive wrong for a particular scene.
-    category_ = classifyCategory(material_name_, vertices_, indices_, bounds_);
+    // Classification is LLM-only: the procedural classifyCategory()
+    // (material-name substring + face-normal vote) was removed.  category_
+    // stays Unknown here; the collision build (application.cpp) stamps the
+    // final category from the LLM classifier's verdict via setCategory().
+    category_ = MeshCategory::Unknown;
 
     if (!build_bvh) {
         bvh_root_ = nullptr;
@@ -1196,7 +1195,7 @@ bool CollisionMesh::buildFromDrawablePrimitive(
 
 const char* meshCategoryTag(MeshCategory c) {
     switch (c) {
-        case MeshCategory::Floor:      return "FLOOR";
+        case MeshCategory::Floor:      return "WALKABLE_SURFACE";
         case MeshCategory::Wall:       return "WALL";
         case MeshCategory::Door:       return "DOOR";
         case MeshCategory::Object:     return "OBJECT";
@@ -1212,12 +1211,20 @@ const char* meshCategoryTag(MeshCategory c) {
 }
 
 MeshCategory meshCategoryFromTag(const std::string& tag) {
-    // Case-insensitive — the LLM occasionally returns mixed case
-    // ("Floor", "floor", "FLOOR") despite the prompt asking for all caps.
+    // Case-insensitive — the LLM occasionally returns mixed case despite
+    // the prompt asking for all caps.  The walkable-surface tag has been
+    // through a couple of names (FLOOR -> GROUND -> WALKABLE_SURFACE); accept
+    // every spelling -- "WALKABLE_SURFACE", "WALKABLE SURFACE" (space form a
+    // small model may emit), bare "WALKABLE", and the legacy GROUND / FLOOR
+    // -- so any reply still maps to MeshCategory::Floor (the enum keeps its
+    // name).  toupper() preserves the space and underscore, so the space and
+    // underscore forms are matched verbatim after upcasing.
     std::string up;
     up.reserve(tag.size());
     for (char c : tag) up.push_back(static_cast<char>(std::toupper(c)));
-    if (up == "FLOOR")      return MeshCategory::Floor;
+    if (up == "WALKABLE_SURFACE" || up == "WALKABLE SURFACE" ||
+        up == "WALKABLE" || up == "GROUND" ||
+        up == "FLOOR")      return MeshCategory::Floor;
     if (up == "WALL")       return MeshCategory::Wall;
     if (up == "DOOR")       return MeshCategory::Door;
     if (up == "OBJECT")     return MeshCategory::Object;
@@ -1227,129 +1234,6 @@ MeshCategory meshCategoryFromTag(const std::string& tag) {
     if (up == "VEGETATION") return MeshCategory::Vegetation;
     if (up == "ELEVATOR")   return MeshCategory::Elevator;
     if (up == "LADDER")     return MeshCategory::Ladder;
-    return MeshCategory::Unknown;
-}
-
-// ── classifyCategory ──────────────────────────────────────────────────
-// Three-stage heuristic; see the doc comment in collision_mesh.h for
-// the exact rules.  Order matters: material-name override wins over
-// geometric vote so a horizontal door panel doesn't become a Floor.
-MeshCategory classifyCategory(
-    const std::string& material_name,
-    const std::vector<glm::vec3>& vertices,
-    const std::vector<int>& indices,
-    const AABB& bounds) {
-    if (vertices.empty() || indices.size() < 3) return MeshCategory::Unknown;
-
-    // ── case-insensitive substring match helper.  Bistro material
-    // names are MixedCase ("MASTER_Bistro_Main_Door"); player-named
-    // assets vary.  Pre-lowercase once.
-    std::string lname;
-    lname.reserve(material_name.size());
-    for (char c : material_name) lname.push_back(static_cast<char>(std::tolower(c)));
-    auto has = [&](const char* needle) {
-        return lname.find(needle) != std::string::npos;
-    };
-
-    // ── Stage 1: unambiguous material-name tags ──────────────────────
-    // Door variants come FIRST -- "Bistro_Main_Door" also contains
-    // nothing else, but glass/window/floor checks below would never
-    // accidentally match "door".  Doormat is special-cased to Floor
-    // because the substring "door" appears inside it but it's clearly
-    // a walkable surface.
-    if (has("doormat"))                     return MeshCategory::Floor;
-    if (has("door") || has("gate") ||
-        has("rollup"))                      return MeshCategory::Door;
-    if (has("glass") || has("window") ||
-        has("frosted"))                     return MeshCategory::Glass;
-    // Explicit floor/road tags before the geometric fallback so a
-    // hexagonal floor-tile primitive with mixed normals (chamfered
-    // edges drag the vote toward Wall) still classifies as Floor.
-    if (has("floor") || has("road") ||
-        has("street") || has("sidewalk") ||
-        has("pavement"))                    return MeshCategory::Floor;
-    if (has("stair") || has("step"))        return MeshCategory::Stairs;
-    if (has("elevator") || has("lift"))     return MeshCategory::Elevator;
-    if (has("ladder") || has("rung"))       return MeshCategory::Ladder;
-    if (has("ceiling"))                     return MeshCategory::Ceiling;
-    // Vegetation: foliage in the broad sense — anything plant-derived.
-    // The list looks long but each entry is a substring that's rare in
-    // non-vegetation material names (deliberately omitting "wood", which
-    // collides with planks/furniture; cut-lumber stays OBJECT).
-    // Bistro's tree-bark materials surface as "MASTER_Bark_Linde" /
-    // "Bistro_Research_Exterior_Linde_Tree_Large", so "bark", "linde",
-    // and "branch" all carry their weight.  Atlas-billboard cards
-    // ("Foliage_Atlas", "LeafCard") get caught by "foliage" / "leaf".
-    if (has("ivy")       || has("foliage")  ||
-        has("leaf")      || has("leaves")   ||
-        has("plant")     || has("tree")     ||
-        has("vegetation")|| has("grass")    ||
-        has("linde")     || has("oak")      ||
-        has("maple")     || has("pine")     ||
-        has("palm")      || has("bark")     ||
-        has("branch")    || has("twig")     ||
-        has("hedge")     || has("bush")     ||
-        has("shrub")     || has("fern")     ||
-        has("moss")      || has("vine")     ||
-        has("flower")    || has("petal")    ||
-        has("sapling")   || has("lawn")     ||
-        has("turf")      || has("weed"))    return MeshCategory::Vegetation;
-    // Explicit wall / cladding materials.  Roofing is intentionally
-    // grouped with Wall (it blocks the same way from gameplay
-    // perspective and isn't a walkable surface).
-    if (has("wall") || has("plaster") ||
-        has("brick") || has("stucco") ||
-        has("trim_cornice") ||
-        has("roofing") || has("roof"))      return MeshCategory::Wall;
-
-    // ── Stage 2: face-normal majority vote ───────────────────────────
-    // Sum |normal_y| * area for every triangle, then compare against a
-    // total-area baseline.  We weight by area so a single big floor
-    // panel beats a hundred tiny detail triangles.  area-thresholds:
-    //   horizontal_ratio > 0.55    → Floor
-    //   vertical_ratio   > 0.55    → Wall
-    //   otherwise the geometry is mixed / leaning -- defer to size
-    //   below.
-    double area_total      = 0.0;
-    double area_horizontal = 0.0;  // |normal.y| > 0.7
-    double area_vertical   = 0.0;  // |normal.y| < 0.3
-    const size_t tri_count = indices.size() / 3;
-    for (size_t t = 0; t < tri_count; ++t) {
-        const int i0 = indices[3*t + 0];
-        const int i1 = indices[3*t + 1];
-        const int i2 = indices[3*t + 2];
-        if (i0 < 0 || i1 < 0 || i2 < 0) continue;
-        if ((size_t)i0 >= vertices.size() ||
-            (size_t)i1 >= vertices.size() ||
-            (size_t)i2 >= vertices.size()) continue;
-        const glm::vec3& v0 = vertices[i0];
-        const glm::vec3& v1 = vertices[i1];
-        const glm::vec3& v2 = vertices[i2];
-        const glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
-        const double area = 0.5 * glm::length(n);
-        if (area <= 0.0) continue;
-        const double ny_abs = std::abs(n.y) / (2.0 * area);
-        area_total += area;
-        if (ny_abs > 0.7) area_horizontal += area;
-        if (ny_abs < 0.3) area_vertical   += area;
-    }
-    if (area_total > 0.0) {
-        const double horiz_ratio = area_horizontal / area_total;
-        const double vert_ratio  = area_vertical   / area_total;
-        if (horiz_ratio > 0.55) return MeshCategory::Floor;
-        if (vert_ratio  > 0.55) return MeshCategory::Wall;
-    }
-
-    // ── Stage 3: bounding-box size ───────────────────────────────────
-    // Genuinely small primitives in all three axes are gameplay props
-    // (chair, bottle, lamp, plate).  Threshold 2 m matches the bistro
-    // scale -- furniture < 2m, walls / floors always exceed it on at
-    // least one axis.
-    const glm::vec3 ext = bounds.max_bounds - bounds.min_bounds;
-    if (ext.x < 2.0f && ext.y < 2.0f && ext.z < 2.0f) {
-        return MeshCategory::Object;
-    }
-
     return MeshCategory::Unknown;
 }
 
