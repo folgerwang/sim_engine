@@ -197,6 +197,25 @@ private:
     // negative-Y offset inside applyPose's setRootNodeTransform call and
     // lerped toward its target each frame to avoid popping.
     float  pelvis_drop_      = 0.0f;
+
+    // ── Flicker-suppression state (IK jitter fix) ────────────────────
+    // walk_weight_: smoothed 0..1 gait blend.  walking_ is now a
+    // hysteresis boolean (see update()); this eases the foot step/lift
+    // in and out so crossing the walk/idle threshold no longer SNAPS the
+    // foot targets — one of the main flicker sources.
+    float  walk_weight_      = 0.0f;
+    // Per-leg ground-probe cache + low-pass.  The collision floor is
+    // decimated/holey while the rendered floor is exact, so queryGroundAt
+    // can switch sources between frames and the hit Y pops up/down.  We
+    // smooth small steps and HOLD the last good hit when a probe briefly
+    // misses, instead of skipping the leg (which froze it for a frame
+    // then snapped it back — visible flicker).
+    struct FootGround {
+        bool      valid = false;
+        float     y     = 0.0f;
+        glm::vec3 nrm   = glm::vec3(0.0f, 1.0f, 0.0f);
+    };
+    FootGround foot_ground_[2];
     // Tuning (metres / unitless).  Conservative defaults so the primary
     // goal (feet on the ground) still reads well even if the gait is
     // slightly off; edit + recompile to tweak.

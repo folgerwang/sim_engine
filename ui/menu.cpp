@@ -952,9 +952,13 @@ bool Menu::draw(
     //      (5%)" etc.).
     // Drawn unconditionally except in the Idle state so the title
     // screen stays clean.
-    if (classifier_status_ == ClassifierStatus::Pending ||
-        classifier_status_ == ClassifierStatus::Ready   ||
-        classifier_status_ == ClassifierStatus::Failed) {
+    // Hide BOTH progress bars once the collision ("simplified mesh") build
+    // has finished — the user wants a clean screen at that point.  The
+    // collision bar below is gated to Building-only for the same reason.
+    if ((classifier_status_ == ClassifierStatus::Pending ||
+         classifier_status_ == ClassifierStatus::Ready   ||
+         classifier_status_ == ClassifierStatus::Failed) &&
+        collision_build_status_ != CollisionBuildStatus::Done) {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
         const float bar_h = 44.0f;  // two rows + padding
         // Half-width, horizontally centred on the viewport top edge
@@ -1046,8 +1050,9 @@ bool Menu::draw(
     // while the collision world builds incrementally.  Shown while
     // Building and after Done (full green, as confirmation); hidden in
     // Idle so the pre-classify phase stays clean.
-    if (collision_build_status_ == CollisionBuildStatus::Building ||
-        collision_build_status_ == CollisionBuildStatus::Done) {
+    // Only while actively building; once Done, hide it (and the classifier
+    // bar above) so both vanish the moment the simplified-mesh build ends.
+    if (collision_build_status_ == CollisionBuildStatus::Building) {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
         const float bar_h = 44.0f;
         const float bar_w = mvp->Size.x * 0.5f;

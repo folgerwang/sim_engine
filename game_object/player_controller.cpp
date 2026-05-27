@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <string>
 
 #include "glm/glm.hpp"
@@ -20,6 +21,19 @@ namespace engine {
 namespace game_object {
 
 namespace {
+
+// Finite-value guards.  A single NaN/Inf that reaches a bone rotation
+// propagates through the cached world matrices and is SELF-SUSTAINING
+// (the IK reads the NaN hip next frame and writes NaN again), which
+// collapses the legs to nothing.  These let the solver detect a bad
+// value and fall back to the bind pose so the rig climbs back out.
+inline bool isFiniteV3(const glm::vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+inline bool isFiniteQ(const glm::quat& q) {
+    return std::isfinite(q.x) && std::isfinite(q.y) &&
+           std::isfinite(q.z) && std::isfinite(q.w);
+}
 
 float wrapDeg(float a) {
     a = std::fmod(a + 180.0f, 360.0f);
@@ -156,12 +170,24 @@ void PlayerController::update(
     last_position_       = position_;
     last_position_valid_ = true;
 
-    // 0.05 m/s threshold filters out the sub-mm-per-frame jitter the
-    // pivot-compensation math produces while the camera is still.
-    // Anything above that (walking, running, glued-to-camera-pan)
-    // engages the walking animation.
-    constexpr float kWalkingSpeedThreshold = 0.05f;
-    walking_ = speed_mps > kWalkingSpeedThreshold;
+    // Hysteresis (was a single 0.05 m/s threshold).  A lone threshold
+    // compared against the camera-follow speed TOGGLES walking_ on/off
+    // frame-to-frame whenever the speed hovers near it (camera-pan
+    // jitter), which snapped the foot gait on and off every frame ->
+    // flicker.  Two thresholds (ON above 0.08, OFF below 0.03) give a
+    // dead band so the state stays put.
+    constexpr float kWalkOnSpeed  = 0.08f;
+    constexpr float kWalkOffSpeed = 0.03f;
+    if (walking_) { if (speed_mps < kWalkOffSpeed) walking_ = false; }
+    else          { if (speed_mps > kWalkOnSpeed)  walking_ = true;  }
+
+    // Smoothly ramp the gait blend toward the (now stable) walking_
+    // state so the foot step/lift ease in and out instead of snapping.
+    const float walk_target = walking_ ? 1.0f : 0.0f;
+    constexpr float kWalkBlendRate = 8.0f;  // per second
+    walk_weight_ +=
+        (walk_target - walk_weight_) *
+        std::min(1.0f, kWalkBlendRate * std::max(delta_t, 0.0f));
 
     // ── Phase advance ───────────────────────────────────────────────
     // idle_phase_: slow constant rate.  ~1 rad/s gives a 6.28 s
@@ -253,6 +279,12 @@ void PlayerController::applyPose(
     // reach its ground target pulls the whole body down instead of
     // leaving the leg dangling.  0 in normal terrain.
     glm::vec3 root_pos = position_;
+    // Guard: a NaN pelvis_drop_ (from a degenerate IK frame) would poison
+    // the root translation and NaN-propagate down the WHOLE skeleton --
+    // the legs are parented to the root, so they vanish.  Clamp it back to
+    // 0 if it ever goes non-finite so the root stays valid and the rig can
+    // recover the next frame.
+    if (!std::isfinite(pelvis_drop_)) pelvis_drop_ = 0.0f;
     root_pos.y -= pelvis_drop_;
     player->setRootNodeTransform(root_pos, root_rot);
 
@@ -365,9 +397,32 @@ void PlayerController::applyPose(
 
 bool PlayerController::applyFootIk(
     const std::shared_ptr<DrawableObject>& player) {
-    if (!foot_ik_enabled_ || !ground_query_) return false;
-    if (player->findNodeIndexByName("left_upper_leg")  < 0 &&
-        player->findNodeIndexByName("right_upper_leg") < 0) {
+    // ── Why-am-I-bailing diagnostic ──────────────────────────────────
+    // [foot_ik] never printed, so the function is returning before the
+    // solve.  Log (throttled ~once/2s) exactly which exit fires so we
+    // can see whether it's the master toggle, missing leg bones / wrong
+    // bone names, or a bind capture that never validates.  Remove once
+    // the IK path is confirmed live.
+    static unsigned s_why = 0;
+    const bool why = ((s_why++ % 120u) == 0u);
+    if (!foot_ik_enabled_) {
+        if (why) std::cout << "[foot_ik.why] bail: foot_ik_enabled_=false"
+                           << std::endl;
+        return false;
+    }
+    if (!ground_query_) {
+        if (why) std::cout << "[foot_ik.why] bail: no ground_query_ set"
+                           << std::endl;
+        return false;
+    }
+    const int li_dbg = player->findNodeIndexByName("left_upper_leg");
+    const int ri_dbg = player->findNodeIndexByName("right_upper_leg");
+    if (li_dbg < 0 && ri_dbg < 0) {
+        if (why) std::cout << "[foot_ik.why] bail: no leg bones "
+                              "(left_upper_leg idx=" << li_dbg
+                           << " right_upper_leg idx=" << ri_dbg
+                           << ") -- bone names don't match the rig"
+                           << std::endl;
         return false;
     }
 
@@ -377,7 +432,15 @@ bool PlayerController::applyFootIk(
     if (!leg_bind_captured_) {
         captureLegBind(player);
         if (leg_bind_[0].valid || leg_bind_[1].valid) leg_bind_captured_ = true;
-        else return false;
+        else {
+            if (why) std::cout << "[foot_ik.why] bail: bind capture not "
+                                  "ready (L0valid=" << leg_bind_[0].valid
+                               << " L1valid=" << leg_bind_[1].valid
+                               << ") -- knee/foot bone names or world "
+                                  "matrices not populated"
+                               << std::endl;
+            return false;
+        }
     }
 
     // Direction of travel (world XZ) for the walking step offsets.
@@ -408,21 +471,42 @@ bool PlayerController::applyFootIk(
 
         // Gait: while walking the foot steps along travel + lifts mid-swing;
         // standing keeps both feet grounded.  Left/right 180 deg out of phase.
+        // Gait scaled by the smoothed walk_weight_ so the foot eases into
+        // and out of stepping instead of snapping when walking_ flips.
         float step = 0.0f, lift = 0.0f;
-        if (walking_) {
-            step = -std::cos(L.phase) * foot_stride_amp_;
+        if (walk_weight_ > 1e-3f) {
+            step = -std::cos(L.phase) * foot_stride_amp_ * walk_weight_;
             const float sn = std::sin(L.phase);
-            lift = (sn > 0.0f ? sn : 0.0f) * foot_lift_amp_;
+            lift = (sn > 0.0f ? sn : 0.0f) * foot_lift_amp_ * walk_weight_;
         }
         // Foot rests under its own hip, displaced along travel by the step.
         const float gx = hip_w.x + fwd.x * step;
         const float gz = hip_w.z + fwd.z * step;
 
+        // Probe ~0.9 m below the hip so an upper storey above is ignored.
         float gy = hip_w.y;
         glm::vec3 gn(0.0f, 1.0f, 0.0f);
-        // Probe ~0.9 m below the hip so an upper storey above is ignored.
-        if (!ground_query_(gx, gz, hip_w.y - 0.9f, gy, gn)) continue;
-        if (glm::length(gn) < 0.1f) gn = up;
+        FootGround& fg = foot_ground_[L.idx];
+        if (ground_query_(gx, gz, hip_w.y - 0.9f, gy, gn)) {
+            if (glm::length(gn) < 0.1f) gn = up;
+            // Low-pass small ground changes to kill the per-frame Y pop
+            // when the probe switches between the decimated collision
+            // floor and the exact rendered floor; SNAP through big steps
+            // (>0.25 m) so real curbs / stairs stay crisp.
+            if (fg.valid && std::fabs(gy - fg.y) < 0.25f) {
+                constexpr float kGroundLerp = 0.35f;
+                gy = fg.y + (gy - fg.y) * kGroundLerp;
+                gn = glm::normalize(glm::mix(fg.nrm, gn, kGroundLerp));
+            }
+            fg.valid = true; fg.y = gy; fg.nrm = gn;
+        } else if (fg.valid) {
+            // Probe missed this frame (off-mesh / triangle budget hit):
+            // HOLD the last good hit rather than `continue`, which left
+            // the leg unposed for a frame and then snapped it back.
+            gy = fg.y; gn = fg.nrm;
+        } else {
+            continue;  // never had a hit yet — can't place this foot
+        }
 
         // Anti-collapse guard: a bad ground probe (furniture, a mis-classified
         // surface) must never put the target up near the hip and fold the leg
@@ -454,27 +538,41 @@ bool PlayerController::applyFootIk(
     // Pelvis drop: when a foot couldn't reach its ground target the body sits
     // too high -> lower the root (next frame) by the worst deficit, smoothed
     // and clamped.  ~0 in normal terrain now that the solve is exact.
+    if (!std::isfinite(worst_deficit)) worst_deficit = 0.0f;
     const float target_drop =
         glm::clamp(worst_deficit, 0.0f, pelvis_drop_max_);
     pelvis_drop_ += (target_drop - pelvis_drop_) * 0.2f;
-    if (pelvis_drop_ < 1e-4f) pelvis_drop_ = 0.0f;
+    if (!std::isfinite(pelvis_drop_) || pelvis_drop_ < 1e-4f)
+        pelvis_drop_ = 0.0f;
 
     // Once/sec ground-truth dump (left leg).  If target.y ~= hip.y the ground
     // probe is feeding a near-hip surface (guard then clamps it); otherwise
     // the foot should sit right on target.y.
     if (dbg_have) {
+        // std::cout (not printf) so the line lands in the captured engine
+        // stdout log alongside the [collision.*] diagnostics; L1/L2 here
+        // are the decisive numbers for the separate leg-length question.
         static unsigned s_ik_log = 0;
         if ((s_ik_log++ % 60u) == 0u) {
-            std::printf(
-                "[foot_ik] hip=(%.2f,%.2f,%.2f) foot=(%.2f,%.2f,%.2f) "
-                "gy=%.2f target=(%.2f,%.2f,%.2f) L1=%.3f L2=%.3f "
-                "def=%.3f drop=%.3f walk=%d\n",
-                dbg_hip.x, dbg_hip.y, dbg_hip.z,
-                dbg_foot.x, dbg_foot.y, dbg_foot.z, dbg_gy,
-                dbg_target.x, dbg_target.y, dbg_target.z,
-                leg_bind_[0].L1, leg_bind_[0].L2, dbg_def, pelvis_drop_,
-                walking_ ? 1 : 0);
+            std::cout << "[foot_ik] hip=(" << dbg_hip.x << "," << dbg_hip.y
+                      << "," << dbg_hip.z << ") foot=(" << dbg_foot.x << ","
+                      << dbg_foot.y << "," << dbg_foot.z << ") gy=" << dbg_gy
+                      << " target=(" << dbg_target.x << "," << dbg_target.y
+                      << "," << dbg_target.z << ") L1=" << leg_bind_[0].L1
+                      << " L2=" << leg_bind_[0].L2
+                      << " reach=" << (leg_bind_[0].L1 + leg_bind_[0].L2)
+                      << " def=" << dbg_def << " drop=" << pelvis_drop_
+                      << " ww=" << walk_weight_
+                      << " walk=" << (walking_ ? 1 : 0) << std::endl;
         }
+    } else if (why) {
+        // Reached the solve loop but the LEFT leg (idx 0) never solved, so
+        // the [foot_ik] line above can't print.  Surface why: either the
+        // left bind is invalid, or every ground probe under it failed with
+        // no cached hit yet.
+        std::cout << "[foot_ik.why] ran loop but left leg not solved (any="
+                  << any << " L0valid=" << leg_bind_[0].valid
+                  << " L1valid=" << leg_bind_[1].valid << ")" << std::endl;
     }
     return any;
 }
@@ -542,6 +640,17 @@ void PlayerController::solveLegIk(
     const glm::mat4 H = player->getNodeWorldMatrixByName(hip_name);
     const glm::vec3 a(H[3]);
     const glm::quat RhipW       = matRotation(H);
+    // NaN recovery: if the hip world is non-finite, a NaN has already
+    // propagated into the rig (e.g. a bad pelvis drop upstream).  Reset
+    // this leg's bones to their VALID bind rotations and bail -- writing
+    // garbage here is what keeps the rig stuck with collapsed/invisible
+    // legs.  Once the root recovers next frame the chain is finite again.
+    if (!isFiniteV3(a) || !isFiniteQ(RhipW)) {
+        player->setNodeRotationByName(hip_name,  B.qh0);
+        player->setNodeRotationByName(knee_name, B.qk0);
+        player->setNodeRotationByName(foot_name, B.qf0);
+        return;
+    }
     const glm::quat qh_cur      = player->getNodeRotationByName(hip_name);
     const glm::quat RhipParentW = RhipW * glm::inverse(qh_cur);
 
@@ -585,15 +694,23 @@ void PlayerController::solveLegIk(
     const glm::quat RhipW_bind = RhipParentW * B.qh0;
     const glm::vec3 u_bind_now = RhipW_bind * B.ahx;
     const glm::quat RhipW_new  = fromTo(u_bind_now, u1) * RhipW_bind;
-    player->setNodeRotationByName(
-        hip_name, glm::normalize(glm::inverse(RhipParentW) * RhipW_new));
+    {
+        const glm::quat hipLocal =
+            glm::normalize(glm::inverse(RhipParentW) * RhipW_new);
+        player->setNodeRotationByName(
+            hip_name, isFiniteQ(hipLocal) ? hipLocal : B.qh0);
+    }
 
     // Knee: swing the bind lower-leg direction onto v1 under the NEW hip.
     const glm::quat RkneeW_bind = RhipW_new * B.qk0;
     const glm::vec3 v_bind_now  = RkneeW_bind * B.akx;
     const glm::quat RkneeW_new  = fromTo(v_bind_now, v1) * RkneeW_bind;
-    player->setNodeRotationByName(
-        knee_name, glm::normalize(glm::inverse(RhipW_new) * RkneeW_new));
+    {
+        const glm::quat kneeLocal =
+            glm::normalize(glm::inverse(RhipW_new) * RkneeW_new);
+        player->setNodeRotationByName(
+            knee_name, isFiniteQ(kneeLocal) ? kneeLocal : B.qk0);
+    }
 
     // Foot: bind orientation under the new knee, then tilt toward the ground
     // normal (self-correcting, clamped).  Uses the freshly computed knee
@@ -607,8 +724,12 @@ void PlayerController::solveLegIk(
             if (ang > 1e-4f) RfootW = glm::angleAxis(ang, ax) * RfootW;
         }
     }
-    player->setNodeRotationByName(
-        foot_name, glm::normalize(glm::inverse(RkneeW_new) * RfootW));
+    {
+        const glm::quat footLocal =
+            glm::normalize(glm::inverse(RkneeW_new) * RfootW);
+        player->setNodeRotationByName(
+            foot_name, isFiniteQ(footLocal) ? footLocal : B.qf0);
+    }
 }
 
 } // namespace game_object
