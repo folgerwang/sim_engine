@@ -83,7 +83,19 @@ public:
 
     // Patch the input_features bitfield in the GPU camera buffer without
     // triggering a full camera recompute.  Call after updateViewCameraInfo.
+    // NOTE: this re-uploads the WHOLE ViewCameraInfo struct, so it also
+    // flushes any debug_isolate_material set via setDebugIsolateMaterial()
+    // beforehand -- set that first, then call this.
     void setInputFeatureFlags(uint32_t flags);
+
+    // Stage the target cluster material_idx consumed by the
+    // FEATURE_INPUT_ISOLATE_MESH path (collision isolate-debug background).
+    // Stores into m_camera_info_ only; the value reaches the GPU on the
+    // next setInputFeatureFlags() re-upload, so call this BEFORE setting
+    // the flags each frame.
+    void setDebugIsolateMaterial(uint32_t material_idx) {
+        m_camera_info_.debug_isolate_material = material_idx;
+    }
 
     const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;

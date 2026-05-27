@@ -77,7 +77,16 @@ extern void decimateMesh(
     Mesh& output_mesh,
     std::vector<int32_t>& output_face_part_ids,
     size_t target_face_count,
-    std::ostream& log);
+    std::ostream& log,
+    // When true, NO edge incident to a locked vertex (mesh boundary /
+    // inter-part seam / sharp feature / UV seam) may collapse -- not even
+    // an interior->boundary collapse.  This fully CONSERVES the outline:
+    // without it, collapsing an interior edge of a boundary triangle
+    // deletes that triangle and erodes the silhouette (boundary edges
+    // in > out).  Collision proxies pass true so the simplified floor
+    // keeps its exact edge; the drawable LOD path leaves it false
+    // (default) so boundaries can still simplify.
+    bool seal_locked_edges = false);
 
 } // game_object
 } // engine

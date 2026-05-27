@@ -96,6 +96,12 @@ public:
         m_view_camera_->setInputFeatureFlags(flags);
     }
 
+    // Stage the FEATURE_INPUT_ISOLATE_MESH target material_idx.  Call
+    // BEFORE setInputFeatureFlags (which re-uploads the camera struct).
+    void setDebugIsolateMaterial(uint32_t material_idx) {
+        m_view_camera_->setDebugIsolateMaterial(material_idx);
+    }
+
 
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);

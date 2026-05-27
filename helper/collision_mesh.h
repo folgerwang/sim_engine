@@ -187,6 +187,19 @@ public:
     // ("Stairs", "Linde_Tree", "Elevator_Shaft").
     const std::string& objectName() const { return object_name_; }
 
+    // ── Source primitive identity (debug / comparison) ──────────────
+    // The (drawable, mesh, primitive) this CollisionMesh was built from,
+    // captured by buildFromDrawablePrimitive.  Lets debug tooling re-
+    // extract the ORIGINAL, un-simplified source geometry for a given
+    // collision-world index (e.g. the isolate overlay draws the original
+    // background mesh next to the simplified one).  sourceDrawable() is
+    // null for the aggregate build paths that don't track a single prim.
+    const game_object::DrawableObject* sourceDrawable() const {
+        return src_drawable_;
+    }
+    size_t sourceMeshIdx() const { return src_mesh_idx_; }
+    size_t sourcePrimIdx() const { return src_prim_idx_; }
+
     // Semantic category — Floor / Wall / Door / Object / Glass /
     // Ceiling / Stairs / Vegetation / Elevator / Ladder / Unknown.
     // Set automatically at the end of buildFromDrawablePrimitive by
@@ -272,6 +285,13 @@ public:
 
     bool empty() const { return indices_.empty(); }
     size_t triangleCount() const { return indices_.size() / 3; }
+
+    // Triangle count of the ORIGINAL source primitive this collision mesh
+    // was built from, captured pre-weld/pre-decimate by
+    // buildFromDrawablePrimitive.  Lets debug tooling report the
+    // simplification ratio (simplified triangleCount() vs this).  Zero on
+    // the aggregate build paths that don't track a single source primitive.
+    size_t originalTriangleCount() const { return orig_tri_count_; }
     const AABB& bounds() const { return bounds_; }
 
     // Read-only access to the flat (vertex, index) arrays so
@@ -309,6 +329,19 @@ private:
     // referencing this mesh.  Same population path as the world
     // transform — set by buildFromDrawablePrimitive only.
     std::string                 object_name_;
+
+    // Source (drawable, mesh, primitive) this mesh was built from --
+    // see sourceDrawable()/sourceMeshIdx()/sourcePrimIdx().  Raw pointer:
+    // the scene DrawableObjects outlive the collision world (which is
+    // rebuilt whenever the scenes change), so this never dangles in
+    // practice; it is used only by debug draw on the main thread.
+    const game_object::DrawableObject* src_drawable_ = nullptr;
+    size_t                      src_mesh_idx_ = 0;
+    size_t                      src_prim_idx_ = 0;
+
+    // Original (pre-weld / pre-decimate) triangle count of the source
+    // primitive -- see originalTriangleCount().
+    size_t                      orig_tri_count_ = 0;
 
     // Semantic classification — see MeshCategory above.  Default
     // Unknown until buildFromDrawablePrimitive resolves it.

@@ -186,6 +186,18 @@
 // background matches the floor-only collision-LOD overlay.
 #define FEATURE_INPUT_FLOOR_ONLY                0x00000004
 
+// Debug-only: collision-mesh ISOLATE background.  When set,
+// cluster_bindless.frag discards every fragment whose cluster
+// material_idx != camera_info.debug_isolate_material, so the textured
+// background shows ONLY the single source primitive that the isolated
+// collision mesh (Left/Right-arrow index) was built from -- every other
+// mesh is skipped.  Each source primitive owns a globally-unique
+// material_idx (ClusterRenderer allocates one staging_material_params_
+// entry per (mesh,prim)), so matching material_idx alone pins the exact
+// primitive.  Takes precedence over FEATURE_INPUT_FLOOR_ONLY; the CPU
+// sets one or the other, never both.
+#define FEATURE_INPUT_ISOLATE_MESH              0x00000008
+
 // Debug render mode is packed into bits 16..23 of camera_info.input_features
 // (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack
 // it as `(input_features >> SHIFT) & 0xFF` and override outColor when the
@@ -1159,6 +1171,13 @@ struct ViewCameraInfo {
     vec2            mouse_pos;
     float           camera_follow_dist;
     uint            input_features;   // FEATURE_INPUT_* flags set per-frame by CPU
+    // Target cluster material_idx for FEATURE_INPUT_ISOLATE_MESH.  Only
+    // read when that flag is set; cluster_bindless.frag discards any
+    // fragment whose material_idx differs, leaving just the isolated
+    // collision mesh's source primitive in the textured background.
+    // Trailing scalar in an std430 buffer (4-byte aligned, packs right
+    // after input_features) so the C++/GLSL layouts stay in lockstep.
+    uint            debug_isolate_material;
 };
 
 struct RuntimeLightsParams {

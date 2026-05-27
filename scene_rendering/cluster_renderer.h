@@ -149,6 +149,15 @@ private:
     std::vector<uint32_t>         cluster_to_mesh_;    // global cluster idx → mesh idx
     std::vector<bool>             mesh_visible_;        // per-mesh visibility (prev frame)
 
+    // Per-mesh (prim_idx → global material_idx) map, indexed by the
+    // mesh's global object id (the uploaded_mesh_count_ value at upload
+    // time, == ClusterDrawInfo::object_idx).  Populated at the end of
+    // uploadMeshClusters from its local prim_to_mat_idx cache.  Used by
+    // materialIdxForPrimitive() so the collision isolate-debug overlay can
+    // resolve an isolated source primitive to the cluster material_idx its
+    // fragments carry.
+    std::vector<std::unordered_map<uint32_t, uint32_t>> mesh_prim_material_;
+
     // ── Merged GPU buffers (created by finalizeUploads) ──
     renderer::BufferInfo cull_info_buffer_;       // ClusterCullInfo[]
     renderer::BufferInfo draw_info_buffer_;       // ClusterDrawInfo[]
@@ -875,6 +884,22 @@ public:
                                  float(total_clusters_all_meshes_));
     }
     uint32_t getMeshCount() const { return uploaded_mesh_count_; }
+
+    // Resolve a source primitive (global mesh object id + primitive index
+    // within that mesh) to the global cluster material_idx its fragments
+    // carry.  global_mesh_idx is MeshInfo::cluster_global_mesh_idx_ (the
+    // object_idx baked into ClusterDrawInfo); prim_idx is the FBX-mesh
+    // primitive index.  Returns -1 when the mesh produced no clusters for
+    // that primitive (released geometry, out-of-range, or never uploaded).
+    // Used by the collision isolate-debug overlay to restrict the textured
+    // background to a single primitive (FEATURE_INPUT_ISOLATE_MESH).
+    int materialIdxForPrimitive(
+        uint32_t global_mesh_idx, uint32_t prim_idx) const {
+        if (global_mesh_idx >= mesh_prim_material_.size()) return -1;
+        const auto& m = mesh_prim_material_[global_mesh_idx];
+        auto it = m.find(prim_idx);
+        return (it != m.end()) ? static_cast<int>(it->second) : -1;
+    }
 
     // Per-mesh visibility from previous frame's cluster cull readback.
     // Returns true (visible) for unknown mesh indices as a safe default.

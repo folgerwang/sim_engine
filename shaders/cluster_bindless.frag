@@ -349,6 +349,19 @@ void main() {
         if (floor_only_cat != 1u) discard;
     }
 
+    // Collision isolate-debug background: when FEATURE_INPUT_ISOLATE_MESH
+    // is set the CPU has resolved the isolated collision mesh's source
+    // primitive to its globally-unique cluster material_idx
+    // (camera_info.debug_isolate_material).  Keep ONLY that primitive's
+    // fragments so the textured background follows the Left/Right-arrow
+    // isolate index; every other mesh is discarded.  Same pre-guard
+    // placement as the floor-only test so it applies to all four pipeline
+    // variants (opaque / G-buffer / OIT / alpha-blend).  The CPU sets
+    // ISOLATE or FLOOR_ONLY, never both.
+    if ((camera_info.input_features & FEATURE_INPUT_ISOLATE_MESH) != 0u) {
+        if (mat_idx != camera_info.debug_isolate_material) discard;
+    }
+
 #if defined(OIT_OUTPUT) || defined(ALPHA_BLEND_OUTPUT)
     // Translucent pipelines (WBOIT or forward alpha-blend): only
     // AlphaMode::Blend materials should ever reach this draw — the cull

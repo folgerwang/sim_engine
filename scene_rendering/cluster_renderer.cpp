@@ -889,6 +889,20 @@ void ClusterRenderer::uploadMeshClusters(
         num_clusters
     });
 
+    // Stash this mesh's prim_idx → global material_idx map, keyed by the
+    // mesh's global object id (== uploaded_mesh_count_ for this upload,
+    // since the counter is bumped just below and matches the object_idx
+    // baked into every ClusterDrawInfo above).  Lets the collision
+    // isolate-debug overlay (application.cpp) translate an isolated
+    // collision mesh's (drawable, mesh, prim) into the cluster
+    // material_idx its fragments carry, so the textured background can be
+    // restricted to that exact source primitive.  prim_to_mat_idx already
+    // holds exactly the (prim → material) entries that produced clusters
+    // for this mesh.
+    if (mesh_prim_material_.size() <= uploaded_mesh_count_)
+        mesh_prim_material_.resize(uploaded_mesh_count_ + 1);
+    mesh_prim_material_[uploaded_mesh_count_] = prim_to_mat_idx;
+
     ++uploaded_mesh_count_;
 }
 

@@ -712,6 +712,18 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         material_name_ = data.materials_[prim.material_idx_].name_;
     }
 
+    // Remember the source (drawable, mesh, primitive) so debug tooling
+    // (the isolate overlay) can re-extract this collision index's ORIGINAL
+    // un-simplified geometry on demand and draw it for comparison.
+    src_drawable_ = &drawable;
+    src_mesh_idx_ = mesh_idx;
+    src_prim_idx_ = prim_idx;
+    // Original (un-simplified) triangle count of this source primitive,
+    // captured BEFORE the weld + decimate below so debug tooling can show
+    // the simplification ratio.  src_indices is the raw primitive index
+    // buffer, already validated as a non-zero multiple of 3 above.
+    orig_tri_count_ = src_indices.size() / 3;
+
     // First node referencing this mesh wins -- bakes parent
     // hierarchy into vertices_ so the per-draw model transform
     // stays identity.
@@ -1073,7 +1085,11 @@ bool CollisionMesh::buildFromDrawablePrimitive(
         const size_t target = std::max<size_t>(
             4, static_cast<size_t>(face_count * c_target_lod_ratio));
         std::ostringstream silent;
-        decimateMesh(src, part_ids, dst, dst_part_ids, target, silent);
+        // seal_locked_edges=true: conserve the floor primitive's exact
+        // outline -- QEM may simplify the flat interior but must not erode
+        // the silhouette / shared seam (no interior->boundary collapses).
+        decimateMesh(src, part_ids, dst, dst_part_ids, target, silent,
+                     /*seal_locked_edges=*/true);
         if (dst.isValid() && dst.getFaceCount() >= 1 &&
             !dst.vertex_data_ptr->empty()) {
             packed_positions.clear();

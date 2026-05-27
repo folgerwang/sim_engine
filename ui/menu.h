@@ -298,6 +298,11 @@ private:
     size_t      collision_mesh_count_      = 0;
     std::string collision_isolate_info_;
 
+    // Name of the scene object currently under the mouse cursor (set each
+    // frame by the application's ray-pick; empty = nothing hovered).  Drawn
+    // as a small tooltip at the mouse position in draw().
+    std::string hover_object_name_;
+
     // ---- Time-of-day -------------------------------------------------------
     // Hours in [0, 24) in the player's **local timezone**.  Initialised
     // at startup from localtime_s / localtime_r so the sun position and
@@ -662,6 +667,11 @@ public:
     }
     inline void setCollisionIsolateInfo(const std::string& s) {
         collision_isolate_info_ = s;
+    }
+    // Name of the object under the mouse cursor (ray-picked by the
+    // application).  Pass "" to clear.  Rendered at the cursor in draw().
+    inline void setHoverObjectName(const std::string& s) {
+        hover_object_name_ = s;
     }
     // Step the isolated mesh index by `delta` (Left/Right arrow hotkeys).
     // Auto-enables isolate mode so the keys work even when the menu /

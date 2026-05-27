@@ -719,6 +719,28 @@ bool Menu::draw(
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
+    // ── Hover-object tooltip ──────────────────────────────────────────
+    // application.cpp ray-picks the scene object under the mouse each
+    // frame and pushes its name via setHoverObjectName().  Draw it in a
+    // small box pinned to the cursor.  Skipped while the pointer is over a
+    // menu window (WantCaptureMouse) so it doesn't fight the UI, and when
+    // the name is empty (pointing at sky / nothing).
+    if (!hover_object_name_.empty() &&
+        !ImGui::GetIO().WantCaptureMouse) {
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        const ImVec2 mp = ImGui::GetMousePos();
+        const ImVec2 ts = ImGui::CalcTextSize(hover_object_name_.c_str());
+        const ImVec2 pad(6.0f, 4.0f);
+        // Offset down-right of the cursor so the pointer tip stays visible.
+        const ImVec2 org(mp.x + 16.0f, mp.y + 10.0f);
+        fg->AddRectFilled(
+            ImVec2(org.x - pad.x, org.y - pad.y),
+            ImVec2(org.x + ts.x + pad.x, org.y + ts.y + pad.y),
+            IM_COL32(0, 0, 0, 190), 4.0f);
+        fg->AddText(org, IM_COL32(255, 235, 120, 255),
+                    hover_object_name_.c_str());
+    }
+
     // ── Player debug overlay ──────────────────────────────────────────
     // Always-on locator widget — paints a red square at the player's
     // projected screen position plus a HUD readout of the world coords

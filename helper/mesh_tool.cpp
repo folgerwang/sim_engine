@@ -333,7 +333,8 @@ void decimateMesh(
     Mesh& output_mesh,
     std::vector<int32_t>& output_face_part_ids,
     size_t target_face_count,
-    std::ostream& log)
+    std::ostream& log,
+    bool seal_locked_edges)
 {
     const auto& in_verts = *input_mesh.vertex_data_ptr;
     const auto& in_faces = *input_mesh.faces_ptr;
@@ -470,7 +471,12 @@ void decimateMesh(
             if (!seen.insert(key).second) continue;
             verts[a].adj_verts.push_back(b);
             verts[b].adj_verts.push_back(a);
-            if (verts[a].locked && verts[b].locked) continue; // skip fully-locked
+            // seal_locked_edges: skip ANY edge touching a locked vertex
+            // (boundary / seam / sharp) so the outline can never erode;
+            // otherwise only skip when BOTH ends are locked.
+            if (seal_locked_edges ? (verts[a].locked || verts[b].locked)
+                                  : (verts[a].locked && verts[b].locked))
+                continue;
             edge_ver[key] = 0;
             pq.push(computeCollapse(verts, std::min(a,b), std::max(a,b), edge_ver));
         }
@@ -489,7 +495,9 @@ void decimateMesh(
             if (it == edge_ver.end() || it->second != entry.version) continue;
         }
         if (verts[v0].deleted || verts[v1].deleted)   continue;
-        if (verts[v0].locked  && verts[v1].locked)    continue;
+        if (seal_locked_edges ? (verts[v0].locked || verts[v1].locked)
+                              : (verts[v0].locked && verts[v1].locked))
+            continue;
 
         // Snap to locked endpoint if needed
         glm::dvec3 new_pos = entry.new_pos;
@@ -623,7 +631,9 @@ void decimateMesh(
         // Recompute all edges incident to v0
         for (int vn : verts[v0].adj_verts) {
             if (verts[vn].deleted || vn == v0) continue;
-            if (verts[v0].locked && verts[vn].locked) continue;
+            if (seal_locked_edges ? (verts[v0].locked || verts[vn].locked)
+                                  : (verts[v0].locked && verts[vn].locked))
+                continue;
             uint64_t key = edgeKey(v0,vn);
             ++edge_ver[key];
             pq.push(computeCollapse(verts, std::min(v0,vn), std::max(v0,vn), edge_ver));
