@@ -141,15 +141,12 @@ void PlayerController::update(
     //     previous frame's position_ (set by the external follow
     //     block), so any caller — keyboard, AI pathing, camera-glue —
     //     that moves us will produce a matching limb swing.
-    //   • walking_ is latched on when the speed exceeds a small
-    //     threshold (0.05 m/s) and off otherwise.  applyPose() reads
-    //     it to gate the arm / leg / knee swing amplitudes; idle sway
-    //     plays in both cases.
-    // The other params (window / camera_yaw / obstacles / world)
-    // remain unused while the controller stays in this "external
-    // motion source" mode — they're kept on the signature for the
-    // future WASD-self-driven version.
-    (void)window;
+    //   • walking_ is driven by the WASD move keys (read from `window`
+    //     below).  applyPose() / the foot IK read it (via walk_weight_)
+    //     to gate the arm / leg / knee swing AND the stepping gait; idle
+    //     sway plays in both cases.
+    // camera_yaw / obstacles / world remain unused for now (the app owns
+    // translation); `window` IS read below for the WASD walk intent.
     (void)camera_yaw_deg;
     (void)obstacles;
     (void)world;
@@ -170,16 +167,25 @@ void PlayerController::update(
     last_position_       = position_;
     last_position_valid_ = true;
 
-    // Hysteresis (was a single 0.05 m/s threshold).  A lone threshold
-    // compared against the camera-follow speed TOGGLES walking_ on/off
-    // frame-to-frame whenever the speed hovers near it (camera-pan
-    // jitter), which snapped the foot gait on and off every frame ->
-    // flicker.  Two thresholds (ON above 0.08, OFF below 0.03) give a
-    // dead band so the state stays put.
-    constexpr float kWalkOnSpeed  = 0.08f;
-    constexpr float kWalkOffSpeed = 0.03f;
-    if (walking_) { if (speed_mps < kWalkOffSpeed) walking_ = false; }
-    else          { if (speed_mps > kWalkOnSpeed)  walking_ = true;  }
+    // ── WASD drives the walk ──────────────────────────────────────────
+    // Read the movement keys directly instead of inferring "walking" from
+    // the position delta.  The camera owns translation (the app's follow
+    // block places the body relative to the camera), but inferring the gait
+    // from motion meant MOUSE-LOOK — which orbits the body and produces a
+    // position delta — falsely triggered the walk and snapped the feet.
+    // Gating on the actual move keys means only WASD engages the walk that
+    // drives the lower-body foot IK; gait_fwd_xz_ (above) still supplies the
+    // real travel direction for foot-step placement.  walk_weight_ below
+    // still ramps the gait in/out so press/release eases rather than snaps.
+    bool wasd_held = false;
+    if (window) {
+        wasd_held =
+            glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS ||
+            glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS ||
+            glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS ||
+            glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
+    }
+    walking_ = wasd_held;
 
     // Smoothly ramp the gait blend toward the (now stable) walking_
     // state so the foot step/lift ease in and out instead of snapping.
@@ -208,8 +214,12 @@ void PlayerController::update(
     if (walking_) {
         constexpr float kSwingRadPerMps = 4.5f / 1.4f; // ≈3.21 rad/s per m/s
         constexpr float kMaxSwingRad    = 12.0f;       // ~2 cycles/sec ceiling
-        float swing_rate =
-            std::min(speed_mps * kSwingRadPerMps, kMaxSwingRad);
+        constexpr float kMinWalkRad     = 3.5f;        // floor cadence so the
+                                                       // feet still step when
+                                                       // WASD translation is
+                                                       // small or blocked
+        const float swing_rate = glm::clamp(
+            speed_mps * kSwingRadPerMps, kMinWalkRad, kMaxSwingRad);
         anim_phase_ += swing_rate * delta_t;
         if (anim_phase_ > 6.28318530718f) {
             anim_phase_ -= 6.28318530718f;
@@ -659,9 +669,22 @@ void PlayerController::solveLegIk(
     if (dist < 1e-5f) return;                       // target on the hip
     const glm::vec3 dir = d3 / dist;
 
+    // ── Joint angle-constraint limits (anatomical; tweak as needed) ──────
+    constexpr float kKneeMaxFlexDeg = 150.0f; // max bend at the knee
+    constexpr float kHipMaxConeDeg  = 95.0f;  // thigh swing from rest dir
+    constexpr float kFootMaxTiltDeg = 30.0f;  // ankle align-to-ground cap
+
+    // Reach clamp: never past full extension (no hyperextension), and never
+    // closer than the distance for MAX knee flexion (so the shin can't fold
+    // through the thigh).  Law of cosines at interior knee angle
+    // (180 - maxFlex): dist² = L1² + L2² - 2·L1·L2·cos(interior).
     const float eps = 0.002f;
-    const float hi = B.L1 + B.L2 - eps;
-    const float lo = std::fabs(B.L1 - B.L2) + eps;
+    const float hi  = B.L1 + B.L2 - eps;
+    const float interior_min = glm::radians(180.0f - kKneeMaxFlexDeg);
+    const float dmin_flex = std::sqrt(std::max(0.0f,
+        B.L1 * B.L1 + B.L2 * B.L2 -
+        2.0f * B.L1 * B.L2 * std::cos(interior_min)));
+    const float lo = std::max(std::fabs(B.L1 - B.L2) + eps, dmin_flex);
     if (dist > hi) { out_deficit = dist - hi; dist = hi; }
     else if (dist < lo) { dist = lo; }
 
@@ -681,8 +704,27 @@ void PlayerController::solveLegIk(
     }
     bendW = glm::normalize(bendW);
 
-    // Analytic knee + foot placement (exact, single pass).
-    const glm::vec3 u1    = glm::angleAxis(alpha, bendW) * dir;
+    // Analytic upper-leg direction (exact two-bone solution).
+    glm::vec3 u1 = glm::angleAxis(alpha, bendW) * dir;
+
+    // ── HIP CONE constraint ──────────────────────────────────────────────
+    // Clamp the thigh direction to within kHipMaxConeDeg of its rest (bind)
+    // direction so the hip can't swing into an impossible pose.  rest_dir is
+    // the bind upper-leg axis expressed in the CURRENT body frame.
+    const glm::quat RhipW_bind = RhipParentW * B.qh0;
+    const glm::vec3 rest_dir   = glm::normalize(RhipW_bind * B.ahx);
+    {
+        const float ang  = std::acos(
+            glm::clamp(glm::dot(u1, rest_dir), -1.0f, 1.0f));
+        const float cone = glm::radians(kHipMaxConeDeg);
+        if (ang > cone) {
+            const glm::vec3 axis = glm::cross(rest_dir, u1);
+            if (glm::length(axis) > 1e-6f)
+                u1 = glm::normalize(
+                    glm::angleAxis(cone, glm::normalize(axis)) * rest_dir);
+        }
+    }
+
     const glm::vec3 knee  = a + u1 * B.L1;
     const glm::vec3 footP = a + dir * dist;
     glm::vec3 v1 = footP - knee;
@@ -690,10 +732,26 @@ void PlayerController::solveLegIk(
     if (v1len < 1e-6f) return;
     v1 /= v1len;
 
-    // Hip: swing the bind upper-leg direction onto u1, written as LOCAL rot.
-    const glm::quat RhipW_bind = RhipParentW * B.qh0;
-    const glm::vec3 u_bind_now = RhipW_bind * B.ahx;
-    const glm::quat RhipW_new  = fromTo(u_bind_now, u1) * RhipW_bind;
+    // ── KNEE FLEXION constraint ──────────────────────────────────────────
+    // Flexion = angle between thigh (u1) and shin (v1): 0 straight, larger
+    // when bent.  Clamp to kKneeMaxFlexDeg so the shin can't fold back
+    // through the thigh.  Rotating v1 toward u1 keeps the SAME bend plane
+    // (no direction flip), it only reduces the magnitude.
+    {
+        const float flex = std::acos(
+            glm::clamp(glm::dot(u1, v1), -1.0f, 1.0f));
+        const float maxf = glm::radians(kKneeMaxFlexDeg);
+        if (flex > maxf) {
+            const glm::vec3 axis = glm::cross(u1, v1);
+            if (glm::length(axis) > 1e-6f)
+                v1 = glm::normalize(
+                    glm::angleAxis(maxf, glm::normalize(axis)) * u1);
+        }
+    }
+
+    // Hip: swing the bind upper-leg direction (rest_dir) onto the
+    // constrained u1, written as a LOCAL rotation.
+    const glm::quat RhipW_new = fromTo(rest_dir, u1) * RhipW_bind;
     {
         const glm::quat hipLocal =
             glm::normalize(glm::inverse(RhipParentW) * RhipW_new);
@@ -720,7 +778,10 @@ void PlayerController::solveLegIk(
         const glm::vec3 cur_up = RfootW * glm::vec3(0.0f, 1.0f, 0.0f);
         glm::vec3 ax; float ang;
         if (axisAngleBetween(cur_up, ground_normal, ax, ang)) {
-            ang = glm::clamp(ang * foot_tilt_w, 0.0f, glm::radians(30.0f));
+            // Ankle tilt-to-ground capped at kFootMaxTiltDeg so the foot
+            // can't roll past an anatomical limit relative to the shin.
+            ang = glm::clamp(ang * foot_tilt_w, 0.0f,
+                             glm::radians(kFootMaxTiltDeg));
             if (ang > 1e-4f) RfootW = glm::angleAxis(ang, ax) * RfootW;
         }
     }
