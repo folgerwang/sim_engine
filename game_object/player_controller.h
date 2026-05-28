@@ -62,9 +62,20 @@ public:
     // 2 m in front, on the ground).  No-op until initialized_ has
     // been set by a prior spawnAt — otherwise we'd race against the
     // async player load.
+    //
+    // When the discrete step animation owns translation
+    // (step_anim_enabled_ == true), the position write is dropped --
+    // each keyboard step inside update() drives position_ instead, so
+    // the body actually WALKS instead of teleporting wherever the
+    // camera looks.  Yaw is still accepted so mouse-look continues to
+    // turn the body's facing direction.
     void setPositionAndYaw(const glm::vec3& world_position,
                            float yaw_deg) {
         if (!initialized_) return;
+        if (step_anim_enabled_) {
+            yaw_deg_ = yaw_deg;
+            return;
+        }
         position_ = world_position;
         yaw_deg_  = yaw_deg;
     }
@@ -105,6 +116,58 @@ public:
     void setFootSoleDrop(float v)   { foot_sole_drop_   = v; }
     void setFootTiltWeight(float v) { foot_tilt_weight_ = v; }
     void setPelvisDropMax(float v)  { pelvis_drop_max_  = v; }
+
+    // ── Discrete keyboard-driven step animation ──────────────────────
+    // First-pass walk experiment.  When enabled, SPACE pressed = "take a
+    // step": the next leg swings forward at the hip and the other leg
+    // swings back, alternating left/right/left/right with each press.
+    // The knee + foot stay at their bind rotations, so pelvis-knee-foot
+    // remain colinear (a stiff peg leg) -- that's the constraint for
+    // this iteration; knee bend comes in a later pass.
+    // Toggled on/off at runtime with the 'B' key (edge-detected) and via
+    // setStepAnimEnabled() for code paths that want to drive it directly.
+    // While ON it takes ownership of the leg bones and skips both the
+    // procedural sin() leg swing AND applyFootIk so the two systems
+    // don't fight over the same bones.
+    void setStepAnimEnabled(bool e) { step_anim_enabled_ = e; }
+    bool stepAnimEnabled() const    { return step_anim_enabled_; }
+    // Tuning hooks (degrees).  Forward = hip swings limb out in front,
+    // back = swings behind.  Symmetric defaults give a tidy gait pose
+    // visible against the bind T-pose.
+    void setStepForwardDeg(float v) { step_fwd_angle_deg_  = v; }
+    void setStepBackDeg(float v)    { step_back_angle_deg_ = v; }
+
+    // ── Auto-step (hands-free walk) ──────────────────────────────────
+    // When enabled, the controller fires a step automatically every
+    // auto_step_interval_s_ seconds -- no keyboard press needed.
+    // SPACE keeps working as a manual trigger; pressing it resets the
+    // auto timer so a tap doesn't immediately get followed by an
+    // auto-fire.
+    void  setAutoStep(bool e)             { auto_step_enabled_ = e; }
+    bool  autoStep() const                { return auto_step_enabled_; }
+    void  setAutoStepIntervalSec(float s) {
+        auto_step_interval_s_ = std::max(0.1f, s);
+    }
+    float autoStepIntervalSec() const     { return auto_step_interval_s_; }
+
+    // ── Static test pose ─────────────────────────────────────────────
+    // Validates whether the leg IK / bone-rotation chain actually
+    // deforms the visible mesh.  When enabled:
+    //   • foot_target_world_xz_[LEFT]  = body + 0.5 m forward (+ L lateral)
+    //   • foot_target_world_xz_[RIGHT] = body - 0.5 m forward (+ R lateral)
+    //   • body's translation target is pinned to position_ -- the
+    //     body doesn't walk, just stands in a wide stance.
+    //   • Auto-step + SPACE-press are ignored.
+    // The leg-IK theta values that fall out are ±arcsin(0.5/leg_len),
+    // about ±31° for a 0.95 m leg -- a big, unmistakable stride pose.
+    // If the visible rig assumes this stance, the IK chain is alive
+    // and we can build a walk on top of it.  If the rig stays in
+    // T-pose, the engine-side bone-matrix composition is dropping the
+    // writes and that's where to fix next.
+    void  setTestPose(bool e)         { test_pose_enabled_ = e; }
+    bool  testPose() const            { return test_pose_enabled_; }
+    void  setTestPoseLfwd(float m)    { test_pose_L_fwd_m_ = m; }
+    void  setTestPoseRfwd(float m)    { test_pose_R_fwd_m_ = m; }
     // Amount the rig root was lowered this frame because a foot could
     // not otherwise reach its ground target (>= 0).  For diagnostics.
     float pelvisDrop() const      { return pelvis_drop_; }
@@ -241,6 +304,94 @@ private:
     };
     LegIkBind leg_bind_[2];               // 0 = left, 1 = right
     bool      leg_bind_captured_ = false;
+
+    // ── Discrete step-animation state ────────────────────────────────
+    // step_anim_enabled_: master switch.  Default ON so the user sees
+    //   the new pose immediately on first run -- flip off via 'B' or
+    //   setStepAnimEnabled(false) to fall back to the existing IK path.
+    // step_key_down_prev_ / step_toggle_key_down_prev_: rising-edge
+    //   detectors so HOLDING SPACE or B doesn't fire repeatedly each
+    //   frame (we want ONE step / ONE toggle per physical press).
+    // step_next_leg_: which leg moves on the NEXT press.  Initialised
+    //   to 0 = left, then flips each step -> L,R,L,R,... per the spec.
+    // step_angle_deg_[2]:        current swing angle of each leg (live).
+    // step_angle_target_deg_[2]: target angle for each leg; the lerp in
+    //   update() chases the current toward the target so a press
+    //   produces a smooth swing rather than an instantaneous snap.
+    bool  step_anim_enabled_           = true;
+    bool  step_key_down_prev_          = false;
+    bool  step_toggle_key_down_prev_   = false;
+    int   step_next_leg_               = 0;
+    float step_angle_deg_[2]           = {0.0f, 0.0f};
+    float step_angle_target_deg_[2]    = {0.0f, 0.0f};
+    float step_fwd_angle_deg_          = 30.0f;
+    float step_back_angle_deg_         = -15.0f;
+
+    // ── Discrete step TRANSLATION state ──────────────────────────────
+    // The walk is now driven by per-foot world positions, not symmetric
+    // leg-angle flips.  On each press:
+    //   • body target advances by step_length_m_/2 along facing dir
+    //     (so two presses = one full stride; matches biology -- one
+    //     stride is *two* steps),
+    //   • the STEPPING foot's world target jumps half a step ahead of
+    //     the new body position,
+    //   • the OTHER foot's target is left untouched -- it stays
+    //     planted in world space.
+    // Each frame: lerp body + each foot toward their targets; the
+    // planted foot's lerp is a no-op (target == current).  Then the
+    // bone-angle for each leg is *derived* from foot_world_xz vs
+    // hip_world_xz, so as the body slides past the planted foot, the
+    // planted leg naturally swings BACKWARD at the hip -- this is what
+    // makes a real walk read different from a body teleport.
+    //
+    //   step_target_pos_           — body's translation target.
+    //   foot_world_xz_[2]          — current per-foot world position
+    //                                (Y kept for future foot lift /
+    //                                ground arc; lerp ignores it for
+    //                                now).
+    //   foot_target_world_xz_[2]   — per-foot world target.
+    //   step_target_initialized_   — false until first frame of step
+    //                                mode; on the transition we seed
+    //                                both feet directly under their
+    //                                hips.  Reset on toggle-off so the
+    //                                next enable re-seeds from wherever
+    //                                the camera-follow left the body.
+    //   step_length_m_             — distance each foot travels per
+    //                                press (the stride per single
+    //                                step, in metres).
+    //   hip_lateral_m_             — half-distance between left and
+    //                                right hips (= foot stance width).
+    glm::vec3 step_target_pos_           = glm::vec3(0.0f);
+    glm::vec3 foot_world_xz_[2]          = { glm::vec3(0.0f),
+                                             glm::vec3(0.0f) };
+    glm::vec3 foot_target_world_xz_[2]   = { glm::vec3(0.0f),
+                                             glm::vec3(0.0f) };
+    bool      step_target_initialized_   = false;
+    // step_length 0.7 m: with leg_length ~0.9 m, this puts the
+    // stepping foot ~0.35 m forward of the hip at plant, which gives a
+    // hip-swing angle of arcsin(0.35/0.9) ≈ 22.8°.  Roughly double the
+    // 12.8° the previous 0.4 m default produced -- visible at the
+    // hip without needing to add explicit foot-lift Y arcing yet.
+    float     step_length_m_             = 0.7f;
+    float     hip_lateral_m_             = 0.10f;
+
+    // Auto-step timer state.  auto_step_timer_ accumulates delta_t
+    // each update() while step mode is active; when it crosses the
+    // interval, fireStep() runs and the timer wraps.  Default ON so
+    // the user gets a hands-free walk right after the next build.
+    bool      auto_step_enabled_         = true;
+    float     auto_step_interval_s_      = 5.0f;
+    float     auto_step_timer_           = 0.0f;
+
+    // Static test-pose state.  When test_pose_enabled_ is true the
+    // step mode short-circuits the auto-step / SPACE handler and
+    // pins the foot targets to fixed body-relative offsets so we can
+    // validate whether the IK actually deforms the rig.  Default ON
+    // for now while we're chasing the bone-rotation propagation bug;
+    // flip to false (via setTestPose(false)) once the rig responds.
+    bool      test_pose_enabled_         = true;
+    float     test_pose_L_fwd_m_         =  0.5f;
+    float     test_pose_R_fwd_m_         = -0.5f;
 };
 
 } // namespace game_object

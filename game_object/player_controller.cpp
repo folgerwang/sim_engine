@@ -231,6 +231,252 @@ void PlayerController::update(
         anim_phase_ *= std::max(0.0f, 1.0f - kAnimDecay * delta_t);
     }
 
+    // ── Discrete step-animation input ────────────────────────────────
+    // 'B' toggles the step mode itself (so we can A/B against the
+    //     existing procedural swing + foot IK at runtime).
+    // SPACE = take one step: the NEXT leg in the L,R,L,R alternation
+    //     swings forward at the hip while the OTHER leg swings back,
+    //     AND the body advances by step_length_m_ along facing dir.
+    //     The position write in setPositionAndYaw is dropped while
+    //     step mode is on, so this translation isn't immediately
+    //     clobbered by the application's camera-follow block.
+    // Both keys are edge-detected -- holding either fires once per
+    // physical press, not every frame.
+    if (window) {
+        const bool toggle_down =
+            (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS);
+        if (toggle_down && !step_toggle_key_down_prev_) {
+            step_anim_enabled_ = !step_anim_enabled_;
+            // Force a re-seed of the translation target next time step
+            // mode comes back on -- otherwise an old target_pos_ from a
+            // previous session would yank the body across the map on
+            // the first press.
+            if (!step_anim_enabled_) step_target_initialized_ = false;
+            std::cout << "[step_anim] enabled="
+                      << (step_anim_enabled_ ? 1 : 0) << std::endl;
+        }
+        step_toggle_key_down_prev_ = toggle_down;
+
+        if (step_anim_enabled_) {
+            // Seed body target + per-foot world positions on the first
+            // frame of step mode (or after a re-enable toggle).  Both
+            // feet start under their hips, body target = current
+            // position, so the very first press has somewhere to walk
+            // FROM that matches the visible bind pose.
+            if (!step_target_initialized_) {
+                const float yaw_rad = glm::radians(yaw_deg_);
+                // right = +90° clockwise rotation of fwd around +Y.
+                // Verified handed-ness: fwd x right = +Y (Y-up RH).
+                const glm::vec3 right_world(
+                    -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
+                step_target_pos_       = position_;
+                foot_world_xz_[0]      = position_
+                                         - right_world * hip_lateral_m_; // L
+                foot_world_xz_[1]      = position_
+                                         + right_world * hip_lateral_m_; // R
+                foot_target_world_xz_[0] = foot_world_xz_[0];
+                foot_target_world_xz_[1] = foot_world_xz_[1];
+                step_target_initialized_ = true;
+            }
+
+            // ── Static test pose short-circuit ──────────────────────
+            // When test_pose_enabled_ is true, pin foot targets to a
+            // fixed body-relative stride (L 0.5 m ahead, R 0.5 m back
+            // by default) and skip the SPACE / auto-step handler.  The
+            // body's translation target is held at position_ so the
+            // character stands in place while we observe whether the
+            // legs actually deform to the requested foot positions.
+            // This is the visual smoke test for the bone-rotation
+            // propagation bug -- if the rig assumes a wide stance,
+            // the IK pipe is alive end-to-end; if it stays in T-pose
+            // despite [step_anim.pose] showing big thetaL/thetaR
+            // numbers, the engine-side matrix composition needs the
+            // fix.
+            if (test_pose_enabled_) {
+                const float yaw_rad = glm::radians(yaw_deg_);
+                const glm::vec3 fwd_world(
+                    std::cos(yaw_rad), 0.0f, -std::sin(yaw_rad));
+                const glm::vec3 right_world(
+                    -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
+                foot_target_world_xz_[0] =
+                    position_
+                    + fwd_world   * test_pose_L_fwd_m_
+                    - right_world * hip_lateral_m_;
+                foot_target_world_xz_[1] =
+                    position_
+                    + fwd_world   * test_pose_R_fwd_m_
+                    + right_world * hip_lateral_m_;
+                step_target_pos_    = position_;        // no walk
+                auto_step_timer_    = 0.0f;
+                step_key_down_prev_ = false;
+                // Done with input handling for this frame.
+                static unsigned s_test_log = 0;
+                if ((s_test_log++ % 60u) == 0u) {
+                    std::cout << "[step_anim.test_pose]"
+                              << " L_fwd=" << test_pose_L_fwd_m_
+                              << "m R_fwd=" << test_pose_R_fwd_m_
+                              << "m foot_tgt_L=("
+                              << foot_target_world_xz_[0].x << ","
+                              << foot_target_world_xz_[0].z
+                              << ") foot_tgt_R=("
+                              << foot_target_world_xz_[1].x << ","
+                              << foot_target_world_xz_[1].z
+                              << ") yaw=" << yaw_deg_
+                              << std::endl;
+                }
+            } else {
+            // ── Single step trigger (shared by SPACE and auto-step) ─
+            // Captures the "advance body by half a step, move ONLY
+            // the stepping foot's target a full step forward" logic
+            // so both the manual SPACE press and the auto-step timer
+            // call the same code path.  fireStep() also handles the
+            // alternation (step_next_leg_) and prints the diagnostic
+            // log line.
+            auto fireStep = [&](const char* source) {
+                const int stepping = step_next_leg_;   // 0=L first
+                const int other    = 1 - stepping;
+                const float yaw_rad = glm::radians(yaw_deg_);
+                const glm::vec3 fwd_world(
+                    std::cos(yaw_rad), 0.0f, -std::sin(yaw_rad));
+                const glm::vec3 right_world(
+                    -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
+                const float side_sign = (stepping == 0) ? -1.0f : +1.0f;
+
+                // Body advances half a step per press; two presses =
+                // one full stride length.
+                step_target_pos_ += fwd_world * (step_length_m_ * 0.5f);
+
+                // Stepping foot target lands half a step AHEAD of
+                // where the body will be after the slide.  The other
+                // foot's target is left untouched -- it stays
+                // anchored at its previous world XZ.
+                foot_target_world_xz_[stepping] =
+                    step_target_pos_
+                    + right_world * (hip_lateral_m_ * side_sign)
+                    + fwd_world   * (step_length_m_ * 0.5f);
+
+                step_next_leg_ = other;
+
+                std::cout << "[step_anim] step leg="
+                          << (stepping == 0 ? "LEFT" : "RIGHT")
+                          << " src=" << source
+                          << " body_tgt=(" << step_target_pos_.x
+                          << "," << step_target_pos_.z
+                          << ") foot_tgt_L=(" << foot_target_world_xz_[0].x
+                          << "," << foot_target_world_xz_[0].z
+                          << ") foot_tgt_R=(" << foot_target_world_xz_[1].x
+                          << "," << foot_target_world_xz_[1].z
+                          << ") yaw=" << yaw_deg_ << std::endl;
+            };
+
+            const bool space_down =
+                (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
+            if (space_down && !step_key_down_prev_) {
+                fireStep("space");
+                // Manual press resets the auto timer so a tap doesn't
+                // get followed by an immediate auto-fire.
+                auto_step_timer_ = 0.0f;
+            }
+            step_key_down_prev_ = space_down;
+
+            // ── Auto-step timer ─────────────────────────────────────
+            // Accumulates delta_t each frame; when it crosses the
+            // interval, fires a step automatically and wraps.  Default
+            // is 5 s/step (configurable via setAutoStepIntervalSec).
+            if (auto_step_enabled_) {
+                auto_step_timer_ += std::max(0.0f, delta_t);
+                if (auto_step_timer_ >= auto_step_interval_s_) {
+                    fireStep("auto");
+                    auto_step_timer_ = 0.0f;
+                }
+            }
+            } // end else (test_pose_enabled_ == false branch)
+        } else {
+            step_key_down_prev_ = false;
+            auto_step_timer_    = 0.0f;
+        }
+    }
+
+    // ── Slide body + the stepping foot toward their targets ─────────
+    // Same lerp rate for body and feet so the slide and the foot
+    // plant complete together.  Rate 1.5/s reaches ~95% in ~2 s,
+    // which on the 5 s auto-step interval keeps the body and the
+    // swinging foot in continuous motion the entire time instead of
+    // settling in 0.4 s and then sitting idle for 4.6 s -- the latter
+    // is what the user saw as "teleport".  The PLANTED foot's
+    // target == current value, so its per-frame lerp is a no-op and
+    // it stays anchored in world space exactly as before.
+    constexpr float kStepLerpRate = 1.5f;
+    const float step_t =
+        std::min(1.0f, kStepLerpRate * std::max(delta_t, 0.0f));
+
+    if (step_anim_enabled_ && step_target_initialized_) {
+        // Body XZ (Y left to foot-IK / spawn / external).
+        position_.x += (step_target_pos_.x - position_.x) * step_t;
+        position_.z += (step_target_pos_.z - position_.z) * step_t;
+
+        // Each foot toward its own target.
+        for (int i = 0; i < 2; ++i) {
+            foot_world_xz_[i].x +=
+                (foot_target_world_xz_[i].x - foot_world_xz_[i].x) * step_t;
+            foot_world_xz_[i].z +=
+                (foot_target_world_xz_[i].z - foot_world_xz_[i].z) * step_t;
+        }
+
+        // ── Derive each leg's hip-swing angle from foot vs hip ──────
+        // Project (foot - hip) onto the body's forward direction; the
+        // sine of the leg's swing angle equals (forward amount) /
+        // leg_length.  With this in place the PLANTED foot stays put
+        // in world space, and as the body slides past it the planted
+        // leg's angle goes negative (foot behind hip) -- which is
+        // exactly the half of walking that makes a step read as
+        // "one foot moving" instead of a body teleport.
+        const float yaw_rad = glm::radians(yaw_deg_);
+        const glm::vec3 fwd_world(
+            std::cos(yaw_rad), 0.0f, -std::sin(yaw_rad));
+        const glm::vec3 right_world(
+            -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
+        for (int i = 0; i < 2; ++i) {
+            const float lat_sign = (i == 0) ? -1.0f : +1.0f;
+            const glm::vec3 hip_world =
+                position_ + right_world * (hip_lateral_m_ * lat_sign);
+            const glm::vec3 diff = foot_world_xz_[i] - hip_world;
+            const float fwd_amount =
+                diff.x * fwd_world.x + diff.z * fwd_world.z;
+            // Fall back to a sensible leg length if the bind capture
+            // hasn't run yet (rig not ready) so the angle is bounded.
+            const float leg_len =
+                (leg_bind_[i].valid && leg_bind_[i].L1 + leg_bind_[i].L2 > 0.1f)
+                ? (leg_bind_[i].L1 + leg_bind_[i].L2)
+                : 0.9f;
+            const float sin_theta =
+                glm::clamp(fwd_amount / leg_len, -0.95f, 0.95f);
+            step_angle_deg_[i] = glm::degrees(std::asin(sin_theta));
+        }
+
+        // ── Per-second live diagnostic ──────────────────────────────
+        // Prints current foot world positions + derived leg angles so
+        // we can confirm from the log whether the angles ARE
+        // oscillating between presses (vs the leg being completely
+        // pinned to bind pose by some downstream bug).  This together
+        // with [step_anim.pose] (printed from applyPose below) is the
+        // pair to compare when the question is "the leg looks still --
+        // is the IK actually outputting a swing?".
+        static unsigned s_live_log = 0;
+        if ((s_live_log++ % 60u) == 0u) {
+            std::cout << "[step_anim.live]"
+                      << " body=(" << position_.x << "," << position_.z << ")"
+                      << " footL=(" << foot_world_xz_[0].x << ","
+                                    << foot_world_xz_[0].z << ")"
+                      << " footR=(" << foot_world_xz_[1].x << ","
+                                    << foot_world_xz_[1].z << ")"
+                      << " thetaL=" << step_angle_deg_[0] << "deg"
+                      << " thetaR=" << step_angle_deg_[1] << "deg"
+                      << " stride=" << step_length_m_
+                      << std::endl;
+        }
+    }
+
     applyPose(player);
 }
 
@@ -391,13 +637,135 @@ void PlayerController::applyPose(
     applyBoneDelta("right_lower_arm", dq_r_elbow);
     applyBoneDelta("spine",           dq_spine);
 
-    // Legs: two-bone foot IK owns them when active (it plants each
-    // foot on the ground, tilts to the surface, and drops the pelvis
-    // when a foot cannot reach).  Fall back to the procedural
-    // leg/knee swing only when IK is unavailable (disabled, no
-    // ground-query wired, or the rig has no leg bones) so behaviour
-    // never regresses to the old floating-feet look.
-    if (!applyFootIk(player)) {
+    // Legs: three paths, in priority order.
+    //
+    // 1) step_anim_enabled_ -- the discrete keyboard-driven step pose
+    //    (this iteration).  Only upper_leg rotates at the hip; knee +
+    //    foot stay at their BIND rotations so pelvis-knee-foot remain
+    //    colinear (no knee bend yet).  Both applyFootIk and the
+    //    procedural sin() swing are skipped to keep them from racing
+    //    the step pose for ownership of the same bones.  We also zero
+    //    pelvis_drop_ since foot IK isn't writing it.
+    // 2) applyFootIk -- the existing two-bone foot-planted IK; runs
+    //    when step mode is OFF and a ground-query is wired.
+    // 3) Procedural swing -- fallback when both above are unavailable
+    //    (no rig leg bones, no ground query, etc.).
+    if (step_anim_enabled_) {
+        // ── Simple direct-write leg rotation ───────────────────────
+        // The brute-force test proved that writing a quaternion
+        // directly to upper_leg.rotation_ DOES rotate the bone and
+        // skin the mesh -- a 90° around bone-local X swung the leg
+        // visibly to a horizontal pose.  So we drop the complex
+        // solveLegIk frame-conversion math (which was producing
+        // hipLocal values that didn't reach the visible mesh) and
+        // just write `axisAngleDeg(swing_axis, step_angle_deg_[i])`
+        // straight to each upper_leg bone.  step_angle_deg_ was
+        // already computed in update() from foot-vs-hip projection,
+        // so amplitude is correct (±~31° during the test pose).
+        //
+        // Axis choice: from the brute-force test we observed that
+        // local-X rotates the leg toward body-right.  For a fore/aft
+        // swing the right axis is bone-local Z.  Sign tuned so a
+        // POSITIVE angle (foot ahead of hip) swings the leg FORWARD;
+        // if it goes the wrong way, flip kSwingAxisSign.
+        static const char* const hip_names[2]  = {
+            "left_upper_leg", "right_upper_leg" };
+        static const char* const knee_names[2] = {
+            "left_lower_leg", "right_lower_leg" };
+        static const char* const foot_names[2] = {
+            "left_foot",      "right_foot" };
+        const glm::vec3 kSwingAxis(0.0f, 0.0f, 1.0f);  // bone-local Z
+        constexpr float kSwingAxisSign = -1.0f;        // flip to +1 if leg swings backward
+
+        // Capture the bind rotations on the first frame we run so we
+        // can compose `bind * delta` rather than overwriting bind
+        // with a small delta (which would leave the bone at a random
+        // resting pose).  bind_rots_ is the existing map populated
+        // earlier in applyPose -- safe to read here.
+        for (int i = 0; i < 2; ++i) {
+            const float swing_deg = kSwingAxisSign * step_angle_deg_[i];
+            const glm::quat dq = axisAngleDeg(kSwingAxis, swing_deg);
+            auto bit = bind_rots_.find(hip_names[i]);
+            if (bit != bind_rots_.end()) {
+                player->setNodeRotationByName(
+                    hip_names[i], bit->second.rot * dq);
+            } else {
+                // Bind capture not ready yet -- write the delta only,
+                // which at least produces SOME rotation rather than
+                // freezing the bone.
+                player->setNodeRotationByName(hip_names[i], dq);
+            }
+            // Knee + foot: keep at their bind rotations (knee straight,
+            // foot at bind orientation).  Stiff peg leg for now; knee
+            // bend can come once the swing reads right.
+            auto kit = bind_rots_.find(knee_names[i]);
+            if (kit != bind_rots_.end()) {
+                player->setNodeRotationByName(
+                    knee_names[i], kit->second.rot);
+            }
+            auto fit = bind_rots_.find(foot_names[i]);
+            if (fit != bind_rots_.end()) {
+                player->setNodeRotationByName(
+                    foot_names[i], fit->second.rot);
+            }
+        }
+
+        // No foot-IK pelvis drop authored here -- decay any residual
+        // from a previous mode so the body settles back to position_.y.
+        pelvis_drop_ *= 0.5f;
+        if (pelvis_drop_ < 1e-4f) pelvis_drop_ = 0.0f;
+        const bool ik_ran = true;
+
+        // ── Per-second pose-path diagnostic ─────────────────────────
+        // Confirms (a) the bind was captured, (b) the IK path ran for
+        // both legs, (c) the controller-supplied angles match what's
+        // written upstream in [step_anim.live], AND (d) -- the new
+        // bit -- whether the bone rotations we wrote actually
+        // propagated into the rig's cached world matrices.
+        //
+        // Method: read each foot bone's world matrix AND its parent
+        // upper-leg hip's world matrix from the rig (these were
+        // refreshed on the PREVIOUS frame's DrawableData::update).
+        // Log the foot-minus-hip world offset.  Interpretation:
+        //   • If offset_L / offset_R CHANGE across log lines (the
+        //     vector rotates), then setNodeRotationByName is being
+        //     consumed by getCachedMatrix() and reaching the GPU
+        //     joints buffer -- skinning is alive, the visible mesh
+        //     SHOULD deform.  If it doesn't, the rig is being drawn
+        //     through a path that bypasses the joints buffer (look
+        //     downstream of base.vert / cluster pipeline).
+        //   • If offset_L / offset_R are STATIC across log lines
+        //     (numbers don't change despite [step_anim.live] thetaL
+        //     ranging ±22°), then the IK writes are being dropped
+        //     somewhere between setNodeRotationByName and the cached
+        //     matrix -- likely m_use_local_matrix_only_ is suppressing
+        //     parent-chain re-evaluation, or the animation update is
+        //     overwriting our rotations.  The fix lives in
+        //     DrawableData::update / getNodeMatrix, NOT in the IK.
+        static unsigned s_pose_log = 0;
+        if ((s_pose_log++ % 60u) == 0u) {
+            const glm::mat4 H_L = player->getNodeWorldMatrixByName("left_upper_leg");
+            const glm::mat4 H_R = player->getNodeWorldMatrixByName("right_upper_leg");
+            const glm::mat4 F_L = player->getNodeWorldMatrixByName("left_foot");
+            const glm::mat4 F_R = player->getNodeWorldMatrixByName("right_foot");
+            const glm::vec3 off_L(F_L[3].x - H_L[3].x,
+                                  F_L[3].y - H_L[3].y,
+                                  F_L[3].z - H_L[3].z);
+            const glm::vec3 off_R(F_R[3].x - H_R[3].x,
+                                  F_R[3].y - H_R[3].y,
+                                  F_R[3].z - H_R[3].z);
+            std::cout << "[step_anim.pose]"
+                      << " leg_bind=" << (leg_bind_captured_ ? 1 : 0)
+                      << " Lvalid=" << (leg_bind_[0].valid ? 1 : 0)
+                      << " Rvalid=" << (leg_bind_[1].valid ? 1 : 0)
+                      << " ik_ran=" << (ik_ran ? 1 : 0)
+                      << " thetaL=" << step_angle_deg_[0] << "deg"
+                      << " thetaR=" << step_angle_deg_[1] << "deg"
+                      << " offL=(" << off_L.x << "," << off_L.y << "," << off_L.z << ")"
+                      << " offR=(" << off_R.x << "," << off_R.y << "," << off_R.z << ")"
+                      << std::endl;
+        }
+    } else if (!applyFootIk(player)) {
         applyBoneDelta("left_upper_leg",  dq_l_leg);
         applyBoneDelta("right_upper_leg", dq_r_leg);
         applyBoneDelta("left_lower_leg",  dq_l_knee);

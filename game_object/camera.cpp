@@ -405,6 +405,21 @@ void ViewCamera::updateViewCameraInfo(
         if (view_camera_params.key == GLFW_KEY_D)
             m_camera_info_.position += move_right_vec;
 
+        // ── Third-person follow-target override ──────────────────────
+        // When the caller supplies an input_camera_pos (via the
+        // CameraObject::updateCamera(cmd_buf, camera_pos) overload),
+        // honour it in the perspective branch too -- previously this
+        // override only worked in the ortho branch (line ~319), so the
+        // perspective camera always derived its position from WASD
+        // alone.  With the hook live, application.cpp can drive
+        // camera_pos = player_pos + follow_offset and the camera
+        // becomes an ACTOR trailing the player instead of dragging
+        // the player around.  Comes AFTER the WASD adds so the
+        // override wins on the same frame the keys were pressed.
+        if (input_camera_pos) {
+            m_camera_info_.position = *input_camera_pos;
+        }
+
         auto eye_pos = m_camera_info_.position;
         auto target_pos = eye_pos + m_camera_info_.facing_dir;
         auto up_dir = m_camera_info_.up_vector;
