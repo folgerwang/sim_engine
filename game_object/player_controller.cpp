@@ -185,7 +185,10 @@ void PlayerController::update(
             glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS ||
             glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
     }
-    walking_ = wasd_held;
+    // force_walking_ is set by the Render Debug skeleton-view modes so
+    // the user can watch the legs animate without holding WASD; in normal
+    // play it stays false and the walk is purely WASD-driven.
+    walking_ = wasd_held || force_walking_;
 
     // Smoothly ramp the gait blend toward the (now stable) walking_
     // state so the foot step/lift ease in and out instead of snapping.

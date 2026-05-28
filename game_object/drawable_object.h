@@ -319,6 +319,19 @@ struct DrawableData {
     // counter increment and the per-second print.
     bool m_debug_log_draws_ = false;
 
+    // ── Per-draw instance-world scratchpad ───────────────────────────
+    // Written by DrawableObject::draw() at the top of every draw call so
+    // drawNodes can apply the per-instance world transform on top of the
+    // shared cached_matrix (model_mat = m_current_instance_world_ * cached).
+    // For drawables that DON'T share their DrawableData (the player rig,
+    // standalone meshes) this stays identity and the existing model_mat =
+    // cached_matrix behaviour is preserved.  For SHARED-instance drawables
+    // (e.g. the debug-cube markers, which all share one loaded mesh) each
+    // wrapper writes its own world here before recording its draw commands;
+    // since push-constants are baked into the cmd stream at record time,
+    // each marker's recorded model_mat carries its own per-instance world.
+    glm::mat4 m_current_instance_world_ = glm::mat4(1.0f);
+
     int32_t                     default_scene_ = 0;
     std::vector<SceneInfo>      scenes_;
     std::vector<NodeInfo>       nodes_;
@@ -398,6 +411,40 @@ class DrawableObject {
     // a cache to make getUseNodeTransformOnly() valid even before
     // object_ is populated; the setter writes both.
     bool                        use_node_transform_only_ = false;
+
+    // ── Per-instance world override (for shared-mesh drawables) ──────
+    // When the same loaded mesh (one shared DrawableData) is rendered as
+    // multiple instances, each outer wrapper holds its own world transform
+    // here.  DrawableObject::draw() copies it into DrawableData::
+    // m_current_instance_world_ at the top of each draw call, so the
+    // per-instance world gets baked into that draw's push-constants.  The
+    // shared DrawableData::nodes_ stay untouched -- writing to
+    // setRootNodeTransform on a shared mesh would clobber every sibling
+    // instance.  setInstanceRootTransform() sets these fields; when
+    // instance_root_valid_ is false the override is identity (existing
+    // single-instance behaviour).
+    glm::vec3                   instance_root_t_ = glm::vec3(0.0f);
+    glm::quat                   instance_root_r_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    // Per-instance non-uniform scale.  Composed AFTER rotation in draw():
+    //   instance_world = translate(t) * mat4_cast(r) * scale(s)
+    // followed by the existing m_debug_scale_ multiplier (so a bone-link
+    // stick can ask for a (length/debug, thin/debug, thin/debug) here and
+    // the final on-screen dimensions come out (length, thin, thin) after
+    // the shared debug_scale is applied).  Default (1,1,1) preserves the
+    // existing behaviour for plain bone-marker cubes.
+    glm::vec3                   instance_root_s_ = glm::vec3(1.0f);
+    bool                        instance_root_valid_ = false;
+
+    // Per-wrapper visibility gate.  When false, DrawableObject::draw()
+    // early-returns BEFORE doing any work (no instance buffer bind, no
+    // node walk, no shadow recording either, since the same draw() runs
+    // for both passes via the depth_only / DrawMode params).  Set per
+    // frame from application code — used by the Render Debug menu's
+    // bone-only / character-only / both selector to toggle the player
+    // mesh and the 19 bone-marker cubes without removing them from the
+    // scene-view lists.  Defaults to true so existing drawables behave
+    // exactly as before.
+    bool                        visible_ = true;
 
     // static members.
     static uint32_t max_alloc_game_objects_in_buffer;
@@ -548,6 +595,29 @@ public:
     void setRootNodeTransform(
         const glm::vec3& translation,
         const glm::quat& rotation);
+
+    // Per-instance world override.  Use this — NOT setRootNodeTransform —
+    // when the DrawableObject shares its underlying DrawableData with
+    // other wrappers (i.e. multiple debug markers driven by one loaded
+    // mesh).  setRootNodeTransform would write into the shared node TRS
+    // and every sibling instance would jump to whichever wrapper called
+    // it last.  This instead stores the per-wrapper world here, and
+    // DrawableObject::draw() composes it into model_mat at record time.
+    void setInstanceRootTransform(
+        const glm::vec3& translation,
+        const glm::quat& rotation,
+        const glm::vec3& scale = glm::vec3(1.0f)) {
+        instance_root_t_     = translation;
+        instance_root_r_     = rotation;
+        instance_root_s_     = scale;
+        instance_root_valid_ = true;
+    }
+
+    // Per-wrapper visibility gate (forward + shadow).  See the visible_
+    // field comment above.  False -> draw() does nothing; true (default)
+    // -> existing behaviour.
+    void setVisible(bool v) { visible_ = v; }
+    bool isVisible() const  { return visible_; }
 
     // Opt the drawable into "external code fully owns the rig" mode.
     // PlayerController-driven drawables (and any future similar

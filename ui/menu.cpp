@@ -1810,6 +1810,37 @@ bool Menu::draw(
                 }
             }
 
+            // ── Skeleton view selector ─────────────────────────────────
+            // Tri-state: show the character only (default), show the 19
+            // bone-marker cubes ON TOP of the character (alignment check),
+            // or show ONLY the bones (inspect the skeleton in isolation
+            // with the skinned mesh hidden).  Application reads this each
+            // frame and toggles DrawableObject::setVisible(...) on the
+            // player mesh and every bone marker.
+            ImGui::Separator();
+            ImGui::TextDisabled("Skeleton view");
+            {
+                struct SkelItem {
+                    SkeletonDebugMode mode;
+                    const char*       label;
+                };
+                static const SkelItem kSkelItems[] = {
+                    { SkeletonDebugMode::CharacterOnly,
+                      "Character only (default)"                },
+                    { SkeletonDebugMode::BoneWithCharacter,
+                      "Bones + character (alignment check)"     },
+                    { SkeletonDebugMode::BoneOnly,
+                      "Bones only (skeleton in isolation)"      },
+                };
+                for (int i = 0; i < IM_ARRAYSIZE(kSkelItems); ++i) {
+                    const auto& it = kSkelItems[i];
+                    bool sel = (skeleton_debug_mode_ == it.mode);
+                    if (ImGui::MenuItem(it.label, NULL, sel)) {
+                        skeleton_debug_mode_ = it.mode;
+                    }
+                }
+            }
+
             // ── Colour legend for the Mesh-Category mode ─────────────────
             // Inline 11-row swatch so users can read the overlay without
             // remembering the colour mapping.  Swatch RGBs MUST match

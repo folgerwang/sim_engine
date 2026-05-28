@@ -300,6 +300,26 @@ public:
 private:
     CollisionDebugShape collision_debug_shape_ =
         CollisionDebugShape::Simplified;
+
+    // ── Skeleton render-debug mode ───────────────────────────────────
+    // Set from the "Render Debug -> Skeleton view" submenu.
+    // CharacterOnly  : the skinned mesh draws; the 19 bone cubes hide.
+    // BoneWithCharacter : both draw (useful to verify the cubes line up
+    //                  with the rig as it animates).
+    // BoneOnly       : only the 19 cubes draw; the mesh hides (lets you
+    //                  inspect the skeleton in isolation).
+    // Defaults to CharacterOnly so the regular gameplay view stays
+    // clean unless the user opts in to skeleton overlays.
+    // Enum is PUBLIC so external code (application.cpp) can name
+    // engine::ui::Menu::SkeletonDebugMode::*; storage stays private.
+public:
+    enum class SkeletonDebugMode : int {
+        CharacterOnly     = 0,
+        BoneWithCharacter = 1,
+        BoneOnly          = 2,
+    };
+private:
+    SkeletonDebugMode skeleton_debug_mode_ = SkeletonDebugMode::CharacterOnly;
     // Set by setCollisionDebugShape() whenever the menu choice
     // changes; the application clears it after rebuilding the
     // collision world to match.
@@ -665,6 +685,16 @@ public:
     }
 
     // Collision-shape selector accessors.
+    // Render-debug skeleton view: bone-only / both / character-only.
+    // Application reads this each frame and toggles per-drawable
+    // visibility on the player mesh and the 19 bone-marker cubes.
+    inline SkeletonDebugMode skeletonDebugMode() const {
+        return skeleton_debug_mode_;
+    }
+    inline void setSkeletonDebugMode(SkeletonDebugMode m) {
+        skeleton_debug_mode_ = m;
+    }
+
     inline CollisionDebugShape collisionDebugShape() const {
         return collision_debug_shape_;
     }

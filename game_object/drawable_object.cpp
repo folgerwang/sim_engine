@@ -3229,7 +3229,12 @@ static void drawNodes(
                 ++drawable_object->m_debug_draw_nodes_with_mesh_;
             }
             glsl::ModelParams model_params{};
-            model_params.model_mat = node.cached_matrix_;
+            // Per-instance world override (set per-draw-call by
+            // DrawableObject::draw); identity when the wrapper hasn't asked
+            // for it, so non-shared drawables behave exactly as before.
+            model_params.model_mat =
+                drawable_object->m_current_instance_world_ *
+                node.cached_matrix_;
             model_params.flip_uv_coord =
                 (drawable_object->m_flip_u_ ? 0x01 : 0x00) |
                 (drawable_object->m_flip_v_ ? 0x02 : 0x00);
@@ -4697,6 +4702,30 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
         return obj;
     }
 
+    // ── In-flight load dedup ────────────────────────────────────────
+    // The cache above is populated at the END of phase 3.  At startup,
+    // multiple callers requesting the SAME asset (e.g. the 6 debug_cube
+    // markers) all fire createAsync before phase 3 runs, so each one
+    // misses the cache and kicks off its own file parse + GPU upload.
+    // Track in-flight loads by filename: the first caller submits the
+    // MeshLoadTask, every subsequent caller for the same filename
+    // attaches as a "waiter" and gets its object_ populated by the SAME
+    // phase 3 that finishes the first load.  Function-local static
+    // because both this site and the phase 3 lambda below (same TU,
+    // same enclosing function) need access; both run on the main
+    // thread, no mutex needed.
+    static std::unordered_map<
+        std::string, std::vector<std::shared_ptr<DrawableObject>>>
+        s_in_flight_loads_;
+    auto in_flight_it = s_in_flight_loads_.find(file_name);
+    if (in_flight_it != s_in_flight_loads_.end()) {
+        in_flight_it->second.push_back(obj);
+        // No task submission: phase 3 of the FIRST submitted load will
+        // populate obj->object_ when it finishes.
+        return obj;
+    }
+    s_in_flight_loads_[file_name].push_back(obj);
+
     // Shared mailbox: phase 2 (worker thread) writes `data`; phase 3
     // (main thread, after fence signals) reads it. The MeshLoadTaskManager
     // runs phase3 only after phase2's command buffer fence signals, so
@@ -4765,6 +4794,9 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                 // the error. Leave obj->object_ null so isReady()
                 // stays false — the caller can notice via the task
                 // status if they held on to the MeshLoadTask handle.
+                // Drop the in-flight entry so a later retry can submit
+                // a fresh load instead of attaching to a dead slot.
+                s_in_flight_loads_.erase(file_name);
                 return;
             }
 
@@ -4913,6 +4945,21 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
             // once it observes ready_ == true.
             obj->object_ = data;
             data->ready_.store(true, std::memory_order_release);
+
+            // Fan out to every in-flight waiter that asked for the SAME
+            // filename while this load was in flight.  The 6 debug-cube
+            // markers all attach here — one file parse + one GPU upload,
+            // six DrawableObject shells sharing the same DrawableData.
+            // Each marker is then positioned independently via
+            // setInstanceRootTransform (NOT setRootNodeTransform, which
+            // would clobber every sibling on the shared nodes_).
+            auto waiter_it = s_in_flight_loads_.find(file_name);
+            if (waiter_it != s_in_flight_loads_.end()) {
+                for (auto& w : waiter_it->second) {
+                    if (w && w != obj) w->object_ = data;
+                }
+                s_in_flight_loads_.erase(waiter_it);
+            }
         };
 
     task_manager.submit(
@@ -5591,6 +5638,12 @@ void DrawableObject::draw(
     DrawMode draw_mode/* = DrawMode::kForward */,
     uint32_t csm_cascade_idx/* = 0 */) {
 
+    // Per-wrapper visibility gate (set from app code, e.g. the Render
+    // Debug menu's bone-only / character-only mode).  Skipping at the
+    // very top means no instance-buffer bind, no node walk, no shadow
+    // recording — exactly what we want when the user hides this drawable.
+    if (!visible_) return;
+
     // Reset per-call debug counter BEFORE the isReady() guard so that
     // a not-ready drawable also prints "0 draws" rather than carrying
     // last frame's count.  Cheap; only used when m_debug_force_red_
@@ -5609,6 +5662,39 @@ void DrawableObject::draw(
         object_->m_debug_draw_prims_iterated_       = 0;
         object_->m_debug_draw_prim_pipeline_null_   = 0;
         object_->m_debug_draw_prim_mesh_shader_     = 0;
+    }
+
+    // ── Stage the per-instance world for this draw call ─────────────
+    // drawNodes pre-multiplies model_mat by m_current_instance_world_, so a
+    // wrapper that shares its DrawableData with other instances can pin its
+    // own world position here without touching the shared nodes_ (which
+    // every sibling marker would otherwise clobber).  When the wrapper
+    // hasn't set an override, identity restores the original behaviour
+    // (model_mat == cached_matrix).
+    if (object_) {
+        if (instance_root_valid_) {
+            glm::mat4 m =
+                glm::translate(glm::mat4(1.0f), instance_root_t_) *
+                glm::mat4_cast(instance_root_r_) *
+                glm::scale(glm::mat4(1.0f), instance_root_s_);
+            // Fold m_debug_scale_ in here for shared-instance drawables.
+            // setRootNodeTransform writes the debug scale into the root
+            // node's scale_, but shared instances DON'T call it (would
+            // clobber siblings), so the per-instance world has to carry
+            // the scale instead.  Non-shared drawables (player rig, etc.)
+            // keep getting scale via the node path unchanged.  Composing
+            // this AFTER instance_root_s_ means link sticks can size
+            // themselves in "(length/debug, thin/debug, thin/debug)" units
+            // and end up at (length, thin, thin) on screen.
+            if (object_->m_debug_scale_ > 0.0f) {
+                m = m * glm::scale(
+                    glm::mat4(1.0f),
+                    glm::vec3(object_->m_debug_scale_));
+            }
+            object_->m_current_instance_world_ = m;
+        } else {
+            object_->m_current_instance_world_ = glm::mat4(1.0f);
+        }
     }
 
     // Skip while the async load is still in flight. The menu spinner

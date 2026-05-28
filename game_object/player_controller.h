@@ -110,6 +110,14 @@ public:
     void setGroundQuery(GroundQueryFn fn) { ground_query_ = std::move(fn); }
     void setFootIkEnabled(bool e) { foot_ik_enabled_ = e; }
     bool footIkEnabled() const    { return foot_ik_enabled_; }
+
+    // Debug helper: force the walk gait on regardless of WASD input.
+    // Used by the Render Debug -> Skeleton view modes so the legs keep
+    // animating while the user inspects the bone overlay, without
+    // requiring them to hold a key.  When false (default) the walk is
+    // entirely WASD-driven (see update()).
+    void setForceWalking(bool v) { force_walking_ = v; }
+    bool forceWalking() const    { return force_walking_; }
     // Live-tunable IK knobs (wired to the Physics > Foot IK menu).
     void setFootStrideAmp(float v)  { foot_stride_amp_  = v; }
     void setFootLiftAmp(float v)    { foot_lift_amp_    = v; }
@@ -245,6 +253,7 @@ private:
     float     player_radius_ = 0.4f;     // capsule radius
     float     player_height_ = 1.8f;     // total capsule height (incl. hemispheres)
     bool      walking_       = false;
+    bool      force_walking_ = false;  // see setForceWalking() above
     bool      initialized_   = false;
 
     // ── Foot IK state ────────────────────────────────
