@@ -3,3 +3,7 @@
 # copy exists because this directory is itself a git submodule and the
 # outer .gitignore does not apply inside.
 third_parties/libtorch/
+
+# FUSE filesystem ghosts from open-but-unlinked files
+.fuse_hidden*
+**/.fuse_hidden*

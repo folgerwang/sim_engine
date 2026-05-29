@@ -381,7 +381,7 @@ private:
     // hip-swing angle of arcsin(0.35/0.9) ≈ 22.8°.  Roughly double the
     // 12.8° the previous 0.4 m default produced -- visible at the
     // hip without needing to add explicit foot-lift Y arcing yet.
-    float     step_length_m_             = 0.7f;
+    float     step_length_m_             = 1.4f;  // doubled stride range
     float     hip_lateral_m_             = 0.10f;
 
     // Auto-step timer state.  auto_step_timer_ accumulates delta_t
@@ -389,7 +389,7 @@ private:
     // interval, fireStep() runs and the timer wraps.  Default ON so
     // the user gets a hands-free walk right after the next build.
     bool      auto_step_enabled_         = true;
-    float     auto_step_interval_s_      = 1.25f;  // another 2x faster (was 2.5s, originally 5.0s)
+    float     auto_step_interval_s_      = 0.625f; // 2x faster again
     float     auto_step_timer_           = 0.0f;
 
     // Static test-pose state.  When test_pose_enabled_ is true the

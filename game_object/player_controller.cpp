@@ -345,9 +345,40 @@ void PlayerController::update(
                     -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
                 const float side_sign = (stepping == 0) ? -1.0f : +1.0f;
 
+                // ── WASD-derived movement direction ────────────────
+                // W/S = fore/aft along body facing.  A/D = strafe
+                // perpendicular.  SPACE forces a forward step so
+                // manual single-step testing still works without
+                // holding WASD.  If no WASD held (and not SPACE),
+                // skip the body advance entirely so the character
+                // stops walking the moment all movement keys are
+                // released.
+                glm::vec3 step_dir = fwd_world;
+                if (std::string(source) != std::string("space")) {
+                    const bool w_pressed = window &&
+                        (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS);
+                    const bool s_pressed = window &&
+                        (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS);
+                    const bool a_pressed = window &&
+                        (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS);
+                    const bool d_pressed = window &&
+                        (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS);
+                    const float wf = (w_pressed ? 1.0f : 0.0f)
+                                   - (s_pressed ? 1.0f : 0.0f);
+                    const float wr = (d_pressed ? 1.0f : 0.0f)
+                                   - (a_pressed ? 1.0f : 0.0f);
+                    step_dir = fwd_world * wf + right_world * wr;
+                    const float len = glm::length(step_dir);
+                    if (len > 1e-3f) {
+                        step_dir /= len;
+                    } else {
+                        return; // no WASD -> no step
+                    }
+                }
+
                 // Body advances half a step per press; two presses =
                 // one full stride length.
-                step_target_pos_ += fwd_world * (step_length_m_ * 0.5f);
+                step_target_pos_ += step_dir * (step_length_m_ * 0.5f);
 
                 // Stepping foot target lands half a step AHEAD of
                 // where the body will be after the slide.  The other
@@ -356,7 +387,7 @@ void PlayerController::update(
                 foot_target_world_xz_[stepping] =
                     step_target_pos_
                     + right_world * (hip_lateral_m_ * side_sign)
-                    + fwd_world   * (step_length_m_ * 0.5f);
+                    + step_dir    * (step_length_m_ * 0.5f);
 
                 step_next_leg_ = other;
 
@@ -386,13 +417,43 @@ void PlayerController::update(
             // Accumulates delta_t each frame; when it crosses the
             // interval, fires a step automatically and wraps.  Default
             // is 5 s/step (configurable via setAutoStepIntervalSec).
-            if (auto_step_enabled_) {
+            if (auto_step_enabled_ && wasd_held) {
                 auto_step_timer_ += std::max(0.0f, delta_t);
                 if (auto_step_timer_ >= auto_step_interval_s_) {
                     fireStep("auto");
                     auto_step_timer_ = 0.0f;
                 }
             }
+
+            // Catch up: the BACK foot slides forward to align with
+            // the FRONT foot's fwd projection.  Front foot stays
+            // put.  Body holds its current XZ.  After lerp settle:
+            // both feet at the same forward position, character
+            // standing at attention.  step_angle_deg_ derived per
+            // frame from foot-vs-hip projection -> trends to 0 ->
+            // arms / spine untwist automatically.
+            if (!wasd_held && step_target_initialized_) {
+                const float yaw_rad = glm::radians(yaw_deg_);
+                const glm::vec3 fwd_world(
+                    std::cos(yaw_rad), 0.0f, -std::sin(yaw_rad));
+                const glm::vec3 right_world(
+                    -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
+                const glm::vec3 dL = foot_world_xz_[0] - position_;
+                const glm::vec3 dR = foot_world_xz_[1] - position_;
+                const float fwdL = dL.x*fwd_world.x + dL.z*fwd_world.z;
+                const float fwdR = dR.x*fwd_world.x + dR.z*fwd_world.z;
+                const int front_i = (fwdL >= fwdR) ? 0 : 1;
+                const int back_i  = 1 - front_i;
+                const float front_fwd = (front_i == 0) ? fwdL : fwdR;
+                const float back_lat  = (back_i == 0) ? -1.0f : +1.0f;
+                foot_target_world_xz_[back_i] =
+                    position_
+                    + fwd_world   * front_fwd
+                    + right_world * (hip_lateral_m_ * back_lat);
+                foot_target_world_xz_[front_i] = foot_world_xz_[front_i];
+                step_target_pos_ = position_;
+            }
+
             } // end else (test_pose_enabled_ == false branch)
         } else {
             step_key_down_prev_ = false;
@@ -766,6 +827,50 @@ void PlayerController::applyPose(
                     foot_names[i], fit->second.rot);
             }
         }
+
+
+        // ── Upper-body counter-motion (natural walk) ───────────────
+        // Real walking has arms swinging OPPOSITE to the same-side
+        // leg (left arm forward when LEFT leg is back), and the spine
+        // counter-twisting the hips.  All amplitudes scale with the
+        // leg swing so the upper body auto-syncs with the gait.
+        // Direct write (no bind composition) -- same pattern the leg
+        // rotation uses, proven to reach the GPU mesh for this rig.
+        //
+        //   kArmFactor   — fraction of opposite leg's swing applied
+        //                  to each arm.  0.7 reads as a strong arm
+        //                  pump; 0.4 reads as a calmer walk.
+        //   kElbowFactor — small elbow bend that tightens at peak
+        //                  forward arm swing.  Keep small (~0.4) so
+        //                  arms don't fold dramatically.
+        //   kSpineFactor — fraction of (left-right leg delta) applied
+        //                  as a Y-axis twist on the spine.
+        constexpr float kArmFactor   = 2.1f;   // 2x of 1.05 (doubled arm swing)
+        constexpr float kElbowFactor = 0.4f;
+        constexpr float kSpineFactor = 0.25f;
+        const glm::vec3 kArmAxis(0.0f, 0.0f, 1.0f);    // same as legs (Z works)
+        const glm::vec3 kSpineAxis(0.0f, 1.0f, 0.0f);  // body vertical twist
+
+        // Arms: opposite of same-side leg.
+        const float arm_L_deg = -kArmFactor * step_angle_deg_[0];
+        const float arm_R_deg = -kArmFactor * step_angle_deg_[1];
+        applyBoneDelta("left_upper_arm",  axisAngleDeg(kArmAxis, arm_L_deg));
+        applyBoneDelta("right_upper_arm", axisAngleDeg(kArmAxis, arm_R_deg));
+
+        // Elbows: bend INTO the swing (positive sign on |arm_deg|)
+        // so the forearm tucks slightly as the arm comes forward.
+        const float elbow_L_deg = kElbowFactor * std::fabs(arm_L_deg);
+        const float elbow_R_deg = kElbowFactor * std::fabs(arm_R_deg);
+        applyBoneDelta("left_lower_arm",  axisAngleDeg(kArmAxis, elbow_L_deg));
+        applyBoneDelta("right_lower_arm", axisAngleDeg(kArmAxis, elbow_R_deg));
+
+        // Spine: counter-twist the hip rotation.  When left leg is
+        // ahead of right (theta_L > theta_R), shoulders rotate to
+        // bring the LEFT shoulder back (negative twist around body
+        // vertical).  If the spine twists the wrong way, flip sign.
+        const float spine_deg = kSpineFactor *
+            (step_angle_deg_[0] - step_angle_deg_[1]);
+        applyBoneDelta("spine", axisAngleDeg(kSpineAxis, spine_deg));
 
         // No foot-IK pelvis drop authored here -- decay any residual
         // from a previous mode so the body settles back to position_.y.
