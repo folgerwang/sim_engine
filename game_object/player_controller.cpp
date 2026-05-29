@@ -268,15 +268,31 @@ void PlayerController::update(
             // FROM that matches the visible bind pose.
             if (!step_target_initialized_) {
                 const float yaw_rad = glm::radians(yaw_deg_);
+                const glm::vec3 fwd_world(
+                    std::cos(yaw_rad), 0.0f, -std::sin(yaw_rad));
                 // right = +90° clockwise rotation of fwd around +Y.
                 // Verified handed-ness: fwd x right = +Y (Y-up RH).
                 const glm::vec3 right_world(
                     -std::sin(yaw_rad), 0.0f, -std::cos(yaw_rad));
                 step_target_pos_       = position_;
+                // Stagger the feet fore-aft on entry: L back by
+                // step_length/2, R ahead by step_length/2.  With both feet
+                // at body position (the old init), the very first step
+                // only swept step_length forward and the SECOND step
+                // swept 1.5*step_length (because the trailing foot had
+                // both lagged the body and now had to catch up).  After
+                // that, steady state was only step_length per swing -- so
+                // the user saw "first big, then tight" as steps 2 → 3
+                // shrank from 1.2 m → 0.8 m.  Pre-staggering means step 1
+                // already starts from steady-state geometry and every
+                // step covers the same world-space arc.
+                const float half_stride = step_length_m_ * 0.5f;
                 foot_world_xz_[0]      = position_
-                                         - right_world * hip_lateral_m_; // L
+                                         - right_world * hip_lateral_m_
+                                         - fwd_world   * half_stride; // L back
                 foot_world_xz_[1]      = position_
-                                         + right_world * hip_lateral_m_; // R
+                                         + right_world * hip_lateral_m_
+                                         + fwd_world   * half_stride; // R ahead
                 foot_target_world_xz_[0] = foot_world_xz_[0];
                 foot_target_world_xz_[1] = foot_world_xz_[1];
                 step_target_initialized_ = true;
@@ -376,9 +392,18 @@ void PlayerController::update(
                     }
                 }
 
-                // Body advances half a step per press; two presses =
-                // one full stride length.
-                step_target_pos_ += step_dir * (step_length_m_ * 0.5f);
+                // Body advances a FULL step_length per press.  Combined
+                // with the foot landing step_length/2 ahead of the new
+                // body position (below), each cycle of two steps
+                // advances each foot by 2*step_length in world space --
+                // 1.5 m of foot sweep per swing at step_length=0.8 m,
+                // which reads as a real stride rather than a shuffle.
+                // The earlier 0.5*step_length advance was the source of
+                // "tight" follow-up steps: it made the steady-state per-
+                // foot sweep equal step_length, half of what step 2 used
+                // to look like (because step 2's trailing foot started
+                // at body position from the init).
+                step_target_pos_ += step_dir * step_length_m_;
 
                 // Stepping foot target lands half a step AHEAD of
                 // where the body will be after the slide.  The other
@@ -849,24 +874,69 @@ void PlayerController::applyPose(
         //                  arms don't fold dramatically.
         //   kSpineFactor — fraction of (left-right leg delta) applied
         //                  as a Y-axis twist on the spine.
-        constexpr float kArmFactor   = 2.1f;   // 2x of 1.05 (doubled arm swing)
-        constexpr float kElbowFactor = 0.4f;
-        constexpr float kSpineFactor = 0.25f;
-        const glm::vec3 kArmAxis(0.0f, 0.0f, 1.0f);    // same as legs (Z works)
+        constexpr float kArmFactor   = 1.8f;  // larger arm swing (was 1.0; ~45deg peak vs ~25deg)
+        constexpr float kElbowFactor = 0.35f; // slightly bigger elbow tuck to match (was 0.25)
+        constexpr float kSpineFactor = 0.20f; // a little more counter-twist (was 0.15)
+        // Arms use bone-local X for fore-aft swing, NOT Z like the legs.
+        // On this rig the arm bone's local Y runs down the bone length
+        // (shoulder -> elbow), so rotating around Z mostly TWISTS the
+        // upper arm around its own axis (cosmetic shoulder roll) and
+        // barely moves the hand forward or back.  Rotating around X is
+        // the actual fore-aft swing hinge -- it's the same axis the
+        // non-step procedural swing already uses for arms in this file
+        // (search swing_axis_local(1,0,0) above), so we know X is the
+        // correct hinge for arms on this skeleton.  Sign flipped from
+        // the leg convention because the arm bone's local X points the
+        // opposite way down the body from the leg's local Z.
+        constexpr float kArmAxisSign = -1.0f;
+        const glm::vec3 kArmAxis(1.0f, 0.0f, 0.0f);    // bone-local X (fore-aft hinge for ARM)
         const glm::vec3 kSpineAxis(0.0f, 1.0f, 0.0f);  // body vertical twist
 
-        // Arms: opposite of same-side leg.
-        const float arm_L_deg = -kArmFactor * step_angle_deg_[0];
-        const float arm_R_deg = -kArmFactor * step_angle_deg_[1];
-        applyBoneDelta("left_upper_arm",  axisAngleDeg(kArmAxis, arm_L_deg));
-        applyBoneDelta("right_upper_arm", axisAngleDeg(kArmAxis, arm_R_deg));
+        // Arms: opposite of same-side leg (kArmFactor sign), then the
+        // kArmAxisSign accounts for the arm bone's local X pointing the
+        // opposite direction down the body from the leg's local Z.  If
+        // arms swing in the SAME direction as same-side legs (clearly
+        // wrong for walking), flip kArmAxisSign back to +1.
+        const float arm_L_deg =
+            kArmAxisSign * -kArmFactor * step_angle_deg_[0];
+        const float arm_R_deg =
+            kArmAxisSign * -kArmFactor * step_angle_deg_[1];
+
+        // Compose dq * bind (NOT bind * dq) so the swing axis is
+        // interpreted in the bone's PARENT (torso) frame rather than
+        // in the bone's own post-bind local frame.  With bind*dq the
+        // upper_arm bind already rotated the arm to hang down by the
+        // side, so bone-local X then points roughly along the arm's
+        // length -- rotating around it just rolled the bicep and made
+        // the arms look frozen.  dq*bind applies the rotation FIRST in
+        // the shoulder/torso frame (where X is a real horizontal
+        // forward/back hinge) and then the bind drops the arm to its
+        // side, so the swing is preserved as a visible fore-aft sweep.
+        auto applyBonePreDelta = [&](const char* name, const glm::quat& dq) {
+            auto it = bind_rots_.find(name);
+            if (it == bind_rots_.end()) return;
+            const glm::quat& bind = it->second.rot;
+            player->setNodeRotationByName(name, dq * bind);
+        };
+
+        applyBonePreDelta("left_upper_arm",
+                          axisAngleDeg(kArmAxis, arm_L_deg));
+        applyBonePreDelta("right_upper_arm",
+                          axisAngleDeg(kArmAxis, arm_R_deg));
 
         // Elbows: bend INTO the swing (positive sign on |arm_deg|)
         // so the forearm tucks slightly as the arm comes forward.
+        // Lower-arm is parented to upper-arm, so the parent frame for
+        // the elbow IS the upper-arm bone -- its local X points along
+        // the forearm at bind, and rotating around it bends the elbow.
+        // bind*dq still applies in the forearm's own frame, which after
+        // the upper-arm swing is "tucking in toward the body."
         const float elbow_L_deg = kElbowFactor * std::fabs(arm_L_deg);
         const float elbow_R_deg = kElbowFactor * std::fabs(arm_R_deg);
-        applyBoneDelta("left_lower_arm",  axisAngleDeg(kArmAxis, elbow_L_deg));
-        applyBoneDelta("right_lower_arm", axisAngleDeg(kArmAxis, elbow_R_deg));
+        applyBonePreDelta("left_lower_arm",
+                          axisAngleDeg(kArmAxis, elbow_L_deg));
+        applyBonePreDelta("right_lower_arm",
+                          axisAngleDeg(kArmAxis, elbow_R_deg));
 
         // Spine: counter-twist the hip rotation.  When left leg is
         // ahead of right (theta_L > theta_R), shoulders rotate to
