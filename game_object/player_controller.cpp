@@ -480,6 +480,60 @@ void PlayerController::update(
         }
     }
 
+
+    // ── Ground-touching IK ──────────────────────────────────────────
+    // Probe the ground under the body's current XZ each frame and
+    // snap position_.y so the BACK foot (the one swept furthest from
+    // vertical) stays planted.  Without this the body's Y stays at
+    // whatever spawn put it, and as the legs swing the feet lift off
+    // the ground.  With it: the planted leg's foot is exactly on the
+    // surface, the swinging foot arcs slightly above ground (natural
+    // bob), and the body rises/falls with terrain XZ.
+    //   • ground_query_ is the app-supplied callback (queryGroundAt
+    //     in application.cpp).  No-op if not wired.
+    //   • kRootToFoot (1.10 m) is the rig's root-to-foot bind
+    //     distance for scene-skinned.gltf.  Tune if the character
+    //     hovers or sinks at theta=0.
+    //   • The lift correction uses |theta_back| of the more-swept
+    //     leg: foot Y lift = leg_len * (1 - cos(theta)).  Subtract
+    //     that from the desired pelvis height so the back foot ends
+    //     up exactly on ground level.
+    if (step_anim_enabled_ && ground_query_) {
+        constexpr float kRootToFoot      = 1.10f;
+        constexpr float kLegLen          = 0.95f;
+        constexpr float kFootSoleDrop    = 0.12f;  // +10cm: feet were sinking into the ground
+        float gy = 0.0f;
+        glm::vec3 gn(0.0f, 1.0f, 0.0f);
+        if (ground_query_(position_.x, position_.z,
+                          position_.y - kRootToFoot, gy, gn)) {
+            const float max_abs_theta = std::max(
+                std::fabs(step_angle_deg_[0]),
+                std::fabs(step_angle_deg_[1]));
+            const float lift = kLegLen *
+                (1.0f - std::cos(glm::radians(max_abs_theta)));
+            const float target_root_y =
+                gy + kRootToFoot - lift + kFootSoleDrop;
+            // Smooth the Y so terrain bumps don't jitter the body --
+            // ~6/s lerp settles in ~0.5 s, fast enough that walking
+            // up steps still tracks reasonably.
+            constexpr float kGroundLerpRate = 6.0f;
+            const float t = std::min(1.0f,
+                kGroundLerpRate * std::max(delta_t, 0.0f));
+            position_.y += (target_root_y - position_.y) * t;
+
+            static unsigned s_ground_log = 0;
+            if ((s_ground_log++ % 60u) == 0u) {
+                std::cout << "[ground_ik]"
+                          << " gy=" << gy
+                          << " thetaMaxAbs=" << max_abs_theta
+                          << " lift=" << lift
+                          << " target_root_y=" << target_root_y
+                          << " body_y=" << position_.y
+                          << std::endl;
+            }
+        }
+    }
+
     applyPose(player);
 }
 
@@ -677,8 +731,8 @@ void PlayerController::applyPose(
             "left_lower_leg", "right_lower_leg" };
         static const char* const foot_names[2] = {
             "left_foot",      "right_foot" };
-        const glm::vec3 kSwingAxis(0.0f, 0.0f, 1.0f);  // bone-local Z
-        constexpr float kSwingAxisSign = -1.0f;        // flip to +1 if leg swings backward
+        const glm::vec3 kSwingAxis(0.0f, 0.0f, 1.0f);  // bone-local Z -- X swung sideways; Z should give fore-aft
+        constexpr float kSwingAxisSign = +1.0f;        // flip to -1 if leg swings backward
 
         // Capture the bind rotations on the first frame we run so we
         // can compose `bind * delta` rather than overwriting bind
@@ -691,7 +745,7 @@ void PlayerController::applyPose(
             auto bit = bind_rots_.find(hip_names[i]);
             if (bit != bind_rots_.end()) {
                 player->setNodeRotationByName(
-                    hip_names[i], bit->second.rot * dq);
+                    hip_names[i], dq); // direct write, no bind composition -- matches the successful brute force exactly
             } else {
                 // Bind capture not ready yet -- write the delta only,
                 // which at least produces SOME rotation rather than

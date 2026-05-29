@@ -389,7 +389,7 @@ private:
     // interval, fireStep() runs and the timer wraps.  Default ON so
     // the user gets a hands-free walk right after the next build.
     bool      auto_step_enabled_         = true;
-    float     auto_step_interval_s_      = 5.0f;
+    float     auto_step_interval_s_      = 1.25f;  // another 2x faster (was 2.5s, originally 5.0s)
     float     auto_step_timer_           = 0.0f;
 
     // Static test-pose state.  When test_pose_enabled_ is true the
@@ -398,7 +398,7 @@ private:
     // validate whether the IK actually deforms the rig.  Default ON
     // for now while we're chasing the bone-rotation propagation bug;
     // flip to false (via setTestPose(false)) once the rig responds.
-    bool      test_pose_enabled_         = true;
+    bool      test_pose_enabled_         = false;  // switched OFF so auto-step actually walks; set true again only when validating IK statically
     float     test_pose_L_fwd_m_         =  0.5f;
     float     test_pose_R_fwd_m_         = -0.5f;
 };
