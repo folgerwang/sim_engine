@@ -748,7 +748,11 @@ bool Menu::draw(
     // doesn't appear visually but the controller state is fine: lets
     // the user see at a glance whether the player is off-screen, behind
     // them, or just very far away.
-    if (has_player_debug_info_) {
+    // Default OFF — set to true to re-enable the cyan bbox wireframe +
+    // red position marker + HUD text.  Was drawing unconditionally
+    // before; user asked for the debug overlay off by default.
+    static bool s_show_player_overlay_ = false;
+    if (s_show_player_overlay_ && has_player_debug_info_) {
         // Non-const because GetForegroundDrawList takes a non-const
         // ImGuiViewport*.  The viewport returned by GetMainViewport()
         // is owned by Dear ImGui — we're only reading from it.

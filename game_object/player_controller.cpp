@@ -451,7 +451,11 @@ void PlayerController::update(
                     + fwd_world   * front_fwd
                     + right_world * (hip_lateral_m_ * back_lat);
                 foot_target_world_xz_[front_i] = foot_world_xz_[front_i];
-                step_target_pos_ = position_;
+                // Body advances forward by front_fwd so it lands over
+                // the feet -- without this the feet end up AHEAD of
+                // the hips, derived step_angle_deg_ stays positive
+                // for both legs, and the character leans forward.
+                step_target_pos_ = position_ + fwd_world * front_fwd;
             }
 
             } // end else (test_pose_enabled_ == false branch)
@@ -470,7 +474,7 @@ void PlayerController::update(
     // is what the user saw as "teleport".  The PLANTED foot's
     // target == current value, so its per-frame lerp is a no-op and
     // it stays anchored in world space exactly as before.
-    constexpr float kStepLerpRate = 1.5f;
+    constexpr float kStepLerpRate = 4.0f;  // bumped from 1.5: stand-down was settling too slowly so the body looked leaned forward
     const float step_t =
         std::min(1.0f, kStepLerpRate * std::max(delta_t, 0.0f));
 
