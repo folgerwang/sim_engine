@@ -242,6 +242,18 @@ private:
     struct BoneBindRot {
         glm::quat rot;
         int       node_idx = -1;   // cached for fast re-lookup
+        // Precomputed swing axis in this bone's LOCAL post-bind frame
+        // corresponding to "player's right" in world (the axis you
+        // rotate around for a fore-aft arm/leg swing in the body's
+        // plane).  Derived once at bind capture from the bone's BIND
+        // world rotation so we never have to guess which bone-local
+        // axis (X / Y / Z) is the actual fore-aft hinge -- on this
+        // rig the upper_arm's bind rotates the bone into a hang-by-
+        // the-side pose, which permutes its X/Y/Z axes relative to
+        // the body, and guessing "X" or "Z" produced a useless twist
+        // around the bone's own length instead of an arm swing.
+        glm::vec3 swing_axis_local = glm::vec3(1.0f, 0.0f, 0.0f);
+        bool      swing_axis_valid = false;
     };
     bool                          bind_rots_captured_ = false;
     std::map<std::string, BoneBindRot> bind_rots_;

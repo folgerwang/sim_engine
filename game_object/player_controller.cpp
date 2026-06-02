@@ -712,23 +712,141 @@ void PlayerController::applyPose(
             "left_lower_leg",  "right_lower_leg",
             "spine",
         };
-        bool any_resolved = false;
+        // Root rotation present at the moment of bind capture.  Used
+        // below to derive each bone's BODY-relative bind rotation
+        // (world bind divided by the root yaw at this instant) so the
+        // computed swing_axis_local stays valid regardless of how the
+        // player turns later.
+        const glm::quat root_rot_at_capture =
+            axisAngleDeg(glm::vec3(0.0f, 1.0f, 0.0f), yaw_deg_);
+        const glm::quat root_rot_inv = glm::inverse(root_rot_at_capture);
+
+        int total_existing = 0;
+        int total_captured = 0;
         for (const char* nm : kBoneNames) {
             int idx = player->findNodeIndexByName(nm);
             if (idx < 0) continue; // bone missing on this rig — skip
+            total_existing++;
+
+            // ── Validate the world matrix first ─────────────────────
+            // The bone's world matrix is updated by DrawableObject's
+            // per-frame work, which may not have run yet on the first
+            // frame the rig becomes "ready".  Degenerate (all-zero)
+            // columns would collapse matRotation() to identity and
+            // then root_rot_inv would falsely look like the bone's
+            // body-frame rotation -- producing axis_local = world-
+            // right-at-capture-yaw for every bone (exactly what the
+            // diagnostic printed when this was broken).  Skip this
+            // bone for this frame; we'll retry next frame.
+            const glm::mat4 W = player->getNodeWorldMatrixByName(nm);
+            const glm::vec3 c0(W[0]), c1(W[1]), c2(W[2]);
+            if (glm::length(c0) < 1e-4f ||
+                glm::length(c1) < 1e-4f ||
+                glm::length(c2) < 1e-4f) {
+                continue;  // world matrix not populated yet
+            }
+
             BoneBindRot b;
-            b.rot      = player->getNodeRotationByName(nm);
             b.node_idx = idx;
+
+            // Treat a degenerate (zero-length) returned quaternion as
+            // identity.  glTF nodes with no explicit rotation field
+            // come back as (0,0,0,0) from getNodeRotationByName on
+            // this engine -- multiplying our swing dq by that wipes
+            // it back to zero, which is the reason arms have been
+            // looking frozen.  The visible "arm hangs at side" bind
+            // pose is actually driven by the skin's inverse-bind
+            // matrices (NOT by the bone's local rotation), so an
+            // identity local rotation is the correct interpretation.
+            const glm::quat raw = player->getNodeRotationByName(nm);
+            const float ql = std::sqrt(
+                raw.x * raw.x + raw.y * raw.y +
+                raw.z * raw.z + raw.w * raw.w);
+            b.rot = (ql > 0.5f)
+                ? raw
+                : glm::quat(1.0f, 0.0f, 0.0f, 0.0f); // identity
+
+            // Compute the swing axis (the bone-local axis post-bind
+            // that, when rotated around, moves the bone in the BODY's
+            // fore-aft plane).  Math: in the body's local frame, the
+            // player's right axis is (0, 0, -1) (matches right_world
+            // formula above when yaw=0).  We want to express that
+            // axis in the bone's post-bind LOCAL frame:
+            //   axis_local = R_arm_body^-1 * (0, 0, -1)
+            //   R_arm_body = root_at_capture^-1 * R_arm_world_bind
+            // The world matrix is now known good (checked above), so
+            // matRotation gives the real bone-bind world rotation
+            // including any clavicle/shoulder chain rotation, and the
+            // returned axis is in the bone's own post-bind local
+            // frame regardless of how the rig nests its bones.
+            const glm::quat R_world = matRotation(W);
+            const glm::quat R_body  = root_rot_inv * R_world;
+            const glm::vec3 axis    =
+                glm::inverse(R_body) * glm::vec3(0.0f, 0.0f, -1.0f);
+            const float al = glm::length(axis);
+            if (al > 1e-4f) {
+                b.swing_axis_local = axis / al;
+                b.swing_axis_valid = true;
+            }
+
             bind_rots_[nm] = b;
-            any_resolved = true;
+            total_captured++;
         }
-        // Only mark captured if at least one bone resolved — otherwise
-        // we're called before isReady() really populated the rig and
-        // would lock in identity rotations.  Re-tries on every frame
-        // until at least one bone name lands.
-        if (any_resolved) {
+        // Mark captured only when EVERY existing bone has captured
+        // valid bind data.  Anything less leaves some bones behind
+        // (their world matrix wasn't populated this frame) -- and
+        // those bones would then sit unposed forever because the flag
+        // stops the retry loop.  When total_captured < total_existing
+        // we fall through and try again next frame.
+        if (total_existing > 0 && total_captured == total_existing) {
             bind_rots_captured_ = true;
+            // One-shot diagnostic so we can verify the swing axes
+            // landed in something sensible (e.g. unit length, not all
+            // pointing along the bone's length).  If the printout
+            // shows the arm axes pointing along Y (the bone length),
+            // the rig's parent chain has a rotation we haven't
+            // accounted for and the math here needs adjusting.
+            auto pa = [&](const char* nm){
+                auto it = bind_rots_.find(nm);
+                if (it == bind_rots_.end()) {
+                    std::cout << "  " << nm << ": MISSING" << std::endl;
+                    return;
+                }
+                const auto& b = it->second;
+                std::cout << "  " << nm
+                          << " bind=(" << b.rot.x << "," << b.rot.y
+                          << "," << b.rot.z << "," << b.rot.w << ")"
+                          << " swing_axis_local=(" << b.swing_axis_local.x
+                          << "," << b.swing_axis_local.y
+                          << "," << b.swing_axis_local.z << ")"
+                          << " valid=" << b.swing_axis_valid
+                          << std::endl;
+            };
+            std::cout << "[bind_capture] yaw_at_capture=" << yaw_deg_
+                      << std::endl;
+            pa("left_upper_arm");
+            pa("right_upper_arm");
+            pa("left_upper_leg");
+            pa("right_upper_leg");
         }
+    }
+
+    // ── DIAGNOSTIC: render bind pose only ────────────────────────────
+    // Temporarily skip ALL procedural deformation (arm/leg swing, foot
+    // IK, step-anim, spine sway) and just write every captured bone's
+    // bind rotation.  The mesh then renders exactly at its bind pose,
+    // which (for the re-skinned rig) reproduces the source mesh.  Use
+    // this to confirm the SKIN is correct in isolation: if the body is
+    // intact and un-torn here but collapses once this flag is off, the
+    // fault is in the animation/IK posing the bones, not the weights.
+    // Set to false to restore normal procedural animation.
+    constexpr bool kRenderBindPoseOnly = false;
+    if (kRenderBindPoseOnly) {
+        for (const auto& kv : bind_rots_) {
+            player->setNodeRotationByName(kv.first, kv.second.rot);
+        }
+        pelvis_drop_ = 0.0f;
+        return;
     }
 
     // ── Procedural swing deltas (in bone-local space) ────────────────
@@ -742,16 +860,30 @@ void PlayerController::applyPose(
     const float swing     = std::sin(anim_phase_);
     const float swing_opp = -swing;
 
-    // Swing axis in BONE-LOCAL frame.  For most humanoid rigs exported
-    // from Blender/Mixamo/Maya, the bone's local X axis runs down the
-    // bone length and the local Z axis is "forward swing".  We rotate
-    // around local-X here as a starting point — that matches the
-    // existing applyPose code's intent and gives a reasonable swing
-    // for the scene-skinned.gltf auto-rig.  If a future rig needs a
-    // different axis, the bind-rot composition (below) means the swing
-    // remains in the bone's LOCAL frame regardless of how the bind
-    // rotation orients that frame in world space.
-    const glm::vec3 swing_axis_local(1, 0, 0);
+    // Swing axis in BONE-LOCAL frame = bone-local Z (0,0,1).
+    //
+    // Why Z, definitively (this rig: scene-skinned.gltf auto-rig):
+    //   • Every bone node is posed by TRANSLATION only -- all bind
+    //     rotations are identity -- so a bone's local frame is just the
+    //     model frame (the yaw lives in the ROOT node, above the bones).
+    //   • The shoulder bones are separated along Z (left z=-0.10,
+    //     right z=+0.10), so model-Z is the LEFT/RIGHT (pitch) axis and
+    //     model-X is FORWARD/BACK.  The arms hang down -Y, so a fore-aft
+    //     walk swing is a rotation about Z.  Rotating about X swings the
+    //     arm SIDEWAYS -- that was the old hardcoded (1,0,0) bug and is
+    //     the splayed/over-stretched arm pose seen while walking.
+    //   • The leg step-path already proved this empirically: its
+    //     kSwingAxis is (0,0,1) with the note "X swung sideways; Z gives
+    //     fore-aft".  Arms share the legs' hang-down geometry, so arms
+    //     use the same Z axis.
+    //
+    // Do NOT use the per-bone captured swing_axis_local here: on an
+    // all-identity-rotation rig that capture resolves to root_rot*right,
+    // which double-counts the body yaw (it came out ~(0.81,0,0.58) --
+    // mostly X = sideways), so it drives the arms out to the sides.
+    // A constant bone-local Z is both correct and yaw-robust because the
+    // yaw is applied by the root, not baked into the swing.
+    const glm::vec3 swing_axis_local(0, 0, 1);
 
     const glm::quat dq_l_arm   = axisAngleDeg(swing_axis_local, swing     * walk_arm_amp_deg);
     const glm::quat dq_r_arm   = axisAngleDeg(swing_axis_local, swing_opp * walk_arm_amp_deg);
@@ -877,66 +1009,47 @@ void PlayerController::applyPose(
         constexpr float kArmFactor   = 1.8f;  // larger arm swing (was 1.0; ~45deg peak vs ~25deg)
         constexpr float kElbowFactor = 0.35f; // slightly bigger elbow tuck to match (was 0.25)
         constexpr float kSpineFactor = 0.20f; // a little more counter-twist (was 0.15)
-        // Arms use bone-local X for fore-aft swing, NOT Z like the legs.
-        // On this rig the arm bone's local Y runs down the bone length
-        // (shoulder -> elbow), so rotating around Z mostly TWISTS the
-        // upper arm around its own axis (cosmetic shoulder roll) and
-        // barely moves the hand forward or back.  Rotating around X is
-        // the actual fore-aft swing hinge -- it's the same axis the
-        // non-step procedural swing already uses for arms in this file
-        // (search swing_axis_local(1,0,0) above), so we know X is the
-        // correct hinge for arms on this skeleton.  Sign flipped from
-        // the leg convention because the arm bone's local X points the
-        // opposite way down the body from the leg's local Z.
-        constexpr float kArmAxisSign = -1.0f;
-        const glm::vec3 kArmAxis(1.0f, 0.0f, 0.0f);    // bone-local X (fore-aft hinge for ARM)
         const glm::vec3 kSpineAxis(0.0f, 1.0f, 0.0f);  // body vertical twist
 
-        // Arms: opposite of same-side leg (kArmFactor sign), then the
-        // kArmAxisSign accounts for the arm bone's local X pointing the
-        // opposite direction down the body from the leg's local Z.  If
-        // arms swing in the SAME direction as same-side legs (clearly
-        // wrong for walking), flip kArmAxisSign back to +1.
-        const float arm_L_deg =
-            kArmAxisSign * -kArmFactor * step_angle_deg_[0];
-        const float arm_R_deg =
-            kArmAxisSign * -kArmFactor * step_angle_deg_[1];
+        // Sign flip per arm.  Leg theta convention: positive = foot
+        // ahead of body.  Real walking has arms swinging OPPOSITE to
+        // same-side leg (left arm BACK when left leg is FORWARD).  The
+        // (-) on each line below provides the opposition; if the arms
+        // come out moving WITH their same-side leg, flip the sign.
+        const float arm_L_deg = -kArmFactor * step_angle_deg_[0];
+        const float arm_R_deg = -kArmFactor * step_angle_deg_[1];
 
-        // Compose dq * bind (NOT bind * dq) so the swing axis is
-        // interpreted in the bone's PARENT (torso) frame rather than
-        // in the bone's own post-bind local frame.  With bind*dq the
-        // upper_arm bind already rotated the arm to hang down by the
-        // side, so bone-local X then points roughly along the arm's
-        // length -- rotating around it just rolled the bicep and made
-        // the arms look frozen.  dq*bind applies the rotation FIRST in
-        // the shoulder/torso frame (where X is a real horizontal
-        // forward/back hinge) and then the bind drops the arm to its
-        // side, so the swing is preserved as a visible fore-aft sweep.
-        auto applyBonePreDelta = [&](const char* name, const glm::quat& dq) {
+        // Swing the arms about bone-local Z, exactly like the legs.
+        //
+        // This used to use the per-bone captured swing_axis_local, but
+        // on this rig (every bone bind rotation is identity) that capture
+        // resolves to root_rot*right, double-counting the body yaw -- it
+        // came out ~(0.81,0,0.58) (mostly X), which swings the arms out
+        // to the SIDES instead of fore-aft.  Bone-local Z is the true
+        // fore-aft (pitch) hinge here (shoulders are separated along Z;
+        // arms hang -Y), and it matches the leg path's proven kSwingAxis.
+        const glm::vec3 kArmSwingAxis(0.0f, 0.0f, 1.0f);
+        auto applyBoneSwing = [&](const char* name, float deg) {
             auto it = bind_rots_.find(name);
             if (it == bind_rots_.end()) return;
-            const glm::quat& bind = it->second.rot;
-            player->setNodeRotationByName(name, dq * bind);
+            const BoneBindRot& b = it->second;
+            const glm::quat dq = axisAngleDeg(kArmSwingAxis, deg);
+            player->setNodeRotationByName(name, b.rot * dq);
         };
 
-        applyBonePreDelta("left_upper_arm",
-                          axisAngleDeg(kArmAxis, arm_L_deg));
-        applyBonePreDelta("right_upper_arm",
-                          axisAngleDeg(kArmAxis, arm_R_deg));
+        applyBoneSwing("left_upper_arm",  arm_L_deg);
+        applyBoneSwing("right_upper_arm", arm_R_deg);
 
-        // Elbows: bend INTO the swing (positive sign on |arm_deg|)
-        // so the forearm tucks slightly as the arm comes forward.
-        // Lower-arm is parented to upper-arm, so the parent frame for
-        // the elbow IS the upper-arm bone -- its local X points along
-        // the forearm at bind, and rotating around it bends the elbow.
-        // bind*dq still applies in the forearm's own frame, which after
-        // the upper-arm swing is "tucking in toward the body."
+        // Elbows: bend INTO the swing (positive sign on |arm_deg|) so
+        // the forearm tucks slightly as the arm comes forward.  The
+        // lower_arm has its own captured swing_axis_local relative to
+        // ITS bind (which is the rest forearm direction relative to
+        // the upper arm) -- it's already the right hinge for an
+        // elbow-flexion rotation.
         const float elbow_L_deg = kElbowFactor * std::fabs(arm_L_deg);
         const float elbow_R_deg = kElbowFactor * std::fabs(arm_R_deg);
-        applyBonePreDelta("left_lower_arm",
-                          axisAngleDeg(kArmAxis, elbow_L_deg));
-        applyBonePreDelta("right_lower_arm",
-                          axisAngleDeg(kArmAxis, elbow_R_deg));
+        applyBoneSwing("left_lower_arm",  elbow_L_deg);
+        applyBoneSwing("right_lower_arm", elbow_R_deg);
 
         // Spine: counter-twist the hip rotation.  When left leg is
         // ahead of right (theta_L > theta_R), shoulders rotate to
