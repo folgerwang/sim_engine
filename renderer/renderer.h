@@ -552,7 +552,13 @@ public:
         const ImageAspectFlags& src_aspect_flags,
         const ImageAspectFlags& dst_aspect_flags,
         const glm::ivec3& src_buffer_size,
-        const glm::ivec3& dst_buffer_size);
+        const glm::ivec3& dst_buffer_size,
+        // Optional destination sub-rectangle (editor viewport).  When
+        // dst_region_size is non-zero the source is scaled into
+        // [dst_offset, dst_offset + dst_region_size] of the dst image instead
+        // of the whole image; defaults reproduce the original full-image blit.
+        const glm::ivec3& dst_offset      = glm::ivec3(0, 0, 0),
+        const glm::ivec3& dst_region_size = glm::ivec3(0, 0, 0));
 
     static bool acquireNextImage(
         const std::shared_ptr<Device>& device,

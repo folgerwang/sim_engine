@@ -18,8 +18,10 @@ extern "C" {
 #endif
 
 #include "imgui.h"
+#include "imgui_internal.h"   // DockBuilder API for the editor default layout
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_vulkan.h"
+#include "game_object/drawable_object.h"  // Details panel reads object transform
 
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -719,6 +721,14 @@ bool Menu::draw(
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
+    // ── UE-style editor dock layout ───────────────────────────────────
+    // Drawn first (as a transparent pass-through host) so the 3D scene
+    // shows through the central viewport and the Outliner/Details/Content
+    // panels dock around it.  Only in-game; the title screen is untouched.
+    if (editor_enabled_ && game_state_ == GameState::InGame) {
+        drawEditorDockSpace();
+    }
+
     // ── Hover-object tooltip ──────────────────────────────────────────
     // application.cpp ray-picks the scene object under the mouse each
     // frame and pushes its name via setHoverObjectName().  Draw it in a
@@ -963,16 +973,15 @@ bool Menu::draw(
          classifier_status_ == ClassifierStatus::Ready   ||
          classifier_status_ == ClassifierStatus::Failed) &&
         collision_build_status_ != CollisionBuildStatus::Done) {
-        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        ImVec2 vp_pos, vp_size, vp_c;
+        getViewportScreenRect(vp_pos, vp_size, vp_c);
         const float bar_h = 44.0f;  // two rows + padding
-        // Half-width, horizontally centred on the viewport top edge
-        // (just below the main menu bar).  Was full-width; the user
-        // wanted it 50% shorter and centred so it sits as a compact
-        // pill rather than spanning the whole screen.
-        const float bar_w = mvp->Size.x * 0.5f;
-        const float bar_x = mvp->Pos.x + (mvp->Size.x - bar_w) * 0.5f;
+        // Half-width, horizontally centred on the VIEWPORT's top edge so the
+        // bar stays inside the 3D viewport rather than spanning the editor.
+        const float bar_w = vp_size.x * 0.5f;
+        const float bar_x = vp_pos.x + (vp_size.x - bar_w) * 0.5f;
         ImGui::SetNextWindowPos(
-            ImVec2(bar_x, mvp->Pos.y + ImGui::GetFrameHeight()),
+            ImVec2(bar_x, vp_pos.y + 6.0f),
             ImGuiCond_Always);
         ImGui::SetNextWindowSize(
             ImVec2(bar_w, bar_h),
@@ -1057,15 +1066,15 @@ bool Menu::draw(
     // Only while actively building; once Done, hide it (and the classifier
     // bar above) so both vanish the moment the simplified-mesh build ends.
     if (collision_build_status_ == CollisionBuildStatus::Building) {
-        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        ImVec2 vp_pos, vp_size, vp_c;
+        getViewportScreenRect(vp_pos, vp_size, vp_c);
         const float bar_h = 44.0f;
-        const float bar_w = mvp->Size.x * 0.5f;
-        const float bar_x = mvp->Pos.x + (mvp->Size.x - bar_w) * 0.5f;
-        // The LLM bar sits at GetFrameHeight(); this one sits one bar
-        // height + a small gap lower so they stack without overlapping.
+        const float bar_w = vp_size.x * 0.5f;
+        const float bar_x = vp_pos.x + (vp_size.x - bar_w) * 0.5f;
+        // Stack one bar-height + a small gap below the LLM bar (which sits at
+        // the viewport top), so the two pills don't overlap.
         const float gap = 6.0f;
-        const float bar_y =
-            mvp->Pos.y + ImGui::GetFrameHeight() + bar_h + gap;
+        const float bar_y = vp_pos.y + 6.0f + bar_h + gap;
         ImGui::SetNextWindowPos(ImVec2(bar_x, bar_y), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(bar_w, bar_h), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.80f);
@@ -1125,13 +1134,12 @@ bool Menu::draw(
     // doesn't fight the centred progress bars.  Lets you read off the
     // index of the broken mesh while scrubbing the slider.
     if (collision_isolate_enabled_ && !collision_isolate_info_.empty()) {
-        ImGuiViewport* mvp = ImGui::GetMainViewport();
-        // Pinned left, but pushed DOWN well below the on-screen clock
-        // widget (which sits in the top-left corner) so the two don't
-        // overlap.  Use Left/Right arrow keys to scrub the mesh index.
+        ImVec2 vp_pos, vp_size, vp_c;
+        getViewportScreenRect(vp_pos, vp_size, vp_c);
+        // Pinned to the viewport's top-left, pushed DOWN below the clock
+        // widget so they don't overlap.  Left/Right arrows scrub the index.
         ImGui::SetNextWindowPos(
-            ImVec2(mvp->Pos.x + 12.0f,
-                   mvp->Pos.y + ImGui::GetFrameHeight() + 150.0f),
+            ImVec2(vp_pos.x + 12.0f, vp_pos.y + 150.0f),
             ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.85f);
         if (ImGui::Begin("##coll_isolate_info", nullptr,
@@ -2418,9 +2426,7 @@ bool Menu::draw(
         const float win_h = row_h * 5.0f + 120.0f;
 
         // Centre on first appearance; user can move/resize freely after.
-        const ImVec2 vp_centre = {
-            vp_pos.x + float(screen_size.x) * 0.5f,
-            vp_pos.y + float(screen_size.y) * 0.5f };
+        const ImVec2 vp_centre = viewportCenter();
         ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
         if (ImGui::Begin("IBL / Sky Debug", &show_ibl_debug_)) {
@@ -2753,9 +2759,7 @@ bool Menu::draw(
     // look like a fuzzy depth map across the whole strip mean the
     // build is working and we can trust the sample side.
     if (show_hiz_debug_) {
-        const ImVec2 vp_centre = {
-            vp_pos.x + float(screen_size.x) * 0.5f,
-            vp_pos.y + float(screen_size.y) * 0.5f };
+        const ImVec2 vp_centre = viewportCenter();
         ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing,
                                 ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(800.0f, 220.0f), ImGuiCond_Appearing);
@@ -2816,9 +2820,7 @@ bool Menu::draw(
     // against the name column so the user can pinpoint a specific
     // material in the 500+-row scrollback.
     if (show_mesh_category_inspector_ && mesh_category_snapshot_valid_) {
-        const ImVec2 vp_centre = {
-            vp_pos.x + float(screen_size.x) * 0.5f,
-            vp_pos.y + float(screen_size.y) * 0.5f };
+        const ImVec2 vp_centre = viewportCenter();
         ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing,
                                 ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(620.0f, 540.0f),
@@ -2935,9 +2937,7 @@ bool Menu::draw(
         const float win_w = thumb * 6.0f + 80.0f;
         const float win_h = thumb * 2.0f + 200.0f;
 
-        const ImVec2 vp_centre = {
-            vp_pos.x + float(screen_size.x) * 0.5f,
-            vp_pos.y + float(screen_size.y) * 0.5f };
+        const ImVec2 vp_centre = viewportCenter();
         ImGui::SetNextWindowPos(vp_centre, ImGuiCond_Appearing,
                                 ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
@@ -3182,6 +3182,178 @@ void Menu::destroyResources() {
         clock_tex_info_.reset();
         clock_tex_id_ = ImTextureID(0);
     }
+}
+
+// ============================================================================
+//  Editor UI (UE-style docked layout)
+//
+//  A fullscreen, transparent DockSpace host covers the main viewport with a
+//  PASS-THROUGH central node, so the existing fullscreen 3D scene shows
+//  through the empty centre (the "Viewport"), while real, resizable panels
+//  dock around it: Outliner + Details tabbed top-right, Content Browser along
+//  the bottom.  No offscreen render target is needed; camera input is already
+//  gated by ImGui's WantCaptureMouse whenever the cursor is over a panel.
+// ============================================================================
+void Menu::getViewportScreenRect(ImVec2& pos, ImVec2& size, ImVec2& center) const {
+    ImGuiViewport* mvp = ImGui::GetMainViewport();
+    if (viewport_valid_ && editor_enabled_) {
+        pos  = ImVec2(mvp->Pos.x + viewport_pos_.x, mvp->Pos.y + viewport_pos_.y);
+        size = ImVec2(viewport_size_.x, viewport_size_.y);
+    } else {
+        pos = mvp->Pos; size = mvp->Size;
+    }
+    center = ImVec2(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
+}
+
+ImVec2 Menu::viewportCenter() const {
+    ImVec2 p, s, c; getViewportScreenRect(p, s, c); return c;
+}
+
+void Menu::drawEditorDockSpace() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    const ImGuiWindowFlags host_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize   | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDocking;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin("##EditorDockHost", nullptr, host_flags);
+    ImGui::PopStyleVar(3);
+
+    const ImGuiID dock_id = ImGui::GetID("EditorDockSpace");
+    ImGui::DockSpace(dock_id, ImVec2(0.0f, 0.0f),
+                     ImGuiDockNodeFlags_PassthruCentralNode);
+
+    // One-time default arrangement: full-width Content Browser along the
+    // bottom, Outliner+Details tabbed on the top-right, viewport = the
+    // remaining (pass-through) centre/top-left.
+    if (!editor_layout_built_) {
+        editor_layout_built_ = true;
+        ImGui::DockBuilderRemoveNode(dock_id);
+        ImGui::DockBuilderAddNode(dock_id,
+            ImGuiDockNodeFlags_DockSpace |
+            ImGuiDockNodeFlags_PassthruCentralNode);
+        ImGui::DockBuilderSetNodeSize(dock_id, vp->WorkSize);
+
+        ImGuiID center = dock_id;
+        ImGuiID bottom = ImGui::DockBuilderSplitNode(
+            center, ImGuiDir_Down, 0.26f, nullptr, &center);
+        ImGuiID right = ImGui::DockBuilderSplitNode(
+            center, ImGuiDir_Right, 0.24f, nullptr, &center);
+
+        ImGui::DockBuilderDockWindow("Content Browser", bottom);
+        ImGui::DockBuilderDockWindow("Outliner", right);
+        ImGui::DockBuilderDockWindow("Details",  right);   // tab with Outliner
+        ImGui::DockBuilderFinish(dock_id);
+    }
+
+    // Track the central node rect (the 3D Viewport region) so the app can
+    // match the camera aspect / scene render size to it.  Coords are in the
+    // main viewport's screen space; convert to window-local pixels.
+    if (ImGuiDockNode* cn = ImGui::DockBuilderGetCentralNode(dock_id)) {
+        viewport_pos_  = glm::vec2(cn->Pos.x - vp->Pos.x, cn->Pos.y - vp->Pos.y);
+        viewport_size_ = glm::vec2(cn->Size.x, cn->Size.y);
+        viewport_valid_ = (cn->Size.x > 4.0f && cn->Size.y > 4.0f);
+    } else {
+        viewport_valid_ = false;
+    }
+    ImGui::End();
+
+    drawOutlinerPanel();
+    drawDetailsPanel();
+    drawContentBrowserPanel();
+}
+
+void Menu::drawOutlinerPanel() {
+    if (ImGui::Begin("Outliner")) {
+        ImGui::TextDisabled("World  (%d objects)", (int)editor_objects_.size());
+        ImGui::Separator();
+        for (int i = 0; i < (int)editor_objects_.size(); ++i) {
+            const std::string label =
+                (editor_objects_[i].name.empty()
+                    ? ("Object " + std::to_string(i))
+                    : editor_objects_[i].name) + "##obj" + std::to_string(i);
+            if (ImGui::Selectable(label.c_str(), editor_selected_ == i))
+                editor_selected_ = i;
+        }
+        if (editor_objects_.empty())
+            ImGui::TextDisabled("(no scene objects yet)");
+    }
+    ImGui::End();
+}
+
+void Menu::drawDetailsPanel() {
+    if (ImGui::Begin("Details")) {
+        if (editor_selected_ >= 0 &&
+            editor_selected_ < (int)editor_objects_.size()) {
+            EditorSceneObject& o = editor_objects_[editor_selected_];
+            ImGui::Text("Name: %s", o.name.c_str());
+            ImGui::Separator();
+            if (o.obj) {
+                ImGui::SeparatorText("Transform");
+                glm::mat4 m = o.obj->getLocation();
+                glm::vec3 pos(m[3].x, m[3].y, m[3].z);
+                if (ImGui::DragFloat3("Location", &pos.x, 0.05f)) {
+                    o.obj->setInstanceRootTransform(
+                        pos, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+                }
+                ImGui::SeparatorText("Rendering");
+                bool vis = o.obj->isVisible();
+                if (ImGui::Checkbox("Visible", &vis)) o.obj->setVisible(vis);
+                ImGui::Text("Loaded: %s", o.obj->isReady() ? "yes" : "(streaming)");
+            } else {
+                ImGui::TextDisabled("(no drawable bound)");
+            }
+        } else {
+            ImGui::TextDisabled("Select an object in the Outliner.");
+        }
+    }
+    ImGui::End();
+}
+
+void Menu::drawContentBrowserPanel() {
+    namespace fs = std::filesystem;
+    if (ImGui::Begin("Content Browser")) {
+        if (ImGui::SmallButton("Up")) {
+            fs::path p(content_dir_);
+            if (p.has_parent_path() && !p.parent_path().empty())
+                content_dir_ = p.parent_path().string();
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(content_dir_.c_str());
+        ImGui::Separator();
+
+        std::error_code ec;
+        if (fs::exists(content_dir_, ec) && fs::is_directory(content_dir_, ec)) {
+            std::vector<std::string> dirs, files;
+            for (auto& e : fs::directory_iterator(content_dir_, ec)) {
+                if (e.is_directory()) dirs.push_back(e.path().filename().string());
+                else                  files.push_back(e.path().filename().string());
+            }
+            std::sort(dirs.begin(), dirs.end());
+            std::sort(files.begin(), files.end());
+            for (const auto& d : dirs) {
+                const std::string lbl = "[ " + d + " ]##d_" + d;
+                if (ImGui::Selectable(lbl.c_str(), false,
+                        ImGuiSelectableFlags_AllowDoubleClick) &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    content_dir_ = (fs::path(content_dir_) / d).string();
+                }
+            }
+            for (const auto& f : files)
+                ImGui::BulletText("%s", f.c_str());
+        } else {
+            ImGui::TextDisabled("(folder not found: %s)", content_dir_.c_str());
+        }
+    }
+    ImGui::End();
 }
 
 }//namespace ui

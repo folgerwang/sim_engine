@@ -16,9 +16,18 @@
 namespace plugins { class PluginManager; }
 
 namespace engine {
-namespace game_object { class MeshLoadTaskManager; }
+namespace game_object { class MeshLoadTaskManager; class DrawableObject; }
 namespace scene_rendering { class SSAO; class ClusterRenderer; class VirtualTextureManager; }
 namespace ui {
+
+// One entry in the editor Outliner.  The application rebuilds this list
+// each frame from its live scene objects (player, NPCs, drawables) and
+// hands it to the Menu via setSceneObjects().  `obj` is borrowed (the app
+// owns the shared_ptr) and used by the Details panel for transform/visibility.
+struct EditorSceneObject {
+    std::string                          name;
+    engine::game_object::DrawableObject* obj = nullptr;
+};
 
 // Game-level state machine driven by the title-screen menu.
 enum class GameState {
@@ -477,6 +486,45 @@ private:
     engine::scene_rendering::VirtualTextureManager* vt_manager_ = nullptr;
 
 public:
+    // ── Editor (UE-style docked layout) ───────────────────────────────
+    // Feed of live scene objects for the Outliner/Details panels, set by
+    // the application each frame.  editor_layout_built_ latches the one-time
+    // DockBuilder default arrangement.  content_dir_ is the Content Browser's
+    // current folder (relative to the working dir).
+    std::vector<EditorSceneObject> editor_objects_;
+    int          editor_selected_   = -1;
+    bool         editor_layout_built_ = false;
+    bool         editor_enabled_    = false;  // editor UI off unless --editor
+    std::string  content_dir_       = "assets";
+    // Screen-space rect (main-viewport pixels) of the dockspace central node
+    // = the 3D Viewport region.  The application reads this each frame to set
+    // the camera aspect and (next step) size the offscreen scene render.
+    glm::vec2    viewport_pos_      = glm::vec2(0.0f);
+    glm::vec2    viewport_size_     = glm::vec2(0.0f);
+    bool         viewport_valid_    = false;
+    void setSceneObjects(std::vector<EditorSceneObject> objs) {
+        editor_objects_ = std::move(objs);
+    }
+    void setEditorEnabled(bool e) { editor_enabled_ = e; }
+    bool isEditorEnabled() const  { return editor_enabled_; }
+    bool      isViewportValid() const { return viewport_valid_ && editor_enabled_; }
+    glm::vec2 getViewportPos()  const { return viewport_pos_; }
+    glm::vec2 getViewportSize() const { return viewport_size_; }
+    float     getViewportAspect() const {
+        return (viewport_size_.y > 1.0f) ? (viewport_size_.x / viewport_size_.y) : 1.0f;
+    }
+private:
+    void drawEditorDockSpace();   // host window + default layout
+    void drawOutlinerPanel();
+    void drawDetailsPanel();
+    void drawContentBrowserPanel();
+    // Absolute screen rect/centre of the editor Viewport (central dock node);
+    // falls back to the full main viewport when the editor is inactive.  Used
+    // to keep loading bars / dialog boxes inside the viewport, not over panels.
+    void   getViewportScreenRect(ImVec2& pos, ImVec2& size, ImVec2& center) const;
+    ImVec2 viewportCenter() const;
+public:
+
     void setBackgroundEnabled(bool enabled) { bg_enabled_ = enabled; }
     bool isBackgroundEnabled() const { return bg_enabled_; }
     void setGpuProfiler(engine::helper::GpuProfiler* profiler) {

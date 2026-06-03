@@ -931,7 +931,9 @@ void Helper::blitImage(
     const ImageAspectFlags& src_aspect_flags,
     const ImageAspectFlags& dst_aspect_flags,
     const glm::ivec3& src_buffer_size,
-    const glm::ivec3& dst_buffer_size) {
+    const glm::ivec3& dst_buffer_size,
+    const glm::ivec3& dst_offset,
+    const glm::ivec3& dst_region_size) {
     BarrierList barrier_list;
     barrier_list.image_barriers.reserve(2);
 
@@ -1000,7 +1002,17 @@ void Helper::blitImage(
     copy_region.src_offsets[0] = glm::ivec3(0, 0, 0);
     copy_region.src_offsets[1] = src_buffer_size;
     copy_region.dst_offsets[0] = glm::ivec3(0, 0, 0);
-    copy_region.dst_offsets[1] = dst_buffer_size;
+    // Destination sub-rectangle: full image by default, or [dst_offset,
+    // dst_offset + dst_region_size] when a non-zero region is supplied
+    // (editor viewport — scales the scene into the panel rect).
+    const bool use_sub_rect =
+        (dst_region_size.x > 0 && dst_region_size.y > 0);
+    copy_region.dst_offsets[0] = use_sub_rect ? dst_offset : glm::ivec3(0, 0, 0);
+    copy_region.dst_offsets[1] = use_sub_rect
+        ? glm::ivec3(dst_offset.x + dst_region_size.x,
+                     dst_offset.y + dst_region_size.y,
+                     1)
+        : dst_buffer_size;
     copy_region.src_subresource.aspect_mask = src_aspect_mask;
     copy_region.dst_subresource.aspect_mask = dst_aspect_mask;
 
@@ -1256,6 +1268,7 @@ void Helper::initImgui(
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;         // Enable docking (UE-style editor layout)
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;       // Enable Multi-Viewport / Platform Windows
 
     // Setup Dear ImGui style

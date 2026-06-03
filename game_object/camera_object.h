@@ -84,6 +84,12 @@ public:
         return m_view_camera_->getCameraInfo().view_proj;
     }
 
+    // Override the projection aspect ratio (width/height).  Used by the editor
+    // so the 3D framing matches the Viewport panel rather than the full window.
+    void setAspect(float aspect) {
+        if (aspect > 0.0f) m_view_camera_params_.aspect = aspect;
+    }
+
     virtual glm::vec3 getCameraPos() {
         return m_view_camera_->getCameraInfo().position;
     }
