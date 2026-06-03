@@ -724,8 +724,10 @@ bool Menu::draw(
     // ── UE-style editor dock layout ───────────────────────────────────
     // Drawn first (as a transparent pass-through host) so the 3D scene
     // shows through the central viewport and the Outliner/Details/Content
-    // panels dock around it.  Only in-game; the title screen is untouched.
-    if (editor_enabled_ && game_state_ == GameState::InGame) {
+    // panels dock around it.  Active from app start in editor mode (so the
+    // title screen + loading all happen inside the viewport), not just
+    // in-game.
+    if (editor_enabled_) {
         drawEditorDockSpace();
     }
 
@@ -1231,9 +1233,11 @@ bool Menu::draw(
 
     // Twilight backdrop + title banner — text now driven by XML config.
     if (show_title_ui) {
-        const ImGuiViewport* vp = ImGui::GetMainViewport();
-        const ImVec2 vp_pos = vp->Pos;
-        const float  vp_w   = vp->Size.x > 0.0f ? vp->Size.x : float(screen_size.x);
+        // Span the editor Viewport (or full window outside editor mode) so the
+        // title header sits at the top of the 3D view, correctly sized.
+        ImVec2 vp_pos, vp_sz, vp_c;
+        getViewportScreenRect(vp_pos, vp_sz, vp_c);
+        const float vp_w = vp_sz.x > 0.0f ? vp_sz.x : float(screen_size.x);
 
         const char* t_title    = title_config_.loaded ? title_config_.title.c_str()    : "Ashes of Eldra";
         const char* t_subtitle = title_config_.loaded ? title_config_.subtitle.c_str() : "chronicles of the fallen realm";
@@ -1254,8 +1258,9 @@ bool Menu::draw(
     if (game_state_ == GameState::TitleScreen && title_config_.loaded &&
         !title_config_.menu_items.empty()) {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
-        const float vp_w = vp->Size.x;
-        const float vp_h = vp->Size.y;
+        // Centre the menu in the editor Viewport (or full window otherwise).
+        ImVec2 mvp_pos, mvp_sz, mvp_c;
+        getViewportScreenRect(mvp_pos, mvp_sz, mvp_c);
 
         // Menu block: centred horizontally, lower-third vertically.
         const float item_w = 320.0f;
@@ -1263,8 +1268,8 @@ bool Menu::draw(
         const float spacing = 12.0f;
         const int   n_items = (int)title_config_.menu_items.size();
         const float block_h = n_items * item_h + (n_items - 1) * spacing;
-        const float start_x = vp->Pos.x + (vp_w - item_w) * 0.5f;
-        const float start_y = vp->Pos.y + vp_h * 0.52f;
+        const float start_x = mvp_pos.x + (mvp_sz.x - item_w) * 0.5f;
+        const float start_y = mvp_pos.y + mvp_sz.y * 0.52f;
 
         ImGui::SetNextWindowViewport(vp->ID);
         ImGui::SetNextWindowPos(ImVec2(start_x, start_y));
@@ -3107,9 +3112,12 @@ bool Menu::draw(
         constexpr float kPad      = 4.0f;
         const float kMenuH = ImGui::GetFrameHeight();
 
-        // Top-left anchor in screen space (below the menu bar).
-        const ImVec2 vp_min = ImGui::GetMainViewport()->Pos;
-        const ImVec2 origin(vp_min.x + 14.0f, vp_min.y + kMenuH + 8.0f);
+        // Top-left anchor: the editor Viewport's top-left (already below the
+        // menu bar) or the full window below the menu bar otherwise.
+        ImVec2 clk_pos, clk_size, clk_c;
+        getViewportScreenRect(clk_pos, clk_size, clk_c);
+        const float clk_top = isViewportValid() ? 8.0f : (kMenuH + 8.0f);
+        const ImVec2 origin(clk_pos.x + 14.0f, clk_pos.y + clk_top);
         const ImVec2 ctr(origin.x + kPad + kFaceSize * 0.5f,
                          origin.y + kPad + kFaceSize * 0.5f);
         const float  R = kFaceSize * 0.5f;
