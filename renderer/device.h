@@ -10,6 +10,15 @@ public:
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool(
         const std::source_location& src_location =
             std::source_location::current()) = 0;
+    // Bigger pool variant — same shape as the default factory but every
+    // pool-size slot (and maxSets) is multiplied by `size_multiplier`.
+    // Used by the application for `drawable_descriptor_pool_`, which
+    // services the streaming async mesh loader and easily blows past the
+    // default pool's COMBINED_IMAGE_SAMPLER budget on heavy scenes.
+    virtual std::shared_ptr<DescriptorPool> createDescriptorPool(
+        uint32_t size_multiplier,
+        const std::source_location& src_location =
+            std::source_location::current()) = 0;
     // Transient command buffer dispatch. When called from the loader
     // worker thread (registered via registerLoaderThread) the device
     // returns a worker-owned command buffer + fence + queue; otherwise

@@ -614,10 +614,12 @@ void Skydome::bindMiniSkyBoxTargets(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
     const renderer::TextureInfo& rt_envmap_tex) {
-    cube_skybox_mini_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            cube_skybox_mini_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!cube_skybox_mini_desc_set_)
+        cube_skybox_mini_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                cube_skybox_mini_desc_set_layout_, 1)[0];
 
     // We need a sampler for the scattering LUT entry.  Reuse the device's
     // default linear sampler kept by Skydome's caller; here we pass nullptr
@@ -688,13 +690,13 @@ void Skydome::recreate(
         skybox_pipeline_ = nullptr;
     }
 
-    skybox_tex_desc_set_ = nullptr;
-
     // skybox
-    skybox_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            skybox_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!skybox_tex_desc_set_)
+        skybox_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                skybox_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     auto skybox_texture_descs = addSkyboxTextures(
@@ -703,10 +705,12 @@ void Skydome::recreate(
         sky_scattering_lut_tex_.view);
     device->updateDescriptorSets(skybox_texture_descs);
 
-    sky_scattering_lut_first_pass_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            sky_scattering_lut_first_pass_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!sky_scattering_lut_first_pass_desc_set_)
+        sky_scattering_lut_first_pass_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                sky_scattering_lut_first_pass_desc_set_layout_, 1)[0];
     auto sky_scattering_lut_first_pass_texture_descs =
         addSkyScatteringLutFirstPassTextures(
             sky_scattering_lut_first_pass_desc_set_,
@@ -714,10 +718,12 @@ void Skydome::recreate(
     device->updateDescriptorSets(
         sky_scattering_lut_first_pass_texture_descs);
 
-    sky_scattering_lut_sum_pass_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            sky_scattering_lut_sum_pass_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!sky_scattering_lut_sum_pass_desc_set_)
+        sky_scattering_lut_sum_pass_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                sky_scattering_lut_sum_pass_desc_set_layout_, 1)[0];
     auto sky_scattering_lut_sum_pass_texture_descs =
         addSkyScatteringLutSumPassTextures(
             sky_scattering_lut_sum_pass_desc_set_,
@@ -726,10 +732,12 @@ void Skydome::recreate(
     device->updateDescriptorSets(
         sky_scattering_lut_sum_pass_texture_descs);
 
-    sky_scattering_lut_final_pass_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            sky_scattering_lut_final_pass_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!sky_scattering_lut_final_pass_desc_set_)
+        sky_scattering_lut_final_pass_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                sky_scattering_lut_final_pass_desc_set_layout_, 1)[0];
     auto sky_scattering_lut_final_pass_texture_descs =
         addSkyScatteringLutFinalPassTextures(
             sky_scattering_lut_final_pass_desc_set_,
@@ -926,18 +934,17 @@ void Skydome::initEnvmapBackgroundPipeline(
         device->destroyPipeline(skybox_envmap_pipeline_);
         skybox_envmap_pipeline_ = nullptr;
     }
-    // Descriptor set and layout are pool-allocated; the pool is recreated on
-    // swap-chain rebuild, so simply release the shared_ptrs.
-    skybox_envmap_desc_set_ = nullptr;
-    skybox_envmap_desc_set_layout_ = nullptr;
-
     // ── Descriptor set layout: envmap cubemap sampler at binding 0 ───────────
-    skybox_envmap_desc_set_layout_ =
-        device->createDescriptorSetLayout(
-            { er::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                ENVMAP_TEX_INDEX,
-                SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER) });
+    // persistent pool: the descriptor set (allocated below from this layout)
+    // is reused across resize, so the layout must also persist — recreating
+    // it would orphan the reused set's layout. Build it once.
+    if (!skybox_envmap_desc_set_layout_)
+        skybox_envmap_desc_set_layout_ =
+            device->createDescriptorSetLayout(
+                { er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                    ENVMAP_TEX_INDEX,
+                    SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+                    er::DescriptorType::COMBINED_IMAGE_SAMPLER) });
 
     // ── Pipeline layout: push constant carries SkyboxEnvmapParams (mat4) ─────
     er::PushConstantRange push_const_range{};
@@ -992,10 +999,12 @@ void Skydome::initEnvmapBackgroundPipeline(
         std::source_location::current());
 
     // ── Descriptor set: bind rt_envmap_tex as the source cubemap sampler ─────
-    skybox_envmap_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            skybox_envmap_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!skybox_envmap_desc_set_)
+        skybox_envmap_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                skybox_envmap_desc_set_layout_, 1)[0];
 
     er::WriteDescriptorList desc_writes;
     er::Helper::addOneTexture(

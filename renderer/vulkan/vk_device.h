@@ -92,6 +92,10 @@ public:
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool(
         const std::source_location& src_location =
             std::source_location::current()) final;
+    virtual std::shared_ptr<DescriptorPool> createDescriptorPool(
+        uint32_t size_multiplier,
+        const std::source_location& src_location =
+            std::source_location::current()) final;
     virtual void createBuffer(
         const uint64_t& buffer_size,
         const BufferUsageFlags& usage,

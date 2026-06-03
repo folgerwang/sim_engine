@@ -285,26 +285,34 @@ void SSAO::recreate(
         std::source_location::current());
 
     // ── SSAO descriptor set ──
-    ssao_desc_set_ = device->createDescriptorSets(
-        descriptor_pool, ssao_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!ssao_desc_set_)
+        ssao_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, ssao_desc_set_layout_, 1)[0];
     writeSSAODescriptors(device, ssao_desc_set_, texture_sampler,
                          depth_view, noise_tex_.view, ao_raw_tex_.view);
 
     // ── Blur H: raw → blurred ──
-    blur_h_desc_set_ = device->createDescriptorSets(
-        descriptor_pool, blur_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!blur_h_desc_set_)
+        blur_h_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, blur_desc_set_layout_, 1)[0];
     writeBlurDescriptors(device, blur_h_desc_set_, texture_sampler,
                          ao_raw_tex_.view, depth_view, ao_blurred_tex_.view);
 
     // ── Blur V: blurred → raw (ping-pong back) ──
-    blur_v_desc_set_ = device->createDescriptorSets(
-        descriptor_pool, blur_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!blur_v_desc_set_)
+        blur_v_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, blur_desc_set_layout_, 1)[0];
     writeBlurDescriptors(device, blur_v_desc_set_, texture_sampler,
                          ao_blurred_tex_.view, depth_view, ao_raw_tex_.view);
 
     // ── Apply: raw AO (after V blur) × color ──
-    apply_desc_set_ = device->createDescriptorSets(
-        descriptor_pool, apply_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!apply_desc_set_)
+        apply_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, apply_desc_set_layout_, 1)[0];
     writeApplyDescriptors(device, apply_desc_set_, texture_sampler,
                           ao_raw_tex_.view, hdr_color_view);
 }

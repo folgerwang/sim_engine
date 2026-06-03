@@ -102,7 +102,18 @@ public:
 
     // Main-thread tick. Runs phase3_fn for any in-flight tasks whose
     // fence has signaled. Cheap when nothing is ready.
-    void poll();
+    //
+    // `max_finalize_per_call` caps how many ready tasks have their
+    // phase3_fn invoked in this poll.  The natural per-frame call should
+    // pass a small number (e.g. 4) so a burst of fence completions —
+    // typical right after recreateSwapChain's waitIdle() — doesn't drain
+    // 50+ phase3 lambdas in one tick (each allocating dozens of
+    // descriptor sets, which can clip the descriptor-pool ceiling).
+    // Tasks that don't make it stay in in_flight_tasks_; their fences
+    // are still signaled and they'll be picked up on the next call.
+    // Pass 0 (or any value >= number ready) to drain everything — used
+    // by waitAll() and during shutdown.
+    void poll(size_t max_finalize_per_call = 0);
 
     // Block until every submitted task has either finalized or errored.
     // Useful at shutdown or for the startup-asset barrier.

@@ -397,14 +397,13 @@ void VolumeCloud::recreate(
         blur_image_y_merge_pipeline_ = nullptr;
     }
 
-    blur_image_x_tex_desc_set_ = nullptr;
-    blur_image_y_merge_tex_desc_set_ = nullptr;
-
     // fog cloud
-    blur_image_x_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            blur_image_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!blur_image_x_tex_desc_set_)
+        blur_image_x_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                blur_image_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     auto cloud_texture_descs = addBlurImageTextures(
@@ -415,10 +414,12 @@ void VolumeCloud::recreate(
         src_depth);
     device->updateDescriptorSets(cloud_texture_descs);
 
-    blur_image_y_merge_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            blur_image_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!blur_image_y_merge_tex_desc_set_)
+        blur_image_y_merge_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                blur_image_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     cloud_texture_descs = addBlurImageTextures(
@@ -451,12 +452,12 @@ void VolumeCloud::recreate(
             std::source_location::current());
 
     for (auto dbuf_idx = 0; dbuf_idx < 2; dbuf_idx++) {
-        render_cloud_fog_desc_set_[dbuf_idx] = nullptr;
-
-        render_cloud_fog_desc_set_[dbuf_idx] =
-            device->createDescriptorSets(
-                descriptor_pool,
-                render_cloud_fog_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!render_cloud_fog_desc_set_[dbuf_idx])
+            render_cloud_fog_desc_set_[dbuf_idx] =
+                device->createDescriptorSets(
+                    descriptor_pool,
+                    render_cloud_fog_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto render_cloud_fog_texture_descs = addCloudFogTextures(

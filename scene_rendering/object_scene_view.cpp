@@ -255,14 +255,18 @@ void ObjectSceneView::recreate(
     // Re-allocate tile-resource descriptor sets from the (new) pool.
     // m_descriptor_pool_ is a reference to the application's pool, so
     // it already points to the freshly-created pool.
-    m_tile_res_desc_sets_.clear();
-    m_tile_res_desc_sets_.resize(2);
+    // persistent pool: allocate once, reuse across resize
+    if (m_tile_res_desc_sets_.size() < 2) {
+        m_tile_res_desc_sets_.resize(2);
+    }
     for (int idx = 0; idx < 2; idx++) {
-        m_tile_res_desc_sets_[idx] =
-            m_device_->createDescriptorSets(
-                m_descriptor_pool_,
-                ego::TileObject::getTileResDescSetLayout(),
-                1)[0];
+        if (!m_tile_res_desc_sets_[idx]) {
+            m_tile_res_desc_sets_[idx] =
+                m_device_->createDescriptorSets(
+                    m_descriptor_pool_,
+                    ego::TileObject::getTileResDescSetLayout(),
+                    1)[0];
+        }
     }
 }
 

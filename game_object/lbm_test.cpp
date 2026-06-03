@@ -184,9 +184,11 @@ void LbmTest::recreate(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::shared_ptr<renderer::TextureInfo>& lbm_patch_tex) {
 
-    lbm_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool, lbm_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!lbm_desc_set_)
+        lbm_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool, lbm_desc_set_layout_, 1)[0];
 
     auto lbm_test_material_descs =
         addLbmTestTextures(

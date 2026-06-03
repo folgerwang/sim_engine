@@ -357,10 +357,12 @@ void VolumeNoise::recreate(
     erh::releasePipeline(device, noise_init_pipeline_);
 
     // perlin noise texture init.
-    detail_noise_init_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            noise_init_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!detail_noise_init_tex_desc_set_)
+        detail_noise_init_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                noise_init_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     auto detail_noise_init_texture_descs =
@@ -370,10 +372,12 @@ void VolumeNoise::recreate(
             detail_noise_tex_);
     device->updateDescriptorSets(detail_noise_init_texture_descs);
 
-    rough_noise_init_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            noise_init_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!rough_noise_init_tex_desc_set_)
+        rough_noise_init_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                noise_init_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     auto rough_noise_init_texture_descs =

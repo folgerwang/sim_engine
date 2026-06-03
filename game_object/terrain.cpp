@@ -2532,8 +2532,10 @@ void TileObject::generateStaticDescriptorSet(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const std::shared_ptr<renderer::ImageView>& heightmap_tex) {
     // tile creator buffer set.
-    creator_buffer_desc_set_ = device->createDescriptorSets(
-        descriptor_pool, tile_creator_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!creator_buffer_desc_set_)
+        creator_buffer_desc_set_ = device->createDescriptorSets(
+            descriptor_pool, tile_creator_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     // all world map buffer only create once, so always pick the first one.
@@ -2548,8 +2550,10 @@ void TileObject::generateStaticDescriptorSet(
 
     // tile creator buffer set.
     for (int dbuf_idx = 0; dbuf_idx < 2; dbuf_idx++) {
-        tile_update_buffer_desc_set_[dbuf_idx] = device->createDescriptorSets(
-            descriptor_pool, tile_update_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!tile_update_buffer_desc_set_[dbuf_idx])
+            tile_update_buffer_desc_set_[dbuf_idx] = device->createDescriptorSets(
+                descriptor_pool, tile_update_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         texture_descs = addTileUpdateBuffers(
@@ -2560,8 +2564,10 @@ void TileObject::generateStaticDescriptorSet(
             s_water_normal_);
         device->updateDescriptorSets(texture_descs);
 
-        tile_flow_update_buffer_desc_set_[dbuf_idx] = device->createDescriptorSets(
-            descriptor_pool, tile_flow_update_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!tile_flow_update_buffer_desc_set_[dbuf_idx])
+            tile_flow_update_buffer_desc_set_[dbuf_idx] = device->createDescriptorSets(
+                descriptor_pool, tile_flow_update_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         texture_descs = addTileFlowUpdateBuffers(

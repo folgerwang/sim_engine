@@ -94,7 +94,7 @@ std::shared_ptr<MeshLoadTask> MeshLoadTaskManager::submit(
     return task;
 }
 
-void MeshLoadTaskManager::poll() {
+void MeshLoadTaskManager::poll(size_t max_finalize_per_call) {
     if (!async_enabled_) {
         // Sync path finalizes inside submit(); nothing to poll.
         return;
@@ -104,11 +104,18 @@ void MeshLoadTaskManager::poll() {
     // drop the lock before calling phase3_fn — phase3 may re-enter the
     // manager (creating sub-uploads, logging, etc.) and we don't want the
     // lock held across user code.
+    //
+    // `max_finalize_per_call` (0 == unlimited) caps the batch — see the
+    // header comment for the rationale.
     std::vector<std::shared_ptr<MeshLoadTask>> ready;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         auto it = in_flight_tasks_.begin();
         while (it != in_flight_tasks_.end()) {
+            if (max_finalize_per_call != 0 &&
+                ready.size() >= max_finalize_per_call) {
+                break;
+            }
             auto& task = *it;
             if (task->fence && device_->isFenceSignaled(task->fence)) {
                 ready.push_back(task);

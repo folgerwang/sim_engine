@@ -112,10 +112,12 @@ CameraObject::CameraObject(
 
 void CameraObject::recreateDescriptorSet() {
     assert(s_view_camera_desc_set_layout_ != nullptr);
-    m_view_camera_desc_set_ =
-        m_device_->createDescriptorSets(
-            m_descriptor_pool_,
-            s_view_camera_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!m_view_camera_desc_set_)
+        m_view_camera_desc_set_ =
+            m_device_->createDescriptorSets(
+                m_descriptor_pool_,
+                s_view_camera_desc_set_layout_, 1)[0];
 
     er::WriteDescriptorList buffer_descs;
     buffer_descs.reserve(1);

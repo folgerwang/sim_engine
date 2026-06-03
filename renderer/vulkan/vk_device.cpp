@@ -788,6 +788,49 @@ std::shared_ptr<RenderPass> VulkanDevice::createRenderPass(
     return vk_render_pass;
 }
 
+// ── Descriptor pool factory helper ─────────────────────────────────
+// Spawn a Vulkan descriptor pool against the given template.  Used both
+// by VulkanDevice::createDescriptorPool (primary pool) and by
+// VulkanDevice::createDescriptorSets when it has to add an overflow pool
+// to the same VulkanDescriptorPool wrapper after vkAllocateDescriptorSets
+// returned VK_ERROR_OUT_OF_POOL_MEMORY / VK_ERROR_FRAGMENTED_POOL.  Kept
+// at file scope (not a member) so we can reuse it from the anonymous
+// helper namespace at the top of this file's TU without dragging the
+// VulkanDevice header into a public surface.
+namespace {
+VkDescriptorPool createVkDescriptorPoolFromTemplate(
+    VkDevice device,
+    const std::vector<VkDescriptorPoolSize>& pool_sizes,
+    VkDescriptorPoolCreateFlags flags,
+    uint32_t max_sets,
+    const std::source_location& src_location) {
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.flags = flags;
+    pool_info.maxSets = max_sets;
+    pool_info.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+    pool_info.pPoolSizes = pool_sizes.data();
+
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    auto result =
+        vkCreateDescriptorPool(
+            device,
+            &pool_info,
+            nullptr,
+            &descriptor_pool);
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to create descriptor pool! : ") +
+            VkResultToString(result));
+    }
+
+    nameVkObject(device, VK_OBJECT_TYPE_DESCRIPTOR_POOL,
+                 reinterpret_cast<uint64_t>(descriptor_pool), src_location);
+    return descriptor_pool;
+}
+}  // namespace
+
 DescriptorSetList VulkanDevice::createDescriptorSets(
     std::shared_ptr<DescriptorPool> descriptor_pool,
     std::shared_ptr<DescriptorSetLayout> descriptor_set_layout,
@@ -796,20 +839,71 @@ DescriptorSetList VulkanDevice::createDescriptorSets(
     auto vk_descriptor_pool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool);
     auto vk_descriptor_set_layout = RENDER_TYPE_CAST(DescriptorSetLayout, descriptor_set_layout);
     std::vector<VkDescriptorSetLayout> layouts(buffer_count, vk_descriptor_set_layout->get());
-    VkDescriptorSetAllocateInfo alloc_info{};
-    alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc_info.descriptorPool = vk_descriptor_pool->get();
-    alloc_info.descriptorSetCount = static_cast<uint32_t>(buffer_count);
-    alloc_info.pSetLayouts = layouts.data();
 
     std::vector<VkDescriptorSet> vk_desc_sets;
     vk_desc_sets.resize(buffer_count);
 
-    auto result =
-        vkAllocateDescriptorSets(
-            device_,
-            &alloc_info,
-            vk_desc_sets.data());
+    // Try the pool's currently-active sub-pool (primary, or the most
+    // recent overflow pool if any).  On VK_ERROR_OUT_OF_POOL_MEMORY or
+    // VK_ERROR_FRAGMENTED_POOL we spawn a fresh overflow pool with the
+    // same template and retry — game engines virtually never use a single
+    // fixed pool for streaming assets, so this is the standard pattern.
+    // The retry is bounded (a handful of attempts) to surface genuine
+    // configuration problems instead of looping forever.
+    constexpr int kMaxOverflowRetries = 4;
+    VkResult result = VK_ERROR_OUT_OF_POOL_MEMORY;
+    for (int attempt = 0; attempt < 1 + kMaxOverflowRetries; ++attempt) {
+        VkDescriptorSetAllocateInfo alloc_info{};
+        alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc_info.descriptorPool = vk_descriptor_pool->currentPool();
+        alloc_info.descriptorSetCount = static_cast<uint32_t>(buffer_count);
+        alloc_info.pSetLayouts = layouts.data();
+
+        result =
+            vkAllocateDescriptorSets(
+                device_,
+                &alloc_info,
+                vk_desc_sets.data());
+
+        if (result == VK_SUCCESS) {
+            break;
+        }
+
+        // Only spawn an overflow pool for the two recoverable cases.
+        // Any other failure is a real error (out-of-host-memory, invalid
+        // parameter, etc.) and is rethrown below.
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY &&
+            result != VK_ERROR_FRAGMENTED_POOL) {
+            break;
+        }
+
+        // Defensive: if this pool wasn't created via createDescriptorPool
+        // (e.g. legacy handle without a recorded template), we have no way
+        // to spawn a matching overflow.  Bail out.
+        if (vk_descriptor_pool->poolSizesTemplate().empty() ||
+            vk_descriptor_pool->poolMaxSets() == 0) {
+            break;
+        }
+
+        VkDescriptorPool overflow =
+            createVkDescriptorPoolFromTemplate(
+                device_,
+                vk_descriptor_pool->poolSizesTemplate(),
+                vk_descriptor_pool->poolCreateFlags(),
+                vk_descriptor_pool->poolMaxSets(),
+                src_location);
+        vk_descriptor_pool->pushOverflow(overflow);
+
+        std::cerr
+            << "[DESCPOOL] " << VkResultToString(result)
+            << " allocating " << buffer_count
+            << " set(s); spawned overflow pool #"
+            << vk_descriptor_pool->overflowPools().size()
+            << " (called from " << src_location.file_name()
+            << ":" << src_location.line() << ")"
+            << std::endl;
+        // Loop and retry against the freshly created overflow pool.
+    }
 
     if (result != VK_SUCCESS) {
         throw std::runtime_error(
@@ -1292,7 +1386,18 @@ std::shared_ptr<Framebuffer> VulkanDevice::createFrameBuffer(
 
 std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool(
     const std::source_location& src_location) {
-    VkDescriptorPoolSize pool_sizes[] =
+    return createDescriptorPool(/*size_multiplier*/1, src_location);
+}
+
+std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool(
+    uint32_t size_multiplier,
+    const std::source_location& src_location) {
+    if (size_multiplier == 0) size_multiplier = 1;
+
+    // Base sizes — same as before.  See note above about the 2048 bump.
+    // Anything streaming-heavy should request a multiplier >= 4 via the
+    // size_multiplier overload (drawable_descriptor_pool_ uses 4).
+    std::vector<VkDescriptorPoolSize> pool_sizes =
     {
         { VK_DESCRIPTOR_TYPE_SAMPLER, 16 },
         // Bumped 1024 -> 2048: ImGui shares this pool (init_info.DescriptorPool),
@@ -1314,32 +1419,27 @@ std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool(
         { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 256 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 256 }
     };
-    VkDescriptorPoolCreateInfo pool_info = {};
-    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool_info.maxSets = 256 * IM_ARRAYSIZE(pool_sizes);
-    pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
-    pool_info.pPoolSizes = pool_sizes;
-
-    VkDescriptorPool descriptor_pool;
-    auto result =
-        vkCreateDescriptorPool(
-            device_,
-            &pool_info,
-            nullptr,
-            &descriptor_pool);
-
-    if (result != VK_SUCCESS) {
-        throw std::runtime_error(
-            std::string("failed to create descriptor pool! : ") +
-            VkResultToString(result));
+    if (size_multiplier > 1) {
+        for (auto& s : pool_sizes) {
+            s.descriptorCount *= size_multiplier;
+        }
     }
 
-    nameVkObject(device_, VK_OBJECT_TYPE_DESCRIPTOR_POOL,
-                 reinterpret_cast<uint64_t>(descriptor_pool), src_location);
+    const VkDescriptorPoolCreateFlags flags =
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    const uint32_t max_sets =
+        256u * static_cast<uint32_t>(pool_sizes.size()) * size_multiplier;
+
+    VkDescriptorPool descriptor_pool =
+        createVkDescriptorPoolFromTemplate(
+            device_, pool_sizes, flags, max_sets, src_location);
+
     auto vk_descriptor_pool =
         std::make_shared<VulkanDescriptorPool>();
     vk_descriptor_pool->set(descriptor_pool);
+    // Stash the create-info template so createDescriptorSets can spawn
+    // overflow pools with identical capacity if the primary fills up.
+    vk_descriptor_pool->recordCreateInfo(pool_sizes, flags, max_sets);
     return vk_descriptor_pool;
 }
 
@@ -1672,6 +1772,15 @@ void VulkanDevice::destroySwapchain(std::shared_ptr<Swapchain> swapchain) {
 void VulkanDevice::destroyDescriptorPool(std::shared_ptr<DescriptorPool> descriptor_pool) {
     auto vk_descriptor_pool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool);
     if (vk_descriptor_pool) {
+        // Destroy overflow pools first, then the primary.  Order doesn't
+        // strictly matter to Vulkan (pools are independent), but doing it
+        // this way mirrors the allocation order and keeps debugger output
+        // intuitive.
+        for (auto overflow : vk_descriptor_pool->overflowPools()) {
+            if (overflow != VK_NULL_HANDLE) {
+                vkDestroyDescriptorPool(device_, overflow, nullptr);
+            }
+        }
         vkDestroyDescriptorPool(device_, vk_descriptor_pool->get(), nullptr);
     }
 }

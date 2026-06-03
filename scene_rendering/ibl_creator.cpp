@@ -391,18 +391,20 @@ void IblCreator::bindIblMiniTargets(
     auto build_per_mip_desc_sets = [&](
         std::vector<std::shared_ptr<er::DescriptorSet>>& dst_sets,
         const std::vector<std::shared_ptr<er::ImageView>>& dst_views) {
-        dst_sets.clear();
-        dst_sets.reserve(dst_views.size());
-        for (const auto& view : dst_views) {
-            auto desc_set = device->createDescriptorSets(
-                descriptor_pool, ibl_mini_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize. The per-mip
+        // cube views were rebuilt above (new ImageView objects), so each
+        // reused set's binding-write must still be re-issued below.
+        while (dst_sets.size() < dst_views.size())
+            dst_sets.push_back(
+                device->createDescriptorSets(
+                    descriptor_pool, ibl_mini_desc_set_layout_, 1)[0]);
+        for (size_t i = 0; i < dst_views.size(); ++i) {
             auto writes = addIblMiniTextures(
-                desc_set,
+                dst_sets[i],
                 texture_sampler,
                 rt_envmap_tex_.view,
-                view);
+                dst_views[i]);
             device->updateDescriptorSets(writes);
-            dst_sets.push_back(desc_set);
         }
     };
 
@@ -574,9 +576,11 @@ void IblCreator::createDescriptorSets(
     // envmap
     {
         // only one descriptor layout.
-        envmap_tex_desc_set_ =
-            device->createDescriptorSets(
-                descriptor_pool, ibl_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!envmap_tex_desc_set_)
+            envmap_tex_desc_set_ =
+                device->createDescriptorSets(
+                    descriptor_pool, ibl_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto ibl_texture_descs = addPanoramaTextures(
@@ -589,8 +593,10 @@ void IblCreator::createDescriptorSets(
     // ibl
     {
         // only one descriptor layout.
-        ibl_tex_desc_set_ = device->createDescriptorSets(
-            descriptor_pool, ibl_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!ibl_tex_desc_set_)
+            ibl_tex_desc_set_ = device->createDescriptorSets(
+                descriptor_pool, ibl_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto ibl_texture_descs = addIblTextures(
@@ -620,8 +626,10 @@ void IblCreator::createDescriptorSets(
     // doubly-low-pass-filtered, increasingly desaturated steady state.
     // Swapping src/dst breaks that loop entirely.
     {
-        ibl_diffuse_tex_desc_set_ = device->createDescriptorSets(
-            descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!ibl_diffuse_tex_desc_set_)
+            ibl_diffuse_tex_desc_set_ = device->createDescriptorSets(
+                descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
 
         auto ibl_texture_descs = addIblComputeTextures(
             ibl_diffuse_tex_desc_set_,
@@ -634,8 +642,10 @@ void IblCreator::createDescriptorSets(
     // ibl specular compute
     {
         // only one descriptor layout.
-        ibl_specular_tex_desc_set_ = device->createDescriptorSets(
-            descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!ibl_specular_tex_desc_set_)
+            ibl_specular_tex_desc_set_ = device->createDescriptorSets(
+                descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto ibl_texture_descs = addIblComputeTextures(
@@ -649,8 +659,10 @@ void IblCreator::createDescriptorSets(
     // ibl sheen compute
     {
         // only one descriptor layout.
-        ibl_sheen_tex_desc_set_ = device->createDescriptorSets(
-            descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!ibl_sheen_tex_desc_set_)
+            ibl_sheen_tex_desc_set_ = device->createDescriptorSets(
+                descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto ibl_texture_descs = addIblComputeTextures(

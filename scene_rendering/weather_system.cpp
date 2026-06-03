@@ -447,11 +447,12 @@ void WeatherSystem::recreate(
     erh::releasePipelineLayout(device, cloud_shadow_merge_pipeline_layout_);
     erh::releasePipeline(device, cloud_shadow_merge_pipeline_);
 
-    temperature_init_tex_desc_set_ = nullptr;
-    temperature_init_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            temperature_init_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!temperature_init_tex_desc_set_)
+        temperature_init_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                temperature_init_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     auto temperature_init_texture_descs = addTemperatureInitTextures(
@@ -462,11 +463,12 @@ void WeatherSystem::recreate(
     device->updateDescriptorSets(temperature_init_texture_descs);
 
     for (int dbuf_idx = 0; dbuf_idx < 2; dbuf_idx++) {
-        airflow_tex_desc_set_[dbuf_idx] = nullptr;
-        airflow_tex_desc_set_[dbuf_idx] =
-            device->createDescriptorSets(
-                descriptor_pool,
-                airflow_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!airflow_tex_desc_set_[dbuf_idx])
+            airflow_tex_desc_set_[dbuf_idx] =
+                device->createDescriptorSets(
+                    descriptor_pool,
+                    airflow_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto airflow_texture_descs = addAirflowTextures(
@@ -483,11 +485,12 @@ void WeatherSystem::recreate(
             soil_water_layer_tex[dbuf_idx]);
         device->updateDescriptorSets(airflow_texture_descs);
 
-        cloud_shadow_tex_desc_set_[dbuf_idx] = nullptr;
-        cloud_shadow_tex_desc_set_[dbuf_idx] =
-            device->createDescriptorSets(
-                descriptor_pool,
-                cloud_shadow_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!cloud_shadow_tex_desc_set_[dbuf_idx])
+            cloud_shadow_tex_desc_set_[dbuf_idx] =
+                device->createDescriptorSets(
+                    descriptor_pool,
+                    cloud_shadow_desc_set_layout_, 1)[0];
 
         // create a global ibl texture descriptor set.
         auto cloud_shadow_texture_descs = addCloudShadowTextures(
@@ -498,11 +501,12 @@ void WeatherSystem::recreate(
         device->updateDescriptorSets(cloud_shadow_texture_descs);
     }
 
-    cloud_shadow_merge_tex_desc_set_ = nullptr;
-    cloud_shadow_merge_tex_desc_set_ =
-        device->createDescriptorSets(
-            descriptor_pool,
-            cloud_shadow_merge_desc_set_layout_, 1)[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!cloud_shadow_merge_tex_desc_set_)
+        cloud_shadow_merge_tex_desc_set_ =
+            device->createDescriptorSets(
+                descriptor_pool,
+                cloud_shadow_merge_desc_set_layout_, 1)[0];
 
     // create a global ibl texture descriptor set.
     auto cloud_shadow_merge_tex_descs = addCloudShadowMergeTextures(

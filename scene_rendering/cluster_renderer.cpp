@@ -2921,10 +2921,17 @@ void ClusterRenderer::ensureOitTargets(const glm::uvec2& size) {
 
     oit_target_size_ = size;
 
-    // (Re)allocate the composite descriptor set against the new views.
+    // (Re)write the composite descriptor set against the new views.
+    // persistent pool: allocate once, reuse across resize — the OIT
+    // targets are rebuilt at the new size above, so the set's bindings
+    // are re-pointed at the fresh accum/reveal views below, but the set
+    // handle itself is reused rather than reallocated (reallocating on
+    // every size change would leak into the now-persistent pool).
     if (descriptor_pool_ && oit_composite_desc_set_layout_) {
-        oit_composite_desc_set_ = device_->createDescriptorSets(
-            descriptor_pool_, oit_composite_desc_set_layout_, 1)[0];
+        if (!oit_composite_desc_set_) {
+            oit_composite_desc_set_ = device_->createDescriptorSets(
+                descriptor_pool_, oit_composite_desc_set_layout_, 1)[0];
+        }
 
         er::WriteDescriptorList writes;
         er::Helper::addOneTexture(writes, oit_composite_desc_set_,
@@ -4020,9 +4027,12 @@ void ClusterRenderer::recreate(
     descriptor_pool_ = descriptor_pool;
 
     // Re-allocate bindless descriptor set.
-    auto desc_sets = device_->createDescriptorSets(
-        descriptor_pool_, bindless_desc_set_layout_, 1);
-    bindless_desc_set_ = desc_sets[0];
+    // persistent pool: allocate once, reuse across resize
+    if (!bindless_desc_set_) {
+        auto desc_sets = device_->createDescriptorSets(
+            descriptor_pool_, bindless_desc_set_layout_, 1);
+        bindless_desc_set_ = desc_sets[0];
+    }
 
     // Re-write SSBO descriptors.
     er::WriteDescriptorList writes;
@@ -4104,8 +4114,11 @@ void ClusterRenderer::recreate(
     // and sampler) is cached on this object and survives the swap
     // chain teardown.
     if (cull_desc_set_layout_ && total_clusters_all_meshes_ > 0) {
-        cull_desc_set_ = device_->createDescriptorSets(
-            descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!cull_desc_set_) {
+            cull_desc_set_ = device_->createDescriptorSets(
+                descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        }
         const uint32_t mat_count = std::max<uint32_t>(1u, total_materials_);
         writeCullDescriptors(
             device_, cull_desc_set_,

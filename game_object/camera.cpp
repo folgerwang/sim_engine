@@ -137,9 +137,11 @@ void ViewCamera::createViewCameraUpdateDescSet(
     // create a global ibl texture descriptor set.
     for (int soil_water = 0; soil_water < 2; soil_water++) {
         // game objects buffer update set.
-        m_update_view_camera_desc_set_[soil_water] =
-            device->createDescriptorSets(
-                descriptor_pool, s_update_view_camera_desc_set_layout_, 1)[0];
+        // persistent pool: allocate once, reuse across resize
+        if (!m_update_view_camera_desc_set_[soil_water])
+            m_update_view_camera_desc_set_[soil_water] =
+                device->createDescriptorSets(
+                    descriptor_pool, s_update_view_camera_desc_set_layout_, 1)[0];
 
         assert(m_view_camera_buffer_);
         auto write_descs = addViewCameraInfoBuffer(

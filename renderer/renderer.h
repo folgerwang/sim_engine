@@ -184,9 +184,52 @@ public:
 
 class VulkanDescriptorPool : public DescriptorPool {
     VkDescriptorPool    descriptor_pool_;
+
+    // ── Overflow pools (Layer 3 of the descriptor-set retry scheme) ──
+    // When vkAllocateDescriptorSets returns VK_ERROR_OUT_OF_POOL_MEMORY or
+    // VK_ERROR_FRAGMENTED_POOL, VulkanDevice::createDescriptorSets spawns
+    // an additional pool with the same create-info template (see
+    // pool_create_info_template_ below) and re-issues the allocation
+    // against it.  All overflow pools are destroyed alongside the primary
+    // by VulkanDevice::destroyDescriptorPool.
+    //
+    // A live pool is the back of overflow_pools_ if any exist, otherwise
+    // it is descriptor_pool_.  See currentPool().
+    std::vector<VkDescriptorPool> overflow_pools_;
+
+    // Template used to create the primary pool, retained so we can spawn
+    // overflow pools with identical capacity / flags.  Sizes are owned so
+    // pPoolSizes stays valid after the original create-info's pool_sizes[]
+    // local goes out of scope.
+    std::vector<VkDescriptorPoolSize> pool_sizes_template_;
+    VkDescriptorPoolCreateFlags       pool_create_flags_ = 0;
+    uint32_t                          pool_max_sets_     = 0;
 public:
     VkDescriptorPool get() { return descriptor_pool_; }
     void set(const VkDescriptorPool& descriptor_pool) { descriptor_pool_ = descriptor_pool; }
+
+    // Most recently spawned pool — the one new allocations should target.
+    VkDescriptorPool currentPool() const {
+        return overflow_pools_.empty() ? descriptor_pool_
+                                       : overflow_pools_.back();
+    }
+
+    void recordCreateInfo(
+        const std::vector<VkDescriptorPoolSize>& sizes,
+        VkDescriptorPoolCreateFlags flags,
+        uint32_t max_sets) {
+        pool_sizes_template_ = sizes;
+        pool_create_flags_   = flags;
+        pool_max_sets_       = max_sets;
+    }
+    const std::vector<VkDescriptorPoolSize>& poolSizesTemplate() const {
+        return pool_sizes_template_;
+    }
+    VkDescriptorPoolCreateFlags poolCreateFlags() const { return pool_create_flags_; }
+    uint32_t poolMaxSets() const { return pool_max_sets_; }
+
+    void pushOverflow(VkDescriptorPool pool) { overflow_pools_.push_back(pool); }
+    const std::vector<VkDescriptorPool>& overflowPools() const { return overflow_pools_; }
 };
 
 class VulkanPipeline : public Pipeline {
