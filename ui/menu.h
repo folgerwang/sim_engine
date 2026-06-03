@@ -494,6 +494,7 @@ public:
     std::vector<EditorSceneObject> editor_objects_;
     int          editor_selected_   = -1;
     bool         editor_layout_built_ = false;
+    float        outliner_list_h_   = 0.0f;   // draggable list/details split (px)
     bool         editor_enabled_    = false;  // editor UI off unless --editor
     std::string  content_dir_       = "assets";
     // Screen-space rect (main-viewport pixels) of the dockspace central node
@@ -510,14 +511,18 @@ public:
     bool      isViewportValid() const { return viewport_valid_ && editor_enabled_; }
     glm::vec2 getViewportPos()  const { return viewport_pos_; }
     glm::vec2 getViewportSize() const { return viewport_size_; }
+    // Aspect of the active viewport: the editor panel in editor mode, else the
+    // full window (so in-game framing matches the editor viewport's handling).
     float     getViewportAspect() const {
-        return (viewport_size_.y > 1.0f) ? (viewport_size_.x / viewport_size_.y) : 1.0f;
+        ImVec2 p, s, c; getViewportScreenRect(p, s, c);
+        return (s.y > 1.0f) ? (s.x / s.y) : 1.0f;
     }
 private:
     void drawEditorDockSpace();   // host window + default layout
-    void drawOutlinerPanel();
-    void drawDetailsPanel();
+    void drawOutlinerPanel();   // object list (top) + selected-object details (below)
+    void drawDetailsContent();  // details widgets, drawn inline under the list
     void drawContentBrowserPanel();
+    void drawOutputPanel();   // UE5-style console Output Log (bottom tab)
     // Absolute screen rect/centre of the editor Viewport (central dock node);
     // falls back to the full main viewport when the editor is inactive.  Used
     // to keep loading bars / dialog boxes inside the viewport, not over panels.

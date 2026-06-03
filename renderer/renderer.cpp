@@ -1275,6 +1275,20 @@ void Helper::initImgui(
     ImGui::StyleColorsDark();
     //ImGui::StyleColorsClassic();
 
+    // Greenish selected-tab styling for the editor dock tabs (Outliner /
+    // Details / Content Browser / Output Log).  The selected tab gets a green
+    // fill + brighter green overline; hovered is a lighter green; the dimmed
+    // (unfocused tab-bar) variants are muted greens so it still reads as the
+    // active tab when another panel has focus.
+    {
+        ImVec4* c = ImGui::GetStyle().Colors;
+        c[ImGuiCol_TabSelected]              = ImVec4(0.16f, 0.44f, 0.24f, 1.00f);
+        c[ImGuiCol_TabSelectedOverline]      = ImVec4(0.36f, 0.85f, 0.46f, 1.00f);
+        c[ImGuiCol_TabHovered]               = ImVec4(0.26f, 0.60f, 0.34f, 0.85f);
+        c[ImGuiCol_TabDimmedSelected]        = ImVec4(0.13f, 0.32f, 0.19f, 1.00f);
+        c[ImGuiCol_TabDimmedSelectedOverline]= ImVec4(0.30f, 0.62f, 0.38f, 1.00f);
+    }
+
     // When viewports are enabled we tweak WindowRounding/WindowBg so platform
     // windows can look identical to regular ones.
     ImGuiStyle& style = ImGui::GetStyle();

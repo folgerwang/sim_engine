@@ -22,6 +22,7 @@ extern "C" {
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_vulkan.h"
 #include "game_object/drawable_object.h"  // Details panel reads object transform
+#include "editor_log.h"                    // Output Log panel
 
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
@@ -3276,8 +3277,8 @@ void Menu::drawEditorDockSpace() {
             center, ImGuiDir_Right, 0.24f, nullptr, &center);
 
         ImGui::DockBuilderDockWindow("Content Browser", bottom);
+        ImGui::DockBuilderDockWindow("Output Log", bottom);   // tab w/ Content Browser
         ImGui::DockBuilderDockWindow("Outliner", right);
-        ImGui::DockBuilderDockWindow("Details",  right);   // tab with Outliner
         ImGui::DockBuilderFinish(dock_id);
     }
 
@@ -3294,14 +3295,29 @@ void Menu::drawEditorDockSpace() {
     ImGui::End();
 
     drawOutlinerPanel();
-    drawDetailsPanel();
     drawContentBrowserPanel();
+    drawOutputPanel();
 }
 
 void Menu::drawOutlinerPanel() {
     if (ImGui::Begin("Outliner")) {
         ImGui::TextDisabled("World  (%d objects)", (int)editor_objects_.size());
-        ImGui::Separator();
+
+        // ── Resizable list / details split ────────────────────────────
+        // A draggable bar between the object list (top) and the selected
+        // object's attributes (bottom).  The list height is persisted in
+        // outliner_list_h_ and clamped so neither pane can collapse.
+        constexpr float kSplitterH = 6.0f;
+        constexpr float kMinPane   = 48.0f;
+        const float total = ImGui::GetContentRegionAvail().y;
+        if (outliner_list_h_ <= 0.0f) outliner_list_h_ = total * 0.5f;  // default
+        float list_h = outliner_list_h_;
+        const float max_list = total - kMinPane - kSplitterH;
+        if (list_h < kMinPane) list_h = kMinPane;
+        if (max_list > kMinPane && list_h > max_list) list_h = max_list;
+
+        // Object list.
+        ImGui::BeginChild("##outliner_list", ImVec2(0, list_h), true);
         for (int i = 0; i < (int)editor_objects_.size(); ++i) {
             const std::string label =
                 (editor_objects_[i].name.empty()
@@ -3312,35 +3328,110 @@ void Menu::drawOutlinerPanel() {
         }
         if (editor_objects_.empty())
             ImGui::TextDisabled("(no scene objects yet)");
+        ImGui::EndChild();
+
+        // Draggable splitter bar.
+        ImGui::InvisibleButton("##outliner_splitter", ImVec2(-1.0f, kSplitterH));
+        const bool split_active  = ImGui::IsItemActive();
+        const bool split_hovered = ImGui::IsItemHovered();
+        if (split_active || split_hovered)
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (split_active)
+            outliner_list_h_ = list_h + ImGui::GetIO().MouseDelta.y;
+        {   // grip line
+            const ImVec2 rmin = ImGui::GetItemRectMin();
+            const ImVec2 rmax = ImGui::GetItemRectMax();
+            const float  cy   = (rmin.y + rmax.y) * 0.5f;
+            const ImU32  col  = ImGui::GetColorU32(
+                split_active  ? ImGuiCol_SeparatorActive  :
+                split_hovered ? ImGuiCol_SeparatorHovered : ImGuiCol_Separator);
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(rmin.x + 2.0f, cy), ImVec2(rmax.x - 2.0f, cy), col, 2.0f);
+        }
+
+        // Attributes of the highlighted object (fills the rest).
+        ImGui::SeparatorText("Details");
+        ImGui::BeginChild("##outliner_details", ImVec2(0, 0), false);
+        drawDetailsContent();
+        ImGui::EndChild();
     }
     ImGui::End();
 }
 
-void Menu::drawDetailsPanel() {
-    if (ImGui::Begin("Details")) {
-        if (editor_selected_ >= 0 &&
-            editor_selected_ < (int)editor_objects_.size()) {
-            EditorSceneObject& o = editor_objects_[editor_selected_];
-            ImGui::Text("Name: %s", o.name.c_str());
-            ImGui::Separator();
-            if (o.obj) {
-                ImGui::SeparatorText("Transform");
-                glm::mat4 m = o.obj->getLocation();
-                glm::vec3 pos(m[3].x, m[3].y, m[3].z);
-                if (ImGui::DragFloat3("Location", &pos.x, 0.05f)) {
-                    o.obj->setInstanceRootTransform(
-                        pos, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
-                }
-                ImGui::SeparatorText("Rendering");
-                bool vis = o.obj->isVisible();
-                if (ImGui::Checkbox("Visible", &vis)) o.obj->setVisible(vis);
-                ImGui::Text("Loaded: %s", o.obj->isReady() ? "yes" : "(streaming)");
-            } else {
-                ImGui::TextDisabled("(no drawable bound)");
+void Menu::drawDetailsContent() {
+    if (editor_selected_ >= 0 &&
+        editor_selected_ < (int)editor_objects_.size()) {
+        EditorSceneObject& o = editor_objects_[editor_selected_];
+        ImGui::Text("Name: %s", o.name.c_str());
+        ImGui::Separator();
+        if (o.obj) {
+            ImGui::SeparatorText("Transform");
+            glm::mat4 m = o.obj->getLocation();
+            glm::vec3 pos(m[3].x, m[3].y, m[3].z);
+            if (ImGui::DragFloat3("Location", &pos.x, 0.05f)) {
+                o.obj->setInstanceRootTransform(
+                    pos, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
             }
+            ImGui::SeparatorText("Rendering");
+            bool vis = o.obj->isVisible();
+            if (ImGui::Checkbox("Visible", &vis)) o.obj->setVisible(vis);
+            ImGui::Text("Loaded: %s", o.obj->isReady() ? "yes" : "(streaming)");
         } else {
-            ImGui::TextDisabled("Select an object in the Outliner.");
+            ImGui::TextDisabled("(no drawable bound)");
         }
+    } else {
+        ImGui::TextDisabled("Select an object above.");
+    }
+}
+
+void Menu::drawOutputPanel() {
+    if (ImGui::Begin("Output Log")) {
+        static std::vector<std::string> s_lines;
+        static std::uint64_t s_version = (std::uint64_t)-1;
+        static bool s_autoscroll = true;
+        static char s_filter[64] = {0};
+
+        std::uint64_t cur_version = s_version;
+        EditorLog::get().snapshot(s_lines, cur_version);
+        const bool changed = (cur_version != s_version);
+        s_version = cur_version;
+
+        // Toolbar: clear / autoscroll / filter.
+        if (ImGui::SmallButton("Clear")) { EditorLog::get().clear(); s_lines.clear(); }
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-scroll", &s_autoscroll);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputTextWithHint("##log_filter", "filter", s_filter, sizeof(s_filter));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d lines", (int)s_lines.size());
+        ImGui::Separator();
+
+        ImGui::BeginChild("##log_scroll", ImVec2(0, 0), false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
+        const bool has_filter = (s_filter[0] != '\0');
+        for (const std::string& ln : s_lines) {
+            if (has_filter && ln.find(s_filter) == std::string::npos) continue;
+            // Subtle colour-coding by tag for readability.
+            ImVec4 col(0.86f, 0.86f, 0.86f, 1.0f);
+            if (ln.find("error") != std::string::npos ||
+                ln.find("ERROR") != std::string::npos ||
+                ln.find("FAIL")  != std::string::npos)
+                col = ImVec4(1.0f, 0.45f, 0.40f, 1.0f);
+            else if (ln.find("warn") != std::string::npos ||
+                     ln.find("WARN") != std::string::npos)
+                col = ImVec4(1.0f, 0.82f, 0.35f, 1.0f);
+            else if (!ln.empty() && ln[0] == '[')
+                col = ImVec4(0.55f, 0.78f, 1.0f, 1.0f);   // [tag] lines
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextUnformatted(ln.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::PopStyleVar();
+        if (s_autoscroll && changed)
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
     }
     ImGui::End();
 }
