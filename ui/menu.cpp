@@ -1383,7 +1383,12 @@ bool Menu::draw(
     bool compile_shaders = false;
 
     bool test_true = true;
-    ImVec2 vp_pos = ImGui::GetMainViewport()->Pos;
+    // Place the FPS widget at the top-right of the VIEWPORT (editor mode) or
+    // the full window (otherwise).  The viewport rect already sits below the
+    // menu bar, so only the full-window fallback needs the menu_height offset.
+    ImVec2 fps_vp_pos, fps_vp_size, fps_vp_c;
+    getViewportScreenRect(fps_vp_pos, fps_vp_size, fps_vp_c);
+    const float fps_top_pad = isViewportValid() ? 8.0f : menu_height;
     ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
     ImGui::Begin(
         "fps",
@@ -1394,7 +1399,8 @@ bool Menu::draw(
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoInputs |
         ImGuiWindowFlags_NoDocking);
-    ImGui::SetWindowPos(ImVec2(vp_pos.x + float(screen_size.x) - 220.0f, vp_pos.y + menu_height));
+    ImGui::SetWindowPos(ImVec2(
+        fps_vp_pos.x + fps_vp_size.x - 220.0f, fps_vp_pos.y + fps_top_pad));
     ImGui::SetWindowSize(ImVec2((float)210, (float)47));
     ImGui::BeginChild("fps", ImVec2(0, 0), false);
     // Rolling average over the last 60 frames for a stable reading.
@@ -1434,9 +1440,14 @@ bool Menu::draw(
             s_elapsed += delta_t;
 
             const float kLoaderSize = 52.0f;
+            // Mesh-load HUD: top-right of the viewport (editor) or window.
+            ImVec2 mlv_pos, mlv_size, mlv_c;
+            getViewportScreenRect(mlv_pos, mlv_size, mlv_c);
+            const float mlv_top = isViewportValid() ? 40.0f
+                                                    : (menu_height + 40.0f);
             const ImVec2 mesh_win_pos = {
-                vp_pos.x + float(screen_size.x) - 380.0f,
-                vp_pos.y + menu_height + 40.0f };
+                mlv_pos.x + mlv_size.x - 380.0f,
+                mlv_pos.y + mlv_top };
 
             ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
             ImGui::SetNextWindowPos(mesh_win_pos);
@@ -3075,9 +3086,17 @@ bool Menu::draw(
     }
     // ------------------------------------------------------------------------
 
-    // Chat box / dialogue UI only during gameplay.
+    // Chat box / dialogue UI only during gameplay.  In editor mode confine it
+    // to the Viewport rect; otherwise it spans the full window (default args).
     if (game_state_ == GameState::InGame) {
-        chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size, skydome, dump_volume_noise, delta_t);
+        ImVec2 cvp_pos, cvp_size, cvp_c;
+        getViewportScreenRect(cvp_pos, cvp_size, cvp_c);
+        const glm::vec2 vp_org  = isViewportValid()
+            ? glm::vec2(cvp_pos.x, cvp_pos.y) : glm::vec2(0.0f);
+        const glm::vec2 vp_size = isViewportValid()
+            ? glm::vec2(cvp_size.x, cvp_size.y) : glm::vec2(0.0f);
+        chat_box_->draw(cmd_buf, render_pass, framebuffer, screen_size,
+            skydome, dump_volume_noise, delta_t, vp_org, vp_size);
     }
 
     // ---- Analog clock overlay (top-left, always on top) --------------------

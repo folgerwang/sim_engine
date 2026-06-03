@@ -21,17 +21,26 @@ bool ChatBox::draw(
     const glm::uvec2& screen_size,
     const std::shared_ptr<scene_rendering::Skydome>& skydome,
     bool& dump_volume_noise,
-    const float& delta_t) {
+    const float& delta_t,
+    const glm::vec2& vp_origin,
+    const glm::vec2& vp_size) {
 
     // In your per-frame UI construction section:
 
-// Get screen dimensions and main viewport origin for positioning.
-    // With multi-viewport enabled, SetNextWindowPos uses absolute screen
-    // coordinates, so we must offset by the main viewport's position.
+    // Positioning frame: the editor Viewport rect when supplied, else the
+    // full main viewport / DisplaySize.  All dialogue positions below are
+    // expressed relative to (vpPos, screenWidth/Height) so passing the
+    // viewport rect keeps the chat inside the 3D viewport in editor mode.
     ImGuiIO& io = ImGui::GetIO();
-    ImVec2 vpPos = ImGui::GetMainViewport()->Pos;
-    float screenWidth = io.DisplaySize.x;
-    float screenHeight = io.DisplaySize.y;
+    ImVec2 vpPos;
+    float screenWidth, screenHeight;
+    if (vp_size.x > 1.0f && vp_size.y > 1.0f) {
+        vpPos = ImVec2(vp_origin.x, vp_origin.y);
+        screenWidth = vp_size.x; screenHeight = vp_size.y;
+    } else {
+        vpPos = ImGui::GetMainViewport()->Pos;
+        screenWidth = io.DisplaySize.x; screenHeight = io.DisplaySize.y;
+    }
 
     // --- Speaker Name and Dialogue Text ---
     float speakerWindowPosX = vpPos.x + screenWidth * 0.15f;
