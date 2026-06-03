@@ -5,6 +5,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
+#include <filesystem>
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
@@ -521,7 +523,32 @@ private:
     void drawEditorDockSpace();   // host window + default layout
     void drawOutlinerPanel();   // object list (top) + selected-object details (below)
     void drawDetailsContent();  // details widgets, drawn inline under the list
-    void drawContentBrowserPanel();
+    void drawContentBrowserPanel();   // folder tree (left) + thumbnail grid (right)
+    void drawFolderTree(const std::string& dir, int depth);
+    // Lazily load (budgeted) a thumbnail texture for an asset; returns 0 (none)
+    // for files that have no thumbnail yet / failed.
+    ImTextureID getThumbnail(const std::string& path);
+    // Make sure a sidecar thumbnail PNG exists and is up to date.  Returns the
+    // thumbnail path on success, or "" if none could be produced.  Regenerates
+    // only when the source asset is newer than the existing thumbnail
+    // (mtime comparison) — otherwise the cached PNG is kept as-is.
+    std::string ensureThumbnail(const std::string& src);
+
+    // Content-browser thumbnail cache (source path -> loaded texture).  Loads
+    // are budgeted per frame so opening a big folder doesn't stall.  Each entry
+    // records the source mtime it was built from; if the source later changes,
+    // the entry is rebuilt and the stale GPU texture is retired (kept alive
+    // until shutdown so ImGui never references a freed descriptor).
+    struct ThumbTex {
+        std::shared_ptr<renderer::TextureInfo> info;
+        ImTextureID                            id     = 0;
+        bool                                   failed = false;
+        std::filesystem::file_time_type        src_time{};
+    };
+    std::unordered_map<std::string, ThumbTex> thumb_cache_;
+    std::vector<std::shared_ptr<renderer::TextureInfo>> retired_thumbs_;
+    float content_left_w_ = 0.0f;
+    int   thumb_budget_   = 0;
     void drawOutputPanel();   // UE5-style console Output Log (bottom tab)
     // Absolute screen rect/centre of the editor Viewport (central dock node);
     // falls back to the full main viewport when the editor is inactive.  Used

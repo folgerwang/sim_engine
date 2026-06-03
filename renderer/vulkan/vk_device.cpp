@@ -1295,7 +1295,14 @@ std::shared_ptr<DescriptorPool> VulkanDevice::createDescriptorPool(
     VkDescriptorPoolSize pool_sizes[] =
     {
         { VK_DESCRIPTOR_TYPE_SAMPLER, 16 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 },
+        // Bumped 1024 -> 2048: ImGui shares this pool (init_info.DescriptorPool),
+        // and the content-browser thumbnail grid allocates one COMBINED_IMAGE_
+        // SAMPLER per thumbnail via ImGui_ImplVulkan_AddTexture.  At 1024 a
+        // folder of textures/models could drain the pool and starve the async
+        // mesh loader's material/skin sets (crash in createDescriptorSets).
+        // The thumbnail cache is also capped (see Menu::getThumbnail) so the
+        // two together stay well under this budget.
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048 },
         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 256 },

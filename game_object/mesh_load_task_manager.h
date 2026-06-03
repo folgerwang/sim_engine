@@ -134,6 +134,12 @@ private:
     std::condition_variable                       pending_cv_;
     std::queue<std::shared_ptr<MeshLoadTask>>     pending_tasks_;
     std::atomic<bool>                             shutdown_{false};
+    // True while the worker holds a task it popped from pending_ but has not
+    // yet pushed to in_flight_ (i.e. mid-Phase-2).  Set under pending_mutex_ at
+    // pop time so waitAll() can't observe a task "in transit" between the two
+    // queues and return prematurely (which would let a load finalize against a
+    // descriptor pool the caller is about to destroy).
+    std::atomic<bool>                             worker_busy_{false};
 
     // Tasks whose phase2 has been submitted to the GPU and are waiting
     // on their fence. Polled and drained by the main thread.

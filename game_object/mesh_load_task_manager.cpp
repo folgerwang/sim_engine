@@ -189,7 +189,16 @@ void MeshLoadTaskManager::waitAll() {
         if (async_enabled_) {
             poll();
         }
-        if (inFlightCount() == 0) {
+        // Fully drained only when: nothing queued, nothing mid-Phase-2, and
+        // nothing waiting on a fence.  Checking pending-empty + !worker_busy_
+        // under pending_mutex_ closes the pop→runPhase2 transit window.
+        bool pending_idle;
+        {
+            std::lock_guard<std::mutex> lk(pending_mutex_);
+            pending_idle = pending_tasks_.empty() &&
+                           !worker_busy_.load(std::memory_order_acquire);
+        }
+        if (pending_idle && inFlightCount() == 0) {
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -223,8 +232,13 @@ void MeshLoadTaskManager::workerLoop() {
             }
             task = pending_tasks_.front();
             pending_tasks_.pop();
+            // Mark busy WHILE still holding pending_mutex_, so waitAll() (which
+            // checks pending-empty + !busy under the same lock) never sees this
+            // task vanish between the pending queue and in_flight_.
+            worker_busy_.store(true, std::memory_order_release);
         }
-        runPhase2(task);
+        runPhase2(task);                 // pushes the task into in_flight_
+        worker_busy_.store(false, std::memory_order_release);
     }
 }
 

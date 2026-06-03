@@ -71,7 +71,8 @@ public:
 
     void updateViewCameraInfo(
         const glsl::ViewCameraParams& view_camera_params,
-        std::shared_ptr<glm::vec3> input_camera_pos);
+        std::shared_ptr<glm::vec3> input_camera_pos,
+        std::shared_ptr<glm::vec3> input_facing_dir = nullptr);
 
     void updateViewCameraBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

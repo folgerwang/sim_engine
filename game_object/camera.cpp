@@ -298,7 +298,8 @@ void ViewCamera::updateViewCameraBuffer(
 
 void ViewCamera::updateViewCameraInfo(
     const glsl::ViewCameraParams& view_camera_params,
-    std::shared_ptr<glm::vec3> input_camera_pos) {
+    std::shared_ptr<glm::vec3> input_camera_pos,
+    std::shared_ptr<glm::vec3> input_facing_dir) {
 
     // Capture last frame's VP BEFORE recomputing view/proj/view_proj.
     // Consumers downstream (cluster G-buffer velocity attachment + any
@@ -418,6 +419,17 @@ void ViewCamera::updateViewCameraInfo(
         // override wins on the same frame the keys were pressed.
         if (input_camera_pos) {
             m_camera_info_.position = *input_camera_pos;
+        }
+        // Optional facing override (third-person follow camera).  Lets the
+        // caller aim the view independently of the mouse-derived yaw/pitch —
+        // e.g. tilt the follow camera UP to look along the character's back.
+        // Guarded against NaN / zero so a bad vector can't brick the pass.
+        if (input_facing_dir &&
+            std::isfinite(input_facing_dir->x) &&
+            std::isfinite(input_facing_dir->y) &&
+            std::isfinite(input_facing_dir->z) &&
+            length(*input_facing_dir) > 1e-4f) {
+            m_camera_info_.facing_dir = normalize(*input_facing_dir);
         }
 
         auto eye_pos = m_camera_info_.position;

@@ -5,6 +5,8 @@
 #include <cctype>
 #include <source_location>
 #include <cstdlib>
+#include <cstdint>
+#include <fstream>
 
 // stbi_load / stbi_image_free are already compiled into the project via
 // tinygltf (STB_IMAGE_IMPLEMENTATION lives in engine_helper.cpp).
@@ -12,6 +14,9 @@
 extern "C" {
     unsigned char* stbi_load(const char*, int*, int*, int*, int);
     void stbi_image_free(void*);
+    // STB_IMAGE_WRITE_IMPLEMENTATION is compiled in engine_helper.cpp, so the
+    // symbol is linked — declaring it here lets us write sidecar thumbnails.
+    int stbi_write_png(const char*, int, int, int, const void*, int);
 }
 #ifndef STBI_rgb_alpha
 #define STBI_rgb_alpha 4
@@ -30,6 +35,7 @@ extern "C" {
 
 #include "menu.h"
 #include "plugins/plugin_manager.h"
+#include "plugins/auto_rig/simple_rasterizer.h"  // model-thumbnail mesh loader + CPU rasterizer
 #include "game_object/mesh_load_task_manager.h"
 #include "scene_rendering/ssao.h"
 #include "scene_rendering/cluster_renderer.h"
@@ -707,6 +713,26 @@ void Menu::init(
     // accidentally bind a dead handle from the old pool.
     rt_texture_id_   = ImTextureID(0);
     main_texture_id_ = ImTextureID(0);
+
+    // Content-browser thumbnail textures hit the SAME hazard: their
+    // ImTextureIDs are VkDescriptorSets allocated from the descriptor pool
+    // that cleanupSwapChain just destroyed.  The underlying Vulkan images
+    // (TextureInfo) survive recreation, so re-register each surviving view
+    // with the fresh pool; drop any that lost their view.  Without this the
+    // grid binds a dangling descriptor on the next frame and the NVIDIA
+    // driver faults inside ImGui_ImplVulkan_RenderDrawData (seen on resize).
+    for (auto& kv : thumb_cache_) {
+        ThumbTex& t = kv.second;
+        if (t.failed) continue;
+        if (t.info && t.info->view)
+            t.id = renderer::Helper::addImTextureID(sampler_, t.info->view);
+        else
+            t.failed = true;
+    }
+    // Retired (superseded) thumbnail textures are no longer referenced by the
+    // UI; the device is idle here, so free them outright rather than
+    // re-registering dead handles.
+    retired_thumbs_.clear();
 }
 
 bool Menu::draw(
@@ -3436,9 +3462,343 @@ void Menu::drawOutputPanel() {
     ImGui::End();
 }
 
+// ── DDS decode helpers (top mip → RGBA8) ────────────────────────────────────
+namespace {
+
+constexpr uint32_t kFourCC(char a, char b, char c, char d) {
+    return (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
+           ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24);
+}
+inline uint32_t rd32le(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+inline void rgb565(uint16_t c, int& r, int& g, int& b) {
+    int r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
+    r = (r5 << 3) | (r5 >> 2); g = (g6 << 2) | (g6 >> 4); b = (b5 << 3) | (b5 >> 2);
+}
+// BC1 colour block (8 bytes) → 16 RGBA texels, row-major.
+inline void decodeBC1(const uint8_t* b, uint8_t out[64], bool punchthrough) {
+    uint16_t c0 = (uint16_t)(b[0] | (b[1] << 8)), c1 = (uint16_t)(b[2] | (b[3] << 8));
+    int r[4], g[4], bl[4], a[4] = {255, 255, 255, 255};
+    rgb565(c0, r[0], g[0], bl[0]); rgb565(c1, r[1], g[1], bl[1]);
+    if (c0 > c1 || !punchthrough) {
+        r[2] = (2*r[0]+r[1])/3; g[2] = (2*g[0]+g[1])/3; bl[2] = (2*bl[0]+bl[1])/3;
+        r[3] = (r[0]+2*r[1])/3; g[3] = (g[0]+2*g[1])/3; bl[3] = (bl[0]+2*bl[1])/3;
+    } else {
+        r[2] = (r[0]+r[1])/2; g[2] = (g[0]+g[1])/2; bl[2] = (bl[0]+bl[1])/2;
+        r[3] = g[3] = bl[3] = 0; a[3] = 0;
+    }
+    uint32_t bits = rd32le(b + 4);
+    for (int i = 0; i < 16; ++i) {
+        int idx = (bits >> (i * 2)) & 3;
+        out[i*4+0] = (uint8_t)r[idx]; out[i*4+1] = (uint8_t)g[idx];
+        out[i*4+2] = (uint8_t)bl[idx]; out[i*4+3] = (uint8_t)a[idx];
+    }
+}
+// BC3/DXT5 alpha block (8 bytes) → 16 alpha values.
+inline void decodeBC3Alpha(const uint8_t* b, uint8_t alpha[16]) {
+    int a0 = b[0], a1 = b[1], al[8]; al[0] = a0; al[1] = a1;
+    if (a0 > a1) { for (int i = 1; i < 7; ++i) al[i+1] = ((7-i)*a0 + i*a1)/7; }
+    else { for (int i = 1; i < 5; ++i) al[i+1] = ((5-i)*a0 + i*a1)/5; al[6] = 0; al[7] = 255; }
+    uint64_t bits = 0; for (int i = 0; i < 6; ++i) bits |= (uint64_t)b[2+i] << (8*i);
+    for (int i = 0; i < 16; ++i) alpha[i] = (uint8_t)al[(bits >> (i*3)) & 7];
+}
+
+// Decode the top mip of a .dds to RGBA8.  Handles DXT1/3/5 and 32bpp
+// uncompressed (via channel masks).  Returns false for DX10/BC7 / exotic
+// formats — the caller then falls back to a type tile.
+bool decodeDdsToRgba(const std::string& path, int& W, int& H,
+                     std::vector<unsigned char>& rgba) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    if (d.size() < 128 || rd32le(d.data()) != 0x20534444u) return false;  // "DDS "
+    const uint8_t* hdr = d.data() + 4;
+    const uint32_t height = rd32le(hdr + 8), width = rd32le(hdr + 12);
+    if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
+    const uint8_t* pf = hdr + 72;                       // DDS_PIXELFORMAT
+    const uint32_t pfFlags = rd32le(pf + 4), fourCC = rd32le(pf + 8),
+                   rgbBits = rd32le(pf + 12);
+    const uint32_t rMask = rd32le(pf + 16), gMask = rd32le(pf + 20),
+                   bMask = rd32le(pf + 24), aMask = rd32le(pf + 28);
+    const bool isFourCC = (pfFlags & 0x4) != 0;
+    if (isFourCC && fourCC == kFourCC('D','X','1','0')) return false;  // DX10/BC7
+
+    W = (int)width; H = (int)height;
+    rgba.assign((size_t)W * H * 4, 255);
+    const uint8_t* src = d.data() + 128;
+    const size_t avail = d.size() - 128;
+    const int bw = (W + 3) / 4, bh = (H + 3) / 4;
+
+    auto putBlock = [&](int bx, int by, const uint8_t px[64]) {
+        for (int py = 0; py < 4; ++py) for (int pxx = 0; pxx < 4; ++pxx) {
+            int X = bx*4 + pxx, Y = by*4 + py; if (X >= W || Y >= H) continue;
+            const uint8_t* s = px + (py*4 + pxx)*4;
+            uint8_t* o = &rgba[((size_t)Y*W + X)*4];
+            o[0]=s[0]; o[1]=s[1]; o[2]=s[2]; o[3]=s[3];
+        }
+    };
+
+    if (isFourCC && fourCC == kFourCC('D','X','T','1')) {
+        if (avail < (size_t)bw*bh*8) return false;
+        for (int by = 0; by < bh; ++by) for (int bx = 0; bx < bw; ++bx) {
+            uint8_t px[64]; decodeBC1(src + ((size_t)by*bw + bx)*8, px, true);
+            putBlock(bx, by, px);
+        }
+        return true;
+    }
+    if (isFourCC && (fourCC == kFourCC('D','X','T','5') ||
+                     fourCC == kFourCC('D','X','T','3'))) {
+        const bool dxt5 = (fourCC == kFourCC('D','X','T','5'));
+        if (avail < (size_t)bw*bh*16) return false;
+        for (int by = 0; by < bh; ++by) for (int bx = 0; bx < bw; ++bx) {
+            const uint8_t* blk = src + ((size_t)by*bw + bx)*16;
+            uint8_t px[64]; decodeBC1(blk + 8, px, false);
+            if (dxt5) { uint8_t al[16]; decodeBC3Alpha(blk, al);
+                        for (int i = 0; i < 16; ++i) px[i*4+3] = al[i]; }
+            else { for (int i = 0; i < 16; ++i) { int byte = blk[i/2];
+                        int a4 = (i&1) ? ((byte>>4)&0xF) : (byte&0xF);
+                        px[i*4+3] = (uint8_t)(a4*17); } }
+            putBlock(bx, by, px);
+        }
+        return true;
+    }
+    if (!isFourCC && rgbBits == 32) {
+        if (avail < (size_t)W*H*4) return false;
+        auto shift = [](uint32_t m){ int s=0; if(!m) return 0; while(!(m&1)){m>>=1;++s;} return s; };
+        const int sr = shift(rMask), sg = shift(gMask), sb = shift(bMask), sa = shift(aMask);
+        for (int i = 0; i < W*H; ++i) {
+            uint32_t p = rd32le(src + (size_t)i*4);
+            rgba[i*4+0] = (uint8_t)((p & rMask) >> sr);
+            rgba[i*4+1] = (uint8_t)((p & gMask) >> sg);
+            rgba[i*4+2] = (uint8_t)((p & bMask) >> sb);
+            rgba[i*4+3] = aMask ? (uint8_t)((p & aMask) >> sa) : 255;
+        }
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+// Produce/refresh the sidecar thumbnail for `src` and return its path (or "").
+// Thumbnails live in a hidden ".thumbnails" folder next to the asset, named
+// "<filename>.png".  Regeneration is incremental: an existing thumbnail at
+// least as new as the source is kept untouched; only a stale/missing one is
+// rebuilt.  Dispatches by type: images (stb) and .dds (decoded) are
+// box-downscaled; .gltf/.glb/.fbx are rasterised to an orbit view.
+std::string Menu::ensureThumbnail(const std::string& src) {
+    namespace fs = std::filesystem;
+    namespace ar = plugins::auto_rig;
+    std::error_code ec;
+    constexpr int kThumb = 128;
+
+    fs::path srcP(src);
+    std::string ext = srcP.extension().string();
+    for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+    const bool is_img   = (ext == ".png" || ext == ".jpg" || ext == ".jpeg" ||
+                           ext == ".bmp" || ext == ".tga");
+    const bool is_dds   = (ext == ".dds");
+    const bool is_model = (ext == ".gltf" || ext == ".glb" || ext == ".fbx");
+    if (!is_img && !is_dds && !is_model) return "";
+
+    const fs::path thumbDir = srcP.parent_path() / ".thumbnails";
+    const fs::path thumb     = thumbDir / (srcP.filename().string() + ".png");
+
+    // Incremental: keep the existing thumbnail unless the source is newer.
+    if (fs::exists(thumb, ec)) {
+        const auto t_src = fs::last_write_time(src, ec);
+        const auto t_thb = fs::last_write_time(thumb, ec);
+        if (!ec && t_src <= t_thb) return thumb.string();
+    }
+    fs::create_directories(thumbDir, ec);
+
+    // ── 3D model → rasterise one auto-framed orbit view ──
+    if (is_model) {
+        ar::TriangleMesh mesh;
+        if (!ar::loadMeshForThumbnail(src, mesh)) return "";
+        ar::SimpleRasterizer rast;
+        auto caps = rast.captureOrbit(mesh, /*views*/1, kThumb,
+                                      /*elevation*/15.0f, /*radius_mult*/1.5f);
+        if (caps.empty() || caps[0].color.empty()) return "";
+        const auto& c = caps[0];
+        if (!stbi_write_png(thumb.string().c_str(), c.width, c.height, 3,
+                            c.color.data(), c.width * 3))
+            return "";
+        return thumb.string();
+    }
+
+    // ── Image / DDS → RGBA pixels, then box-downscale to <=kThumb ──
+    int w = 0, h = 0;
+    std::vector<unsigned char> rgba;
+    if (is_dds) {
+        if (!decodeDdsToRgba(src, w, h, rgba)) return "";
+    } else {
+        int comp = 0;
+        unsigned char* px = stbi_load(src.c_str(), &w, &h, &comp, STBI_rgb_alpha);
+        if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); return ""; }
+        rgba.assign(px, px + (size_t)w * h * 4);
+        stbi_image_free(px);
+    }
+
+    int dw = w, dh = h;
+    if (w > kThumb || h > kThumb) {
+        const float s = (float)kThumb / (float)std::max(w, h);
+        dw = std::max(1, (int)(w * s));
+        dh = std::max(1, (int)(h * s));
+    }
+    std::vector<unsigned char> out((size_t)dw * dh * 4);
+    for (int y = 0; y < dh; ++y) {
+        for (int x = 0; x < dw; ++x) {
+            const int sx = std::min(w - 1, (int)(((float)x + 0.5f) * w / dw));
+            const int sy = std::min(h - 1, (int)(((float)y + 0.5f) * h / dh));
+            const unsigned char* sp = rgba.data() + ((size_t)sy * w + sx) * 4;
+            unsigned char* dp = out.data() + ((size_t)y * dw + x) * 4;
+            dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = sp[3];
+        }
+    }
+    if (!stbi_write_png(thumb.string().c_str(), dw, dh, 4, out.data(), dw * 4))
+        return "";
+    return thumb.string();
+}
+
+ImTextureID Menu::getThumbnail(const std::string& src) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto src_time = fs::last_write_time(src, ec);
+
+    auto it = thumb_cache_.find(src);
+    if (it != thumb_cache_.end()) {
+        // Reuse the cached texture unless the source changed since we built it.
+        if (it->second.failed) return 0;
+        if (ec || src_time == it->second.src_time) return it->second.id;
+        // Source is newer — retire the stale GPU texture (kept alive so ImGui
+        // never touches a freed descriptor) and rebuild below.
+        if (it->second.info) retired_thumbs_.push_back(it->second.info);
+        thumb_cache_.erase(it);
+    }
+
+    if (thumb_budget_ <= 0) return 0;   // budget spent — retry next frame
+
+    // CRITICAL: do NOT create thumbnails while the async mesh loader is busy.
+    // Thumbnail generation does GPU work on the MAIN thread — ensureThumbnail()
+    // loads/rasterises a model (tinygltf/ufbx) and createTextureImage() records
+    // a command buffer + submits to a queue + allocates device memory.  The
+    // mesh-load WORKER thread does the same kinds of GPU work concurrently, and
+    // Vulkan requires external synchronisation for queues / command pools / the
+    // allocator.  Running both at once corrupts driver state and faults later
+    // inside vkAllocateDescriptorSets (the createDescriptorSets crash).  Defer
+    // all thumbnail creation until the loader has drained; cached thumbnails
+    // still display (the cache-hit path above returns before this point).
+    if (mesh_load_task_manager_ &&
+        mesh_load_task_manager_->inFlightCount() > 0) {
+        return 0;   // loader active — retry on a later, idle frame
+    }
+
+    // Hard cap on cached thumbnails (bounds ImGui's own descriptor pool).
+    constexpr size_t kMaxThumbs = 192;
+    if (thumb_cache_.size() >= kMaxThumbs) return 0;
+
+    --thumb_budget_;
+
+    ThumbTex t;
+    t.src_time = src_time;
+    const std::string thumb = ensureThumbnail(src);   // incremental: only if stale
+    if (thumb.empty()) {
+        t.failed = true;
+    } else {
+        try {
+            t.info = std::make_shared<renderer::TextureInfo>();
+            engine::helper::createTextureImage(
+                device_, thumb, renderer::Format::R8G8B8A8_UNORM, true,
+                *t.info, std::source_location::current());
+            if (t.info && t.info->view)
+                t.id = renderer::Helper::addImTextureID(sampler_, t.info->view);
+            else
+                t.failed = true;
+        } catch (...) {
+            t.failed = true;
+            t.info.reset();
+        }
+    }
+    const ImTextureID id = t.failed ? 0 : t.id;
+    thumb_cache_.emplace(src, std::move(t));
+    return id;
+}
+
+void Menu::drawFolderTree(const std::string& dir, int depth) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
+
+    std::vector<fs::directory_entry> subs;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        if (!e.is_directory()) continue;
+        if (e.path().filename() == ".thumbnails") continue;
+        subs.push_back(e);
+    }
+    std::sort(subs.begin(), subs.end(), [](const auto& a, const auto& b) {
+        return a.path().filename().string() < b.path().filename().string(); });
+
+    std::string name = fs::path(dir).filename().string();
+    if (name.empty()) name = dir;
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
+                               ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (content_dir_ == dir) flags |= ImGuiTreeNodeFlags_Selected;
+    if (depth == 0)          flags |= ImGuiTreeNodeFlags_DefaultOpen;
+    if (subs.empty())
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+
+    const bool open = ImGui::TreeNodeEx(name.c_str(), flags);
+    // Click on the label (not the open/close arrow) selects the folder.
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        content_dir_ = dir;
+    if (open && !subs.empty()) {
+        for (auto& s : subs) drawFolderTree(s.path().string(), depth + 1);
+        ImGui::TreePop();
+    }
+}
+
 void Menu::drawContentBrowserPanel() {
     namespace fs = std::filesystem;
     if (ImGui::Begin("Content Browser")) {
+        thumb_budget_ = 3;   // cap texture loads per frame so big folders don't stall
+
+        const float total_w = ImGui::GetContentRegionAvail().x;
+        constexpr float kMinPane = 90.0f, kSplit = 6.0f;
+        if (content_left_w_ <= 0.0f) content_left_w_ = total_w * 0.22f;
+        if (content_left_w_ < kMinPane) content_left_w_ = kMinPane;
+        if (total_w - kMinPane - kSplit > kMinPane &&
+            content_left_w_ > total_w - kMinPane - kSplit)
+            content_left_w_ = total_w - kMinPane - kSplit;
+
+        // ── Left: folder tree (names only) ────────────────────────────
+        ImGui::BeginChild("##cb_tree", ImVec2(content_left_w_, 0), true);
+        drawFolderTree("assets", 0);
+        ImGui::EndChild();
+
+        // Vertical splitter between the two panes.
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::InvisibleButton("##cb_split", ImVec2(kSplit, -1.0f));
+        if (ImGui::IsItemActive() || ImGui::IsItemHovered())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive())
+            content_left_w_ += ImGui::GetIO().MouseDelta.x;
+        {
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            const float cx = (a.x + b.x) * 0.5f;
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(cx, a.y + 2), ImVec2(cx, b.y - 2),
+                ImGui::GetColorU32(ImGui::IsItemActive() ? ImGuiCol_SeparatorActive
+                                                         : ImGuiCol_Separator), 1.5f);
+        }
+        ImGui::SameLine(0.0f, 0.0f);
+
+        // ── Right: thumbnail grid of the selected folder ──────────────
+        ImGui::BeginChild("##cb_grid", ImVec2(0, 0), true);
         if (ImGui::SmallButton("Up")) {
             fs::path p(content_dir_);
             if (p.has_parent_path() && !p.parent_path().empty())
@@ -3450,26 +3810,74 @@ void Menu::drawContentBrowserPanel() {
 
         std::error_code ec;
         if (fs::exists(content_dir_, ec) && fs::is_directory(content_dir_, ec)) {
-            std::vector<std::string> dirs, files;
+            std::vector<fs::directory_entry> items;   // dirs first, then files
+            std::vector<fs::directory_entry> dirs, files;
             for (auto& e : fs::directory_iterator(content_dir_, ec)) {
-                if (e.is_directory()) dirs.push_back(e.path().filename().string());
-                else                  files.push_back(e.path().filename().string());
+                if (e.path().filename() == ".thumbnails") continue;
+                (e.is_directory() ? dirs : files).push_back(e);
             }
-            std::sort(dirs.begin(), dirs.end());
-            std::sort(files.begin(), files.end());
-            for (const auto& d : dirs) {
-                const std::string lbl = "[ " + d + " ]##d_" + d;
-                if (ImGui::Selectable(lbl.c_str(), false,
-                        ImGuiSelectableFlags_AllowDoubleClick) &&
-                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    content_dir_ = (fs::path(content_dir_) / d).string();
+            auto byname = [](const fs::directory_entry& a, const fs::directory_entry& b) {
+                return a.path().filename().string() < b.path().filename().string(); };
+            std::sort(dirs.begin(), dirs.end(), byname);
+            std::sort(files.begin(), files.end(), byname);
+            items.insert(items.end(), dirs.begin(), dirs.end());
+            items.insert(items.end(), files.begin(), files.end());
+
+            const float cell  = 80.0f;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            int cols = (int)(avail / (cell + 14.0f));
+            if (cols < 1) cols = 1;
+
+            for (size_t i = 0; i < items.size(); ++i) {
+                const fs::directory_entry& e = items[i];
+                const std::string name = e.path().filename().string();
+                std::string ext = e.path().extension().string();
+                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+                const bool is_dir = e.is_directory();
+                const bool is_img = (ext == ".png" || ext == ".jpg" ||
+                                     ext == ".jpeg" || ext == ".bmp" ||
+                                     ext == ".tga"  || ext == ".dds");
+                const bool is_model = (ext == ".gltf" || ext == ".glb" ||
+                                       ext == ".obj"  || ext == ".fbx");
+
+                // Anything with a generatable thumbnail goes through getThumbnail;
+                // it returns 0 (→ type tile) for formats we can't render yet.
+                ImTextureID tex = (!is_dir && (is_img || is_model))
+                                  ? getThumbnail(e.path().string()) : 0;
+
+                ImGui::PushID((int)i);
+                ImGui::BeginGroup();
+                bool clicked = false;
+                if (tex) {
+                    clicked = ImGui::ImageButton("##t", tex, ImVec2(cell, cell));
+                } else {
+                    const ImVec4 c = is_dir   ? ImVec4(0.24f, 0.31f, 0.45f, 1.0f)
+                                   : is_model ? ImVec4(0.28f, 0.40f, 0.27f, 1.0f)
+                                              : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, c);
+                    std::string glyph = is_dir ? "DIR"
+                        : (ext.size() > 1 ? ext.substr(1) : "?");
+                    for (auto& ch : glyph) ch = (char)std::toupper((unsigned char)ch);
+                    clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
+                    ImGui::PopStyleColor();
                 }
+                // Truncated one-line label (keeps the grid aligned).
+                std::string disp = name;
+                if (disp.size() > 11) disp = disp.substr(0, 9) + "..";
+                ImGui::TextUnformatted(disp.c_str());
+                ImGui::EndGroup();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name.c_str());
+                ImGui::PopID();
+
+                if (clicked && is_dir) content_dir_ = e.path().string();
+
+                if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
             }
-            for (const auto& f : files)
-                ImGui::BulletText("%s", f.c_str());
+            if (items.empty()) ImGui::TextDisabled("(empty)");
         } else {
             ImGui::TextDisabled("(folder not found: %s)", content_dir_.c_str());
         }
+        ImGui::EndChild();
     }
     ImGui::End();
 }

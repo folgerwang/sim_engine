@@ -64,6 +64,14 @@ public:
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const glm::vec3& camera_pos);
 
+    // Follow-camera overload: override BOTH the camera position and its view
+    // (facing) direction.  Used by the third-person follow rig to place the
+    // eye behind/below the character and aim the view up along her back.
+    virtual void updateCamera(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const glm::vec3& camera_pos,
+        const glm::vec3& facing_dir);
+
     void createCameraDescSetWithTerrain(
         const std::shared_ptr<renderer::Sampler>& texture_sampler,
         const renderer::TextureInfo& rock_layer,

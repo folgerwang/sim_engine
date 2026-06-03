@@ -1307,7 +1307,22 @@ void Helper::initImgui(
     init_info.QueueFamily = queue_family_list.getGraphicAndPresentFamilyIndex()[0]; // get graphic queue family index.
     init_info.Queue = RENDER_TYPE_CAST(Queue, graphics_queue)->get();
     init_info.PipelineCache = nullptr;// g_PipelineCache;
-    init_info.DescriptorPool = RENDER_TYPE_CAST(DescriptorPool, descriptor_pool)->get();
+    // Give ImGui its OWN descriptor pool instead of sharing the engine's.
+    // The content-browser thumbnail grid allocates one COMBINED_IMAGE_SAMPLER
+    // per thumbnail via ImGui_ImplVulkan_AddTexture.  Sharing the engine pool
+    // let those allocations contend with / starve the async mesh loader's
+    // material/skin descriptor sets — the driver faulted inside
+    // vkAllocateDescriptorSets (createDescriptorSets) under the combination of
+    // a worker-thread mesh load and main-thread ImGui texture allocation on
+    // the same VkDescriptorPool (host access to a pool must be externally
+    // synchronised) plus eventual exhaustion.  A dedicated self-managed pool
+    // (DescriptorPoolSize > 0) isolates ALL ImGui textures — fonts, the
+    // viewport blits, and thumbnails — from engine descriptors entirely.
+    // NOTE: DescriptorPool and DescriptorPoolSize are mutually exclusive; the
+    // passed-in engine pool is intentionally unused here now.
+    (void)descriptor_pool;
+    init_info.DescriptorPool     = VK_NULL_HANDLE;
+    init_info.DescriptorPoolSize = 1024;   // fonts + UI blits + thumbnails (capped at 192)
     init_info.PipelineInfoMain.RenderPass = RENDER_TYPE_CAST(RenderPass, render_pass)->get();
     init_info.PipelineInfoMain.Subpass = 0;
     init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;

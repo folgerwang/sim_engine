@@ -169,6 +169,20 @@ void CameraObject::updateCamera(
         input_camera_pos);
 }
 
+void CameraObject::updateCamera(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const glm::vec3& camera_pos,
+    const glm::vec3& facing_dir) {
+
+    auto input_camera_pos = std::make_shared<glm::vec3>(camera_pos);
+    auto input_facing_dir = std::make_shared<glm::vec3>(facing_dir);
+    m_view_camera_params_.init_camera_pos = camera_pos;
+    m_view_camera_->updateViewCameraInfo(
+        m_view_camera_params_,
+        input_camera_pos,
+        input_facing_dir);
+}
+
 void CameraObject::createCameraDescSetWithTerrain(
     const std::shared_ptr<renderer::Sampler>& texture_sampler,
     const renderer::TextureInfo& rock_layer,
