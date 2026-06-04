@@ -124,6 +124,12 @@ void PlayerController::update(
 
     if (!player || !player->isReady()) return;
 
+    // Editor "edit mode" gate: when movement is disabled, hide the input
+    // window from the WASD/SPACE *movement* reads (mwin) so the character
+    // stays put while the free camera consumes the keys.  Non-movement key
+    // reads (debug toggles) keep using the real `window`.
+    GLFWwindow* mwin = movement_enabled_ ? window : nullptr;
+
     // Wait for the application to call spawnAt() once the level
     // finishes loading.  Until then, leave the rig at its glTF rest
     // pose instead of teleporting it to the world origin.
@@ -178,12 +184,12 @@ void PlayerController::update(
     // real travel direction for foot-step placement.  walk_weight_ below
     // still ramps the gait in/out so press/release eases rather than snaps.
     bool wasd_held = false;
-    if (window) {
+    if (mwin) {
         wasd_held =
-            glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS ||
-            glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS ||
-            glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS ||
-            glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
+            glfwGetKey(mwin, GLFW_KEY_W) == GLFW_PRESS ||
+            glfwGetKey(mwin, GLFW_KEY_A) == GLFW_PRESS ||
+            glfwGetKey(mwin, GLFW_KEY_S) == GLFW_PRESS ||
+            glfwGetKey(mwin, GLFW_KEY_D) == GLFW_PRESS;
     }
     // force_walking_ is set by the Render Debug skeleton-view modes so
     // the user can watch the legs animate without holding WASD; in normal
@@ -371,14 +377,14 @@ void PlayerController::update(
                 // released.
                 glm::vec3 step_dir = fwd_world;
                 if (std::string(source) != std::string("space")) {
-                    const bool w_pressed = window &&
-                        (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS);
-                    const bool s_pressed = window &&
-                        (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS);
-                    const bool a_pressed = window &&
-                        (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS);
-                    const bool d_pressed = window &&
-                        (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS);
+                    const bool w_pressed = mwin &&
+                        (glfwGetKey(mwin, GLFW_KEY_W) == GLFW_PRESS);
+                    const bool s_pressed = mwin &&
+                        (glfwGetKey(mwin, GLFW_KEY_S) == GLFW_PRESS);
+                    const bool a_pressed = mwin &&
+                        (glfwGetKey(mwin, GLFW_KEY_A) == GLFW_PRESS);
+                    const bool d_pressed = mwin &&
+                        (glfwGetKey(mwin, GLFW_KEY_D) == GLFW_PRESS);
                     const float wf = (w_pressed ? 1.0f : 0.0f)
                                    - (s_pressed ? 1.0f : 0.0f);
                     const float wr = (d_pressed ? 1.0f : 0.0f)
@@ -429,7 +435,7 @@ void PlayerController::update(
             };
 
             const bool space_down =
-                (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
+                mwin && (glfwGetKey(mwin, GLFW_KEY_SPACE) == GLFW_PRESS);
             if (space_down && !step_key_down_prev_) {
                 fireStep("space");
                 // Manual press resets the auto timer so a tap doesn't

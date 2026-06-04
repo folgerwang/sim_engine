@@ -3247,8 +3247,13 @@ static void drawNodes(
             // push constants; depth-only / shadow / mesh-shader CSM
             // pipelines simply ignore the field (they don't read
             // model_params).
+            // 1u = debug smoke-test red (whole drawable); 2u = editor
+            // selection highlight for THIS node (or whole drawable when
+            // m_highlight_node_ == -2).  base.frag tints amber for 2u.
             model_params.debug_force_red =
-                drawable_object->m_debug_force_red_ ? 1u : 0u;
+                drawable_object->m_debug_force_red_ ? 1u
+                : ((drawable_object->m_highlight_node_ == node_idx ||
+                    drawable_object->m_highlight_node_ == -2) ? 2u : 0u);
             // base.vert's skin-matrix multiplication is skipped when
             // this is set (see DrawableData::m_debug_skip_skinning_).
             // For depth-only / shadow / mesh-shader CSM permutations

@@ -118,6 +118,11 @@ public:
     // entirely WASD-driven (see update()).
     void setForceWalking(bool v) { force_walking_ = v; }
     bool forceWalking() const    { return force_walking_; }
+    // When false (editor "edit mode"), WASD/SPACE no longer move the character
+    // — update() still poses it (idle), it just won't translate.  The free
+    // camera consumes WASD instead.
+    void setMovementEnabled(bool e) { movement_enabled_ = e; }
+    bool movementEnabled() const    { return movement_enabled_; }
     // Live-tunable IK knobs (wired to the Physics > Foot IK menu).
     void setFootStrideAmp(float v)  { foot_stride_amp_  = v; }
     void setFootLiftAmp(float v)    { foot_lift_amp_    = v; }
@@ -266,6 +271,7 @@ private:
     float     player_height_ = 1.8f;     // total capsule height (incl. hemispheres)
     bool      walking_       = false;
     bool      force_walking_ = false;  // see setForceWalking() above
+    bool      movement_enabled_ = true; // editor edit-mode freezes movement
     bool      initialized_   = false;
 
     // ── Foot IK state ────────────────────────────────

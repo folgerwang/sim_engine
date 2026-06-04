@@ -272,6 +272,11 @@ struct DrawableData {
     // rasterizer (versus being silently culled / never bound).  Set
     // via DrawableObject::setDebugForceRed.
     bool m_debug_force_red_ = false;
+    // Editor selection highlight target node index.  -1 = no highlight,
+    // -2 = highlight the WHOLE drawable, >=0 = highlight just that node.
+    // drawNodes() pushes debug_force_red=2 for matching nodes and base.frag
+    // tints them amber — a real highlight layer on the original mesh.
+    int32_t m_highlight_node_ = -1;
     // "Skip skinning" debug override — when set, drawNodes pushes
     // model_params.debug_skip_skinning=1 for every primitive draw on
     // this drawable.  base.vert then renders the mesh in its glTF
@@ -660,6 +665,10 @@ public:
     }
     bool getDebugForceRed() const {
         return object_ ? object_->m_debug_force_red_ : false;
+    }
+    // Editor selection highlight: -1 none, -2 whole drawable, >=0 a node.
+    void setHighlightNode(int n) {
+        if (object_) object_->m_highlight_node_ = n;
     }
 
     // ── Debug "skip skinning" override ───────────────────────────────

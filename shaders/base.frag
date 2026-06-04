@@ -348,7 +348,13 @@ void main() {
     // specific DrawableObject (currently the PlayerController player)
     // via setDebugForceRed(true); every other drawable keeps the
     // field at 0 and is unaffected.
-    if (model_params.debug_force_red != 0u) {
+    if (model_params.debug_force_red == 1u) {
         outColor = vec4(1.0, 0.0, 0.0, 1.0);
+    } else if (model_params.debug_force_red == 2u) {
+        // Editor selection highlight: blend the lit colour toward a bright
+        // amber so the picked object/sub-object reads as a highlight layer
+        // rendered on top of the original mesh.  Set per-node by drawNodes()
+        // when the drawable's m_highlight_node_ matches (or == -2 = whole).
+        outColor.rgb = mix(outColor.rgb, vec3(1.0, 0.55, 0.08), 0.5);
     }
 }

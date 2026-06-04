@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
+#include <limits>
+#include <ctime>
 
 // stbi_load / stbi_image_free are already compiled into the project via
 // tinygltf (STB_IMAGE_IMPLEMENTATION lives in engine_helper.cpp).
@@ -733,6 +735,18 @@ void Menu::init(
     // UI; the device is idle here, so free them outright rather than
     // re-registering dead handles.
     retired_thumbs_.clear();
+
+    // Selection-mask texture hits the same hazard.  Re-register its surviving
+    // view with the fresh pool; drop the deferred-free list WITHOUT calling
+    // RemoveTexture (those descriptors belonged to the now-destroyed pool).
+    // Reset the change key so it regenerates for the (likely changed) viewport.
+    if (sel_mask_tex_ && sel_mask_tex_->view)
+        sel_mask_id_ = renderer::Helper::addImTextureID(sampler_, sel_mask_tex_->view);
+    else
+        sel_mask_id_ = 0;
+    sel_mask_dead_.clear();
+    sel_mask_obj_  = nullptr;
+    sel_mask_node_ = -3;
 }
 
 bool Menu::draw(
@@ -979,6 +993,77 @@ bool Menu::draw(
             ImVec2(pos.x + ts.x + pad.x, pos.y + ts.y + pad.y),
             IM_COL32(0, 0, 0, 160), 4.0f);
         fg->AddText(pos, IM_COL32(255, 255, 255, 255), buf);
+    }
+
+    // ── Outliner selected-object highlight + mask ─────────────────────────
+    // Bright bounding box + a translucent screen-space "mask" around the
+    // object (or sub-object) selected in the editor Outliner, projected into
+    // the viewport through the camera's view_proj (same one the player marker
+    // uses, fed every frame).  Double-clicking an Outliner item ALSO teleports
+    // the camera to frame it — that part is consumed app-side via
+    // takeEditorFocus().  The box pulses so it reads as a live selection.
+    if (editor_enabled_) {
+        // Refresh the exact silhouette mask if the selection / camera changed.
+        updateSelectionMask();
+
+        ImVec2 hvp_pos, hvp_size, hvp_c;
+        getViewportScreenRect(hvp_pos, hvp_size, hvp_c);
+        const float hsw = hvp_size.x, hsh = hvp_size.y;
+        ImDrawList* hfg = ImGui::GetForegroundDrawList();
+
+        // Pulsing colour so the selection reads as "live".
+        const float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 4.0f);
+        const int   edge_a = 180 + (int)(75.0f * pulse);
+        const ImU32 kEdge = IM_COL32(255, 190, 50, edge_a);
+        const ImU32 kMask = IM_COL32(255, 190, 50, 70);
+
+        // Confine ALL highlight drawing to the viewport rect so it can't bleed
+        // over the docked panels (Outliner / Content Browser / Output Log).
+        hfg->PushClipRect(hvp_pos,
+            ImVec2(hvp_pos.x + hsw, hvp_pos.y + hsh), true);
+
+        // Preferred: the EXACT silhouette mask (CPU-rasterised this object from
+        // the camera).  It already fills the viewport (rendered at the camera
+        // view), so draw it 1:1 over the viewport rect.  Falls back to the
+        // convex-hull outline, then the bounding box, when no mask is ready.
+        std::vector<ImVec2> hull;
+        glm::vec3 hb_min, hb_max;
+        if (sel_mask_id_) {
+            hfg->AddImage(sel_mask_id_, hvp_pos,
+                ImVec2(hvp_pos.x + hsw, hvp_pos.y + hsh));
+        } else if (selectedScreenHull(hull)) {
+            hfg->AddConvexPolyFilled(hull.data(), (int)hull.size(), kMask);
+            hfg->AddPolyline(hull.data(), (int)hull.size(), kEdge,
+                             ImDrawFlags_Closed, 2.5f);
+        } else if (selectedWorldAabb(hb_min, hb_max)) {
+            // Fallback (e.g. a whole-FBX group selection): bounding box.
+            const float Xc[2] = { hb_min.x, hb_max.x };
+            const float Yc[2] = { hb_min.y, hb_max.y };
+            const float Zc[2] = { hb_min.z, hb_max.z };
+            glm::vec4 clip[8];
+            for (int i = 0; i < 8; ++i)
+                clip[i] = player_view_proj_ * glm::vec4(
+                    Xc[i & 1], Yc[(i >> 1) & 1], Zc[(i >> 2) & 1], 1.0f);
+            constexpr float kWEps = 1e-3f;
+            auto toPx = [&](const glm::vec4& cc) -> ImVec2 {
+                glm::vec3 ndc = glm::vec3(cc) / cc.w;
+                return ImVec2((ndc.x * 0.5f + 0.5f) * hsw + hvp_pos.x,
+                              (ndc.y * 0.5f + 0.5f) * hsh + hvp_pos.y);
+            };
+            static const int edges[12][2] = {
+                {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7},
+                {0,4},{1,5},{2,6},{3,7} };
+            for (int e = 0; e < 12; ++e) {
+                glm::vec4 A = clip[edges[e][0]];
+                glm::vec4 B = clip[edges[e][1]];
+                const bool ain = A.w >= kWEps, bin = B.w >= kWEps;
+                if (!ain && !bin) continue;
+                if (!ain) A = A + ((kWEps - A.w) / (B.w - A.w)) * (B - A);
+                if (!bin) B = B + ((kWEps - B.w) / (A.w - B.w)) * (A - B);
+                hfg->AddLine(toPx(A), toPx(B), kEdge, 2.5f);
+            }
+        }
+        hfg->PopClipRect();
     }
 
     // ── Classifier progress bar (top-pinned overlay) ─────────────────
@@ -3131,10 +3216,52 @@ bool Menu::draw(
             skydome, dump_volume_noise, delta_t, vp_org, vp_size);
     }
 
+    // ── Viewport Play / Stop button (editor only, top-left corner) ──────────
+    // Toggles play mode: Play (green ▶) enters play mode (character is
+    // controllable, clock visible); Stop (red ■) returns to edit mode (player
+    // frozen, camera flies the level).  Only appears once the level has fully
+    // loaded — in game AND the collision ("simplified mesh") build is Done
+    // (the same point at which the loading bars disappear).
+    if (editor_enabled_ &&
+        game_state_ == GameState::InGame &&
+        collision_build_status_ == CollisionBuildStatus::Done) {
+        ImVec2 tb_pos, tb_size, tb_c;
+        getViewportScreenRect(tb_pos, tb_size, tb_c);
+        ImGui::SetNextWindowPos(ImVec2(tb_pos.x + 8.0f, tb_pos.y + 8.0f));
+        ImGui::SetNextWindowBgAlpha(0.35f);
+        if (ImGui::Begin("##viewport_toolbar", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking |
+                ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing)) {
+            const float bs = 30.0f;
+            const ImVec2 bp = ImGui::GetCursorScreenPos();
+            const bool clicked = ImGui::Button("##playstop", ImVec2(bs, bs));
+            ImDrawList* d = ImGui::GetWindowDrawList();
+            const ImVec2 cc(bp.x + bs * 0.5f, bp.y + bs * 0.5f);
+            if (play_mode_) {
+                d->AddRectFilled(ImVec2(cc.x - 6, cc.y - 6),
+                                 ImVec2(cc.x + 6, cc.y + 6),
+                                 IM_COL32(240, 80, 80, 255), 2.0f);   // ■ stop
+            } else {
+                d->AddTriangleFilled(ImVec2(cc.x - 5, cc.y - 8),
+                                     ImVec2(cc.x - 5, cc.y + 8),
+                                     ImVec2(cc.x + 8, cc.y),
+                                     IM_COL32(90, 220, 120, 255));     // ▶ play
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(play_mode_ ? "Stop — return to edit mode"
+                                             : "Play — control the character");
+            if (clicked) play_mode_ = !play_mode_;
+        }
+        ImGui::End();
+    }
+
     // ---- Analog clock overlay (top-left, always on top) --------------------
     // Drawn directly on the foreground draw list so it is always visible
-    // above every ImGui window, regardless of window z-order.
-    {
+    // above every ImGui window, regardless of window z-order.  Only shown in
+    // PLAY mode (the time-of-day clock is a gameplay element).
+    if (play_mode_) {
         constexpr float kFaceSize = 96.0f;
         constexpr float kPad      = 4.0f;
         const float kMenuH = ImGui::GetFrameHeight();
@@ -3143,7 +3270,10 @@ bool Menu::draw(
         // menu bar) or the full window below the menu bar otherwise.
         ImVec2 clk_pos, clk_size, clk_c;
         getViewportScreenRect(clk_pos, clk_size, clk_c);
-        const float clk_top = isViewportValid() ? 8.0f : (kMenuH + 8.0f);
+        // Shifted DOWN by half the face size (leaves room for the Play button
+        // above it in the editor viewport's top-left corner).
+        const float clk_top =
+            (isViewportValid() ? 8.0f : (kMenuH + 8.0f)) + kFaceSize * 0.5f;
         const ImVec2 origin(clk_pos.x + 14.0f, clk_pos.y + clk_top);
         const ImVec2 ctr(origin.x + kPad + kFaceSize * 0.5f,
                          origin.y + kPad + kFaceSize * 0.5f);
@@ -3342,16 +3472,78 @@ void Menu::drawOutlinerPanel() {
         if (list_h < kMinPane) list_h = kMinPane;
         if (max_list > kMinPane && list_h > max_list) list_h = max_list;
 
-        // Object list.
+        // Object list — a tree.  Multi-mesh drawables (the Bistro FBX files)
+        // become collapsible GROUPS named after the asset, with their many
+        // sub-objects (named mesh nodes) nested underneath; single-mesh
+        // objects (player, NPC) render as flat leaves.
         ImGui::BeginChild("##outliner_list", ImVec2(0, list_h), true);
         for (int i = 0; i < (int)editor_objects_.size(); ++i) {
-            const std::string label =
-                (editor_objects_[i].name.empty()
-                    ? ("Object " + std::to_string(i))
-                    : editor_objects_[i].name) + "##obj" + std::to_string(i);
-            if (ImGui::Selectable(label.c_str(), editor_selected_ == i))
+            EditorSceneObject& eo = editor_objects_[i];
+            const std::string base =
+                eo.name.empty() ? ("Object " + std::to_string(i)) : eo.name;
+            const auto& kids = outlinerChildren(eo);
+            const bool dbl = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+
+            if (kids.empty()) {
+                // Leaf object.  Single click selects; double click teleports.
+                const std::string label = base + "##obj" + std::to_string(i);
+                const bool sel = (editor_selected_ == i && editor_selected_child_ < 0);
+                if (ImGui::Selectable(label.c_str(), sel)) {
+                    editor_selected_ = i;
+                    editor_selected_child_ = -1;
+                }
+                if (ImGui::IsItemHovered() && dbl) requestEditorFocus(i, -1);
+                if (editor_scroll_to_selected_ && sel) ImGui::SetScrollHereY(0.5f);
+                continue;
+            }
+
+            // Group node (FBX file).  Clicking the label (not the arrow)
+            // selects the group; expanding lists its sub-objects.
+            ImGuiTreeNodeFlags gflags = ImGuiTreeNodeFlags_OpenOnArrow |
+                                        ImGuiTreeNodeFlags_SpanAvailWidth;
+            if (editor_selected_ == i && editor_selected_child_ < 0)
+                gflags |= ImGuiTreeNodeFlags_Selected;
+            const std::string glabel = base + "  (" +
+                std::to_string(kids.size()) + ")##grp" + std::to_string(i);
+            // Revealing a pick-selected sub-object: force its group open.
+            if (editor_scroll_to_selected_ && editor_selected_ == i &&
+                editor_selected_child_ >= 0)
+                ImGui::SetNextItemOpen(true);
+            const bool open = ImGui::TreeNodeEx(glabel.c_str(), gflags);
+            if (editor_scroll_to_selected_ && editor_selected_ == i &&
+                editor_selected_child_ < 0)
+                ImGui::SetScrollHereY(0.5f);
+            const bool ghover = ImGui::IsItemHovered();
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
                 editor_selected_ = i;
+                editor_selected_child_ = -1;
+            }
+            if (ghover && dbl && !ImGui::IsItemToggledOpen())
+                requestEditorFocus(i, -1);
+            if (open) {
+                for (int c = 0; c < (int)kids.size(); ++c) {
+                    const bool csel =
+                        (editor_selected_ == i && editor_selected_child_ == c);
+                    ImGuiTreeNodeFlags cflags =
+                        ImGuiTreeNodeFlags_Leaf |
+                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                        ImGuiTreeNodeFlags_SpanAvailWidth;
+                    if (csel) cflags |= ImGuiTreeNodeFlags_Selected;
+                    const std::string clabel = kids[c].first + "##o" +
+                        std::to_string(i) + "_" + std::to_string(c);
+                    ImGui::TreeNodeEx(clabel.c_str(), cflags);
+                    if (ImGui::IsItemClicked()) {
+                        editor_selected_ = i;
+                        editor_selected_child_ = c;
+                    }
+                    if (ImGui::IsItemHovered() && dbl) requestEditorFocus(i, c);
+                    if (editor_scroll_to_selected_ && csel)
+                        ImGui::SetScrollHereY(0.5f);
+                }
+                ImGui::TreePop();
+            }
         }
+        editor_scroll_to_selected_ = false;   // one-shot consumed this draw
         if (editor_objects_.empty())
             ImGui::TextDisabled("(no scene objects yet)");
         ImGui::EndChild();
@@ -3384,12 +3576,352 @@ void Menu::drawOutlinerPanel() {
     ImGui::End();
 }
 
+// Build (once, when the object is ready) and cache the list of sub-object
+// names for a drawable.  A drawable is treated as a GROUP only if it has more
+// than one mesh node (so single-mesh objects like the player stay flat).
+// Returns an empty list for not-yet-ready or single-mesh objects.
+const std::vector<std::pair<std::string, int>>&
+Menu::outlinerChildren(const EditorSceneObject& eo) {
+    static const std::vector<std::pair<std::string, int>> kEmpty;
+    if (!eo.obj) return kEmpty;
+    auto it = outliner_children_cache_.find(eo.obj);
+    if (it != outliner_children_cache_.end()) return it->second;
+    if (!eo.obj->isReady()) return kEmpty;   // not loaded yet — retry next frame
+
+    std::vector<std::pair<std::string, int>> kids;
+    const auto& data = eo.obj->getDrawableData();
+    int mesh_nodes = 0;
+    for (const auto& n : data.nodes_) if (n.mesh_idx_ >= 0) ++mesh_nodes;
+    if (mesh_nodes > 1) {
+        kids.reserve((size_t)mesh_nodes);
+        for (int ni = 0; ni < (int)data.nodes_.size(); ++ni) {
+            if (data.nodes_[ni].mesh_idx_ < 0) continue;
+            std::string nm = data.nodes_[ni].name_;
+            if (nm.empty()) nm = "node " + std::to_string(ni);
+            kids.emplace_back(std::move(nm), ni);
+        }
+    }
+    auto res = outliner_children_cache_.emplace(eo.obj, std::move(kids));
+    return res.first->second;
+}
+
+// World-space AABB of the selected object (group) or sub-object node.
+bool Menu::selectedWorldAabb(glm::vec3& bmin, glm::vec3& bmax) {
+    if (editor_selected_ < 0 ||
+        editor_selected_ >= (int)editor_objects_.size())
+        return false;
+    EditorSceneObject& eo = editor_objects_[editor_selected_];
+    if (!eo.obj || !eo.obj->isReady()) return false;
+
+    glm::vec3 lmin, lmax;   // local/model-space box
+    glm::mat4 world(1.0f);
+
+    const auto& kids = outlinerChildren(eo);
+    if (editor_selected_child_ >= 0 &&
+        editor_selected_child_ < (int)kids.size()) {
+        // Sub-object node: mesh bbox in the node's world matrix.
+        const auto& data = eo.obj->getDrawableData();
+        const int ni = kids[editor_selected_child_].second;
+        if (ni < 0 || ni >= (int)data.nodes_.size()) return false;
+        const auto& node = data.nodes_[ni];
+        if (node.mesh_idx_ < 0 ||
+            node.mesh_idx_ >= (int)data.meshes_.size()) return false;
+        const auto& mesh = data.meshes_[node.mesh_idx_];
+        if (mesh.bbox_min_.x > mesh.bbox_max_.x) return false;
+        lmin = mesh.bbox_min_; lmax = mesh.bbox_max_;
+        world = node.cached_matrix_;          // already world-space
+    } else {
+        // Whole object: model bbox in the instance world transform.
+        lmin = eo.obj->getModelBboxMin();
+        lmax = eo.obj->getModelBboxMax();
+        if (lmin.x > lmax.x) return false;
+        world = eo.obj->getLocation();
+    }
+
+    // Transform the 8 corners and re-fit an axis-aligned world box.
+    const float Xc[2] = { lmin.x, lmax.x };
+    const float Yc[2] = { lmin.y, lmax.y };
+    const float Zc[2] = { lmin.z, lmax.z };
+    bmin = glm::vec3(std::numeric_limits<float>::max());
+    bmax = glm::vec3(std::numeric_limits<float>::lowest());
+    for (int i = 0; i < 8; ++i) {
+        glm::vec4 w = world * glm::vec4(Xc[i & 1], Yc[(i >> 1) & 1],
+                                        Zc[(i >> 2) & 1], 1.0f);
+        glm::vec3 p(w);
+        bmin = glm::min(bmin, p);
+        bmax = glm::max(bmax, p);
+    }
+    return bmax.x >= bmin.x;
+}
+
+// Convex-hull outline of the selected object's projected mesh vertices.
+bool Menu::selectedScreenHull(std::vector<ImVec2>& hull) {
+    hull.clear();
+    if (editor_selected_ < 0 ||
+        editor_selected_ >= (int)editor_objects_.size())
+        return false;
+    EditorSceneObject& eo = editor_objects_[editor_selected_];
+    if (!eo.obj || !eo.obj->isReady()) return false;
+    const auto& data = eo.obj->getDrawableData();
+
+    const auto& kids = outlinerChildren(eo);
+    const bool is_group = !kids.empty();
+    const bool child_sel = (editor_selected_child_ >= 0 &&
+                            editor_selected_child_ < (int)kids.size());
+    // Groups with no chosen sub-object would mean projecting the whole FBX
+    // (hundreds of thousands of verts) — skip and let the caller use the bbox.
+    if (is_group && !child_sel) return false;
+
+    ImVec2 vp_pos, vp_size, vp_c;
+    getViewportScreenRect(vp_pos, vp_size, vp_c);
+    const float sw = vp_size.x, sh = vp_size.y;
+
+    std::vector<ImVec2> pts;
+    auto projectMesh = [&](int mesh_idx, const glm::mat4& world) {
+        if (mesh_idx < 0 || mesh_idx >= (int)data.meshes_.size()) return;
+        const auto& mesh = data.meshes_[mesh_idx];
+        if (!mesh.vertex_position_) return;
+        const auto& V = *mesh.vertex_position_;
+        // Cap the vertex count we project so huge meshes stay cheap.
+        const size_t stride = (V.size() > 4000) ? (V.size() / 4000 + 1) : 1;
+        for (size_t i = 0; i < V.size(); i += stride) {
+            glm::vec4 clip = player_view_proj_ * (world * glm::vec4(V[i], 1.0f));
+            if (clip.w < 1e-3f) continue;          // behind camera
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            pts.push_back(ImVec2((ndc.x * 0.5f + 0.5f) * sw + vp_pos.x,
+                                 (ndc.y * 0.5f + 0.5f) * sh + vp_pos.y));
+        }
+    };
+
+    if (child_sel) {
+        const int ni = kids[editor_selected_child_].second;
+        if (ni >= 0 && ni < (int)data.nodes_.size())
+            projectMesh(data.nodes_[ni].mesh_idx_, data.nodes_[ni].cached_matrix_);
+    } else {
+        // Single-mesh object (player / NPC / standalone drawable).
+        for (const auto& node : data.nodes_)
+            if (node.mesh_idx_ >= 0)
+                projectMesh(node.mesh_idx_, node.cached_matrix_);
+    }
+    if (pts.size() < 3) return false;
+
+    // Andrew's monotone-chain convex hull (counter-clockwise).
+    std::sort(pts.begin(), pts.end(), [](const ImVec2& a, const ImVec2& b) {
+        return a.x < b.x || (a.x == b.x && a.y < b.y); });
+    auto cross = [](const ImVec2& O, const ImVec2& A, const ImVec2& B) {
+        return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x); };
+    const int n = (int)pts.size();
+    std::vector<ImVec2> H(2 * n);
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        while (k >= 2 && cross(H[k - 2], H[k - 1], pts[i]) <= 0.0f) --k;
+        H[k++] = pts[i];
+    }
+    for (int i = n - 2, t = k + 1; i >= 0; --i) {
+        while (k >= t && cross(H[k - 2], H[k - 1], pts[i]) <= 0.0f) --k;
+        H[k++] = pts[i];
+    }
+    H.resize((size_t)std::max(0, k - 1));
+    if (H.size() < 3) return false;
+    hull = std::move(H);
+    return true;
+}
+
+// Regenerate the exact silhouette mask when the selection or camera changed.
+void Menu::updateSelectionMask() {
+    ++sel_mask_frame_;
+    // Free retired mask textures whose in-flight window has elapsed.
+    for (auto it = sel_mask_dead_.begin(); it != sel_mask_dead_.end();) {
+        if (it->free_frame <= sel_mask_frame_) {
+            if (it->id)
+                ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)it->id);
+            it = sel_mask_dead_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    auto dropCurrent = [&]() {
+        if (sel_mask_id_ || sel_mask_tex_)
+            sel_mask_dead_.push_back(
+                { sel_mask_frame_ + 4, sel_mask_id_, sel_mask_tex_ });
+        sel_mask_id_ = 0; sel_mask_tex_.reset();
+        sel_mask_obj_ = nullptr; sel_mask_node_ = -3;
+    };
+
+    if (!editor_enabled_ || !device_ || !sampler_) { dropCurrent(); return; }
+
+    engine::game_object::DrawableObject* obj = nullptr;
+    int node_idx = -1;
+    if (!getSelectedHighlight(obj, node_idx) || !obj || !obj->isReady()) {
+        dropCurrent();
+        return;
+    }
+
+    ImVec2 vp_pos, vp_size, vp_c;
+    getViewportScreenRect(vp_pos, vp_size, vp_c);
+    const glm::vec2 vpsz(vp_size.x, vp_size.y);
+    if (vpsz.x < 8.0f || vpsz.y < 8.0f) return;
+
+    const bool changed =
+        (obj != sel_mask_obj_) || (node_idx != sel_mask_node_) ||
+        (player_view_proj_ != sel_mask_vp_) || (vpsz != sel_mask_vpsz_);
+    if (!changed) return;   // reuse the cached mask
+
+    // ── Build a world-space triangle mesh from the selected node(s) ──
+    plugins::auto_rig::TriangleMesh mesh;
+    const auto& data = obj->getDrawableData();
+    auto addNode = [&](int ni) {
+        if (ni < 0 || ni >= (int)data.nodes_.size()) return;
+        const auto& node = data.nodes_[ni];
+        if (node.mesh_idx_ < 0 || node.mesh_idx_ >= (int)data.meshes_.size()) return;
+        const auto& m = data.meshes_[node.mesh_idx_];
+        if (!m.vertex_position_) return;
+        const auto& V = *m.vertex_position_;
+        const glm::mat4& W = node.cached_matrix_;
+        const uint32_t base = (uint32_t)mesh.positions.size();
+        mesh.positions.reserve(mesh.positions.size() + V.size());
+        for (const auto& v : V)
+            mesh.positions.push_back(glm::vec3(W * glm::vec4(v, 1.0f)));
+        for (const auto& prim : m.primitives_) {
+            if (!prim.vertex_indices_) continue;
+            for (int32_t idx : *prim.vertex_indices_)
+                mesh.indices.push_back(base + (uint32_t)idx);
+        }
+    };
+    if (node_idx >= 0) addNode(node_idx);
+    else for (int ni = 0; ni < (int)data.nodes_.size(); ++ni)
+        if (data.nodes_[ni].mesh_idx_ >= 0) addNode(ni);
+
+    // Record the change key now so an unrenderable selection isn't retried
+    // every frame.
+    sel_mask_obj_ = obj; sel_mask_node_ = node_idx;
+    sel_mask_vp_ = player_view_proj_; sel_mask_vpsz_ = vpsz;
+
+    if (mesh.positions.empty() || mesh.indices.size() < 3) { dropCurrent(); return; }
+    mesh.recomputeBounds();
+    mesh.recomputeNormals();   // rasteriser shades with normals — avoid empties
+
+    // ── Rasterise the silhouette from the CURRENT camera ──────────────────
+    // The mesh is already in world space, so pass identity as the view and the
+    // camera's view_proj as the projection.  Cap the resolution to bound cost.
+    float scale = 1.0f;
+    const float mxdim = std::max(vpsz.x, vpsz.y);
+    if (mxdim > 1280.0f) scale = 1280.0f / mxdim;
+    const int rw = std::max(16, (int)(vpsz.x * scale));
+    const int rh = std::max(16, (int)(vpsz.y * scale));
+    plugins::auto_rig::SimpleRasterizer rast;
+    plugins::auto_rig::ViewCapture cap =
+        rast.render(mesh, rw, rh, glm::mat4(1.0f), player_view_proj_);
+    if ((int)cap.silhouette.size() < rw * rh) { dropCurrent(); return; }
+
+    // ── Amber RGBA from the coverage mask ──
+    std::vector<uint8_t> rgba((size_t)rw * rh * 4, 0);
+    for (int i = 0; i < rw * rh; ++i) {
+        if (cap.silhouette[i]) {
+            rgba[i*4+0] = 255; rgba[i*4+1] = 190; rgba[i*4+2] = 50; rgba[i*4+3] = 110;
+        }
+    }
+
+    // ── Upload + register (ImGui's own descriptor pool) ──
+    std::shared_ptr<renderer::TextureInfo> info;
+    ImTextureID id = 0;
+    try {
+        info = std::make_shared<renderer::TextureInfo>();
+        info->mip_levels = 1;
+        renderer::Helper::create2DTextureImage(
+            device_, renderer::Format::R8G8B8A8_UNORM, rw, rh, rgba.data(),
+            info->image, info->memory, std::source_location::current());
+        info->view = device_->createImageView(
+            info->image, renderer::ImageViewType::VIEW_2D,
+            renderer::Format::R8G8B8A8_UNORM,
+            SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+            std::source_location::current());
+        if (info->view)
+            id = renderer::Helper::addImTextureID(sampler_, info->view);
+    } catch (...) {
+        info.reset();
+        id = 0;
+    }
+
+    // Retire the previous mask, install the new one.
+    if (sel_mask_id_ || sel_mask_tex_)
+        sel_mask_dead_.push_back(
+            { sel_mask_frame_ + 4, sel_mask_id_, sel_mask_tex_ });
+    sel_mask_tex_ = info; sel_mask_id_ = id; sel_mask_w_ = rw; sel_mask_h_ = rh;
+}
+
+void Menu::requestEditorFocus(int obj_idx, int child_idx) {
+    editor_selected_       = obj_idx;
+    editor_selected_child_ = child_idx;
+    glm::vec3 bmin, bmax;
+    if (!selectedWorldAabb(bmin, bmax)) return;
+    editor_focus_center_ = (bmin + bmax) * 0.5f;
+    editor_focus_radius_ =
+        glm::max(0.25f, glm::length(bmax - bmin) * 0.5f);
+    editor_focus_pending_ = true;
+}
+
+bool Menu::getSelectedHighlight(engine::game_object::DrawableObject*& obj,
+                                int& node_idx) {
+    if (editor_selected_ < 0 ||
+        editor_selected_ >= (int)editor_objects_.size())
+        return false;
+    obj = editor_objects_[editor_selected_].obj;
+    if (!obj) return false;
+    const auto& kids = outlinerChildren(editor_objects_[editor_selected_]);
+    if (editor_selected_child_ >= 0 &&
+        editor_selected_child_ < (int)kids.size())
+        node_idx = kids[editor_selected_child_].second;  // a specific sub-object
+    else if (kids.empty())
+        node_idx = -2;   // single-mesh object → highlight the whole thing
+    else
+        node_idx = -1;   // group selected, no sub-object → bbox only, no tint
+    return true;
+}
+
+void Menu::selectByPick(engine::game_object::DrawableObject* obj, int node_idx) {
+    if (!obj) return;
+    for (int i = 0; i < (int)editor_objects_.size(); ++i) {
+        if (editor_objects_[i].obj != obj) continue;
+        editor_selected_       = i;
+        editor_selected_child_ = -1;
+        if (node_idx >= 0) {
+            const auto& kids = outlinerChildren(editor_objects_[i]);
+            for (int c = 0; c < (int)kids.size(); ++c) {
+                if (kids[c].second == node_idx) {
+                    editor_selected_child_ = c;
+                    break;
+                }
+            }
+        }
+        editor_scroll_to_selected_ = true;   // reveal it in the list next draw
+        return;
+    }
+}
+
 void Menu::drawDetailsContent() {
     if (editor_selected_ >= 0 &&
         editor_selected_ < (int)editor_objects_.size()) {
         EditorSceneObject& o = editor_objects_[editor_selected_];
-        ImGui::Text("Name: %s", o.name.c_str());
-        ImGui::Separator();
+
+        // Sub-object (FBX node) selected within a group: show which one, then
+        // fall through to the parent FBX's transform/visibility below.
+        const auto& kids = outlinerChildren(o);
+        if (editor_selected_child_ >= 0 &&
+            editor_selected_child_ < (int)kids.size()) {
+            ImGui::Text("Object: %s", kids[editor_selected_child_].first.c_str());
+            ImGui::TextDisabled("in group: %s", o.name.c_str());
+            ImGui::Separator();
+            // (Per-node transform editing is a follow-up; the group transform
+            // below moves the whole FBX.)
+        } else {
+            ImGui::Text("Name: %s", o.name.c_str());
+            if (!kids.empty())
+                ImGui::TextDisabled("%d sub-objects", (int)kids.size());
+            ImGui::Separator();
+        }
+
         if (o.obj) {
             ImGui::SeparatorText("Transform");
             glm::mat4 m = o.obj->getLocation();
@@ -3762,10 +4294,72 @@ void Menu::drawFolderTree(const std::string& dir, int depth) {
     }
 }
 
+// Launch the FLUX.2 generator for one image (detached subprocess).
+void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
+                          int width, int height) {
+    namespace fs = std::filesystem;
+    std::string p = prompt;
+    while (!p.empty() && (p.back() == '\n' || p.back() == '\r' ||
+                          p.back() == ' '  || p.back() == '\t'))
+        p.pop_back();
+    if (p.empty()) { gen_status_ = 3; gen_err_ = "empty prompt"; return; }
+
+    std::error_code ec;
+    fs::create_directories(folder, ec);
+
+    static int s_n = 0;
+    const std::string base = "flux_" +
+        std::to_string((long long)std::time(nullptr)) + "_" + std::to_string(s_n++);
+    gen_out_path_ = (fs::path(folder) / (base + ".png")).string();
+    const std::string pfile =
+        (fs::path(folder) / (base + ".prompt.txt")).string();
+    { std::ofstream pf(pfile, std::ios::binary); pf << p; }
+
+    gen_last_prompt_ = p; gen_last_w_ = width; gen_last_h_ = height;
+    gen_err_.clear();
+
+    // Use the SAME interpreter Setup.bat configured (system "python" with the
+    // CUDA torch it installed) — not a separate venv.
+#ifdef _WIN32
+    const std::string script = "tools\\flux\\flux_generate.py";
+    const std::string cmd =
+        "cmd /c start \"flux\" /B python \"" + script + "\""
+        " --prompt-file \"" + pfile + "\" --out \"" + gen_out_path_ + "\""
+        " --width "  + std::to_string(width) +
+        " --height " + std::to_string(height);
+#else
+    const std::string script = "tools/flux/flux_generate.py";
+    const std::string cmd =
+        "python3 \"" + script + "\""
+        " --prompt-file \"" + pfile + "\" --out \"" + gen_out_path_ + "\""
+        " --width "  + std::to_string(width) +
+        " --height " + std::to_string(height) + " &";
+#endif
+    EditorLog::get().push("[flux] launching generation -> " + gen_out_path_);
+    std::system(cmd.c_str());
+    gen_status_ = 1;   // running
+}
+
 void Menu::drawContentBrowserPanel() {
     namespace fs = std::filesystem;
     if (ImGui::Begin("Content Browser")) {
         thumb_budget_ = 3;   // cap texture loads per frame so big folders don't stall
+
+        // Poll a running generation: the output PNG appears (success) or
+        // "<out>.err" (failure).  The grid's thumbnail system shows the PNG.
+        if (gen_status_ == 1) {
+            std::error_code pec;
+            if (fs::exists(gen_out_path_, pec)) {
+                gen_status_ = 2;
+                EditorLog::get().push("[flux] image ready: " + gen_out_path_);
+            } else if (fs::exists(gen_out_path_ + ".err", pec)) {
+                gen_status_ = 3;
+                std::ifstream ef(gen_out_path_ + ".err", std::ios::binary);
+                gen_err_.assign(std::istreambuf_iterator<char>(ef),
+                                std::istreambuf_iterator<char>());
+                EditorLog::get().push("[flux] generation FAILED: " + gen_err_);
+            }
+        }
 
         const float total_w = ImGui::GetContentRegionAvail().x;
         constexpr float kMinPane = 90.0f, kSplit = 6.0f;
@@ -3877,7 +4471,74 @@ void Menu::drawContentBrowserPanel() {
         } else {
             ImGui::TextDisabled("(folder not found: %s)", content_dir_.c_str());
         }
+
+        // Right-click the grid background (not a tile) → image-generation popup.
+        if (ImGui::IsWindowHovered() &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+            !ImGui::IsAnyItemHovered()) {
+            gen_popup_pending_ = true;
+        }
         ImGui::EndChild();
+
+        // ── FLUX.2 generate-image popup ────────────────────────────────────
+        if (gen_popup_pending_) {
+            gen_popup_pending_ = false;
+            gen_folder_ = content_dir_;
+            ImGui::OpenPopup("##gen_image");
+        }
+        if (ImGui::BeginPopup("##gen_image")) {
+            ImGui::TextDisabled("Generate image into:");
+            ImGui::TextUnformatted(gen_folder_.c_str());
+            ImGui::Separator();
+
+            ImGui::TextUnformatted("Prompt");
+            ImGui::InputTextMultiline("##gen_prompt", gen_prompt_,
+                sizeof(gen_prompt_), ImVec2(380.0f, 90.0f));
+
+            struct Sz { const char* label; int w, h; };
+            static const Sz kSizes[] = {
+                {"512 x 512",                512,  512},
+                {"768 x 768",                768,  768},
+                {"1024 x 1024",             1024, 1024},
+                {"1024 x 1536 (portrait)",  1024, 1536},
+                {"1536 x 1024 (landscape)", 1536, 1024},
+            };
+            const int nSz = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
+            if (gen_size_idx_ < 0 || gen_size_idx_ >= nSz) gen_size_idx_ = 2;
+            ImGui::SetNextItemWidth(380.0f);
+            if (ImGui::BeginCombo("##gen_size", kSizes[gen_size_idx_].label)) {
+                for (int i = 0; i < nSz; ++i)
+                    if (ImGui::Selectable(kSizes[i].label, gen_size_idx_ == i))
+                        gen_size_idx_ = i;
+                ImGui::EndCombo();
+            }
+
+            ImGui::Separator();
+            const bool busy = (gen_status_ == 1);
+            if (busy) ImGui::BeginDisabled();
+            if (ImGui::Button("Generate", ImVec2(120, 0)))
+                launchImageGen(gen_folder_, gen_prompt_,
+                               kSizes[gen_size_idx_].w, kSizes[gen_size_idx_].h);
+            ImGui::SameLine();
+            const bool can_regen = !gen_last_prompt_.empty();
+            if (!can_regen) ImGui::BeginDisabled();
+            if (ImGui::Button("Regenerate", ImVec2(120, 0)))
+                launchImageGen(gen_folder_, gen_last_prompt_,
+                               gen_last_w_, gen_last_h_);
+            if (!can_regen) ImGui::EndDisabled();
+            if (busy) ImGui::EndDisabled();
+
+            if (gen_status_ == 1)
+                ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.30f, 1.0f),
+                    "Generating... (FLUX.2 — this can take a while)");
+            else if (gen_status_ == 2)
+                ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.50f, 1.0f),
+                    "Done — image added to this folder.");
+            else if (gen_status_ == 3)
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                    "Failed — see Output Log.");
+            ImGui::EndPopup();
+        }
     }
     ImGui::End();
 }

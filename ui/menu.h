@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include <filesystem>
+#include <cstdint>
 #include "renderer/renderer.h"
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
@@ -495,6 +496,78 @@ public:
     // current folder (relative to the working dir).
     std::vector<EditorSceneObject> editor_objects_;
     int          editor_selected_   = -1;
+    int          editor_selected_child_ = -1;  // sub-object index within the
+                                               // selected group (-1 = group itself)
+    // Sub-object list per drawable, built ONCE when the object is ready: each
+    // entry is { node name, node index } so the Outliner can both render the
+    // name and (on selection) resolve the node for its world AABB.  Lets each
+    // multi-mesh FBX render as a group with its objects nested underneath
+    // (keyed by the borrowed DrawableObject*).
+    std::unordered_map<engine::game_object::DrawableObject*,
+                       std::vector<std::pair<std::string, int>>>
+        outliner_children_cache_;
+    const std::vector<std::pair<std::string, int>>&
+        outlinerChildren(const EditorSceneObject& eo);
+
+    // Double-click "teleport to object": the Outliner sets this; the app
+    // consumes it via takeEditorFocus() to move the camera to frame the target.
+    bool         editor_focus_pending_ = false;
+    glm::vec3    editor_focus_center_  = glm::vec3(0.0f);
+    float        editor_focus_radius_  = 1.0f;
+    // World-space AABB of the currently-selected object (group) or sub-object
+    // node.  Returns false if nothing valid/ready is selected.
+    bool selectedWorldAabb(glm::vec3& bmin, glm::vec3& bmax);
+    // Screen-space convex-hull outline of the selected sub-object (or single-
+    // mesh object): projects the node's mesh vertices and hulls them, tracing
+    // the object's projected shape instead of its bounding box.  Returns false
+    // for group selections (too many verts) so the caller can fall back to the
+    // bbox.  Output points are in absolute screen pixels.
+    bool selectedScreenHull(std::vector<ImVec2>& hull);
+    // Outliner double-click: select the item + request a camera teleport to it.
+    void requestEditorFocus(int obj_idx, int child_idx);
+    // App consumes a pending teleport request: returns true exactly once after
+    // a double-click, with the target's world-space centre + bounding radius so
+    // the camera can frame it.
+    bool takeEditorFocus(glm::vec3& center, float& radius) {
+        if (!editor_focus_pending_) return false;
+        editor_focus_pending_ = false;
+        center = editor_focus_center_;
+        radius = editor_focus_radius_;
+        return true;
+    }
+
+    // Rendered-highlight target: the app reads the currently-selected drawable
+    // + node index each frame (-2 = whole single-mesh object, -1 = group/none)
+    // and sets it via DrawableObject::setHighlightNode for the amber overlay.
+    bool getSelectedHighlight(engine::game_object::DrawableObject*& obj,
+                              int& node_idx);
+    // Scene-view double-click → select this drawable (and sub-object node) in
+    // the Outliner, scrolling/opening to reveal it.
+    void selectByPick(engine::game_object::DrawableObject* obj, int node_idx);
+    bool editor_scroll_to_selected_ = false;  // one-shot: scroll list to sel
+
+    // ── Exact selection silhouette mask ────────────────────────────────────
+    // The selected node's mesh, CPU-rasterised from the current camera into a
+    // full-viewport amber RGBA silhouette and drawn as the highlight mask.
+    // Regenerated only when the selection or camera (view_proj / viewport size)
+    // changes; reused otherwise.  Invalidated on swapchain recreate.
+    void updateSelectionMask();
+    std::shared_ptr<renderer::TextureInfo> sel_mask_tex_;
+    ImTextureID  sel_mask_id_   = 0;
+    int          sel_mask_w_    = 0;
+    int          sel_mask_h_    = 0;
+    engine::game_object::DrawableObject* sel_mask_obj_ = nullptr;
+    int          sel_mask_node_ = -3;
+    glm::mat4    sel_mask_vp_   = glm::mat4(0.0f);
+    glm::vec2    sel_mask_vpsz_ = glm::vec2(0.0f);
+    struct DeadMask {
+        std::uint64_t                          free_frame;
+        ImTextureID                            id;
+        std::shared_ptr<renderer::TextureInfo> info;
+    };
+    std::vector<DeadMask> sel_mask_dead_;   // deferred free (avoid in-flight use)
+    std::uint64_t         sel_mask_frame_ = 0;
+
     bool         editor_layout_built_ = false;
     float        outliner_list_h_   = 0.0f;   // draggable list/details split (px)
     bool         editor_enabled_    = false;  // editor UI off unless --editor
@@ -508,8 +581,17 @@ public:
     void setSceneObjects(std::vector<EditorSceneObject> objs) {
         editor_objects_ = std::move(objs);
     }
-    void setEditorEnabled(bool e) { editor_enabled_ = e; }
+    void setEditorEnabled(bool e) {
+        editor_enabled_ = e;
+        // Editor starts in EDIT mode (play OFF): player frozen, free camera.
+        // Non-editor runs always play.  Toggled by the viewport Play button.
+        if (e) play_mode_ = false;
+    }
     bool isEditorEnabled() const  { return editor_enabled_; }
+    // Play mode: player is controllable + clock visible.  Edit mode (false):
+    // player frozen, camera flies the level.  The app reads this each frame.
+    bool isPlayMode() const { return play_mode_; }
+    bool play_mode_ = true;
     bool      isViewportValid() const { return viewport_valid_ && editor_enabled_; }
     glm::vec2 getViewportPos()  const { return viewport_pos_; }
     glm::vec2 getViewportSize() const { return viewport_size_; }
@@ -549,6 +631,23 @@ private:
     std::vector<std::shared_ptr<renderer::TextureInfo>> retired_thumbs_;
     float content_left_w_ = 0.0f;
     int   thumb_budget_   = 0;
+
+    // ── FLUX.2 text-to-image generation (Content Browser right-click) ───────
+    // launchImageGen() writes the prompt to a file, spawns the per-image
+    // generator (tools/flux/.venv python flux_generate.py) detached, and polls
+    // for the output PNG / "<out>.err".  gen_status_: 0 idle, 1 running, 2 done,
+    // 3 error.  The grid's existing thumbnail system shows the result.
+    void launchImageGen(const std::string& folder, const std::string& prompt,
+                        int width, int height);
+    bool        gen_popup_pending_ = false;   // right-click → open popup next frame
+    char        gen_prompt_[2048]  = {0};
+    int         gen_size_idx_      = 2;       // index into the size presets
+    std::string gen_folder_;                  // folder to generate into
+    std::string gen_out_path_;                // current output PNG
+    int         gen_status_        = 0;
+    std::string gen_err_;
+    std::string gen_last_prompt_;             // for the Regenerate button
+    int         gen_last_w_ = 1024, gen_last_h_ = 1024;
     void drawOutputPanel();   // UE5-style console Output Log (bottom tab)
     // Absolute screen rect/centre of the editor Viewport (central dock node);
     // falls back to the full main viewport when the editor is inactive.  Used
