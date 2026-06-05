@@ -498,6 +498,11 @@ public:
     // DockBuilder default arrangement.  content_dir_ is the Content Browser's
     // current folder (relative to the working dir).
     std::vector<EditorSceneObject> editor_objects_;
+    // ── Scene authoring request flags + name buffer (consume* in public) ──
+    bool scene_import_request_ = false;
+    bool scene_save_request_   = false;
+    bool scene_load_request_   = false;
+    char scene_name_buf_[128]  = "Untitled";
     int          editor_selected_   = -1;
     int          editor_selected_child_ = -1;  // sub-object index within the
                                                // selected group (-1 = group itself)
@@ -715,6 +720,32 @@ public:
     }
     const std::vector<std::string>& getNewGameMeshes() const {
         return new_game_mesh_requests_;
+    }
+
+    // ── Scene authoring (Import / Save / Load) ───────────────────────────
+    // Set by the "Scene" menu during draw; serviced by the application a frame
+    // later (so the modal OS file dialog isn't opened mid-ImGui-frame).
+    bool consumeImportRequest() {
+        if (scene_import_request_) { scene_import_request_ = false; return true; }
+        return false;
+    }
+    bool consumeSaveSceneRequest(std::string& out_name) {
+        if (scene_save_request_) {
+            scene_save_request_ = false;
+            out_name = scene_name_buf_;
+            return true;
+        }
+        return false;
+    }
+    bool consumeLoadSceneRequest() {
+        if (scene_load_request_) { scene_load_request_ = false; return true; }
+        return false;
+    }
+    void setSceneName(const std::string& n) {
+        const size_t cap = sizeof(scene_name_buf_) - 1;
+        const size_t len = (n.size() < cap) ? n.size() : cap;
+        for (size_t i = 0; i < len; ++i) scene_name_buf_[i] = n[i];
+        scene_name_buf_[len] = '\0';
     }
     Menu(
         GLFWwindow* window,

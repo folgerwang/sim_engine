@@ -1776,6 +1776,16 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
 
+        if (ImGui::BeginMenu("Scene"))
+        {
+            ImGui::InputText("Name", scene_name_buf_, sizeof(scene_name_buf_));
+            ImGui::Separator();
+            if (ImGui::MenuItem("Import Model...")) { scene_import_request_ = true; }
+            if (ImGui::MenuItem("Save Scene"))      { scene_save_request_   = true; }
+            if (ImGui::MenuItem("Load Scene..."))   { scene_load_request_   = true; }
+            ImGui::EndMenu();
+        }
+
         if (ImGui::BeginMenu("Terrain"))
         {
             if (ImGui::MenuItem("Turn off water pass", NULL, turn_off_water_pass_)) {
@@ -4139,11 +4149,29 @@ void Menu::drawDetailsContent() {
 
         if (o.obj) {
             ImGui::SeparatorText("Transform");
-            glm::mat4 m = o.obj->getLocation();
-            glm::vec3 pos(m[3].x, m[3].y, m[3].z);
-            if (ImGui::DragFloat3("Location", &pos.x, 0.05f)) {
+            // Per-instance world override (offset / rotation / scale).  Fall
+            // back to the createAsync location translation if no instance
+            // override has been set yet (e.g. player / npc).
+            glm::vec3 pos, scl;
+            glm::quat rot;
+            if (o.obj->hasInstanceRoot()) {
+                pos = o.obj->getInstanceRootTranslation();
+                rot = o.obj->getInstanceRootRotation();
+                scl = o.obj->getInstanceRootScale();
+            } else {
+                const glm::mat4& m = o.obj->getLocation();
+                pos = glm::vec3(m[3].x, m[3].y, m[3].z);
+                rot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+                scl = glm::vec3(1.0f);
+            }
+            glm::vec3 euler_deg = glm::degrees(glm::eulerAngles(rot));
+            bool changed = false;
+            changed = ImGui::DragFloat3("Offset",   &pos.x, 0.05f) || changed;
+            changed = ImGui::DragFloat3("Rotation", &euler_deg.x, 0.5f) || changed;
+            changed = ImGui::DragFloat3("Scale",    &scl.x, 0.01f, 0.001f, 1000.0f) || changed;
+            if (changed) {
                 o.obj->setInstanceRootTransform(
-                    pos, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+                    pos, glm::quat(glm::radians(euler_deg)), scl);
             }
             ImGui::SeparatorText("Rendering");
             bool vis = o.obj->isVisible();

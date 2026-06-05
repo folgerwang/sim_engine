@@ -618,6 +618,14 @@ public:
         instance_root_valid_ = true;
     }
 
+    // Read-back of the per-instance world override, for the editor transform
+    // panel and scene serialization.  Meaningful once setInstanceRootTransform
+    // has run (hasInstanceRoot() == true).
+    const glm::vec3& getInstanceRootTranslation() const { return instance_root_t_; }
+    const glm::quat& getInstanceRootRotation()    const { return instance_root_r_; }
+    const glm::vec3& getInstanceRootScale()       const { return instance_root_s_; }
+    bool             hasInstanceRoot()            const { return instance_root_valid_; }
+
     // Per-wrapper visibility gate (forward + shadow).  See the visible_
     // field comment above.  False -> draw() does nothing; true (default)
     // -> existing behaviour.

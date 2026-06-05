@@ -1,0 +1,177 @@
+#include "scene/scene_io.h"
+
+#include <cstring>
+#include <fstream>
+
+namespace engine {
+namespace scene {
+
+namespace {
+
+template <typename T>
+void writePod(std::ofstream& os, const T& v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+template <typename T>
+bool readPod(std::ifstream& is, T& v) {
+    return static_cast<bool>(is.read(reinterpret_cast<char*>(&v), sizeof(T)));
+}
+
+void writeStr(std::ofstream& os, const std::string& s) {
+    const uint32_t n = static_cast<uint32_t>(s.size());
+    writePod(os, n);
+    if (n) {
+        os.write(s.data(), static_cast<std::streamsize>(n));
+    }
+}
+
+bool readStr(std::ifstream& is, std::string& s) {
+    uint32_t n = 0;
+    if (!readPod(is, n)) {
+        return false;
+    }
+    // Sanity cap (16 MB) so a corrupt length can't trigger a huge allocation.
+    if (n > (1u << 24)) {
+        return false;
+    }
+    s.resize(n);
+    if (n) {
+        return static_cast<bool>(is.read(&s[0], static_cast<std::streamsize>(n)));
+    }
+    return true;
+}
+
+void writeXform(std::ofstream& os, const Transform& t) {
+    writePod(os, t.translation.x);
+    writePod(os, t.translation.y);
+    writePod(os, t.translation.z);
+    writePod(os, t.rotation.x);
+    writePod(os, t.rotation.y);
+    writePod(os, t.rotation.z);
+    writePod(os, t.rotation.w);
+    writePod(os, t.scale.x);
+    writePod(os, t.scale.y);
+    writePod(os, t.scale.z);
+}
+
+bool readXform(std::ifstream& is, Transform& t) {
+    bool ok = true;
+    ok = ok && readPod(is, t.translation.x);
+    ok = ok && readPod(is, t.translation.y);
+    ok = ok && readPod(is, t.translation.z);
+    ok = ok && readPod(is, t.rotation.x);
+    ok = ok && readPod(is, t.rotation.y);
+    ok = ok && readPod(is, t.rotation.z);
+    ok = ok && readPod(is, t.rotation.w);
+    ok = ok && readPod(is, t.scale.x);
+    ok = ok && readPod(is, t.scale.y);
+    ok = ok && readPod(is, t.scale.z);
+    return ok;
+}
+
+const char     kMagic[8] = { 'R', 'W', 'S', 'C', 'E', 'N', 'E', '\0' };
+const uint32_t kVersion  = 1;
+
+} // namespace
+
+bool saveSceneBinary(const std::string& path, const Scene& scene) {
+    std::ofstream os(path, std::ios::binary | std::ios::trunc);
+    if (!os) {
+        return false;
+    }
+
+    os.write(kMagic, 8);
+    writePod(os, kVersion);
+    writeStr(os, scene.name);
+    writeXform(os, scene.root);
+    writePod(os, static_cast<uint32_t>(scene.objects.size()));
+
+    for (const auto& o : scene.objects) {
+        writeStr(os, o.name);
+        writeStr(os, o.asset_path);
+        writePod(os, o.parent_index);
+        writePod(os, o.source_node_index);
+        writePod(os, static_cast<uint8_t>(o.is_group ? 1 : 0));
+        writePod(os, static_cast<uint8_t>(o.visible ? 1 : 0));
+        writeXform(os, o.transform);
+    }
+
+    return static_cast<bool>(os);
+}
+
+bool loadSceneBinary(const std::string& path, Scene& out_scene) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) {
+        return false;
+    }
+
+    char magic[8] = { 0 };
+    if (!is.read(magic, 8)) {
+        return false;
+    }
+    if (std::memcmp(magic, kMagic, 8) != 0) {
+        return false;
+    }
+
+    uint32_t version = 0;
+    if (!readPod(is, version)) {
+        return false;
+    }
+    if (version != kVersion) {
+        return false;  // only v1 understood for now
+    }
+
+    Scene s;
+    if (!readStr(is, s.name)) {
+        return false;
+    }
+    if (!readXform(is, s.root)) {
+        return false;
+    }
+
+    uint32_t count = 0;
+    if (!readPod(is, count)) {
+        return false;
+    }
+    // Sanity cap (1M objects) against a corrupt count.
+    if (count > (1u << 20)) {
+        return false;
+    }
+
+    s.objects.resize(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        Object& o = s.objects[i];
+        uint8_t is_group = 0;
+        uint8_t visible  = 0;
+        if (!readStr(is, o.name)) {
+            return false;
+        }
+        if (!readStr(is, o.asset_path)) {
+            return false;
+        }
+        if (!readPod(is, o.parent_index)) {
+            return false;
+        }
+        if (!readPod(is, o.source_node_index)) {
+            return false;
+        }
+        if (!readPod(is, is_group)) {
+            return false;
+        }
+        if (!readPod(is, visible)) {
+            return false;
+        }
+        if (!readXform(is, o.transform)) {
+            return false;
+        }
+        o.is_group = (is_group != 0);
+        o.visible  = (visible != 0);
+    }
+
+    out_scene = std::move(s);
+    return true;
+}
+
+} // namespace scene
+} // namespace engine
