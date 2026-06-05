@@ -22,6 +22,12 @@ class ViewCamera {
 
     glsl::ViewCameraInfo m_camera_info_;
     bool m_is_ortho_ = false;
+    // Last frame's aspect ratio.  Used by updateViewCameraInfo to detect a
+    // window-resize projection discontinuity and zero the velocity attachment
+    // for that single frame, so TAA / motion-blur reprojection does not smear
+    // the whole screen into offset "ghost copies" during a drag-resize.
+    // -1 = unset (first frame).
+    float m_last_vp_aspect_ = -1.0f;
 
 public:
     ViewCamera() = delete;

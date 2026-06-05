@@ -314,7 +314,20 @@ void ViewCamera::updateViewCameraInfo(
     // becomes meaningful from frame 1 onward.
     const bool first_vp_capture =
         glm::determinant(m_camera_info_.view_proj) == 0.0f;
-    if (!first_vp_capture) {
+    // A window resize changes the aspect ratio, which rebuilds proj (and thus
+    // view_proj) for EVERY pixel.  Leaving prev_view_proj at the old-aspect VP
+    // makes the velocity attachment (curNDC - prevNDC, consumed by the cluster
+    // G-buffer + the TAA / motion-blur reprojection) read a huge bogus motion
+    // across the whole screen, which smears the frame into the offset ghost
+    // copies seen mid-resize.  Treat an aspect change exactly like frame 0:
+    // zero the velocity for this one frame by mirroring the freshly-computed
+    // VP into prev_view_proj at the bottom of this function.
+    const float aspect_delta_ = view_camera_params.aspect - m_last_vp_aspect_;
+    const bool aspect_changed =
+        m_last_vp_aspect_ >= 0.0f &&
+        (aspect_delta_ > 1e-6f || aspect_delta_ < -1e-6f);
+    const bool zero_velocity_this_frame = first_vp_capture || aspect_changed;
+    if (!zero_velocity_this_frame) {
         m_camera_info_.prev_view_proj = m_camera_info_.view_proj;
     }
 
@@ -468,9 +481,10 @@ void ViewCamera::updateViewCameraInfo(
     // function: on the very first call there was no previous VP to copy,
     // so seed prev_view_proj with the freshly-computed VP — that makes
     // velocity = curNDC - prevNDC exactly zero everywhere on frame 0.
-    if (first_vp_capture) {
+    if (zero_velocity_this_frame) {
         m_camera_info_.prev_view_proj = m_camera_info_.view_proj;
     }
+    m_last_vp_aspect_ = view_camera_params.aspect;
 
     m_device_->updateBufferMemory(
         m_view_camera_buffer_->memory,

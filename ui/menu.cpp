@@ -4585,8 +4585,29 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     fs::create_directories(folder, ec);
 
     static int s_n = 0;
-    const std::string base = "flux_" +
-        std::to_string((long long)std::time(nullptr)) + "_" + std::to_string(s_n++);
+    // Optional name from the popup (gen_name_): sanitize + drop a typed
+    // ".png"; empty -> a unique auto name (a reused name overwrites).
+    std::string base;
+    {
+        std::string clean;
+        for (char ch : std::string(gen_name_)) {
+            if (ch=='/'||ch=='\\'||ch==':'||ch=='*'||ch=='?'||ch=='"'||
+                ch=='<'||ch=='>'||ch=='|'||ch=='\n'||ch=='\r'||ch=='\t')
+                continue;
+            clean.push_back(ch);
+        }
+        while (!clean.empty() && clean.front()==' ') clean.erase(clean.begin());
+        while (!clean.empty() && clean.back()==' ')  clean.pop_back();
+        if (clean.size() >= 4) {
+            std::string e = clean.substr(clean.size()-4);
+            for (char& ec : e) if (ec>='A'&&ec<='Z') ec=(char)(ec+32);
+            if (e == ".png") clean.resize(clean.size()-4);
+        }
+        base = clean.empty()
+             ? ("flux_" + std::to_string((long long)std::time(nullptr)) +
+                "_" + std::to_string(s_n++))
+             : clean;
+    }
     gen_out_path_ = (fs::path(folder) / (base + ".png")).string();
     fs::path flux_tmp = fs::path(folder) / ".flux_tmp";
     fs::create_directories(flux_tmp, ec);
@@ -4823,7 +4844,7 @@ void Menu::drawContentBrowserPanel() {
             s_gen_open = true;
         }
         if (s_gen_open) {
-            ImGui::SetNextWindowSize(ImVec2(520.0f, 380.0f), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(624.0f, 500.0f), ImGuiCond_Always);
             ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 260.0f),
                                                 ImVec2(8192.0f, 8192.0f));
             if (ImGui::Begin("Generate Image", &s_gen_open,
@@ -4844,6 +4865,13 @@ void Menu::drawContentBrowserPanel() {
                 ImVec2(box_w, ImGui::GetTextLineHeightWithSpacing() * 7.0f),
                 ImGuiInputTextFlags_CallbackAlways, &GenPromptWrapCallback,
                 &genud);
+
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Name (optional)");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            ImGui::InputTextWithHint("##gen_name",
+                "leave empty for an auto name", gen_name_, sizeof(gen_name_));
+            ImGui::Spacing();
 
             struct Sz { const char* label; int w, h; };
             static const Sz kSizes[] = {

@@ -664,6 +664,7 @@ private:
                         int width, int height);
     bool        gen_popup_pending_ = false;   // right-click → open popup next frame
     char        gen_prompt_[2048]  = {0};
+    char        gen_name_[128]     = {0};   // optional output filename (empty = auto)
     int         gen_size_idx_      = 2;       // index into the size presets
     std::string gen_folder_;                  // folder to generate into
     std::string gen_out_path_;                // current output PNG
