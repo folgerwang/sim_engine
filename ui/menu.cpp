@@ -4311,8 +4311,10 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     const std::string base = "flux_" +
         std::to_string((long long)std::time(nullptr)) + "_" + std::to_string(s_n++);
     gen_out_path_ = (fs::path(folder) / (base + ".png")).string();
+    fs::path flux_tmp = fs::path(folder) / ".flux_tmp";
+    fs::create_directories(flux_tmp, ec);
     const std::string pfile =
-        (fs::path(folder) / (base + ".prompt.txt")).string();
+        (flux_tmp / (base + ".png.prompt.txt")).string();
     { std::ofstream pf(pfile, std::ios::binary); pf << p; }
 
     gen_last_prompt_ = p; gen_last_w_ = width; gen_last_h_ = height;
@@ -4349,12 +4351,17 @@ void Menu::drawContentBrowserPanel() {
         // "<out>.err" (failure).  The grid's thumbnail system shows the PNG.
         if (gen_status_ == 1) {
             std::error_code pec;
+            // Sidecars (.err) live in <folder>/.flux_tmp/<name>.err
+            fs::path _op(gen_out_path_);
+            const std::string err_path =
+                (_op.parent_path() / ".flux_tmp" /
+                 (_op.filename().string() + ".err")).string();
             if (fs::exists(gen_out_path_, pec)) {
                 gen_status_ = 2;
                 EditorLog::get().push("[flux] image ready: " + gen_out_path_);
-            } else if (fs::exists(gen_out_path_ + ".err", pec)) {
+            } else if (fs::exists(err_path, pec)) {
                 gen_status_ = 3;
-                std::ifstream ef(gen_out_path_ + ".err", std::ios::binary);
+                std::ifstream ef(err_path, std::ios::binary);
                 gen_err_.assign(std::istreambuf_iterator<char>(ef),
                                 std::istreambuf_iterator<char>());
                 EditorLog::get().push("[flux] generation FAILED: " + gen_err_);
@@ -4481,22 +4488,32 @@ void Menu::drawContentBrowserPanel() {
         ImGui::EndChild();
 
         // ── FLUX.2 generate-image popup ────────────────────────────────────
+        static bool s_gen_open = false;
         if (gen_popup_pending_) {
             gen_popup_pending_ = false;
             gen_folder_ = content_dir_;
-            ImGui::OpenPopup("##gen_image");
+            s_gen_open = true;
         }
-        if (ImGui::BeginPopup("##gen_image")) {
+        if (s_gen_open) {
+            ImGui::SetNextWindowSize(ImVec2(470.0f, 0.0f), ImGuiCond_Appearing);
+            if (ImGui::Begin("Generate Image", &s_gen_open,
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoCollapse)) {
             ImGui::TextDisabled("Generate image into:");
             ImGui::TextUnformatted(gen_folder_.c_str());
             ImGui::Separator();
 
             ImGui::TextUnformatted("Prompt");
             ImGui::InputTextMultiline("##gen_prompt", gen_prompt_,
-                sizeof(gen_prompt_), ImVec2(380.0f, 90.0f));
+                sizeof(gen_prompt_),
+                ImVec2(440.0f, ImGui::GetTextLineHeight() * 8.0f));
 
             struct Sz { const char* label; int w, h; };
             static const Sz kSizes[] = {
+                {"32 x 32 (icon)",            32,   32},
+                {"64 x 64 (icon)",            64,   64},
+                {"128 x 128 (icon)",         128,  128},
+                {"256 x 256 (icon)",         256,  256},
                 {"512 x 512",                512,  512},
                 {"768 x 768",                768,  768},
                 {"1024 x 1024",             1024, 1024},
@@ -4504,8 +4521,8 @@ void Menu::drawContentBrowserPanel() {
                 {"1536 x 1024 (landscape)", 1536, 1024},
             };
             const int nSz = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
-            if (gen_size_idx_ < 0 || gen_size_idx_ >= nSz) gen_size_idx_ = 2;
-            ImGui::SetNextItemWidth(380.0f);
+            if (gen_size_idx_ < 0 || gen_size_idx_ >= nSz) gen_size_idx_ = 6;
+            ImGui::SetNextItemWidth(440.0f);
             if (ImGui::BeginCombo("##gen_size", kSizes[gen_size_idx_].label)) {
                 for (int i = 0; i < nSz; ++i)
                     if (ImGui::Selectable(kSizes[i].label, gen_size_idx_ == i))
@@ -4537,7 +4554,8 @@ void Menu::drawContentBrowserPanel() {
             else if (gen_status_ == 3)
                 ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
                     "Failed — see Output Log.");
-            ImGui::EndPopup();
+            }
+            ImGui::End();
         }
     }
     ImGui::End();
