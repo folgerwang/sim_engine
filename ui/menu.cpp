@@ -33,7 +33,9 @@ extern "C" {
 
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
+#include "renderer/vulkan/vk_device.h"   // VulkanDevice/VulkanPhysicalDevice for VRAM query
 #include "helper/engine_helper.h"
+#include "helper/vram_cuda.h"             // device-wide VRAM (counts ML/CUDA + other processes)
 
 #include "menu.h"
 #include "plugins/plugin_manager.h"
@@ -54,6 +56,70 @@ namespace {
         fprintf(stderr, "[vulkan] Error: VkResult = %d\n", err);
         if (err < 0)
             abort();
+    }
+
+    // ------------------------------------------------------------------
+    // VRAM profiler helpers.  Use the driver-reported VK_EXT_memory_budget
+    // numbers, which account for EVERY Vulkan allocation made by this process
+    // (engine buffers/images, render targets, swapchain, and ImGui's own
+    // vertex/index buffers + font atlas) — no manual bookkeeping needed.
+    // ------------------------------------------------------------------
+    struct VramQuery { double used_mb, budget_mb, total_mb; bool valid; };
+
+    static VkPhysicalDevice getVkPhysicalDevice(
+            const std::shared_ptr<engine::renderer::Device>& dev) {
+        // The engine only ever instantiates the Vulkan backend, and the
+        // PhysicalDevice base is non-polymorphic (no vtable), so use
+        // static_cast rather than dynamic_cast.
+        if (!dev) return VK_NULL_HANDLE;
+        auto* vkdev = static_cast<engine::renderer::vk::VulkanDevice*>(dev.get());
+        const auto& pd = vkdev->getPhysicalDevice();
+        if (!pd) return VK_NULL_HANDLE;
+        auto* vkpd =
+            static_cast<engine::renderer::vk::VulkanPhysicalDevice*>(pd.get());
+        return vkpd->get();
+    }
+
+    static VramQuery queryVram(VkPhysicalDevice phys) {
+        VramQuery q{0.0, 0.0, 0.0, false};
+        if (phys == VK_NULL_HANDLE) return q;
+
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        budget.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 mp{};
+        mp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        mp.pNext = &budget;
+        // Core in Vulkan 1.1+ (engine requests 1.3), statically linked.
+        vkGetPhysicalDeviceMemoryProperties2(phys, &mp);
+
+        const VkPhysicalDeviceMemoryProperties& props = mp.memoryProperties;
+        double used = 0.0, bud = 0.0, total = 0.0;
+        bool any_budget = false;
+        for (uint32_t i = 0; i < props.memoryHeapCount; ++i) {
+            if (!(props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+                continue;                                // VRAM heaps only
+            total += static_cast<double>(props.memoryHeaps[i].size);
+            // heapUsage/heapBudget are only meaningful when the extension was
+            // actually enabled at device creation (budget reads back non-zero).
+            if (budget.heapBudget[i] != 0) {
+                used += static_cast<double>(budget.heapUsage[i]);
+                bud  += static_cast<double>(budget.heapBudget[i]);
+                any_budget = true;
+            }
+        }
+        const double MB = 1024.0 * 1024.0;
+        q.total_mb = total / MB;
+        if (any_budget) {
+            q.used_mb   = used / MB;
+            q.budget_mb = bud  / MB;
+            q.valid     = true;
+        } else {
+            // Extension unavailable — show capacity only (no usage readback).
+            q.budget_mb = q.total_mb;
+            q.valid     = (total > 0.0);
+        }
+        return q;
     }
 
     // ------------------------------------------------------------------
@@ -533,6 +599,25 @@ Menu::Menu(
         clock_tex_id_ = ImTextureID(0);
     }
 
+    // ---- Viewport Play button icon ----------------------------------------
+    try {
+        play_icon_info_ = std::make_shared<renderer::TextureInfo>();
+        engine::helper::createTextureImage(
+            device,
+            "assets/icon/play.png",
+            renderer::Format::R8G8B8A8_UNORM,
+            true,
+            *play_icon_info_,
+            std::source_location::current());
+        if (play_icon_info_->view) {
+            play_icon_id_ = renderer::Helper::addImTextureID(
+                sampler, play_icon_info_->view);
+        }
+    } catch (...) {
+        play_icon_info_.reset();
+        play_icon_id_ = ImTextureID(0);
+    }
+
     // ---- Scan the background PNG for bright star-like pixels ----
     // Load the image a second time (CPU side only) to read pixel data.
     // We look for small clusters of bright pixels (luminance > threshold)
@@ -706,6 +791,14 @@ void Menu::init(
         // No clock face image available — null out so the fallback
         // circle in Menu::draw is used instead of a stale handle.
         clock_tex_id_ = ImTextureID(0);
+    }
+
+    // Same hazard for the viewport Play button icon.
+    if (play_icon_info_ && play_icon_info_->view && sampler_) {
+        play_icon_id_ = renderer::Helper::addImTextureID(
+            sampler_, play_icon_info_->view);
+    } else {
+        play_icon_id_ = ImTextureID(0);   // fall back to the drawn triangle
     }
 
     // rt_texture_id_ and main_texture_id_ are also pool-allocated and
@@ -1506,6 +1599,9 @@ bool Menu::draw(
     ImVec2 fps_vp_pos, fps_vp_size, fps_vp_c;
     getViewportScreenRect(fps_vp_pos, fps_vp_size, fps_vp_c);
     const float fps_top_pad = isViewportValid() ? 8.0f : menu_height;
+    // Standalone FPS box only in game mode; in editor mode FPS is merged into
+    // the top-right VRAM HUD panel (see Menu::draw's profiler overlay).
+    if (!editor_enabled_) {
     ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
     ImGui::Begin(
         "fps",
@@ -1532,6 +1628,7 @@ bool Menu::draw(
     ImGui::Text("fps : %8.2f", fps);
     ImGui::EndChild();
     ImGui::End();
+    }
 
     // (Title banner + version stamp now drawn inline inside the
     // twilight backdrop window earlier in this frame — see the call
@@ -3243,6 +3340,11 @@ bool Menu::draw(
                 d->AddRectFilled(ImVec2(cc.x - 6, cc.y - 6),
                                  ImVec2(cc.x + 6, cc.y + 6),
                                  IM_COL32(240, 80, 80, 255), 2.0f);   // ■ stop
+            } else if (play_icon_id_) {
+                // assets/icon/play.png (falls back to the drawn triangle below).
+                d->AddImage(play_icon_id_, bp, ImVec2(bp.x + bs, bp.y + bs),
+                            ImVec2(0, 0), ImVec2(1, 1),
+                            IM_COL32(255, 255, 255, 255));
             } else {
                 d->AddTriangleFilled(ImVec2(cc.x - 5, cc.y - 8),
                                      ImVec2(cc.x - 5, cc.y + 8),
@@ -3332,6 +3434,114 @@ bool Menu::draw(
     }
     // ------------------------------------------------------------------------
 
+    // ── VRAM usage profiler (editor overlay, top-right of viewport) ─────────
+    // Driver-reported device-local heap usage vs capacity.  Covers ALL VRAM
+    // allocations by this process, ImGui's buffers included (see queryVram).
+    if (editor_enabled_) {
+        const double now = ImGui::GetTime();
+        if (!vram_valid_ || now - vram_last_poll_ > 0.25) {   // throttle to 4 Hz
+            // (1) Vulkan: this process's own VRAM (engine + ImGui).
+            const VramQuery q = queryVram(getVkPhysicalDevice(device_));
+            vram_used_mb_   = q.used_mb;
+            vram_budget_mb_ = q.budget_mb;
+            vram_total_mb_  = q.total_mb;
+            vram_valid_     = q.valid;
+            // (2) CUDA: device-wide usage, so ML passes (LibTorch in-process +
+            //     the FLUX/Ollama subprocesses) and other apps are included.
+            unsigned long long dwf = 0, dwt = 0;
+            if (engine::queryDeviceWideVramBytes(dwf, dwt) && dwt != 0) {
+                const double MB = 1024.0 * 1024.0;
+                vram_dev_total_mb_ = (double)dwt / MB;
+                vram_dev_used_mb_  = (double)(dwt - dwf) / MB;
+                vram_dev_valid_    = true;
+            } else {
+                vram_dev_valid_ = false;
+            }
+            vram_last_poll_ = now;
+        }
+
+        // Prefer the device-wide (CUDA) numbers; fall back to Vulkan-only.
+        const bool   dev    = vram_dev_valid_ && vram_dev_total_mb_ > 0.0;
+        const double cap_mb = dev ? vram_dev_total_mb_ : vram_total_mb_;
+        const double use_mb = dev ? vram_dev_used_mb_  : vram_used_mb_;
+        const double mine_mb = vram_valid_ ? vram_used_mb_ : 0.0;
+        const bool   vram_ok = (dev || vram_valid_) && cap_mb > 0.0;
+
+        // FPS line (always) + VRAM line + bar (when the query succeeded).
+        char fbuf[48];
+        snprintf(fbuf, sizeof(fbuf), "FPS  %.0f", ImGui::GetIO().Framerate);
+        char vbuf[128] = {0};
+        if (vram_ok) {
+            const double free_mb = std::max(0.0, cap_mb - use_mb);
+            if (dev && vram_valid_)
+                snprintf(vbuf, sizeof(vbuf),
+                         "VRAM %.1f / %.0f GB  ·  engine %.1f  ·  %.1f free",
+                         use_mb / 1024.0, cap_mb / 1024.0,
+                         mine_mb / 1024.0, free_mb / 1024.0);
+            else
+                snprintf(vbuf, sizeof(vbuf),
+                         "VRAM %.1f / %.0f GB  ·  %.1f free%s",
+                         use_mb / 1024.0, cap_mb / 1024.0, free_mb / 1024.0,
+                         dev ? "" : "  (engine only)");
+        }
+
+        // ── Tidy HUD panel: FPS on top, then (optional) VRAM text + bar ─────
+        ImVec2 vp_pos, vp_size, vp_c;
+        getViewportScreenRect(vp_pos, vp_size, vp_c);
+        const float kMenuH = ImGui::GetFrameHeight();
+        const float inpad = 7.0f, gap = 5.0f, bar_h = 9.0f, line_gap = 2.0f;
+        const float txt_h = ImGui::GetTextLineHeight();
+        const ImVec2 fps_ts  = ImGui::CalcTextSize(fbuf);
+        const ImVec2 vram_ts = vram_ok ? ImGui::CalcTextSize(vbuf) : ImVec2(0, 0);
+        const float cont_w = std::max({fps_ts.x, vram_ts.x,
+                                       vram_ok ? 210.0f : 70.0f});
+        const float panel_w = cont_w + inpad * 2.0f;
+        float panel_h = inpad * 2.0f + txt_h;                 // FPS line
+        if (vram_ok) panel_h += line_gap + txt_h + gap + bar_h;
+        const float margin = 10.0f;
+        const float right  = vp_pos.x + vp_size.x;
+        const float ptop   = vp_pos.y +
+            (isViewportValid() ? 8.0f : (kMenuH + 8.0f));
+        const ImVec2 p0(right - margin - panel_w, ptop);
+        const ImVec2 p1(p0.x + panel_w, p0.y + panel_h);
+
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        dl->AddRectFilled(p0, p1, IM_COL32(16, 16, 22, 170), 4.0f);
+        dl->AddRect      (p0, p1, IM_COL32(0, 0, 0, 120), 4.0f);
+
+        // FPS line.
+        const ImVec2 fp(p0.x + inpad, p0.y + inpad);
+        dl->AddText(ImVec2(fp.x + 1.0f, fp.y + 1.0f), IM_COL32(0, 0, 0, 190), fbuf);
+        dl->AddText(fp, IM_COL32(232, 232, 240, 245), fbuf);
+
+        if (vram_ok) {
+            const ImVec2 tp(p0.x + inpad, fp.y + txt_h + line_gap);
+            dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f),
+                        IM_COL32(0, 0, 0, 190), vbuf);          // shadow
+            dl->AddText(tp, IM_COL32(232, 232, 240, 245), vbuf);
+
+            const ImVec2 b0(p0.x + inpad, tp.y + txt_h + gap);
+            const ImVec2 b1(p1.x - inpad, b0.y + bar_h);
+            const float  bw = b1.x - b0.x;
+            dl->AddRectFilled(b0, b1, IM_COL32(40, 40, 48, 220), 2.0f);
+
+            const float fu = (float)std::min(1.0, std::max(0.0, use_mb / cap_mb));
+            const ImU32  used_col = fu < 0.70f ? IM_COL32( 90, 200, 120, 240)
+                                  : fu < 0.90f ? IM_COL32(235, 190,  70, 240)
+                                               : IM_COL32(235,  90,  80, 240);
+            dl->AddRectFilled(b0, ImVec2(b0.x + bw * fu, b1.y), used_col, 2.0f);
+
+            // Engine's own Vulkan share overlaid in blue.
+            if (dev && mine_mb > 0.0) {
+                const float fm = (float)std::min((double)fu, mine_mb / cap_mb);
+                dl->AddRectFilled(b0, ImVec2(b0.x + bw * fm, b1.y),
+                                  IM_COL32(80, 160, 245, 245), 2.0f);
+            }
+            dl->AddRect(b0, b1, IM_COL32(0, 0, 0, 140), 2.0f);
+        }
+    }
+    // ------------------------------------------------------------------------
+
     renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
 
     cmd_buf->endRenderPass();
@@ -3365,6 +3575,11 @@ void Menu::destroyResources() {
         clock_tex_info_->destroy(device_);
         clock_tex_info_.reset();
         clock_tex_id_ = ImTextureID(0);
+    }
+    if (play_icon_info_ && device_) {
+        play_icon_info_->destroy(device_);
+        play_icon_info_.reset();
+        play_icon_id_ = ImTextureID(0);
     }
 }
 
@@ -4295,12 +4510,74 @@ void Menu::drawFolderTree(const std::string& dir, int depth) {
 }
 
 // Launch the FLUX.2 generator for one image (detached subprocess).
+// ImGui's InputTextMultiline has no native word-wrap: a long line just scrolls
+// horizontally and gets clipped.  This callback soft-wraps the buffer to the box
+// width by converting spaces to newlines (and back), so wrapping is purely
+// visual and reversible.  Cursor stays aligned because we only swap chars in
+// place (' ' <-> '\n'), never insert or delete, so the buffer length is stable.
+namespace {
+struct GenWrapUD { float wrap_w; };
+
+int GenPromptWrapCallback(ImGuiInputTextCallbackData* data) {
+    GenWrapUD* ud = static_cast<GenWrapUD*>(data->UserData);
+    const float wrap_w = ud ? ud->wrap_w : 400.0f;
+    if (wrap_w <= 1.0f || data->BufTextLen <= 0) return 0;
+
+    // Flatten existing soft-wraps back to spaces; record the cursor as a count
+    // of kept characters so we can restore it after re-wrapping.
+    std::string raw;
+    raw.reserve(data->BufTextLen);
+    int raw_cursor = 0;
+    for (int i = 0; i < data->BufTextLen; ++i) {
+        char c = data->Buf[i];
+        if (c == '\r') continue;
+        if (c == '\n') c = ' ';
+        if (i < data->CursorPos) ++raw_cursor;
+        raw.push_back(c);
+    }
+
+    // Greedy pixel word-wrap: convert the last space on an over-long line to a
+    // newline.  Length is preserved, so cursor index maps 1:1.
+    std::string wrapped = raw;
+    int line_start = 0;
+    int last_space = -1;
+    for (int i = 0; i < (int)wrapped.size(); ++i) {
+        if (wrapped[i] == ' ') last_space = i;
+        const char* ls = wrapped.c_str() + line_start;
+        const char* le = wrapped.c_str() + (i + 1);
+        if (ImGui::CalcTextSize(ls, le).x > wrap_w && last_space > line_start) {
+            wrapped[last_space] = '\n';
+            line_start = last_space + 1;
+            last_space = -1;
+        }
+    }
+
+    // Only rewrite if something actually changed (avoids fighting the cursor
+    // every frame under CallbackAlways).
+    bool same = ((int)wrapped.size() == data->BufTextLen);
+    for (int i = 0; same && i < (int)wrapped.size(); ++i)
+        if (wrapped[i] != data->Buf[i]) same = false;
+    if (same) return 0;
+
+    if ((int)wrapped.size() < data->BufSize) {
+        for (int i = 0; i < (int)wrapped.size(); ++i) data->Buf[i] = wrapped[i];
+        data->Buf[wrapped.size()] = '\0';
+        data->BufTextLen = (int)wrapped.size();
+        data->BufDirty = true;
+        data->CursorPos = data->SelectionStart = data->SelectionEnd = raw_cursor;
+    }
+    return 0;
+}
+} // namespace
+
 void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
                           int width, int height) {
     namespace fs = std::filesystem;
     std::string p = prompt;
-    while (!p.empty() && (p.back() == '\n' || p.back() == '\r' ||
-                          p.back() == ' '  || p.back() == '\t'))
+    // The prompt box soft-wraps by inserting newlines purely for display; the
+    // model wants a clean single line, so collapse interior breaks to spaces.
+    for (char& c : p) if (c == '\n' || c == '\r') c = ' ';
+    while (!p.empty() && (p.back() == ' ' || p.back() == '\t'))
         p.pop_back();
     if (p.empty()) { gen_status_ = 3; gen_err_ = "empty prompt"; return; }
 
@@ -4468,6 +4745,16 @@ void Menu::drawContentBrowserPanel() {
                 ImGui::TextUnformatted(disp.c_str());
                 ImGui::EndGroup();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name.c_str());
+                // Right-click a tile → Rename.
+                if (ImGui::BeginPopupContextItem("##cbctx")) {
+                    if (ImGui::MenuItem("Rename")) {
+                        rename_target_ = e.path().string();
+                        std::snprintf(rename_buf_, sizeof(rename_buf_), "%s",
+                                      name.c_str());
+                        rename_open_ = true;
+                    }
+                    ImGui::EndPopup();
+                }
                 ImGui::PopID();
 
                 if (clicked && is_dir) content_dir_ = e.path().string();
@@ -4487,6 +4774,47 @@ void Menu::drawContentBrowserPanel() {
         }
         ImGui::EndChild();
 
+        // ── Rename dialog (right-click a tile → Rename) ────────────────────
+        if (rename_open_) { ImGui::OpenPopup("Rename##cb"); rename_open_ = false; }
+        if (ImGui::BeginPopupModal("Rename##cb", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextDisabled("%s",
+                std::filesystem::path(rename_target_).filename().string().c_str());
+            ImGui::TextUnformatted("New name:");
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            ImGui::SetNextItemWidth(320.0f);
+            const bool enter = ImGui::InputText("##rn_in", rename_buf_,
+                sizeof(rename_buf_), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::Spacing();
+            const bool ok = ImGui::Button("Rename", ImVec2(120, 0)) || enter;
+            ImGui::SameLine();
+            const bool cancel = ImGui::Button("Cancel", ImVec2(120, 0));
+
+            if (ok && rename_buf_[0] != '\0' && !rename_target_.empty()) {
+                fs::path src(rename_target_);
+                fs::path dst = src.parent_path() / rename_buf_;
+                std::error_code rec2;
+                if (fs::exists(dst, rec2)) {
+                    EditorLog::get().push("[rename] target already exists: " +
+                                          dst.filename().string());
+                } else {
+                    fs::rename(src, dst, rec2);
+                    if (rec2) {
+                        EditorLog::get().push("[rename] failed: " + rec2.message());
+                    } else {
+                        EditorLog::get().push("[rename] " +
+                            src.filename().string() + " -> " +
+                            std::string(rename_buf_));
+                        if (content_dir_ == rename_target_)
+                            content_dir_ = dst.string();
+                    }
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            if (cancel) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
         // ── FLUX.2 generate-image popup ────────────────────────────────────
         static bool s_gen_open = false;
         if (gen_popup_pending_) {
@@ -4495,18 +4823,27 @@ void Menu::drawContentBrowserPanel() {
             s_gen_open = true;
         }
         if (s_gen_open) {
-            ImGui::SetNextWindowSize(ImVec2(470.0f, 0.0f), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(520.0f, 380.0f), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 260.0f),
+                                                ImVec2(8192.0f, 8192.0f));
             if (ImGui::Begin("Generate Image", &s_gen_open,
-                             ImGuiWindowFlags_AlwaysAutoResize |
                              ImGuiWindowFlags_NoCollapse)) {
             ImGui::TextDisabled("Generate image into:");
             ImGui::TextUnformatted(gen_folder_.c_str());
             ImGui::Separator();
 
             ImGui::TextUnformatted("Prompt");
+            // Fill the window width so the box grows when the window is resized.
+            const float box_w = ImGui::GetContentRegionAvail().x;
+            GenWrapUD genud;
+            genud.wrap_w = box_w - ImGui::GetStyle().FramePadding.x * 2.0f
+                                 - ImGui::GetStyle().ScrollbarSize - 4.0f;
+            // CallbackAlways: re-wrap EVERY line each frame (and on resize).
             ImGui::InputTextMultiline("##gen_prompt", gen_prompt_,
                 sizeof(gen_prompt_),
-                ImVec2(440.0f, ImGui::GetTextLineHeight() * 8.0f));
+                ImVec2(box_w, ImGui::GetTextLineHeightWithSpacing() * 7.0f),
+                ImGuiInputTextFlags_CallbackAlways, &GenPromptWrapCallback,
+                &genud);
 
             struct Sz { const char* label; int w, h; };
             static const Sz kSizes[] = {
@@ -4522,7 +4859,7 @@ void Menu::drawContentBrowserPanel() {
             };
             const int nSz = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
             if (gen_size_idx_ < 0 || gen_size_idx_ >= nSz) gen_size_idx_ = 6;
-            ImGui::SetNextItemWidth(440.0f);
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
             if (ImGui::BeginCombo("##gen_size", kSizes[gen_size_idx_].label)) {
                 for (int i = 0; i < nSz; ++i)
                     if (ImGui::Selectable(kSizes[i].label, gen_size_idx_ == i))
@@ -4531,15 +4868,19 @@ void Menu::drawContentBrowserPanel() {
             }
 
             ImGui::Separator();
+            // Split the row evenly so neither button's label is clipped
+            // (the fantasy font makes "Regenerate" wider than a fixed 120px).
+            const float btn_w = (ImGui::GetContentRegionAvail().x
+                                 - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
             const bool busy = (gen_status_ == 1);
             if (busy) ImGui::BeginDisabled();
-            if (ImGui::Button("Generate", ImVec2(120, 0)))
+            if (ImGui::Button("Generate", ImVec2(btn_w, 0)))
                 launchImageGen(gen_folder_, gen_prompt_,
                                kSizes[gen_size_idx_].w, kSizes[gen_size_idx_].h);
             ImGui::SameLine();
             const bool can_regen = !gen_last_prompt_.empty();
             if (!can_regen) ImGui::BeginDisabled();
-            if (ImGui::Button("Regenerate", ImVec2(120, 0)))
+            if (ImGui::Button("Regenerate", ImVec2(btn_w, 0)))
                 launchImageGen(gen_folder_, gen_last_prompt_,
                                gen_last_w_, gen_last_h_);
             if (!can_regen) ImGui::EndDisabled();

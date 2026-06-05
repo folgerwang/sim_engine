@@ -187,6 +187,9 @@ private:
     // Analog clock face overlay — loaded from assets/ui/clock_face.png.
     std::shared_ptr<renderer::TextureInfo> clock_tex_info_;
     ImTextureID clock_tex_id_ = ImTextureID(0);
+    // Viewport Play button icon (assets/icon/play.png).
+    std::shared_ptr<renderer::TextureInfo> play_icon_info_;
+    ImTextureID play_icon_id_ = ImTextureID(0);
 
     // Device + sampler kept for re-registering textures / cleanup.
     std::shared_ptr<renderer::Device> device_;
@@ -592,6 +595,21 @@ public:
     // player frozen, camera flies the level.  The app reads this each frame.
     bool isPlayMode() const { return play_mode_; }
     bool play_mode_ = true;
+
+    // ── VRAM profiler cache ─────────────────────────────────────────────
+    // Polled at ~4 Hz from Menu::draw and drawn as a viewport overlay bar.
+    // Two sources: (1) Vulkan VK_EXT_memory_budget = THIS process's Vulkan
+    // allocations (engine + ImGui); (2) CUDA cudaMemGetInfo = DEVICE-WIDE
+    // usage incl. ML (LibTorch/CUDA in-process and the FLUX/Ollama processes).
+    double vram_used_mb_   = 0.0;   // engine Vulkan usage (this process)
+    double vram_budget_mb_ = 0.0;   // amount this process may allocate
+    double vram_total_mb_  = 0.0;   // Vulkan device-local capacity
+    double vram_dev_used_mb_  = 0.0; // device-wide used (all consumers, ML incl.)
+    double vram_dev_total_mb_ = 0.0; // device-wide capacity (CUDA-reported)
+    double vram_last_poll_ = -1.0;  // ImGui::GetTime() of last query
+    bool   vram_valid_     = false; // Vulkan query succeeded
+    bool   vram_dev_valid_ = false; // CUDA device-wide query succeeded
+
     bool      isViewportValid() const { return viewport_valid_ && editor_enabled_; }
     glm::vec2 getViewportPos()  const { return viewport_pos_; }
     glm::vec2 getViewportSize() const { return viewport_size_; }
@@ -631,6 +649,11 @@ private:
     std::vector<std::shared_ptr<renderer::TextureInfo>> retired_thumbs_;
     float content_left_w_ = 0.0f;
     int   thumb_budget_   = 0;
+
+    // Content Browser rename (right-click a tile → Rename → dialog).
+    std::string rename_target_;        // full path of the item being renamed
+    char        rename_buf_[256] = {0};// edit buffer (new name incl. extension)
+    bool        rename_open_     = false; // open the rename dialog next frame
 
     // ── FLUX.2 text-to-image generation (Content Browser right-click) ───────
     // launchImageGen() writes the prompt to a file, spawns the per-image

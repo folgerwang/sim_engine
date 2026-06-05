@@ -56,6 +56,7 @@ const std::vector<const char*> device_extensions = {
     VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
     VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
     VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME,
+    VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,   // driver-reported per-heap VRAM usage/budget (profiler)
 };
 
 #ifdef NDEBUG
