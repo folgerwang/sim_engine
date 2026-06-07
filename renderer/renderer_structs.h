@@ -467,6 +467,12 @@ struct TextureInfo {
     // consumers can hand the buffer around without copying.
     std::shared_ptr<std::vector<uint8_t>> cpu_pixels;
 
+    // Optional: pre-encoded Virtual Texture albedo tile cache (BC7),
+    // baked at import time into the .rwtex asset.  When present the VT
+    // manager's registerMaterial adopts it directly — no runtime CPU
+    // BC7 encode, and no full-res RGBA8 needed in cpu_pixels.
+    std::shared_ptr<std::vector<uint8_t>> vt_bc7_tiles;
+
     // ── Alpha-only companion (R8_UNORM) ───────────────────────────────
     // Optional: a smaller texture holding ONLY this texture's alpha
     // channel, used by the depth-only / shadow fragment shader for

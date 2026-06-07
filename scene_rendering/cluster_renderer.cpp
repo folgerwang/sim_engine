@@ -17,6 +17,7 @@
 #include <cctype>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace er  = engine::renderer;
 
@@ -611,9 +612,27 @@ void ClusterRenderer::uploadMeshClusters(
                     // normal, the cache would return the FIRST
                     // material's normal data; revisit with a
                     // tuple-keyed cache when that case appears.
-                    if (vt_manager_ && albedo_tex && albedo_tex->image &&
+                    // VT-only baked textures carry CPU pixels and/or a
+                    // bake-time pre-encoded BC7 tile blob but NO GPU
+                    // image — registerMaterial handles all three
+                    // sources.  Cache key = image pointer when present,
+                    // else the shared cpu_pixels / blob pointer.
+                    const bool albedo_has_cpu =
+                        albedo_tex && albedo_tex->cpu_pixels &&
+                        !albedo_tex->cpu_pixels->empty();
+                    const bool albedo_has_blob =
+                        albedo_tex && albedo_tex->vt_bc7_tiles &&
+                        !albedo_tex->vt_bc7_tiles->empty();
+                    if (vt_manager_ && albedo_tex &&
+                        (albedo_tex->image || albedo_has_cpu ||
+                         albedo_has_blob) &&
                         albedo_tex->size.x > 0 && albedo_tex->size.y > 0) {
-                        auto vt_it = vt_albedo_id_cache_.find(albedo_tex->image.get());
+                        const void* vt_key = albedo_tex->image
+                            ? static_cast<const void*>(albedo_tex->image.get())
+                            : albedo_tex->cpu_pixels
+                                ? static_cast<const void*>(albedo_tex->cpu_pixels.get())
+                                : static_cast<const void*>(albedo_tex->vt_bc7_tiles.get());
+                        auto vt_it = vt_albedo_id_cache_.find(vt_key);
                         uint32_t vid = kInvalidVtId;
                         if (vt_it != vt_albedo_id_cache_.end()) {
                             vid = vt_it->second;
@@ -627,9 +646,7 @@ void ClusterRenderer::uploadMeshClusters(
                             // back to the GPU image — registerMaterial does
                             // a one-time blit-decode + readback for BC-only
                             // sources to materialise RGBA8.
-                            const uint8_t* px =
-                                (albedo_tex->cpu_pixels &&
-                                 !albedo_tex->cpu_pixels->empty())
+                            const uint8_t* px = albedo_has_cpu
                                 ? albedo_tex->cpu_pixels->data()
                                 : nullptr;
                             vid = vt_manager_->registerMaterial(
@@ -639,9 +656,10 @@ void ClusterRenderer::uploadMeshClusters(
                                 /*mr_ao*/   nullptr,
                                 /*emissive*/nullptr,
                                 albedo_tex->size.x,
-                                albedo_tex->size.y);
+                                albedo_tex->size.y,
+                                albedo_tex->vt_bc7_tiles);
                             if (vid != kInvalidVtId) {
-                                vt_albedo_id_cache_[albedo_tex->image.get()] = vid;
+                                vt_albedo_id_cache_[vt_key] = vid;
                                 if (nrm_img) {
                                     vt_normal_id_cache_[nrm_img.get()] = vid;
                                 }
@@ -906,11 +924,129 @@ void ClusterRenderer::uploadMeshClusters(
     ++uploaded_mesh_count_;
 }
 
+// ─── preRegisterVtMaterials ────────────────────────────────────────────────
+// Budgeted VT cache warm-up — see header doc.  Mirrors the registration
+// logic inside uploadMeshClusters::getMaterialIdx (same cache keys), so a
+// later upload of the same textures is a pure cache hit.
+int ClusterRenderer::preRegisterVtMaterials(
+    const game_object::DrawableData& drawable_data,
+    int max_new) {
+    if (!vt_manager_ || max_new <= 0) return 0;
+
+    int registered = 0;
+    for (const auto& mat : drawable_data.materials_) {
+        if (registered >= max_new) break;
+
+        const renderer::TextureInfo* albedo_tex = nullptr;
+        if (mat.base_color_idx_ >= 0 &&
+            static_cast<size_t>(mat.base_color_idx_) <
+                drawable_data.textures_.size()) {
+            albedo_tex = &drawable_data.textures_[mat.base_color_idx_];
+        }
+        if (!albedo_tex) continue;
+        const bool has_cpu =
+            albedo_tex->cpu_pixels && !albedo_tex->cpu_pixels->empty();
+        const bool has_blob =
+            albedo_tex->vt_bc7_tiles && !albedo_tex->vt_bc7_tiles->empty();
+        if (!(albedo_tex->image || has_cpu || has_blob) ||
+            albedo_tex->size.x == 0 || albedo_tex->size.y == 0) {
+            continue;
+        }
+        const void* vt_key = albedo_tex->image
+            ? static_cast<const void*>(albedo_tex->image.get())
+            : albedo_tex->cpu_pixels
+                ? static_cast<const void*>(albedo_tex->cpu_pixels.get())
+                : static_cast<const void*>(albedo_tex->vt_bc7_tiles.get());
+        if (vt_albedo_id_cache_.find(vt_key) != vt_albedo_id_cache_.end()) {
+            continue;   // already warm (valid OR known-failed)
+        }
+
+        const renderer::TextureInfo* normal_tex = nullptr;
+        if (mat.normal_idx_ >= 0 &&
+            static_cast<size_t>(mat.normal_idx_) <
+                drawable_data.textures_.size()) {
+            normal_tex = &drawable_data.textures_[mat.normal_idx_];
+        }
+        const auto& nrm_img =
+            (normal_tex && normal_tex->image)
+                ? normal_tex->image
+                : std::shared_ptr<renderer::Image>();
+
+        const uint8_t* px = has_cpu
+            ? albedo_tex->cpu_pixels->data()
+            : nullptr;
+        const uint32_t vid = vt_manager_->registerMaterial(
+            px,
+            albedo_tex->image,
+            nrm_img,
+            /*mr_ao*/   nullptr,
+            /*emissive*/nullptr,
+            albedo_tex->size.x,
+            albedo_tex->size.y,
+            albedo_tex->vt_bc7_tiles);
+        // Cache EVEN failed registrations (pool full, …) so the warm-up
+        // doesn't retry the same texture every frame; uploadMeshClusters
+        // checks vid validity before using a cached entry.
+        vt_albedo_id_cache_[vt_key] = vid;
+        if (vid != kInvalidVtId && nrm_img) {
+            vt_normal_id_cache_[nrm_img.get()] = vid;
+        }
+        ++registered;
+    }
+    return registered;
+}
+
+// ─── countPendingVtMaterials ───────────────────────────────────────────────
+int ClusterRenderer::countPendingVtMaterials(
+    const game_object::DrawableData& drawable_data) const {
+    if (!vt_manager_) return 0;
+    int pending = 0;
+    std::unordered_set<const void*> seen;
+    for (const auto& mat : drawable_data.materials_) {
+        const renderer::TextureInfo* albedo_tex = nullptr;
+        if (mat.base_color_idx_ >= 0 &&
+            static_cast<size_t>(mat.base_color_idx_) <
+                drawable_data.textures_.size()) {
+            albedo_tex = &drawable_data.textures_[mat.base_color_idx_];
+        }
+        if (!albedo_tex) continue;
+        const bool has_cpu =
+            albedo_tex->cpu_pixels && !albedo_tex->cpu_pixels->empty();
+        const bool has_blob =
+            albedo_tex->vt_bc7_tiles && !albedo_tex->vt_bc7_tiles->empty();
+        if (!(albedo_tex->image || has_cpu || has_blob) ||
+            albedo_tex->size.x == 0 || albedo_tex->size.y == 0) {
+            continue;
+        }
+        const void* vt_key = albedo_tex->image
+            ? static_cast<const void*>(albedo_tex->image.get())
+            : albedo_tex->cpu_pixels
+                ? static_cast<const void*>(albedo_tex->cpu_pixels.get())
+                : static_cast<const void*>(albedo_tex->vt_bc7_tiles.get());
+        if (!seen.insert(vt_key).second) continue;
+        if (vt_albedo_id_cache_.find(vt_key) == vt_albedo_id_cache_.end()) {
+            ++pending;
+        }
+    }
+    return pending;
+}
+
 // ─── Finalize uploads (create merged GPU SSBOs) ───────────────────
 
 void ClusterRenderer::finalizeUploads() {
     total_clusters_all_meshes_ =
         static_cast<uint32_t>(staging_cull_infos_.size());
+
+    // ── Re-finalize support (editor incremental uploads) ──────────────
+    // When merged buffers from a previous finalize exist, drain the GPU
+    // first: every buffer below is REPLACED (the shared_ptr reassignment
+    // frees the old allocation) and no in-flight frame may still
+    // reference it.  This is an editor-time hitch (object placement /
+    // transform commit), not a per-frame cost.
+    const bool refinalize = (cull_info_buffer_.buffer != nullptr);
+    if (refinalize) {
+        device_->waitIdle();
+    }
 
     // Log VT registration outcome so we know the pool got populated.
     // Counts unique source images registered (cache size).  If this is
@@ -920,6 +1056,19 @@ void ClusterRenderer::finalizeUploads() {
                 vt_normal_id_cache_.size());
 
     if (total_clusters_all_meshes_ == 0) {
+        if (refinalize) {
+            // Everything was removed (e.g. the editor's last placed
+            // object was deleted on top of an empty base).  Park the
+            // renderer: draw()/cull() gate on gpu_ready_, so flipping it
+            // off retires the stale buffers without destroying them.
+            // The next finalize with content re-arms everything.
+            gpu_ready_ = false;
+            total_merged_vertices_ = 0;
+            total_merged_indices_  = 0;
+            total_visible_all_meshes_ = 0;
+            cluster_to_mesh_.clear();
+            mesh_visible_.clear();
+        }
         std::printf("[CLUSTER_RENDERER] No clusters to upload.\n");
         return;
     }
@@ -1075,9 +1224,11 @@ void ClusterRenderer::finalizeUploads() {
         total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
     draw_count_buffer_phase_a_ = createCounterBuffer(device_);
 
-    // Allocate and write descriptor set.
-    cull_desc_set_ = device_->createDescriptorSets(
-        descriptor_pool_, cull_desc_set_layout_, 1)[0];
+    // Allocate (once — reused on re-finalize) and write descriptor set.
+    if (!cull_desc_set_) {
+        cull_desc_set_ = device_->createDescriptorSets(
+            descriptor_pool_, cull_desc_set_layout_, 1)[0];
+    }
 
     // material_params_buffer_ was just created above; staging_material_params_
     // still has the source data for the size lookup.  total_materials_ isn't
@@ -1110,8 +1261,10 @@ void ClusterRenderer::finalizeUploads() {
     // ever write into it, never read, so cascades sharing the scratch
     // is fine.  Other bindings reuse the main-cull SSBOs.
     for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
-        cull_desc_sets_shadow_[k] = device_->createDescriptorSets(
-            descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        if (!cull_desc_sets_shadow_[k]) {
+            cull_desc_sets_shadow_[k] = device_->createDescriptorSets(
+                descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        }
         writeCullDescriptors(
             device_, cull_desc_sets_shadow_[k],
             total_clusters_all_meshes_,
@@ -1244,17 +1397,20 @@ void ClusterRenderer::finalizeUploads() {
     // The layout is independent of the cull compute's layout (which has
     // 12 bindings and is COMPUTE-visible only).
     if (total_merged_vertices_ > 0 && total_merged_indices_ > 0) {
-        std::vector<er::DescriptorSetLayoutBinding> mesh_bindings(5);
-        for (int i = 0; i < 5; ++i) {
-            mesh_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
-                i, SET_2_FLAG_BITS(ShaderStage, TASK_BIT_EXT, MESH_BIT_EXT),
-                er::DescriptorType::STORAGE_BUFFER);
+        if (!cluster_mesh_data_desc_set_layout_) {
+            std::vector<er::DescriptorSetLayoutBinding> mesh_bindings(5);
+            for (int i = 0; i < 5; ++i) {
+                mesh_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
+                    i, SET_2_FLAG_BITS(ShaderStage, TASK_BIT_EXT, MESH_BIT_EXT),
+                    er::DescriptorType::STORAGE_BUFFER);
+            }
+            cluster_mesh_data_desc_set_layout_ =
+                device_->createDescriptorSetLayout(mesh_bindings);
         }
-        cluster_mesh_data_desc_set_layout_ =
-            device_->createDescriptorSetLayout(mesh_bindings);
-
-        cluster_mesh_data_desc_set_ = device_->createDescriptorSets(
-            descriptor_pool_, cluster_mesh_data_desc_set_layout_, 1)[0];
+        if (!cluster_mesh_data_desc_set_) {
+            cluster_mesh_data_desc_set_ = device_->createDescriptorSets(
+                descriptor_pool_, cluster_mesh_data_desc_set_layout_, 1)[0];
+        }
 
         er::WriteDescriptorList mesh_writes;
         mesh_writes.reserve(5);
@@ -1360,20 +1516,15 @@ void ClusterRenderer::finalizeUploads() {
                 static_cast<uint32_t>(mesh_cluster_ranges_.size()),
                 static_cast<unsigned long long>(total_triangles_all_meshes_));
 
-    // Record counts before clearing staging (used by initBindlessPipeline).
+    // Record counts (used by initBindlessPipeline / descriptor rewrites).
     total_materials_ = static_cast<uint32_t>(
         std::max(size_t(1), staging_material_params_.size()));
-    // Texture staging is kept alive until initBindlessPipeline writes descriptors.
+    // NOTE: the texture staging arrays are NOT padded to
+    // MAX_CLUSTER_TEXTURES any more — the descriptor-write loops bounds-
+    // check and fall back to dummy_texture_ for empty slots, and in-place
+    // padding would break the slot dedup on later (editor) uploads.
     total_textures_ = static_cast<uint32_t>(staging_tex_views_.size());
-    // Pad unused base-colour texture slots with the dummy white texture.
-    while (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
-        staging_tex_views_.push_back(dummy_texture_.view);
-    }
-    // Same for normal-map slots.
     total_normal_textures_ = static_cast<uint32_t>(staging_normal_tex_views_.size());
-    while (staging_normal_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
-        staging_normal_tex_views_.push_back(dummy_texture_.view);
-    }
 
     // Backup material_params (with VT ids populated) so setVtEnabled()
     // can restore them after a user-driven VT-off → VT-on transition.
@@ -1381,19 +1532,171 @@ void ClusterRenderer::finalizeUploads() {
     material_params_backup_ = staging_material_params_;
     vt_enabled_ = true;  // freshly uploaded with VT ids → VT is on.
 
-    // Free CPU staging memory.
-    staging_cull_infos_.clear();
-    staging_cull_infos_.shrink_to_fit();
-    staging_draw_infos_.clear();
-    staging_draw_infos_.shrink_to_fit();
-    staging_material_params_.clear();
-    staging_material_params_.shrink_to_fit();
-    staging_tex_slot_map_.clear();
-    staging_normal_slot_map_.clear();
-    staging_vertices_.clear();
-    staging_vertices_.shrink_to_fit();
-    staging_indices_.clear();
-    staging_indices_.shrink_to_fit();
+    // CPU staging is RETAINED (not cleared) so the editor's incremental
+    // flow can resetToBaseUploads() + re-stage placed objects + call
+    // finalizeUploads() again.  Costs one CPU copy of the merged VB/IB —
+    // acceptable for the editor; revisit with a "shipping" mode flag if
+    // the retained copy ever matters for the packaged game.
+    if (!base_marked_) {
+        // Auto-snapshot: the first finalize defines the base scene unless
+        // the application marked it explicitly beforehand.
+        markBaseUploads();
+    }
+
+    // On a RE-finalize the bindless graphics set (if the pipeline is
+    // already up) still points at the old, just-replaced buffers —
+    // re-point bindings 0..3 now.  Safe: refinalize did waitIdle above.
+    if (refinalize && bindless_desc_set_) {
+        rewriteBindlessDescriptorsAfterRefinalize();
+    }
+}
+
+// ─── markBaseUploads / resetToBaseUploads ──────────────────────────────────
+// Editor incremental-upload bookkeeping — see header doc.
+
+void ClusterRenderer::markBaseUploads() {
+    base_cluster_count_  = staging_cull_infos_.size();
+    base_material_count_ = staging_material_params_.size();
+    base_vertex_count_   = staging_vertices_.size();
+    base_index_count_    = staging_indices_.size();
+    base_tex_count_      = staging_tex_views_.size();
+    base_normal_tex_count_ = staging_normal_tex_views_.size();
+    base_mesh_count_     = uploaded_mesh_count_;
+    base_marked_         = true;
+    std::printf("[CLUSTER_RENDERER] Base uploads marked: %u meshes, "
+                "%zu clusters, %zu verts.\n",
+                base_mesh_count_, base_cluster_count_, base_vertex_count_);
+}
+
+void ClusterRenderer::resetToBaseUploads() {
+    if (!base_marked_) {
+        markBaseUploads();
+        return;
+    }
+    // staging_draw_infos_ is 1:1 with staging_cull_infos_ (one entry per
+    // cluster, including geometry-less placeholders) — same truncation.
+    staging_cull_infos_.resize(base_cluster_count_);
+    staging_draw_infos_.resize(base_cluster_count_);
+    staging_material_params_.resize(base_material_count_);
+    staging_material_names_.resize(base_material_count_);
+    staging_vertices_.resize(base_vertex_count_);
+    staging_indices_.resize(base_index_count_);
+    mesh_cluster_ranges_.resize(base_mesh_count_);
+    if (mesh_prim_material_.size() > base_mesh_count_) {
+        mesh_prim_material_.resize(base_mesh_count_);
+    }
+    uploaded_mesh_count_ = base_mesh_count_;
+
+    // Drop the placed tail's texture views too: a removed object's
+    // drawable (and its GPU textures) may be destroyed right after this
+    // call, and retaining the dead views would feed them back into the
+    // descriptor rewrite on the next finalize.  The dedup maps lose the
+    // corresponding entries so re-staged objects re-register cleanly.
+    // (VT pool registrations are NOT reclaimed — editor-grade leak,
+    // bounded by the pool size; a full scene reload resets it.)
+    if (staging_tex_views_.size() > base_tex_count_) {
+        staging_tex_views_.resize(base_tex_count_);
+        for (auto it = staging_tex_slot_map_.begin();
+             it != staging_tex_slot_map_.end();) {
+            if (it->second >= static_cast<int>(base_tex_count_)) {
+                it = staging_tex_slot_map_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (staging_normal_tex_views_.size() > base_normal_tex_count_) {
+        staging_normal_tex_views_.resize(base_normal_tex_count_);
+        for (auto it = staging_normal_slot_map_.begin();
+             it != staging_normal_slot_map_.end();) {
+            if (it->second >= static_cast<int>(base_normal_tex_count_)) {
+                it = staging_normal_slot_map_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+// ─── setMeshClustersHidden ─────────────────────────────────────────────────
+// Poison / restore one mesh's cluster bounding spheres in the HOST_VISIBLE
+// cull-info buffer.  See header doc.
+void ClusterRenderer::setMeshClustersHidden(
+    uint32_t global_mesh_idx, bool hidden) {
+    if (!gpu_ready_ || !cull_info_buffer_.memory) return;
+    if (global_mesh_idx >= mesh_cluster_ranges_.size()) return;
+    const auto& r = mesh_cluster_ranges_[global_mesh_idx];
+    if (r.cluster_count == 0) return;
+    const uint64_t total_sz =
+        total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo);
+    if ((r.cluster_start + r.cluster_count) > total_clusters_all_meshes_)
+        return;
+    void* mapped = device_->mapMemory(cull_info_buffer_.memory, total_sz, 0);
+    if (!mapped) return;
+    auto* infos = reinterpret_cast<glsl::ClusterCullInfo*>(mapped);
+    for (uint32_t ci = r.cluster_start;
+         ci < r.cluster_start + r.cluster_count; ++ci) {
+        if (hidden) {
+            infos[ci].bounds_sphere.w = -1e30f;  // fails every frustum test
+        } else if (ci < staging_cull_infos_.size()) {
+            infos[ci].bounds_sphere = staging_cull_infos_[ci].bounds_sphere;
+        }
+    }
+    device_->unmapMemory(cull_info_buffer_.memory);
+}
+
+// ─── rewriteBindlessDescriptorsAfterRefinalize ─────────────────────────────
+// Mirrors the descriptor writes at the end of initBindlessPipeline for
+// bindings 0..3 only.  The VT bindings (4..10) point at VirtualTexture-
+// Manager resources that survive a refinalize untouched.  Caller already
+// did device_->waitIdle(), so updating the live set is safe.
+void ClusterRenderer::rewriteBindlessDescriptorsAfterRefinalize() {
+    er::WriteDescriptorList writes;
+    writes.reserve(2 + MAX_CLUSTER_TEXTURES * 2);
+
+    er::Helper::addOneBuffer(writes, bindless_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 0,
+        draw_info_buffer_.buffer,
+        static_cast<uint32_t>(
+            std::max(1u, total_clusters_all_meshes_) *
+            sizeof(glsl::ClusterDrawInfo)));
+
+    er::Helper::addOneBuffer(writes, bindless_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 1,
+        material_params_buffer_.buffer,
+        static_cast<uint32_t>(
+            total_materials_ * sizeof(glsl::BindlessMaterialParams)));
+
+    for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
+        auto tex_write = std::make_shared<er::TextureDescriptor>();
+        tex_write->binding           = 2;
+        tex_write->dst_array_element = ti;
+        tex_write->desc_type         = er::DescriptorType::COMBINED_IMAGE_SAMPLER;
+        tex_write->desc_set          = bindless_desc_set_;
+        tex_write->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        tex_write->sampler           = default_sampler_;
+        tex_write->texture           =
+            (ti < staging_tex_views_.size() && staging_tex_views_[ti])
+                ? staging_tex_views_[ti]
+                : dummy_texture_.view;
+        writes.push_back(tex_write);
+    }
+    for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
+        auto nw = std::make_shared<er::TextureDescriptor>();
+        nw->binding           = 3;
+        nw->dst_array_element = ti;
+        nw->desc_type         = er::DescriptorType::COMBINED_IMAGE_SAMPLER;
+        nw->desc_set          = bindless_desc_set_;
+        nw->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        nw->sampler           = default_sampler_;
+        nw->texture           =
+            (ti < staging_normal_tex_views_.size() && staging_normal_tex_views_[ti])
+                ? staging_normal_tex_views_[ti]
+                : dummy_texture_.view;
+        writes.push_back(nw);
+    }
+
+    device_->updateDescriptorSets(writes);
 }
 
 // ─── setVtEnabled ──────────────────────────────────────────────────────────
@@ -2875,11 +3178,12 @@ void ClusterRenderer::initBindlessPipeline(
         device_->updateDescriptorSets(writes);
     }
 
-    // Texture staging views are no longer needed after descriptor write.
-    staging_tex_views_.clear();
-    staging_tex_views_.shrink_to_fit();
-    staging_normal_tex_views_.clear();
-    staging_normal_tex_views_.shrink_to_fit();
+    // NOTE: texture staging views are RETAINED (they used to be cleared
+    // here) — the editor's re-finalize path needs them to (a) keep the
+    // slot-dedup maps meaningful for later uploads and (b) rewrite the
+    // bindless texture arrays after the merged buffers are replaced.
+    // The views are shared_ptrs into DrawableData textures that stay
+    // alive anyway; the extra cost is just the vector itself.
 
     std::printf("[CLUSTER_RENDERER] Bindless graphics pipeline created. "
                 "Bindless set at index %u.\n", bindless_set_index);

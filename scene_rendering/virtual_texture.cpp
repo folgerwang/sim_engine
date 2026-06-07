@@ -7,6 +7,8 @@
 #include "renderer/renderer_helper.h"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -1566,6 +1568,125 @@ std::vector<uint8_t> VirtualTextureManager::readbackImageToRgba8(
     return out;
 }
 
+// ─── albedoTileCacheBytes / encodeAlbedoTileCacheCpu ───────────────────────
+// Bake-time CPU encode — see header doc.  MUST stay byte-identical to the
+// runtime path in encodeAndCacheVt below (same pyramid, same bordered tile
+// extraction, same BC7 mode-6 encode, same entry order); the pre-encoded
+// blob is adopted there with a plain copy.
+
+uint64_t VirtualTextureManager::albedoTileCacheBytes(
+    uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return 0;
+    const uint32_t pages_x = (width  + kVtPageSize - 1) / kVtPageSize;
+    const uint32_t pages_y = (height + kVtPageSize - 1) / kVtPageSize;
+    const uint32_t mips    = vtComputeMipCount(pages_x, pages_y);
+    return uint64_t(vtTotalPagesAllMips(pages_x, pages_y, mips)) *
+           kBc7BytesPerEntry;
+}
+
+bool VirtualTextureManager::encodeAlbedoTileCacheCpu(
+    const uint8_t* rgba, uint32_t width, uint32_t height,
+    std::vector<uint8_t>& out_blob) {
+    out_blob.clear();
+    if (!rgba || width == 0 || height == 0) return false;
+
+    const uint32_t pages_x   = (width  + kVtPageSize - 1) / kVtPageSize;
+    const uint32_t pages_y   = (height + kVtPageSize - 1) / kVtPageSize;
+    const uint32_t mip_count = vtComputeMipCount(pages_x, pages_y);
+    const uint32_t total_pages =
+        vtTotalPagesAllMips(pages_x, pages_y, mip_count);
+    out_blob.assign(uint64_t(total_pages) * kBc7BytesPerEntry, 0);
+
+    // CPU mip pyramid (same box filter as the runtime path).
+    std::vector<std::vector<uint8_t>> mip_pixels(mip_count);
+    std::vector<uint32_t> mip_w(mip_count), mip_h(mip_count);
+    mip_pixels[0].assign(rgba, rgba + uint64_t(width) * height * 4u);
+    mip_w[0] = width; mip_h[0] = height;
+    for (uint32_t k = 1; k < mip_count; ++k) {
+        mip_w[k] = std::max(1u, mip_w[k - 1] >> 1);
+        mip_h[k] = std::max(1u, mip_h[k - 1] >> 1);
+        mip_pixels[k].resize(uint64_t(mip_w[k]) * mip_h[k] * 4u);
+        boxDownsampleRgba8(mip_pixels[k - 1].data(),
+                           mip_w[k - 1], mip_h[k - 1],
+                           mip_pixels[k].data());
+    }
+
+    // Per-entry bordered tile extraction + BC7 encode, chunked across
+    // hardware threads (the import bake runs on a background thread —
+    // no frame budget to respect).
+    auto encode_entry = [&](uint32_t entry_idx) {
+        uint32_t local = entry_idx;
+        uint32_t k = 0;
+        while (k < mip_count) {
+            uint32_t mp = vtMipPagesAt(pages_x, k) * vtMipPagesAt(pages_y, k);
+            if (local < mp) break;
+            local -= mp;
+            ++k;
+        }
+        if (k >= mip_count) return;
+        const uint32_t mpx = vtMipPagesAt(pages_x, k);
+        const uint32_t px  = local % mpx;
+        const uint32_t py  = local / mpx;
+        const uint32_t mw  = mip_w[k];
+        const uint32_t mh  = mip_h[k];
+        const uint8_t* mip_data = mip_pixels[k].data();
+
+        std::vector<uint8_t> tile_rgba(kVtTileSize * kVtTileSize * 4u);
+        const int32_t origin_x =
+            int32_t(px * kVtPageSize) - int32_t(kVtTileBorder);
+        const int32_t origin_y =
+            int32_t(py * kVtPageSize) - int32_t(kVtTileBorder);
+        for (uint32_t ty = 0; ty < kVtTileSize; ++ty) {
+            int32_t sy_signed = origin_y + int32_t(ty);
+            uint32_t sy = uint32_t(std::clamp(sy_signed,
+                                              0, int32_t(mh) - 1));
+            for (uint32_t tx = 0; tx < kVtTileSize; ++tx) {
+                int32_t sx_signed = origin_x + int32_t(tx);
+                uint32_t sx = uint32_t(std::clamp(sx_signed,
+                                                  0, int32_t(mw) - 1));
+                const uint8_t* s = mip_data + (size_t(sy) * mw + sx) * 4u;
+                uint8_t* d = tile_rgba.data() +
+                             (size_t(ty) * kVtTileSize + tx) * 4u;
+                d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+            }
+        }
+
+        uint8_t* dst0 = out_blob.data() +
+                        uint64_t(entry_idx) * kBc7BytesPerEntry;
+        encodeBC7Mode6(tile_rgba.data(), kVtTileSize, kVtTileSize, dst0);
+
+        std::vector<uint8_t> tile_rgba_half(
+            (kVtTileSize / 2) * (kVtTileSize / 2) * 4u);
+        boxDownsampleRgba8(tile_rgba.data(), kVtTileSize, kVtTileSize,
+                           tile_rgba_half.data());
+        encodeBC7Mode6(tile_rgba_half.data(),
+                       kVtTileSize / 2, kVtTileSize / 2,
+                       dst0 + kBc7BytesMip0);
+    };
+
+    const uint32_t n_threads = std::max(
+        1u, std::min(std::thread::hardware_concurrency(), 16u));
+    if (n_threads <= 1 || total_pages < 8) {
+        for (uint32_t e = 0; e < total_pages; ++e) encode_entry(e);
+    } else {
+        std::vector<std::thread> workers;
+        std::atomic<uint32_t> next{0};
+        workers.reserve(n_threads);
+        for (uint32_t t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    const uint32_t e =
+                        next.fetch_add(1, std::memory_order_relaxed);
+                    if (e >= total_pages) break;
+                    encode_entry(e);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+    return true;
+}
+
 void VirtualTextureManager::encodeAndCacheVt(
     uint32_t vt_index,
     const uint8_t* albedo_pixels,
@@ -1575,7 +1696,8 @@ void VirtualTextureManager::encodeAndCacheVt(
     const std::shared_ptr<er::Image>& emissive_image,
     uint32_t width, uint32_t height,
     uint32_t pages_x, uint32_t pages_y, uint32_t mip_count,
-    uint32_t page_table_offset) {
+    uint32_t page_table_offset,
+    const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles) {
 
     while (vt_cache_.size() <= vt_index) {
         vt_cache_.emplace_back();
@@ -1598,8 +1720,27 @@ void VirtualTextureManager::encodeAndCacheVt(
     // buffer holds the pixels for the rest of this function only —
     // the real long-lived storage is the per-tile BC7 cache built
     // below.
+    // ── Bake-time pre-encoded blob shortcut ──────────────────────────
+    // Exact-size match → adopt the import-baked BC7 tile cache and skip
+    // the CPU pyramid + encode (and the GPU readback fallback) entirely.
+    const uint32_t pre_total_pages =
+        vtTotalPagesAllMips(pages_x, pages_y, mip_count);
+    const bool albedo_pre_encoded =
+        albedo_bc7_tiles &&
+        albedo_bc7_tiles->size() ==
+            uint64_t(pre_total_pages) * kBc7BytesPerEntry;
+    if (albedo_pre_encoded) {
+        cache.bc7_albedo = *albedo_bc7_tiles;
+    } else if (albedo_bc7_tiles && !albedo_bc7_tiles->empty()) {
+        std::printf("[RVT] vt=%u baked BC7 blob size mismatch "
+                    "(%zu vs expected %llu) — re-encoding from pixels.\n",
+                    vt_index, albedo_bc7_tiles->size(),
+                    (unsigned long long)(uint64_t(pre_total_pages) *
+                                         kBc7BytesPerEntry));
+    }
+
     std::vector<uint8_t> fallback_pixels;
-    if (!albedo_pixels && albedo_image) {
+    if (!albedo_pre_encoded && !albedo_pixels && albedo_image) {
         // ALBEDO: source is sRGB-encoded BC7_SRGB / BC1_SRGB / etc.
         // Use the SRGB temp so the round-trip preserves bytes; bc7enc
         // then encodes those preserved bytes opaquely and the
@@ -1616,8 +1757,8 @@ void VirtualTextureManager::encodeAndCacheVt(
     // pool mip 0 (kVtPageSize content + kVtTileBorder per side) and
     // half that at pool mip 1.  Border samples are clamped to the
     // mip's edge for tiles that straddle the source boundary.
-    const uint32_t total_pages =
-        vtTotalPagesAllMips(pages_x, pages_y, mip_count);
+    const uint32_t total_pages = pre_total_pages;
+    if (!albedo_pre_encoded) {
     cache.bc7_albedo.assign(uint64_t(total_pages) * kBc7BytesPerEntry, 0);
 
     if (!albedo_pixels) {
@@ -1707,6 +1848,7 @@ void VirtualTextureManager::encodeAndCacheVt(
                            kVtTileSize/2, kVtTileSize/2,
                            dst0 + kBc7BytesMip0);
         });
+    } // !albedo_pre_encoded
 
     // ── NORMAL pipeline: identical structure to ALBEDO above but
     //    encoded as BC5_UNORM (RG only) instead of BC7.  The pool's
@@ -1965,12 +2107,16 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
     const std::shared_ptr<er::Image>& mr_ao_image,
     const std::shared_ptr<er::Image>& emissive_image,
     uint32_t width,
-    uint32_t height) {
+    uint32_t height,
+    const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles) {
 
-    // Either CPU pixels OR a GPU image must be available — we use
-    // the pixels directly when present, fall back to GPU decode-blit
-    // + readback when only the image is available (DDS/BC sources).
-    if ((!albedo_pixels && !albedo_image) || width == 0 || height == 0) {
+    // CPU pixels, a GPU image, OR a bake-time pre-encoded BC7 tile
+    // blob must be available — pixels are used directly when present,
+    // the image needs a one-time decode-blit + readback (DDS/BC
+    // sources), and the blob skips the encode entirely.
+    const bool has_blob = albedo_bc7_tiles && !albedo_bc7_tiles->empty();
+    if ((!albedo_pixels && !albedo_image && !has_blob) ||
+        width == 0 || height == 0) {
         return kInvalidVtId;
     }
     if (meta_cpu_.size() >= kMaxVirtualTextures) return kInvalidVtId;
@@ -2015,7 +2161,8 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
     encodeAndCacheVt(vt_index, albedo_pixels, albedo_image,
                      normal_image, mr_ao_image, emissive_image,
                      width, height,
-                     pages_x, pages_y, mip_count, table_offset);
+                     pages_x, pages_y, mip_count, table_offset,
+                     albedo_bc7_tiles);
 
     // ── Pin the smallest mip (always-resident fallback) ───────────
     // Smallest mip is mip_count - 1 with vtMipPagesAt = 1×1 = 1 page.

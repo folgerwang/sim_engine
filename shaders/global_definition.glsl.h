@@ -621,6 +621,20 @@ struct ClusterDebugParams {
     mat4            transform;
 };
 
+// Push constants for the editor Debug Display GPU preview pass
+// (preview_mesh.vert / preview_mesh.frag, helper::MeshPreview).  The mesh is
+// rendered in its own world space; the three studio spot lights are derived
+// in the fragment shader from the bbox centre/radius + camera position.
+struct PreviewMeshParams {
+    mat4            view_proj;
+    vec4            center_radius;     // xyz = bbox centre, w = bounding radius
+    vec4            camera_pos;        // xyz = eye position (w unused)
+    vec4            base_color_factor; // multiplies the base-color texture
+    // x = metallic, y = roughness, z = has_uv (0/1: sample the texture or
+    // not), w unused.  128 bytes total — at the guaranteed push limit.
+    vec4            pbr_params;
+};
+
 // ─── Nanite-like GPU cluster culling structures ──────────────────────────
 // Shared between cluster_cull.comp and the C++ ClusterRenderer class.
 // All data is packed for std430 SSBO access.

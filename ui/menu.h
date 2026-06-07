@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <cstdint>
 #include "renderer/renderer.h"
+#include "helper/mesh_preview.h"   // Debug Display GPU preview payload
+#include "scene/scene_types.h"     // group-node transform editing (Details)
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
 #include "helper/gpu_profiler.h"
@@ -17,6 +19,7 @@
 #include "imgui.h"
 
 namespace plugins { class PluginManager; }
+namespace plugins { namespace auto_rig { struct TriangleMesh; } }
 
 namespace engine {
 namespace game_object { class MeshLoadTaskManager; class DrawableObject; }
@@ -30,6 +33,21 @@ namespace ui {
 struct EditorSceneObject {
     std::string                          name;
     engine::game_object::DrawableObject* obj = nullptr;
+    // True when this object belongs to the authored scene (Create Scene /
+    // Import / Load) — the Outliner nests these under the scene node inside
+    // "World"; everything else (player, NPCs, debug drawables) lists under
+    // "World" directly.
+    bool                                 in_scene = false;
+    // Index of this row's parent within the SAME editor_objects_ list, or
+    // -1 for a top-level row.  Used to nest placed objects under their
+    // source-group node ("Building/Wall", "Building/Roof", …).  Group rows
+    // themselves are organizational: obj == nullptr.
+    int                                  parent = -1;
+    // The row's authored scene transform (borrowed from the app's
+    // scene_.objects, valid for the current frame).  For GROUP rows the
+    // Details panel edits this directly — moving/rotating the whole group;
+    // the app re-composes children when the menu reports a change.
+    engine::scene::Transform*            scene_xform = nullptr;
 };
 
 // Game-level state machine driven by the title-screen menu.
@@ -502,6 +520,11 @@ public:
     bool scene_import_request_ = false;
     bool scene_save_request_   = false;
     bool scene_load_request_   = false;
+    bool scene_create_request_ = false;  // "Create Scene" (empty + grid)
+    bool show_scene_grid_      = false;  // reference grid / ruler visible
+    // True once a scene has been created or loaded this session — makes the
+    // Outliner show the scene node (named scene_name_buf_) under "World".
+    bool scene_node_active_    = false;
     char scene_name_buf_[128]  = "Untitled";
     int          editor_selected_   = -1;
     int          editor_selected_child_ = -1;  // sub-object index within the
@@ -568,6 +591,9 @@ public:
     int          sel_mask_node_ = -3;
     glm::mat4    sel_mask_vp_   = glm::mat4(0.0f);
     glm::vec2    sel_mask_vpsz_ = glm::vec2(0.0f);
+    // Wrapper instance transform at last mask build — dragging the
+    // placed object must refresh the mask.
+    glm::mat4    sel_mask_inst_ = glm::mat4(0.0f);
     struct DeadMask {
         std::uint64_t                          free_frame;
         ImTextureID                            id;
@@ -576,10 +602,119 @@ public:
     std::vector<DeadMask> sel_mask_dead_;   // deferred free (avoid in-flight use)
     std::uint64_t         sel_mask_frame_ = 0;
 
+    // ── Debug Display window: shaded orbit preview of the clicked object ──
+    // Two sources feed it: clicking an object in the scene viewport /
+    // Outliner (updateDebugDisplay, from the loaded DrawableData), and
+    // double-clicking a tile in the Content Browser (buildAssetPreview,
+    // from a CPU file parse).  Texture retirement shares sel_mask_dead_'s
+    // deferred-free machinery.
+    void drawDebugDisplayPanel();
+    void updateDebugDisplay(engine::game_object::DrawableObject* obj,
+                            int node_idx);
+    // Content-asset preview: sub_index = sub-object ordinal (matches the
+    // virtual-folder tile order), or -1 for the whole file.
+    void buildAssetPreview(const std::string& path, int sub_index,
+                           const std::string& caption);
+    // .rwobj object preview: prefers the baked render-ready .rwgeo/.rwtex
+    // data; falls back to parsing the source model.
+    void buildRwObjPreview(const std::string& rwobj_path,
+                           const std::string& fallback_name);
+    // Arrow-key navigation between sibling objects — callable from BOTH the
+    // Debug Display panel and the Content Browser grid (whichever has
+    // focus), so arrows always move the selection, never scroll the panel.
+    void handlePreviewArrowNav();
+    // Shared bookkeeping after staging a content preview (key, caption,
+    // selection-key reset, Debug Display tab focus).
+    void finishAssetPreview(const std::string& key,
+                            const std::string& caption);
+    // Shared tail: stage a payload for the GPU PBR preview pass.  The app
+    // consumes it via takeDebugPreviewPayload() and records
+    // helper::MeshPreview's offscreen render before the ImGui pass.
+    void installDebugPreview(plugins::auto_rig::TriangleMesh& mesh);
+    void stagePreviewPayload(engine::helper::MeshPreviewPayload&& payload);
+    void retireDebugPreview();
+    engine::helper::MeshPreviewPayload preview_payload_;
+    bool         preview_pending_ = false;   // payload staged, not rendered
+    bool         preview_active_  = false;   // something to show in the panel
+    bool         preview_focus_   = false;   // raise the panel's dock tab once
+    engine::game_object::DrawableObject* dbg_disp_obj_ = nullptr;
+    int          dbg_disp_node_ = -3;       // -3 = nothing cached
+    std::string  dbg_disp_caption_;         // shown above the image
+    std::string  dbg_asset_key_;            // "path#sub" of asset preview
+    // ── Arrow-key navigation between sibling objects ───────────────────
+    // While the Debug Display shows a content preview, Left/Right (or
+    // Up/Down) steps to the previous/next item: sibling .rwobj files in
+    // the same group folder, or sub-objects of the same model file.
+    enum class PreviewNav { None, RwObjSiblings, SubObjects };
+    PreviewNav   preview_nav_       = PreviewNav::None;
+    std::string  preview_nav_path_;          // current .rwobj / model path
+    int          preview_nav_index_ = -1;    // sub-object ordinal (SubObjects)
+    // Tiles per row of the Content Browser grid, written while it draws —
+    // lets Up/Down arrows move by a ROW (Left/Right move by one item).
+    int          browser_grid_cols_ = 1;
+    // One-shot: arrow navigation moved the selection — scroll the grid so
+    // the newly selected tile is visible (consumed when it draws).
+    bool         browser_scroll_to_selected_ = false;
+    // Asset path remembered while a content-tile drag is in flight.  ImGui
+    // clears the payload in NewFrame on the release frame — BEFORE our drop
+    // check runs — so the drop is detected as "payload vanished + mouse
+    // released" using this copy.
+    std::string  drag_asset_path_;
+    // Last selection the panel saw — preview only rebuilds from the scene
+    // when this CHANGES, so a content-asset preview isn't immediately
+    // overwritten by the (unchanged) selection on the next frame.
+    engine::game_object::DrawableObject* dbg_sel_seen_obj_ = nullptr;
+    int          dbg_sel_seen_node_ = -3;
+
     bool         editor_layout_built_ = false;
     float        outliner_list_h_   = 0.0f;   // draggable list/details split (px)
     bool         editor_enabled_    = false;  // editor UI off unless --editor
-    std::string  content_dir_       = "assets";
+    // Content Browser current folder — the game project's asset view, rooted
+    // at content/.  Import copies external files here (+ .rwmeta sidecar).
+    std::string  content_dir_       = "content";
+    // File Browser current folder — raw disk view rooted at the project dir.
+    std::string  file_dir_          = ".";
+    float        file_left_w_       = 0.0f;   // File Browser splitter width
+    // ── Content-browser workflow requests (consumed by the application) ──
+    bool         content_import_request_ = false;  // "Import…" clicked
+    std::string  content_import_dir_;              // folder to import into
+    std::string  place_asset_request_;             // asset to add to the scene
+    // "New Folder" dialog state (Content Browser context menu).
+    bool         newfolder_open_ = false;
+    char         newfolder_buf_[128] = "";
+    // Set when a group node's transform is edited (consumed by the app).
+    bool         scene_xform_dirty_ = false;
+    // "Delete" confirmation state (Content Browser context menu).  Deleting
+    // an imported model also removes its .rwmeta sidecar, its exploded
+    // <stem>/ object folder, and its cached thumbnail.
+    std::string  delete_target_;
+    bool         delete_open_   = false;
+    bool         delete_is_dir_ = false;
+    // Streaming-import status (pushed by the app each frame while its
+    // background copy thread runs) — drawn as a progress bar at the top of
+    // the Content Browser until the import finishes.
+    bool         content_import_active_ = false;
+    float        content_import_frac_   = 0.0f;
+    std::string  content_import_label_;
+    // Scene placements still streaming in (drag & drop / Add to Scene):
+    // object names pushed by the app each frame while a placed object's
+    // async source load is in flight.  Drives the same rune-ring loader
+    // HUD as raw mesh loads so dropping an asset always gives immediate
+    // feedback.  Empty = hidden.
+    std::vector<std::string> scene_place_pending_;
+    // VT warm-up progress (placed objects' textures being BC7-encoded
+    // for the Virtual Texture pool, one per frame) — drawn as a bar in
+    // the same loader HUD.  active=false hides it.
+    bool        vt_warm_active_ = false;
+    float       vt_warm_frac_   = 0.0f;
+    std::string vt_warm_label_;
+    // Sub-object lists for content assets (path → mesh-node names), shown
+    // when a model tile is opened as a virtual folder.  Filled from the
+    // asset's .rwmeta sidecar (baked at import) when present, else by a
+    // one-time CPU parse (helper::listModelSubObjects).
+    std::unordered_map<std::string, std::vector<std::string>>
+        asset_children_cache_;
+    const std::vector<std::string>& assetSubObjects(const std::string& path);
     // Screen-space rect (main-viewport pixels) of the dockspace central node
     // = the 3D Viewport region.  The application reads this each frame to set
     // the camera aspect and (next step) size the offscreen scene render.
@@ -628,8 +763,15 @@ private:
     void drawEditorDockSpace();   // host window + default layout
     void drawOutlinerPanel();   // object list (top) + selected-object details (below)
     void drawDetailsContent();  // details widgets, drawn inline under the list
-    void drawContentBrowserPanel();   // folder tree (left) + thumbnail grid (right)
-    void drawFolderTree(const std::string& dir, int depth);
+    void drawContentBrowserPanel();   // engine assets under content/ (import target)
+    void drawFileBrowserPanel();      // raw disk files, rooted at the project dir
+    // Shared body for both browsers: folder tree (left) + thumbnail grid
+    // (right).  is_content adds the Import… / New Folder toolbar and the
+    // "Add to Scene" tile actions.
+    void drawBrowserBody(const std::string& tree_root, std::string& cur_dir,
+                         float& left_w, bool is_content);
+    void drawFluxGeneratePopup();     // FLUX.2 popup + poll (once per frame)
+    void drawFolderTree(const std::string& dir, int depth, std::string& cur_dir);
     // Lazily load (budgeted) a thumbnail texture for an asset; returns 0 (none)
     // for files that have no thumbnail yet / failed.
     ImTextureID getThumbnail(const std::string& path);
@@ -741,11 +883,90 @@ public:
         if (scene_load_request_) { scene_load_request_ = false; return true; }
         return false;
     }
+    // "Create Scene" mode: clears the current scene to an empty grid the user
+    // builds from scratch.  Serviced by the application a frame later (it tears
+    // down the live imports), which is why it is a consume-once request.
+    bool consumeCreateSceneRequest() {
+        if (scene_create_request_) { scene_create_request_ = false; return true; }
+        return false;
+    }
+    // Persistent toggle: whether the editor reference grid / ruler is drawn.
+    // Enabled automatically when "Create Scene" is chosen; the user can also
+    // flip it from the Scene menu's "Show Grid" checkbox.
+    bool sceneGridEnabled() const { return show_scene_grid_; }
+    void setSceneGridEnabled(bool on) { show_scene_grid_ = on; }
+    // Content Browser "Import…": the app opens the OS file dialog and copies
+    // the chosen file (+ companions) into out_dir with a .rwmeta sidecar.
+    bool consumeContentImportRequest(std::string& out_dir) {
+        if (content_import_request_) {
+            content_import_request_ = false;
+            out_dir = content_import_dir_;
+            return true;
+        }
+        return false;
+    }
+    // Content Browser "Add to Scene" (context menu / double-click on a model
+    // tile): the app instantiates the asset into the authored scene.
+    bool consumePlaceAssetRequest(std::string& out_path) {
+        if (!place_asset_request_.empty()) {
+            out_path = place_asset_request_;
+            place_asset_request_.clear();
+            return true;
+        }
+        return false;
+    }
+    // Debug Display GPU preview: the app polls this each frame and, when a
+    // new payload has been staged (object clicked / content tile previewed),
+    // records helper::MeshPreview's offscreen PBR pass with it.
+    bool takeDebugPreviewPayload(engine::helper::MeshPreviewPayload& out) {
+        if (!preview_pending_) return false;
+        preview_pending_ = false;
+        out = std::move(preview_payload_);
+        preview_payload_ = engine::helper::MeshPreviewPayload{};
+        return true;
+    }
+
+    // A group node's transform was edited in the Details panel — the app
+    // re-composes parent * local into every child drawable's instance TRS.
+    bool consumeSceneTransformsDirty() {
+        if (!scene_xform_dirty_) return false;
+        scene_xform_dirty_ = false;
+        return true;
+    }
+
+    // Scene placement loads, pushed by the application each frame: the
+    // names of placed objects whose async source load hasn't finished
+    // yet.  The mesh-load rune ring HUD spins while any are pending.
+    void setScenePlacementPending(std::vector<std::string> names) {
+        scene_place_pending_ = std::move(names);
+    }
+
+    // VT warm-up progress (texture preparation for placed objects),
+    // pushed by the application each frame.  active=false hides the bar.
+    void setVtWarmupStatus(bool active, float frac,
+                           const std::string& label) {
+        vt_warm_active_ = active;
+        vt_warm_frac_   = frac < 0.0f ? 0.0f : frac > 1.0f ? 1.0f : frac;
+        vt_warm_label_  = label;
+    }
+
+    // Streaming-import progress, pushed by the application each frame while
+    // its background copy thread runs (active=false hides the bar).
+    void setContentImportStatus(bool active, float frac,
+                                const std::string& label) {
+        content_import_active_ = active;
+        content_import_frac_   = frac < 0.0f ? 0.0f
+                               : frac > 1.0f ? 1.0f : frac;
+        content_import_label_  = label;
+    }
     void setSceneName(const std::string& n) {
         const size_t cap = sizeof(scene_name_buf_) - 1;
         const size_t len = (n.size() < cap) ? n.size() : cap;
         for (size_t i = 0; i < len; ++i) scene_name_buf_[i] = n[i];
         scene_name_buf_[len] = '\0';
+        // Called on Create Scene / successful Load — either way a scene now
+        // exists, so surface its node in the Outliner under "World".
+        scene_node_active_ = true;
     }
     Menu(
         GLFWwindow* window,

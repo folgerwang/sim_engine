@@ -11,10 +11,12 @@
 #include <unordered_map>
 #include <set>
 #include <filesystem>
+#include <mutex>
 
 #include "helper/engine_helper.h"
 #include "helper/bvh.h"
 #include "helper/mesh_tool.h"
+#include "helper/model_inspect.h"
 #include "game_object/drawable_object.h"
 #include "game_object/mesh_load_task_manager.h"
 #include "renderer/renderer_helper.h"
@@ -2316,11 +2318,22 @@ static renderer::WriteDescriptorList addDrawableTextures(
     auto& black_tex = renderer::Helper::getBlackTexture();
     auto& white_tex = renderer::Helper::getWhiteTexture();
 
+    // Helper: a texture slot is usable only when it has a GPU view —
+    // VT-only baked textures (.rwtex → cpu_pixels, no full-res image)
+    // carry a valid index but a null view; bind the fallback for those
+    // so the descriptor set stays complete.
+    auto tex_or = [&textures](int32_t idx,
+                              const renderer::TextureInfo& fallback)
+        -> const renderer::TextureInfo& {
+        return (idx < 0 ||
+                idx >= static_cast<int32_t>(textures.size()) ||
+                !textures[idx].view)
+            ? fallback : textures[idx];
+    };
+
     // base color.
-    auto& base_color_tex_view =
-        material.base_color_idx_ < 0 ?
-        black_tex :
-        textures[material.base_color_idx_];
+    const auto& base_color_tex_view =
+        tex_or(material.base_color_idx_, black_tex);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -2331,11 +2344,9 @@ static renderer::WriteDescriptorList addDrawableTextures(
         base_color_tex_view.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    // normal.
-    auto& specular_tex_view =
-        material.specular_color_idx_ < 0 ?
-        black_tex :
-        textures[material.specular_color_idx_];
+    // specular.
+    const auto& specular_tex_view =
+        tex_or(material.specular_color_idx_, black_tex);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -2347,10 +2358,8 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // normal.
-    auto& normal_tex_view =
-        material.normal_idx_ < 0 ?
-        black_tex :
-        textures[material.normal_idx_];
+    const auto& normal_tex_view =
+        tex_or(material.normal_idx_, black_tex);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -2362,10 +2371,8 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // metallic roughness.
-    auto& metallic_roughness_tex =
-        material.metallic_roughness_idx_ < 0 ?
-        black_tex :
-        textures[material.metallic_roughness_idx_];
+    const auto& metallic_roughness_tex =
+        tex_or(material.metallic_roughness_idx_, black_tex);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -2376,11 +2383,9 @@ static renderer::WriteDescriptorList addDrawableTextures(
         metallic_roughness_tex.view,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-    // emisive.
-    auto& emissive_tex =
-        material.emissive_idx_ < 0 ?
-        black_tex :
-        textures[material.emissive_idx_];
+    // emissive.
+    const auto& emissive_tex =
+        tex_or(material.emissive_idx_, black_tex);
 
 
     renderer::Helper::addOneTexture(
@@ -2393,10 +2398,8 @@ static renderer::WriteDescriptorList addDrawableTextures(
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
     // occlusion.
-    auto& occlusion_tex =
-        material.occlusion_idx_ < 0 ?
-        white_tex :
-        textures[material.occlusion_idx_];
+    const auto& occlusion_tex =
+        tex_or(material.occlusion_idx_, white_tex);
 
     renderer::Helper::addOneTexture(
         descriptor_writes,
@@ -3223,7 +3226,14 @@ static void drawNodes(
             ++drawable_object->m_debug_draw_nodes_visited_;
         }
         const auto& node = drawable_object->nodes_[node_idx];
-        if (node.mesh_idx_ >= 0) {
+        // Per-wrapper sub-object filter (staged by DrawableObject::draw):
+        // when active, only the matching node's mesh is drawn.  Children
+        // are still recursed below so a filtered node anywhere in the
+        // hierarchy is reached.
+        const bool node_filtered =
+            drawable_object->m_only_render_node_ >= 0 &&
+            drawable_object->m_only_render_node_ != node_idx;
+        if (node.mesh_idx_ >= 0 && !node_filtered) {
             if (drawable_object->m_debug_force_red_ ||
                 drawable_object->m_debug_log_draws_) {
                 ++drawable_object->m_debug_draw_nodes_with_mesh_;
@@ -4458,6 +4468,14 @@ void DrawableData::update(
     const float& time,
     bool use_local_matrix_only,
     bool skip_animations) {
+    // ── Shared-data dedup ────────────────────────────────────────────
+    // Many wrappers can share ONE DrawableData (every placed sub-object of
+    // a group does).  Animations, the full node-hierarchy matrix refresh
+    // and joint uploads only need to run ONCE per frame — without this
+    // gate, placing N objects from a big FBX cost N × hierarchy-walk on
+    // the CPU every frame.
+    if (time == m_last_update_time_) return;
+    m_last_update_time_ = time;
     // ── Animation channels ───────────────────────────────────────────
     // Skipped when the caller owns the node transforms (e.g. the
     // PlayerController-driven character).  Without this gate, an
@@ -4762,6 +4780,14 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                     state->data = loadFbxModel(device, file_name);
                 } else if (ext == ".gltf" || ext == ".glb") {
                     state->data = loadGltfModel(device, file_name);
+                } else if (ext == ".rwobj") {
+                    // Native render-ready asset: small per-object load
+                    // (baked .rwgeo + .rwtex), no source-model parse.
+                    state->data = loadRwObjModel(device, file_name);
+                    if (!state->data) {
+                        err_out = "baked .rwobj load failed: " + file_name;
+                        return false;
+                    }
                 } else {
                     err_out = "unsupported mesh extension: " + ext;
                     return false;
@@ -5700,6 +5726,31 @@ void DrawableObject::draw(
         } else {
             object_->m_current_instance_world_ = glm::mat4(1.0f);
         }
+
+        // ── Stage the per-wrapper sub-object filter for this draw call ──
+        // Lazily resolve the ordinal ("k-th node with a mesh", the order the
+        // Outliner / Content Browser use) to a nodes_ index now that the
+        // node table exists, then stage it into the SHARED DrawableData the
+        // same way the instance world is staged — so sibling wrappers that
+        // dedup onto one DrawableData can each render a different node.
+        if (only_render_ordinal_ >= 0 && only_render_node_ < 0 && isReady()) {
+            int k = 0;
+            for (int ni = 0; ni < (int)object_->nodes_.size(); ++ni) {
+                if (object_->nodes_[ni].mesh_idx_ < 0) continue;
+                if (k == only_render_ordinal_) {
+                    only_render_node_ = ni;
+                    break;
+                }
+                ++k;
+            }
+            if (only_render_node_ < 0) {
+                // Out-of-range ordinal — render nothing rather than
+                // silently showing the whole file (no node has this index).
+                only_render_node_ = 0x7fffffff;
+            }
+        }
+        object_->m_only_render_node_ =
+            (only_render_ordinal_ >= 0) ? only_render_node_ : -1;
     }
 
     // Skip while the async load is still in flight. The menu spinner
@@ -5748,21 +5799,48 @@ void DrawableObject::draw(
 
     int32_t root_node =
         object_->default_scene_ >= 0 ? object_->default_scene_ : 0;
-    for (auto node_idx : object_->scenes_[root_node].nodes_) {
-        drawNodes(
-            cmd_buf,
-            object_,
-            drawable_pipeline_layout_,
-            desc_set_list,
-            node_idx,
-            pipeline_list,
-            viewports,
-            scissors,
-            depth_only,
-            last_hash,
-            csm_cascade_idx,
-            mesh_shader_csm_mode,
-            mesh_shader_fallback);
+    if (object_->m_only_render_node_ >= 0) {
+        // Sub-object wrapper: jump STRAIGHT to the filtered node instead of
+        // walking the whole hierarchy.  With N placed objects sharing one
+        // big FBX, the full walk cost N x total_nodes per pass on the CPU
+        // (the CSM + forward spike); the filtered node's own subtree is
+        // tiny, and drawNodes still skips any non-matching child meshes.
+        // An out-of-range filter (unresolvable ordinal sentinel) draws
+        // nothing at all.
+        if (object_->m_only_render_node_ <
+            (int32_t)object_->nodes_.size()) {
+            drawNodes(
+                cmd_buf,
+                object_,
+                drawable_pipeline_layout_,
+                desc_set_list,
+                object_->m_only_render_node_,
+                pipeline_list,
+                viewports,
+                scissors,
+                depth_only,
+                last_hash,
+                csm_cascade_idx,
+                mesh_shader_csm_mode,
+                mesh_shader_fallback);
+        }
+    } else {
+        for (auto node_idx : object_->scenes_[root_node].nodes_) {
+            drawNodes(
+                cmd_buf,
+                object_,
+                drawable_pipeline_layout_,
+                desc_set_list,
+                node_idx,
+                pipeline_list,
+                viewports,
+                scissors,
+                depth_only,
+                last_hash,
+                csm_cascade_idx,
+                mesh_shader_csm_mode,
+                mesh_shader_fallback);
+        }
     }
 
     // Per-second tally of how many indirect-draw submissions actually
@@ -6246,6 +6324,533 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
         indirect_draw_cmd_buffer.data());
 
     drawable_object->num_prims_ = num_prims;
+
+    return drawable_object;
+}
+
+// ─── loadRwObjModel ────────────────────────────────────────────────────────
+// Build a DrawableData straight from a baked render-ready asset:
+//   .rwobj  → names the object + points at its .rwgeo
+//   .rwgeo  → world-space geometry + material SECTIONS (per-face materials
+//             collapsed into contiguous index ranges at bake time)
+//   .rwtex  → decoded RGBA8 base-colour textures (referenced by section)
+// One mesh, one node (geometry is baked in source-world space, transforms
+// already applied), one primitive + material per section.  Mirrors the
+// FBX loader's GPU layout exactly (interleaved VertexStruct VB, shared IB,
+// 4 buffer views, LOD0-only index ranges) so the forward pipeline, shadow
+// pass, selection, collision and cluster upload all work unchanged.
+std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::string& input_filename) {
+
+    // Resolve the reference.  geo_path comes back resolved against the
+    // .rwobj's own folder; empty when the asset was never baked.
+    std::string src_path, ref_name, geo_path;
+    int sub_ordinal = -1;
+    if (!helper::readRwObjRef(input_filename, src_path, sub_ordinal,
+                              ref_name, geo_path) ||
+        geo_path.empty()) {
+        std::cout << "[rwobj] '" << input_filename
+                  << "' has no baked geometry (geo= missing)" << std::endl;
+        return nullptr;
+    }
+
+    helper::ModelPreviewData md;
+    std::vector<std::string> tex_paths;   // parallel to md.textures
+    if (!helper::loadRwGeo(geo_path, md, &tex_paths,
+                           /*decode_textures=*/false) ||
+        md.positions.empty() || md.indices.empty() || md.sections.empty()) {
+        std::cout << "[rwobj] failed to read baked geometry '" << geo_path
+                  << "'" << std::endl;
+        return nullptr;
+    }
+
+    // Dedup triangle-soup vertices (files baked before the bake-side
+    // dedup landed store one vertex per triangle corner — zero GPU
+    // vertex-cache reuse, ~3× the vertex shading of the engine's own
+    // FBX path).  Near no-op for freshly baked, already-indexed files.
+    {
+        const size_t pre_vc = md.positions.size();
+        helper::dedupModelVertices(md);
+        if (md.positions.size() < pre_vc) {
+            std::cout << "[rwobj] vertex dedup: " << pre_vc << " -> "
+                      << md.positions.size() << std::endl;
+        }
+    }
+
+    auto drawable_object = std::make_shared<ego::DrawableData>(device);
+    // Baked UVs are FINAL (the bake already applied the FBX V-flip), so
+    // no shader-side flip — leave m_flip_u_/m_flip_v_ at their false
+    // defaults.  Single static node → local-matrix-only transforms.
+    drawable_object->m_use_local_matrix_only_ = true;
+
+    // ── CPU-side mesh (retained: cluster sidecar, collision, selection) ──
+    const uint32_t vtx_count =
+        static_cast<uint32_t>(md.positions.size());
+    helper::Mesh cpu_mesh;   // ctor allocates the shared vectors
+    cpu_mesh.vertex_data_ptr->resize(vtx_count);
+    for (uint32_t i = 0; i < vtx_count; ++i) {
+        auto& v = cpu_mesh.vertex_data_ptr->at(i);
+        v.position = md.positions[i];
+        v.normal = (i < md.normals.size())
+            ? md.normals[i] : glm::vec3(0.0f, 1.0f, 0.0f);
+        v.uv = (i < md.uvs.size()) ? md.uvs[i] : glm::vec2(0.0f);
+    }
+    const uint32_t index_count =
+        static_cast<uint32_t>(md.indices.size());
+    cpu_mesh.faces_ptr->reserve(index_count / 3);
+    for (uint32_t i = 0; i + 2 < index_count; i += 3) {
+        cpu_mesh.faces_ptr->emplace_back(
+            md.indices[i], md.indices[i + 1], md.indices[i + 2]);
+    }
+
+    // ── Textures — VT-ONLY, with a cross-object cache ──────────────────
+    // Baked objects render through the cluster pipeline, whose materials
+    // sample the Runtime Virtual Texture pool — registerMaterial builds
+    // its BC7 tile cache straight from CPU pixels.  So NO full-res GPU
+    // texture is created here at all: we keep only
+    //   • cpu_pixels  — feeds VT registration + the effective-opaque scan
+    //   • a small R8 alpha companion (cutout textures only) for the
+    //     forward/shadow mask path
+    // The forward pass (brief window before cluster takeover, and during
+    // transform edits) renders these objects with their flat section
+    // colour — the descriptor writer binds black/white fallbacks for
+    // view-less textures.
+    //
+    // Entries are cached by canonical .rwtex path: baked objects of one
+    // group share textures heavily, and per-OBJECT copies were the
+    // "24 GB instead of 2" symptom.  Copies share cpu_pixels / the
+    // companion via shared_ptr; entries live for the app's lifetime
+    // (same policy as the drawable dedup cache).
+    static std::mutex s_rwtex_cache_mutex;
+    static std::unordered_map<std::string, renderer::TextureInfo>
+        s_rwtex_gpu_cache;
+
+    drawable_object->textures_.resize(md.textures.size());
+    for (size_t ti = 0; ti < md.textures.size() && ti < tex_paths.size();
+         ++ti) {
+        auto& dst = drawable_object->textures_[ti];
+
+        std::string key = std::filesystem::path(tex_paths[ti])
+                              .lexically_normal().generic_string();
+        for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+
+        {
+            std::lock_guard<std::mutex> lk(s_rwtex_cache_mutex);
+            auto it = s_rwtex_gpu_cache.find(key);
+            if (it != s_rwtex_gpu_cache.end()) {
+                dst = it->second;   // shares cpu_pixels / companion
+                continue;
+            }
+        }
+
+        helper::RwTexBaked tb;
+        if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
+            tb.w <= 0 || tb.h <= 0) {
+            continue;
+        }
+        dst.size = glm::uvec3(uint32_t(tb.w), uint32_t(tb.h), 1u);
+        dst.linear = false;   // base colour → sRGB semantics
+        dst.source_filename_ = tex_paths[ti];
+        // Bake-time pre-encoded VT tile cache: registration becomes a
+        // memcpy (no runtime CPU BC7 encode at all).
+        dst.vt_bc7_tiles = tb.bc7_tiles;
+
+        // R8 cutout companion — from the baked full-res alpha plane
+        // (format 1) or a scan of the legacy full-res pixels (format
+        // 0).  Built once per UNIQUE texture (cached);
+        // computeEffectiveOpaqueForMaterials adopts it instead of
+        // rebuilding per object.
+        std::vector<uint8_t> alpha_data;
+        int aw = tb.w, ah = tb.h;
+        if (!tb.alpha.empty()) {
+            alpha_data.assign(tb.alpha.begin(), tb.alpha.end());
+        } else if (!tb.bc7_tiles &&
+                   tb.preview_w == tb.w && tb.preview_h == tb.h) {
+            // Legacy file: preview IS the full-res image — scan it.
+            bool has_transparency = false;
+            for (size_t i = 3; i < tb.preview_rgba.size(); i += 4) {
+                if (tb.preview_rgba[i] < 250) {
+                    has_transparency = true;
+                    break;
+                }
+            }
+            if (has_transparency) {
+                alpha_data.resize(size_t(tb.w) * tb.h);
+                for (size_t i = 0, n = alpha_data.size(); i < n; ++i) {
+                    alpha_data[i] = tb.preview_rgba[i * 4 + 3];
+                }
+            }
+        }
+        if (!alpha_data.empty()) {
+            renderer::Helper::create2DTextureImage(
+                device,
+                renderer::Format::R8_UNORM,
+                aw,
+                ah,
+                alpha_data.data(),
+                dst.alpha_only_image,
+                dst.alpha_only_memory,
+                std::source_location::current());
+            dst.alpha_only_view = device->createImageView(
+                dst.alpha_only_image,
+                renderer::ImageViewType::VIEW_2D,
+                renderer::Format::R8_UNORM,
+                SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                std::source_location::current());
+        }
+
+        // CPU pixels: only needed as the VT registration source when
+        // there's NO baked tile cache (legacy format 0 — full-res
+        // pixels).  With a blob present we deliberately skip it: the
+        // preview is low-res and would mismatch dst.size, and keeping
+        // it would only waste RAM.
+        if (!dst.vt_bc7_tiles &&
+            tb.preview_w == tb.w && tb.preview_h == tb.h &&
+            !tb.preview_rgba.empty()) {
+            dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
+                tb.preview_rgba.begin(), tb.preview_rgba.end());
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(s_rwtex_cache_mutex);
+            s_rwtex_gpu_cache.emplace(key, dst);
+        }
+    }
+
+    // ── Materials: one per baked section ──────────────────────────────
+    const size_t num_sections = md.sections.size();
+    drawable_object->materials_.resize(num_sections);
+    for (size_t si = 0; si < num_sections; ++si) {
+        const auto& sec = md.sections[si];
+        auto& dst_material = drawable_object->materials_[si];
+        dst_material.name_ = ref_name + "_s" + std::to_string(si);
+        if (sec.tex_index >= 0 &&
+            static_cast<size_t>(sec.tex_index) <
+                drawable_object->textures_.size()) {
+            dst_material.base_color_idx_ = sec.tex_index;
+        }
+        // Match the FBX path exactly: base.frag has ALPHAMODE_MASK
+        // always active with cutoff 0.1 — opaque textures (alpha 1)
+        // never trigger the discard, cutout foliage/signs do.
+        dst_material.alpha_cutoff_ = 0.1f;
+        dst_material.alpha_mask_   = true;
+        dst_material.alpha_mode_   = ego::AlphaMode::Mask;
+
+        device->createBuffer(
+            sizeof(glsl::PbrMaterialParams),
+            SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+            0,
+            dst_material.uniform_buffer_.buffer,
+            dst_material.uniform_buffer_.memory,
+            std::source_location::current());
+
+        glsl::PbrMaterialParams ubo{};
+        ubo.base_color_factor = sec.base_color;
+        ubo.emissive_factor   = glm::vec3(0.0f);
+        ubo.emissive_color    = glm::vec3(0.0f);
+        ubo.specular_factor   = glm::vec3(1.0f);
+        ubo.specular_color    = glm::vec3(1.0f);
+        ubo.glossiness_factor = 1.0f;
+        ubo.metallic_roughness_specular_factor = 1.0f;
+        ubo.metallic_factor   = sec.metallic;
+        ubo.roughness_factor  = sec.roughness;
+        ubo.alpha_cutoff      = 0.1f;
+        ubo.mip_count         = 11;
+        ubo.normal_scale      = 1.0f;
+        ubo.uv_set_flags      = glm::vec4(0.0f);
+        ubo.exposure          = 1.0f;
+        ubo.occlusion_strength = 1.0f;
+        ubo.tonemap_type      = TONEMAP_DEFAULT;
+        ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+        // NO FEATURE_HAS_BASE_COLOR_MAP: baked textures are VT-only
+        // (cpu_pixels, no full-res GPU image) — the forward pass renders
+        // the flat section colour; the cluster pass samples the VT pool.
+        ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+
+        device->updateBufferMemory(
+            dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
+    }
+
+    // ── GPU buffers + views (same layout as the FBX path) ─────────────
+    drawable_object->meshes_.resize(1);
+    drawable_object->buffers_.resize(2);
+    drawable_object->buffer_views_.resize(4);
+    auto& drawable_mesh = drawable_object->meshes_[0];
+    auto& vertex_buffer = drawable_object->buffers_[0];
+    auto& indice_buffer = drawable_object->buffers_[1];
+
+    renderer::Helper::createBuffer(
+        device,
+        SET_4_FLAG_BITS(
+            BufferUsage,
+            VERTEX_BUFFER_BIT,
+            STORAGE_BUFFER_BIT,
+            SHADER_DEVICE_ADDRESS_BIT,
+            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        vertex_buffer.buffer,
+        vertex_buffer.memory,
+        std::source_location::current(),
+        cpu_mesh.vertex_data_ptr->size() * sizeof(helper::VertexStruct),
+        cpu_mesh.vertex_data_ptr->data());
+
+    const bool use_16bits_index = vtx_count < 65536;
+    uint32_t index_bytes_count = 4;
+    auto index_type = renderer::IndexType::UINT32;
+    if (use_16bits_index) {
+        std::vector<uint16_t> indices_16(index_count);
+        for (uint32_t i = 0; i < index_count; ++i) {
+            indices_16[i] = static_cast<uint16_t>(md.indices[i]);
+        }
+        renderer::Helper::createBuffer(
+            device,
+            SET_4_FLAG_BITS(
+                BufferUsage,
+                INDEX_BUFFER_BIT,
+                STORAGE_BUFFER_BIT,
+                SHADER_DEVICE_ADDRESS_BIT,
+                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            indice_buffer.buffer,
+            indice_buffer.memory,
+            std::source_location::current(),
+            indices_16.size() * 2,
+            indices_16.data());
+        index_bytes_count = 2;
+        index_type = renderer::IndexType::UINT16;
+    } else {
+        renderer::Helper::createBuffer(
+            device,
+            SET_4_FLAG_BITS(
+                BufferUsage,
+                INDEX_BUFFER_BIT,
+                STORAGE_BUFFER_BIT,
+                SHADER_DEVICE_ADDRESS_BIT,
+                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            indice_buffer.buffer,
+            indice_buffer.memory,
+            std::source_location::current(),
+            md.indices.size() * 4,
+            md.indices.data());
+    }
+
+    const int pos_view_idx = 0, normal_view_idx = 1,
+              uv_view_idx = 2, indice_view_idx = 3;
+    drawable_object->buffer_views_[pos_view_idx].buffer_idx = 0;
+    drawable_object->buffer_views_[pos_view_idx].offset = 0;
+    drawable_object->buffer_views_[pos_view_idx].range =
+        cpu_mesh.vertex_data_ptr->size() * sizeof(helper::VertexStruct);
+    drawable_object->buffer_views_[pos_view_idx].stride =
+        sizeof(helper::VertexStruct);
+
+    drawable_object->buffer_views_[normal_view_idx] =
+        drawable_object->buffer_views_[pos_view_idx];
+    drawable_object->buffer_views_[normal_view_idx].offset = sizeof(glm::vec3);
+
+    drawable_object->buffer_views_[uv_view_idx] =
+        drawable_object->buffer_views_[pos_view_idx];
+    drawable_object->buffer_views_[uv_view_idx].offset = 2 * sizeof(glm::vec3);
+
+    drawable_object->buffer_views_[indice_view_idx].buffer_idx = 1;
+    drawable_object->buffer_views_[indice_view_idx].offset = 0;
+    drawable_object->buffer_views_[indice_view_idx].range =
+        index_count * index_bytes_count;
+    drawable_object->buffer_views_[indice_view_idx].stride = index_bytes_count;
+
+    // ── Mesh bbox + CPU position table (collision / selection) ────────
+    for (const auto& p : md.positions) {
+        drawable_mesh.bbox_min_ = glm::min(drawable_mesh.bbox_min_, p);
+        drawable_mesh.bbox_max_ = glm::max(drawable_mesh.bbox_max_, p);
+    }
+    {
+        auto positions = std::make_shared<std::vector<glm::vec3>>(
+            md.positions.begin(), md.positions.end());
+        drawable_mesh.vertex_position_ = std::move(positions);
+    }
+
+    // ── Primitives: one per section ────────────────────────────────────
+    drawable_mesh.primitives_.resize(num_sections);
+    for (size_t si = 0; si < num_sections; ++si) {
+        const auto& sec = md.sections[si];
+        auto& primitive_info = drawable_mesh.primitives_[si];
+        primitive_info.tag_.restart_enable = false;
+        primitive_info.material_idx_ = static_cast<int32_t>(si);
+        primitive_info.tag_.topology = static_cast<uint32_t>(
+            renderer::PrimitiveTopology::TRIANGLE_LIST);
+        primitive_info.tag_.has_texcoord_0 = true;
+        primitive_info.tag_.has_normal = true;
+        primitive_info.tag_.double_sided = false;
+
+        uint32_t dst_binding = 0;
+        engine::renderer::VertexInputBindingDescription binding = {};
+        engine::renderer::VertexInputAttributeDescription attribute = {};
+
+        // position
+        binding.binding = dst_binding;
+        binding.stride = sizeof(helper::VertexStruct);
+        binding.input_rate = renderer::VertexInputRate::VERTEX;
+        primitive_info.binding_descs_.push_back(binding);
+        attribute.buffer_view = pos_view_idx;
+        attribute.binding = dst_binding;
+        attribute.offset = 0;
+        attribute.buffer_offset = 0;
+        attribute.location = VINPUT_POSITION;
+        attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
+        primitive_info.attribute_descs_.push_back(attribute);
+        dst_binding++;
+
+        // normal
+        binding.binding = dst_binding;
+        primitive_info.binding_descs_.push_back(binding);
+        attribute.buffer_view = normal_view_idx;
+        attribute.binding = dst_binding;
+        attribute.offset = 0;
+        attribute.buffer_offset = sizeof(glm::vec3);
+        attribute.location = VINPUT_NORMAL;
+        attribute.format = engine::renderer::Format::R32G32B32_SFLOAT;
+        primitive_info.attribute_descs_.push_back(attribute);
+        dst_binding++;
+
+        // uv
+        binding.binding = dst_binding;
+        primitive_info.binding_descs_.push_back(binding);
+        attribute.buffer_view = uv_view_idx;
+        attribute.binding = dst_binding;
+        attribute.offset = 0;
+        attribute.buffer_offset = 2 * sizeof(glm::vec3);
+        attribute.location = VINPUT_TEXCOORD0;
+        attribute.format = engine::renderer::Format::R32G32_SFLOAT;
+        primitive_info.attribute_descs_.push_back(attribute);
+        dst_binding++;
+
+        // indices — no baked LODs: every LOD slot points at the same
+        // full-resolution section range.
+        primitive_info.index_desc_.resize(helper::c_num_lods + 1);
+        for (uint32_t i_lod = 0; i_lod < helper::c_num_lods + 1; i_lod++) {
+            primitive_info.index_desc_[i_lod].buffer_view = indice_view_idx;
+            primitive_info.index_desc_[i_lod].offset =
+                sec.first_index * index_bytes_count;
+            primitive_info.index_desc_[i_lod].index_type = index_type;
+            primitive_info.index_desc_[i_lod].index_count = sec.index_count;
+        }
+
+        // Per-primitive bbox from the section's own vertices.
+        glm::vec3 pmin(std::numeric_limits<float>::max());
+        glm::vec3 pmax(std::numeric_limits<float>::lowest());
+        const uint32_t sec_end =
+            std::min(sec.first_index + sec.index_count, index_count);
+        for (uint32_t ii = sec.first_index; ii < sec_end; ++ii) {
+            const uint32_t vi = md.indices[ii];
+            if (vi < vtx_count) {
+                pmin = glm::min(pmin, md.positions[vi]);
+                pmax = glm::max(pmax, md.positions[vi]);
+            }
+        }
+        primitive_info.bbox_min_ = pmin;
+        primitive_info.bbox_max_ = pmax;
+
+        primitive_info.generateHash();
+    }
+
+    // ── Cluster sidecar (Nanite-lite GPU culling path) ─────────────────
+    helper::buildClusterMesh(cpu_mesh, drawable_mesh.cluster_mesh_);
+    {
+        // cluster → primitive map: sections are contiguous FACE ranges,
+        // so the cluster's first face index resolves its section.
+        std::vector<uint32_t> sec_face_start(num_sections + 1, 0);
+        for (size_t si = 0; si < num_sections; ++si) {
+            sec_face_start[si] = md.sections[si].first_index / 3;
+        }
+        sec_face_start[num_sections] = index_count / 3;
+        drawable_mesh.cluster_prim_map_.clear();
+        for (const auto& cluster : drawable_mesh.cluster_mesh_.clusters) {
+            uint32_t prim_idx = 0;
+            if (!cluster.face_indices.empty()) {
+                const uint32_t first_face = cluster.face_indices[0];
+                for (uint32_t p = 0; p + 1 < sec_face_start.size(); ++p) {
+                    if (first_face >= sec_face_start[p] &&
+                        first_face < sec_face_start[p + 1]) {
+                        prim_idx = p;
+                        break;
+                    }
+                }
+            }
+            drawable_mesh.cluster_prim_map_.push_back(prim_idx);
+        }
+    }
+
+    // ── Node + scene (geometry is baked world-space → identity node) ──
+    drawable_object->nodes_.resize(1);
+    auto& node = drawable_object->nodes_[0];
+    node.name_ = ref_name.empty() ? std::string("rwobj") : ref_name;
+    node.mesh_idx_ = 0;
+    node.matrix_ = glm::mat4(1.0f);
+    drawable_object->scenes_.resize(1);
+    drawable_object->scenes_[0].nodes_.resize(1);
+    drawable_object->scenes_[0].nodes_[0] = 0;
+    drawable_object->default_scene_ = 0;
+
+    for (auto& scene : drawable_object->scenes_) {
+        calculateBbox(drawable_object, scene.nodes_[0], glm::mat4(1.0f),
+                      scene.bbox_min_, scene.bbox_max_);
+    }
+
+    drawable_object->update(
+        device, 0, 0.0f, drawable_object->m_use_local_matrix_only_);
+
+    setupRaytracing(drawable_object);
+
+    // ── Indirect draw buffer (same as the FBX path) ───────────────────
+    uint32_t num_prims = 0;
+    for (auto& mesh : drawable_object->meshes_) {
+        for (auto& prim : mesh.primitives_) {
+            prim.indirect_draw_cmd_ofs_ =
+                num_prims * sizeof(renderer::DrawIndexedIndirectCommand) +
+                INDIRECT_DRAW_BUF_OFS;
+            num_prims++;
+        }
+    }
+    std::vector<uint32_t> indirect_draw_cmd_buffer(
+        sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) *
+            num_prims + 1);
+    auto indirect_draw_buf =
+        reinterpret_cast<renderer::DrawIndexedIndirectCommand*>(
+            indirect_draw_cmd_buffer.data() + 1);
+    indirect_draw_cmd_buffer[0] = 0;
+    uint32_t prim_idx = 0;
+    for (const auto& mesh : drawable_object->meshes_) {
+        for (const auto& prim : mesh.primitives_) {
+            indirect_draw_buf[prim_idx].first_index = 0;
+            indirect_draw_buf[prim_idx].first_instance = 0;
+            indirect_draw_buf[prim_idx].index_count =
+                static_cast<uint32_t>(prim.index_desc_[0].index_count);
+            indirect_draw_buf[prim_idx].instance_count = 0;
+            indirect_draw_buf[prim_idx].vertex_offset = 0;
+            prim_idx++;
+        }
+    }
+    renderer::Helper::createBuffer(
+        device,
+        SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT, STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        0,
+        drawable_object->indirect_draw_cmd_.buffer,
+        drawable_object->indirect_draw_cmd_.memory,
+        std::source_location::current(),
+        indirect_draw_cmd_buffer.size() * sizeof(uint32_t),
+        indirect_draw_cmd_buffer.data());
+    drawable_object->num_prims_ = num_prims;
+
+    std::cout << "[rwobj] loaded '" << ref_name << "' ("
+              << vtx_count << " verts, " << index_count / 3 << " tris, "
+              << num_sections << " section(s), "
+              << md.textures.size() << " texture(s))" << std::endl;
 
     return drawable_object;
 }

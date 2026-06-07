@@ -277,6 +277,18 @@ struct DrawableData {
     // drawNodes() pushes debug_force_red=2 for matching nodes and base.frag
     // tints them amber — a real highlight layer on the original mesh.
     int32_t m_highlight_node_ = -1;
+    // "Only render this node" filter — STAGED PER DRAW CALL by
+    // DrawableObject::draw() from the wrapper's sub-object selection (same
+    // shared-data staging pattern as m_current_instance_world_, so several
+    // wrappers can share one DrawableData and each render a different
+    // node).  -1 = draw every node (default).  drawNodes() skips the mesh
+    // draw for any other node but still recurses children, so a filtered
+    // node deep in the hierarchy is reached regardless of its parents.
+    int32_t m_only_render_node_ = -1;
+    // Same-frame dedup stamp for DrawableData::update() — many wrappers can
+    // share one DrawableData (placed sub-objects); the hierarchy/animation/
+    // joint refresh only needs to run once per frame.
+    float m_last_update_time_ = -1.0e30f;
     // "Skip skinning" debug override — when set, drawNodes pushes
     // model_params.debug_skip_skinning=1 for every primitive draw on
     // this drawable.  base.vert then renders the mesh in its glTF
@@ -450,6 +462,18 @@ class DrawableObject {
     // scene-view lists.  Defaults to true so existing drawables behave
     // exactly as before.
     bool                        visible_ = true;
+
+    // ── Per-wrapper "render only ONE sub-object" filter ────────────────
+    // Set via setOnlyRenderSubObject(ordinal) where `ordinal` is the k-th
+    // renderable (mesh) node — the same enumeration the Outliner children
+    // and the Content Browser .rwobj files use.  The ordinal is resolved
+    // to an actual nodes_ index lazily on the first draw after the async
+    // load completes (the node table doesn't exist before that), then
+    // staged into DrawableData::m_only_render_node_ each draw call so
+    // dedup-shared DrawableData instances can each show different nodes.
+    // -1 = no filter (whole drawable, default).
+    int32_t                     only_render_ordinal_ = -1;
+    int32_t                     only_render_node_    = -1;  // resolved index
 
     // static members.
     static uint32_t max_alloc_game_objects_in_buffer;
@@ -631,6 +655,17 @@ public:
     // -> existing behaviour.
     void setVisible(bool v) { visible_ = v; }
     bool isVisible() const  { return visible_; }
+
+    // Restrict rendering to the `ordinal`-th renderable sub-object (the
+    // k-th node with a mesh — the same order the Outliner children and the
+    // Content Browser's exploded .rwobj assets use).  Pass -1 to clear.
+    // Safe to call on a not-yet-loaded shell: the ordinal is resolved to a
+    // node index lazily on the first draw after the load completes.
+    void setOnlyRenderSubObject(int32_t ordinal) {
+        only_render_ordinal_ = ordinal;
+        only_render_node_    = -1;   // re-resolve on next draw
+    }
+    int32_t onlyRenderSubObject() const { return only_render_ordinal_; }
 
     // Opt the drawable into "external code fully owns the rig" mode.
     // PlayerController-driven drawables (and any future similar
@@ -897,6 +932,17 @@ public:
         const std::string& input_filename);
 
     static std::shared_ptr<DrawableData> loadFbxModel(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::string& input_filename);
+
+    // Native render-ready asset load: a .rwobj object reference whose
+    // baked geometry (.rwgeo v3, sections + .rwtex textures) was written
+    // at import time.  Builds a single-mesh DrawableData directly from
+    // the baked data — no source-model parse, so each placed object
+    // streams independently (per-object loading wheel, individual
+    // pop-in) instead of riding one giant shared FBX load.  Returns
+    // nullptr when the reference has no baked geometry.
+    static std::shared_ptr<DrawableData> loadRwObjModel(
         const std::shared_ptr<renderer::Device>& device,
         const std::string& input_filename);
 };

@@ -108,13 +108,41 @@ private:
     // ── VT-id dedup caches ────────────────────────────────────────
     // The same source image can be referenced by many materials.  We
     // register it with the VT only ONCE; subsequent encounters reuse
-    // the cached VirtualTextureId.  Keyed by Image raw pointer (the
-    // source of truth for "same texture") rather than ImageView so
-    // multiple views of the same image share the registration.
-    std::unordered_map<renderer::Image*, uint32_t> vt_albedo_id_cache_;
-    std::unordered_map<renderer::Image*, uint32_t> vt_normal_id_cache_;
+    // the cached VirtualTextureId.  Keyed by the Image raw pointer
+    // (the source of truth for "same texture"); VT-only baked
+    // textures (.rwtex → cpu_pixels, no GPU image) key by their
+    // shared cpu_pixels vector pointer instead — both are stable
+    // identities shared across TextureInfo copies.
+    std::unordered_map<const void*, uint32_t> vt_albedo_id_cache_;
+    std::unordered_map<const void*, uint32_t> vt_normal_id_cache_;
 
     uint32_t uploaded_mesh_count_ = 0;
+
+    // ── Editor incremental uploads (base scene + placed-object tail) ──
+    // The first markBaseUploads() snapshot records the staging tail that
+    // belongs to the immutable "base" level (the New Game bistro uploads,
+    // or zero counts for the editor's empty Create Scene flow).
+    // resetToBaseUploads() truncates staging back to that snapshot so the
+    // application can re-stage the placed-object tail and run
+    // finalizeUploads() again.  To make the re-finalize possible the CPU
+    // staging vectors are RETAINED after finalize (editor-grade memory
+    // cost).  Texture views / slot maps / VT caches are append-only and
+    // never truncated — a removed object may strand a texture slot, which
+    // is acceptable until a full scene reload.
+    bool   base_marked_         = false;
+    size_t base_cluster_count_  = 0;
+    size_t base_material_count_ = 0;
+    size_t base_vertex_count_   = 0;
+    size_t base_index_count_    = 0;
+    size_t base_tex_count_      = 0;
+    size_t base_normal_tex_count_ = 0;
+    uint32_t base_mesh_count_   = 0;
+
+    // Re-point the bindless graphics descriptor set (bindings 0..3) at
+    // the freshly created merged buffers + texture staging after a
+    // RE-finalize.  The VT bindings (4..10) reference VirtualTexture-
+    // Manager-owned resources that survive the refinalize untouched.
+    void rewriteBindlessDescriptorsAfterRefinalize();
 
     // ── Shared sampler + dummy 1×1 white texture (fallback for empty slots) ──
     std::shared_ptr<renderer::Sampler>    default_sampler_;
@@ -451,9 +479,58 @@ public:
         const std::vector<uint32_t>& cluster_prim_map,
         const glm::mat4& model_transform);
 
+    // ── VT cache warm-up (editor placed-object flow) ──────────────────
+    // registerMaterial BC7-encodes every tile of every mip of a texture
+    // on the CPU — doing that for dozens of textures inside ONE
+    // finalize froze the editor for seconds after placing a big group.
+    // This walks the drawable's materials and registers at most
+    // `max_new` not-yet-cached albedo(+normal) textures with the VT
+    // manager, so the application can spread the encoding cost across
+    // frames BEFORE triggering the rebuild; the rebuild's own
+    // registerMaterial lookups then hit the warm cache.  Returns the
+    // number of NEW registrations performed (0 = this drawable's
+    // textures are fully cached).
+    int preRegisterVtMaterials(
+        const game_object::DrawableData& drawable_data,
+        int max_new);
+    // How many of this drawable's albedo textures still need VT
+    // registration (dedup'd within the call) — drives the editor's
+    // "Preparing textures N/M" progress bar during warm-up.
+    int countPendingVtMaterials(
+        const game_object::DrawableData& drawable_data) const;
+
     // Create merged GPU SSBOs + descriptor set from all staged data.
-    // Call once after all uploadMeshClusters() calls are done.
+    // Call after all uploadMeshClusters() calls are done.  MAY be called
+    // again after further uploads (editor placed-object flow): a re-run
+    // drains the GPU (waitIdle), replaces every merged buffer, and
+    // rewrites the cull / mesh-data / bindless descriptors in place —
+    // pipelines and descriptor-set handles are reused.
     void finalizeUploads();
+
+    // ── Editor incremental upload API ─────────────────────────────────
+    // Snapshot the CURRENT staging tail as the immutable base scene.
+    // The application calls this after staging the level meshes (New
+    // Game flow) or lazily before the first placed-object upload in the
+    // editor (empty base).  Re-callable: the LATEST call wins.
+    void markBaseUploads();
+    bool baseUploadsMarked() const { return base_marked_; }
+    // Truncate staging back to the base snapshot, dropping every
+    // placed-object upload.  Call before re-staging the placed set,
+    // then uploadMeshClusters() per placed object + finalizeUploads().
+    void resetToBaseUploads();
+    // True once initBindlessPipeline has built the graphics pipelines —
+    // the application's late (editor) finalize uses this to decide
+    // whether the pipeline-init block still needs to run.
+    bool bindlessReady() const { return bindless_pipeline_ != nullptr; }
+    // Instantly hide / restore one uploaded mesh's clusters by poisoning
+    // their bounding spheres in the HOST_VISIBLE cull-info buffer (radius
+    // -1e30 fails every frustum test).  Used while the editor drags a
+    // placed object: its stale cluster instance vanishes the same frame
+    // and the live forward path takes over until the debounced re-
+    // finalize bakes the new transform.  Restore copies the staged
+    // values back.  The unsynchronised write can race the in-flight cull
+    // dispatch — worst case one cluster flickers for a single frame.
+    void setMeshClustersHidden(uint32_t global_mesh_idx, bool hidden);
 
     // Patch the per-material flags SSBO with MeshCategory bits taken
     // from the supplied LLM-backed classifier.  Walks

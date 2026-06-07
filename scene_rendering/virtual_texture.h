@@ -298,6 +298,12 @@ public:
     //   * normal_image / mr_ao_image / emissive_image: GPU images
     //     (kept alive for streaming-time blits).
     //   * width / height: source albedo dimensions in texels.
+    //   * albedo_bc7_tiles: OPTIONAL pre-encoded per-tile BC7 cache
+    //     blob, produced at import-bake time by
+    //     encodeAlbedoTileCacheCpu().  When present (and its size
+    //     matches albedoTileCacheBytes(width, height)), the runtime
+    //     CPU BC7 encode is skipped entirely — registration becomes a
+    //     memcpy.  albedo_pixels / albedo_image may then both be null.
     VirtualTextureId registerMaterial(
         const uint8_t* albedo_pixels,
         const std::shared_ptr<renderer::Image>& albedo_image,
@@ -305,7 +311,23 @@ public:
         const std::shared_ptr<renderer::Image>& mr_ao_image,
         const std::shared_ptr<renderer::Image>& emissive_image,
         uint32_t width,
-        uint32_t height);
+        uint32_t height,
+        const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles =
+            nullptr);
+
+    // ── Bake-time CPU encode ──────────────────────────────────────────
+    // Build the per-tile BC7 albedo cache blob for a width×height RGBA8
+    // image — byte-identical to what encodeAndCacheVt produces at
+    // runtime, so a baked blob can be handed straight to
+    // registerMaterial(..., albedo_bc7_tiles).  Static + CPU-only: the
+    // import bake calls it without a VT instance or GPU.  Multi-threaded
+    // internally.
+    static bool encodeAlbedoTileCacheCpu(
+        const uint8_t* rgba, uint32_t width, uint32_t height,
+        std::vector<uint8_t>& out_blob);
+    // Expected blob size for a width×height source (0 for degenerate
+    // dims) — bake writes it, loaders validate against it.
+    static uint64_t albedoTileCacheBytes(uint32_t width, uint32_t height);
 
     // Bind handles for material descriptor sets.
     std::shared_ptr<renderer::ImageView> getPoolImageView(VtLayer layer) const;
@@ -506,7 +528,9 @@ private:
         const std::shared_ptr<renderer::Image>& emissive_image,
         uint32_t width, uint32_t height,
         uint32_t pages_x, uint32_t pages_y, uint32_t mip_count,
-        uint32_t page_table_offset);
+        uint32_t page_table_offset,
+        const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles =
+            nullptr);
 
     // Decompress an arbitrary-format GPU image into a CPU RGBA8
     // buffer.  Uses vkCmdBlitImage to decompress BC formats into a

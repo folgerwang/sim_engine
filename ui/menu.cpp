@@ -24,6 +24,9 @@ extern "C" {
 #define STBI_rgb_alpha 4
 #endif
 
+#include <glm/gtc/matrix_transform.hpp>  // selection helpers compose the
+#include <glm/gtc/quaternion.hpp>        // wrapper instance TRS
+
 #include "imgui.h"
 #include "imgui_internal.h"   // DockBuilder API for the editor default layout
 #include "imgui_impl_glfw.h"
@@ -36,6 +39,8 @@ extern "C" {
 #include "renderer/vulkan/vk_device.h"   // VulkanDevice/VulkanPhysicalDevice for VRAM query
 #include "helper/engine_helper.h"
 #include "helper/vram_cuda.h"             // device-wide VRAM (counts ML/CUDA + other processes)
+#include "helper/model_inspect.h"         // sub-object names for content assets
+#include "helper/mesh_preview.h"          // GPU offscreen Debug Display preview
 
 #include "menu.h"
 #include "plugins/plugin_manager.h"
@@ -840,6 +845,10 @@ void Menu::init(
     sel_mask_dead_.clear();
     sel_mask_obj_  = nullptr;
     sel_mask_node_ = -3;
+
+    // Debug Display GPU preview target: same descriptor-pool hazard as the
+    // selection mask — re-register its view with the fresh pool.
+    engine::helper::MeshPreview::reregisterImGui();
 }
 
 bool Menu::draw(
@@ -1159,6 +1168,63 @@ bool Menu::draw(
         hfg->PopClipRect();
     }
 
+    // ── Scene-grid origin axis labels (X / Y / Z at the gizmo tips) ──────
+    // Companion to SceneGrid's solid origin arrows: project each arrow-tip
+    // world position through the camera (player_view_proj_, fed every frame
+    // by setPlayerDebugInfo) into the viewport and paint a colour-matched
+    // glyph there.  Same NDC→pixel mapping as the selection bbox above; the
+    // Vulkan projection already flips Y, so [-1,1]→[0,1] remap is enough.
+    if (show_scene_grid_) {
+        ImVec2 avp_pos, avp_size, avp_c;
+        getViewportScreenRect(avp_pos, avp_size, avp_c);
+        if (avp_size.x > 1.0f && avp_size.y > 1.0f) {
+            ImDrawList* afg = ImGui::GetForegroundDrawList();
+            afg->PushClipRect(
+                avp_pos,
+                ImVec2(avp_pos.x + avp_size.x, avp_pos.y + avp_size.y),
+                true);
+
+            // Slightly past the 3.1 m arrow tips (shaft 2.6 + head 0.5 in
+            // scene_grid.cpp) so the glyph floats clear of the arrowhead.
+            struct AxisLabel {
+                glm::vec3   world;
+                ImU32       color;
+                const char* text;
+            };
+            const AxisLabel axis_labels[3] = {
+                { glm::vec3(3.45f, 0.0f, 0.0f), IM_COL32(235,  70,  70, 255), "X" },
+                { glm::vec3(0.0f, 3.45f, 0.0f), IM_COL32( 75, 220,  90, 255), "Y" },
+                { glm::vec3(0.0f, 0.0f, 3.45f), IM_COL32( 80, 130, 245, 255), "Z" },
+            };
+            for (const auto& L : axis_labels) {
+                glm::vec4 clip = player_view_proj_ * glm::vec4(L.world, 1.0f);
+                if (clip.w <= 1e-3f) continue;       // behind the camera
+                glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                if (ndc.x < -1.05f || ndc.x > 1.05f ||
+                    ndc.y < -1.05f || ndc.y > 1.05f) continue;
+                const ImVec2 px(
+                    (ndc.x * 0.5f + 0.5f) * avp_size.x + avp_pos.x,
+                    (ndc.y * 0.5f + 0.5f) * avp_size.y + avp_pos.y);
+
+                // Centre the glyph on the projected point with a soft dark
+                // backing pill so it reads over any background.  Drawn at
+                // 2x the default font size so the labels read clearly.
+                ImFont*     fnt   = ImGui::GetFont();
+                const float fsize = ImGui::GetFontSize() * 2.0f;
+                ImVec2 ts = ImGui::CalcTextSize(L.text);
+                ts.x *= 2.0f;
+                ts.y *= 2.0f;
+                const ImVec2 tp(px.x - ts.x * 0.5f, px.y - ts.y * 0.5f);
+                afg->AddRectFilled(
+                    ImVec2(tp.x - 4.0f, tp.y - 2.0f),
+                    ImVec2(tp.x + ts.x + 4.0f, tp.y + ts.y + 2.0f),
+                    IM_COL32(0, 0, 0, 140), 4.0f);
+                afg->AddText(fnt, fsize, tp, L.color, L.text);
+            }
+            afg->PopClipRect();
+        }
+    }
+
     // ── Classifier progress bar (top-pinned overlay) ─────────────────
     // Full-width ImGui window pinned to the very top of the viewport
     // so it's the first thing the user sees during a long classify.
@@ -1176,7 +1242,15 @@ bool Menu::draw(
     // Hide BOTH progress bars once the collision ("simplified mesh") build
     // has finished — the user wants a clean screen at that point.  The
     // collision bar below is gated to Building-only for the same reason.
-    if ((classifier_status_ == ClassifierStatus::Pending ||
+    //
+    // DISABLED for now: the background mesh-category (LLM classifier)
+    // progress bar is turned off until the baking feature lands, at which
+    // point it will return as part of the bake UI.  Flip this back to true
+    // (or remove the flag) to restore the overlay — everything below still
+    // receives live status via setClassifierStatus().
+    constexpr bool kShowMeshCategoryProgressBar = false;
+    if (kShowMeshCategoryProgressBar &&
+        (classifier_status_ == ClassifierStatus::Pending ||
          classifier_status_ == ClassifierStatus::Ready   ||
          classifier_status_ == ClassifierStatus::Failed) &&
         collision_build_status_ != CollisionBuildStatus::Done) {
@@ -1640,9 +1714,21 @@ bool Menu::draw(
     // menu. See drawRuneLoader() above for the ring geometry; the
     // aesthetic mirrors the loader in
     // realworld/design/fantasy_menu.html.
-    if (mesh_load_task_manager_) {
-        auto in_flight = mesh_load_task_manager_->inFlightFilenames();
-        if (!in_flight.empty()) {
+    if (mesh_load_task_manager_ || !scene_place_pending_.empty() ||
+        vt_warm_active_) {
+        std::vector<std::string> in_flight;
+        if (mesh_load_task_manager_) {
+            in_flight = mesh_load_task_manager_->inFlightFilenames();
+        }
+        // Scene placements still streaming in (drag & drop / Add to
+        // Scene) spin the same rune ring, listed alongside the raw mesh
+        // loads — so dropping an object always gives immediate feedback,
+        // even when its source dedups onto an already-in-flight load.
+        const size_t raw_loads = in_flight.size();
+        for (const auto& n : scene_place_pending_) {
+            in_flight.push_back(n);
+        }
+        if (!in_flight.empty() || vt_warm_active_) {
             // Cap the displayed list so a large batch load doesn't
             // blow past the screen edge; the count shown beside the
             // loader still reflects the full set.
@@ -1698,11 +1784,26 @@ bool Menu::draw(
             // Title + first filename sit to the right of the rings.
             ImGui::SameLine();
             ImGui::BeginGroup();
-            ImGui::TextColored(
-                ImVec4(0.95f, 0.86f, 0.60f, 1.0f),
-                "Loading %zu mesh%s",
-                in_flight.size(),
-                in_flight.size() == 1 ? "" : "es");
+            if (in_flight.empty()) {
+                // Loads done — only the VT texture warm-up remains.
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.86f, 0.60f, 1.0f),
+                    "Preparing textures");
+            } else if (raw_loads == 0) {
+                // Pure placement wait (source already loading elsewhere
+                // or shared) — word it as what the user just did.
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.86f, 0.60f, 1.0f),
+                    "Placing %zu object%s",
+                    in_flight.size(),
+                    in_flight.size() == 1 ? "" : "s");
+            } else {
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.86f, 0.60f, 1.0f),
+                    "Loading %zu mesh%s",
+                    in_flight.size(),
+                    in_flight.size() == 1 ? "" : "es");
+            }
             // Inline the first stem so a single-mesh load reads as one
             // self-contained line ("Loading 1 mesh\nbistro.fbx").
             if (!in_flight.empty()) {
@@ -1732,6 +1833,18 @@ bool Menu::draw(
                     ImGui::BulletText("... (+%zu more)",
                         in_flight.size() - kMaxListed);
                 }
+            }
+
+            // ── VT warm-up progress bar ───────────────────────────────
+            // Placed objects' textures being BC7-encoded into the
+            // Virtual Texture pool (one per frame) — objects render
+            // flat until this finishes and the cluster bake snaps in.
+            if (vt_warm_active_) {
+                ImGui::Separator();
+                ImGui::TextColored(
+                    ImVec4(0.70f, 0.65f, 0.50f, 1.0f),
+                    "%s", vt_warm_label_.c_str());
+                ImGui::ProgressBar(vt_warm_frac_, ImVec2(280.0f, 0.0f));
             }
             ImGui::End();
         }
@@ -1779,6 +1892,16 @@ bool Menu::draw(
         if (ImGui::BeginMenu("Scene"))
         {
             ImGui::InputText("Name", scene_name_buf_, sizeof(scene_name_buf_));
+            ImGui::Separator();
+            // Create Scene mode: empties the current scene and shows a flat
+            // reference grid (200 x 200 m, 1 m spacing, Y up) to build on.
+            if (ImGui::MenuItem("Create Scene")) {
+                scene_create_request_ = true;
+                show_scene_grid_      = true;
+                scene_node_active_    = true;   // surface the scene node in
+                                                // the Outliner immediately
+            }
+            ImGui::MenuItem("Show Grid", NULL, &show_scene_grid_);
             ImGui::Separator();
             if (ImGui::MenuItem("Import Model...")) { scene_import_request_ = true; }
             if (ImGui::MenuItem("Save Scene"))      { scene_save_request_   = true; }
@@ -2463,9 +2586,15 @@ bool Menu::draw(
         }
     }
 
-    bool in_focus =
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) ||
-        ImGui::IsWindowFocused(ImGuiHoveredFlags_AnyWindow);
+    // Camera pause: gate on what ImGui actually WANTS, not on window focus.
+    // Focus persists after ANY panel interaction (placing an object focuses
+    // the browser/Outliner) and right-clicking the viewport never clears
+    // it — which froze the camera until a stray left-click on empty space.
+    // WantCaptureMouse is false whenever the cursor is over the
+    // pass-through viewport; WantTextInput keeps WASD from fighting an
+    // active text field.
+    ImGuiIO& focus_io = ImGui::GetIO();
+    bool in_focus = focus_io.WantCaptureMouse || focus_io.WantTextInput;
 
     // Pin all menu windows to the main viewport so they stay inside the
     // main application window (only the AutoRig plugin overrides this).
@@ -3658,8 +3787,10 @@ void Menu::drawEditorDockSpace() {
             center, ImGuiDir_Right, 0.24f, nullptr, &center);
 
         ImGui::DockBuilderDockWindow("Content Browser", bottom);
-        ImGui::DockBuilderDockWindow("Output Log", bottom);   // tab w/ Content Browser
+        ImGui::DockBuilderDockWindow("File Browser", bottom);  // tab w/ Content Browser
+        ImGui::DockBuilderDockWindow("Output Log", bottom);    // tab w/ Content Browser
         ImGui::DockBuilderDockWindow("Outliner", right);
+        ImGui::DockBuilderDockWindow("Debug Display", right);  // tab w/ Outliner
         ImGui::DockBuilderFinish(dock_id);
     }
 
@@ -3676,13 +3807,58 @@ void Menu::drawEditorDockSpace() {
     ImGui::End();
 
     drawOutlinerPanel();
+    drawDebugDisplayPanel();
     drawContentBrowserPanel();
+    drawFileBrowserPanel();
     drawOutputPanel();
+    // Shared FLUX.2 popup — drawn ONCE per frame (both browsers can open it).
+    drawFluxGeneratePopup();
+
+    // ── Drag & drop placement into the 3D viewport ──────────────────────
+    // The viewport is the pass-through central dock node (no ImGui window),
+    // so a regular drop target can't live there.  And ImGui clears the
+    // payload in NewFrame ON the release frame — before this code runs —
+    // so we remember the path while the drag is in flight and detect the
+    // drop as "payload vanished + mouse released this frame".
+    if (const ImGuiPayload* pl = ImGui::GetDragDropPayload();
+        pl && pl->IsDataType("RW_CONTENT_ASSET") && pl->Data) {
+        // Drag in flight: remember the asset + show the drop hint.
+        drag_asset_path_.assign((const char*)pl->Data);
+        ImVec2 vp_pos, vp_size, vp_c;
+        getViewportScreenRect(vp_pos, vp_size, vp_c);
+        const ImVec2 m = ImGui::GetIO().MousePos;
+        const bool in_viewport =
+            m.x >= vp_pos.x && m.x < vp_pos.x + vp_size.x &&
+            m.y >= vp_pos.y && m.y < vp_pos.y + vp_size.y;
+        const bool over_panel =
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
+        if (in_viewport && !over_panel) {
+            ImGui::GetForegroundDrawList()->AddText(
+                ImVec2(m.x + 14.0f, m.y + 10.0f),
+                IM_COL32(120, 255, 140, 255), "+ place in scene");
+        }
+    } else if (!drag_asset_path_.empty()) {
+        // Drag ended this frame (release or cancel).
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            ImVec2 vp_pos, vp_size, vp_c;
+            getViewportScreenRect(vp_pos, vp_size, vp_c);
+            const ImVec2 m = ImGui::GetIO().MousePos;
+            const bool in_viewport =
+                m.x >= vp_pos.x && m.x < vp_pos.x + vp_size.x &&
+                m.y >= vp_pos.y && m.y < vp_pos.y + vp_size.y;
+            const bool over_panel =
+                ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
+            if (in_viewport && !over_panel) {
+                place_asset_request_ = drag_asset_path_;
+            }
+        }
+        drag_asset_path_.clear();
+    }
 }
 
 void Menu::drawOutlinerPanel() {
     if (ImGui::Begin("Outliner")) {
-        ImGui::TextDisabled("World  (%d objects)", (int)editor_objects_.size());
+        ImGui::TextDisabled("%d object(s)", (int)editor_objects_.size());
 
         // ── Resizable list / details split ────────────────────────────
         // A draggable bar between the object list (top) and the selected
@@ -3697,12 +3873,18 @@ void Menu::drawOutlinerPanel() {
         if (list_h < kMinPane) list_h = kMinPane;
         if (max_list > kMinPane && list_h > max_list) list_h = max_list;
 
-        // Object list — a tree.  Multi-mesh drawables (the Bistro FBX files)
-        // become collapsible GROUPS named after the asset, with their many
-        // sub-objects (named mesh nodes) nested underneath; single-mesh
-        // objects (player, NPC) render as flat leaves.
+        // Object list — a tree rooted at "World".  The authored scene
+        // (Create Scene / Load Scene) appears as a child node named after
+        // the scene, with its objects nested underneath; engine-level
+        // objects (player, NPCs, debug drawables) list under World directly.
+        // Multi-mesh drawables (the Bistro FBX files) become collapsible
+        // GROUPS named after the asset, with their many sub-objects (named
+        // mesh nodes) nested underneath; single-mesh objects render as
+        // flat leaves.
         ImGui::BeginChild("##outliner_list", ImVec2(0, list_h), true);
-        for (int i = 0; i < (int)editor_objects_.size(); ++i) {
+
+        // Renders one editor object (leaf or group) at its outliner index.
+        auto draw_object_row = [&](int i) {
             EditorSceneObject& eo = editor_objects_[i];
             const std::string base =
                 eo.name.empty() ? ("Object " + std::to_string(i)) : eo.name;
@@ -3719,7 +3901,7 @@ void Menu::drawOutlinerPanel() {
                 }
                 if (ImGui::IsItemHovered() && dbl) requestEditorFocus(i, -1);
                 if (editor_scroll_to_selected_ && sel) ImGui::SetScrollHereY(0.5f);
-                continue;
+                return;
             }
 
             // Group node (FBX file).  Clicking the label (not the arrow)
@@ -3767,11 +3949,124 @@ void Menu::drawOutlinerPanel() {
                 }
                 ImGui::TreePop();
             }
+        };
+
+        // If a scene-member object is being revealed (scene-view pick),
+        // force the World / scene nodes open so the row is reachable.
+        if (editor_scroll_to_selected_) {
+            ImGui::SetNextItemOpen(true);
+        } else {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+        }
+        if (ImGui::TreeNodeEx("World##world_root",
+                              ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            // ── Authored scene node (after Create Scene / Load Scene) ────
+            // Also derived from the DATA: placed objects (in_scene rows)
+            // are only ever rendered inside this node, so placing into a
+            // fresh session without clicking "Create Scene" first must
+            // still surface it — otherwise the Outliner shows a non-zero
+            // object count above an empty tree.
+            if (!scene_node_active_) {
+                for (const auto& eo : editor_objects_) {
+                    if (eo.in_scene) {
+                        scene_node_active_ = true;
+                        break;
+                    }
+                }
+            }
+            if (scene_node_active_) {
+                const bool reveal_scene_member =
+                    editor_scroll_to_selected_ &&
+                    editor_selected_ >= 0 &&
+                    editor_selected_ < (int)editor_objects_.size() &&
+                    editor_objects_[editor_selected_].in_scene;
+                if (reveal_scene_member) {
+                    ImGui::SetNextItemOpen(true);
+                } else {
+                    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+                }
+                int scene_count = 0;
+                for (const auto& eo : editor_objects_)
+                    if (eo.in_scene) ++scene_count;
+                const std::string slabel =
+                    std::string(scene_name_buf_) + "  (" +
+                    std::to_string(scene_count) + ")##scene_node";
+                if (ImGui::TreeNodeEx(slabel.c_str(),
+                                      ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                    // Children of a scene row (placed objects under their
+                    // source-group node).
+                    auto scene_children_of = [&](int pi) {
+                        std::vector<int> out;
+                        for (int j = 0; j < (int)editor_objects_.size(); ++j)
+                            if (editor_objects_[j].in_scene &&
+                                editor_objects_[j].parent == pi)
+                                out.push_back(j);
+                        return out;
+                    };
+                    for (int i = 0; i < (int)editor_objects_.size(); ++i) {
+                        if (!editor_objects_[i].in_scene) continue;
+                        if (editor_objects_[i].parent >= 0) continue;
+                        const auto group_kids = scene_children_of(i);
+                        if (group_kids.empty()) {
+                            draw_object_row(i);
+                            continue;
+                        }
+                        // Source-group node: individual placed objects
+                        // nest underneath it.
+                        ImGuiTreeNodeFlags gflags2 =
+                            ImGuiTreeNodeFlags_OpenOnArrow |
+                            ImGuiTreeNodeFlags_SpanAvailWidth |
+                            ImGuiTreeNodeFlags_DefaultOpen;
+                        if (editor_selected_ == i &&
+                            editor_selected_child_ < 0)
+                            gflags2 |= ImGuiTreeNodeFlags_Selected;
+                        const std::string glabel2 =
+                            (editor_objects_[i].name.empty()
+                                 ? std::string("Group")
+                                 : editor_objects_[i].name) +
+                            "  (" + std::to_string(group_kids.size()) +
+                            ")##sgrp" + std::to_string(i);
+                        const bool gopen =
+                            ImGui::TreeNodeEx(glabel2.c_str(), gflags2);
+                        if (ImGui::IsItemClicked() &&
+                            !ImGui::IsItemToggledOpen()) {
+                            editor_selected_       = i;
+                            editor_selected_child_ = -1;
+                        }
+                        if (gopen) {
+                            for (int j : group_kids) draw_object_row(j);
+                            ImGui::TreePop();
+                        }
+                    }
+                    if (scene_count == 0)
+                        ImGui::TextDisabled("(empty scene)");
+                    ImGui::TreePop();
+                }
+            }
+
+            // ── Engine-level objects (player, NPCs, debug drawables) ─────
+            for (int i = 0; i < (int)editor_objects_.size(); ++i)
+                if (!editor_objects_[i].in_scene) draw_object_row(i);
+
+            ImGui::TreePop();
         }
         editor_scroll_to_selected_ = false;   // one-shot consumed this draw
-        if (editor_objects_.empty())
+        if (editor_objects_.empty() && !scene_node_active_)
             ImGui::TextDisabled("(no scene objects yet)");
         ImGui::EndChild();
+        // Dropping a content asset anywhere on the Outliner list adds it to
+        // the scene — same as dropping into the viewport / Add to Scene.
+        // (EndChild submits the list as an item, so it can host a target.)
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* pl =
+                    ImGui::AcceptDragDropPayload("RW_CONTENT_ASSET")) {
+                if (pl->Data) {
+                    place_asset_request_.assign(
+                        (const char*)pl->Data);
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
 
         // Draggable splitter bar.
         ImGui::InvisibleButton("##outliner_splitter", ImVec2(-1.0f, kSplitterH));
@@ -3817,7 +4112,9 @@ Menu::outlinerChildren(const EditorSceneObject& eo) {
     const auto& data = eo.obj->getDrawableData();
     int mesh_nodes = 0;
     for (const auto& n : data.nodes_) if (n.mesh_idx_ >= 0) ++mesh_nodes;
-    if (mesh_nodes > 1) {
+    // A wrapper restricted to ONE sub-object (.rwobj placement) is a leaf in
+    // the Outliner even though its shared DrawableData has many mesh nodes.
+    if (mesh_nodes > 1 && eo.obj->onlyRenderSubObject() < 0) {
         kids.reserve((size_t)mesh_nodes);
         for (int ni = 0; ni < (int)data.nodes_.size(); ++ni) {
             if (data.nodes_[ni].mesh_idx_ < 0) continue;
@@ -3841,6 +4138,16 @@ bool Menu::selectedWorldAabb(glm::vec3& bmin, glm::vec3& bmax) {
     glm::vec3 lmin, lmax;   // local/model-space box
     glm::mat4 world(1.0f);
 
+    // Per-instance world (render path: instance_world * cached_matrix_).
+    glm::mat4 inst(1.0f);
+    if (eo.obj->hasInstanceRoot()) {
+        inst = glm::translate(glm::mat4(1.0f),
+                              eo.obj->getInstanceRootTranslation()) *
+               glm::mat4_cast(eo.obj->getInstanceRootRotation()) *
+               glm::scale(glm::mat4(1.0f),
+                          eo.obj->getInstanceRootScale());
+    }
+
     const auto& kids = outlinerChildren(eo);
     if (editor_selected_child_ >= 0 &&
         editor_selected_child_ < (int)kids.size()) {
@@ -3854,13 +4161,31 @@ bool Menu::selectedWorldAabb(glm::vec3& bmin, glm::vec3& bmax) {
         const auto& mesh = data.meshes_[node.mesh_idx_];
         if (mesh.bbox_min_.x > mesh.bbox_max_.x) return false;
         lmin = mesh.bbox_min_; lmax = mesh.bbox_max_;
-        world = node.cached_matrix_;          // already world-space
+        world = inst * node.cached_matrix_;
+    } else if (eo.obj->onlyRenderSubObject() >= 0) {
+        // Placed sub-object wrapper: frame ITS node, not the whole shared
+        // source file (whose bbox spans e.g. all of Bistro).
+        const auto& data = eo.obj->getDrawableData();
+        int k = 0, ni = -1;
+        for (int i = 0; i < (int)data.nodes_.size(); ++i) {
+            if (data.nodes_[i].mesh_idx_ < 0) continue;
+            if (k == eo.obj->onlyRenderSubObject()) { ni = i; break; }
+            ++k;
+        }
+        if (ni < 0) return false;
+        const auto& node = data.nodes_[ni];
+        if (node.mesh_idx_ < 0 ||
+            node.mesh_idx_ >= (int)data.meshes_.size()) return false;
+        const auto& mesh = data.meshes_[node.mesh_idx_];
+        if (mesh.bbox_min_.x > mesh.bbox_max_.x) return false;
+        lmin = mesh.bbox_min_; lmax = mesh.bbox_max_;
+        world = inst * node.cached_matrix_;
     } else {
         // Whole object: model bbox in the instance world transform.
         lmin = eo.obj->getModelBboxMin();
         lmax = eo.obj->getModelBboxMax();
         if (lmin.x > lmax.x) return false;
-        world = eo.obj->getLocation();
+        world = eo.obj->hasInstanceRoot() ? inst : eo.obj->getLocation();
     }
 
     // Transform the 8 corners and re-fit an axis-aligned world box.
@@ -3901,6 +4226,16 @@ bool Menu::selectedScreenHull(std::vector<ImVec2>& hull) {
     getViewportScreenRect(vp_pos, vp_size, vp_c);
     const float sw = vp_size.x, sh = vp_size.y;
 
+    // Per-instance world (render path: instance_world * cached_matrix_).
+    glm::mat4 inst(1.0f);
+    if (eo.obj->hasInstanceRoot()) {
+        inst = glm::translate(glm::mat4(1.0f),
+                              eo.obj->getInstanceRootTranslation()) *
+               glm::mat4_cast(eo.obj->getInstanceRootRotation()) *
+               glm::scale(glm::mat4(1.0f),
+                          eo.obj->getInstanceRootScale());
+    }
+
     std::vector<ImVec2> pts;
     auto projectMesh = [&](int mesh_idx, const glm::mat4& world) {
         if (mesh_idx < 0 || mesh_idx >= (int)data.meshes_.size()) return;
@@ -3921,12 +4256,26 @@ bool Menu::selectedScreenHull(std::vector<ImVec2>& hull) {
     if (child_sel) {
         const int ni = kids[editor_selected_child_].second;
         if (ni >= 0 && ni < (int)data.nodes_.size())
-            projectMesh(data.nodes_[ni].mesh_idx_, data.nodes_[ni].cached_matrix_);
+            projectMesh(data.nodes_[ni].mesh_idx_,
+                        inst * data.nodes_[ni].cached_matrix_);
+    } else if (eo.obj->onlyRenderSubObject() >= 0) {
+        // Placed sub-object wrapper: project ONLY its filtered node — the
+        // shared DrawableData is the whole source file, and walking every
+        // node here ran per frame while selected.
+        int k = 0;
+        for (const auto& node : data.nodes_) {
+            if (node.mesh_idx_ < 0) continue;
+            if (k == eo.obj->onlyRenderSubObject()) {
+                projectMesh(node.mesh_idx_, inst * node.cached_matrix_);
+                break;
+            }
+            ++k;
+        }
     } else {
         // Single-mesh object (player / NPC / standalone drawable).
         for (const auto& node : data.nodes_)
             if (node.mesh_idx_ >= 0)
-                projectMesh(node.mesh_idx_, node.cached_matrix_);
+                projectMesh(node.mesh_idx_, inst * node.cached_matrix_);
     }
     if (pts.size() < 3) return false;
 
@@ -3988,9 +4337,23 @@ void Menu::updateSelectionMask() {
     const glm::vec2 vpsz(vp_size.x, vp_size.y);
     if (vpsz.x < 8.0f || vpsz.y < 8.0f) return;
 
+    // The render path composes instance_world * node.cached_matrix_ —
+    // mirror that here, otherwise placed objects' masks appear at the
+    // raw geometry position (identity node for native baked assets)
+    // instead of where the instance actually sits.  Part of the cache
+    // key too, so dragging the object refreshes the mask.
+    glm::mat4 inst(1.0f);
+    if (obj->hasInstanceRoot()) {
+        inst = glm::translate(glm::mat4(1.0f),
+                              obj->getInstanceRootTranslation()) *
+               glm::mat4_cast(obj->getInstanceRootRotation()) *
+               glm::scale(glm::mat4(1.0f), obj->getInstanceRootScale());
+    }
+
     const bool changed =
         (obj != sel_mask_obj_) || (node_idx != sel_mask_node_) ||
-        (player_view_proj_ != sel_mask_vp_) || (vpsz != sel_mask_vpsz_);
+        (player_view_proj_ != sel_mask_vp_) || (vpsz != sel_mask_vpsz_) ||
+        (inst != sel_mask_inst_);
     if (!changed) return;   // reuse the cached mask
 
     // ── Build a world-space triangle mesh from the selected node(s) ──
@@ -4003,7 +4366,7 @@ void Menu::updateSelectionMask() {
         const auto& m = data.meshes_[node.mesh_idx_];
         if (!m.vertex_position_) return;
         const auto& V = *m.vertex_position_;
-        const glm::mat4& W = node.cached_matrix_;
+        const glm::mat4 W = inst * node.cached_matrix_;
         const uint32_t base = (uint32_t)mesh.positions.size();
         mesh.positions.reserve(mesh.positions.size() + V.size());
         for (const auto& v : V)
@@ -4014,7 +4377,29 @@ void Menu::updateSelectionMask() {
                 mesh.indices.push_back(base + (uint32_t)idx);
         }
     };
-    if (node_idx >= 0) addNode(node_idx);
+    // A placed sub-object wrapper shares the WHOLE source file's
+    // DrawableData — rasterising all of it (e.g. the entire Bistro) froze
+    // the app for seconds on selection.  Restrict to the wrapper's single
+    // filtered node.
+    int eff_node = node_idx;
+    if (obj->onlyRenderSubObject() >= 0) {
+        int k = 0;
+        eff_node = -1;
+        for (int ni = 0; ni < (int)data.nodes_.size(); ++ni) {
+            if (data.nodes_[ni].mesh_idx_ < 0) continue;
+            if (k == obj->onlyRenderSubObject()) { eff_node = ni; break; }
+            ++k;
+        }
+        if (eff_node < 0) {
+            sel_mask_obj_ = obj; sel_mask_node_ = node_idx;
+            sel_mask_vp_ = player_view_proj_; sel_mask_vpsz_ = vpsz;
+            sel_mask_inst_ = inst;
+            dropCurrent();
+            return;
+        }
+    }
+
+    if (eff_node >= 0) addNode(eff_node);
     else for (int ni = 0; ni < (int)data.nodes_.size(); ++ni)
         if (data.nodes_[ni].mesh_idx_ >= 0) addNode(ni);
 
@@ -4022,8 +4407,16 @@ void Menu::updateSelectionMask() {
     // every frame.
     sel_mask_obj_ = obj; sel_mask_node_ = node_idx;
     sel_mask_vp_ = player_view_proj_; sel_mask_vpsz_ = vpsz;
+    sel_mask_inst_ = inst;
 
     if (mesh.positions.empty() || mesh.indices.size() < 3) { dropCurrent(); return; }
+
+    // Triangle budget: the mask is a CPU rasterisation that re-runs on
+    // every camera move while selected — beyond this it costs frames (or
+    // seconds).  Oversized selections fall back to the hull/bbox highlight.
+    constexpr size_t kMaxMaskIndices = 600'000;   // ~200k triangles
+    if (mesh.indices.size() > kMaxMaskIndices) { dropCurrent(); return; }
+
     mesh.recomputeBounds();
     mesh.recomputeNormals();   // rasteriser shades with normals — avoid empties
 
@@ -4177,6 +4570,27 @@ void Menu::drawDetailsContent() {
             bool vis = o.obj->isVisible();
             if (ImGui::Checkbox("Visible", &vis)) o.obj->setVisible(vis);
             ImGui::Text("Loaded: %s", o.obj->isReady() ? "yes" : "(streaming)");
+        } else if (o.scene_xform) {
+            // ── Group node: edit the GROUP transform ─────────────────────
+            // Children store local-to-parent transforms; the app composes
+            // parent * local into each child drawable when this changes —
+            // so dragging these values moves/rotates the whole group.
+            ImGui::SeparatorText("Group Transform");
+            glm::vec3 pos = o.scene_xform->translation;
+            glm::vec3 scl = o.scene_xform->scale;
+            glm::vec3 euler_deg =
+                glm::degrees(glm::eulerAngles(o.scene_xform->rotation));
+            bool changed = false;
+            changed = ImGui::DragFloat3("Offset",   &pos.x, 0.05f) || changed;
+            changed = ImGui::DragFloat3("Rotation", &euler_deg.x, 0.5f) || changed;
+            changed = ImGui::DragFloat3("Scale",    &scl.x, 0.01f,
+                                        0.001f, 1000.0f) || changed;
+            if (changed) {
+                o.scene_xform->translation = pos;
+                o.scene_xform->rotation    = glm::quat(glm::radians(euler_deg));
+                o.scene_xform->scale       = scl;
+                scene_xform_dirty_ = true;
+            }
         } else {
             ImGui::TextDisabled("(no drawable bound)");
         }
@@ -4503,7 +4917,8 @@ ImTextureID Menu::getThumbnail(const std::string& src) {
     return id;
 }
 
-void Menu::drawFolderTree(const std::string& dir, int depth) {
+void Menu::drawFolderTree(const std::string& dir, int depth,
+                          std::string& cur_dir) {
     namespace fs = std::filesystem;
     std::error_code ec;
     if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
@@ -4511,7 +4926,10 @@ void Menu::drawFolderTree(const std::string& dir, int depth) {
     std::vector<fs::directory_entry> subs;
     for (auto& e : fs::directory_iterator(dir, ec)) {
         if (!e.is_directory()) continue;
-        if (e.path().filename() == ".thumbnails") continue;
+        // Hide dot-folders (.git, .thumbnails, .flux_tmp, …) — internal
+        // bookkeeping, never browsable assets.
+        const std::string fn = e.path().filename().string();
+        if (!fn.empty() && fn[0] == '.') continue;
         subs.push_back(e);
     }
     std::sort(subs.begin(), subs.end(), [](const auto& a, const auto& b) {
@@ -4522,7 +4940,7 @@ void Menu::drawFolderTree(const std::string& dir, int depth) {
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
                                ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (content_dir_ == dir) flags |= ImGuiTreeNodeFlags_Selected;
+    if (cur_dir == dir) flags |= ImGuiTreeNodeFlags_Selected;
     if (depth == 0)          flags |= ImGuiTreeNodeFlags_DefaultOpen;
     if (subs.empty())
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
@@ -4530,9 +4948,10 @@ void Menu::drawFolderTree(const std::string& dir, int depth) {
     const bool open = ImGui::TreeNodeEx(name.c_str(), flags);
     // Click on the label (not the open/close arrow) selects the folder.
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-        content_dir_ = dir;
+        cur_dir = dir;
     if (open && !subs.empty()) {
-        for (auto& s : subs) drawFolderTree(s.path().string(), depth + 1);
+        for (auto& s : subs)
+            drawFolderTree(s.path().string(), depth + 1, cur_dir);
         ImGui::TreePop();
     }
 }
@@ -4668,43 +5087,48 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     gen_status_ = 1;   // running
 }
 
-void Menu::drawContentBrowserPanel() {
+// ── Shared directory-browser body ───────────────────────────────────────────
+// Folder tree (left) + thumbnail grid (right).  Drives BOTH bottom panels:
+//   * File Browser    — raw disk view rooted at the project folder; lets you
+//                       inspect what's on disk (is_content == false).
+//   * Content Browser — the game project's asset view rooted at content/;
+//                       Import… copies external files in (with a .rwmeta
+//                       sidecar) and tiles gain "Add to Scene"
+//                       (is_content == true).
+void Menu::drawBrowserBody(const std::string& tree_root,
+                           std::string& cur_dir,
+                           float& left_w,
+                           bool is_content) {
     namespace fs = std::filesystem;
-    if (ImGui::Begin("Content Browser")) {
+    {
         thumb_budget_ = 3;   // cap texture loads per frame so big folders don't stall
 
-        // Poll a running generation: the output PNG appears (success) or
-        // "<out>.err" (failure).  The grid's thumbnail system shows the PNG.
-        if (gen_status_ == 1) {
-            std::error_code pec;
-            // Sidecars (.err) live in <folder>/.flux_tmp/<name>.err
-            fs::path _op(gen_out_path_);
-            const std::string err_path =
-                (_op.parent_path() / ".flux_tmp" /
-                 (_op.filename().string() + ".err")).string();
-            if (fs::exists(gen_out_path_, pec)) {
-                gen_status_ = 2;
-                EditorLog::get().push("[flux] image ready: " + gen_out_path_);
-            } else if (fs::exists(err_path, pec)) {
-                gen_status_ = 3;
-                std::ifstream ef(err_path, std::ios::binary);
-                gen_err_.assign(std::istreambuf_iterator<char>(ef),
-                                std::istreambuf_iterator<char>());
-                EditorLog::get().push("[flux] generation FAILED: " + gen_err_);
-            }
+        // ── Streaming-import progress (Content Browser only) ───────────
+        // Shown while the app's background thread copies the chosen file
+        // into content/; the new tile appears in the grid when it's done.
+        if (is_content && content_import_active_) {
+            char overlay[160];
+            std::snprintf(overlay, sizeof(overlay), "Importing %s  %.0f%%",
+                          content_import_label_.c_str(),
+                          content_import_frac_ * 100.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                                  ImVec4(1.0f, 0.78f, 0.31f, 1.0f));
+            ImGui::ProgressBar(content_import_frac_, ImVec2(-1.0f, 0.0f),
+                               overlay);
+            ImGui::PopStyleColor();
         }
 
         const float total_w = ImGui::GetContentRegionAvail().x;
         constexpr float kMinPane = 90.0f, kSplit = 6.0f;
-        if (content_left_w_ <= 0.0f) content_left_w_ = total_w * 0.22f;
-        if (content_left_w_ < kMinPane) content_left_w_ = kMinPane;
+        if (left_w <= 0.0f) left_w = total_w * 0.22f;
+        if (left_w < kMinPane) left_w = kMinPane;
         if (total_w - kMinPane - kSplit > kMinPane &&
-            content_left_w_ > total_w - kMinPane - kSplit)
-            content_left_w_ = total_w - kMinPane - kSplit;
+            left_w > total_w - kMinPane - kSplit)
+            left_w = total_w - kMinPane - kSplit;
 
         // ── Left: folder tree (names only) ────────────────────────────
-        ImGui::BeginChild("##cb_tree", ImVec2(content_left_w_, 0), true);
-        drawFolderTree("assets", 0);
+        ImGui::BeginChild("##cb_tree", ImVec2(left_w, 0), true);
+        drawFolderTree(tree_root, 0, cur_dir);
         ImGui::EndChild();
 
         // Vertical splitter between the two panes.
@@ -4713,7 +5137,7 @@ void Menu::drawContentBrowserPanel() {
         if (ImGui::IsItemActive() || ImGui::IsItemHovered())
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         if (ImGui::IsItemActive())
-            content_left_w_ += ImGui::GetIO().MouseDelta.x;
+            left_w += ImGui::GetIO().MouseDelta.x;
         {
             const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
             const float cx = (a.x + b.x) * 0.5f;
@@ -4725,22 +5149,110 @@ void Menu::drawContentBrowserPanel() {
         ImGui::SameLine(0.0f, 0.0f);
 
         // ── Right: thumbnail grid of the selected folder ──────────────
-        ImGui::BeginChild("##cb_grid", ImVec2(0, 0), true);
-        if (ImGui::SmallButton("Up")) {
-            fs::path p(content_dir_);
-            if (p.has_parent_path() && !p.parent_path().empty())
-                content_dir_ = p.parent_path().string();
+        // NoNav window flag: arrow keys must MOVE THE SELECTION, never
+        // scroll-shift the panel (ImGui's default nav response).
+        ImGui::BeginChild("##cb_grid", ImVec2(0, 0), true,
+                          ImGuiWindowFlags_NoNav);
+        // Keep ImGui's keyboard-nav focus OFF the tiles: its blue focus
+        // ring (set by clicking a button) would linger on the last clicked
+        // tile while the amber preview-selection border moves with the
+        // arrow keys — two competing highlights.  With NoNav the amber
+        // border is the single selection indicator for mouse AND arrows.
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+
+        // Arrow keys work from THIS panel too (not just the Debug Display):
+        // after clicking a tile the browser keeps focus, and arrows should
+        // still step the selection.
+        if (is_content &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            preview_nav_ != PreviewNav::None) {
+            handlePreviewArrowNav();
         }
+
+        if (ImGui::ArrowButton("##cb_up", ImGuiDir_Up)) {
+            fs::path p(cur_dir);
+            // Never navigate above the browser's root.
+            if (cur_dir != tree_root &&
+                p.has_parent_path() && !p.parent_path().empty())
+                cur_dir = p.parent_path().string();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Up one level");
         ImGui::SameLine();
-        ImGui::TextUnformatted(content_dir_.c_str());
+        ImGui::TextUnformatted(cur_dir.c_str());
         ImGui::Separator();
 
         std::error_code ec;
-        if (fs::exists(content_dir_, ec) && fs::is_directory(content_dir_, ec)) {
+        if (is_content && fs::exists(cur_dir, ec) &&
+            fs::is_regular_file(cur_dir, ec)) {
+            // ── Virtual asset folder ──────────────────────────────────
+            // cur_dir is a model FILE the user opened like a directory:
+            // list its renderable sub-objects (mesh nodes) as tiles —
+            // the same group/children structure the Outliner shows for
+            // the placed asset.  Names come from the .rwmeta sidecar
+            // (baked at import) or a one-time CPU parse, cached either way.
+            const auto& subs = assetSubObjects(cur_dir);
+            const float cell  = 80.0f;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            int cols = (int)(avail / (cell + 14.0f));
+            if (cols < 1) cols = 1;
+            if (is_content) browser_grid_cols_ = cols;
+            for (size_t i = 0; i < subs.size(); ++i) {
+                ImGui::PushID((int)i);
+                ImGui::BeginGroup();
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                                      ImVec4(0.33f, 0.30f, 0.42f, 1.0f));
+                ImGui::Button("MESH", ImVec2(cell, cell));
+                ImGui::PopStyleColor();
+                std::string disp = subs[i];
+                if (disp.size() > 11) disp = disp.substr(0, 9) + "..";
+                ImGui::TextUnformatted(disp.c_str());
+                ImGui::EndGroup();
+
+                // Selection highlight: this sub-object is the one currently
+                // previewed in the Debug Display (click or arrow keys).
+                if (preview_nav_ == PreviewNav::SubObjects &&
+                    preview_nav_path_ == cur_dir &&
+                    preview_nav_index_ == (int)i) {
+                    const ImVec2 ra = ImGui::GetItemRectMin();
+                    const ImVec2 rb = ImGui::GetItemRectMax();
+                    ImGui::GetWindowDrawList()->AddRect(
+                        ImVec2(ra.x - 2.0f, ra.y - 2.0f),
+                        ImVec2(rb.x + 2.0f, rb.y + 2.0f),
+                        IM_COL32(255, 190, 50, 255), 4.0f, 0, 2.5f);
+                    // Arrow navigation: keep the selection in view.
+                    if (browser_scroll_to_selected_) {
+                        ImGui::SetScrollHereY(0.5f);
+                        browser_scroll_to_selected_ = false;
+                    }
+                }
+
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", subs[i].c_str());
+                // Double-click a sub-object → preview it in Debug Display.
+                if (ImGui::IsItemHovered() &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    buildAssetPreview(cur_dir, (int)i,
+                        fs::path(cur_dir).filename().string() +
+                        "  /  " + subs[i]);
+                }
+                ImGui::PopID();
+                if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
+            }
+            if (subs.empty())
+                ImGui::TextDisabled("(no sub-objects — single-mesh asset)");
+        } else if (fs::exists(cur_dir, ec) && fs::is_directory(cur_dir, ec)) {
             std::vector<fs::directory_entry> items;   // dirs first, then files
             std::vector<fs::directory_entry> dirs, files;
-            for (auto& e : fs::directory_iterator(content_dir_, ec)) {
-                if (e.path().filename() == ".thumbnails") continue;
+            for (auto& e : fs::directory_iterator(cur_dir, ec)) {
+                // Hide dot-entries (.thumbnails, .flux_tmp, .git, …).
+                const std::string fn = e.path().filename().string();
+                if (!fn.empty() && fn[0] == '.') continue;
+                // Sidecar metadata / the asset index stay invisible in the
+                // asset view.
+                if (is_content &&
+                    e.path().extension() == ".rwmeta") continue;
+                if (is_content &&
+                    e.path().filename() == "asset_index.tsv") continue;
                 (e.is_directory() ? dirs : files).push_back(e);
             }
             auto byname = [](const fs::directory_entry& a, const fs::directory_entry& b) {
@@ -4754,6 +5266,7 @@ void Menu::drawContentBrowserPanel() {
             const float avail = ImGui::GetContentRegionAvail().x;
             int cols = (int)(avail / (cell + 14.0f));
             if (cols < 1) cols = 1;
+            if (is_content) browser_grid_cols_ = cols;
 
             for (size_t i = 0; i < items.size(); ++i) {
                 const fs::directory_entry& e = items[i];
@@ -4766,6 +5279,17 @@ void Menu::drawContentBrowserPanel() {
                                      ext == ".tga"  || ext == ".dds");
                 const bool is_model = (ext == ".gltf" || ext == ".glb" ||
                                        ext == ".obj"  || ext == ".fbx");
+                // Exploded sub-object reference asset (one object of a
+                // multi-object import) — placeable + previewable.
+                const bool is_object = (ext == ".rwobj");
+                // Import GROUP folder (holds import.rwmeta + .rwobj files):
+                // placeable as a whole — every object, original layout.
+                bool is_group_dir = false;
+                if (is_content && is_dir) {
+                    std::error_code gec;
+                    is_group_dir =
+                        fs::exists(e.path() / "import.rwmeta", gec);
+                }
 
                 // Anything with a generatable thumbnail goes through getThumbnail;
                 // it returns 0 (→ type tile) for formats we can't render yet.
@@ -4778,49 +5302,140 @@ void Menu::drawContentBrowserPanel() {
                 if (tex) {
                     clicked = ImGui::ImageButton("##t", tex, ImVec2(cell, cell));
                 } else {
-                    const ImVec4 c = is_dir   ? ImVec4(0.24f, 0.31f, 0.45f, 1.0f)
-                                   : is_model ? ImVec4(0.28f, 0.40f, 0.27f, 1.0f)
-                                              : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
+                    const ImVec4 c = is_dir    ? ImVec4(0.24f, 0.31f, 0.45f, 1.0f)
+                                   : is_model  ? ImVec4(0.28f, 0.40f, 0.27f, 1.0f)
+                                   : is_object ? ImVec4(0.33f, 0.30f, 0.42f, 1.0f)
+                                               : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, c);
-                    std::string glyph = is_dir ? "DIR"
+                    std::string glyph = is_dir    ? "DIR"
+                                      : is_object ? "OBJ"
                         : (ext.size() > 1 ? ext.substr(1) : "?");
                     for (auto& ch : glyph) ch = (char)std::toupper((unsigned char)ch);
                     clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
                     ImGui::PopStyleColor();
+                }
+
+                // Drag a placeable tile into the 3D viewport to add it to
+                // the scene — same effect as right-click → Add to Scene
+                // (the drop is handled at the end of the editor pass).
+                // Group FOLDERS are draggable too (places every object).
+                if (is_content && (is_model || is_object || is_group_dir) &&
+                    ImGui::BeginDragDropSource()) {
+                    const std::string pay = e.path().string();
+                    ImGui::SetDragDropPayload("RW_CONTENT_ASSET",
+                                              pay.c_str(), pay.size() + 1);
+                    ImGui::TextUnformatted(name.c_str());
+                    ImGui::EndDragDropSource();
                 }
                 // Truncated one-line label (keeps the grid aligned).
                 std::string disp = name;
                 if (disp.size() > 11) disp = disp.substr(0, 9) + "..";
                 ImGui::TextUnformatted(disp.c_str());
                 ImGui::EndGroup();
+
+                // ── Selection highlight ───────────────────────────────
+                // The tile whose object is currently shown in the Debug
+                // Display (clicked or arrow-stepped) gets an amber border,
+                // matching the editor's selection colour.
+                bool tile_selected = false;
+                if (is_content && is_object &&
+                    preview_nav_ == PreviewNav::RwObjSiblings) {
+                    tile_selected =
+                        (e.path().string() == preview_nav_path_);
+                } else if (is_content && is_model) {
+                    tile_selected =
+                        (dbg_asset_key_ == e.path().string() + "#-1");
+                }
+                if (tile_selected) {
+                    const ImVec2 ra = ImGui::GetItemRectMin();
+                    const ImVec2 rb = ImGui::GetItemRectMax();
+                    ImGui::GetWindowDrawList()->AddRect(
+                        ImVec2(ra.x - 2.0f, ra.y - 2.0f),
+                        ImVec2(rb.x + 2.0f, rb.y + 2.0f),
+                        IM_COL32(255, 190, 50, 255), 4.0f, 0, 2.5f);
+                    // Arrow navigation: keep the selection in view.
+                    if (browser_scroll_to_selected_) {
+                        ImGui::SetScrollHereY(0.5f);
+                        browser_scroll_to_selected_ = false;
+                    }
+                }
+
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name.c_str());
-                // Right-click a tile → Rename.
+                // Right-click a tile → context actions.
                 if (ImGui::BeginPopupContextItem("##cbctx")) {
+                    if (is_content &&
+                        (is_model || is_object || is_group_dir) &&
+                        ImGui::MenuItem("Add to Scene")) {
+                        place_asset_request_ = e.path().string();
+                    }
                     if (ImGui::MenuItem("Rename")) {
                         rename_target_ = e.path().string();
                         std::snprintf(rename_buf_, sizeof(rename_buf_), "%s",
                                       name.c_str());
                         rename_open_ = true;
                     }
+                    // Remove from the project (Content Browser only) —
+                    // confirmed via the modal below since it's destructive.
+                    if (is_content && ImGui::MenuItem("Delete")) {
+                        delete_target_ = e.path().string();
+                        delete_is_dir_ = is_dir;
+                        delete_open_   = true;
+                    }
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();
 
-                if (clicked && is_dir) content_dir_ = e.path().string();
+                // Folders open on click.  Content-Browser model assets are
+                // Explorer-style: a click previews the asset in the Debug
+                // Display; a double-click ALSO opens it as a virtual folder
+                // of its sub-objects.  .rwobj object assets preview their
+                // single sub-object on click / double-click.  "Add to
+                // Scene" lives in the tile's right-click menu.
+                if (clicked && is_dir) {
+                    cur_dir = e.path().string();
+                } else if (clicked && is_content && is_model) {
+                    buildAssetPreview(e.path().string(), -1, name);
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                        cur_dir = e.path().string();
+                } else if (clicked && is_content && is_object) {
+                    // Prefers the baked .rwgeo/.rwtex render-ready data.
+                    buildRwObjPreview(e.path().string(), name);
+                }
 
                 if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
             }
             if (items.empty()) ImGui::TextDisabled("(empty)");
         } else {
-            ImGui::TextDisabled("(folder not found: %s)", content_dir_.c_str());
+            ImGui::TextDisabled("(folder not found: %s)", cur_dir.c_str());
         }
 
-        // Right-click the grid background (not a tile) → image-generation popup.
+        // Right-click the grid background (not a tile) → context menu.
+        // Content Browser: Import / New Folder live here (no toolbar).
+        // Both browsers: FLUX image generation into the current folder.
         if (ImGui::IsWindowHovered() &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
             !ImGui::IsAnyItemHovered()) {
-            gen_popup_pending_ = true;
+            ImGui::OpenPopup("##cb_bg_ctx");
         }
+        if (ImGui::BeginPopup("##cb_bg_ctx")) {
+            if (is_content) {
+                if (ImGui::MenuItem("Import...")) {
+                    content_import_request_ = true;
+                    content_import_dir_     = cur_dir;
+                }
+                if (ImGui::MenuItem("New Folder...")) {
+                    newfolder_buf_[0] = '\0';
+                    newfolder_open_   = true;
+                }
+                ImGui::Separator();
+            }
+            if (ImGui::MenuItem("Generate Image...")) {
+                gen_popup_pending_ = true;
+                gen_folder_        = cur_dir;
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopItemFlag();   // ImGuiItemFlags_NoNav (grid tiles)
         ImGui::EndChild();
 
         // ── Rename dialog (right-click a tile → Rename) ────────────────────
@@ -4854,8 +5469,15 @@ void Menu::drawContentBrowserPanel() {
                         EditorLog::get().push("[rename] " +
                             src.filename().string() + " -> " +
                             std::string(rename_buf_));
-                        if (content_dir_ == rename_target_)
-                            content_dir_ = dst.string();
+                        if (cur_dir == rename_target_)
+                            cur_dir = dst.string();
+                        // Keep an imported asset's sidecar travelling with it.
+                        std::error_code mec;
+                        const std::string meta_src = rename_target_ + ".rwmeta";
+                        if (is_content && fs::exists(meta_src, mec)) {
+                            fs::rename(meta_src,
+                                       dst.string() + ".rwmeta", mec);
+                        }
                     }
                 }
                 ImGui::CloseCurrentPopup();
@@ -4864,11 +5486,182 @@ void Menu::drawContentBrowserPanel() {
             ImGui::EndPopup();
         }
 
-        // ── FLUX.2 generate-image popup ────────────────────────────────────
+        // ── Delete confirmation (right-click a tile → Delete) ──────────────
+        if (delete_open_) { ImGui::OpenPopup("Delete##cb"); delete_open_ = false; }
+        if (ImGui::BeginPopupModal("Delete##cb", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            const fs::path tgt(delete_target_);
+            ImGui::Text("Delete '%s'?", tgt.filename().string().c_str());
+            if (delete_is_dir_) {
+                ImGui::TextDisabled(
+                    "The folder and EVERYTHING inside it will be removed.");
+            } else {
+                std::string lext = tgt.extension().string();
+                for (auto& c : lext) c = (char)std::tolower((unsigned char)c);
+                const bool del_model =
+                    (lext == ".gltf" || lext == ".glb" ||
+                     lext == ".obj"  || lext == ".fbx");
+                if (del_model) {
+                    ImGui::TextDisabled(
+                        "Also removes its .rwmeta sidecar, the exploded\n"
+                        "'%s/' object folder, and its cached thumbnail.",
+                        tgt.stem().string().c_str());
+                }
+                ImGui::TextDisabled(
+                    "Objects already placed in the scene keep rendering,\n"
+                    "but will fail to load after a scene reload.");
+            }
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
+            const bool del_ok = ImGui::Button("Delete", ImVec2(120, 0));
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            const bool del_cancel = ImGui::Button("Cancel", ImVec2(120, 0));
+
+            if (del_ok && !delete_target_.empty()) {
+                std::error_code dec;
+                if (delete_is_dir_) {
+                    fs::remove_all(tgt, dec);
+                } else {
+                    fs::remove(tgt, dec);
+                    // Import artifacts that travel with a model file.
+                    std::error_code dec2;
+                    fs::remove(fs::path(delete_target_ + ".rwmeta"), dec2);
+                    const fs::path exploded = tgt.parent_path() / tgt.stem();
+                    if (fs::is_directory(exploded, dec2))
+                        fs::remove_all(exploded, dec2);
+                    const fs::path thumb = tgt.parent_path() / ".thumbnails" /
+                        (tgt.filename().string() + ".png");
+                    fs::remove(thumb, dec2);
+                }
+                if (dec) {
+                    EditorLog::get().push("[delete] failed: " + dec.message());
+                } else {
+                    EditorLog::get().push("[delete] removed '" +
+                        tgt.filename().string() + "'");
+                }
+                // Drop stale caches for the removed path.
+                asset_children_cache_.erase(delete_target_);
+                auto itc = thumb_cache_.find(delete_target_);
+                if (itc != thumb_cache_.end()) {
+                    if (itc->second.info)
+                        retired_thumbs_.push_back(itc->second.info);
+                    thumb_cache_.erase(itc);
+                }
+                // If the browser was sitting inside the deleted item
+                // (folder, or a model opened as a virtual folder), back out.
+                if (cur_dir.rfind(delete_target_, 0) == 0)
+                    cur_dir = tree_root;
+                delete_target_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            if (del_cancel) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        // ── New Folder dialog (Content Browser toolbar) ────────────────────
+        if (is_content) {
+            if (newfolder_open_) {
+                ImGui::OpenPopup("New Folder##cb");
+                newfolder_open_ = false;
+            }
+            if (ImGui::BeginPopupModal("New Folder##cb", nullptr,
+                                       ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextDisabled("in %s", cur_dir.c_str());
+                ImGui::TextUnformatted("Folder name:");
+                if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+                ImGui::SetNextItemWidth(320.0f);
+                const bool nf_enter = ImGui::InputText("##nf_in",
+                    newfolder_buf_, sizeof(newfolder_buf_),
+                    ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::Spacing();
+                const bool nf_ok = ImGui::Button("Create", ImVec2(120, 0)) ||
+                                   nf_enter;
+                ImGui::SameLine();
+                const bool nf_cancel = ImGui::Button("Cancel", ImVec2(120, 0));
+                if (nf_ok && newfolder_buf_[0] != '\0') {
+                    std::error_code nec;
+                    const fs::path np = fs::path(cur_dir) / newfolder_buf_;
+                    if (fs::exists(np, nec)) {
+                        EditorLog::get().push(
+                            "[content] folder already exists: " + np.string());
+                    } else {
+                        fs::create_directories(np, nec);
+                        if (nec) {
+                            EditorLog::get().push(
+                                "[content] create folder failed: " +
+                                nec.message());
+                        } else {
+                            EditorLog::get().push(
+                                "[content] created folder: " + np.string());
+                            cur_dir = np.string();
+                        }
+                    }
+                    ImGui::CloseCurrentPopup();
+                }
+                if (nf_cancel) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
+    }
+}
+
+// ── Panel wrappers ───────────────────────────────────────────────────────────
+void Menu::drawContentBrowserPanel() {
+    // Ensure the project's content root exists so the tree / grid / import
+    // target always have a home (cheap no-op when already present).
+    std::error_code ec;
+    std::filesystem::create_directories("content", ec);
+    if (content_dir_.empty()) content_dir_ = "content";
+    if (ImGui::Begin("Content Browser")) {
+        drawBrowserBody("content", content_dir_, content_left_w_,
+                        /*is_content=*/true);
+    }
+    ImGui::End();
+}
+
+void Menu::drawFileBrowserPanel() {
+    if (ImGui::Begin("File Browser")) {
+        drawBrowserBody(".", file_dir_, file_left_w_,
+                        /*is_content=*/false);
+    }
+    ImGui::End();
+}
+
+// ── FLUX.2 generate-image popup ──────────────────────────────────────────────
+// Single instance shared by both browsers (each sets gen_folder_ when its
+// grid background is right-clicked).  Drawn once per frame from the editor
+// panel pass so the two panels can't double-submit the same window.
+void Menu::drawFluxGeneratePopup() {
+    namespace fs = std::filesystem;
+
+    // Poll a running generation: the output PNG appears (success) or
+    // "<out>.err" (failure).  The grid's thumbnail system shows the PNG.
+    if (gen_status_ == 1) {
+        std::error_code pec;
+        // Sidecars (.err) live in <folder>/.flux_tmp/<name>.err
+        fs::path _op(gen_out_path_);
+        const std::string err_path =
+            (_op.parent_path() / ".flux_tmp" /
+             (_op.filename().string() + ".err")).string();
+        if (fs::exists(gen_out_path_, pec)) {
+            gen_status_ = 2;
+            EditorLog::get().push("[flux] image ready: " + gen_out_path_);
+        } else if (fs::exists(err_path, pec)) {
+            gen_status_ = 3;
+            std::ifstream ef(err_path, std::ios::binary);
+            gen_err_.assign(std::istreambuf_iterator<char>(ef),
+                            std::istreambuf_iterator<char>());
+            EditorLog::get().push("[flux] generation FAILED: " + gen_err_);
+        }
+    }
+
+    {
         static bool s_gen_open = false;
         if (gen_popup_pending_) {
             gen_popup_pending_ = false;
-            gen_folder_ = content_dir_;
+            if (gen_folder_.empty()) gen_folder_ = content_dir_;
             s_gen_open = true;
         }
         if (s_gen_open) {
@@ -4953,6 +5746,489 @@ void Menu::drawContentBrowserPanel() {
                     "Failed — see Output Log.");
             }
             ImGui::End();
+        }
+    }
+}
+
+// ── Sub-object names for a content asset (virtual-folder view) ──────────────
+// Preferred source is the .rwmeta sidecar baked at import time (instant);
+// assets that predate the bake (or were dropped into content/ by hand) get a
+// one-time CPU parse via helper::listModelSubObjects.  Either way the result
+// is cached for the session.
+const std::vector<std::string>&
+Menu::assetSubObjects(const std::string& path) {
+    auto it = asset_children_cache_.find(path);
+    if (it != asset_children_cache_.end()) return it->second;
+
+    std::vector<std::string> names;
+    bool baked = false;
+    {
+        std::ifstream meta(path + ".rwmeta");
+        std::string line;
+        while (meta && std::getline(meta, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line == "subobjects_baked=1") {
+                baked = true;
+            } else if (line.rfind("subobject=", 0) == 0) {
+                names.push_back(line.substr(10));
+            }
+        }
+    }
+    if (!baked) {
+        // No baked list — parse the model itself (may hitch once on a very
+        // large file; the result is cached so it only ever happens once).
+        names = engine::helper::listModelSubObjects(path);
+    }
+
+    auto res = asset_children_cache_.emplace(path, std::move(names));
+    return res.first->second;
+}
+
+// ── Debug Display: shaded orbit preview of the clicked object ───────────────
+// Rebuilds only when the selection key (object pointer + node index) changes.
+// The mesh is pulled from the loaded DrawableData exactly like the selection
+// mask, then rendered by the CPU rasteriser as one auto-framed orbit view.
+void Menu::updateDebugDisplay(engine::game_object::DrawableObject* obj,
+                              int node_idx) {
+    if (obj == dbg_disp_obj_ && node_idx == dbg_disp_node_) return;
+    dbg_disp_obj_  = obj;
+    dbg_disp_node_ = node_idx;
+
+    if (!obj || !obj->isReady()) { retireDebugPreview(); return; }
+
+    // A wrapper restricted to one sub-object (.rwobj placement) previews
+    // ONLY that node, regardless of how it was selected.
+    int eff_node = node_idx;
+    if (obj->onlyRenderSubObject() >= 0) {
+        const auto& d2 = obj->getDrawableData();
+        int k = 0;
+        eff_node = -1;
+        for (int ni = 0; ni < (int)d2.nodes_.size(); ++ni) {
+            if (d2.nodes_[ni].mesh_idx_ < 0) continue;
+            if (k == obj->onlyRenderSubObject()) { eff_node = ni; break; }
+            ++k;
+        }
+        if (eff_node < 0) { retireDebugPreview(); return; }
+    }
+
+    // World-space triangle mesh from the selected node — or, for a group /
+    // whole-object selection (node_idx < 0), every mesh node.
+    plugins::auto_rig::TriangleMesh mesh;
+    const auto& data = obj->getDrawableData();
+    auto addNode = [&](int ni) {
+        if (ni < 0 || ni >= (int)data.nodes_.size()) return;
+        const auto& node = data.nodes_[ni];
+        if (node.mesh_idx_ < 0 ||
+            node.mesh_idx_ >= (int)data.meshes_.size()) return;
+        const auto& m = data.meshes_[node.mesh_idx_];
+        if (!m.vertex_position_) return;
+        const auto& V = *m.vertex_position_;
+        const glm::mat4& W = node.cached_matrix_;
+        const uint32_t base = (uint32_t)mesh.positions.size();
+        mesh.positions.reserve(mesh.positions.size() + V.size());
+        for (const auto& v : V)
+            mesh.positions.push_back(glm::vec3(W * glm::vec4(v, 1.0f)));
+        for (const auto& prim : m.primitives_) {
+            if (!prim.vertex_indices_) continue;
+            for (int32_t idx : *prim.vertex_indices_)
+                mesh.indices.push_back(base + (uint32_t)idx);
+        }
+    };
+    if (eff_node >= 0) {
+        addNode(eff_node);
+    } else {
+        for (int ni = 0; ni < (int)data.nodes_.size(); ++ni)
+            if (data.nodes_[ni].mesh_idx_ >= 0) addNode(ni);
+    }
+    if (mesh.positions.empty() || mesh.indices.size() < 3) {
+        retireDebugPreview();
+        return;
+    }
+    dbg_asset_key_.clear();   // the scene selection owns the preview now
+    installDebugPreview(mesh);
+}
+
+void Menu::retireDebugPreview() {
+    preview_pending_ = false;
+    preview_active_  = false;
+    preview_payload_ = engine::helper::MeshPreviewPayload{};
+    preview_nav_     = PreviewNav::None;
+    preview_nav_path_.clear();
+    preview_nav_index_ = -1;
+}
+
+// Stage a ready payload for the GPU PBR preview pass: the application
+// consumes it via takeDebugPreviewPayload() and records
+// helper::MeshPreview's offscreen render before the ImGui pass samples the
+// persistent preview target.
+void Menu::stagePreviewPayload(engine::helper::MeshPreviewPayload&& payload) {
+    if (payload.positions.empty() || payload.indices.size() < 3) {
+        retireDebugPreview();
+        return;
+    }
+    preview_payload_ = std::move(payload);
+    preview_pending_ = true;
+    preview_active_  = true;
+    // NOTE: tab focus is requested by finishAssetPreview (content previews
+    // only) — scene-selection previews must NOT yank the Outliner tab away
+    // while the user is clicking rows in it.
+}
+
+// TriangleMesh adapter (scene-object selections + any path that still
+// produces an auto_rig mesh).  Carries UVs + the base-colour texture when
+// the mesh has them; untextured meshes shade as neutral PBR.
+void Menu::installDebugPreview(plugins::auto_rig::TriangleMesh& mesh) {
+    if (mesh.positions.empty() || mesh.indices.size() < 3) {
+        retireDebugPreview();
+        return;
+    }
+    mesh.recomputeBounds();
+    if (mesh.normals.size() != mesh.positions.size()) {
+        mesh.recomputeNormals();
+    }
+
+    // Scene-selection previews aren't arrow-navigable (no sibling list).
+    preview_nav_ = PreviewNav::None;
+
+    engine::helper::MeshPreviewPayload p;
+    p.positions = std::move(mesh.positions);
+    p.normals   = std::move(mesh.normals);
+    p.indices   = std::move(mesh.indices);
+
+    engine::helper::MeshPreviewSection sec;
+    sec.first_index = 0;
+    sec.index_count = (uint32_t)p.indices.size();
+    if (mesh.texcoords.size() == p.positions.size() &&
+        !mesh.base_color_texture.empty() &&
+        (mesh.base_color_texture.channels == 3 ||
+         mesh.base_color_texture.channels == 4)) {
+        p.uvs = std::move(mesh.texcoords);
+        const auto& t = mesh.base_color_texture;
+        engine::helper::MeshPreviewTexture mt;
+        mt.w = t.width;
+        mt.h = t.height;
+        const size_t n = (size_t)t.width * t.height;
+        mt.rgba.resize(n * 4);
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* sp = t.pixels.data() + i * t.channels;
+            uint8_t* dp = mt.rgba.data() + i * 4;
+            dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2];
+            dp[3] = (t.channels == 4) ? sp[3] : 255;
+        }
+        p.textures.push_back(std::move(mt));
+        sec.tex_index = 0;
+    }
+    p.sections.push_back(sec);
+    stagePreviewPayload(std::move(p));
+}
+
+// Content Browser → Debug Display: preview an asset file (sub_index < 0) or
+// one of its sub-objects.  CPU-only parse extracts geometry, UVs, the
+// base-colour texture and the PBR factors; the GPU pass does the shading.
+void Menu::buildAssetPreview(const std::string& path, int sub_index,
+                             const std::string& caption) {
+    const std::string key = path + "#" + std::to_string(sub_index);
+    if (key == dbg_asset_key_) return;   // already showing
+
+    engine::helper::ModelPreviewData data;
+    if (!engine::helper::loadModelPreviewData(path, sub_index, data)) {
+        EditorLog::get().push(
+            "[preview] could not load geometry from: " + path);
+        return;
+    }
+    engine::helper::MeshPreviewPayload p;
+    p.positions = std::move(data.positions);
+    p.normals   = std::move(data.normals);
+    p.uvs       = std::move(data.uvs);
+    p.indices   = std::move(data.indices);
+    for (auto& t : data.textures) {
+        engine::helper::MeshPreviewTexture mt;
+        mt.rgba = std::move(t.rgba);
+        mt.w = t.w;
+        mt.h = t.h;
+        p.textures.push_back(std::move(mt));
+    }
+    for (const auto& s : data.sections) {
+        engine::helper::MeshPreviewSection ms;
+        ms.first_index = s.first_index;
+        ms.index_count = s.index_count;
+        ms.base_color  = s.base_color;
+        ms.metallic    = s.metallic;
+        ms.roughness   = s.roughness;
+        ms.tex_index   = s.tex_index;
+        p.sections.push_back(ms);
+    }
+    stagePreviewPayload(std::move(p));
+    finishAssetPreview(key, caption);
+
+    // Arrow-key navigation: step through this model's sub-objects.
+    if (sub_index >= 0) {
+        preview_nav_       = PreviewNav::SubObjects;
+        preview_nav_path_  = path;
+        preview_nav_index_ = sub_index;
+    } else {
+        preview_nav_ = PreviewNav::None;
+    }
+}
+
+// .rwobj object preview — prefers the render-ready bake (.rwgeo + .rwtex
+// under the group folder, written at import) and only re-parses the source
+// model when no baked data exists.
+void Menu::buildRwObjPreview(const std::string& rwobj_path,
+                             const std::string& fallback_name) {
+    std::string src, name, geo;
+    int node = -1;
+    if (!engine::helper::readRwObjRef(rwobj_path, src, node, name, geo)) {
+        EditorLog::get().push(
+            "[preview] bad .rwobj reference: " + rwobj_path);
+        return;
+    }
+    if (name.empty()) name = fallback_name;
+
+    if (!geo.empty()) {
+        const std::string key = rwobj_path + "#geo";
+        if (key == dbg_asset_key_) return;   // already showing
+        engine::helper::ModelPreviewData data;
+        if (engine::helper::loadRwGeo(geo, data)) {
+            engine::helper::MeshPreviewPayload p;
+            p.positions = std::move(data.positions);
+            p.normals   = std::move(data.normals);
+            p.uvs       = std::move(data.uvs);
+            p.indices   = std::move(data.indices);
+            for (auto& t : data.textures) {
+                engine::helper::MeshPreviewTexture mt;
+                mt.rgba = std::move(t.rgba);
+                mt.w = t.w;
+                mt.h = t.h;
+                p.textures.push_back(std::move(mt));
+            }
+            for (const auto& s : data.sections) {
+                engine::helper::MeshPreviewSection ms;
+                ms.first_index = s.first_index;
+                ms.index_count = s.index_count;
+                ms.base_color  = s.base_color;
+                ms.metallic    = s.metallic;
+                ms.roughness   = s.roughness;
+                ms.tex_index   = s.tex_index;
+                p.sections.push_back(ms);
+            }
+            stagePreviewPayload(std::move(p));
+            finishAssetPreview(key, name);
+            // Arrow-key navigation: step through sibling .rwobj files.
+            preview_nav_       = PreviewNav::RwObjSiblings;
+            preview_nav_path_  = rwobj_path;
+            preview_nav_index_ = -1;
+            return;
+        }
+        EditorLog::get().push(
+            "[preview] baked data unreadable, re-parsing source: " + geo);
+    }
+    buildAssetPreview(src, node, name);
+    // The fallback parsed the SOURCE model — keep navigation anchored on
+    // the .rwobj siblings so arrows still walk the group folder.
+    if (preview_nav_ != PreviewNav::None) {
+        preview_nav_       = PreviewNav::RwObjSiblings;
+        preview_nav_path_  = rwobj_path;
+        preview_nav_index_ = -1;
+    }
+}
+
+// Arrow-key navigation: Left/Right step one item (wrapping); Up/Down move a
+// whole ROW of the Content Browser grid (clamped at the edges).  The caller
+// gates on ITS OWN window focus, so this runs for whichever panel the user
+// is interacting with.
+void Menu::handlePreviewArrowNav() {
+    const int cols = std::max(1, browser_grid_cols_);
+    int  step      = 0;
+    bool row_move  = false;   // row moves CLAMP (no wrap)
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step = +1;
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  step = -1;
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+        step = +cols;
+        row_move = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+        step = -cols;
+        row_move = true;
+    }
+    if (step == 0) return;
+
+    auto next_index = [&](int cur, int n) -> int {
+        if (n <= 0) return -1;
+        if (row_move) {
+            const int nxt = cur + step;
+            return (nxt >= 0 && nxt < n) ? nxt : -1;  // clamp
+        }
+        return ((cur + step) % n + n) % n;            // wrap
+    };
+
+    if (preview_nav_ == PreviewNav::RwObjSiblings) {
+        // Enumerate the group folder's .rwobj files (sorted — the NNN_
+        // prefix keeps bake order = tile order).
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        std::vector<std::string> sibs;
+        const fs::path dir = fs::path(preview_nav_path_).parent_path();
+        for (auto& e : fs::directory_iterator(dir, ec)) {
+            if (e.path().extension() == ".rwobj")
+                sibs.push_back(e.path().string());
+        }
+        std::sort(sibs.begin(), sibs.end());
+        if (!sibs.empty()) {
+            int cur = 0;
+            for (int i = 0; i < (int)sibs.size(); ++i)
+                if (sibs[i] == preview_nav_path_) { cur = i; break; }
+            const int nxt = next_index(cur, (int)sibs.size());
+            if (nxt >= 0 && nxt != cur) {
+                buildRwObjPreview(
+                    sibs[nxt], fs::path(sibs[nxt]).stem().string());
+                browser_scroll_to_selected_ = true;
+            }
+        }
+    } else if (preview_nav_ == PreviewNav::SubObjects) {
+        const auto& subs = assetSubObjects(preview_nav_path_);
+        if (!subs.empty()) {
+            const int nxt =
+                next_index(preview_nav_index_, (int)subs.size());
+            if (nxt >= 0 && nxt != preview_nav_index_) {
+                buildAssetPreview(
+                    preview_nav_path_, nxt,
+                    std::filesystem::path(preview_nav_path_)
+                            .filename().string() +
+                        "  /  " + subs[nxt]);
+                browser_scroll_to_selected_ = true;
+            }
+        }
+    }
+}
+
+void Menu::finishAssetPreview(const std::string& key,
+                              const std::string& caption) {
+    dbg_asset_key_    = key;
+    dbg_disp_caption_ = caption;
+
+    // Invalidate the scene-selection key so clicking any scene object next
+    // rebuilds from the selection — but record the CURRENT selection as
+    // "seen" so the unchanged selection doesn't overwrite this preview on
+    // the very next frame.
+    dbg_disp_obj_  = nullptr;
+    dbg_disp_node_ = -3;
+    engine::game_object::DrawableObject* cobj = nullptr;
+    int cnode = -3;
+    if (!getSelectedHighlight(cobj, cnode)) { cobj = nullptr; cnode = -3; }
+    dbg_sel_seen_obj_  = cobj;
+    dbg_sel_seen_node_ = cnode;
+
+    // Bring the Debug Display tab to the front: the direct by-name call
+    // raises the dock tab immediately (works mid-frame), and the flag makes
+    // the panel itself claim focus on its next Begin as a fallback.
+    ImGui::SetWindowFocus("Debug Display");
+    preview_focus_ = true;
+}
+
+void Menu::drawDebugDisplayPanel() {
+    // A freshly staged preview raises this window's dock tab so the result
+    // is visible immediately (it shares a dock slot with the Outliner).
+    if (preview_focus_) {
+        ImGui::SetNextWindowFocus();
+        preview_focus_ = false;
+    }
+    if (ImGui::Begin("Debug Display")) {
+        engine::game_object::DrawableObject* obj = nullptr;
+        int node = -3;
+        if (!getSelectedHighlight(obj, node)) { obj = nullptr; node = -3; }
+
+        // Rebuild from the scene only when the selection CHANGES, so a
+        // content-asset preview (double-clicked in the Content Browser)
+        // stays up until the user clicks something else.
+        const bool sel_changed =
+            (obj != dbg_sel_seen_obj_) || (node != dbg_sel_seen_node_);
+        dbg_sel_seen_obj_  = obj;
+        dbg_sel_seen_node_ = node;
+        if (sel_changed) {
+            updateDebugDisplay(obj, node);
+            dbg_disp_caption_.clear();
+            if (obj && editor_selected_ >= 0 &&
+                editor_selected_ < (int)editor_objects_.size()) {
+                const auto& eo = editor_objects_[editor_selected_];
+                dbg_disp_caption_ =
+                    eo.name.empty() ? std::string("Object") : eo.name;
+                const auto& kids = outlinerChildren(eo);
+                if (editor_selected_child_ >= 0 &&
+                    editor_selected_child_ < (int)kids.size())
+                    dbg_disp_caption_ +=
+                        "  /  " + kids[editor_selected_child_].first;
+            }
+        }
+
+        // The image lives in helper::MeshPreview's persistent GPU target —
+        // rendered by the app (real pipeline, three spot lights) whenever a
+        // staged mesh is consumed, sampled here every frame.
+        const ImTextureID prev_id =
+            engine::helper::MeshPreview::imguiId();
+        const bool show_image =
+            preview_active_ &&
+            engine::helper::MeshPreview::hasImage() &&
+            prev_id != 0;
+
+        if (!dbg_disp_caption_.empty() && show_image) {
+            ImGui::TextDisabled("%s", dbg_disp_caption_.c_str());
+            ImGui::Separator();
+        }
+
+        if (show_image) {
+            // Fit the preview into the panel, preserving aspect, centred.
+            const float pw = (float)engine::helper::MeshPreview::kSize;
+            const float ph = (float)engine::helper::MeshPreview::kSize;
+            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            float s = std::min(avail.x / pw, avail.y / ph);
+            if (s <= 0.0f || avail.x < 8.0f || avail.y < 8.0f) s = 1.0f;
+            const ImVec2 sz(pw * s, ph * s);
+            const float pad_x = (avail.x - sz.x) * 0.5f;
+            if (pad_x > 0.0f)
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad_x);
+            ImGui::Image(prev_id, sz);
+
+            // ── Orbit camera: drag to rotate, wheel to zoom ───────────
+            // ImageButton-free hit test on the image item itself; the
+            // offscreen pass re-records next frame when the camera moves.
+            if (ImGui::IsItemHovered()) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+                    const ImVec2 d = io.MouseDelta;
+                    if (d.x != 0.0f || d.y != 0.0f) {
+                        engine::helper::MeshPreview::orbit(
+                            -d.x * 0.4f, d.y * 0.4f);
+                    }
+                }
+                // Right-drag: move the object around the view (pans the
+                // camera target in the view plane).
+                if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f)) {
+                    const ImVec2 d = io.MouseDelta;
+                    if (d.x != 0.0f || d.y != 0.0f) {
+                        engine::helper::MeshPreview::pan(d.x, d.y);
+                    }
+                }
+                if (io.MouseWheel != 0.0f) {
+                    engine::helper::MeshPreview::zoom(io.MouseWheel);
+                }
+            }
+            ImGui::TextDisabled(
+                "drag: orbit    right-drag: move    wheel: zoom    "
+                "arrows: navigate panel grid");
+
+            // ── Arrow keys: navigate the Content Browser grid ───────────
+            // Shared handler — also invoked from the Content Browser when
+            // IT has focus, so arrows move the selection from either side.
+            if (ImGui::IsWindowFocused(
+                    ImGuiFocusedFlags_RootAndChildWindows) &&
+                preview_nav_ != PreviewNav::None) {
+                handlePreviewArrowNav();
+            }
+        } else {
+            ImGui::TextDisabled(
+                "(click an object in the scene / Outliner, or double-click\n"
+                " a tile in the Content Browser, to preview it here)");
         }
     }
     ImGui::End();
