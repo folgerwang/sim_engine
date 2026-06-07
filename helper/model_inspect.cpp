@@ -160,7 +160,9 @@ void appendGltfPrim(const tinygltf::Model& model,
                     std::vector<glm::vec3>& positions,
                     std::vector<glm::vec3>& normals,
                     std::vector<glm::vec2>& uvs,
-                    std::vector<uint32_t>&  indices) {
+                    std::vector<uint32_t>&  indices,
+                    std::vector<glm::u16vec4>* out_joints = nullptr,
+                    std::vector<glm::vec4>*    out_weights = nullptr) {
     const glm::mat3 nrm_mat(world);   // approximate (ok for previews)
     if (prim.mode != TINYGLTF_MODE_TRIANGLES && prim.mode != -1) return;
     auto pit = prim.attributes.find("POSITION");
@@ -204,6 +206,76 @@ void appendGltfPrim(const tinygltf::Model& model,
         uvs.push_back((t && i < tc)
             ? glm::vec2(t[i * ts + 0], t[i * ts + 1])
             : glm::vec2(0.0f));
+    }
+
+    // JOINTS_0 + WEIGHTS_0 — skinned meshes only, and only when the
+    // caller asked for them.  Always pushes pc entries so the arrays
+    // stay parallel to `positions` even for unskinned primitives mixed
+    // into a skinned bake (identity binding: joint 0, weight 1).
+    if (out_joints && out_weights) {
+        auto rawAccessor = [&](int acc_idx, const uint8_t*& raw,
+                               size_t& count, size_t& stride,
+                               int& comp_type) -> bool {
+            raw = nullptr; count = 0; stride = 0; comp_type = 0;
+            if (acc_idx < 0 || acc_idx >= (int)model.accessors.size())
+                return false;
+            const auto& a = model.accessors[acc_idx];
+            if (a.bufferView < 0 ||
+                a.bufferView >= (int)model.bufferViews.size())
+                return false;
+            const auto& bv = model.bufferViews[a.bufferView];
+            const auto& bf = model.buffers[bv.buffer];
+            raw = bf.data.data() + bv.byteOffset + a.byteOffset;
+            count = a.count;
+            comp_type = a.componentType;
+            const int comp_sz =
+                tinygltf::GetComponentSizeInBytes(a.componentType);
+            stride = bv.byteStride ? bv.byteStride : (size_t)comp_sz * 4;
+            return true;
+        };
+
+        const uint8_t* jraw = nullptr; size_t jc = 0, js = 0; int jt = 0;
+        const uint8_t* wraw = nullptr; size_t wc = 0, ws = 0; int wt = 0;
+        auto jit = prim.attributes.find("JOINTS_0");
+        auto wit = prim.attributes.find("WEIGHTS_0");
+        const bool has_j = jit != prim.attributes.end() &&
+            rawAccessor(jit->second, jraw, jc, js, jt);
+        const bool has_w = wit != prim.attributes.end() &&
+            rawAccessor(wit->second, wraw, wc, ws, wt);
+
+        for (size_t i = 0; i < pc; ++i) {
+            glm::u16vec4 J(0);
+            glm::vec4    W(1.0f, 0.0f, 0.0f, 0.0f);
+            if (has_j && i < jc) {
+                const uint8_t* p4 = jraw + i * js;
+                for (int c = 0; c < 4; ++c) {
+                    J[c] = (jt == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+                        ? reinterpret_cast<const uint16_t*>(p4)[c]
+                        : (uint16_t)p4[c];   // UNSIGNED_BYTE
+                }
+            }
+            if (has_w && i < wc) {
+                const uint8_t* p4 = wraw + i * ws;
+                for (int c = 0; c < 4; ++c) {
+                    float v = 0.0f;
+                    if (wt == TINYGLTF_COMPONENT_TYPE_FLOAT)
+                        v = reinterpret_cast<const float*>(p4)[c];
+                    else if (wt ==
+                             TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+                        v = reinterpret_cast<const uint16_t*>(p4)[c] /
+                            65535.0f;
+                    else if (wt == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
+                        v = p4[c] / 255.0f;
+                    W[c] = v;
+                }
+                // Renormalise (quantised weights rarely sum to 1).
+                const float sum = W.x + W.y + W.z + W.w;
+                if (sum > 1e-6f) W /= sum;
+                else W = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            }
+            out_joints->push_back(J);
+            out_weights->push_back(W);
+        }
     }
 
     if (prim.indices >= 0) {
@@ -251,6 +323,32 @@ void gltfMaterialFactors(const tinygltf::Model& model, int material_idx,
     }
     metallic  = (float)mr.metallicFactor;
     roughness = (float)mr.roughnessFactor;
+}
+
+// Albedo texture index of a glTF material, with the
+// KHR_materials_pbrSpecularGlossiness diffuseTexture fallback — older
+// Sketchfab / Mixamo exports (e.g. scene-skinned.gltf) put the albedo
+// there and leave pbrMetallicRoughness.baseColorTexture at -1.  The
+// engine's glTF loader carries the same fallback; without it those
+// assets bake/preview untextured.
+int gltfAlbedoTextureIndex(const tinygltf::Model& model, int material_idx) {
+    if (material_idx < 0 || material_idx >= (int)model.materials.size())
+        return -1;
+    const auto& m = model.materials[material_idx];
+    int tex = m.pbrMetallicRoughness.baseColorTexture.index;
+    if (tex < 0) {
+        auto it = m.extensions.find("KHR_materials_pbrSpecularGlossiness");
+        if (it != m.extensions.end() && it->second.IsObject() &&
+            it->second.Has("diffuseTexture")) {
+            const auto& dt = it->second.Get("diffuseTexture");
+            if (dt.IsObject() && dt.Has("index") &&
+                dt.Get("index").IsNumber()) {
+                tex = dt.Get("index").GetNumberAsInt();
+            }
+        }
+    }
+    if (tex < 0 || tex >= (int)model.textures.size()) return -1;
+    return tex;
 }
 
 // ufbx 3x4 matrix → glm column-major 4x4.
@@ -440,14 +538,10 @@ bool loadModelPreviewData(const std::string& path, int sub_index,
         // In-memory texture cache: glTF image index → out.textures index.
         std::unordered_map<int, int> img_cache;
         auto tex_of_material = [&](int material_idx) -> int {
-            if (material_idx < 0 ||
-                material_idx >= (int)model.materials.size()) return -1;
-            const auto& mr =
-                model.materials[material_idx].pbrMetallicRoughness;
-            if (mr.baseColorTexture.index < 0 ||
-                mr.baseColorTexture.index >= (int)model.textures.size())
-                return -1;
-            const int src = model.textures[mr.baseColorTexture.index].source;
+            const int tex_idx =
+                gltfAlbedoTextureIndex(model, material_idx);
+            if (tex_idx < 0) return -1;
+            const int src = model.textures[tex_idx].source;
             if (src < 0 || src >= (int)model.images.size()) return -1;
             auto it = img_cache.find(src);
             if (it != img_cache.end()) return it->second;
@@ -863,6 +957,67 @@ listModelTextureDependencies(const std::string& path) {
     return deps;
 }
 
+bool modelHasSkin(const std::string& path) {
+    const std::string ext = lowerExt(path);
+    if (ext == ".gltf" || ext == ".glb") {
+        tinygltf::Model    model;
+        tinygltf::TinyGLTF loader;
+        std::string err, warn;
+        const bool ok = (ext == ".glb")
+            ? loader.LoadBinaryFromFile(&model, &err, &warn, path)
+            : loader.LoadASCIIFromFile(&model, &err, &warn, path);
+        if (!ok) return false;
+        return !model.skins.empty();
+    }
+    if (ext == ".fbx") {
+        ufbx_load_opts opts{};
+        ufbx_error error;
+        ufbx_scene* scene = ufbx_load_file(path.c_str(), &opts, &error);
+        if (!scene) return false;
+        const bool has_skin = scene->skin_deformers.count > 0;
+        ufbx_free_scene(scene);
+        return has_skin;
+    }
+    return false;
+}
+
+std::vector<std::pair<std::string, std::string>>
+listModelFileDependencies(const std::string& path) {
+    namespace fs = std::filesystem;
+    auto deps = listModelTextureDependencies(path);
+    const std::string ext = lowerExt(path);
+    if (ext == ".gltf") {
+        // Binary buffer files (.bin) — same sanitize/dedup rules as the
+        // texture dependencies.
+        const fs::path src_dir = fs::path(path).parent_path();
+        tinygltf::Model    model;
+        tinygltf::TinyGLTF loader;
+        std::string err, warn;
+        if (loader.LoadASCIIFromFile(&model, &err, &warn, path)) {
+            for (const auto& buf : model.buffers) {
+                if (buf.uri.empty()) continue;
+                if (buf.uri.rfind("data:", 0) == 0) continue;   // embedded
+                fs::path rel(buf.uri);
+                std::string rel_s =
+                    (rel.is_absolute() ||
+                     buf.uri.find("..") != std::string::npos)
+                        ? rel.filename().string()
+                        : rel.generic_string();
+                const fs::path resolved = src_dir / fs::path(buf.uri);
+                std::error_code ec;
+                if (rel_s.empty() || !fs::exists(resolved, ec) ||
+                    !fs::is_regular_file(resolved, ec))
+                    continue;
+                bool dup = false;
+                for (const auto& d : deps)
+                    if (d.first == rel_s) { dup = true; break; }
+                if (!dup) deps.emplace_back(rel_s, resolved.string());
+            }
+        }
+    }
+    return deps;
+}
+
 bool readRwObjRef(const std::string& rwobj_path,
                   std::string& out_source_path,
                   int&         out_sub_index,
@@ -922,6 +1077,14 @@ constexpr char kRwTexMagic[8] = {'R','W','T','E','X','0','0','1'};
 constexpr char kRwGeoMagic[8]  = {'R','W','G','E','O','0','0','1'};
 constexpr char kRwGeoMagic2[8] = {'R','W','G','E','O','0','0','2'};
 constexpr char kRwGeoMagic3[8] = {'R','W','G','E','O','0','0','3'};
+// v4 = v3 + skinning: flags bit1 = has_skin → a joint table (hier node +
+// inverse bind per joint) after the section table, and per-vertex
+// u16vec4 joints + vec4 weights blobs between uvs and indices.
+constexpr char kRwGeoMagic4[8] = {'R','W','G','E','O','0','0','4'};
+// v5 = v4 + full PBR material refs: every section carries TWO more
+// texlen+rel pairs after the albedo one — normal map, then
+// metallic-roughness map (either may be empty).
+constexpr char kRwGeoMagic5[8] = {'R','W','G','E','O','0','0','5'};
 constexpr char kRwHierMagic[8] = {'R','W','H','I','E','R','0','1'};
 
 template <typename T>
@@ -1173,7 +1336,9 @@ struct GeoSectionOut {
     glm::vec4   base_color  = glm::vec4(1.0f);
     float       metallic    = 0.0f;
     float       roughness   = 0.6f;
-    std::string tex_rel;
+    std::string tex_rel;   // albedo
+    std::string nrm_rel;   // normal map (may be empty)
+    std::string mr_rel;    // metallic-roughness map (may be empty)
 };
 
 // Dedup triangle-soup geometry by exact (position, normal, uv) bits.
@@ -1187,11 +1352,16 @@ struct GeoSectionOut {
 void dedupSoupVertices(std::vector<glm::vec3>& positions,
                        std::vector<glm::vec3>& normals,
                        std::vector<glm::vec2>& uvs,
-                       std::vector<uint32_t>&  indices) {
+                       std::vector<uint32_t>&  indices,
+                       std::vector<glm::u16vec4>* joints = nullptr,
+                       std::vector<glm::vec4>*    weights = nullptr) {
     const size_t vc = positions.size();
     if (vc == 0) return;
     const bool has_n  = normals.size() == vc;
     const bool has_uv = uvs.size() == vc;
+    const bool has_skin =
+        joints && weights &&
+        joints->size() == vc && weights->size() == vc;
 
     auto vert_hash = [&](uint32_t v) -> uint64_t {
         uint64_t h = 1469598103934665603ull;
@@ -1205,12 +1375,19 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
         mix(&positions[v], sizeof(glm::vec3));
         if (has_n)  mix(&normals[v], sizeof(glm::vec3));
         if (has_uv) mix(&uvs[v], sizeof(glm::vec2));
+        if (has_skin) {
+            mix(&(*joints)[v], sizeof(glm::u16vec4));
+            mix(&(*weights)[v], sizeof(glm::vec4));
+        }
         return h;
     };
 
     std::vector<glm::vec3> dpos;  dpos.reserve(vc / 2);
     std::vector<glm::vec3> dnrm;  if (has_n)  dnrm.reserve(vc / 2);
     std::vector<glm::vec2> duv;   if (has_uv) duv.reserve(vc / 2);
+    std::vector<glm::u16vec4> djnt;
+    std::vector<glm::vec4>    dwgt;
+    if (has_skin) { djnt.reserve(vc / 2); dwgt.reserve(vc / 2); }
     std::vector<uint32_t> remap(vc);
     std::unordered_map<uint64_t, std::vector<uint32_t>> buckets;
     buckets.reserve(vc);
@@ -1221,7 +1398,9 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
         for (uint32_t c : cands) {
             if (dpos[c] == positions[v] &&
                 (!has_n  || dnrm[c] == normals[v]) &&
-                (!has_uv || duv[c] == uvs[v])) {
+                (!has_uv || duv[c] == uvs[v]) &&
+                (!has_skin ||
+                 (djnt[c] == (*joints)[v] && dwgt[c] == (*weights)[v]))) {
                 found = c;
                 break;
             }
@@ -1231,6 +1410,10 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
             dpos.push_back(positions[v]);
             if (has_n)  dnrm.push_back(normals[v]);
             if (has_uv) duv.push_back(uvs[v]);
+            if (has_skin) {
+                djnt.push_back((*joints)[v]);
+                dwgt.push_back((*weights)[v]);
+            }
             cands.push_back(found);
         }
         remap[v] = found;
@@ -1242,6 +1425,10 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
     positions = std::move(dpos);
     if (has_n)  normals = std::move(dnrm);
     if (has_uv) uvs = std::move(duv);
+    if (has_skin) {
+        *joints  = std::move(djnt);
+        *weights = std::move(dwgt);
+    }
 }
 
 bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
@@ -1250,22 +1437,39 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
     bool any_tex = false;
-    for (const auto& s : sections) any_tex |= !s.tex_rel.empty();
+    for (const auto& s : sections) {
+        any_tex |= !s.tex_rel.empty() || !s.nrm_rel.empty() ||
+                   !s.mr_rel.empty();
+    }
     const bool has_uv = any_tex && d.uvs.size() == d.positions.size();
+    const bool has_skin =
+        d.joints.size() == d.positions.size() &&
+        d.weights.size() == d.positions.size() &&
+        !d.skin_joint_nodes.empty() &&
+        d.skin_joint_nodes.size() == d.skin_inverse_bind.size();
 
     // Dedup the parse helpers' triangle soup before writing — indexed,
     // shared vertices are what the GPU (and the cluster builder) want.
-    std::vector<glm::vec3> positions = d.positions;
-    std::vector<glm::vec3> normals   = d.normals;
-    std::vector<glm::vec2> uvs       = has_uv ? d.uvs
-                                              : std::vector<glm::vec2>();
-    std::vector<uint32_t>  indices   = d.indices;
-    dedupSoupVertices(positions, normals, uvs, indices);
+    std::vector<glm::vec3>    positions = d.positions;
+    std::vector<glm::vec3>    normals   = d.normals;
+    std::vector<glm::vec2>    uvs       = has_uv ? d.uvs
+                                                 : std::vector<glm::vec2>();
+    std::vector<uint32_t>     indices   = d.indices;
+    std::vector<glm::u16vec4> joints    = has_skin
+        ? d.joints  : std::vector<glm::u16vec4>();
+    std::vector<glm::vec4>    weights   = has_skin
+        ? d.weights : std::vector<glm::vec4>();
+    dedupSoupVertices(positions, normals, uvs, indices,
+                      has_skin ? &joints : nullptr,
+                      has_skin ? &weights : nullptr);
 
-    f.write(kRwGeoMagic3, 8);
+    // v5: full PBR section refs (albedo + normal + metallic-roughness);
+    // flags bit1 marks the optional skin blobs.  Older files (v1-v4)
+    // remain readable.
+    f.write(kRwGeoMagic5, 8);
     wrPod(f, (uint32_t)positions.size());
     wrPod(f, (uint32_t)indices.size());
-    wrPod(f, (uint32_t)(has_uv ? 1u : 0u));
+    wrPod(f, (uint32_t)((has_uv ? 1u : 0u) | (has_skin ? 2u : 0u)));
     // v3: geometry is NODE-LOCAL; this matrix places it in source-world
     // space (standalone consumers apply it; hierarchical renderers compose
     // the rwhier chain instead).
@@ -1279,7 +1483,22 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
         wrPod(f, s.roughness);
         wrPod(f, (uint32_t)s.tex_rel.size());
         f.write(s.tex_rel.data(), (std::streamsize)s.tex_rel.size());
+        // v5: normal + metallic-roughness refs (empty = none).
+        wrPod(f, (uint32_t)s.nrm_rel.size());
+        f.write(s.nrm_rel.data(), (std::streamsize)s.nrm_rel.size());
+        wrPod(f, (uint32_t)s.mr_rel.size());
+        f.write(s.mr_rel.data(), (std::streamsize)s.mr_rel.size());
     }
+    // Skin joint table (v4): per joint, the hierarchy.rwhier node index
+    // it binds to + the inverse bind matrix.
+    if (has_skin) {
+        wrPod(f, (uint32_t)d.skin_joint_nodes.size());
+        for (size_t j = 0; j < d.skin_joint_nodes.size(); ++j) {
+            wrPod(f, d.skin_joint_nodes[j]);
+            wrPod(f, d.skin_inverse_bind[j]);
+        }
+    }
+
     f.write(reinterpret_cast<const char*>(positions.data()),
             (std::streamsize)(positions.size() * sizeof(glm::vec3)));
     f.write(reinterpret_cast<const char*>(normals.data()),
@@ -1287,6 +1506,12 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     if (has_uv) {
         f.write(reinterpret_cast<const char*>(uvs.data()),
                 (std::streamsize)(uvs.size() * sizeof(glm::vec2)));
+    }
+    if (has_skin) {
+        f.write(reinterpret_cast<const char*>(joints.data()),
+                (std::streamsize)(joints.size() * sizeof(glm::u16vec4)));
+        f.write(reinterpret_cast<const char*>(weights.data()),
+                (std::streamsize)(weights.size() * sizeof(glm::vec4)));
     }
     f.write(reinterpret_cast<const char*>(indices.data()),
             (std::streamsize)(indices.size() * sizeof(uint32_t)));
@@ -1313,9 +1538,14 @@ bool writeRwHier(const std::string& path,
 
 // Public wrapper over the bake-side soup dedup — see header doc.
 void dedupModelVertices(ModelPreviewData& d) {
-    // uvs may legitimately be absent (untextured object) — the helper
+    // uvs / skin attributes may legitimately be absent — the helper
     // tolerates any combination of matching array sizes.
-    dedupSoupVertices(d.positions, d.normals, d.uvs, d.indices);
+    const bool has_skin =
+        d.joints.size() == d.positions.size() &&
+        d.weights.size() == d.positions.size();
+    dedupSoupVertices(d.positions, d.normals, d.uvs, d.indices,
+                      has_skin ? &d.joints : nullptr,
+                      has_skin ? &d.weights : nullptr);
 }
 
 bool loadRwHier(const std::string& path, std::vector<RwHierNode>& out) {
@@ -1355,7 +1585,9 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     if (!f) return false;
     char magic[8];
     if (!f.read(magic, 8)) return false;
-    const bool v3 = std::memcmp(magic, kRwGeoMagic3, 8) == 0;
+    const bool v5 = std::memcmp(magic, kRwGeoMagic5, 8) == 0;
+    const bool v4 = std::memcmp(magic, kRwGeoMagic4, 8) == 0 || v5;
+    const bool v3 = std::memcmp(magic, kRwGeoMagic3, 8) == 0 || v4;
     const bool v2 = std::memcmp(magic, kRwGeoMagic2, 8) == 0;
     const bool v1 = std::memcmp(magic, kRwGeoMagic,  8) == 0;
     if (!v1 && !v2 && !v3) return false;
@@ -1364,9 +1596,10 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     if (!rdPod(f, vc) || !rdPod(f, ic) || !rdPod(f, flags)) return false;
     if (vc == 0 || ic < 3 || vc > 50'000'000u || ic > 150'000'000u)
         return false;
-    const bool has_uv = (flags & 1u) != 0;
+    const bool has_uv   = (flags & 1u) != 0;
+    const bool has_skin = v4 && (flags & 2u) != 0;
 
-    // v3: node-local geometry + the node's world matrix (re-applied below
+    // v3+: node-local geometry + the node's world matrix (re-applied below
     // so standalone consumers keep seeing source-world coordinates).
     glm::mat4 node_to_world(1.0f);
     if (v3 && !rdPod(f, node_to_world)) return false;
@@ -1377,6 +1610,8 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
         glm::vec4 color = glm::vec4(1.0f);
         float metallic = 0.0f, roughness = 0.6f;
         std::string tex_rel;
+        std::string nrm_rel;   // v5
+        std::string mr_rel;    // v5
     };
     std::vector<SecIn> secs;
     if (v2 || v3) {
@@ -1391,6 +1626,15 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
                 return false;
             s.tex_rel.resize(texlen);
             if (texlen && !f.read(s.tex_rel.data(), texlen)) return false;
+            if (v5) {
+                uint32_t nlen = 0, mlen = 0;
+                if (!rdPod(f, nlen)) return false;
+                s.nrm_rel.resize(nlen);
+                if (nlen && !f.read(s.nrm_rel.data(), nlen)) return false;
+                if (!rdPod(f, mlen)) return false;
+                s.mr_rel.resize(mlen);
+                if (mlen && !f.read(s.mr_rel.data(), mlen)) return false;
+            }
         }
     } else {
         SecIn s;
@@ -1405,6 +1649,19 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
         secs.push_back(std::move(s));
     }
 
+    // Skin joint table (v4, has_skin).
+    if (has_skin) {
+        uint32_t jc = 0;
+        if (!rdPod(f, jc) || jc == 0 || jc > 65536u) return false;
+        out.skin_joint_nodes.resize(jc);
+        out.skin_inverse_bind.resize(jc);
+        for (uint32_t j = 0; j < jc; ++j) {
+            if (!rdPod(f, out.skin_joint_nodes[j]) ||
+                !rdPod(f, out.skin_inverse_bind[j]))
+                return false;
+        }
+    }
+
     out.positions.resize(vc);
     out.normals.resize(vc);
     if (!f.read(reinterpret_cast<char*>(out.positions.data()),
@@ -1417,6 +1674,16 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
         out.uvs.resize(vc);
         if (!f.read(reinterpret_cast<char*>(out.uvs.data()),
                     (std::streamsize)(vc * sizeof(glm::vec2))))
+            return false;
+    }
+    if (has_skin) {
+        out.joints.resize(vc);
+        out.weights.resize(vc);
+        if (!f.read(reinterpret_cast<char*>(out.joints.data()),
+                    (std::streamsize)(vc * sizeof(glm::u16vec4))))
+            return false;
+        if (!f.read(reinterpret_cast<char*>(out.weights.data()),
+                    (std::streamsize)(vc * sizeof(glm::vec4))))
             return false;
     }
     out.indices.resize(ic);
@@ -1439,9 +1706,45 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     }
 
     // Textures: group-relative .rwtex files (group = parent of objects/),
-    // dedup'd by relative path.
+    // dedup'd by relative path.  Shared resolver for the albedo / normal /
+    // metallic-roughness refs.
     const fs::path group = fs::path(rwgeo_path).parent_path().parent_path();
     std::unordered_map<std::string, int> tex_cache;
+    auto resolve_tex = [&](const std::string& rel) -> int {
+        if (rel.empty()) return -1;
+        auto it = tex_cache.find(rel);
+        if (it != tex_cache.end()) return it->second;
+        int slot = -1;
+        const std::string tex_path = (group / fs::path(rel)).string();
+        if (decode_textures) {
+            PreviewTexture pt;
+            if (readRwTex(tex_path, pt.w, pt.h, pt.rgba)) {
+                slot = (int)out.textures.size();
+                out.textures.push_back(std::move(pt));
+                if (out_texture_paths)
+                    out_texture_paths->push_back(tex_path);
+            } else {
+                std::cout << "[rwgeo] texture missing: " << tex_path
+                          << std::endl;
+            }
+        } else {
+            // Paths-only mode: reserve the slot (empty entry) so the
+            // index stays valid; the caller loads pixels on cache
+            // misses via readRwTex.
+            std::error_code tec;
+            if (fs::exists(tex_path, tec)) {
+                slot = (int)out.textures.size();
+                out.textures.emplace_back();
+                if (out_texture_paths)
+                    out_texture_paths->push_back(tex_path);
+            } else {
+                std::cout << "[rwgeo] texture missing: " << tex_path
+                          << std::endl;
+            }
+        }
+        tex_cache.emplace(rel, slot);
+        return slot;
+    };
     for (const auto& s : secs) {
         PreviewSection sec;
         sec.first_index = s.first;
@@ -1449,43 +1752,9 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
         sec.base_color  = s.color;
         sec.metallic    = s.metallic;
         sec.roughness   = s.roughness;
-        sec.tex_index   = -1;
-        if (!s.tex_rel.empty()) {
-            auto it = tex_cache.find(s.tex_rel);
-            if (it != tex_cache.end()) {
-                sec.tex_index = it->second;
-            } else {
-                const std::string tex_path =
-                    (group / fs::path(s.tex_rel)).string();
-                if (decode_textures) {
-                    PreviewTexture pt;
-                    if (readRwTex(tex_path, pt.w, pt.h, pt.rgba)) {
-                        sec.tex_index = (int)out.textures.size();
-                        out.textures.push_back(std::move(pt));
-                        if (out_texture_paths)
-                            out_texture_paths->push_back(tex_path);
-                    } else {
-                        std::cout << "[rwgeo] texture missing: " << tex_path
-                                  << std::endl;
-                    }
-                } else {
-                    // Paths-only mode: reserve the slot (empty entry) so
-                    // tex_index stays valid; the caller loads pixels on
-                    // cache misses via readRwTex.
-                    std::error_code tec;
-                    if (fs::exists(tex_path, tec)) {
-                        sec.tex_index = (int)out.textures.size();
-                        out.textures.emplace_back();
-                        if (out_texture_paths)
-                            out_texture_paths->push_back(tex_path);
-                    } else {
-                        std::cout << "[rwgeo] texture missing: " << tex_path
-                                  << std::endl;
-                    }
-                }
-                tex_cache.emplace(s.tex_rel, sec.tex_index);
-            }
-        }
+        sec.tex_index   = resolve_tex(s.tex_rel);
+        sec.nrm_index   = resolve_tex(s.nrm_rel);
+        sec.mr_index    = resolve_tex(s.mr_rel);
         out.sections.push_back(sec);
     }
     if (out.textures.empty()) out.uvs.clear();
@@ -1542,15 +1811,12 @@ bool bakeModelToRenderReady(
 
         // Texture bake cache: glTF image index → textures/<name>.rwtex.
         std::unordered_map<int, std::string> tex_cache;
-        auto bake_gltf_texture = [&](int material_idx) -> std::string {
-            if (material_idx < 0 ||
-                material_idx >= (int)model.materials.size()) return {};
-            const auto& mr =
-                model.materials[material_idx].pbrMetallicRoughness;
-            if (mr.baseColorTexture.index < 0 ||
-                mr.baseColorTexture.index >= (int)model.textures.size())
+        // Bake ONE glTF texture (by texture index) to textures/<name>.rwtex
+        // — used for albedo, normal and metallic-roughness refs alike.
+        auto bake_gltf_texture = [&](int tex_idx) -> std::string {
+            if (tex_idx < 0 || tex_idx >= (int)model.textures.size())
                 return {};
-            const int src = model.textures[mr.baseColorTexture.index].source;
+            const int src = model.textures[tex_idx].source;
             if (src < 0 || src >= (int)model.images.size()) return {};
             auto it = tex_cache.find(src);
             if (it != tex_cache.end()) return it->second;
@@ -1596,10 +1862,49 @@ bool bakeModelToRenderReady(
             ModelPreviewData d;
             std::vector<GeoSectionOut> secs;
             const auto& mesh = model.meshes[model.nodes[i].mesh];
+
+            // Skinned node: extract per-vertex joints/weights and the
+            // skin's joint table (joint → glTF node index, which is
+            // EXACTLY the hierarchy.rwhier node index — the hier below
+            // is written 1:1 in glTF node order — plus the inverse bind
+            // matrix).  The baked .rwgeo then carries everything a
+            // native skinned renderer needs.
+            const int skin_idx = model.nodes[i].skin;
+            const bool node_skinned =
+                skin_idx >= 0 && skin_idx < (int)model.skins.size();
+            if (node_skinned) {
+                const auto& skin = model.skins[skin_idx];
+                d.skin_joint_nodes.assign(skin.joints.begin(),
+                                          skin.joints.end());
+                d.skin_inverse_bind.assign(skin.joints.size(),
+                                           glm::mat4(1.0f));
+                if (skin.inverseBindMatrices >= 0 &&
+                    skin.inverseBindMatrices <
+                        (int)model.accessors.size()) {
+                    const auto& a =
+                        model.accessors[skin.inverseBindMatrices];
+                    if (a.bufferView >= 0 &&
+                        a.bufferView < (int)model.bufferViews.size()) {
+                        const auto& bv = model.bufferViews[a.bufferView];
+                        const auto& bf = model.buffers[bv.buffer];
+                        const float* m = reinterpret_cast<const float*>(
+                            bf.data.data() + bv.byteOffset + a.byteOffset);
+                        const size_t n = std::min(
+                            (size_t)a.count, skin.joints.size());
+                        for (size_t j = 0; j < n; ++j) {
+                            std::memcpy(&d.skin_inverse_bind[j],
+                                        m + j * 16, 16 * sizeof(float));
+                        }
+                    }
+                }
+            }
+
             for (const auto& prim : mesh.primitives) {
                 const uint32_t first = (uint32_t)d.indices.size();
                 appendGltfPrim(model, prim, glm::mat4(1.0f),
-                               d.positions, d.normals, d.uvs, d.indices);
+                               d.positions, d.normals, d.uvs, d.indices,
+                               node_skinned ? &d.joints  : nullptr,
+                               node_skinned ? &d.weights : nullptr);
                 const uint32_t count = (uint32_t)d.indices.size() - first;
                 if (count < 3) continue;
                 GeoSectionOut s;
@@ -1607,7 +1912,18 @@ bool bakeModelToRenderReady(
                 s.index_count = count;
                 gltfMaterialFactors(model, prim.material, s.base_color,
                                     s.metallic, s.roughness);
-                s.tex_rel = bake_gltf_texture(prim.material);
+                s.tex_rel = bake_gltf_texture(
+                    gltfAlbedoTextureIndex(model, prim.material));
+                // Full PBR refs: normal + metallic-roughness maps.
+                if (prim.material >= 0 &&
+                    prim.material < (int)model.materials.size()) {
+                    const auto& m = model.materials[prim.material];
+                    s.nrm_rel = bake_gltf_texture(
+                        m.normalTexture.index);
+                    s.mr_rel = bake_gltf_texture(
+                        m.pbrMetallicRoughness
+                            .metallicRoughnessTexture.index);
+                }
                 secs.push_back(std::move(s));
             }
             if (d.positions.empty() || d.indices.size() < 3 ||
@@ -1759,6 +2075,14 @@ bool bakeModelToRenderReady(
                 fbxMaterialFactors(mats[b], s.base_color, s.metallic,
                                    s.roughness, tex);
                 s.tex_rel = bake_fbx_texture(tex);
+                // Normal map (PBR preview) — ufbx pbr slot first, then
+                // the classic FBX property.
+                if (mats[b]) {
+                    const ufbx_texture* nrm =
+                        mats[b]->pbr.normal_map.texture;
+                    if (!nrm) nrm = mats[b]->fbx.normal_map.texture;
+                    s.nrm_rel = bake_fbx_texture(nrm);
+                }
                 secs.push_back(std::move(s));
             }
             if (d.positions.empty() || d.indices.size() < 3 ||

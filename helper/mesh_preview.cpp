@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <tuple>
 #include <vector>
 
 #include "glm/gtc/matrix_transform.hpp"
@@ -158,6 +160,7 @@ std::shared_ptr<renderer::DescriptorPool>              MeshPreview::s_pool_;
 std::shared_ptr<renderer::TextureInfo>                 MeshPreview::s_color_;
 std::shared_ptr<renderer::TextureInfo>                 MeshPreview::s_depth_;
 std::shared_ptr<renderer::TextureInfo>                 MeshPreview::s_white_tex_;
+std::shared_ptr<renderer::TextureInfo>                 MeshPreview::s_flatnrm_tex_;
 ImTextureID                                            MeshPreview::s_im_id_ = 0;
 bool                                                   MeshPreview::s_has_image_ = false;
 bool                                                   MeshPreview::s_color_in_read_layout_ = false;
@@ -233,13 +236,17 @@ void MeshPreview::initStaticMembers(
         s_attrib_descs_.push_back(attr2);
     }
 
-    // Set 0: binding 0 = base-colour combined image sampler.
+    // Set 0: binding 0 = albedo, 1 = normal map, 2 = metallic-roughness —
+    // full PBR material set per section (fallbacks: white / flat-normal /
+    // white).
     {
-        std::vector<renderer::DescriptorSetLayoutBinding> bindings(1);
-        bindings[0] =
-            renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                0, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-                renderer::DescriptorType::COMBINED_IMAGE_SAMPLER);
+        std::vector<renderer::DescriptorSetLayoutBinding> bindings(3);
+        for (uint32_t b = 0; b < 3; ++b) {
+            bindings[b] =
+                renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                    b, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+                    renderer::DescriptorType::COMBINED_IMAGE_SAMPLER);
+        }
         s_desc_set_layout_ = device->createDescriptorSetLayout(bindings);
     }
     // Sets are allocated on demand (one per texture of the current preview)
@@ -284,6 +291,9 @@ void MeshPreview::initStaticMembers(
     // 1x1 white fallback for untextured meshes.
     const uint8_t white[4] = { 255, 255, 255, 255 };
     s_white_tex_ = createPixelTexture(device, 1, 1, white);
+    // 1x1 flat-normal fallback (+Z tangent space) for unmapped sections.
+    const uint8_t flatn[4] = { 128, 128, 255, 255 };
+    s_flatnrm_tex_ = createPixelTexture(device, 1, 1, flatn);
 
     // Persistent offscreen targets.
     s_color_ = std::make_shared<renderer::TextureInfo>();
@@ -326,6 +336,10 @@ void MeshPreview::destroyStaticMembers(
     s_pool_.reset();
     s_index_count_ = 0;
     if (s_white_tex_) { s_white_tex_->destroy(device); s_white_tex_.reset(); }
+    if (s_flatnrm_tex_) {
+        s_flatnrm_tex_->destroy(device);
+        s_flatnrm_tex_.reset();
+    }
     if (s_color_) { s_color_->destroy(device); s_color_.reset(); }
     if (s_depth_) { s_depth_->destroy(device); s_depth_.reset(); }
     if (s_pipeline_) { device->destroyPipeline(s_pipeline_); s_pipeline_.reset(); }
@@ -460,15 +474,29 @@ void MeshPreview::render(
         return device->createDescriptorSets(
             s_pool_, s_desc_set_layout_, 1)[0];
     };
-    auto bind_texture_set =
-        [&](const std::shared_ptr<renderer::TextureInfo>& tex) -> size_t {
+    // Binds the FULL PBR set: 0 = albedo (white fallback), 1 = normal
+    // map (flat-normal fallback), 2 = metallic-roughness (white).
+    auto bind_material_set =
+        [&](const std::shared_ptr<renderer::TextureInfo>& albedo,
+            const std::shared_ptr<renderer::TextureInfo>& nrm,
+            const std::shared_ptr<renderer::TextureInfo>& mr) -> size_t {
         auto set = acquire_set();
         renderer::WriteDescriptorList writes;
-        writes.reserve(1);
+        writes.reserve(3);
         renderer::Helper::addOneTexture(
             writes, set,
             renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 0,
-            s_sampler_, tex->view,
+            s_sampler_, (albedo ? albedo : s_white_tex_)->view,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::Helper::addOneTexture(
+            writes, set,
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 1,
+            s_sampler_, (nrm ? nrm : s_flatnrm_tex_)->view,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        renderer::Helper::addOneTexture(
+            writes, set,
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 2,
+            s_sampler_, (mr ? mr : s_white_tex_)->view,
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         device->updateDescriptorSets(writes);
         s_active_sets_.push_back(set);
@@ -483,14 +511,17 @@ void MeshPreview::render(
             s_mat_texs_.push_back(nullptr);
         }
     }
-    const size_t white_set = bind_texture_set(s_white_tex_);
-    std::vector<size_t> tex_set(s_mat_texs_.size(), white_set);
-    for (size_t t = 0; t < s_mat_texs_.size(); ++t) {
-        if (s_mat_texs_[t] && s_mat_texs_[t]->view)
-            tex_set[t] = bind_texture_set(s_mat_texs_[t]);
-    }
+    auto tex_at = [&](int idx) -> std::shared_ptr<renderer::TextureInfo> {
+        return (idx >= 0 && idx < (int)s_mat_texs_.size())
+            ? s_mat_texs_[idx] : nullptr;
+    };
+    const size_t white_set =
+        bind_material_set(nullptr, nullptr, nullptr);
 
     // ── Sections (synthesise one default section when none given) ────────
+    // One descriptor set per section with any real texture; sections with
+    // identical (albedo, nrm, mr) triples share a set via this cache.
+    std::map<std::tuple<int, int, int>, size_t> combo_cache;
     if (payload.sections.empty()) {
         GpuSection sec;
         sec.first_index = 0;
@@ -506,11 +537,25 @@ void MeshPreview::render(
             sec.base_color  = ps.base_color;
             sec.metallic    = glm::clamp(ps.metallic,  0.0f, 1.0f);
             sec.roughness   = glm::clamp(ps.roughness, 0.0f, 1.0f);
-            const bool tex_ok = has_uv && ps.tex_index >= 0 &&
-                ps.tex_index < (int)s_mat_texs_.size() &&
-                s_mat_texs_[ps.tex_index];
-            sec.has_tex   = tex_ok;
-            sec.set_index = tex_ok ? tex_set[ps.tex_index] : white_set;
+            const auto albedo = has_uv ? tex_at(ps.tex_index) : nullptr;
+            const auto nrm    = has_uv ? tex_at(ps.nrm_index) : nullptr;
+            const auto mrtex  = has_uv ? tex_at(ps.mr_index)  : nullptr;
+            sec.has_tex = albedo != nullptr;
+            sec.has_nrm = nrm    != nullptr;
+            sec.has_mr  = mrtex  != nullptr;
+            if (!albedo && !nrm && !mrtex) {
+                sec.set_index = white_set;
+            } else {
+                const auto key = std::make_tuple(
+                    albedo ? ps.tex_index : -1,
+                    nrm    ? ps.nrm_index : -1,
+                    mrtex  ? ps.mr_index  : -1);
+                auto it = combo_cache.find(key);
+                sec.set_index = (it != combo_cache.end())
+                    ? it->second
+                    : (combo_cache[key] =
+                           bind_material_set(albedo, nrm, mrtex));
+            }
             s_sections_.push_back(sec);
         }
         if (s_sections_.empty()) {
@@ -705,9 +750,12 @@ void MeshPreview::recordPass(
             renderer::PipelineBindPoint::GRAPHICS,
             s_pipeline_layout_, desc_sets);
         params.base_color_factor = sec.base_color;
+        // pbr_params: x=metallic, y=roughness, z=has albedo map,
+        // w = map flags (bit0 normal map, bit1 metallic-roughness map).
         params.pbr_params = glm::vec4(
             sec.metallic, sec.roughness,
-            sec.has_tex ? 1.0f : 0.0f, 0.0f);
+            sec.has_tex ? 1.0f : 0.0f,
+            (sec.has_nrm ? 1.0f : 0.0f) + (sec.has_mr ? 2.0f : 0.0f));
         cmd_buf->pushConstants(
             SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             s_pipeline_layout_,

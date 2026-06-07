@@ -22,6 +22,11 @@ layout(push_constant) uniform PreviewMeshUniformBufferObject {
 };
 
 layout(set = 0, binding = 0) uniform sampler2D base_color_tex;
+// Full PBR material set — fallbacks are 1x1 flat-normal / white, and the
+// push constant's pbr_params.w flags (bit0 = normal map bound, bit1 =
+// metallic-roughness map bound) gate their use.
+layout(set = 0, binding = 1) uniform sampler2D normal_tex;
+layout(set = 0, binding = 2) uniform sampler2D metal_rough_tex;
 
 layout(location = 0) in vec3 v_world;
 layout(location = 1) in vec3 v_normal;
@@ -97,9 +102,12 @@ void main() {
     const vec3  center = params.center_radius.xyz;
     const float r      = max(params.center_radius.w, 1e-4);
     const vec3  cam    = params.camera_pos.xyz;
-    const float metallic  = params.pbr_params.x;
-    const float roughness = clamp(params.pbr_params.y, 0.03, 1.0);
+    float metallic  = params.pbr_params.x;
+    float roughness = clamp(params.pbr_params.y, 0.03, 1.0);
     const float has_uv    = params.pbr_params.z;
+    const int   map_flags = int(params.pbr_params.w + 0.5);
+    const bool  has_nrm_map = (map_flags & 1) != 0;
+    const bool  has_mr_map  = (map_flags & 2) != 0;
 
     // Base colour: texture (authored sRGB → linearise) x factor.
     vec3 albedo = params.base_color_factor.rgb;
@@ -111,8 +119,38 @@ void main() {
         albedo *= pow(tex.rgb, vec3(2.2));
     }
 
+    // Metallic-roughness map (glTF convention: G = roughness, B = metallic)
+    // multiplies the per-section factors.
+    if (has_uv > 0.5 && has_mr_map) {
+        vec3 mr = texture(metal_rough_tex, v_uv).rgb;
+        roughness = clamp(roughness * mr.g, 0.03, 1.0);
+        metallic  = clamp(metallic * mr.b, 0.0, 1.0);
+    }
+
     vec3 N = normalize(v_normal);
     vec3 V = normalize(cam - v_world);
+
+    // Normal mapping — TBN from screen-space derivatives (the preview
+    // vertex stream has no tangents; derivative reconstruction is plenty
+    // for a 512² inspection view).
+    if (has_uv > 0.5 && has_nrm_map) {
+        vec3 dpdx = dFdx(v_world);
+        vec3 dpdy = dFdy(v_world);
+        vec2 duvx = dFdx(v_uv);
+        vec2 duvy = dFdy(v_uv);
+        vec3 T = dpdx * duvy.y - dpdy * duvx.y;
+        float t_len2 = dot(T, T);
+        if (t_len2 > 1e-12) {
+            T = normalize(T - N * dot(N, T));
+            vec3 B = cross(N, T) *
+                     sign(duvx.x * duvy.y - duvy.x * duvx.y);
+            vec3 nm = texture(normal_tex, v_uv).rgb * 2.0 - 1.0;
+            vec3 mapped = normalize(
+                T * nm.x + B * nm.y + N * max(nm.z, 0.05));
+            if (all(not(isnan(mapped)))) N = mapped;
+        }
+    }
+
     if (dot(N, V) < 0.0) N = -N;        // double-sided preview
 
     // Camera-relative basis for placing the rig.

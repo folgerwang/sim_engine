@@ -6530,6 +6530,20 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
                 drawable_object->textures_.size()) {
             dst_material.base_color_idx_ = sec.tex_index;
         }
+        // v5 bakes carry normal / metallic-roughness refs too — record
+        // them for the future native skinned/forward render (the VT-only
+        // texture entries have no GPU views yet, so the forward shader
+        // feature flags stay off below).
+        if (sec.nrm_index >= 0 &&
+            static_cast<size_t>(sec.nrm_index) <
+                drawable_object->textures_.size()) {
+            dst_material.normal_idx_ = sec.nrm_index;
+        }
+        if (sec.mr_index >= 0 &&
+            static_cast<size_t>(sec.mr_index) <
+                drawable_object->textures_.size()) {
+            dst_material.metallic_roughness_idx_ = sec.mr_index;
+        }
         // Match the FBX path exactly: base.frag has ALPHAMODE_MASK
         // always active with cutoff 0.1 — opaque textures (alpha 1)
         // never trigger the discard, cutout foliage/signs do.

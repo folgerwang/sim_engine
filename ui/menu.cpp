@@ -171,11 +171,16 @@ namespace {
         s.Colors[ImGuiCol_Separator]         = ImVec4(0.35f, 0.30f, 0.18f, 0.60f);
         s.Colors[ImGuiCol_SeparatorHovered]  = gold_dim;
         s.Colors[ImGuiCol_SeparatorActive]   = gold;
-        s.Colors[ImGuiCol_Tab]               = ImVec4(0.08f, 0.08f, 0.15f, 1.00f);
-        s.Colors[ImGuiCol_TabHovered]        = gold_dim;
-        s.Colors[ImGuiCol_TabActive]         = ImVec4(0.14f, 0.14f, 0.22f, 1.00f);
-        s.Colors[ImGuiCol_TabUnfocused]      = ImVec4(0.05f, 0.06f, 0.12f, 1.00f);
-        s.Colors[ImGuiCol_TabUnfocusedActive]= ImVec4(0.10f, 0.10f, 0.18f, 1.00f);
+        // Tabs: SOLID, clearly visible backgrounds — the previous values
+        // were so close to the window bg that tab strips read as bare
+        // text floating over the viewport.  Selected tab = muted gold
+        // block; UNSELECTED tabs = noticeably brighter raised indigo so
+        // they separate from the panel/menu background at a glance.
+        s.Colors[ImGuiCol_Tab]               = ImVec4(0.22f, 0.22f, 0.34f, 1.00f);
+        s.Colors[ImGuiCol_TabHovered]        = ImVec4(0.42f, 0.35f, 0.18f, 1.00f);
+        s.Colors[ImGuiCol_TabActive]         = ImVec4(0.33f, 0.27f, 0.14f, 1.00f);
+        s.Colors[ImGuiCol_TabUnfocused]      = ImVec4(0.19f, 0.19f, 0.30f, 1.00f);
+        s.Colors[ImGuiCol_TabUnfocusedActive]= ImVec4(0.26f, 0.22f, 0.15f, 1.00f);
         s.Colors[ImGuiCol_ResizeGrip]        = ImVec4(0.35f, 0.30f, 0.18f, 0.40f);
         s.Colors[ImGuiCol_ResizeGripHovered] = gold_dim;
         s.Colors[ImGuiCol_ResizeGripActive]  = gold;
@@ -1124,13 +1129,115 @@ bool Menu::draw(
         hfg->PushClipRect(hvp_pos,
             ImVec2(hvp_pos.x + hsw, hvp_pos.y + hsh), true);
 
+        // ── Scene-camera frustum gizmo ───────────────────────────────────
+        // Selecting a camera object (.rwcam row) draws a wireframe frustum
+        // pyramid + up-triangle at the camera's pose so the captured view
+        // point/direction is visible in the scene.
+        const bool cam_selected =
+            editor_selected_ >= 0 &&
+            editor_selected_ < (int)editor_objects_.size() &&
+            editor_objects_[editor_selected_].is_camera &&
+            editor_objects_[editor_selected_].scene_xform;
+        // Suppress the gizmo while looking THROUGH this camera (view eye
+        // at/near the camera position — the frustum would hang right in
+        // front of the lens): apex clip-w ≈ view-space depth.
+        bool cam_gizmo_visible = cam_selected;
+        if (cam_selected) {
+            const glm::vec4 apex_cc = player_view_proj_ * glm::vec4(
+                editor_objects_[editor_selected_].scene_xform->translation,
+                1.0f);
+            if (apex_cc.w > -0.75f && apex_cc.w < 0.75f)
+                cam_gizmo_visible = false;
+        }
+        if (cam_gizmo_visible) {
+            const auto& xf = *editor_objects_[editor_selected_].scene_xform;
+            const glm::vec3 cpos = xf.translation;
+            const glm::mat3 R   = glm::mat3_cast(xf.rotation);
+            const glm::vec3 cr  = R[0];           // right
+            const glm::vec3 cu  = R[1];           // up
+            const glm::vec3 cf  = -R[2];          // forward (looks down -Z)
+
+            // Compact frustum: 0.6 m deep, 60° vertical FOV, 16:9.
+            const float dist = 0.6f;
+            const float hh   = dist * std::tan(glm::radians(60.0f * 0.5f));
+            const float hw   = hh * (16.0f / 9.0f);
+            const glm::vec3 c  = cpos + cf * dist;
+            const glm::vec3 q0 = c - cr * hw - cu * hh;
+            const glm::vec3 q1 = c + cr * hw - cu * hh;
+            const glm::vec3 q2 = c + cr * hw + cu * hh;
+            const glm::vec3 q3 = c - cr * hw + cu * hh;
+            // "Up" indicator triangle above the far rect.
+            const glm::vec3 t0 = c - cr * hw * 0.35f + cu * hh;
+            const glm::vec3 t1 = c + cr * hw * 0.35f + cu * hh;
+            const glm::vec3 t2 = c + cu * hh * 1.55f;
+
+            constexpr float kWEps = 1e-3f;
+            auto camToPx = [&](const glm::vec3& wp, ImVec2& out) -> bool {
+                glm::vec4 cc = player_view_proj_ * glm::vec4(wp, 1.0f);
+                if (cc.w < kWEps) return false;
+                glm::vec3 ndc = glm::vec3(cc) / cc.w;
+                out = ImVec2((ndc.x * 0.5f + 0.5f) * hsw + hvp_pos.x,
+                             (ndc.y * 0.5f + 0.5f) * hsh + hvp_pos.y);
+                return true;
+            };
+            auto camLine = [&](const glm::vec3& a, const glm::vec3& b,
+                               ImU32 col, float th) {
+                ImVec2 pa, pb;
+                if (camToPx(a, pa) && camToPx(b, pb))
+                    hfg->AddLine(pa, pb, col, th);
+            };
+            // Pulsing, fully bright cyan + a translucent fill on the far
+            // rect so the gizmo pops against any scene content.
+            const int   cam_a  = 200 + (int)(55.0f * pulse);
+            const ImU32 kCam     = IM_COL32(0, 220, 255, cam_a);
+            const ImU32 kCamFill = IM_COL32(0, 220, 255, 60);
+            const ImU32 kCamUp   = IM_COL32(255, 190, 50, cam_a);
+            // Translucent far-rect + up-triangle fills.
+            {
+                ImVec2 p0, p1, p2, p3;
+                if (camToPx(q0, p0) && camToPx(q1, p1) &&
+                    camToPx(q2, p2) && camToPx(q3, p3)) {
+                    const ImVec2 quad[4] = { p0, p1, p2, p3 };
+                    hfg->AddConvexPolyFilled(quad, 4, kCamFill);
+                }
+                ImVec2 u0, u1, u2;
+                if (camToPx(t0, u0) && camToPx(t1, u1) && camToPx(t2, u2)) {
+                    hfg->AddTriangleFilled(u0, u1, u2,
+                                           IM_COL32(255, 190, 50, 150));
+                }
+            }
+            // Apex → far corners.
+            camLine(cpos, q0, kCam, 3.0f);
+            camLine(cpos, q1, kCam, 3.0f);
+            camLine(cpos, q2, kCam, 3.0f);
+            camLine(cpos, q3, kCam, 3.0f);
+            // Far rectangle.
+            camLine(q0, q1, kCam, 3.0f);
+            camLine(q1, q2, kCam, 3.0f);
+            camLine(q2, q3, kCam, 3.0f);
+            camLine(q3, q0, kCam, 3.0f);
+            // Up triangle outline.
+            camLine(t0, t1, kCamUp, 3.0f);
+            camLine(t1, t2, kCamUp, 3.0f);
+            camLine(t2, t0, kCamUp, 3.0f);
+            // Filled apex dot + ring so the camera position reads from any
+            // angle (and from behind, where the frustum is nearly edge-on).
+            ImVec2 apx;
+            if (camToPx(cpos, apx)) {
+                hfg->AddCircleFilled(apx, 5.0f, kCam, 12);
+                hfg->AddCircle(apx, 9.0f, kCam, 16, 2.5f);
+            }
+        }
+
         // Preferred: the EXACT silhouette mask (CPU-rasterised this object from
         // the camera).  It already fills the viewport (rendered at the camera
         // view), so draw it 1:1 over the viewport rect.  Falls back to the
         // convex-hull outline, then the bounding box, when no mask is ready.
         std::vector<ImVec2> hull;
         glm::vec3 hb_min, hb_max;
-        if (sel_mask_id_) {
+        if (cam_selected) {
+            // Camera gizmo already drawn — skip the mask/hull/bbox path.
+        } else if (sel_mask_id_) {
             hfg->AddImage(sel_mask_id_, hvp_pos,
                 ImVec2(hvp_pos.x + hsw, hvp_pos.y + hsh));
         } else if (selectedScreenHull(hull)) {
@@ -1901,6 +2008,13 @@ bool Menu::draw(
                 scene_node_active_    = true;   // surface the scene node in
                                                 // the Outliner immediately
             }
+            // Capture the CURRENT editor view (position + facing) as a
+            // scene camera: writes content/cameras/<name>.rwcam and adds
+            // a camera object to the Outliner under World.
+            if (ImGui::MenuItem("Create Camera Here")) {
+                camera_create_request_ = true;
+                scene_node_active_     = true;
+            }
             ImGui::MenuItem("Show Grid", NULL, &show_scene_grid_);
             ImGui::Separator();
             if (ImGui::MenuItem("Import Model...")) { scene_import_request_ = true; }
@@ -1922,32 +2036,8 @@ bool Menu::draw(
             ImGui::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Game Objects"))
-        {
-            // (The legacy "Spawn player" menu item was removed: the
-            // player is now eager-loaded at application startup with
-            // a single asset, so an on-demand spawn would either
-            // reload the same rig or substitute a different asset
-            // whose joint names PlayerController doesn't know how to
-            // pose.  Use "Reset player position" below to re-snap the
-            // existing character to the current camera view.)
-
-            // Recovery option for the "I can't find my character" case:
-            // re-anchors the player to a point in front of the
-            // current camera, on the ground.  Cheap to invoke — just
-            // sets a flag the application drains and forwards to
-            // PlayerController::spawnAt().  See the menu's
-            // reset_player_position_requested_ field for details.
-            if (ImGui::MenuItem("Reset player position", NULL)) {
-                reset_player_position_requested_ = true;
-            }
-
-            if (ImGui::MenuItem("Load gltf", NULL)) {
-                s_select_load_gltf = true;
-            }
-
-            ImGui::EndMenu();
-        }
+        // ("Game Objects" menu removed — player objects are now authored
+        // scene objects: right-click the viewport → "Add Player Object".)
 
         // ── Physics menu ─────────────────────────────────────────────────
         // Collects toggles related to the static-mesh CollisionWorld and
@@ -3854,6 +3944,49 @@ void Menu::drawEditorDockSpace() {
         }
         drag_asset_path_.clear();
     }
+
+    // ── Viewport right-click context menu ────────────────────────────────
+    // The viewport is the pass-through central dock node (no ImGui window),
+    // so the popup is opened manually: a right-button CLICK (release within
+    // a few pixels of the press — drags are camera-look) over the viewport
+    // and not over any panel.
+    if (editor_enabled_) {
+        const ImGuiIO& vio = ImGui::GetIO();
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            viewport_rclick_pos_ = vio.MousePos;
+        }
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+            !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
+            !ImGui::IsAnyItemHovered()) {
+            ImVec2 vp_pos, vp_size, vp_c;
+            getViewportScreenRect(vp_pos, vp_size, vp_c);
+            const ImVec2 m = vio.MousePos;
+            const float dx = m.x - viewport_rclick_pos_.x;
+            const float dy = m.y - viewport_rclick_pos_.y;
+            const bool in_viewport =
+                m.x >= vp_pos.x && m.x < vp_pos.x + vp_size.x &&
+                m.y >= vp_pos.y && m.y < vp_pos.y + vp_size.y;
+            if (in_viewport && (dx * dx + dy * dy) < 16.0f) {
+                ImGui::OpenPopup("##viewport_ctx");
+            }
+        }
+        if (ImGui::BeginPopup("##viewport_ctx")) {
+            // Capture the CURRENT editor view as a scene camera (same as
+            // Scene menu → Create Camera Here).
+            if (ImGui::MenuItem("Add Camera Object")) {
+                camera_create_request_ = true;
+                scene_node_active_     = true;
+            }
+            // Player object: organizational node + skeleton-mesh child
+            // (the character imported in the Content Browser's player
+            // folder), placed in front of the camera.
+            if (ImGui::MenuItem("Add Player Object")) {
+                player_create_request_ = true;
+                scene_node_active_     = true;
+            }
+            ImGui::EndPopup();
+        }
+    }
 }
 
 void Menu::drawOutlinerPanel() {
@@ -3910,8 +4043,12 @@ void Menu::drawOutlinerPanel() {
                                         ImGuiTreeNodeFlags_SpanAvailWidth;
             if (editor_selected_ == i && editor_selected_child_ < 0)
                 gflags |= ImGuiTreeNodeFlags_Selected;
+            // NAME-keyed ID (not index): adding/removing rows shifts
+            // indices, and an index-keyed ID would make ImGui see a
+            // "new" node and reopen it (DefaultOpen) — losing the
+            // user's collapse state whenever the scene changes.
             const std::string glabel = base + "  (" +
-                std::to_string(kids.size()) + ")##grp" + std::to_string(i);
+                std::to_string(kids.size()) + ")##grp_" + base;
             // Revealing a pick-selected sub-object: force its group open.
             if (editor_scroll_to_selected_ && editor_selected_ == i &&
                 editor_selected_child_ >= 0)
@@ -4020,12 +4157,17 @@ void Menu::drawOutlinerPanel() {
                         if (editor_selected_ == i &&
                             editor_selected_child_ < 0)
                             gflags2 |= ImGuiTreeNodeFlags_Selected;
+                        // NAME-keyed ID — index-keyed IDs reopened
+                        // collapsed groups whenever rows were added
+                        // (e.g. creating a camera object).
+                        const std::string gname2 =
+                            editor_objects_[i].name.empty()
+                                ? std::string("Group")
+                                : editor_objects_[i].name;
                         const std::string glabel2 =
-                            (editor_objects_[i].name.empty()
-                                 ? std::string("Group")
-                                 : editor_objects_[i].name) +
-                            "  (" + std::to_string(group_kids.size()) +
-                            ")##sgrp" + std::to_string(i);
+                            gname2 + "  (" +
+                            std::to_string(group_kids.size()) +
+                            ")##sgrp_" + gname2;
                         const bool gopen =
                             ImGui::TreeNodeEx(glabel2.c_str(), gflags2);
                         if (ImGui::IsItemClicked() &&
@@ -4472,6 +4614,24 @@ void Menu::updateSelectionMask() {
 void Menu::requestEditorFocus(int obj_idx, int child_idx) {
     editor_selected_       = obj_idx;
     editor_selected_child_ = child_idx;
+
+    // Double-clicking a CAMERA object looks THROUGH it: stage the camera's
+    // exact pose for the app to snap the view camera to (instead of the
+    // orbit-the-bbox focus used for meshes).
+    if (obj_idx >= 0 && obj_idx < (int)editor_objects_.size() &&
+        editor_objects_[obj_idx].is_camera &&
+        editor_objects_[obj_idx].scene_xform) {
+        const auto& xf = *editor_objects_[obj_idx].scene_xform;
+        const glm::mat3 R = glm::mat3_cast(xf.rotation);
+        editor_campose_pos_     = xf.translation;
+        editor_campose_dir_     = -R[2];   // camera looks down local -Z
+        editor_campose_follow_  =
+            editor_objects_[obj_idx].follow_link
+                ? *editor_objects_[obj_idx].follow_link : -1;
+        editor_campose_pending_ = true;
+        return;
+    }
+
     glm::vec3 bmin, bmax;
     if (!selectedWorldAabb(bmin, bmax)) return;
     editor_focus_center_ = (bmin + bmax) * 0.5f;
@@ -4590,6 +4750,138 @@ void Menu::drawDetailsContent() {
                 o.scene_xform->rotation    = glm::quat(glm::radians(euler_deg));
                 o.scene_xform->scale       = scl;
                 scene_xform_dirty_ = true;
+            }
+
+            // ── Player: skeleton-mesh assignment ──────────────────────
+            // Players are created EMPTY; pick a character (imported into
+            // the Content Browser's player folder) here to attach it —
+            // or None to detach.  Mirrors the camera's Follow link.
+            if (o.is_player) {
+                ImGui::SeparatorText("Player");
+                std::string cur = "None";
+                for (const auto& ce : editor_objects_) {
+                    if (ce.in_scene && ce.parent == editor_selected_) {
+                        cur = ce.name;
+                        break;
+                    }
+                }
+                if (ImGui::BeginCombo("Skeleton Mesh", cur.c_str())) {
+                    if (ImGui::Selectable("None", cur == "None")) {
+                        player_mesh_assign_pending_ = true;
+                        player_mesh_assign_idx_  = o.scene_index;
+                        player_mesh_assign_path_.clear();
+                    }
+                    // Characters under content/player/ (import.rwmeta
+                    // with type=character).  Bake-only imports record the
+                    // ORIGINAL model in source= (no copy in content);
+                    // older imports carried a copied main= file.
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    for (auto& e :
+                         fs::directory_iterator("content/player", ec)) {
+                        if (!e.is_directory(ec)) continue;
+                        std::ifstream meta(
+                            (e.path() / "import.rwmeta").string());
+                        if (!meta) continue;
+                        std::string line, main_file, source_file;
+                        bool is_char = false;
+                        while (std::getline(meta, line)) {
+                            if (line == "type=character") is_char = true;
+                            else if (line.rfind("main=", 0) == 0)
+                                main_file = line.substr(5);
+                            else if (line.rfind("source=", 0) == 0)
+                                source_file = line.substr(7);
+                        }
+                        std::string model_path;
+                        if (!main_file.empty())
+                            model_path = (e.path() / main_file).string();
+                        else if (!source_file.empty())
+                            model_path = source_file;
+                        if (!is_char || model_path.empty()) continue;
+                        const std::string label =
+                            e.path().filename().string();
+                        if (ImGui::Selectable(label.c_str(),
+                                              cur.rfind(label, 0) == 0)) {
+                            player_mesh_assign_pending_ = true;
+                            player_mesh_assign_idx_  = o.scene_index;
+                            player_mesh_assign_path_ = model_path;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                // The mesh slot is ALSO a drag-drop target: drag a
+                // character (its group folder or the model file) from
+                // the Content Browser straight onto the combo.
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* pl =
+                            ImGui::AcceptDragDropPayload(
+                                "RW_CONTENT_ASSET")) {
+                        std::string p((const char*)pl->Data);
+                        namespace fs = std::filesystem;
+                        std::error_code ec;
+                        if (fs::is_directory(p, ec)) {
+                            // Group folder → resolve the character's
+                            // model: copied main= (legacy) or the
+                            // original source= (bake-only imports).
+                            std::ifstream meta(
+                                (fs::path(p) / "import.rwmeta").string());
+                            std::string line, main_file, source_file;
+                            bool is_char = false;
+                            while (meta && std::getline(meta, line)) {
+                                if (line == "type=character")
+                                    is_char = true;
+                                else if (line.rfind("main=", 0) == 0)
+                                    main_file = line.substr(5);
+                                else if (line.rfind("source=", 0) == 0)
+                                    source_file = line.substr(7);
+                            }
+                            if (is_char && !main_file.empty())
+                                p = (fs::path(p) / main_file).string();
+                            else if (is_char && !source_file.empty())
+                                p = source_file;
+                            else
+                                p.clear();
+                        }
+                        if (!p.empty()) {
+                            player_mesh_assign_pending_ = true;
+                            player_mesh_assign_idx_  = o.scene_index;
+                            player_mesh_assign_path_ = p;
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                ImGui::TextDisabled(
+                    "(pick above or drag a character onto the slot)");
+            }
+
+            // ── Camera: follow-target link ────────────────────────────
+            // Points the camera at a player object.  Linked → looking
+            // through this camera follows the player; empty → the camera
+            // is a free view pose.
+            if (o.is_camera && o.follow_link) {
+                ImGui::SeparatorText("Camera");
+                std::string cur_label = "None (free)";
+                for (const auto& pe : editor_objects_) {
+                    if (pe.is_player && pe.scene_index == *o.follow_link) {
+                        cur_label = pe.name;
+                        break;
+                    }
+                }
+                if (ImGui::BeginCombo("Follow", cur_label.c_str())) {
+                    if (ImGui::Selectable("None (free)",
+                                          *o.follow_link < 0)) {
+                        *o.follow_link = -1;
+                    }
+                    for (const auto& pe : editor_objects_) {
+                        if (!pe.is_player || pe.scene_index < 0) continue;
+                        const bool sel =
+                            (pe.scene_index == *o.follow_link);
+                        if (ImGui::Selectable(pe.name.c_str(), sel)) {
+                            *o.follow_link = pe.scene_index;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
             }
         } else {
             ImGui::TextDisabled("(no drawable bound)");
@@ -5282,6 +5574,11 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // Exploded sub-object reference asset (one object of a
                 // multi-object import) — placeable + previewable.
                 const bool is_object = (ext == ".rwobj");
+                // Baked render-ready geometry (objects/NNN.rwgeo) —
+                // previewable directly.  Character (bake-only) imports
+                // have no .rwobj refs, so this is how their skeleton
+                // meshes preview in the Debug Display.
+                const bool is_geo = (ext == ".rwgeo");
                 // Import GROUP folder (holds import.rwmeta + .rwobj files):
                 // placeable as a whole — every object, original layout.
                 bool is_group_dir = false;
@@ -5305,10 +5602,12 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     const ImVec4 c = is_dir    ? ImVec4(0.24f, 0.31f, 0.45f, 1.0f)
                                    : is_model  ? ImVec4(0.28f, 0.40f, 0.27f, 1.0f)
                                    : is_object ? ImVec4(0.33f, 0.30f, 0.42f, 1.0f)
+                                   : is_geo    ? ImVec4(0.30f, 0.36f, 0.42f, 1.0f)
                                                : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, c);
                     std::string glyph = is_dir    ? "DIR"
                                       : is_object ? "OBJ"
+                                      : is_geo    ? "GEO"
                         : (ext.size() > 1 ? ext.substr(1) : "?");
                     for (auto& ch : glyph) ch = (char)std::toupper((unsigned char)ch);
                     clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
@@ -5345,6 +5644,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 } else if (is_content && is_model) {
                     tile_selected =
                         (dbg_asset_key_ == e.path().string() + "#-1");
+                } else if (is_content && is_geo) {
+                    tile_selected =
+                        (dbg_asset_key_ == e.path().string() + "#geo");
                 }
                 if (tile_selected) {
                     const ImVec2 ra = ImGui::GetItemRectMin();
@@ -5400,6 +5702,8 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 } else if (clicked && is_content && is_object) {
                     // Prefers the baked .rwgeo/.rwtex render-ready data.
                     buildRwObjPreview(e.path().string(), name);
+                } else if (clicked && is_content && is_geo) {
+                    buildRwGeoPreview(e.path().string(), name);
                 }
 
                 if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
@@ -5956,6 +6260,8 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
         ms.metallic    = s.metallic;
         ms.roughness   = s.roughness;
         ms.tex_index   = s.tex_index;
+        ms.nrm_index   = s.nrm_index;
+        ms.mr_index    = s.mr_index;
         p.sections.push_back(ms);
     }
     stagePreviewPayload(std::move(p));
@@ -5974,6 +6280,47 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
 // .rwobj object preview — prefers the render-ready bake (.rwgeo + .rwtex
 // under the group folder, written at import) and only re-parses the source
 // model when no baked data exists.
+// Preview a baked .rwgeo directly (no .rwobj ref needed) — how the
+// bake-only character imports' skeleton meshes show in the Debug Display.
+void Menu::buildRwGeoPreview(const std::string& rwgeo_path,
+                             const std::string& display_name) {
+    const std::string key = rwgeo_path + "#geo";
+    if (key == dbg_asset_key_) return;   // already showing
+    engine::helper::ModelPreviewData data;
+    if (!engine::helper::loadRwGeo(rwgeo_path, data)) {
+        EditorLog::get().push(
+            "[preview] baked geometry unreadable: " + rwgeo_path);
+        return;
+    }
+    engine::helper::MeshPreviewPayload p;
+    p.positions = std::move(data.positions);
+    p.normals   = std::move(data.normals);
+    p.uvs       = std::move(data.uvs);
+    p.indices   = std::move(data.indices);
+    for (auto& t : data.textures) {
+        engine::helper::MeshPreviewTexture mt;
+        mt.rgba = std::move(t.rgba);
+        mt.w = t.w;
+        mt.h = t.h;
+        p.textures.push_back(std::move(mt));
+    }
+    for (const auto& s : data.sections) {
+        engine::helper::MeshPreviewSection ms;
+        ms.first_index = s.first_index;
+        ms.index_count = s.index_count;
+        ms.base_color  = s.base_color;
+        ms.metallic    = s.metallic;
+        ms.roughness   = s.roughness;
+        ms.tex_index   = s.tex_index;
+        ms.nrm_index   = s.nrm_index;
+        ms.mr_index    = s.mr_index;
+        p.sections.push_back(ms);
+    }
+    stagePreviewPayload(std::move(p));
+    finishAssetPreview(key, display_name);
+    preview_nav_ = PreviewNav::None;
+}
+
 void Menu::buildRwObjPreview(const std::string& rwobj_path,
                              const std::string& fallback_name) {
     std::string src, name, geo;
@@ -6010,6 +6357,8 @@ void Menu::buildRwObjPreview(const std::string& rwobj_path,
                 ms.metallic    = s.metallic;
                 ms.roughness   = s.roughness;
                 ms.tex_index   = s.tex_index;
+                ms.nrm_index   = s.nrm_index;
+                ms.mr_index    = s.mr_index;
                 p.sections.push_back(ms);
             }
             stagePreviewPayload(std::move(p));

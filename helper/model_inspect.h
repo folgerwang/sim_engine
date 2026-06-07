@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/type_precision.hpp>   // glm::u16vec4 (skin joint indices)
 
 namespace engine {
 namespace helper {
@@ -42,7 +43,9 @@ struct PreviewSection {
     glm::vec4 base_color  = glm::vec4(1.0f);
     float     metallic    = 0.0f;
     float     roughness   = 0.6f;
-    int       tex_index   = -1;  // into ModelPreviewData::textures, -1 none
+    int       tex_index   = -1;  // albedo, into ModelPreviewData::textures
+    int       nrm_index   = -1;  // normal map (-1 = none)
+    int       mr_index    = -1;  // metallic-roughness map (glTF G=rough B=metal)
 };
 struct ModelPreviewData {
     std::vector<glm::vec3>      positions;
@@ -51,6 +54,18 @@ struct ModelPreviewData {
     std::vector<uint32_t>       indices;
     std::vector<PreviewTexture> textures;  // dedup'd across sections
     std::vector<PreviewSection> sections;  // >= 1 after a successful load
+
+    // ── Skinned meshes only (empty otherwise) ─────────────────────────
+    // Per-vertex skinning data, parallel to `positions`: 4 joint indices
+    // (into the skin table below) + 4 normalized weights.
+    std::vector<glm::u16vec4>   joints;
+    std::vector<glm::vec4>      weights;
+    // Skin table: per joint, the node it binds to (index into the
+    // group's hierarchy.rwhier node array — glTF node order) and the
+    // inverse bind matrix.  Together with joints/weights this is the
+    // complete data a native skinned renderer needs.
+    std::vector<int32_t>        skin_joint_nodes;
+    std::vector<glm::mat4>      skin_inverse_bind;
 };
 
 // CPU-only preview load (Debug Display): fills world-space triangles +
@@ -71,6 +86,18 @@ bool loadModelPreviewData(const std::string& path, int sub_index,
 // are not listed.
 std::vector<std::pair<std::string, std::string>>
 listModelTextureDependencies(const std::string& path);
+
+// True when the model contains a skin (skeleton-driven deformation):
+// glTF skins / FBX skin deformers.  Skinned models are CHARACTER assets —
+// the static render-ready bake would freeze them, so the import copies
+// them source-form instead.
+bool modelHasSkin(const std::string& path);
+
+// All external files the model needs to load from a copied location:
+// listModelTextureDependencies PLUS (for .gltf) the binary buffer files
+// (.bin).  Same {dst_relative, src_absolute} pair convention.
+std::vector<std::pair<std::string, std::string>>
+listModelFileDependencies(const std::string& path);
 
 // Decode the top mip of a .dds file to RGBA8 (DXT1/3/5 + 32bpp
 // uncompressed).  Returns false for DX10/BC7 and exotic formats.  Shared by

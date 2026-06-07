@@ -48,6 +48,19 @@ struct EditorSceneObject {
     // Details panel edits this directly — moving/rotating the whole group;
     // the app re-composes children when the menu reports a change.
     engine::scene::Transform*            scene_xform = nullptr;
+    // Scene camera row (.rwcam asset): no drawable; selecting it draws a
+    // frustum gizmo at scene_xform's pose in the viewport.
+    bool                                 is_camera = false;
+    // Player object row (.rwplayer marker): an organizational node whose
+    // child row holds the skeleton-mesh drawable.
+    bool                                 is_player = false;
+    // This row's index within the app's scene_.objects (-1 for non-scene
+    // rows) — the value camera "follow" links store.
+    int                                  scene_index = -1;
+    // Camera rows only: borrowed pointer to the link slot in the app's
+    // scene object (scene index of the followed player object, -1 =
+    // none → free camera).  The Details panel edits it directly.
+    int32_t*                             follow_link = nullptr;
 };
 
 // Game-level state machine driven by the title-screen menu.
@@ -521,6 +534,14 @@ public:
     bool scene_save_request_   = false;
     bool scene_load_request_   = false;
     bool scene_create_request_ = false;  // "Create Scene" (empty + grid)
+    bool camera_create_request_ = false; // "Create Camera Here" (view pose)
+    bool player_create_request_ = false; // "Add Player Object"
+    // Player "Skeleton Mesh" assignment (Details combo): scene index of
+    // the player row + the character model path ("" = clear the mesh).
+    bool        player_mesh_assign_pending_ = false;
+    int         player_mesh_assign_idx_     = -1;
+    std::string player_mesh_assign_path_;
+    ImVec2 viewport_rclick_pos_ = ImVec2(0, 0);  // right-press pos (click vs drag)
     bool show_scene_grid_      = false;  // reference grid / ruler visible
     // True once a scene has been created or loaded this session — makes the
     // Outliner show the scene node (named scene_name_buf_) under "World".
@@ -545,6 +566,11 @@ public:
     bool         editor_focus_pending_ = false;
     glm::vec3    editor_focus_center_  = glm::vec3(0.0f);
     float        editor_focus_radius_  = 1.0f;
+    // "View through scene camera" (double-click on a camera object).
+    bool         editor_campose_pending_ = false;
+    glm::vec3    editor_campose_pos_     = glm::vec3(0.0f);
+    glm::vec3    editor_campose_dir_     = glm::vec3(0.0f, 0.0f, 1.0f);
+    int          editor_campose_follow_  = -1;   // linked player scene idx
     // World-space AABB of the currently-selected object (group) or sub-object
     // node.  Returns false if nothing valid/ready is selected.
     bool selectedWorldAabb(glm::vec3& bmin, glm::vec3& bmax);
@@ -564,6 +590,20 @@ public:
         editor_focus_pending_ = false;
         center = editor_focus_center_;
         radius = editor_focus_radius_;
+        return true;
+    }
+    // App consumes a pending "view through scene camera" request (Outliner
+    // double-click on a camera object): the view camera snaps to the
+    // camera object's exact position + forward direction.
+    // follow_scene_idx = scene index of the linked player object (-1 =
+    // free camera) — the app keeps the view tracking that player.
+    bool takeEditorCameraPose(glm::vec3& pos, glm::vec3& dir,
+                              int& follow_scene_idx) {
+        if (!editor_campose_pending_) return false;
+        editor_campose_pending_ = false;
+        pos = editor_campose_pos_;
+        dir = editor_campose_dir_;
+        follow_scene_idx = editor_campose_follow_;
         return true;
     }
 
@@ -619,6 +659,10 @@ public:
     // data; falls back to parsing the source model.
     void buildRwObjPreview(const std::string& rwobj_path,
                            const std::string& fallback_name);
+    // Direct .rwgeo preview (no .rwobj ref) — bake-only character
+    // imports' skeleton meshes preview through this.
+    void buildRwGeoPreview(const std::string& rwgeo_path,
+                           const std::string& display_name);
     // Arrow-key navigation between sibling objects — callable from BOTH the
     // Debug Display panel and the Content Browser grid (whichever has
     // focus), so arrows always move the selection, never scroll the panel.
@@ -889,6 +933,28 @@ public:
     bool consumeCreateSceneRequest() {
         if (scene_create_request_) { scene_create_request_ = false; return true; }
         return false;
+    }
+    // "Create Camera Here": the app captures the CURRENT editor view
+    // (position + facing) into a camera scene object (Outliner).
+    bool consumeCreateCameraRequest() {
+        if (camera_create_request_) { camera_create_request_ = false; return true; }
+        return false;
+    }
+    // "Add Player Object": the app creates an EMPTY player scene object
+    // in front of the camera; the skeleton mesh is assigned afterwards
+    // via the Details panel (consumePlayerMeshAssign below).
+    bool consumeCreatePlayerRequest() {
+        if (player_create_request_) { player_create_request_ = false; return true; }
+        return false;
+    }
+    // Player "Skeleton Mesh" assignment from the Details combo.
+    // out_path empty = detach the current mesh.
+    bool consumePlayerMeshAssign(int& out_scene_idx, std::string& out_path) {
+        if (!player_mesh_assign_pending_) return false;
+        player_mesh_assign_pending_ = false;
+        out_scene_idx = player_mesh_assign_idx_;
+        out_path = player_mesh_assign_path_;
+        return true;
     }
     // Persistent toggle: whether the editor reference grid / ruler is drawn.
     // Enabled automatically when "Create Scene" is chosen; the user can also

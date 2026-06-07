@@ -41,7 +41,9 @@ struct MeshPreviewSection {
     glm::vec4 base_color  = glm::vec4(1.0f);
     float     metallic    = 0.0f;
     float     roughness   = 0.6f;
-    int       tex_index   = -1;  // into MeshPreviewPayload::textures
+    int       tex_index   = -1;  // albedo, into MeshPreviewPayload::textures
+    int       nrm_index   = -1;  // normal map (-1 = none)
+    int       mr_index    = -1;  // metallic-roughness map (G=rough, B=metal)
 };
 struct MeshPreviewPayload {
     std::vector<glm::vec3>          positions;
@@ -129,6 +131,7 @@ private:
     static std::shared_ptr<renderer::TextureInfo>  s_color_;
     static std::shared_ptr<renderer::TextureInfo>  s_depth_;
     static std::shared_ptr<renderer::TextureInfo>  s_white_tex_;   // 1x1 fallback
+    static std::shared_ptr<renderer::TextureInfo>  s_flatnrm_tex_; // 1x1 (128,128,255)
     static ImTextureID                             s_im_id_;
     static bool                                    s_has_image_;
     static bool                                    s_color_in_read_layout_;
@@ -151,6 +154,8 @@ private:
         float     metallic    = 0.0f;
         float     roughness   = 0.6f;
         bool      has_tex     = false;
+        bool      has_nrm     = false;   // normal map bound
+        bool      has_mr      = false;   // metallic-roughness map bound
         size_t    set_index   = 0;   // into s_active_sets_
     };
     static std::vector<GpuSection>                 s_sections_;

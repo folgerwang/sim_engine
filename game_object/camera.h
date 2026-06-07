@@ -108,6 +108,15 @@ public:
         return m_camera_info_;
     }
 
+    // Hard-set the mouse-look state.  Used by the editor's "view through
+    // scene camera" snap: the per-frame update derives facing_dir FROM
+    // yaw/pitch, so a pose override only sticks if these are synced to
+    // the target direction too.
+    void setYawPitch(float yaw_deg, float pitch_deg) {
+        m_camera_info_.yaw   = yaw_deg;
+        m_camera_info_.pitch = pitch_deg;
+    }
+
     std::shared_ptr<renderer::BufferInfo> getViewCameraBuffer() {
         return m_view_camera_buffer_;
     }

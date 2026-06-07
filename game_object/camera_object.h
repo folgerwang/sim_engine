@@ -106,6 +106,19 @@ public:
         return m_view_camera_->getCameraInfo();
     }
 
+    // Sync the mouse-look yaw/pitch to an explicit view direction — used
+    // by the editor's "view through scene camera" snap so the per-frame
+    // camera update (which derives facing from yaw/pitch) keeps the pose
+    // instead of reverting to the previous mouse state.
+    void setViewDirection(const glm::vec3& dir) {
+        const glm::vec3 d = glm::normalize(dir);
+        const float pitch = glm::degrees(glm::asin(
+            glm::clamp(d.y, -1.0f, 1.0f)));
+        // getDirectionByYawAndPitch: x=cos(-yaw)cosP, z=sin(-yaw)cosP.
+        const float yaw = -glm::degrees(glm::atan(d.z, d.x));
+        m_view_camera_->setYawPitch(yaw, pitch);
+    }
+
     void setInputFeatureFlags(uint32_t flags) {
         m_view_camera_->setInputFeatureFlags(flags);
     }
