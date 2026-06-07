@@ -663,6 +663,10 @@ public:
     // imports' skeleton meshes preview through this.
     void buildRwGeoPreview(const std::string& rwgeo_path,
                            const std::string& display_name);
+    // Body of the Rendering ▸ Render Debug submenu (debug visualisation
+    // modes, pipeline toggle, viewers, glass mode) — extracted so the
+    // large block can live under the Rendering menu.
+    void drawRenderDebugMenuContent();
     // Arrow-key navigation between sibling objects — callable from BOTH the
     // Debug Display panel and the Content Browser grid (whichever has
     // focus), so arrows always move the selection, never scroll the panel.
