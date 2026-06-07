@@ -541,6 +541,10 @@ public:
     bool        player_mesh_assign_pending_ = false;
     int         player_mesh_assign_idx_     = -1;
     std::string player_mesh_assign_path_;
+    // Scene-object rename (Details "Name" field): scene index + new name.
+    bool        scene_rename_pending_ = false;
+    int         scene_rename_idx_     = -1;
+    std::string scene_rename_name_;
     ImVec2 viewport_rclick_pos_ = ImVec2(0, 0);  // right-press pos (click vs drag)
     bool show_scene_grid_      = false;  // reference grid / ruler visible
     // True once a scene has been created or loaded this session — makes the
@@ -663,6 +667,12 @@ public:
     // imports' skeleton meshes preview through this.
     void buildRwGeoPreview(const std::string& rwgeo_path,
                            const std::string& display_name);
+    // Whole-GROUP preview: merges every baked objects/*.rwgeo of an
+    // import group (original source layout, shared textures dedup'd)
+    // into one Debug Display payload — clicking a group folder shows
+    // the assembled collection instead of nothing.
+    void buildRwGroupPreview(const std::string& group_dir,
+                             const std::string& display_name);
     // Body of the Rendering ▸ Render Debug submenu (debug visualisation
     // modes, pipeline toggle, viewers, glass mode) — extracted so the
     // large block can live under the Rendering menu.
@@ -958,6 +968,15 @@ public:
         player_mesh_assign_pending_ = false;
         out_scene_idx = player_mesh_assign_idx_;
         out_path = player_mesh_assign_path_;
+        return true;
+    }
+    // Scene-object rename from the Details "Name" field.
+    bool consumeSceneObjectRename(int& out_scene_idx,
+                                  std::string& out_name) {
+        if (!scene_rename_pending_) return false;
+        scene_rename_pending_ = false;
+        out_scene_idx = scene_rename_idx_;
+        out_name = scene_rename_name_;
         return true;
     }
     // Persistent toggle: whether the editor reference grid / ruler is drawn.

@@ -3746,17 +3746,17 @@ void Menu::drawEditorDockSpace() {
             }
         }
         if (ImGui::BeginPopup("##viewport_ctx")) {
+            // Player object: organizational node with a skeleton-mesh
+            // slot (assign a character from the Content Browser's player
+            // folder in Details), placed in front of the camera.
+            if (ImGui::MenuItem("Add Player Object")) {
+                player_create_request_ = true;
+                scene_node_active_     = true;
+            }
             // Capture the CURRENT editor view as a scene camera (same as
             // Scene menu → Create Camera Here).
             if (ImGui::MenuItem("Add Camera Object")) {
                 camera_create_request_ = true;
-                scene_node_active_     = true;
-            }
-            // Player object: organizational node + skeleton-mesh child
-            // (the character imported in the Content Browser's player
-            // folder), placed in front of the camera.
-            if (ImGui::MenuItem("Add Player Object")) {
-                player_create_request_ = true;
                 scene_node_active_     = true;
             }
             ImGui::EndPopup();
@@ -3818,12 +3818,12 @@ void Menu::drawOutlinerPanel() {
                                         ImGuiTreeNodeFlags_SpanAvailWidth;
             if (editor_selected_ == i && editor_selected_child_ < 0)
                 gflags |= ImGuiTreeNodeFlags_Selected;
-            // NAME-keyed ID (not index): adding/removing rows shifts
-            // indices, and an index-keyed ID would make ImGui see a
-            // "new" node and reopen it (DefaultOpen) — losing the
-            // user's collapse state whenever the scene changes.
+            // "###"-keyed ID (note: "##" still hashes the WHOLE label —
+            // including the live sub-object count — so any count change
+            // minted a new ID and reopened collapsed groups; "###"
+            // restricts the ID to the stable name suffix).
             const std::string glabel = base + "  (" +
-                std::to_string(kids.size()) + ")##grp_" + base;
+                std::to_string(kids.size()) + ")###grp_" + base;
             // Revealing a pick-selected sub-object: force its group open.
             if (editor_scroll_to_selected_ && editor_selected_ == i &&
                 editor_selected_child_ >= 0)
@@ -3900,9 +3900,12 @@ void Menu::drawOutlinerPanel() {
                 int scene_count = 0;
                 for (const auto& eo : editor_objects_)
                     if (eo.in_scene) ++scene_count;
+                // "###" — the live object count must not participate in
+                // the ID, or every scene change re-expands a collapsed
+                // scene node.
                 const std::string slabel =
                     std::string(scene_name_buf_) + "  (" +
-                    std::to_string(scene_count) + ")##scene_node";
+                    std::to_string(scene_count) + ")###scene_node";
                 if (ImGui::TreeNodeEx(slabel.c_str(),
                                       ImGuiTreeNodeFlags_SpanAvailWidth)) {
                     // Children of a scene row (placed objects under their
@@ -3932,9 +3935,10 @@ void Menu::drawOutlinerPanel() {
                         if (editor_selected_ == i &&
                             editor_selected_child_ < 0)
                             gflags2 |= ImGuiTreeNodeFlags_Selected;
-                        // NAME-keyed ID — index-keyed IDs reopened
-                        // collapsed groups whenever rows were added
-                        // (e.g. creating a camera object).
+                        // "###"-keyed ID — "##" hashes the whole label
+                        // including the live child count, so any count
+                        // change minted a new ID and reopened collapsed
+                        // groups; "###" keys on the stable name only.
                         const std::string gname2 =
                             editor_objects_[i].name.empty()
                                 ? std::string("Group")
@@ -3942,7 +3946,7 @@ void Menu::drawOutlinerPanel() {
                         const std::string glabel2 =
                             gname2 + "  (" +
                             std::to_string(group_kids.size()) +
-                            ")##sgrp_" + gname2;
+                            ")###sgrp_" + gname2;
                         const bool gopen =
                             ImGui::TreeNodeEx(glabel2.c_str(), gflags2);
                         if (ImGui::IsItemClicked() &&
@@ -4469,7 +4473,31 @@ void Menu::drawDetailsContent() {
             // (Per-node transform editing is a follow-up; the group transform
             // below moves the whole FBX.)
         } else {
-            ImGui::Text("Name: %s", o.name.c_str());
+            if (o.in_scene && o.scene_index >= 0) {
+                // Scene objects (placed meshes, groups, cameras, players)
+                // are renameable: commit on Enter or focus loss; the app
+                // writes the new name into scene_.objects (persisted via
+                // scene Save).
+                static int  s_name_idx = -1;
+                static char s_name_buf[128] = {0};
+                if (s_name_idx != o.scene_index) {
+                    s_name_idx = o.scene_index;
+                    std::snprintf(s_name_buf, sizeof(s_name_buf), "%s",
+                                  o.name.c_str());
+                }
+                ImGui::SetNextItemWidth(220.0f);
+                const bool entered = ImGui::InputText(
+                    "Name", s_name_buf, sizeof(s_name_buf),
+                    ImGuiInputTextFlags_EnterReturnsTrue);
+                if ((entered || ImGui::IsItemDeactivatedAfterEdit()) &&
+                    s_name_buf[0] != '\0' && o.name != s_name_buf) {
+                    scene_rename_pending_ = true;
+                    scene_rename_idx_     = o.scene_index;
+                    scene_rename_name_    = s_name_buf;
+                }
+            } else {
+                ImGui::Text("Name: %s", o.name.c_str());
+            }
             if (!kids.empty())
                 ImGui::TextDisabled("%d sub-objects", (int)kids.size());
             ImGui::Separator();
@@ -4594,6 +4622,34 @@ void Menu::drawDetailsContent() {
                         std::string p((const char*)pl->Data);
                         namespace fs = std::filesystem;
                         std::error_code ec;
+                        // A FILE dragged from inside a character group
+                        // (e.g. one of its baked objects/*.rwgeo tiles)
+                        // resolves UP to the group folder — the WHOLE
+                        // character attaches as one unit (a single
+                        // skeleton is a group of skeleton meshes; you
+                        // can't bind just one of them).
+                        if (!fs::is_directory(p, ec)) {
+                            fs::path dir = fs::path(p).parent_path();
+                            for (int up = 0;
+                                 up < 3 && !dir.empty();
+                                 ++up, dir = dir.parent_path()) {
+                                std::ifstream gm(
+                                    (dir / "import.rwmeta").string());
+                                if (!gm) continue;
+                                std::string gl;
+                                bool gchar = false;
+                                while (std::getline(gm, gl)) {
+                                    if (gl == "type=character") {
+                                        gchar = true;
+                                        break;
+                                    }
+                                }
+                                if (gchar) {
+                                    p = dir.string();
+                                    break;
+                                }
+                            }
+                        }
                         if (fs::is_directory(p, ec)) {
                             // Group folder → resolve the character's
                             // model: copied main= (legacy) or the
@@ -5469,7 +5525,18 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // single sub-object on click / double-click.  "Add to
                 // Scene" lives in the tile's right-click menu.
                 if (clicked && is_dir) {
-                    cur_dir = e.path().string();
+                    if (is_group_dir && is_content) {
+                        // Group folder, Explorer-style like model tiles:
+                        // CLICK previews the assembled collection of its
+                        // baked objects in the Debug Display; DOUBLE-
+                        // click also opens the folder.
+                        buildRwGroupPreview(e.path().string(), name);
+                        if (ImGui::IsMouseDoubleClicked(
+                                ImGuiMouseButton_Left))
+                            cur_dir = e.path().string();
+                    } else {
+                        cur_dir = e.path().string();
+                    }
                 } else if (clicked && is_content && is_model) {
                     buildAssetPreview(e.path().string(), -1, name);
                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
@@ -6247,6 +6314,111 @@ void Menu::drawRenderDebugMenuContent() {
                 TMode::WBOIT);
         }
     }
+}
+
+// ── Whole-group preview ────────────────────────────────────────────────────
+// Merge every baked objects/*.rwgeo of an import group into ONE preview
+// payload.  Each .rwgeo loads in source-world coordinates (its header
+// matrix is re-applied by loadRwGeo), so the assembly reconstructs the
+// authored layout; textures are dedup'd across objects by file path.
+void Menu::buildRwGroupPreview(const std::string& group_dir,
+                               const std::string& display_name) {
+    const std::string key = group_dir + "#group";
+    if (key == dbg_asset_key_) return;   // already showing
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<std::string> geos;
+    for (auto& e : fs::directory_iterator(
+             fs::path(group_dir) / "objects", ec)) {
+        if (e.path().extension() == ".rwgeo")
+            geos.push_back(e.path().string());
+    }
+    std::sort(geos.begin(), geos.end());
+    if (geos.empty()) {
+        EditorLog::get().push(
+            "[preview] no baked objects in group: " + group_dir);
+        return;
+    }
+
+    // Vertex budget: a whole Bistro-sized group merges to millions of
+    // vertices; cap the assembly so the preview upload stays sane.
+    constexpr size_t kMaxGroupVerts = 3'000'000;
+
+    engine::helper::MeshPreviewPayload p;
+    std::unordered_map<std::string, int> texmap;   // tex path → payload idx
+    size_t skipped = 0;
+    for (const auto& geo : geos) {
+        if (p.positions.size() >= kMaxGroupVerts) { ++skipped; continue; }
+        engine::helper::ModelPreviewData md;
+        std::vector<std::string> tpaths;
+        if (!engine::helper::loadRwGeo(geo, md, &tpaths) ||
+            md.positions.empty() || md.indices.empty()) {
+            continue;
+        }
+        const uint32_t vbase = (uint32_t)p.positions.size();
+        const uint32_t ibase = (uint32_t)p.indices.size();
+        p.positions.insert(p.positions.end(),
+                           md.positions.begin(), md.positions.end());
+        p.normals.insert(p.normals.end(),
+                         md.normals.begin(), md.normals.end());
+        // Keep the uv stream parallel to positions (zero-fill objects
+        // that have none) so a textured object later in the merge still
+        // maps correctly.
+        for (size_t i = 0; i < md.positions.size(); ++i) {
+            p.uvs.push_back(i < md.uvs.size() ? md.uvs[i]
+                                              : glm::vec2(0.0f));
+        }
+        for (uint32_t ix : md.indices) p.indices.push_back(vbase + ix);
+
+        // Texture dedup across objects (tpaths is parallel to
+        // md.textures — covers albedo/normal/mr refs alike).
+        std::vector<int> remap(md.textures.size(), -1);
+        for (size_t t = 0; t < md.textures.size() &&
+                           t < tpaths.size(); ++t) {
+            auto it = texmap.find(tpaths[t]);
+            if (it != texmap.end()) {
+                remap[t] = it->second;
+                continue;
+            }
+            engine::helper::MeshPreviewTexture mt;
+            mt.rgba = std::move(md.textures[t].rgba);
+            mt.w = md.textures[t].w;
+            mt.h = md.textures[t].h;
+            remap[t] = (int)p.textures.size();
+            p.textures.push_back(std::move(mt));
+            texmap.emplace(tpaths[t], remap[t]);
+        }
+        auto remap_idx = [&remap](int idx) -> int {
+            return (idx >= 0 && idx < (int)remap.size()) ? remap[idx] : -1;
+        };
+        for (const auto& s : md.sections) {
+            engine::helper::MeshPreviewSection ms;
+            ms.first_index = ibase + s.first_index;
+            ms.index_count = s.index_count;
+            ms.base_color  = s.base_color;
+            ms.metallic    = s.metallic;
+            ms.roughness   = s.roughness;
+            ms.tex_index   = remap_idx(s.tex_index);
+            ms.nrm_index   = remap_idx(s.nrm_index);
+            ms.mr_index    = remap_idx(s.mr_index);
+            p.sections.push_back(ms);
+        }
+    }
+    if (p.positions.empty() || p.indices.size() < 3) {
+        EditorLog::get().push(
+            "[preview] group has no readable baked geometry: " +
+            group_dir);
+        return;
+    }
+    if (skipped > 0) {
+        EditorLog::get().push(
+            "[preview] group preview capped — " +
+            std::to_string(skipped) + " object(s) omitted");
+    }
+    stagePreviewPayload(std::move(p));
+    finishAssetPreview(key, display_name + " (group)");
+    preview_nav_ = PreviewNav::None;
 }
 
 // Preview a baked .rwgeo directly (no .rwobj ref needed) — how the

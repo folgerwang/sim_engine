@@ -5772,6 +5772,13 @@ void DrawableObject::draw(
         return;
     }
 
+    // Defensive: a destroyed-but-cached DrawableData (its GPU buffers
+    // freed while ready_ stayed set) must not reach the bind below —
+    // it would crash in bindVertexBuffers on a null buffer.
+    if (!object_->instance_buffer_.buffer) {
+        return;
+    }
+
     auto& pipeline_list =
         (draw_mode == DrawMode::kCsmLayered)    ? drawable_csm_layered_pipeline_list_     :
         (draw_mode == DrawMode::kCsmPerCascade) ? drawable_csm_per_cascade_pipeline_list_ :
