@@ -72,7 +72,9 @@ bool readXform(std::ifstream& is, Transform& t) {
 
 const char     kMagic[8] = { 'R', 'W', 'S', 'C', 'E', 'N', 'E', '\0' };
 // v2: + music_path (string) + music_volume (float32) after the object list.
-const uint32_t kVersion  = 2;
+// v3: + per-object audio_clip (string) + audio_loop (u8) + audio_volume (f32)
+//     in each object record (after its transform) — BGM objects.
+const uint32_t kVersion  = 3;
 
 } // namespace
 
@@ -96,6 +98,10 @@ bool saveSceneBinary(const std::string& path, const Scene& scene) {
         writePod(os, static_cast<uint8_t>(o.is_group ? 1 : 0));
         writePod(os, static_cast<uint8_t>(o.visible ? 1 : 0));
         writeXform(os, o.transform);
+        // v3 per-object audio (BGM objects).
+        writeStr(os, o.audio_clip);
+        writePod(os, static_cast<uint8_t>(o.audio_loop ? 1 : 0));
+        writePod(os, o.audio_volume);
     }
 
     // v2 trailer: scene music.
@@ -172,6 +178,14 @@ bool loadSceneBinary(const std::string& path, Scene& out_scene) {
         }
         o.is_group = (is_group != 0);
         o.visible  = (visible != 0);
+        // v3 per-object audio (absent in v1/v2 — defaults stand).
+        if (version >= 3) {
+            uint8_t loop = 1;
+            if (!readStr(is, o.audio_clip)) return false;
+            if (!readPod(is, loop)) return false;
+            if (!readPod(is, o.audio_volume)) return false;
+            o.audio_loop = (loop != 0);
+        }
     }
 
     // v2 trailer: scene music (absent in v1 files — defaults stand).

@@ -238,6 +238,14 @@ bool AudioEngine::isPlaying(uint64_t handle) {
            ma_sound_is_playing(it->second.sound.get());
 }
 
+void AudioEngine::setVolume(uint64_t handle, float v) {
+    State& s = S();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    auto it = s.voices.find(handle);
+    if (it != s.voices.end() && it->second.sound)
+        ma_sound_set_volume(it->second.sound.get(), v);
+}
+
 void AudioEngine::setBusVolume(Bus bus, float v) {
     State& s = S();
     std::lock_guard<std::mutex> lk(s.mtx);
@@ -281,6 +289,7 @@ void  AudioEngine::stop(uint64_t) {}
 void  AudioEngine::stopAll() {}
 void  AudioEngine::stopBus(Bus) {}
 bool  AudioEngine::isPlaying(uint64_t) { return false; }
+void  AudioEngine::setVolume(uint64_t, float) {}
 void  AudioEngine::setBusVolume(Bus, float) {}
 float AudioEngine::busVolume(Bus) { return 1.0f; }
 void  AudioEngine::update() {}

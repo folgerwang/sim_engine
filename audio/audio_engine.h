@@ -53,6 +53,9 @@ public:
     static void stopBus(Bus bus);
     static bool isPlaying(uint64_t handle);
 
+    // Live per-sound volume (0..1).  No-op if the handle has finished.
+    static void setVolume(uint64_t handle, float volume);
+
     static void  setBusVolume(Bus bus, float v);   // 0..1
     static float busVolume(Bus bus);
 

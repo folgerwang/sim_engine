@@ -2010,11 +2010,6 @@ bool Menu::draw(
             // Camera creation lives on the viewport right-click menu
             // ("Add Camera Object") — no Scene-menu duplicate.
             ImGui::MenuItem("Show Grid", NULL, &show_scene_grid_);
-            // Counterpart to the audio tile's "Set as Scene Music".
-            if (ImGui::MenuItem("Clear Scene Music")) {
-                scene_music_path_.clear();
-                scene_music_pending_ = true;
-            }
             ImGui::Separator();
             // Model import happens through the Content Browser (Import
             // button / drag-and-drop) — no Scene-menu duplicate.
@@ -3850,6 +3845,12 @@ void Menu::drawEditorDockSpace() {
                 camera_create_request_ = true;
                 scene_node_active_     = true;
             }
+            // Background-music object: drag a clip onto it (Details) and
+            // set repeat / volume.
+            if (ImGui::MenuItem("Add BGM Object")) {
+                bgm_create_request_ = true;
+                scene_node_active_  = true;
+            }
             ImGui::EndPopup();
         }
     }
@@ -4813,6 +4814,81 @@ void Menu::drawDetailsContent() {
                     ImGui::EndCombo();
                 }
             }
+
+            // ── BGM object: clip + repeat + volume ────────────────────
+            // Drag a music clip from the Content Browser onto the slot;
+            // the app loops/plays it on the music bus.  Repeat + volume
+            // edit the scene object directly (synced live).
+            if (o.is_bgm && o.audio_clip) {
+                ImGui::SeparatorText("Background Music");
+                const std::string cur =
+                    o.audio_clip->empty()
+                        ? std::string("(none — drag a clip here)")
+                        : std::filesystem::path(*o.audio_clip)
+                              .filename().string();
+                ImGui::Button(cur.c_str(),
+                              ImVec2(ImGui::GetContentRegionAvail().x, 0));
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* pl =
+                            ImGui::AcceptDragDropPayload("RW_CONTENT_ASSET")) {
+                        std::string p((const char*)pl->Data);
+                        std::string ext =
+                            std::filesystem::path(p).extension().string();
+                        for (auto& c : ext)
+                            c = (char)std::tolower((unsigned char)c);
+                        if (ext == ".wav" || ext == ".mp3" || ext == ".flac")
+                            *o.audio_clip = p;
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                if (!o.audio_clip->empty()) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Clear")) o.audio_clip->clear();
+                }
+                if (o.audio_loop)
+                    ImGui::Checkbox("Repeat", o.audio_loop);
+                if (o.audio_volume) {
+                    ImGui::SetNextItemWidth(
+                        ImGui::GetContentRegionAvail().x * 0.6f);
+                    ImGui::SliderFloat("Volume", o.audio_volume,
+                                       0.0f, 1.0f, "%.2f");
+                }
+            }
+        } else if (o.is_bgm && o.audio_clip) {
+            // BGM object with no transform pane shown above — render the
+            // clip/repeat/volume editor on its own.
+            ImGui::SeparatorText("Background Music");
+            const std::string cur =
+                o.audio_clip->empty()
+                    ? std::string("(none — drag a clip here)")
+                    : std::filesystem::path(*o.audio_clip)
+                          .filename().string();
+            ImGui::Button(cur.c_str(),
+                          ImVec2(ImGui::GetContentRegionAvail().x, 0));
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* pl =
+                        ImGui::AcceptDragDropPayload("RW_CONTENT_ASSET")) {
+                    std::string p((const char*)pl->Data);
+                    std::string ext =
+                        std::filesystem::path(p).extension().string();
+                    for (auto& c : ext)
+                        c = (char)std::tolower((unsigned char)c);
+                    if (ext == ".wav" || ext == ".mp3" || ext == ".flac")
+                        *o.audio_clip = p;
+                }
+                ImGui::EndDragDropTarget();
+            }
+            if (!o.audio_clip->empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear")) o.audio_clip->clear();
+            }
+            if (o.audio_loop) ImGui::Checkbox("Repeat", o.audio_loop);
+            if (o.audio_volume) {
+                ImGui::SetNextItemWidth(
+                    ImGui::GetContentRegionAvail().x * 0.6f);
+                ImGui::SliderFloat("Volume", o.audio_volume,
+                                   0.0f, 1.0f, "%.2f");
+            }
         } else {
             ImGui::TextDisabled("(no drawable bound)");
         }
@@ -5575,7 +5651,8 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // Images are draggable too — onto the Generate Image popup
                 // as a reference (FLUX.2 conditioning), not into the scene.
                 if (is_content &&
-                    (is_model || is_object || is_group_dir || is_img) &&
+                    (is_model || is_object || is_group_dir || is_img ||
+                     is_audio) &&
                     ImGui::BeginDragDropSource()) {
                     const std::string pay = e.path().string();
                     ImGui::SetDragDropPayload("RW_CONTENT_ASSET",
@@ -5627,13 +5704,8 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                         ImGui::MenuItem("Add to Scene")) {
                         place_asset_request_ = e.path().string();
                     }
-                    // Loop this clip on the music bus + persist it in the
-                    // scene file (saved as part of Save Scene).
-                    if (is_content && is_audio &&
-                        ImGui::MenuItem("Set as Scene Music")) {
-                        scene_music_path_    = e.path().string();
-                        scene_music_pending_ = true;
-                    }
+                            // Background music is set by dragging a clip onto a BGM
+                    // scene object (right-click viewport → Add BGM Object).
                     if (ImGui::MenuItem("Rename")) {
                         rename_target_ = e.path().string();
                         std::snprintf(rename_buf_, sizeof(rename_buf_), "%s",

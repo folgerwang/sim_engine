@@ -51,6 +51,13 @@ struct Object {
     bool        is_group        = false; // true for the imported-file root
     bool        visible         = true;
     Transform   transform;            // local to parent (world when parent_index == -1)
+
+    // BGM (audio) object — asset_path ends ".rwbgm".  Holds the music clip a
+    // user dragged onto it plus its playback attributes (Details panel).
+    // Serialized from scene format v3.
+    std::string audio_clip;           // path to the music file ("" = unset)
+    bool        audio_loop   = true;  // repeat
+    float       audio_volume = 1.0f;  // 0..1
 };
 
 // The authored scene.  Default-constructed = empty scene named "Untitled" at

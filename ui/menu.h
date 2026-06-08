@@ -61,6 +61,13 @@ struct EditorSceneObject {
     // scene object (scene index of the followed player object, -1 =
     // none → free camera).  The Details panel edits it directly.
     int32_t*                             follow_link = nullptr;
+    // BGM object row (.rwbgm marker): no drawable; the Details panel edits
+    // the clip / repeat / volume directly through these borrowed pointers
+    // into the app's scene object (valid for the current frame).
+    bool                                 is_bgm = false;
+    std::string*                         audio_clip   = nullptr;
+    bool*                                audio_loop   = nullptr;
+    float*                               audio_volume = nullptr;
 };
 
 // Game-level state machine driven by the title-screen menu.
@@ -536,6 +543,7 @@ public:
     bool scene_create_request_ = false;  // "Create Scene" (empty + grid)
     bool camera_create_request_ = false; // "Create Camera Here" (view pose)
     bool player_create_request_ = false; // "Add Player Object"
+    bool bgm_create_request_    = false; // "Add BGM Object"
     // Player "Skeleton Mesh" assignment (Details combo): scene index of
     // the player row + the character model path ("" = clear the mesh).
     bool        player_mesh_assign_pending_ = false;
@@ -908,10 +916,6 @@ private:
     uint64_t    audio_preview_handle_ = 0;
     std::string audio_preview_path_;
 
-    // Scene music request (audio tile right-click / Scene menu clear).
-    bool        scene_music_pending_ = false;
-    std::string scene_music_path_;       // "" = clear
-
     // Audio menu → Voice submenu: cached list of installed TTS voices,
     // refreshed each time the submenu opens (cleared when it closes), plus
     // a filter box for narrowing a long (100+) list.
@@ -981,17 +985,6 @@ public:
         if (scene_load_request_) { scene_load_request_ = false; return true; }
         return false;
     }
-    // "Set as Scene Music" (audio tile right-click) / "Clear Scene Music"
-    // (Scene menu).  out_path = clip to loop on the music bus; "" = clear.
-    // Serviced by the application, which also persists it into the scene.
-    bool consumeSceneMusicRequest(std::string& out_path) {
-        if (scene_music_pending_) {
-            scene_music_pending_ = false;
-            out_path = scene_music_path_;
-            return true;
-        }
-        return false;
-    }
     // "Create Scene" mode: clears the current scene to an empty grid the user
     // builds from scratch.  Serviced by the application a frame later (it tears
     // down the live imports), which is why it is a consume-once request.
@@ -1003,6 +996,13 @@ public:
     // (position + facing) into a camera scene object (Outliner).
     bool consumeCreateCameraRequest() {
         if (camera_create_request_) { camera_create_request_ = false; return true; }
+        return false;
+    }
+    // "Add BGM Object": the app creates an empty BGM scene object (virtual
+    // ".rwbgm" marker); the user drags a music clip onto it and sets
+    // repeat/volume in its Details panel.
+    bool consumeCreateBgmRequest() {
+        if (bgm_create_request_) { bgm_create_request_ = false; return true; }
         return false;
     }
     // "Add Player Object": the app creates an EMPTY player scene object
