@@ -7,7 +7,7 @@
 // factor << 1 for Piper voices) and plays it on AudioEngine's kVoice bus.
 // A new speak() supersedes the currently playing line — dialog semantics.
 //
-// Voice model: first directory under assets/models/tts/ containing a .onnx
+// Voice model: first directory under assets/ml_models/tts/ containing a .onnx
 // + tokens.txt (Setup.bat downloads vits-piper-en_US-amy-medium by default;
 // drop any sherpa-onnx VITS voice next to it and pass its dir to init()).
 //
@@ -17,6 +17,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace engine {
 namespace audio {
@@ -44,6 +45,24 @@ public:
 
     // True while a line is being synthesized or played.
     static bool speaking();
+
+    // ── Live voice switching (editor voice picker) ──────────────────────
+    // Folder names of every installed voice under assets/ml_models/tts (each a
+    // dir with a .onnx + tokens.txt).  Cheap directory scan.
+    static std::vector<std::string> listVoices();
+
+    // Folder name of the voice currently loaded ("" if none / not ready).
+    static std::string currentVoice();
+
+    // Switch to the named voice (one of listVoices()) and re-synthesize the
+    // last spoken line with it, so the picker can be auditioned one-by-one.
+    // The sherpa instance is rebuilt on the worker thread — never blocks the
+    // frame.  Returns false if the name doesn't match an installed voice.
+    static bool setVoice(const std::string& voice_name);
+
+    // Re-speak the most recent line with the current voice (0 if nothing has
+    // been spoken yet).
+    static uint64_t repeatLast();
 };
 
 } // namespace audio

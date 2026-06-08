@@ -21,5 +21,10 @@ std::string openModelFileDialog(void* owner_hwnd = nullptr);
 std::string openSceneFileDialog(void* owner_hwnd = nullptr,
                                 const char* initial_dir = nullptr);
 
+// Filtered to image files (*.png;*.jpg;*.jpeg;*.bmp).  Used by the FLUX.2
+// "Generate Image" popup to pick reference images.
+std::string openImageFileDialog(void* owner_hwnd = nullptr,
+                                const char* initial_dir = nullptr);
+
 } // namespace scene
 } // namespace engine

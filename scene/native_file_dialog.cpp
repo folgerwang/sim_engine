@@ -71,5 +71,19 @@ std::string openSceneFileDialog(void* owner_hwnd,
 #endif
 }
 
+std::string openImageFileDialog(void* owner_hwnd,
+                                const char* initial_dir) {
+#ifdef _WIN32
+    return openWithFilter(
+        "Images (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0"
+        "All files (*.*)\0*.*\0",
+        "Choose reference image", owner_hwnd, initial_dir);
+#else
+    (void)owner_hwnd;
+    (void)initial_dir;
+    return std::string();
+#endif
+}
+
 } // namespace scene
 } // namespace engine

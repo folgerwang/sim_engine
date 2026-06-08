@@ -877,6 +877,11 @@ private:
     std::string gen_err_;
     std::string gen_last_prompt_;             // for the Regenerate button
     int         gen_last_w_ = 1024, gen_last_h_ = 1024;
+    // Reference images for FLUX.2 native conditioning (ControlNet-style):
+    // up to 4 paths passed to flux_generate.py --ref-image.  Added via the
+    // popup's "Add Reference..." picker or by dragging Content Browser
+    // image tiles onto the popup.
+    std::vector<std::string> gen_ref_images_;
 
     // ── Text-to-audio generation (Content Browser right-click) ──────────────
     // Mirror of the FLUX flow: launchAudioGen() spawns
@@ -906,6 +911,12 @@ private:
     // Scene music request (audio tile right-click / Scene menu clear).
     bool        scene_music_pending_ = false;
     std::string scene_music_path_;       // "" = clear
+
+    // Audio menu → Voice submenu: cached list of installed TTS voices,
+    // refreshed each time the submenu opens (cleared when it closes), plus
+    // a filter box for narrowing a long (100+) list.
+    std::vector<std::string> tts_voice_cache_;
+    char                     tts_voice_filter_[64] = {0};
     void drawOutputPanel();   // UE5-style console Output Log (bottom tab)
     // Absolute screen rect/centre of the editor Viewport (central dock node);
     // falls back to the full main viewport when the editor is inactive.  Used

@@ -42,6 +42,8 @@ extern "C" {
 #include "helper/model_inspect.h"         // sub-object names for content assets
 #include "helper/mesh_preview.h"          // GPU offscreen Debug Display preview
 #include "audio/audio_engine.h"           // Content Browser audio preview
+#include "audio/tts_engine.h"             // Audio menu voice picker
+#include "scene/native_file_dialog.h"     // reference-image picker (FLUX.2)
 
 #include "menu.h"
 #include "plugins/plugin_manager.h"
@@ -2133,6 +2135,90 @@ bool Menu::draw(
             if (ImGui::BeginMenu("Render Debug")) {
                 drawRenderDebugMenuContent();
                 ImGui::EndMenu();
+            }
+            ImGui::EndMenu();
+        }
+
+        // ── Audio menu ────────────────────────────────────────────────────
+        // Bus volumes + the text-to-voice picker.  The voice list is the
+        // installed sherpa-onnx voices under assets/ml_models/tts; selecting one
+        // switches live and re-speaks the last dialog line so you can audition
+        // them one by one.
+        if (ImGui::BeginMenu("Audio"))
+        {
+            namespace au = engine::audio;
+
+            // Master-ish bus volumes (0..1).  Stored in the engine so they
+            // persist across clips played this session.
+            float vMusic = au::AudioEngine::busVolume(
+                au::AudioEngine::Bus::kMusic);
+            if (ImGui::SliderFloat("Music##bus", &vMusic, 0.0f, 1.0f, "%.2f"))
+                au::AudioEngine::setBusVolume(au::AudioEngine::Bus::kMusic,
+                                              vMusic);
+            float vSfx = au::AudioEngine::busVolume(
+                au::AudioEngine::Bus::kSfx);
+            if (ImGui::SliderFloat("SFX##bus", &vSfx, 0.0f, 1.0f, "%.2f"))
+                au::AudioEngine::setBusVolume(au::AudioEngine::Bus::kSfx,
+                                              vSfx);
+            float vVoice = au::AudioEngine::busVolume(
+                au::AudioEngine::Bus::kVoice);
+            if (ImGui::SliderFloat("Voice##bus", &vVoice, 0.0f, 1.0f, "%.2f"))
+                au::AudioEngine::setBusVolume(au::AudioEngine::Bus::kVoice,
+                                              vVoice);
+
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Voice (text-to-speech)"))
+            {
+                // Cache the voice list — a directory scan every frame the
+                // menu is open is wasteful.  Rebuilt when first opened.
+                if (tts_voice_cache_.empty())
+                    tts_voice_cache_ = au::TtsEngine::listVoices();
+                const std::string cur = au::TtsEngine::currentVoice();
+
+                if (tts_voice_cache_.empty()) {
+                    ImGui::TextDisabled("(no voices installed)");
+                    ImGui::TextDisabled("Get more:  Setup.bat -tts-voice=all");
+                    ImGui::TextDisabled("or  tools/tts/download_voices.py --all");
+                } else {
+                    ImGui::TextDisabled("%zu voice(s) — click to audition",
+                                        tts_voice_cache_.size());
+                    // Filter box (type to narrow a long list, e.g. "en_US").
+                    ImGui::SetNextItemWidth(280.0f);
+                    ImGui::InputTextWithHint("##voice_filter", "filter...",
+                        tts_voice_filter_, sizeof(tts_voice_filter_));
+                    std::string flt = tts_voice_filter_;
+                    for (auto& c : flt)
+                        c = (char)std::tolower((unsigned char)c);
+
+                    // Scrollable list so 100+ voices stay on-screen.  Use
+                    // Selectables (not MenuItems) so picking one does NOT
+                    // close the popup — you can audition several in a row.
+                    ImGui::BeginChild("##voice_list", ImVec2(300.0f, 360.0f),
+                                      true);
+                    for (const auto& v : tts_voice_cache_) {
+                        if (!flt.empty()) {
+                            std::string lv = v;
+                            for (auto& c : lv)
+                                c = (char)std::tolower((unsigned char)c);
+                            if (lv.find(flt) == std::string::npos) continue;
+                        }
+                        const bool sel = (v == cur);
+                        if (ImGui::Selectable(v.c_str(), sel))
+                            au::TtsEngine::setVoice(v);
+                    }
+                    ImGui::EndChild();
+
+                    if (ImGui::Button("Repeat last line"))
+                        au::TtsEngine::repeatLast();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Stop"))
+                        au::TtsEngine::stop();
+                }
+                ImGui::EndMenu();
+            } else {
+                // Menu closed — drop the cache so it refreshes next open
+                // (picks up voices added to the folder mid-session).
+                tts_voice_cache_.clear();
             }
             ImGui::EndMenu();
         }
@@ -5201,6 +5287,14 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     gen_last_prompt_ = p; gen_last_w_ = width; gen_last_h_ = height;
     gen_err_.clear();
 
+    // Reference images: FLUX.2 klein's native image conditioning — the
+    // prompt steers edits / style / structure relative to them (ControlNet-
+    // style guidance with the base weights, no extra checkpoints).
+    std::string ref_args;
+    for (const auto& rp : gen_ref_images_) {
+        ref_args += " --ref-image \"" + rp + "\"";
+    }
+
     // Use the SAME interpreter Setup.bat configured (system "python" with the
     // CUDA torch it installed) — not a separate venv.
 #ifdef _WIN32
@@ -5209,14 +5303,14 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
         "cmd /c start \"flux\" /B python \"" + script + "\""
         " --prompt-file \"" + pfile + "\" --out \"" + gen_out_path_ + "\""
         " --width "  + std::to_string(width) +
-        " --height " + std::to_string(height);
+        " --height " + std::to_string(height) + ref_args;
 #else
     const std::string script = "tools/flux/flux_generate.py";
     const std::string cmd =
         "python3 \"" + script + "\""
         " --prompt-file \"" + pfile + "\" --out \"" + gen_out_path_ + "\""
         " --width "  + std::to_string(width) +
-        " --height " + std::to_string(height) + " &";
+        " --height " + std::to_string(height) + ref_args + " &";
 #endif
     EditorLog::get().push("[flux] launching generation -> " + gen_out_path_);
     std::system(cmd.c_str());
@@ -5478,7 +5572,10 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // the scene — same effect as right-click → Add to Scene
                 // (the drop is handled at the end of the editor pass).
                 // Group FOLDERS are draggable too (places every object).
-                if (is_content && (is_model || is_object || is_group_dir) &&
+                // Images are draggable too — onto the Generate Image popup
+                // as a reference (FLUX.2 conditioning), not into the scene.
+                if (is_content &&
+                    (is_model || is_object || is_group_dir || is_img) &&
                     ImGui::BeginDragDropSource()) {
                     const std::string pay = e.path().string();
                     ImGui::SetDragDropPayload("RW_CONTENT_ASSET",
@@ -5874,8 +5971,11 @@ void Menu::drawFluxGeneratePopup() {
             s_gen_open = true;
         }
         if (s_gen_open) {
-            ImGui::SetNextWindowSize(ImVec2(624.0f, 500.0f), ImGuiCond_Always);
-            ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 260.0f),
+            // Appearing (not Always) so it's resizable; tall enough for the
+            // reference-image list + button row with the fantasy font.
+            ImGui::SetNextWindowSize(ImVec2(624.0f, 640.0f),
+                                     ImGuiCond_Appearing);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 360.0f),
                                                 ImVec2(8192.0f, 8192.0f));
             if (ImGui::Begin("Generate Image", &s_gen_open,
                              ImGuiWindowFlags_NoCollapse)) {
@@ -5923,6 +6023,57 @@ void Menu::drawFluxGeneratePopup() {
                     if (ImGui::Selectable(kSizes[i].label, gen_size_idx_ == i))
                         gen_size_idx_ = i;
                 ImGui::EndCombo();
+            }
+
+            // ── Reference images (FLUX.2 native conditioning) ─────────────
+            // Up to 4 images guide structure / style / edits; the prompt
+            // says HOW to use them ("same character, new pose", "in the
+            // style of this", "recolor this").  Add via picker or by
+            // dragging Content Browser image tiles onto this window.
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Reference images (optional, max 4)");
+            for (size_t i = 0; i < gen_ref_images_.size(); ++i) {
+                ImGui::PushID((int)(1000 + i));
+                if (ImGui::SmallButton("X")) {
+                    gen_ref_images_.erase(gen_ref_images_.begin() + i);
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(std::filesystem::path(gen_ref_images_[i])
+                                           .filename().string().c_str());
+                ImGui::PopID();
+            }
+            const bool full = gen_ref_images_.size() >= 4;
+            if (full) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Add Reference...")) {
+                const std::string img =
+                    engine::scene::openImageFileDialog(nullptr,
+                                                       gen_folder_.c_str());
+                if (!img.empty() && gen_ref_images_.size() < 4)
+                    gen_ref_images_.push_back(img);
+            }
+            if (full) ImGui::EndDisabled();
+            if (!gen_ref_images_.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear")) gen_ref_images_.clear();
+            }
+            // Accept Content Browser image tiles dropped anywhere in the
+            // window (the tile drag source emits "RW_CONTENT_ASSET").
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* pl =
+                        ImGui::AcceptDragDropPayload("RW_CONTENT_ASSET")) {
+                    const std::string dropped((const char*)pl->Data);
+                    std::string ext =
+                        std::filesystem::path(dropped).extension().string();
+                    for (auto& c : ext)
+                        c = (char)std::tolower((unsigned char)c);
+                    const bool is_img = (ext == ".png" || ext == ".jpg" ||
+                                         ext == ".jpeg" || ext == ".bmp");
+                    if (is_img && gen_ref_images_.size() < 4)
+                        gen_ref_images_.push_back(dropped);
+                }
+                ImGui::EndDragDropTarget();
             }
 
             ImGui::Separator();
