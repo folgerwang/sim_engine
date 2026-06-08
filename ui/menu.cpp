@@ -2004,15 +2004,12 @@ bool Menu::draw(
                 scene_node_active_    = true;   // surface the scene node in
                                                 // the Outliner immediately
             }
-            // Capture the CURRENT editor view (position + facing) as a
-            // camera object in the Outliner under World.
-            if (ImGui::MenuItem("Create Camera Here")) {
-                camera_create_request_ = true;
-                scene_node_active_     = true;
-            }
+            // Camera creation lives on the viewport right-click menu
+            // ("Add Camera Object") — no Scene-menu duplicate.
             ImGui::MenuItem("Show Grid", NULL, &show_scene_grid_);
             ImGui::Separator();
-            if (ImGui::MenuItem("Import Model...")) { scene_import_request_ = true; }
+            // Model import happens through the Content Browser (Import
+            // button / drag-and-drop) — no Scene-menu duplicate.
             if (ImGui::MenuItem("Save Scene"))      { scene_save_request_   = true; }
             if (ImGui::MenuItem("Load Scene..."))   { scene_load_request_   = true; }
             ImGui::EndMenu();
@@ -3753,8 +3750,8 @@ void Menu::drawEditorDockSpace() {
                 player_create_request_ = true;
                 scene_node_active_     = true;
             }
-            // Capture the CURRENT editor view as a scene camera (same as
-            // Scene menu → Create Camera Here).
+            // Capture the CURRENT editor view (position + facing) as a
+            // scene camera in the Outliner under World.
             if (ImGui::MenuItem("Add Camera Object")) {
                 camera_create_request_ = true;
                 scene_node_active_     = true;
@@ -4101,6 +4098,14 @@ bool Menu::selectedWorldAabb(glm::vec3& bmin, glm::vec3& bmax) {
         if (mesh.bbox_min_.x > mesh.bbox_max_.x) return false;
         lmin = mesh.bbox_min_; lmax = mesh.bbox_max_;
         world = inst * node.cached_matrix_;
+    } else if (eo.obj->getSkinnedModelAabb(lmin, lmax)) {
+        // Skinned character: box from JOINT positions, not the raw
+        // mesh bbox.  The pre-skin accessor bounds live in mesh space
+        // and for sibling-armature exports (Mixamo/Blender) sit far
+        // from where the skinned body actually renders — the joint-
+        // derived box follows the same joint.cached * inv_bind math
+        // the vertex shader uses, so it hugs the on-screen body.
+        world = eo.obj->hasInstanceRoot() ? inst : eo.obj->getLocation();
     } else {
         // Whole object: model bbox in the instance world transform.
         lmin = eo.obj->getModelBboxMin();

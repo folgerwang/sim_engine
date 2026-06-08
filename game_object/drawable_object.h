@@ -793,6 +793,18 @@ public:
     glm::vec3 getModelBboxMin() const;
     glm::vec3 getModelBboxMax() const;
 
+    // Model-space AABB of a SKINNED character derived from its joint
+    // positions (cached node matrices), padded for the flesh around
+    // the bones.  The raw mesh bbox_min_/bbox_max_ are PRE-skin
+    // accessor bounds: for rigs whose skeleton is authored away from
+    // the mesh node (Mixamo/Blender sibling-armature exports) they
+    // land nowhere near the rendered body.  Joint origins follow the
+    // same math the vertex shader applies (joint.cached * inv_bind),
+    // so this box tracks what's actually on screen.  Returns false
+    // for non-skinned or not-ready drawables — callers fall back to
+    // the mesh bbox.
+    bool getSkinnedModelAabb(glm::vec3& bmin, glm::vec3& bmax) const;
+
     void updateInstanceBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
 

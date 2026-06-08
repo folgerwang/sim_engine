@@ -5587,6 +5587,21 @@ void DrawableObject::updateInstanceBuffer(
     params.force_identity = use_node_transform_only_ ? 1u : 0u;
     params.pad0 = 0u;
     params.pad1 = 0u;
+    // Explicit transform for the force_identity path.  ALWAYS a true
+    // identity: the editor placement TRS is applied on the OTHER side
+    // of the vertex math — drawMesh pre-multiplies model_params.model_-
+    // mat by m_current_instance_world_ (staged from the instance-root
+    // TRS in draw()).  Writing the TRS here as well would apply the
+    // placement twice.  The push-constant fields stay so the compute
+    // can take an arbitrary transform later if a caller ever needs the
+    // instance buffer (not model_mat) to carry placement.
+    {
+        const glm::mat4 forced(1.0f);
+        params.forced_mat_0 = forced[0];
+        params.forced_mat_1 = forced[1];
+        params.forced_mat_2 = forced[2];
+        params.forced_pos   = forced[3];
+    }
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         update_instance_buffer_pipeline_layout_,
@@ -5757,18 +5772,6 @@ void DrawableObject::draw(
     // (see application.cpp HUD wiring) is the user-visible signal; the
     // object simply pops in the first frame after phase 3 finalizes.
     if (!isReady()) {
-        if (object_ &&
-            (object_->m_debug_force_red_ ||
-             object_->m_debug_log_draws_)) {
-            object_->m_debug_draw_not_ready_ = 1;
-            static uint64_t s_not_ready_frame = 0;
-            if ((s_not_ready_frame++ % 60u) == 0u) {
-                std::cout << "[player.draw] SKIPPED — !isReady() ("
-                          << "draw_mode=" << int(draw_mode)
-                          << " depth_only=" << depth_only << ")"
-                          << std::endl;
-            }
-        }
         return;
     }
 
@@ -5850,129 +5853,6 @@ void DrawableObject::draw(
         }
     }
 
-    // Per-second tally of how many indirect-draw submissions actually
-    // reached the rasterizer for this drawable, plus every gating
-    // counter that explains where draws were dropped if the count is
-    // 0.  Gated on m_debug_log_draws_ (independent of force-red).
-    //
-    // ── File mirror ──────────────────────────────────────────────────
-    // Every [player.draw*] line we emit to stdout is ALSO written to
-    // logs/player_draw_YYYY-MM-DD_HH-MM-SS.log so a long session can
-    // be analysed offline without scrollback-hunting.  Opened lazily
-    // on first hit, one fresh file per launch (matching the existing
-    // logs/2026-05-18_*.log naming convention), flushed every line so
-    // a crash doesn't lose the last second of data.  Static local
-    // ofstream — no class-field change.
-    if (object_->m_debug_force_red_ || object_->m_debug_log_draws_) {
-        static uint64_t s_draw_log_frame = 0;
-        static std::ofstream s_draw_log_file;
-        static bool          s_draw_log_opened = false;
-        auto open_draw_log = [&]() {
-            if (s_draw_log_opened) return;
-            s_draw_log_opened = true;
-            std::error_code ec;
-            std::filesystem::create_directories("logs", ec);
-            auto now_t = std::chrono::system_clock::to_time_t(
-                std::chrono::system_clock::now());
-            std::tm tm_local{};
-            localtime_s(&tm_local, &now_t);
-            char fname[256];
-            std::strftime(
-                fname, sizeof(fname),
-                "logs/player_draw_%Y-%m-%d_%H-%M-%S.log",
-                &tm_local);
-            s_draw_log_file.open(fname,
-                                 std::ios::out | std::ios::app);
-            if (s_draw_log_file.is_open()) {
-                std::filesystem::path abs = std::filesystem::absolute(
-                    fname, ec);
-                s_draw_log_file
-                    << "# [player.draw] tally stream\n"
-                    << "# one block per ~60 frames, three lines per "
-                       "block:\n"
-                    << "#   [player.draw]       indirect_draws_issued\n"
-                    << "#   [player.draw.reach] gating counters\n"
-                    << "#   [player.draw.ctx]   root xform + flags\n";
-                std::cout << "[player.draw] streaming to "
-                          << abs.string() << std::endl;
-            }
-        };
-        if ((s_draw_log_frame++ % 60u) == 0u) {
-            open_draw_log();
-            // Resolve the root node's world-space translation so we
-            // can spot "draws issued but model_mat sends it to NaN /
-            // off into the next ZIP code" cases cheaply.
-            glm::vec3 root_T(0.0f);
-            int32_t root_node_idx = -1;
-            if (!object_->scenes_.empty() &&
-                object_->default_scene_ >= 0 &&
-                object_->default_scene_ < (int)object_->scenes_.size() &&
-                !object_->scenes_[object_->default_scene_].nodes_.empty()) {
-                root_node_idx =
-                    object_->scenes_[object_->default_scene_].nodes_[0];
-                if (root_node_idx >= 0 &&
-                    root_node_idx < (int)object_->nodes_.size()) {
-                    const auto& cm =
-                        object_->nodes_[root_node_idx].cached_matrix_;
-                    root_T = glm::vec3(cm[3]);
-                }
-            }
-            // Tee helper — emits one line to stdout AND the file
-            // mirror.  Built via ostringstream so the formatting
-            // happens once and both sinks see the same bytes; cheap
-            // because it fires only once every 60 frames.  Each
-            // file write flushes so a crash mid-session doesn't
-            // truncate the last second of data.
-            auto emit = [&](const std::string& line) {
-                std::cout << line << std::endl;
-                if (s_draw_log_file.is_open()) {
-                    s_draw_log_file << line << '\n';
-                    s_draw_log_file.flush();
-                }
-            };
-
-            {
-                std::ostringstream ss;
-                ss << "[player.draw] mode=" << int(draw_mode)
-                   << " depth_only=" << depth_only
-                   << " indirect_draws_issued="
-                   << object_->m_debug_draw_call_count_
-                   << " (of " << object_->meshes_.size() << " meshes)";
-                emit(ss.str());
-            }
-            {
-                std::ostringstream ss;
-                ss << "[player.draw.reach]"
-                   << " called="          << object_->m_debug_draw_called_
-                   << " not_ready="       << object_->m_debug_draw_not_ready_
-                   << " nodes_visited="   << object_->m_debug_draw_nodes_visited_
-                   << " nodes_w_mesh="    << object_->m_debug_draw_nodes_with_mesh_
-                   << " mesh_entered="    << object_->m_debug_draw_mesh_entered_
-                   << " culled_frustum="  << object_->m_debug_draw_mesh_culled_frustum_
-                   << " cluster_indirect="<< object_->m_debug_draw_mesh_taken_by_cluster_
-                   << " cluster_debug="   << object_->m_debug_draw_mesh_cluster_debug_path_
-                   << " prims_iter="      << object_->m_debug_draw_prims_iterated_
-                   << " pipe_null="       << object_->m_debug_draw_prim_pipeline_null_
-                   << " mesh_shader="     << object_->m_debug_draw_prim_mesh_shader_;
-                emit(ss.str());
-            }
-            {
-                std::ostringstream ss;
-                ss << "[player.draw.ctx] root_node=" << root_node_idx
-                   << " root_T=(" << root_T.x << "," << root_T.y
-                   << "," << root_T.z << ")"
-                   << " use_node_xform_only="
-                   << (object_->m_use_node_transform_only_ ? 1 : 0)
-                   << " frustum_cull_active="
-                   << (s_frustum_cull_active ? 1 : 0)
-                   << " cluster_indirect_active="
-                   << (engine::helper::clusterIndirectActive() ? 1 : 0)
-                   << " cluster_rendering_enabled="
-                   << (engine::helper::clusterRenderingEnabled() ? 1 : 0);
-                emit(ss.str());
-            }
-        }
-    }
 }
 
 void DrawableObject::update(
@@ -6117,6 +5997,43 @@ glm::vec3 DrawableObject::getModelBboxMax() const {
     for (const auto& m : object_->meshes_) mx = glm::max(mx, m.bbox_max_);
     if (mx.x == std::numeric_limits<float>::lowest()) return glm::vec3(0.0f);
     return mx;
+}
+
+bool DrawableObject::getSkinnedModelAabb(
+    glm::vec3& bmin, glm::vec3& bmax) const {
+    if (!object_ || !object_->ready_.load(std::memory_order_acquire))
+        return false;
+    if (object_->skins_.empty()) return false;
+
+    bmin = glm::vec3(std::numeric_limits<float>::max());
+    bmax = glm::vec3(std::numeric_limits<float>::lowest());
+    size_t joints_seen = 0;
+    for (const auto& skin : object_->skins_) {
+        for (const auto j : skin.joints_) {
+            if (j < 0 || (size_t)j >= object_->nodes_.size()) continue;
+            // cached_matrix_ column 3 = the joint's model-space
+            // position — exactly where vertices weighted to this
+            // joint render (joint.cached * inv_bind maps bind-pose
+            // verts back into the joint's neighbourhood).
+            const glm::vec3 p =
+                glm::vec3(object_->nodes_[j].cached_matrix_[3]);
+            bmin = glm::min(bmin, p);
+            bmax = glm::max(bmax, p);
+            ++joints_seen;
+        }
+    }
+    if (joints_seen < 2) return false;
+
+    // Joints are bone ORIGINS — the mesh surface sits a few cm to a
+    // few dm outside them (skull above the head joint, fingertips past
+    // the hand joint, clothing).  Pad each side by 15% of the largest
+    // extent, at least 5 cm.
+    const glm::vec3 ext = bmax - bmin;
+    const float pad = std::max(
+        0.05f, 0.15f * std::max(ext.x, std::max(ext.y, ext.z)));
+    bmin -= glm::vec3(pad);
+    bmax += glm::vec3(pad);
+    return true;
 }
 
 std::shared_ptr<renderer::BufferInfo> DrawableObject::getGameObjectsBuffer() {

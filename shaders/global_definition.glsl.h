@@ -941,6 +941,18 @@ struct InstanceBufferUpdateParams {
     uint            force_identity;
     uint            pad0;
     uint            pad1;
+    // Only read when force_identity != 0: the explicit world transform
+    // to write into every instance slot, expressed as the three world
+    // basis COLUMNS (rotation*scale) plus translation — exactly the
+    // convention the GameObjectInfo path produces and base.vert
+    // consumes (mat3x3(rot_0,rot_1,rot_2) * p + pos.xyz).  Editor-
+    // placed skinned characters need this: a bare identity rendered
+    // them at the model's authored origin (world 0,0,0, typically
+    // below the terrain) instead of where the user dropped them.
+    vec4            forced_mat_0;
+    vec4            forced_mat_1;
+    vec4            forced_mat_2;
+    vec4            forced_pos;
 };
 
 struct NoiseInitParams {

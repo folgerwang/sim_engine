@@ -14,7 +14,8 @@ namespace scene {
 namespace {
 // `filter` is a double-null-terminated set of "label\0pattern\0" pairs.
 std::string openWithFilter(const char* filter, const char* title,
-                           void* owner_hwnd) {
+                           void* owner_hwnd,
+                           const char* initial_dir = nullptr) {
     char file_buf[MAX_PATH] = { 0 };
 
     // Explicit ...A (ANSI) variants so we work with std::string regardless of
@@ -27,6 +28,10 @@ std::string openWithFilter(const char* filter, const char* title,
     ofn.lpstrFile    = file_buf;
     ofn.nMaxFile     = MAX_PATH;
     ofn.lpstrTitle   = title;
+    // Starting folder (e.g. content/scene for scene files).  NULL keeps
+    // the OS default (last-visited folder).
+    ofn.lpstrInitialDir =
+        (initial_dir && initial_dir[0]) ? initial_dir : nullptr;
     // OFN_NOCHANGEDIR: the engine loads assets via paths relative to the
     // working directory; without this the common dialog would change CWD to
     // the browsed folder and break subsequent relative asset loads.
@@ -52,14 +57,16 @@ std::string openModelFileDialog(void* owner_hwnd) {
 #endif
 }
 
-std::string openSceneFileDialog(void* owner_hwnd) {
+std::string openSceneFileDialog(void* owner_hwnd,
+                                const char* initial_dir) {
 #ifdef _WIN32
     return openWithFilter(
         "Scene files (*.scene)\0*.scene\0"
         "All files (*.*)\0*.*\0",
-        "Load scene", owner_hwnd);
+        "Load scene", owner_hwnd, initial_dir);
 #else
     (void)owner_hwnd;
+    (void)initial_dir;
     return std::string();
 #endif
 }

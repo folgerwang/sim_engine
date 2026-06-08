@@ -53,10 +53,13 @@ void main()
   // shared game_objects_buffer_ position.  See the struct comment in
   // global_definition.glsl.h for why this matters.
   if (params.force_identity != 0u) {
-    insts[inst_idx].mat_rot_0     = vec4(1.0, 0.0, 0.0, 0.0);
-    insts[inst_idx].mat_rot_1     = vec4(0.0, 1.0, 0.0, 0.0);
-    insts[inst_idx].mat_rot_2     = vec4(0.0, 0.0, 1.0, 0.0);
-    insts[inst_idx].mat_pos_scale = vec4(0.0, 0.0, 0.0, 1.0);
+    // Explicit transform pushed from the CPU (editor placement TRS for
+    // hand-placed skinned characters; identity for the controller-
+    // driven player).  Same column convention as the path below.
+    insts[inst_idx].mat_rot_0     = params.forced_mat_0;
+    insts[inst_idx].mat_rot_1     = params.forced_mat_1;
+    insts[inst_idx].mat_rot_2     = params.forced_mat_2;
+    insts[inst_idx].mat_pos_scale = vec4(params.forced_pos.xyz, 1.0);
     return;
   }
 

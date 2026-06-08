@@ -15,8 +15,11 @@ namespace scene {
 // Filtered to model files (*.gltf;*.glb;*.fbx;*.obj).
 std::string openModelFileDialog(void* owner_hwnd = nullptr);
 
-// Filtered to scene files (*.scene).
-std::string openSceneFileDialog(void* owner_hwnd = nullptr);
+// Filtered to scene files (*.scene).  `initial_dir` (optional) is the
+// folder the dialog opens in — the editor passes content/scene, where
+// Save Scene writes.
+std::string openSceneFileDialog(void* owner_hwnd = nullptr,
+                                const char* initial_dir = nullptr);
 
 } // namespace scene
 } // namespace engine
