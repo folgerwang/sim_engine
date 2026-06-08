@@ -41,6 +41,7 @@ extern "C" {
 #include "helper/vram_cuda.h"             // device-wide VRAM (counts ML/CUDA + other processes)
 #include "helper/model_inspect.h"         // sub-object names for content assets
 #include "helper/mesh_preview.h"          // GPU offscreen Debug Display preview
+#include "audio/audio_engine.h"           // Content Browser audio preview
 
 #include "menu.h"
 #include "plugins/plugin_manager.h"
@@ -2007,6 +2008,11 @@ bool Menu::draw(
             // Camera creation lives on the viewport right-click menu
             // ("Add Camera Object") — no Scene-menu duplicate.
             ImGui::MenuItem("Show Grid", NULL, &show_scene_grid_);
+            // Counterpart to the audio tile's "Set as Scene Music".
+            if (ImGui::MenuItem("Clear Scene Music")) {
+                scene_music_path_.clear();
+                scene_music_pending_ = true;
+            }
             ImGui::Separator();
             // Model import happens through the Content Browser (Import
             // button / drag-and-drop) — no Scene-menu duplicate.
@@ -3675,6 +3681,8 @@ void Menu::drawEditorDockSpace() {
     drawOutputPanel();
     // Shared FLUX.2 popup — drawn ONCE per frame (both browsers can open it).
     drawFluxGeneratePopup();
+    // Shared text-to-audio popup — same single-instance rule.
+    drawAudioGeneratePopup();
 
     // ── Drag & drop placement into the 3D viewport ──────────────────────
     // The viewport is the pass-through central dock node (no ImGui window),
@@ -5415,6 +5423,10 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // have no .rwobj refs, so this is how their skeleton
                 // meshes preview in the Debug Display.
                 const bool is_geo = (ext == ".rwgeo");
+                // Audio clips (generated or imported) — click to preview
+                // through the engine's SFX bus, click again to stop.
+                const bool is_audio = (ext == ".wav" || ext == ".mp3" ||
+                                       ext == ".flac");
                 // Import GROUP folder (holds import.rwmeta + .rwobj files):
                 // placeable as a whole — every object, original layout.
                 bool is_group_dir = false;
@@ -5435,15 +5447,27 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 if (tex) {
                     clicked = ImGui::ImageButton("##t", tex, ImVec2(cell, cell));
                 } else {
+                    // Audio tiles flip to a brighter "PLAYING" tint while
+                    // their clip is on the preview bus.
+                    const bool audio_playing =
+                        is_audio && audio_preview_handle_ != 0 &&
+                        audio_preview_path_ == e.path().string() &&
+                        engine::audio::AudioEngine::isPlaying(
+                            audio_preview_handle_);
                     const ImVec4 c = is_dir    ? ImVec4(0.24f, 0.31f, 0.45f, 1.0f)
                                    : is_model  ? ImVec4(0.28f, 0.40f, 0.27f, 1.0f)
                                    : is_object ? ImVec4(0.33f, 0.30f, 0.42f, 1.0f)
                                    : is_geo    ? ImVec4(0.30f, 0.36f, 0.42f, 1.0f)
+                                   : audio_playing
+                                               ? ImVec4(0.45f, 0.33f, 0.18f, 1.0f)
+                                   : is_audio  ? ImVec4(0.40f, 0.30f, 0.22f, 1.0f)
                                                : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, c);
                     std::string glyph = is_dir    ? "DIR"
                                       : is_object ? "OBJ"
                                       : is_geo    ? "GEO"
+                                      : audio_playing ? "||>"
+                                      : is_audio  ? "SND"
                         : (ext.size() > 1 ? ext.substr(1) : "?");
                     for (auto& ch : glyph) ch = (char)std::toupper((unsigned char)ch);
                     clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
@@ -5506,6 +5530,13 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                         ImGui::MenuItem("Add to Scene")) {
                         place_asset_request_ = e.path().string();
                     }
+                    // Loop this clip on the music bus + persist it in the
+                    // scene file (saved as part of Save Scene).
+                    if (is_content && is_audio &&
+                        ImGui::MenuItem("Set as Scene Music")) {
+                        scene_music_path_    = e.path().string();
+                        scene_music_pending_ = true;
+                    }
                     if (ImGui::MenuItem("Rename")) {
                         rename_target_ = e.path().string();
                         std::snprintf(rename_buf_, sizeof(rename_buf_), "%s",
@@ -5551,6 +5582,29 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     buildRwObjPreview(e.path().string(), name);
                 } else if (clicked && is_content && is_geo) {
                     buildRwGeoPreview(e.path().string(), name);
+                } else if (clicked && is_audio) {
+                    // Toggle preview: clicking the playing clip stops it;
+                    // clicking another clip switches to it.
+                    const std::string p = e.path().string();
+                    const bool was_this =
+                        audio_preview_handle_ != 0 &&
+                        audio_preview_path_ == p &&
+                        engine::audio::AudioEngine::isPlaying(
+                            audio_preview_handle_);
+                    if (audio_preview_handle_ != 0) {
+                        engine::audio::AudioEngine::stop(
+                            audio_preview_handle_);
+                        audio_preview_handle_ = 0;
+                    }
+                    if (!was_this) {
+                        audio_preview_handle_ =
+                            engine::audio::AudioEngine::playFile(
+                                p, engine::audio::AudioEngine::Bus::kSfx);
+                        audio_preview_path_ = p;
+                        if (audio_preview_handle_ == 0)
+                            EditorLog::get().push(
+                                "[audio] preview failed: " + p);
+                    }
                 }
 
                 if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
@@ -5583,6 +5637,10 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             if (ImGui::MenuItem("Generate Image...")) {
                 gen_popup_pending_ = true;
                 gen_folder_        = cur_dir;
+            }
+            if (ImGui::MenuItem("Generate Audio...")) {
+                agen_popup_pending_ = true;
+                agen_folder_        = cur_dir;
             }
             ImGui::EndPopup();
         }
@@ -5899,6 +5957,201 @@ void Menu::drawFluxGeneratePopup() {
             ImGui::End();
         }
     }
+}
+
+// ── Text-to-audio generation (Stable Audio Open via tools/audiogen) ─────────
+// Same contract as the FLUX image tool: write the prompt to a sidecar file,
+// spawn the python generator detached, poll for the output WAV (success) or
+// "<out>.err" (failure traceback).
+void Menu::launchAudioGen(const std::string& folder, const std::string& prompt,
+                          int type_idx, float duration_sec) {
+    namespace fs = std::filesystem;
+    std::string p = prompt;
+    for (char& c : p) if (c == '\n' || c == '\r') c = ' ';
+    while (!p.empty() && (p.back() == ' ' || p.back() == '\t'))
+        p.pop_back();
+    if (p.empty()) { agen_status_ = 3; agen_err_ = "empty prompt"; return; }
+
+    std::error_code ec;
+    fs::create_directories(folder, ec);
+
+    static int s_n = 0;
+    // Optional name from the popup (agen_name_): sanitize + drop a typed
+    // ".wav"; empty -> a unique auto name (a reused name overwrites).
+    std::string base;
+    {
+        std::string clean;
+        for (char ch : std::string(agen_name_)) {
+            if (ch=='/'||ch=='\\'||ch==':'||ch=='*'||ch=='?'||ch=='"'||
+                ch=='<'||ch=='>'||ch=='|'||ch=='\n'||ch=='\r'||ch=='\t')
+                continue;
+            clean.push_back(ch);
+        }
+        while (!clean.empty() && clean.front()==' ') clean.erase(clean.begin());
+        while (!clean.empty() && clean.back()==' ')  clean.pop_back();
+        if (clean.size() >= 4) {
+            std::string e = clean.substr(clean.size()-4);
+            for (char& c2 : e) if (c2>='A'&&c2<='Z') c2=(char)(c2+32);
+            if (e == ".wav") clean.resize(clean.size()-4);
+        }
+        base = clean.empty()
+             ? (std::string(type_idx == 1 ? "sfx_" : "music_") +
+                std::to_string((long long)std::time(nullptr)) +
+                "_" + std::to_string(s_n++))
+             : clean;
+    }
+    agen_out_path_ = (fs::path(folder) / (base + ".wav")).string();
+    // Stale results from a previous run with the same name would satisfy the
+    // poll instantly — clear them first.
+    fs::remove(agen_out_path_, ec);
+    fs::remove(agen_out_path_ + ".err", ec);
+
+    fs::path tmp_dir = fs::path(folder) / ".audiogen_tmp";
+    fs::create_directories(tmp_dir, ec);
+    const std::string pfile =
+        (tmp_dir / (base + ".wav.prompt.txt")).string();
+    { std::ofstream pf(pfile, std::ios::binary); pf << p; }
+
+    agen_last_prompt_ = p;
+    agen_last_type_   = type_idx;
+    agen_last_dur_    = duration_sec;
+    agen_err_.clear();
+
+    const char* type_arg = (type_idx == 1) ? "sfx" : "music";
+    char dur[32];
+    std::snprintf(dur, sizeof(dur), "%.1f", duration_sec);
+
+    // Same interpreter Setup.bat configured (shared CUDA torch install).
+#ifdef _WIN32
+    const std::string script = "tools\\audiogen\\audiogen_generate.py";
+    const std::string cmd =
+        "cmd /c start \"audiogen\" /B python \"" + script + "\""
+        " --prompt-file \"" + pfile + "\" --out \"" + agen_out_path_ + "\""
+        " --type " + type_arg + " --duration " + dur;
+#else
+    const std::string script = "tools/audiogen/audiogen_generate.py";
+    const std::string cmd =
+        "python3 \"" + script + "\""
+        " --prompt-file \"" + pfile + "\" --out \"" + agen_out_path_ + "\""
+        " --type " + std::string(type_arg) + " --duration " + dur + " &";
+#endif
+    EditorLog::get().push("[audiogen] launching generation -> " +
+                          agen_out_path_);
+    std::system(cmd.c_str());
+    agen_status_ = 1;   // running
+}
+
+// Generate-audio popup — single instance shared by both browsers, drawn once
+// per frame next to drawFluxGeneratePopup().
+void Menu::drawAudioGeneratePopup() {
+    namespace fs = std::filesystem;
+
+    // Poll a running generation: the WAV appears (success) or "<out>.err"
+    // (failure, traceback inside).
+    if (agen_status_ == 1) {
+        std::error_code pec;
+        if (fs::exists(agen_out_path_, pec)) {
+            agen_status_ = 2;
+            EditorLog::get().push("[audiogen] clip ready: " + agen_out_path_);
+        } else if (fs::exists(agen_out_path_ + ".err", pec)) {
+            agen_status_ = 3;
+            std::ifstream ef(agen_out_path_ + ".err", std::ios::binary);
+            agen_err_.assign(std::istreambuf_iterator<char>(ef),
+                             std::istreambuf_iterator<char>());
+            EditorLog::get().push("[audiogen] generation FAILED: " +
+                                  agen_err_);
+        }
+    }
+
+    static bool s_open = false;
+    if (agen_popup_pending_) {
+        agen_popup_pending_ = false;
+        if (agen_folder_.empty()) agen_folder_ = content_dir_;
+        s_open = true;
+    }
+    if (!s_open) return;
+
+    // Appearing (not Always) so the user can resize; tall enough that the
+    // button row + status line fit below the prompt with the fantasy font.
+    ImGui::SetNextWindowSize(ImVec2(624.0f, 560.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 320.0f),
+                                        ImVec2(8192.0f, 8192.0f));
+    if (ImGui::Begin("Generate Audio", &s_open,
+                     ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextDisabled("Generate audio into:");
+        ImGui::TextUnformatted(agen_folder_.c_str());
+        ImGui::Separator();
+
+        ImGui::TextUnformatted("Prompt");
+        const float box_w = ImGui::GetContentRegionAvail().x;
+        GenWrapUD genud;
+        genud.wrap_w = box_w - ImGui::GetStyle().FramePadding.x * 2.0f
+                             - ImGui::GetStyle().ScrollbarSize - 4.0f;
+        ImGui::InputTextMultiline("##agen_prompt", agen_prompt_,
+            sizeof(agen_prompt_),
+            ImVec2(box_w, ImGui::GetTextLineHeightWithSpacing() * 5.0f),
+            ImGuiInputTextFlags_CallbackAlways, &GenPromptWrapCallback,
+            &genud);
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Name (optional)");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputTextWithHint("##agen_name",
+            "leave empty for an auto name", agen_name_, sizeof(agen_name_));
+
+        ImGui::Spacing();
+        const char* kTypes[] = { "Music", "Sound Effect" };
+        if (agen_type_idx_ < 0 || agen_type_idx_ > 1) agen_type_idx_ = 0;
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::BeginCombo("##agen_type", kTypes[agen_type_idx_])) {
+            for (int i = 0; i < 2; ++i)
+                if (ImGui::Selectable(kTypes[i], agen_type_idx_ == i))
+                    agen_type_idx_ = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::SliderFloat("##agen_dur", &agen_duration_, 1.0f, 47.0f,
+                           "%.0f s");
+
+        ImGui::Separator();
+        const float btn_w = (ImGui::GetContentRegionAvail().x
+                             - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        const bool busy = (agen_status_ == 1);
+        if (busy) ImGui::BeginDisabled();
+        if (ImGui::Button("Generate", ImVec2(btn_w, 0)))
+            launchAudioGen(agen_folder_, agen_prompt_, agen_type_idx_,
+                           agen_duration_);
+        ImGui::SameLine();
+        const bool can_regen = !agen_last_prompt_.empty();
+        if (!can_regen) ImGui::BeginDisabled();
+        if (ImGui::Button("Regenerate", ImVec2(btn_w, 0)))
+            launchAudioGen(agen_folder_, agen_last_prompt_,
+                           agen_last_type_, agen_last_dur_);
+        if (!can_regen) ImGui::EndDisabled();
+        if (busy) ImGui::EndDisabled();
+
+        if (agen_status_ == 1)
+            ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.30f, 1.0f),
+                "Generating... (Stable Audio Open — this can take a while)");
+        else if (agen_status_ == 2) {
+            ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.50f, 1.0f),
+                "Done — clip added to this folder.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Play")) {
+                if (audio_preview_handle_ != 0)
+                    engine::audio::AudioEngine::stop(audio_preview_handle_);
+                audio_preview_handle_ =
+                    engine::audio::AudioEngine::playFile(
+                        agen_out_path_,
+                        engine::audio::AudioEngine::Bus::kSfx);
+                audio_preview_path_ = agen_out_path_;
+            }
+        } else if (agen_status_ == 3)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                "Failed — see Output Log.");
+    }
+    ImGui::End();
 }
 
 // ── Sub-object names for a content asset (virtual-folder view) ──────────────

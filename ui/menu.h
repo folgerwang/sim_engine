@@ -877,6 +877,35 @@ private:
     std::string gen_err_;
     std::string gen_last_prompt_;             // for the Regenerate button
     int         gen_last_w_ = 1024, gen_last_h_ = 1024;
+
+    // ── Text-to-audio generation (Content Browser right-click) ──────────────
+    // Mirror of the FLUX flow: launchAudioGen() spawns
+    // tools/audiogen/audiogen_generate.py (Stable Audio Open) detached and
+    // polls for the output WAV / "<out>.err".  agen_status_: 0 idle,
+    // 1 running, 2 done, 3 error.
+    void drawAudioGeneratePopup();    // popup + poll (once per frame)
+    void launchAudioGen(const std::string& folder, const std::string& prompt,
+                        int type_idx, float duration_sec);
+    bool        agen_popup_pending_ = false;
+    char        agen_prompt_[2048]  = {0};
+    char        agen_name_[128]     = {0};   // optional output name (empty = auto)
+    int         agen_type_idx_      = 0;     // 0 = music, 1 = sound effect
+    float       agen_duration_      = 12.0f; // seconds (model max 47)
+    std::string agen_folder_;                // folder to generate into
+    std::string agen_out_path_;              // current output WAV
+    int         agen_status_        = 0;
+    std::string agen_err_;
+    std::string agen_last_prompt_;           // for the Regenerate button
+    int         agen_last_type_     = 0;
+    float       agen_last_dur_      = 12.0f;
+
+    // Content Browser audio preview (click a wav/mp3/flac tile to toggle).
+    uint64_t    audio_preview_handle_ = 0;
+    std::string audio_preview_path_;
+
+    // Scene music request (audio tile right-click / Scene menu clear).
+    bool        scene_music_pending_ = false;
+    std::string scene_music_path_;       // "" = clear
     void drawOutputPanel();   // UE5-style console Output Log (bottom tab)
     // Absolute screen rect/centre of the editor Viewport (central dock node);
     // falls back to the full main viewport when the editor is inactive.  Used
@@ -939,6 +968,17 @@ public:
     }
     bool consumeLoadSceneRequest() {
         if (scene_load_request_) { scene_load_request_ = false; return true; }
+        return false;
+    }
+    // "Set as Scene Music" (audio tile right-click) / "Clear Scene Music"
+    // (Scene menu).  out_path = clip to loop on the music bus; "" = clear.
+    // Serviced by the application, which also persists it into the scene.
+    bool consumeSceneMusicRequest(std::string& out_path) {
+        if (scene_music_pending_) {
+            scene_music_pending_ = false;
+            out_path = scene_music_path_;
+            return true;
+        }
         return false;
     }
     // "Create Scene" mode: clears the current scene to an empty grid the user

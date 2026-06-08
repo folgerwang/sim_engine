@@ -71,7 +71,8 @@ bool readXform(std::ifstream& is, Transform& t) {
 }
 
 const char     kMagic[8] = { 'R', 'W', 'S', 'C', 'E', 'N', 'E', '\0' };
-const uint32_t kVersion  = 1;
+// v2: + music_path (string) + music_volume (float32) after the object list.
+const uint32_t kVersion  = 2;
 
 } // namespace
 
@@ -97,6 +98,10 @@ bool saveSceneBinary(const std::string& path, const Scene& scene) {
         writeXform(os, o.transform);
     }
 
+    // v2 trailer: scene music.
+    writeStr(os, scene.music_path);
+    writePod(os, scene.music_volume);
+
     return static_cast<bool>(os);
 }
 
@@ -118,8 +123,8 @@ bool loadSceneBinary(const std::string& path, Scene& out_scene) {
     if (!readPod(is, version)) {
         return false;
     }
-    if (version != kVersion) {
-        return false;  // only v1 understood for now
+    if (version < 1 || version > kVersion) {
+        return false;  // newer than this build understands
     }
 
     Scene s;
@@ -167,6 +172,16 @@ bool loadSceneBinary(const std::string& path, Scene& out_scene) {
         }
         o.is_group = (is_group != 0);
         o.visible  = (visible != 0);
+    }
+
+    // v2 trailer: scene music (absent in v1 files — defaults stand).
+    if (version >= 2) {
+        if (!readStr(is, s.music_path)) {
+            return false;
+        }
+        if (!readPod(is, s.music_volume)) {
+            return false;
+        }
     }
 
     out_scene = std::move(s);

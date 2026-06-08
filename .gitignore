@@ -4,6 +4,11 @@
 # outer .gitignore does not apply inside.
 third_parties/libtorch/
 
+# sherpa-onnx SDK (text-to-voice): ~100 MB of prebuilt DLLs/import libs,
+# auto-downloaded by CMake at configure time (pinned version) — never commit.
+# miniaudio (third_parties/miniaudio/) IS committed: single pinned header.
+third_parties/sherpa-onnx/
+
 # FUSE filesystem ghosts from open-but-unlinked files
 .fuse_hidden*
 **/.fuse_hidden*

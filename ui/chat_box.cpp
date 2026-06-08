@@ -8,6 +8,7 @@
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"
+#include "audio/tts_engine.h"   // speak NPC dialog lines
 
 #include "chat_box.h"
 
@@ -90,6 +91,26 @@ bool ChatBox::draw(
     ImGui::Spacing(); // Adds a small vertical space
     ImGui::TextWrapped("%s", currentQuestionLine.c_str());
     ImGui::PopStyleColor(); // Pop text color
+
+    // ── Text-to-voice ────────────────────────────────────────────────────
+    // Speak the NPC's lines once each time they CHANGE (this UI redraws
+    // every frame, so keying on the concatenated text is what gives
+    // "say each new line once" semantics).  TtsEngine synthesizes on a
+    // worker thread and plays on the voice bus; a no-op when the
+    // sherpa-onnx backend or the voice model is absent.
+    {
+        std::string spoken;
+        for (const auto& line : currentDialogueLines) {
+            spoken += line;
+            spoken += ' ';
+        }
+        spoken += currentQuestionLine;
+        static std::string s_last_spoken;
+        if (spoken != s_last_spoken) {
+            s_last_spoken = spoken;
+            engine::audio::TtsEngine::speak(spoken);
+        }
+    }
 
     ImGui::End(); // End of "SpeakerInfo"
     ImGui::PopStyleVar(); // Pop WindowPadding

@@ -59,6 +59,12 @@ struct Scene {
     std::string         name = "Untitled";
     Transform           root;     // scene-level world offset / rotation / scale
     std::vector<Object> objects;
+
+    // Background music: path to an audio clip (typically a generated .wav
+    // under content/audio), looped on the music bus while the scene is
+    // active.  Empty = no scene music.  Serialized from format v2 on.
+    std::string         music_path;
+    float               music_volume = 1.0f;
 };
 
 } // namespace scene
