@@ -1,5 +1,7 @@
 #include <fstream>
 #include <filesystem>
+#include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <iostream>
 #include <cstdio>
@@ -62,19 +64,51 @@ void storeImageFileWithHeader(
     file.close();
 }
 
+namespace {
+// Cross-asset texture dedup cache. Keyed by canonical path + srgb + format; the
+// cache OWNS each entry (borrowed_ == false) and hands callers borrowed copies
+// that share the same GPU handles. Frees once at shutdown (destroyTextureCache).
+std::mutex                                             g_tex_cache_mutex;
+std::unordered_map<std::string, renderer::TextureInfo> g_tex_cache;
+
+std::string texCacheKey(const std::string& file_name, bool srgb,
+                        renderer::Format fmt) {
+    std::error_code ec;
+    std::string p = std::filesystem::weakly_canonical(file_name, ec).string();
+    if (ec || p.empty()) p = file_name;
+    return p + "|" + (srgb ? "s" : "l") + "|" +
+           std::to_string(static_cast<int>(fmt));
+}
+}  // namespace
+
 void createTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& file_name,
     const renderer::Format& input_format,
     bool is_srgb_texture,
     renderer::TextureInfo& texture,
-    const std::source_location& src_location) {
+    const std::source_location& src_location,
+    bool cacheable) {
 
     // Create a path object
     std::filesystem::path file_path(file_name);
 
     // Get the file extension
     auto extension = file_path.extension().string();
+
+    // Cross-asset dedup: identical (path, srgb, format) -> one GPU upload.
+    const bool do_cache = cacheable && !file_name.empty();
+    std::string cache_key;
+    if (do_cache) {
+        cache_key = texCacheKey(file_name, is_srgb_texture, input_format);
+        std::lock_guard<std::mutex> lk(g_tex_cache_mutex);
+        auto it = g_tex_cache.find(cache_key);
+        if (it != g_tex_cache.end()) {
+            texture = it->second;      // share the cached GPU handles
+            texture.borrowed_ = true;  // caller must not free; cache owns
+            return;
+        }
+    }
 
     int tex_width = 1, tex_height = 1, tex_channels = 1;
     void* void_pixels = nullptr;
@@ -183,6 +217,29 @@ void createTextureImage(
         src_location,
         0,
         std::max(texture.mip_levels, 1u));
+
+    if (do_cache) {
+        std::lock_guard<std::mutex> lk(g_tex_cache_mutex);
+        renderer::TextureInfo owning = texture;
+        owning.borrowed_ = false;                  // cache is the sole owner
+        auto [it, inserted] = g_tex_cache.try_emplace(cache_key, owning);
+        if (!inserted) {
+            // Lost a race: free our redundant GPU texture, adopt the cached one.
+            texture.borrowed_ = false;
+            texture.destroy(device);
+        }
+        texture = it->second;
+        texture.borrowed_ = true;                  // hand caller a borrowed view
+    }
+}
+
+void destroyTextureCache(const std::shared_ptr<renderer::Device>& device) {
+    std::lock_guard<std::mutex> lk(g_tex_cache_mutex);
+    for (auto& kv : g_tex_cache) {
+        kv.second.borrowed_ = false;
+        kv.second.destroy(device);
+    }
+    g_tex_cache.clear();
 }
 
 std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(

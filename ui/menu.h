@@ -553,6 +553,12 @@ public:
     bool        scene_rename_pending_ = false;
     int         scene_rename_idx_     = -1;
     std::string scene_rename_name_;
+    // Scene-root ("Scene" Outliner node): selectable like an object, with an
+    // editable Name + Transform in the Details panel.
+    bool        editor_scene_root_selected_ = false;
+    engine::scene::Transform* scene_root_xform_ = nullptr;  // -> app scene_.root
+    bool        scene_root_rename_pending_ = false;
+    std::string scene_root_name_;
     ImVec2 viewport_rclick_pos_ = ImVec2(0, 0);  // right-press pos (click vs drag)
     bool show_scene_grid_      = false;  // reference grid / ruler visible
     // True once a scene has been created or loaded this session — makes the
@@ -1098,6 +1104,13 @@ public:
         content_import_frac_   = frac < 0.0f ? 0.0f
                                : frac > 1.0f ? 1.0f : frac;
         content_import_label_  = label;
+    }
+    void setSceneRootXform(engine::scene::Transform* t) { scene_root_xform_ = t; }
+    bool consumeSceneRootRename(std::string& out_name) {
+        if (!scene_root_rename_pending_) return false;
+        scene_root_rename_pending_ = false;
+        out_name = scene_root_name_;
+        return true;
     }
     void setSceneName(const std::string& n) {
         const size_t cap = sizeof(scene_name_buf_) - 1;

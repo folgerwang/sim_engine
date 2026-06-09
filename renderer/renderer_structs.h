@@ -451,6 +451,11 @@ struct TextureInfo {
     // future addition.
     std::string                        source_filename_;
     bool                               linear = true;
+    // True when this TextureInfo's GPU handles are OWNED by the shared texture
+    // cache (engine_helper) and merely borrowed here. DrawableData::destroy must
+    // NOT free a borrowed texture — the cache frees it once at shutdown. Set by
+    // createTextureImage(..., cacheable=true) on a cache hit/insert.
+    bool                               borrowed_ = false;
     glm::uvec3                         size = glm::uvec3(0);
     uint32_t                           mip_levels = 1;
     std::shared_ptr<Image>             image;

@@ -428,6 +428,7 @@ class DrawableObject {
     // a cache to make getUseNodeTransformOnly() valid even before
     // object_ is populated; the setter writes both.
     bool                        use_node_transform_only_ = false;
+    bool                        external_animation_ = false;
 
     // ── Per-instance world override (for shared-mesh drawables) ──────
     // When the same loaded mesh (one shared DrawableData) is rendered as
@@ -697,6 +698,15 @@ public:
     }
     bool getUseNodeTransformOnly() const { return use_node_transform_only_; }
 
+    // ── ECS-driven animation ──────────────────────────────────────────────
+    // When true, DrawableObject::update() skips the imported glTF channel
+    // evaluation (like use_node_transform_only_) but WITHOUT the identity-
+    // instance side effect — so a placed/instanced object keeps its world
+    // placement while the ECS AnimationSystem owns its node TRS (written via
+    // setNodeLocalTRS before update()). Default false = unchanged behaviour.
+    void setExternalAnimation(bool v) { external_animation_ = v; }
+    bool getExternalAnimation() const { return external_animation_; }
+
     // ── Debug "force red" override ──────────────────────────────────
     // When true, every primitive of this drawable renders as a flat
     // bright red pixel through base.frag (debug_force_red is pushed
@@ -792,6 +802,30 @@ public:
     glm::mat4 getNodeWorldMatrixByName(const std::string& name) const;
     glm::vec3 getModelBboxMin() const;
     glm::vec3 getModelBboxMax() const;
+
+    // ── ECS animation seam ────────────────────────────────────────────────
+    // The ECS AnimationSystem samples clips (read from getDrawableData()) and
+    // writes the resulting per-node local TRS back through setNodeLocalTRS().
+    // Pair with skipping the imported channel evaluation (DrawableData::update
+    // skip_animations) so the ECS pose is not overwritten the same frame.
+    // All index-based, bounds- and ready-checked; no-ops on a not-yet-loaded
+    // shell. No behaviour change unless a caller actually drives them.
+    uint32_t getNodeCount() const {
+        return object_ ? static_cast<uint32_t>(object_->nodes_.size()) : 0u;
+    }
+    bool getNodeLocalTRS(uint32_t node_idx, glm::vec3& t, glm::quat& r,
+                         glm::vec3& s) const {
+        if (!object_ || node_idx >= object_->nodes_.size()) return false;
+        const auto& n = object_->nodes_[node_idx];
+        t = n.translation_; r = n.rotation_; s = n.scale_;
+        return true;
+    }
+    void setNodeLocalTRS(uint32_t node_idx, const glm::vec3& t,
+                         const glm::quat& r, const glm::vec3& s) {
+        if (!object_ || node_idx >= object_->nodes_.size()) return;
+        auto& n = object_->nodes_[node_idx];
+        n.translation_ = t; n.rotation_ = r; n.scale_ = s;
+    }
 
     // Model-space AABB of a SKINNED character derived from its joint
     // positions (cached node matrices), padded for the flesh around

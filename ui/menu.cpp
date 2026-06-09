@@ -3998,8 +3998,19 @@ void Menu::drawOutlinerPanel() {
                 const std::string slabel =
                     std::string(scene_name_buf_) + "  (" +
                     std::to_string(scene_count) + ")###scene_node";
-                if (ImGui::TreeNodeEx(slabel.c_str(),
-                                      ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                ImGuiTreeNodeFlags _sflags =
+                    ImGuiTreeNodeFlags_SpanAvailWidth |
+                    ImGuiTreeNodeFlags_OpenOnArrow;
+                if (editor_scene_root_selected_ && editor_selected_ < 0)
+                    _sflags |= ImGuiTreeNodeFlags_Selected;
+                const bool _scene_open =
+                    ImGui::TreeNodeEx(slabel.c_str(), _sflags);
+                if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+                    editor_scene_root_selected_ = true;
+                    editor_selected_       = -1;
+                    editor_selected_child_ = -1;
+                }
+                if (_scene_open) {
                     // Children of a scene row (placed objects under their
                     // source-group node).
                     auto scene_children_of = [&](int pi) {
@@ -4558,6 +4569,40 @@ void Menu::selectByPick(engine::game_object::DrawableObject* obj, int node_idx) 
 }
 
 void Menu::drawDetailsContent() {
+    // ── Scene root (Outliner "Scene" node): Name + Transform, like an object.
+    if (editor_selected_ < 0 && editor_scene_root_selected_) {
+        ImGui::SetNextItemWidth(220.0f);
+        const bool entered = ImGui::InputText(
+            "Name", scene_name_buf_, sizeof(scene_name_buf_),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        if ((entered || ImGui::IsItemDeactivatedAfterEdit()) &&
+            scene_name_buf_[0] != '\0') {
+            scene_root_rename_pending_ = true;
+            scene_root_name_ = scene_name_buf_;
+        }
+        ImGui::Separator();
+        if (scene_root_xform_) {
+            ImGui::SeparatorText("Transform");
+            glm::vec3 pos = scene_root_xform_->translation;
+            glm::vec3 scl = scene_root_xform_->scale;
+            glm::vec3 euler_deg =
+                glm::degrees(glm::eulerAngles(scene_root_xform_->rotation));
+            bool changed = false;
+            changed = ImGui::DragFloat3("Offset",   &pos.x, 0.05f) || changed;
+            changed = ImGui::DragFloat3("Rotation", &euler_deg.x, 0.5f) || changed;
+            changed = ImGui::DragFloat3("Scale",    &scl.x, 0.01f, 0.001f,
+                                        1000.0f) || changed;
+            if (changed) {
+                scene_root_xform_->translation = pos;
+                scene_root_xform_->rotation = glm::quat(glm::radians(euler_deg));
+                scene_root_xform_->scale    = scl;
+                scene_xform_dirty_ = true;
+            }
+        } else {
+            ImGui::TextDisabled("(no scene loaded)");
+        }
+        return;
+    }
     if (editor_selected_ >= 0 &&
         editor_selected_ < (int)editor_objects_.size()) {
         EditorSceneObject& o = editor_objects_[editor_selected_];

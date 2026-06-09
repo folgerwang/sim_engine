@@ -62,7 +62,13 @@ void createTextureImage(
     const renderer::Format& format,
     bool is_srgb_texture,
     renderer::TextureInfo& texture,
-    const std::source_location& src_location);
+    const std::source_location& src_location,
+    bool cacheable = false);
+
+// Frees every texture owned by the shared cross-asset texture cache. Call once
+// at shutdown while the device is still valid (paired with the
+// createTextureImage cacheable=true path).
+void destroyTextureCache(const std::shared_ptr<renderer::Device>& device);
 
 std::shared_ptr<renderer::BufferInfo> createUnifiedMeshBuffer(
     const std::shared_ptr<renderer::Device>& device,

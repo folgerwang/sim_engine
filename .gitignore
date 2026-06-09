@@ -8,6 +8,8 @@ third_parties/libtorch/
 # auto-downloaded by CMake at configure time (pinned version) — never commit.
 # miniaudio (third_parties/miniaudio/) IS committed: single pinned header.
 third_parties/sherpa-onnx/
+# EnTT single header: fetched at CMake configure time (see CMakeLists.txt).
+third_parties/entt/entt/entt.hpp
 
 # FUSE filesystem ghosts from open-but-unlinked files
 .fuse_hidden*

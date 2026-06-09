@@ -910,7 +910,8 @@ static void setupMeshState(
             format,
             texture_is_srgb[i_tex],
             dst_tex,
-            std::source_location::current());
+            std::source_location::current(),
+            /*cacheable=*/true);
     }
 
     // Material
@@ -4330,7 +4331,7 @@ void PrimitiveInfo::generateHash() {
 void DrawableData::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     for (auto& texture : textures_) {
-        texture.destroy(device);
+        if (!texture.borrowed_) texture.destroy(device);  // cache owns borrowed
     }
 
     for (auto& material : materials_) {
@@ -5472,6 +5473,7 @@ void DrawableObject::destroyStaticMembers(
         device->destroyDescriptorSetLayout(mesh_shader_shadow_desc_set_layout_);
         mesh_shader_shadow_desc_set_layout_ = nullptr;
     }
+    helper::destroyTextureCache(device);   // free cross-asset shared textures
     drawable_object_list_.clear();
     device->destroyDescriptorSetLayout(drawable_indirect_draw_desc_set_layout_);
     device->destroyPipelineLayout(drawable_indirect_draw_pipeline_layout_);
@@ -5878,7 +5880,8 @@ void DrawableObject::update(
             0,
             time,
             object_->m_use_local_matrix_only_,
-            /*skip_animations=*/use_node_transform_only_);
+            /*skip_animations=*/(use_node_transform_only_ ||
+                                 external_animation_));
     }
 }
 
