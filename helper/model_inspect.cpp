@@ -402,7 +402,10 @@ void appendFbxMesh(const ufbx_node* node,
                    std::vector<glm::vec2>& uvs,
                    std::vector<const ufbx_material*>&  out_mats,
                    std::vector<std::vector<uint32_t>>& out_buckets,
-                   bool world_space = true) {
+                   bool world_space = true,
+                   const ufbx_skin_deformer* skin = nullptr,
+                   std::vector<glm::u16vec4>* out_joints = nullptr,
+                   std::vector<glm::vec4>*    out_weights = nullptr) {
     const ufbx_mesh* m = node->mesh;
     if (!m) return;
     const ufbx_matrix& xform =
@@ -478,6 +481,36 @@ void appendFbxMesh(const ufbx_node* node,
                 uv = glm::vec2((float)u.x, 1.0f - (float)u.y);
             }
             uvs.push_back(uv);
+
+            // Skin: per corner, look up the control point's weights.  Local
+            // joint index == cluster index (the bake writes skin_joint_nodes
+            // parallel to clusters).  Pushes one entry per emitted vertex so
+            // joints/weights stay parallel to positions (identity binding for
+            // unskinned verts in a skinned mesh).
+            if (out_joints && out_weights) {
+                glm::u16vec4 J(0);
+                glm::vec4    W(1.0f, 0.0f, 0.0f, 0.0f);
+                if (skin) {
+                    const uint32_t cp = m->vertex_position.indices.data[ix];
+                    if (cp < skin->vertices.count) {
+                        const ufbx_skin_vertex sv = skin->vertices.data[cp];
+                        glm::u16vec4 jj(0);
+                        glm::vec4    ww(0.0f);
+                        const uint32_t nw =
+                            sv.num_weights < 4u ? sv.num_weights : 4u;
+                        for (uint32_t w = 0; w < nw; ++w) {
+                            const ufbx_skin_weight sw =
+                                skin->weights.data[sv.weight_begin + w];
+                            jj[(int)w] = (uint16_t)sw.cluster_index;
+                            ww[(int)w] = (float)sw.weight;
+                        }
+                        const float sum = ww.x + ww.y + ww.z + ww.w;
+                        if (sum > 1e-6f) { W = ww / sum; J = jj; }
+                    }
+                }
+                out_joints->push_back(J);
+                out_weights->push_back(W);
+            }
         }
     }
 }
@@ -1086,6 +1119,7 @@ constexpr char kRwGeoMagic4[8] = {'R','W','G','E','O','0','0','4'};
 // metallic-roughness map (either may be empty).
 constexpr char kRwGeoMagic5[8] = {'R','W','G','E','O','0','0','5'};
 constexpr char kRwHierMagic[8] = {'R','W','H','I','E','R','0','1'};
+constexpr char kRwAnimMagic[8] = {'R','W','A','N','I','M','0','1'};
 
 template <typename T>
 void wrPod(std::ofstream& f, const T& v) {
@@ -1534,6 +1568,44 @@ bool writeRwHier(const std::string& path,
     return (bool)f;
 }
 
+// Write every clip to one animation.rwanim.  Layout (after the 8-byte magic):
+//   u32 clip_count
+//   per clip: u32 name_len, char[name_len], f32 duration, u32 channel_count
+//     per channel: i32 node, u8 path, u8 step, u32 key_count, u8 comps(3|4),
+//                  f32 times[key_count], f32 values[key_count*comps]
+bool writeRwAnim(const std::string& path,
+                 const std::vector<RwAnimClip>& clips) {
+    if (clips.empty()) return false;
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(kRwAnimMagic, 8);
+    wrPod(f, (uint32_t)clips.size());
+    for (const auto& clip : clips) {
+        wrPod(f, (uint32_t)clip.name.size());
+        f.write(clip.name.data(), (std::streamsize)clip.name.size());
+        wrPod(f, clip.duration);
+        wrPod(f, (uint32_t)clip.channels.size());
+        for (const auto& ch : clip.channels) {
+            const uint8_t comps =
+                (ch.path == RwAnimPath::kRotation) ? 4u : 3u;
+            const uint32_t kc = (uint32_t)ch.times.size();
+            wrPod(f, ch.node);
+            wrPod(f, (uint8_t)ch.path);
+            wrPod(f, ch.step);
+            wrPod(f, kc);
+            wrPod(f, comps);
+            if (kc) {
+                f.write(reinterpret_cast<const char*>(ch.times.data()),
+                        (std::streamsize)(kc * sizeof(float)));
+                for (const auto& v : ch.values)
+                    f.write(reinterpret_cast<const char*>(&v),
+                            (std::streamsize)(comps * sizeof(float)));
+            }
+        }
+    }
+    return (bool)f;
+}
+
 } // anonymous namespace
 
 // Public wrapper over the bake-side soup dedup — see header doc.
@@ -1570,6 +1642,56 @@ bool loadRwHier(const std::string& path, std::vector<RwHierNode>& out) {
         if (name_len && !f.read(n.name.data(), name_len)) {
             out.clear();
             return false;
+        }
+    }
+    return true;
+}
+
+bool loadRwAnim(const std::string& path, std::vector<RwAnimClip>& out) {
+    out.clear();
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[8];
+    if (!f.read(magic, 8) || std::memcmp(magic, kRwAnimMagic, 8) != 0)
+        return false;
+    uint32_t clip_count = 0;
+    if (!rdPod(f, clip_count) || clip_count > 100'000u) return false;
+    out.resize(clip_count);
+    for (auto& clip : out) {
+        uint32_t name_len = 0;
+        if (!rdPod(f, name_len) || name_len > 4096u) { out.clear(); return false; }
+        clip.name.resize(name_len);
+        if (name_len && !f.read(clip.name.data(), name_len)) {
+            out.clear(); return false;
+        }
+        uint32_t ch_count = 0;
+        if (!rdPod(f, clip.duration) || !rdPod(f, ch_count) ||
+            ch_count > 1'000'000u) { out.clear(); return false; }
+        clip.channels.resize(ch_count);
+        for (auto& ch : clip.channels) {
+            uint32_t kc = 0;
+            uint8_t  path = 0, comps = 0;
+            if (!rdPod(f, ch.node) || !rdPod(f, path) || !rdPod(f, ch.step) ||
+                !rdPod(f, kc) || !rdPod(f, comps) ||
+                kc > 10'000'000u || (comps != 3 && comps != 4)) {
+                out.clear(); return false;
+            }
+            ch.path = (RwAnimPath)path;
+            ch.times.resize(kc);
+            ch.values.resize(kc);
+            if (kc) {
+                if (!f.read(reinterpret_cast<char*>(ch.times.data()),
+                            (std::streamsize)(kc * sizeof(float)))) {
+                    out.clear(); return false;
+                }
+                for (auto& v : ch.values) {
+                    v = glm::vec4(0.0f);
+                    if (!f.read(reinterpret_cast<char*>(&v),
+                                (std::streamsize)(comps * sizeof(float)))) {
+                        out.clear(); return false;
+                    }
+                }
+            }
         }
     }
     return true;
@@ -1967,6 +2089,84 @@ bool bakeModelToRenderReady(
             writeRwHier(
                 (fs::path(group_dir) / "hierarchy.rwhier").string(), hier);
         }
+
+        // ── Animation: every glTF clip → animation.rwanim ───────────────
+        // glTF is already keyframed; channels target node indices that match
+        // hierarchy.rwhier 1:1.  Rotation stored quaternion XYZW.
+        {
+            std::vector<RwAnimClip> clips;
+            clips.reserve(model.animations.size());
+            for (const auto& anim : model.animations) {
+                RwAnimClip clip;
+                clip.name = anim.name;
+                float dur = 0.0f;
+                for (const auto& chan : anim.channels) {
+                    if (chan.sampler < 0 ||
+                        chan.sampler >= (int)anim.samplers.size() ||
+                        chan.target_node < 0)
+                        continue;
+                    RwAnimChannel oc;
+                    oc.node = chan.target_node;
+                    if (chan.target_path == "translation")
+                        oc.path = RwAnimPath::kTranslation;
+                    else if (chan.target_path == "scale")
+                        oc.path = RwAnimPath::kScale;
+                    else if (chan.target_path == "rotation")
+                        oc.path = RwAnimPath::kRotation;
+                    else
+                        continue;   // morph "weights" / unsupported
+                    const auto& samp = anim.samplers[chan.sampler];
+                    const bool cubic = (samp.interpolation == "CUBICSPLINE");
+                    oc.step = (samp.interpolation == "STEP") ? 1u : 0u;
+                    const int ncomp =
+                        (oc.path == RwAnimPath::kRotation) ? 4 : 3;
+                    size_t tc = 0, ts = 0, vc = 0, vs = 0;
+                    const float* tp =
+                        gltfAccessorPtr(model, samp.input, tc, ts, 1);
+                    const float* vp =
+                        gltfAccessorPtr(model, samp.output, vc, vs, ncomp);
+                    if (!tp || !vp || tc == 0) continue;
+                    oc.times.reserve(tc);
+                    oc.values.reserve(tc);
+                    for (size_t k = 0; k < tc; ++k) {
+                        const float t = tp[k * ts];
+                        oc.times.push_back(t);
+                        if (t > dur) dur = t;
+                        // CUBICSPLINE packs [inTangent, value, outTangent]
+                        // per key — take the middle (value) sample.
+                        const size_t vk = cubic ? (k * 3 + 1) : k;
+                        glm::vec4 val(0.0f);
+                        for (int c = 0; c < ncomp; ++c)
+                            val[c] = vp[vk * vs + c];
+                        oc.values.push_back(val);
+                    }
+                    clip.channels.push_back(std::move(oc));
+                }
+                clip.duration = dur;
+                if (!clip.channels.empty())
+                    clips.push_back(std::move(clip));
+            }
+            if (!clips.empty()) {
+                writeRwAnim(
+                    (fs::path(group_dir) / "animation.rwanim").string(),
+                    clips);
+                std::cout << "[bake] baked " << clips.size()
+                          << " animation clip(s)" << std::endl;
+            }
+        }
+
+        // Character manifest — lets the engine load this baked group as ONE
+        // skinned DrawableObject straight from raw data (no source needed).
+        if (!model.skins.empty()) {
+            const std::string leaf = fs::path(group_dir).filename().string();
+            std::ofstream mf(
+                (fs::path(group_dir) / (leaf + ".rwchar")).string(),
+                std::ios::trunc);
+            if (mf)
+                mf << "rwchar=1\nname=" << leaf
+                   << "\nhierarchy=hierarchy.rwhier"
+                   << "\nanimation=animation.rwanim\n";
+        }
     } else if (ext == ".fbx") {
         // RAW load options — identical to the engine's loadFbxModel (axis
         // conversion can mirror geometry; see loadModelPreviewData note).
@@ -2061,8 +2261,32 @@ bool bakeModelToRenderReady(
             ModelPreviewData d;
             std::vector<const ufbx_material*>  mats;
             std::vector<std::vector<uint32_t>> buckets;
+
+            // Skinned node: build the skin joint table — per cluster, the bone
+            // node's scene index (== hierarchy.rwhier index, via typed_id)
+            // plus the node-local inverse bind (mesh_node_to_bone, matching the
+            // NODE-LOCAL geometry baked below).  Mirrors the glTF skin bake so
+            // the .rwgeo carries the full rig with no source dependency.
+            const ufbx_skin_deformer* skin =
+                (node->mesh->skin_deformers.count > 0)
+                    ? node->mesh->skin_deformers.data[0] : nullptr;
+            if (skin) {
+                d.skin_joint_nodes.resize(skin->clusters.count);
+                d.skin_inverse_bind.resize(skin->clusters.count);
+                for (size_t ci = 0; ci < skin->clusters.count; ++ci) {
+                    const ufbx_skin_cluster* cl = skin->clusters.data[ci];
+                    d.skin_joint_nodes[ci] =
+                        (cl && cl->bone_node)
+                            ? (int32_t)cl->bone_node->typed_id : -1;
+                    d.skin_inverse_bind[ci] = cl
+                        ? ufbxToGlm(cl->mesh_node_to_bone) : glm::mat4(1.0f);
+                }
+            }
             appendFbxMesh(node, d.positions, d.normals, d.uvs,
-                          mats, buckets, /*world_space=*/false);
+                          mats, buckets, /*world_space=*/false,
+                          skin,
+                          skin ? &d.joints  : nullptr,
+                          skin ? &d.weights : nullptr);
             std::vector<GeoSectionOut> secs;
             for (size_t b = 0; b < buckets.size(); ++b) {
                 if (buckets[b].size() < 3) continue;
@@ -2134,6 +2358,88 @@ bool bakeModelToRenderReady(
             }
             writeRwHier(
                 (fs::path(group_dir) / "hierarchy.rwhier").string(), hier);
+        }
+
+        // ── Animation: bake every FBX anim stack → animation.rwanim ─────
+        // ufbx_bake_anim resamples each stack to per-node TRS keyframes;
+        // baked_node.typed_id == scene->nodes index == hierarchy.rwhier
+        // index.  Rotation stored quaternion XYZW.
+        {
+            std::vector<RwAnimClip> clips;
+            for (size_t si = 0; si < scene->anim_stacks.count; ++si) {
+                const ufbx_anim_stack* stack = scene->anim_stacks.data[si];
+                if (!stack || !stack->anim) continue;
+                ufbx_bake_opts bopts{};
+                ufbx_error berr;
+                ufbx_baked_anim* bake =
+                    ufbx_bake_anim(scene, stack->anim, &bopts, &berr);
+                if (!bake) continue;
+                RwAnimClip clip;
+                clip.name = (stack->name.data && stack->name.length)
+                    ? std::string(stack->name.data)
+                    : ("clip " + std::to_string(si));
+                clip.duration = (float)bake->playback_duration;
+                for (size_t ni = 0; ni < bake->nodes.count; ++ni) {
+                    const ufbx_baked_node& bn = bake->nodes.data[ni];
+                    const int32_t node_idx = (int32_t)bn.typed_id;
+                    auto push_vec = [&](const ufbx_baked_vec3_list& keys,
+                                        RwAnimPath path) {
+                        if (!keys.count) return;
+                        RwAnimChannel ch;
+                        ch.node = node_idx; ch.path = path; ch.step = 0;
+                        ch.times.reserve(keys.count);
+                        ch.values.reserve(keys.count);
+                        for (size_t k = 0; k < keys.count; ++k) {
+                            ch.times.push_back((float)keys.data[k].time);
+                            ch.values.emplace_back(
+                                (float)keys.data[k].value.x,
+                                (float)keys.data[k].value.y,
+                                (float)keys.data[k].value.z, 0.0f);
+                        }
+                        clip.channels.push_back(std::move(ch));
+                    };
+                    push_vec(bn.translation_keys, RwAnimPath::kTranslation);
+                    push_vec(bn.scale_keys,       RwAnimPath::kScale);
+                    if (bn.rotation_keys.count) {
+                        RwAnimChannel ch;
+                        ch.node = node_idx;
+                        ch.path = RwAnimPath::kRotation;
+                        ch.step = 0;
+                        ch.times.reserve(bn.rotation_keys.count);
+                        ch.values.reserve(bn.rotation_keys.count);
+                        for (size_t k = 0; k < bn.rotation_keys.count; ++k) {
+                            const auto& kf = bn.rotation_keys.data[k];
+                            ch.times.push_back((float)kf.time);
+                            ch.values.emplace_back(
+                                (float)kf.value.x, (float)kf.value.y,
+                                (float)kf.value.z, (float)kf.value.w);
+                        }
+                        clip.channels.push_back(std::move(ch));
+                    }
+                }
+                ufbx_free_baked_anim(bake);
+                if (!clip.channels.empty())
+                    clips.push_back(std::move(clip));
+            }
+            if (!clips.empty()) {
+                writeRwAnim(
+                    (fs::path(group_dir) / "animation.rwanim").string(),
+                    clips);
+                std::cout << "[bake] baked " << clips.size()
+                          << " animation clip(s)" << std::endl;
+            }
+        }
+
+        // Character manifest — see the glTF branch.
+        if (scene->skin_deformers.count > 0) {
+            const std::string leaf = fs::path(group_dir).filename().string();
+            std::ofstream mf(
+                (fs::path(group_dir) / (leaf + ".rwchar")).string(),
+                std::ios::trunc);
+            if (mf)
+                mf << "rwchar=1\nname=" << leaf
+                   << "\nhierarchy=hierarchy.rwhier"
+                   << "\nanimation=animation.rwanim\n";
         }
         ufbx_free_scene(scene);
     } else {

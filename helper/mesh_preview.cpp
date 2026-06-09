@@ -164,6 +164,11 @@ std::shared_ptr<renderer::TextureInfo>                 MeshPreview::s_flatnrm_te
 ImTextureID                                            MeshPreview::s_im_id_ = 0;
 bool                                                   MeshPreview::s_has_image_ = false;
 bool                                                   MeshPreview::s_color_in_read_layout_ = false;
+uint32_t                                               MeshPreview::s_width_  = MeshPreview::kSize;
+uint32_t                                               MeshPreview::s_height_ = MeshPreview::kSize;
+uint32_t                                               MeshPreview::s_req_w_  = 0;
+uint32_t                                               MeshPreview::s_req_h_  = 0;
+uint64_t                                               MeshPreview::s_frame_  = 0;
 std::vector<std::shared_ptr<renderer::DescriptorSet>>  MeshPreview::s_active_sets_;
 std::vector<MeshPreview::RecycleSet>                   MeshPreview::s_set_recycle_;
 std::vector<MeshPreview::GpuSection>                   MeshPreview::s_sections_;
@@ -184,6 +189,9 @@ float     MeshPreview::s_orbit_el_   = 20.0f;
 float     MeshPreview::s_orbit_dist_ = 2.4f;
 glm::vec3 MeshPreview::s_pan_        = glm::vec3(0.0f);
 bool      MeshPreview::s_camera_dirty_ = false;
+glm::mat4 MeshPreview::s_view_proj_  = glm::mat4(1.0f);
+bool      MeshPreview::s_weight_debug_ = false;
+bool      MeshPreview::s_segment_debug_ = false;
 
 void MeshPreview::initStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
@@ -370,6 +378,7 @@ void MeshPreview::reregisterImGui() {
 void MeshPreview::collectGarbage(
     const std::shared_ptr<renderer::Device>& device,
     uint64_t current_frame) {
+    s_frame_ = current_frame;
     for (auto it = s_dead_.begin(); it != s_dead_.end();) {
         if (current_frame >= it->free_frame) {
             if (it->buf) it->buf->destroy(device);
@@ -388,11 +397,48 @@ void MeshPreview::collectGarbage(
     }
 }
 
+void MeshPreview::applyPendingResize(
+    const std::shared_ptr<renderer::Device>& device) {
+    if (!ready()) return;
+    uint32_t w = s_req_w_, h = s_req_h_;
+    if (w == 0 || h == 0) return;
+    if (w < 64u)   w = 64u;   if (w > 2048u) w = 2048u;
+    if (h < 64u)   h = 64u;   if (h > 2048u) h = 2048u;
+    if (w == s_width_ && h == s_height_) return;
+
+    // Retire the old targets on the deferred-free list (an in-flight frame may
+    // still sample them); collectGarbage frees them a few frames later.
+    if (s_color_) s_dead_tex_.push_back({ s_frame_ + 5, s_color_ });
+    if (s_depth_) s_dead_tex_.push_back({ s_frame_ + 5, s_depth_ });
+    s_color_.reset();
+    s_depth_.reset();
+    s_width_  = w;
+    s_height_ = h;
+
+    s_color_ = std::make_shared<renderer::TextureInfo>();
+    renderer::Helper::create2DTextureImage(
+        device, kColorFormat, glm::uvec2(w, h), 1, *s_color_,
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, COLOR_ATTACHMENT_BIT),
+        renderer::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        std::source_location::current());
+    s_color_in_read_layout_ = false;
+
+    s_depth_ = std::make_shared<renderer::TextureInfo>();
+    renderer::Helper::createDepthResources(
+        device, kDepthFormat, glm::uvec2(w, h), *s_depth_,
+        std::source_location::current());
+
+    reregisterImGui();        // new view -> new ImGui texture id
+    s_camera_dirty_ = true;   // force a re-record at the new size
+}
+
 void MeshPreview::render(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const MeshPreviewPayload& payload,
     uint64_t current_frame) {
+    s_frame_ = current_frame;
+    applyPendingResize(device);
 
     const auto& positions = payload.positions;
     const auto& normals   = payload.normals;
@@ -631,7 +677,7 @@ void MeshPreview::pan(float dx_px, float dy_px) {
 
     // Pixel → world scale at the framing distance (~vertical FOV span).
     const float world_per_px =
-        (s_radius_ * s_orbit_dist_) * 1.5f / (float)kSize;
+        (s_radius_ * s_orbit_dist_) * 1.5f / (float)s_height_;
 
     // Dragging moves the OBJECT with the cursor: shift the orbit target the
     // opposite way (screen Y grows downward).
@@ -642,7 +688,7 @@ void MeshPreview::pan(float dx_px, float dy_px) {
 void MeshPreview::rerenderIfNeeded(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
-    (void)device;
+    applyPendingResize(device);
     if (!s_camera_dirty_ || !ready() || s_index_count_ == 0) return;
     recordPass(cmd_buf);
 }
@@ -663,12 +709,14 @@ void MeshPreview::recordPass(
 
     const glm::mat4 view = glm::lookAt(eye, target, glm::vec3(0, 1, 0));
     glm::mat4 proj = glm::perspective(
-        glm::radians(40.0f), 1.0f,
+        glm::radians(40.0f),
+        (s_height_ > 0) ? (float)s_width_ / (float)s_height_ : 1.0f,
         glm::max(s_radius_ * 0.02f, 0.001f), s_radius_ * 30.0f);
     proj[1][1] *= -1.0f;   // Vulkan clip-space Y
 
     glsl::PreviewMeshParams params{};
     params.view_proj         = proj * view;
+    s_view_proj_             = params.view_proj;   // for editor overlays
     params.center_radius     = glm::vec4(s_center_, s_radius_);
     params.camera_pos        = glm::vec4(eye, 0.0f);
     params.base_color_factor = glm::vec4(1.0f);
@@ -707,7 +755,7 @@ void MeshPreview::recordPass(
 
     renderer::RenderingInfo ri = {};
     ri.render_area_offset  = { 0, 0 };
-    ri.render_area_extent  = { kSize, kSize };
+    ri.render_area_extent  = { s_width_, s_height_ };
     ri.layer_count         = 1;
     ri.view_mask           = 0;
     ri.color_attachments   = { color_attach };
@@ -717,12 +765,12 @@ void MeshPreview::recordPass(
 
     renderer::Viewport vp;
     vp.x = 0.0f; vp.y = 0.0f;
-    vp.width  = (float)kSize;
-    vp.height = (float)kSize;
+    vp.width  = (float)s_width_;
+    vp.height = (float)s_height_;
     vp.min_depth = 0.0f; vp.max_depth = 1.0f;
     renderer::Scissor sc;
     sc.offset = glm::ivec2(0);
-    sc.extent = glm::uvec2(kSize, kSize);
+    sc.extent = glm::uvec2(s_width_, s_height_);
     std::vector<renderer::Viewport> viewports = { vp };
     std::vector<renderer::Scissor>  scissors  = { sc };
     cmd_buf->setViewports(viewports, 0, 1);
@@ -755,7 +803,9 @@ void MeshPreview::recordPass(
         params.pbr_params = glm::vec4(
             sec.metallic, sec.roughness,
             sec.has_tex ? 1.0f : 0.0f,
-            (sec.has_nrm ? 1.0f : 0.0f) + (sec.has_mr ? 2.0f : 0.0f));
+            (sec.has_nrm ? 1.0f : 0.0f) + (sec.has_mr ? 2.0f : 0.0f)
+                + (s_weight_debug_  ? 4.0f : 0.0f)    // bit2 = weight render
+                + (s_segment_debug_ ? 8.0f : 0.0f));  // bit3 = segment render
         cmd_buf->pushConstants(
             SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             s_pipeline_layout_,

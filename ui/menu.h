@@ -6,10 +6,12 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <filesystem>
 #include <cstdint>
 #include "renderer/renderer.h"
 #include "helper/mesh_preview.h"   // Debug Display GPU preview payload
+#include "helper/model_inspect.h"  // RwAnimClip (animated preview)
 #include "scene/scene_types.h"     // group-node transform editing (Details)
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
@@ -744,6 +746,10 @@ public:
     // Content Browser current folder — the game project's asset view, rooted
     // at content/.  Import copies external files here (+ .rwmeta sidecar).
     std::string  content_dir_       = "content";
+    // Content Browser per-asset enable flag (debug): paths in this set are
+    // DISABLED — greyed out in the grid.  Purely a browser-side marker; does
+    // not affect the 3D scene.  Toggled from each tile's right-click menu.
+    std::unordered_set<std::string> content_disabled_;
     // File Browser current folder — raw disk view rooted at the project dir.
     std::string  file_dir_          = ".";
     float        file_left_w_       = 0.0f;   // File Browser splitter width
@@ -756,6 +762,65 @@ public:
     char         newfolder_buf_[128] = "";
     // Set when a group node's transform is edited (consumed by the app).
     bool         scene_xform_dirty_ = false;
+    // Animation playback (Details panel). State pushed by the app each frame;
+    // control edits reported back via consumeAnimControl.
+    bool  anim_has_          = false;
+    bool  anim_playing_      = false;
+    float anim_time_         = 0.0f;
+    float anim_dur_          = 0.0f;
+    float anim_speed_        = 1.0f;
+    bool  anim_ctrl_pending_ = false;
+    bool  anim_scrub_        = false;
+    // Debug Display Static/Skeletal badge: set wherever a preview is staged.
+    bool  dbg_preview_skinned_ = false;
+    // ── Animated (CPU-skinned) Debug Display preview ───────────────────
+    // Populated when a fully-skinned character GROUP is previewed: the bind
+    // payload plus per-vertex skin, the skeleton and the first clip.
+    // tickPreviewAnimation() samples the clip (via the unit-tested
+    // ecs::AnimationSystem), CPU-skins the bind pose and re-stages the
+    // payload each frame, so the existing static preview pass shows motion.
+    // Assumes an identity skinned-mesh node (the common rigged-character
+    // case); falls back to a static preview otherwise.
+    bool  preview_anim_ready_   = false;
+    bool  preview_anim_playing_ = true;
+    float preview_anim_time_    = 0.0f;
+    float preview_anim_speed_   = 1.0f;
+    engine::helper::MeshPreviewPayload preview_anim_base_;   // BIND pose
+    std::vector<glm::uvec4> preview_skin_joints_;            // per vtx: node idx
+    std::vector<glm::vec4>  preview_skin_weights_;           // per vtx
+    std::vector<int32_t>    preview_node_parent_;            // skeleton
+    std::vector<std::string> preview_node_name_;             // bone names
+    std::vector<glm::mat4>  preview_node_bind_local_;        // node-local bind
+    std::vector<glm::mat4>  preview_node_invbind_;           // per node (I dflt)
+    std::vector<float>      preview_node_rot_limit_;         // per node: max rad
+    // inverse(skinned mesh node's bind world): folded into joint matrices so
+    // SOURCE-WORLD bind vertices skin correctly (the bake's node_to_world is
+    // cancelled — glTF ignores the mesh-node transform for skinned meshes).
+    glm::mat4               preview_mesh_node_inv_ = glm::mat4(1.0f);
+    engine::helper::RwAnimClip preview_clip_;                // first clip
+    // Skeleton debug draw (Debug Display overlay): toggle + per-frame joint
+    // world positions (node origins), filled by tickPreviewAnimation.
+    bool                    preview_show_skeleton_ = false;
+    std::vector<glm::vec3>  preview_joint_world_;
+    // ── Weight debug mode ──────────────────────────────────────────────
+    // Select a bone, see/heat-map its per-vertex weights, and tweak its
+    // influence (a per-bone multiplier applied + renormalized in the skin).
+    bool                    preview_show_weights_ = false;
+    bool                    preview_show_segments_ = false;  // colour by segment
+    bool                    preview_show_distance_ = false;  // geodesic dist heat
+    // Cached welded BIND surface graph + bind joint positions, built once per
+    // preview, for the geodesic distance-to-selected-bone debug.
+    std::vector<int>                                preview_weld_id_;
+    std::vector<glm::vec3>                          preview_weld_pos_;
+    std::vector<std::vector<std::pair<int, float>>> preview_weld_adj_;
+    std::vector<glm::ivec3>                         preview_weld_tris_;  // welded
+    std::vector<glm::vec3>                          preview_joint_bind_world_;
+    int                                             preview_dist_sel_cached_ = -999;
+    std::vector<float>                              preview_surface_close_;  // per vtx
+    std::vector<int>        preview_weight_bones_;   // selectable joint nodes
+    int                     preview_weight_sel_ = 0; // index into the list
+    std::vector<float>      preview_bone_weight_scale_;  // per node, default 1
+    void tickPreviewAnimation();
     // "Delete" confirmation state (Content Browser context menu).  Deleting
     // an imported model also removes its .rwmeta sidecar, its exploded
     // <stem>/ object folder, and its cached thumbnail.
@@ -1106,6 +1171,22 @@ public:
         content_import_label_  = label;
     }
     void setSceneRootXform(engine::scene::Transform* t) { scene_root_xform_ = t; }
+    void setAnimState(bool has, bool playing, float time, float dur, float speed) {
+        anim_has_ = has;
+        anim_dur_ = dur;
+        if (!anim_ctrl_pending_) {   // don't clobber a value being edited
+            anim_playing_ = playing;
+            anim_time_    = time;
+            anim_speed_   = speed;
+        }
+    }
+    bool consumeAnimControl(bool& playing, float& speed, float& time, bool& scrub) {
+        if (!anim_ctrl_pending_) return false;
+        anim_ctrl_pending_ = false;
+        playing = anim_playing_; speed = anim_speed_; time = anim_time_;
+        scrub = anim_scrub_; anim_scrub_ = false;
+        return true;
+    }
     bool consumeSceneRootRename(std::string& out_name) {
         if (!scene_root_rename_pending_) return false;
         scene_root_rename_pending_ = false;

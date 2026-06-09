@@ -9,6 +9,10 @@
 #include <fstream>
 #include <limits>
 #include <ctime>
+#include <queue>          // geodesic weight de-bleed (Dijkstra)
+#include <functional>     // std::greater
+#include <unordered_map>
+#include <cstring>        // std::memcpy (exact-position vertex weld)
 
 // stbi_load / stbi_image_free are already compiled into the project via
 // tinygltf (STB_IMAGE_IMPLEMENTATION lives in engine_helper.cpp).
@@ -41,6 +45,7 @@ extern "C" {
 #include "helper/vram_cuda.h"             // device-wide VRAM (counts ML/CUDA + other processes)
 #include "helper/model_inspect.h"         // sub-object names for content assets
 #include "helper/mesh_preview.h"          // GPU offscreen Debug Display preview
+#include "ecs/animation_system.h"         // clip sampling for the animated preview
 #include "audio/audio_engine.h"           // Content Browser audio preview
 #include "audio/tts_engine.h"             // Audio menu voice picker
 #include "scene/native_file_dialog.h"     // reference-image picker (FLUX.2)
@@ -4678,6 +4683,25 @@ void Menu::drawDetailsContent() {
             bool vis = o.obj->isVisible();
             if (ImGui::Checkbox("Visible", &vis)) o.obj->setVisible(vis);
             ImGui::Text("Loaded: %s", o.obj->isReady() ? "yes" : "(streaming)");
+
+            if (anim_has_) {
+                ImGui::SeparatorText("Animation");
+                bool playing = anim_playing_;
+                if (ImGui::Checkbox("Play", &playing)) {
+                    anim_playing_ = playing; anim_ctrl_pending_ = true;
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                float speed = anim_speed_;
+                if (ImGui::SliderFloat("Speed", &speed, 0.0f, 3.0f)) {
+                    anim_speed_ = speed; anim_ctrl_pending_ = true;
+                }
+                float t = anim_time_;
+                const float maxt = anim_dur_ > 0.0f ? anim_dur_ : 1.0f;
+                if (ImGui::SliderFloat("Time", &t, 0.0f, maxt, "%.2fs")) {
+                    anim_time_ = t; anim_scrub_ = true; anim_ctrl_pending_ = true;
+                }
+            }
         } else if (o.scene_xform) {
             // ── Group node: edit the GROUP transform ─────────────────────
             // Children store local-to-parent transforms; the app composes
@@ -5657,6 +5681,14 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                   ? getThumbnail(e.path().string()) : 0;
 
                 ImGui::PushID((int)i);
+                // Debug enable flag: disabled assets are greyed out in the grid
+                // (purely a browser marker — the 3D scene is unaffected).
+                const std::string item_path = e.path().string();
+                const bool tile_disabled =
+                    content_disabled_.find(item_path) != content_disabled_.end();
+                if (tile_disabled)
+                    ImGui::PushStyleVar(ImGuiStyleVar_Alpha,
+                                        ImGui::GetStyle().Alpha * 0.35f);
                 ImGui::BeginGroup();
                 bool clicked = false;
                 if (tex) {
@@ -5688,6 +5720,18 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
                     ImGui::PopStyleColor();
                 }
+                // Double-click opens a folder (including group folders) or a
+                // model as a virtual sub-object folder. Detected independently
+                // of the single click below: ImGui::Button reports on mouse
+                // RELEASE while a double-click registers on the second PRESS,
+                // so the two never land in the same frame -- gating the "enter
+                // folder" on `clicked` (as before) never fired for groups.
+                const bool tile_dbl =
+                    ImGui::IsItemHovered() &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                if (tile_dbl && (is_dir || (is_content && is_model))) {
+                    cur_dir = e.path().string();
+                }
 
                 // Drag a placeable tile into the 3D viewport to add it to
                 // the scene — same effect as right-click → Add to Scene
@@ -5710,6 +5754,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 if (disp.size() > 11) disp = disp.substr(0, 9) + "..";
                 ImGui::TextUnformatted(disp.c_str());
                 ImGui::EndGroup();
+                if (tile_disabled) ImGui::PopStyleVar();   // end grey-out
 
                 // ── Selection highlight ───────────────────────────────
                 // The tile whose object is currently shown in the Debug
@@ -5744,6 +5789,15 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name.c_str());
                 // Right-click a tile → context actions.
                 if (ImGui::BeginPopupContextItem("##cbctx")) {
+                    // Debug enable/disable: greys the tile out (browser only).
+                    if (ImGui::MenuItem("Enabled", nullptr, !tile_disabled)) {
+                        if (tile_disabled) content_disabled_.erase(item_path);
+                        else               content_disabled_.insert(item_path);
+                        // Force the Debug Display to rebuild (it dedups by key)
+                        // so a group preview drops/re-adds this object now.
+                        dbg_asset_key_.clear();
+                    }
+                    ImGui::Separator();
                     if (is_content &&
                         (is_model || is_object || is_group_dir) &&
                         ImGui::MenuItem("Add to Scene")) {
@@ -5776,21 +5830,15 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // Scene" lives in the tile's right-click menu.
                 if (clicked && is_dir) {
                     if (is_group_dir && is_content) {
-                        // Group folder, Explorer-style like model tiles:
-                        // CLICK previews the assembled collection of its
-                        // baked objects in the Debug Display; DOUBLE-
-                        // click also opens the folder.
+                        // Group folder, Explorer-style: a single CLICK previews
+                        // the assembled collection in the Debug Display; a
+                        // DOUBLE-click (handled above) opens the folder.
                         buildRwGroupPreview(e.path().string(), name);
-                        if (ImGui::IsMouseDoubleClicked(
-                                ImGuiMouseButton_Left))
-                            cur_dir = e.path().string();
                     } else {
-                        cur_dir = e.path().string();
+                        cur_dir = e.path().string();   // plain folder: enter
                     }
                 } else if (clicked && is_content && is_model) {
                     buildAssetPreview(e.path().string(), -1, name);
-                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                        cur_dir = e.path().string();
                 } else if (clicked && is_content && is_object) {
                     // Prefers the baked .rwgeo/.rwtex render-ready data.
                     buildRwObjPreview(e.path().string(), name);
@@ -6467,6 +6515,7 @@ void Menu::updateDebugDisplay(engine::game_object::DrawableObject* obj,
     dbg_disp_node_ = node_idx;
 
     if (!obj || !obj->isReady()) { retireDebugPreview(); return; }
+    dbg_preview_skinned_ = obj->isSkinned();
 
     // A wrapper restricted to one sub-object (.rwobj placement) previews
     // ONLY that node, regardless of how it was selected.
@@ -6527,6 +6576,342 @@ void Menu::retireDebugPreview() {
     preview_nav_     = PreviewNav::None;
     preview_nav_path_.clear();
     preview_nav_index_ = -1;
+    dbg_preview_skinned_ = false;
+    preview_anim_ready_ = false;
+    engine::helper::MeshPreview::setWeightDebug(false);
+    engine::helper::MeshPreview::setSegmentDebug(false);
+}
+
+// Per-frame CPU skinning for the animated Debug Display preview.  Samples the
+// baked clip (via the unit-tested ecs::AnimationSystem), composes the skeleton
+// world matrices, linear-blend-skins the bind pose and re-stages the payload —
+// so the existing static preview pass renders the animation.  Assumes an
+// identity skinned-mesh node (the common rigged-character case).
+void Menu::tickPreviewAnimation() {
+    if (!preview_anim_ready_) return;
+    const size_t nn = preview_node_parent_.size();
+    const size_t vc = preview_anim_base_.positions.size();
+    if (nn == 0 || vc == 0 || preview_skin_joints_.size() != vc) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    const float dur =
+        preview_clip_.duration > 0.0f ? preview_clip_.duration : 1.0f;
+    if (preview_anim_playing_) {
+        preview_anim_time_ += io.DeltaTime * preview_anim_speed_;
+        if (preview_anim_time_ > dur)
+            preview_anim_time_ = std::fmod(preview_anim_time_, dur);
+        if (preview_anim_time_ < 0.0f) preview_anim_time_ = 0.0f;
+    }
+
+    // Baked clip → ECS clip → sampled pose (per-node TRS overrides).
+    engine::ecs::AnimationClip clip;
+    clip.duration = preview_clip_.duration;
+    for (const auto& ch : preview_clip_.channels) {
+        engine::ecs::AnimChannel oc;
+        oc.target_node = ch.node;
+        oc.interp = ch.step ? engine::ecs::AnimInterp::kStep
+                            : engine::ecs::AnimInterp::kLinear;
+        oc.times = ch.times;
+        if (ch.path == engine::helper::RwAnimPath::kRotation) {
+            oc.path = engine::ecs::AnimPath::kRotation;
+            for (const auto& v : ch.values)
+                oc.quat.emplace_back(v.w, v.x, v.y, v.z);
+        } else {
+            oc.path = (ch.path == engine::helper::RwAnimPath::kScale)
+                          ? engine::ecs::AnimPath::kScale
+                          : engine::ecs::AnimPath::kTranslation;
+            for (const auto& v : ch.values)
+                oc.vec.emplace_back(v.x, v.y, v.z);
+        }
+        clip.channels.push_back(std::move(oc));
+    }
+    engine::ecs::AnimPose pose;
+    engine::ecs::AnimationSystem::sample(clip, preview_anim_time_, pose);
+
+    // Per-node local matrices: bind, overridden by the sampled channels under
+    // RIGID-SKELETON constraints:
+    //   • Bone lengths are preserved — only ROTATION is taken from the clip for
+    //     non-root bones; their translation/scale stay at bind (a non-root
+    //     translation or scale would change the bone's length).  Only the ROOT
+    //     may translate (locomotion / bob).
+    //   • Each bone's rotation is clamped to preview_node_rot_limit_ around its
+    //     bind orientation, so a joint cannot hyper-rotate.
+    std::vector<glm::mat4> local(nn);
+    for (size_t i = 0; i < nn; ++i) {
+        const glm::mat4& bl = preview_node_bind_local_[i];
+        const glm::vec3 t_bind(bl[3]);
+        const glm::vec3 c0(bl[0]), c1(bl[1]), c2(bl[2]);
+        const glm::vec3 s_bind(glm::length(c0), glm::length(c1),
+                               glm::length(c2));
+        const glm::mat3 rm(
+            s_bind.x > 1e-8f ? glm::vec3(c0 / s_bind.x) : glm::vec3(1, 0, 0),
+            s_bind.y > 1e-8f ? glm::vec3(c1 / s_bind.y) : glm::vec3(0, 1, 0),
+            s_bind.z > 1e-8f ? glm::vec3(c2 / s_bind.z) : glm::vec3(0, 0, 1));
+        const glm::quat r_bind = glm::quat_cast(rm);
+
+        glm::vec3 t = t_bind;          // keep bone length (bind translation)
+        glm::quat r = r_bind;
+        const bool is_root = preview_node_parent_[i] < 0;
+        if (i < pose.nodes.size()) {
+            const auto& nd = pose.nodes[i];
+            if (nd.has_r) r = nd.rotation;
+            if (is_root && nd.has_t) t = nd.translation;   // root only
+            // scale is never taken from the clip — rigid bones
+        }
+        // Rotation constraint: cap the deviation from the bind orientation.
+        const float lim = (i < preview_node_rot_limit_.size())
+                              ? preview_node_rot_limit_[i] : 3.14159265f;
+        glm::quat dev = glm::normalize(glm::inverse(r_bind) * r);
+        if (dev.w < 0.0f) dev = -dev;                      // shortest arc
+        const float ang = 2.0f * std::acos(glm::clamp(dev.w, -1.0f, 1.0f));
+        if (ang > lim && ang > 1e-5f)
+            dev = glm::slerp(glm::quat(1, 0, 0, 0), dev, lim / ang);
+        r = glm::normalize(r_bind * dev);
+
+        local[i] = glm::translate(glm::mat4(1.0f), t) *
+                   glm::mat4_cast(r) *
+                   glm::scale(glm::mat4(1.0f), s_bind);
+    }
+
+    // World matrices: resolve parents in repeated passes (any node order).
+    std::vector<glm::mat4> world(nn, glm::mat4(1.0f));
+    std::vector<char> done(nn, 0);
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (size_t i = 0; i < nn; ++i) {
+            if (done[i]) continue;
+            const int par = preview_node_parent_[i];
+            if (par < 0 || par >= (int)nn) {
+                world[i] = local[i]; done[i] = 1; progress = true;
+            } else if (done[par]) {
+                world[i] = world[par] * local[i]; done[i] = 1; progress = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < nn; ++i)
+        if (!done[i]) world[i] = local[i];   // cycle guard
+
+    // Joint world positions (node origins) for the skeleton debug overlay.
+    // Same world space as the skinned mesh, so they project consistently.
+    preview_joint_world_.resize(nn);
+    for (size_t i = 0; i < nn; ++i)
+        preview_joint_world_[i] = glm::vec3(world[i][3]);
+
+    // Joint matrices.  The trailing preview_mesh_node_inv_ cancels the bake's
+    // node_to_world baked into the source-world bind vertices, so the result
+    // is the correct world-space skinned position (matches the engine's GPU
+    // path: world = sum w * jointWorld * inverseBind * nodeLocalVertex).
+    std::vector<glm::mat4> jm(nn);
+    for (size_t i = 0; i < nn; ++i)
+        jm[i] = world[i] * preview_node_invbind_[i] * preview_mesh_node_inv_;
+
+    // Linear-blend skin the bind pose into a fresh payload.  The weight-debug
+    // mode applies a per-bone influence multiplier (then renormalizes), so the
+    // user can scrub a bone's weight up/down and watch the deformation change.
+    const bool wdebug = preview_show_weights_;
+    // Selected bone (for the weight render): pack its per-vertex weight into
+    // uv.x and tell the preview pass to draw the flat weight colour instead of
+    // the textured material.
+    int wsel_node = -1;
+    if (wdebug && !preview_weight_bones_.empty()) {
+        int s = preview_weight_sel_;
+        if (s < 0) s = 0;
+        if (s >= (int)preview_weight_bones_.size())
+            s = (int)preview_weight_bones_.size() - 1;
+        wsel_node = preview_weight_bones_[s];
+    }
+    const bool sdebug = preview_show_segments_ && !wdebug;  // segment colouring
+    const bool ddebug = preview_show_distance_ && !wdebug && !sdebug;
+    engine::helper::MeshPreview::setWeightDebug(wdebug || ddebug);  // shared heatmap
+    engine::helper::MeshPreview::setSegmentDebug(sdebug);
+
+    // Distance mode: geodesic distance from the SELECTED bone over the cached
+    // bind surface → closeness = exp(-dist/tau) (red at the bone, fading out).
+    // Recomputed only when the selected bone changes.
+    if (ddebug && !preview_weight_bones_.empty() && !preview_weld_adj_.empty()) {
+        int sel = preview_weight_sel_;
+        if (sel < 0) sel = 0;
+        if (sel >= (int)preview_weight_bones_.size())
+            sel = (int)preview_weight_bones_.size() - 1;
+        if (sel != preview_dist_sel_cached_ ||
+            preview_surface_close_.size() != vc) {
+            preview_dist_sel_cached_ = sel;
+            glm::vec3 bmn(1e30f), bmx(-1e30f);
+            for (const auto& p : preview_weld_pos_) {
+                bmn = glm::min(bmn, p); bmx = glm::max(bmx, p);
+            }
+            const float scale = glm::length(bmx - bmn);
+            const float tau   = glm::max(0.25f * scale, 1e-4f);
+            const int Wn = (int)preview_weld_pos_.size();
+            // BONE-RAY seeding (matches the auto-rig pass): straight-line
+            // nearest-joint assignment leaks across gaps (with the arm down the
+            // elbow is euclidean-near the waist, so the waist would wrongly seed
+            // the forearm).  Instead fire rays from points ALONG the selected
+            // bone's segment; the NEAREST surface hit in each direction is the
+            // limb that wraps the bone, so seeds land on the correct part and
+            // the geodesic distance is measured from there.
+            const int selNode = preview_weight_bones_[sel];
+            const glm::vec3 B = preview_joint_bind_world_[selNode];
+            const int par = (selNode < (int)preview_node_parent_.size())
+                                ? preview_node_parent_[selNode] : -1;
+            const glm::vec3 A =
+                (par >= 0 && par < (int)preview_joint_bind_world_.size())
+                    ? preview_joint_bind_world_[par] : B;
+            auto rayTriV = [&](const glm::vec3& o, const glm::vec3& d,
+                               const glm::ivec3& t, float& outT) -> bool {
+                const glm::vec3& v0 = preview_weld_pos_[t.x];
+                const glm::vec3& v1 = preview_weld_pos_[t.y];
+                const glm::vec3& v2 = preview_weld_pos_[t.z];
+                const glm::vec3 e1 = v1 - v0, e2 = v2 - v0;
+                const glm::vec3 pv = glm::cross(d, e2);
+                const float det = glm::dot(e1, pv);
+                if (std::fabs(det) < 1e-12f) return false;
+                const float inv = 1.0f / det;
+                const glm::vec3 tv = o - v0;
+                const float u = glm::dot(tv, pv) * inv;
+                if (u < -1e-5f || u > 1.0f + 1e-5f) return false;
+                const glm::vec3 qv = glm::cross(tv, e1);
+                const float vb = glm::dot(d, qv) * inv;
+                if (vb < -1e-5f || u + vb > 1.0f + 1e-5f) return false;
+                const float tt = glm::dot(e2, qv) * inv;
+                if (tt <= 1e-6f) return false;
+                outT = tt; return true;
+            };
+            std::vector<float> dist(Wn, 1e30f);
+            std::priority_queue<std::pair<float, int>,
+                                std::vector<std::pair<float, int>>,
+                                std::greater<std::pair<float, int>>> pq;
+            const int kBoneDirs = 64, kSamples = 4;
+            std::vector<std::pair<float, int>> hits;
+            for (int sp = 0; sp <= kSamples; ++sp) {
+                const float u = static_cast<float>(sp) / kSamples;
+                const glm::vec3 o = A + (B - A) * u;
+                for (int s = 0; s < kBoneDirs; ++s) {
+                    const float k     = static_cast<float>(s) + 0.5f;
+                    const float phi   = std::acos(1.0f - 2.0f * k / kBoneDirs);
+                    const float theta = 2.39996323f * static_cast<float>(s);
+                    const glm::vec3 d(std::sin(phi) * std::cos(theta),
+                                      std::sin(phi) * std::sin(theta),
+                                      std::cos(phi));
+                    float bestT = 1e30f; int bestTri = -1;
+                    for (size_t ti = 0; ti < preview_weld_tris_.size(); ++ti) {
+                        const glm::ivec3& tv = preview_weld_tris_[ti];
+                        float tt;
+                        if (!rayTriV(o, d, tv, tt)) continue;
+                        // Only seed the surface the bone EXITS (its own limb);
+                        // a foreign part across a gap is ENTERED (normal faces
+                        // the ray) and is rejected.
+                        const glm::vec3 fn = glm::cross(
+                            preview_weld_pos_[tv.y] - preview_weld_pos_[tv.x],
+                            preview_weld_pos_[tv.z] - preview_weld_pos_[tv.x]);
+                        if (glm::dot(fn, d) <= 0.0f) continue;
+                        if (tt < bestT) { bestT = tt; bestTri = (int)ti; }
+                    }
+                    if (bestTri >= 0) hits.push_back({ bestT, bestTri });
+                }
+            }
+            // Reject far outlier hits (rays that escaped into a neighbour) using
+            // the median nearest-hit distance as the local limb radius — keeps
+            // the bone's own cross-section.  No euclidean fallback: if no rays
+            // hit, the field is simply empty (geodesic-only).
+            if (!hits.empty()) {
+                std::vector<float> ds; ds.reserve(hits.size());
+                for (const auto& h : hits) ds.push_back(h.first);
+                std::nth_element(ds.begin(), ds.begin() + ds.size() / 2, ds.end());
+                const float cutoff = ds[ds.size() / 2] * 2.0f + 1e-4f;
+                for (const auto& h : hits) {
+                    if (h.first > cutoff) continue;
+                    const glm::ivec3& t = preview_weld_tris_[h.second];
+                    for (int c = 0; c < 3; ++c) {
+                        const int sw = t[c];
+                        if (dist[sw] > 0.0f) { dist[sw] = 0.0f; pq.push({0.0f, sw}); }
+                    }
+                }
+            }
+            while (!pq.empty()) {
+                const auto top = pq.top(); pq.pop();
+                const float d = top.first; const int u = top.second;
+                if (d > dist[u]) continue;
+                for (const auto& e : preview_weld_adj_[u]) {
+                    const float ndd = d + e.second;
+                    if (ndd < dist[e.first]) {
+                        dist[e.first] = ndd; pq.push({ndd, e.first});
+                    }
+                }
+            }
+            // Falloff ends at the "yellow" band (closeness kYellow) and is
+            // discarded beyond — matches the auto-rig weight cutoff so the
+            // heatmap shows exactly the kept influence region.
+            const float kYellow = 0.625f;
+            preview_surface_close_.assign(vc, 0.0f);
+            for (size_t v = 0; v < vc; ++v) {
+                const float d = dist[preview_weld_id_[v]];
+                const float c = (d >= 1e29f) ? 0.0f : std::exp(-d / tau);
+                preview_surface_close_[v] =
+                    (c < kYellow) ? 0.0f : (c - kYellow) / (1.0f - kYellow);
+            }
+        }
+    }
+
+    engine::helper::MeshPreviewPayload out = preview_anim_base_;
+    for (size_t v = 0; v < vc; ++v) {
+        const glm::uvec4 J = preview_skin_joints_[v];
+        const glm::vec4  W = preview_skin_weights_[v];
+        glm::mat4 m(0.0f);
+        float wsum = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            float w = W[k];
+            if (w <= 0.0f) continue;
+            const uint32_t n = J[k];
+            if (n >= nn) continue;
+            if (n < preview_bone_weight_scale_.size())
+                w *= preview_bone_weight_scale_[n];   // tweakable influence
+            if (w <= 0.0f) continue;
+            m += jm[n] * w; wsum += w;
+        }
+        // Weight render: pack the selected bone's weight on this vertex into
+        // uv.x (read by the preview shader's flat heat-map branch).
+        if (wdebug && v < out.uvs.size()) {
+            float wt = 0.0f;
+            for (int k = 0; k < 4; ++k)
+                if ((int)J[k] == wsel_node) wt += W[k];
+            out.uvs[v] = glm::vec2(wt, 0.0f);
+        } else if (sdebug && v < out.uvs.size()) {
+            // Segment render: pack the DOMINANT bone's node index into uv.x;
+            // the shader maps it to a distinct hue.
+            int dk = 0; float dw = -1.0f;
+            for (int k = 0; k < 4; ++k)
+                if (W[k] > dw) { dw = W[k]; dk = k; }
+            out.uvs[v] = glm::vec2((float)J[dk], 0.0f);
+        } else if (ddebug && v < out.uvs.size() &&
+                   v < preview_surface_close_.size()) {
+            // Distance render: closeness to the selected bone (heatmap branch).
+            out.uvs[v] = glm::vec2(preview_surface_close_[v], 0.0f);
+        }
+        const glm::vec3& bp = preview_anim_base_.positions[v];
+        if (wsum <= 1e-6f) {
+            // Unweighted vertex: leave it at the bind pose (do NOT collapse).
+            out.positions[v] = bp;
+            continue;
+        }
+        // Normalize by the weight total so vertices whose 4 weights don't sum
+        // to exactly 1 aren't pulled toward the origin (the shard/spike
+        // artifact).  Dividing by wsum is the correct weighted blend.
+        const float inv = 1.0f / wsum;
+        out.positions[v] = glm::vec3(m * glm::vec4(bp, 1.0f)) * inv;
+        if (v < preview_anim_base_.normals.size()) {
+            glm::vec3 n = (glm::mat3(m) * preview_anim_base_.normals[v]) * inv;
+            const float l = glm::length(n);
+            out.normals[v] =
+                (l > 1e-6f) ? (n / l) : preview_anim_base_.normals[v];
+        }
+    }
+
+    // Re-stage directly (bypass stagePreviewPayload so the ready flag stays).
+    preview_payload_ = std::move(out);
+    preview_pending_ = true;
+    preview_active_  = true;
 }
 
 // Stage a ready payload for the GPU PBR preview pass: the application
@@ -6541,6 +6926,13 @@ void Menu::stagePreviewPayload(engine::helper::MeshPreviewPayload&& payload) {
     preview_payload_ = std::move(payload);
     preview_pending_ = true;
     preview_active_  = true;
+    // Default to a STATIC preview; buildRwGroupPreview re-enables animation
+    // after staging when the group is fully skinned.  tickPreviewAnimation
+    // bypasses this path (writes preview_payload_ directly) so it doesn't
+    // clear its own flag.
+    preview_anim_ready_ = false;
+    engine::helper::MeshPreview::setWeightDebug(false);   // back to textured
+    engine::helper::MeshPreview::setSegmentDebug(false);
     // NOTE: tab focus is requested by finishAssetPreview (content previews
     // only) — scene-selection previews must NOT yank the Outliner tab away
     // while the user is clicking rows in it.
@@ -6608,6 +7000,13 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
             "[preview] could not load geometry from: " + path);
         return;
     }
+    // This path previews a raw source model FILE (.gltf/.glb/.fbx) that lives
+    // in content; that file IS the asset's own data, not a separate original.
+    // loadModelPreviewData only loads static geometry (no joints), so read the
+    // skin flag from the same file.  (Bake-only character imports never reach
+    // here — they preview via buildRwGroupPreview / buildRwGeoPreview, which
+    // read the skin blobs straight out of the baked .rwgeo.)
+    dbg_preview_skinned_ = engine::helper::modelHasSkin(path);
     engine::helper::MeshPreviewPayload p;
     p.positions = std::move(data.positions);
     p.normals   = std::move(data.normals);
@@ -6847,10 +7246,109 @@ void Menu::drawRenderDebugMenuContent() {
 // payload.  Each .rwgeo loads in source-world coordinates (its header
 // matrix is re-applied by loadRwGeo), so the assembly reconstructs the
 // authored layout; textures are dedup'd across objects by file path.
+// (Preview-side geodesic weight de-bleed removed — the auto-rig pass now does
+// geodesic surface weighting at rig time, so the asset weights are clean.)
+
+// Synthesize a looping WALK clip for a rig that ships without animation
+// (e.g. scene-skinned: a 19-bone humanoid skeleton, no clips).  Bones are
+// matched by name; channels are per-bone LOCAL rotations.  The bind pose has
+// identity bone rotations and is Y-up with limbs hanging down, so each bone's
+// local Z is the medial-lateral axis — rotating about it swings the limb
+// fore/aft (the walk swing).  Returns an empty clip for rigs we don't
+// recognise (caller then falls back to a static preview).
+static engine::helper::RwAnimClip makeProceduralWalk(
+    const std::vector<engine::helper::RwHierNode>& hier) {
+    engine::helper::RwAnimClip clip;
+
+    std::unordered_map<std::string, int> idx;
+    for (size_t i = 0; i < hier.size(); ++i) {
+        std::string n = hier[i].name;
+        for (auto& c : n) c = (char)std::tolower((unsigned char)c);
+        idx[n] = (int)i;
+    }
+    auto find = [&](const char* nm) -> int {
+        auto it = idx.find(nm);
+        return it == idx.end() ? -1 : it->second;
+    };
+    const int l_thigh = find("left_upper_leg"),  r_thigh = find("right_upper_leg");
+    const int l_shin  = find("left_lower_leg"),  r_shin  = find("right_lower_leg");
+    const int l_arm   = find("left_upper_arm"),  r_arm   = find("right_upper_arm");
+    const int l_fore  = find("left_lower_arm"),  r_fore  = find("right_lower_arm");
+    const int spine   = find("spine"),           hips    = find("hips");
+    if (l_thigh < 0 || r_thigh < 0) return clip;   // not a rig we know
+
+    clip.name = "walk";
+    const float kStride = 1.0f;    // one stride per second
+    clip.duration = kStride;
+    const int   kSteps = 24;       // samples per cycle (+1 closing key)
+    const float kPI = 3.14159265f;
+    const glm::vec3 axisZ(0, 0, 1), axisY(0, 1, 0);
+    // Swing amplitudes (radians).
+    const float A_thigh = 0.55f, A_knee = 0.9f, A_arm = 0.45f,
+                A_elbow = 0.25f, A_spin = 0.08f, BOB = 0.025f;
+
+    auto quat = [](const glm::vec3& ax, float a) -> glm::vec4 {
+        const float s = std::sin(a * 0.5f);
+        return glm::vec4(ax.x * s, ax.y * s, ax.z * s, std::cos(a * 0.5f));
+    };
+    auto addRot = [&](int node, const glm::vec3& axis, auto angFn) {
+        if (node < 0) return;
+        engine::helper::RwAnimChannel ch;
+        ch.node = node;
+        ch.path = engine::helper::RwAnimPath::kRotation;
+        ch.step = 0;
+        for (int k = 0; k <= kSteps; ++k) {
+            const float p = 2.0f * kPI * (float)k / (float)kSteps;
+            ch.times.push_back(kStride * (float)k / (float)kSteps);
+            ch.values.push_back(quat(axis, angFn(p)));
+        }
+        clip.channels.push_back(std::move(ch));
+    };
+
+    // Thighs swing fore/aft (legs in opposite phase).
+    addRot(l_thigh, axisZ, [&](float p) { return A_thigh * std::sin(p); });
+    addRot(r_thigh, axisZ, [&](float p) { return A_thigh * std::sin(p + kPI); });
+    // Knees flex one-directionally, peaking on the back/lift part of the step.
+    addRot(l_shin, axisZ, [&](float p) {
+        return -A_knee * 0.5f * (1.0f - std::cos(p + 1.2f)); });
+    addRot(r_shin, axisZ, [&](float p) {
+        return -A_knee * 0.5f * (1.0f - std::cos(p + kPI + 1.2f)); });
+    // Arms swing opposite the same-side leg.
+    addRot(l_arm, axisZ, [&](float p) { return A_arm * std::sin(p + kPI); });
+    addRot(r_arm, axisZ, [&](float p) { return A_arm * std::sin(p); });
+    // Slight constant elbow bend.
+    addRot(l_fore, axisZ, [&](float) { return -A_elbow; });
+    addRot(r_fore, axisZ, [&](float) { return -A_elbow; });
+    // Subtle torso counter-twist about the up axis.
+    addRot(spine, axisY, [&](float p) { return A_spin * std::sin(p); });
+
+    // Hips vertical bob (twice per stride) via a translation channel.
+    if (hips >= 0) {
+        const glm::vec3 base(hier[hips].local[3]);   // bind translation
+        engine::helper::RwAnimChannel ch;
+        ch.node = hips;
+        ch.path = engine::helper::RwAnimPath::kTranslation;
+        ch.step = 0;
+        for (int k = 0; k <= kSteps; ++k) {
+            const float p = 2.0f * kPI * (float)k / (float)kSteps;
+            glm::vec3 tr = base;
+            tr.y += BOB * (-std::cos(2.0f * p));
+            ch.times.push_back(kStride * (float)k / (float)kSteps);
+            ch.values.push_back(glm::vec4(tr, 0.0f));
+        }
+        clip.channels.push_back(std::move(ch));
+    }
+    return clip;
+}
+
 void Menu::buildRwGroupPreview(const std::string& group_dir,
                                const std::string& display_name) {
     const std::string key = group_dir + "#group";
     if (key == dbg_asset_key_) return;   // already showing
+    // Detected from the baked raw data below: a character import is a group
+    // whose objects/*.rwgeo carry skin blobs (joints/skin table).  We do NOT
+    // consult the source model — the imported .rwgeo is the source of truth.
+    dbg_preview_skinned_ = false;
 
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -6874,14 +7372,27 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
     engine::helper::MeshPreviewPayload p;
     std::unordered_map<std::string, int> texmap;   // tex path → payload idx
     size_t skipped = 0;
+    // Animated-preview capture (used only when the whole group is skinned).
+    std::vector<glm::uvec4>            sj;            // per vtx: 4 node indices
+    std::vector<glm::vec4>             sw;            // per vtx: 4 weights
+    std::unordered_map<int, glm::mat4> invbind_map;   // skeleton node → inv bind
+    bool all_skinned = true;
+    int  first_skinned_ordinal = -1;   // owner mesh node (bind-space cancel)
     for (const auto& geo : geos) {
         if (p.positions.size() >= kMaxGroupVerts) { ++skipped; continue; }
+        // Skip objects disabled in the Content Browser — they're left out of
+        // the assembled Debug Display preview.
+        if (content_disabled_.find(geo) != content_disabled_.end()) continue;
         engine::helper::ModelPreviewData md;
         std::vector<std::string> tpaths;
         if (!engine::helper::loadRwGeo(geo, md, &tpaths) ||
             md.positions.empty() || md.indices.empty()) {
             continue;
         }
+        // Raw-data skin detection: any baked object carrying a skin table /
+        // per-vertex joints makes the whole group a skeleton mesh.
+        if (!md.skin_joint_nodes.empty() || !md.joints.empty())
+            dbg_preview_skinned_ = true;
         const uint32_t vbase = (uint32_t)p.positions.size();
         const uint32_t ibase = (uint32_t)p.indices.size();
         p.positions.insert(p.positions.end(),
@@ -6896,6 +7407,49 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
                                               : glm::vec2(0.0f));
         }
         for (uint32_t ix : md.indices) p.indices.push_back(vbase + ix);
+
+        // ── Animated-preview skin capture (parallel to p.positions) ──
+        // Remap each vertex's object-local cluster indices to GLOBAL skeleton
+        // node indices (skin_joint_nodes were baked as hierarchy.rwhier
+        // indices) so one node-indexed joint table covers the whole group.
+        {
+            const bool obj_skinned =
+                md.joints.size()  == md.positions.size() &&
+                md.weights.size() == md.positions.size() &&
+                !md.skin_joint_nodes.empty();
+            if (!obj_skinned) all_skinned = false;
+            if (obj_skinned && first_skinned_ordinal < 0) {
+                // Leading digits of "NNN_name.rwgeo" == mesh_ordinal.
+                const std::string fn = fs::path(geo).filename().string();
+                int ord = 0; bool any = false;
+                for (char c : fn) {
+                    if (c >= '0' && c <= '9') { ord = ord * 10 + (c - '0');
+                                                any = true; }
+                    else break;
+                }
+                if (any) first_skinned_ordinal = ord;
+            }
+            for (size_t i = 0; i < md.positions.size(); ++i) {
+                glm::uvec4 J(0u);
+                glm::vec4  W(0.0f);
+                if (obj_skinned) {
+                    const glm::u16vec4 lj = md.joints[i];
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t local = lj[k];
+                        J[k] = (local < md.skin_joint_nodes.size())
+                            ? (uint32_t)md.skin_joint_nodes[local] : 0u;
+                    }
+                    W = md.weights[i];
+                }
+                sj.push_back(J);
+                sw.push_back(W);
+            }
+            if (obj_skinned)
+                for (size_t j = 0; j < md.skin_joint_nodes.size() &&
+                                   j < md.skin_inverse_bind.size(); ++j)
+                    invbind_map[md.skin_joint_nodes[j]] =
+                        md.skin_inverse_bind[j];
+        }
 
         // Texture dedup across objects (tpaths is parallel to
         // md.textures — covers albedo/normal/mr refs alike).
@@ -6942,9 +7496,171 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
             "[preview] group preview capped — " +
             std::to_string(skipped) + " object(s) omitted");
     }
-    stagePreviewPayload(std::move(p));
+    // ── Animated preview setup (fully-skinned group + skeleton + clip) ──
+    bool want_anim = dbg_preview_skinned_ && all_skinned &&
+                     sj.size() == p.positions.size();
+    std::vector<engine::helper::RwHierNode> hier;
+    std::vector<engine::helper::RwAnimClip> clips;
+    engine::helper::RwAnimClip chosen_clip;
+    if (want_anim) {
+        namespace fs = std::filesystem;
+        want_anim = engine::helper::loadRwHier(
+            (fs::path(group_dir) / "hierarchy.rwhier").string(), hier) &&
+            !hier.empty();
+    }
+    if (want_anim) {
+        namespace fs = std::filesystem;
+        // Prefer a baked clip; otherwise synthesize a walk for rigs that
+        // ship without animation (e.g. scene-skinned: bones, no clips).
+        if (engine::helper::loadRwAnim(
+                (fs::path(group_dir) / "animation.rwanim").string(), clips) &&
+            !clips.empty()) {
+            chosen_clip = clips[0];
+        } else {
+            chosen_clip = makeProceduralWalk(hier);
+        }
+        if (chosen_clip.channels.empty()) want_anim = false;
+    }
+    if (want_anim) {
+        preview_anim_base_    = p;            // copy BIND pose before the move
+
+        // Bind-pose joint world matrices (reused by the de-bleed below AND the
+        // mesh-node-inverse further down).
+        std::vector<glm::mat4> nwb(hier.size(), glm::mat4(1.0f));
+        {
+            std::vector<char> dn(hier.size(), 0);
+            bool prog = true;
+            while (prog) {
+                prog = false;
+                for (size_t i = 0; i < hier.size(); ++i) {
+                    if (dn[i]) continue;
+                    const int par = hier[i].parent;
+                    if (par < 0 || par >= (int)hier.size()) {
+                        nwb[i] = hier[i].local; dn[i] = 1; prog = true;
+                    } else if (dn[par]) {
+                        nwb[i] = nwb[par] * hier[i].local; dn[i] = 1; prog = true;
+                    }
+                }
+            }
+        }
+
+        // Weights come straight from the asset now (the auto-rig pass does the
+        // geodesic surface weighting at rig time — no preview-side de-bleed).
+        preview_skin_joints_  = std::move(sj);
+        preview_skin_weights_ = std::move(sw);
+        preview_node_parent_.assign(hier.size(), -1);
+        preview_node_name_.assign(hier.size(), std::string());
+        preview_node_bind_local_.assign(hier.size(), glm::mat4(1.0f));
+        preview_node_invbind_.assign(hier.size(), glm::mat4(1.0f));
+        for (size_t i = 0; i < hier.size(); ++i) {
+            preview_node_parent_[i]     = hier[i].parent;
+            preview_node_name_[i]       = hier[i].name;
+            preview_node_bind_local_[i] = hier[i].local;
+            auto it = invbind_map.find((int)i);
+            if (it != invbind_map.end())
+                preview_node_invbind_[i] = it->second;
+        }
+
+        // Per-bone rotation limits (radians, around bind) so joints can't
+        // hyper-rotate.  Keyed by name; generous default for anything else.
+        preview_node_rot_limit_.assign(hier.size(), 3.14159265f);
+        for (size_t i = 0; i < hier.size(); ++i) {
+            std::string n = hier[i].name;
+            for (auto& c : n) c = (char)std::tolower((unsigned char)c);
+            auto has = [&](const char* s) {
+                return n.find(s) != std::string::npos; };
+            float lim = 3.14159265f;
+            if      (has("lower_leg") || has("calf") || has("knee"))      lim = 2.50f;
+            else if (has("lower_arm") || has("forearm") || has("elbow"))  lim = 1.75f;
+            else if (has("upper_leg") || has("thigh") ||
+                     has("upper_arm") || has("shoulder"))                 lim = 1.30f;
+            else if (has("spine") || has("chest") ||
+                     has("neck")  || has("head"))                         lim = 0.45f;
+            else if (has("hand")  || has("foot") || has("toe"))           lim = 0.70f;
+            preview_node_rot_limit_[i] = lim;
+        }
+
+        // Weight-debug: selectable joint list (the skin's bones) + per-bone
+        // influence multipliers (1 = unchanged).
+        preview_weight_bones_.clear();
+        for (const auto& kv : invbind_map)
+            preview_weight_bones_.push_back(kv.first);
+        std::sort(preview_weight_bones_.begin(), preview_weight_bones_.end());
+        preview_weight_sel_ = 0;
+        preview_bone_weight_scale_.assign(hier.size(), 1.0f);
+
+        preview_clip_ = chosen_clip;
+
+        // Owner skinned-mesh node's bind world (nwb, computed above) → its
+        // inverse cancels the node_to_world the bake folded into the
+        // source-world vertices, so joint matrices act on node-local positions.
+        preview_mesh_node_inv_ = glm::mat4(1.0f);
+        for (size_t i = 0; i < hier.size(); ++i)
+            if (hier[i].mesh_ordinal == first_skinned_ordinal) {
+                preview_mesh_node_inv_ = glm::inverse(nwb[i]);
+                break;
+            }
+
+        // Cache the welded BIND surface graph + bind joint positions for the
+        // geodesic distance-to-selected-bone debug view.
+        {
+            const auto& P = preview_anim_base_.positions;
+            const auto& I = preview_anim_base_.indices;
+            const int Vp = (int)P.size();
+            preview_weld_id_.assign(Vp, 0);
+            preview_weld_pos_.clear();
+            std::unordered_map<uint64_t, int> weld; weld.reserve(Vp * 2);
+            auto keyOf = [](const glm::vec3& p) -> uint64_t {
+                uint32_t u[3]; std::memcpy(u, &p, sizeof(u));
+                for (int i = 0; i < 3; ++i) if (u[i] == 0x80000000u) u[i] = 0u;
+                uint64_t h = 1469598103934665603ull;
+                for (int i = 0; i < 3; ++i) { h ^= u[i]; h *= 1099511628211ull; }
+                return h;
+            };
+            for (int i = 0; i < Vp; ++i) {
+                const uint64_t k = keyOf(P[i]);
+                auto it = weld.find(k);
+                if (it == weld.end()) {
+                    const int id = (int)preview_weld_pos_.size();
+                    weld.emplace(k, id); preview_weld_pos_.push_back(P[i]);
+                    preview_weld_id_[i] = id;
+                } else preview_weld_id_[i] = it->second;
+            }
+            const int Wn = (int)preview_weld_pos_.size();
+            preview_weld_adj_.assign(Wn, {});
+            auto addE = [&](int a, int b) {
+                if (a == b) return;
+                const float w = glm::length(preview_weld_pos_[a] -
+                                            preview_weld_pos_[b]);
+                preview_weld_adj_[a].push_back({b, w});
+                preview_weld_adj_[b].push_back({a, w});
+            };
+            preview_weld_tris_.clear();
+            preview_weld_tris_.reserve(I.size() / 3);
+            for (size_t t = 0; t + 2 < I.size(); t += 3) {
+                const int a = preview_weld_id_[I[t]],
+                          b = preview_weld_id_[I[t + 1]],
+                          c = preview_weld_id_[I[t + 2]];
+                addE(a, b); addE(b, c); addE(c, a);
+                preview_weld_tris_.push_back({ a, b, c });
+            }
+            preview_joint_bind_world_.assign(hier.size(), glm::vec3(0.0f));
+            for (size_t i = 0; i < hier.size(); ++i)
+                preview_joint_bind_world_[i] = glm::vec3(nwb[i][3]);
+            preview_dist_sel_cached_ = -999;
+            preview_surface_close_.clear();
+        }
+    }
+
+    stagePreviewPayload(std::move(p));   // clears preview_anim_ready_
     finishAssetPreview(key, display_name + " (group)");
     preview_nav_ = PreviewNav::None;
+
+    if (want_anim) {
+        preview_anim_time_    = 0.0f;
+        preview_anim_playing_ = true;
+        preview_anim_ready_   = true;    // set AFTER stage (which cleared it)
+    }
 }
 
 // Preview a baked .rwgeo directly (no .rwobj ref needed) — how the
@@ -6959,6 +7675,7 @@ void Menu::buildRwGeoPreview(const std::string& rwgeo_path,
             "[preview] baked geometry unreadable: " + rwgeo_path);
         return;
     }
+    dbg_preview_skinned_ = !data.joints.empty();
     engine::helper::MeshPreviewPayload p;
     p.positions = std::move(data.positions);
     p.normals   = std::move(data.normals);
@@ -6998,6 +7715,7 @@ void Menu::buildRwObjPreview(const std::string& rwobj_path,
         return;
     }
     if (name.empty()) name = fallback_name;
+    dbg_preview_skinned_ = false;   // .rwobj objects are static props
 
     if (!geo.empty()) {
         const std::string key = rwobj_path + "#geo";
@@ -7193,42 +7911,227 @@ void Menu::drawDebugDisplayPanel() {
         }
 
         if (show_image) {
+            // Animated skeleton preview: re-pose + re-stage each frame.
+            tickPreviewAnimation();
             // Fit the preview into the panel, preserving aspect, centred.
-            const float pw = (float)engine::helper::MeshPreview::kSize;
-            const float ph = (float)engine::helper::MeshPreview::kSize;
-            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            // Reserve a couple of lines at the bottom for the help text so it
+            // is not clipped when the image fills the panel.
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            const float kReserveBottom =
+                ImGui::GetTextLineHeightWithSpacing() * 2.0f + 6.0f;
+            if (avail.y > kReserveBottom + 32.0f) avail.y -= kReserveBottom;
+            // Drive the offscreen target resolution from the panel pixel size
+            // so the preview renders natively (not an upscaled fixed 512^2).
+            {
+                ImGuiIO& io = ImGui::GetIO();
+                const float dpi = io.DisplayFramebufferScale.x > 0.0f
+                                      ? io.DisplayFramebufferScale.x : 1.0f;
+                auto rstep = [](float v) {
+                    int p = (int)v; p = (p / 32) * 32; return p < 64 ? 64 : p;
+                };
+                engine::helper::MeshPreview::requestSize(
+                    (uint32_t)rstep(avail.x * dpi),
+                    (uint32_t)rstep(avail.y * dpi));
+            }
+            const float pw = (float)engine::helper::MeshPreview::width();
+            const float ph = (float)engine::helper::MeshPreview::height();
             float s = std::min(avail.x / pw, avail.y / ph);
             if (s <= 0.0f || avail.x < 8.0f || avail.y < 8.0f) s = 1.0f;
             const ImVec2 sz(pw * s, ph * s);
             const float pad_x = (avail.x - sz.x) * 0.5f;
             if (pad_x > 0.0f)
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad_x);
+            const ImVec2 img_p0 = ImGui::GetCursorScreenPos();
             ImGui::Image(prev_id, sz);
 
             // ── Orbit camera: drag to rotate, wheel to zoom ───────────
-            // ImageButton-free hit test on the image item itself; the
-            // offscreen pass re-records next frame when the camera moves.
-            if (ImGui::IsItemHovered()) {
+            // Overlay an invisible button on the image so a drag manipulates
+            // the camera WITHOUT also moving the window (a floating/popup
+            // Debug Display would otherwise be dragged too). The active item
+            // consumes the mouse; the offscreen pass re-records when the
+            // camera moves.
+            ImGui::SetCursorScreenPos(img_p0);
+            ImGui::SetNextItemAllowOverlap();   // top-left toggle sits on top
+            ImGui::InvisibleButton(
+                "##preview_drag", sz,
+                ImGuiButtonFlags_MouseButtonLeft |
+                    ImGuiButtonFlags_MouseButtonRight);
+            const bool prev_active  = ImGui::IsItemActive();
+            const bool prev_hovered = ImGui::IsItemHovered();
+            {
                 ImGuiIO& io = ImGui::GetIO();
-                if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+                if (prev_active &&
+                    ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
                     const ImVec2 d = io.MouseDelta;
-                    if (d.x != 0.0f || d.y != 0.0f) {
+                    if (d.x != 0.0f || d.y != 0.0f)
                         engine::helper::MeshPreview::orbit(
                             -d.x * 0.4f, d.y * 0.4f);
-                    }
                 }
                 // Right-drag: move the object around the view (pans the
                 // camera target in the view plane).
-                if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f)) {
+                if (prev_active &&
+                    ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f)) {
                     const ImVec2 d = io.MouseDelta;
-                    if (d.x != 0.0f || d.y != 0.0f) {
+                    if (d.x != 0.0f || d.y != 0.0f)
                         engine::helper::MeshPreview::pan(d.x, d.y);
+                }
+                if (prev_hovered && io.MouseWheel != 0.0f)
+                    engine::helper::MeshPreview::zoom(io.MouseWheel);
+            }
+
+            // ── Static / Skeletal badge (top-right corner of the image) ──
+            {
+                const char* badge =
+                    dbg_preview_skinned_ ? "Skeletal" : "Static";
+                const ImU32 fg = dbg_preview_skinned_
+                                     ? IM_COL32(130, 190, 255, 255)
+                                     : IM_COL32(200, 200, 200, 255);
+                const ImVec2 tsz = ImGui::CalcTextSize(badge);
+                const float padx = 6.0f, pady = 3.0f;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 b1(img_p0.x + sz.x - tsz.x - padx * 2.0f - 4.0f,
+                                img_p0.y + 4.0f);
+                const ImVec2 b2(img_p0.x + sz.x - 4.0f,
+                                img_p0.y + 4.0f + tsz.y + pady * 2.0f);
+                dl->AddRectFilled(b1, b2, IM_COL32(0, 0, 0, 150), 4.0f);
+                dl->AddText(ImVec2(b1.x + padx, b1.y + pady), fg, badge);
+            }
+
+            // ── Skeleton debug draw: top-left toggle + bone overlay ──────
+            // The toggle/overlay only make sense for a skeleton mesh that has
+            // a live skeleton (preview_anim_ready_).  Save/restore the layout
+            // cursor so the button (placed at the image's top-left) doesn't
+            // push the controls below the image off-position.
+            const ImVec2 cursor_below_img = ImGui::GetCursorScreenPos();
+            if (dbg_preview_skinned_ && preview_anim_ready_) {
+                ImGui::SetCursorScreenPos(ImVec2(img_p0.x + 6.0f,
+                                                 img_p0.y + 6.0f));
+                if (ImGui::Button(preview_show_skeleton_ ? "Bones: On"
+                                                         : "Bones: Off"))
+                    preview_show_skeleton_ = !preview_show_skeleton_;
+                ImGui::SameLine();
+                if (ImGui::Button(preview_show_weights_ ? "Weights: On"
+                                                        : "Weights: Off")) {
+                    preview_show_weights_ = !preview_show_weights_;
+                    if (preview_show_weights_) {
+                        preview_show_segments_ = false;
+                        preview_show_distance_ = false;
                     }
                 }
-                if (io.MouseWheel != 0.0f) {
-                    engine::helper::MeshPreview::zoom(io.MouseWheel);
+                ImGui::SameLine();
+                if (ImGui::Button(preview_show_segments_ ? "Segments: On"
+                                                         : "Segments: Off")) {
+                    preview_show_segments_ = !preview_show_segments_;
+                    if (preview_show_segments_) {
+                        preview_show_weights_ = false;
+                        preview_show_distance_ = false;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(preview_show_distance_ ? "Dist: On"
+                                                         : "Dist: Off")) {
+                    preview_show_distance_ = !preview_show_distance_;
+                    if (preview_show_distance_) {
+                        preview_show_weights_  = false;
+                        preview_show_segments_ = false;
+                    }
+                    preview_dist_sel_cached_ = -999;   // force recompute
                 }
             }
+            // Skeleton overlay — shown for Bones mode OR Weights mode (the
+            // weight colour lives on the MESH now, so here we only draw the
+            // bones, highlighting the selected bone white in Weights mode).
+            const bool overlay_skel =
+                (preview_show_skeleton_ || preview_show_weights_ ||
+                 preview_show_segments_ || preview_show_distance_) &&
+                preview_anim_ready_ &&
+                preview_joint_world_.size() == preview_node_parent_.size() &&
+                !preview_joint_world_.empty();
+            if (overlay_skel) {
+                int selnode = -1;
+                if ((preview_show_weights_ || preview_show_distance_) &&
+                    !preview_weight_bones_.empty()) {
+                    int s = preview_weight_sel_;
+                    if (s < 0) s = 0;
+                    if (s >= (int)preview_weight_bones_.size())
+                        s = (int)preview_weight_bones_.size() - 1;
+                    selnode = preview_weight_bones_[s];
+                }
+                const glm::mat4 vpm = engine::helper::MeshPreview::lastViewProj();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(img_p0,
+                                 ImVec2(img_p0.x + sz.x, img_p0.y + sz.y), true);
+                auto project = [&](const glm::vec3& w, ImVec2& out) -> bool {
+                    const glm::vec4 c = vpm * glm::vec4(w, 1.0f);
+                    if (c.w <= 1e-5f) return false;            // behind camera
+                    const float u = (c.x / c.w) * 0.5f + 0.5f;
+                    const float v = (c.y / c.w) * 0.5f + 0.5f; // Vulkan Y flip
+                    out = ImVec2(img_p0.x + u * sz.x, img_p0.y + v * sz.y);
+                    return true;
+                };
+                const ImU32 bone_col  = IM_COL32(255, 215, 70, 220);
+                const ImU32 joint_col = IM_COL32(255, 90, 60, 255);
+                const ImU32 sel_col   = IM_COL32(255, 255, 255, 255);
+                for (size_t i = 0; i < preview_joint_world_.size(); ++i) {
+                    ImVec2 a;
+                    if (!project(preview_joint_world_[i], a)) continue;
+                    const bool is_sel = ((int)i == selnode);
+                    const int par = preview_node_parent_[i];
+                    if (par >= 0 && par < (int)preview_joint_world_.size()) {
+                        ImVec2 b;
+                        if (project(preview_joint_world_[par], b))
+                            dl->AddLine(a, b, is_sel ? sel_col : bone_col,
+                                        is_sel ? 3.0f : 2.0f);
+                    }
+                    dl->AddCircleFilled(a, is_sel ? 5.0f : 3.0f,
+                                        is_sel ? sel_col : joint_col);
+                }
+                dl->PopClipRect();
+            }
+            ImGui::SetCursorScreenPos(cursor_below_img);
+
+            // ── Animation playback controls (skeleton previews only) ────
+            if (preview_anim_ready_) {
+                ImGui::Checkbox("Play##prevanim", &preview_anim_playing_);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(110.0f);
+                ImGui::SliderFloat("Speed##prevanim", &preview_anim_speed_,
+                                   0.0f, 3.0f);
+                const float dur = preview_clip_.duration > 0.0f
+                                      ? preview_clip_.duration : 1.0f;
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderFloat("##prevanimtime", &preview_anim_time_,
+                                       0.0f, dur, "%.2fs"))
+                    preview_anim_playing_ = false;   // scrubbing pauses
+            }
+
+            // ── Weight debug: bone selector + influence tweak ───────────
+            if ((preview_show_weights_ || preview_show_distance_) &&
+                !preview_weight_bones_.empty()) {
+                const int count = (int)preview_weight_bones_.size();
+                if (ImGui::SmallButton("<##wbprev")) preview_weight_sel_--;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(">##wbnext")) preview_weight_sel_++;
+                // Wrap the selection.
+                if (preview_weight_sel_ < 0)        preview_weight_sel_ = count - 1;
+                if (preview_weight_sel_ >= count)   preview_weight_sel_ = 0;
+                const int sn = preview_weight_bones_[preview_weight_sel_];
+                ImGui::SameLine();
+                const std::string nm =
+                    (sn >= 0 && sn < (int)preview_node_name_.size())
+                        ? preview_node_name_[sn] : std::string("?");
+                ImGui::Text("bone %d/%d: %s", preview_weight_sel_ + 1, count,
+                            nm.c_str());
+                // Influence tweak is weights-mode only (distance is read-only).
+                if (preview_show_weights_ &&
+                    sn >= 0 && sn < (int)preview_bone_weight_scale_.size()) {
+                    ImGui::SetNextItemWidth(-1.0f);
+                    ImGui::SliderFloat("##wscale",
+                                       &preview_bone_weight_scale_[sn],
+                                       0.0f, 3.0f, "influence x%.2f");
+                }
+            }
+
             ImGui::TextDisabled(
                 "drag: orbit    right-drag: move    wheel: zoom    "
                 "arrows: navigate panel grid");

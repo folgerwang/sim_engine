@@ -113,6 +113,25 @@ public:
     // True once a preview has been rendered at least once.
     static bool hasImage() { return s_has_image_; }
 
+    // Current offscreen target resolution (defaults to kSize x kSize).
+    static uint32_t width()  { return s_width_; }
+    static uint32_t height() { return s_height_; }
+    // World→clip matrix of the LAST recorded pass (Vulkan clip space, Y
+    // already flipped).  Lets the editor overlay 3D gizmos (e.g. the skeleton
+    // debug draw) onto the preview image in screen space.
+    static const glm::mat4& lastViewProj() { return s_view_proj_; }
+    // Weight-debug render: when on, the mesh is drawn flat, coloured by the
+    // per-vertex weight the caller packs into the payload's uv.x (no texturing
+    // / lighting).  Toggled by the editor's bone/weight inspector.
+    static void setWeightDebug(bool on) { s_weight_debug_ = on; }
+    // Segmentation render: mesh drawn flat, coloured by the dominant bone index
+    // the caller packs into uv.x (distinct hue per segment).
+    static void setSegmentDebug(bool on) { s_segment_debug_ = on; }
+    // Request a new target resolution (cheap; applied next render/rerender on
+    // the main thread). Driven by the Debug Display panel size so the preview
+    // re-renders at native resolution instead of upscaling a fixed 512^2.
+    static void requestSize(uint32_t w, uint32_t h) { s_req_w_ = w; s_req_h_ = h; }
+
 private:
     // Records the full offscreen pass (mesh + grid) with the current orbit
     // camera into cmd_buf.  Requires uploaded buffers.
@@ -135,6 +154,15 @@ private:
     static ImTextureID                             s_im_id_;
     static bool                                    s_has_image_;
     static bool                                    s_color_in_read_layout_;
+    static uint32_t                                s_width_;
+    static uint32_t                                s_height_;
+    static uint32_t                                s_req_w_;
+    static uint32_t                                s_req_h_;
+    static uint64_t                                s_frame_;   // last monotonic frame
+    // Recreate the offscreen target at the requested size (deferred-free of the
+    // old one). Safe: called only from render()/rerenderIfNeeded (main thread,
+    // outside any render pass).
+    static void applyPendingResize(const std::shared_ptr<renderer::Device>& device);
 
     // Per-texture descriptor sets for the CURRENT preview, plus a recycler
     // so retired sets are reused once no in-flight frame references them
@@ -182,6 +210,9 @@ private:
     static float     s_orbit_dist_;
     static glm::vec3 s_pan_;
     static bool      s_camera_dirty_;
+    static glm::mat4 s_view_proj_;   // world→clip of the last recorded pass
+    static bool      s_weight_debug_;  // flat per-vertex-weight render mode
+    static bool      s_segment_debug_; // flat per-segment (bone index) render
     struct DeadBuffer {
         uint64_t                              free_frame;
         std::shared_ptr<renderer::BufferInfo> buf;

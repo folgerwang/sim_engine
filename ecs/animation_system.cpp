@@ -77,16 +77,17 @@ void AnimationSystem::sample(const AnimationClip& clip, float time, AnimPose& ou
 size_t AnimationSystem::update(entt::registry& reg, float dt) {
     size_t n = 0;
     for (auto [e, player] : reg.view<AnimationPlayer>().each()) {
-        if (!player.playing || !player.clip || player.clip->duration <= 0.0f)
-            continue;
-        player.time += dt * player.speed;
+        if (!player.clip || player.clip->duration <= 0.0f) continue;
 
         const float dur = player.clip->duration;
-        if (player.loop) {
-            player.time = std::fmod(player.time, dur);
-            if (player.time < 0.0f) player.time += dur;   // wrap negatives
-        } else {
-            player.time = std::clamp(player.time, 0.0f, dur);
+        if (player.playing) {
+            player.time += dt * player.speed;
+            if (player.loop) {
+                player.time = std::fmod(player.time, dur);
+                if (player.time < 0.0f) player.time += dur;   // wrap negatives
+            } else {
+                player.time = std::clamp(player.time, 0.0f, dur);
+            }
         }
 
         AnimPose& pose = reg.all_of<AnimPose>(e) ? reg.get<AnimPose>(e)

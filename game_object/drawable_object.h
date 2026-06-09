@@ -838,6 +838,9 @@ public:
     // for non-skinned or not-ready drawables — callers fall back to
     // the mesh bbox.
     bool getSkinnedModelAabb(glm::vec3& bmin, glm::vec3& bmax) const;
+    // True when this drawable carries skinning data (skeleton-driven
+    // deformation). Used by the Debug Display to badge Static vs Skeletal.
+    bool isSkinned() const { return object_ && !object_->skins_.empty(); }
 
     void updateInstanceBuffer(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
@@ -989,6 +992,18 @@ public:
     // pop-in) instead of riding one giant shared FBX load.  Returns
     // nullptr when the reference has no baked geometry.
     static std::shared_ptr<DrawableData> loadRwObjModel(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::string& input_filename);
+
+    // Native skinned-character load: a .rwchar manifest names a baked group
+    // (content/.../<name>/) that holds hierarchy.rwhier (skeleton), every
+    // objects/*.rwgeo (v4: geometry + per-vertex joints/weights + skin
+    // table) and animation.rwanim (clips).  Builds ONE skinned DrawableData
+    // — nodes_, skins_ (+joint buffers), skinned vertex attributes and
+    // animations_ — entirely from raw data, so a character animates with NO
+    // source model present.  Flows through the same Phase-3 descriptor /
+    // _SKIN-pipeline path as the glTF loader.  Returns nullptr on failure.
+    static std::shared_ptr<DrawableData> loadRwCharacter(
         const std::shared_ptr<renderer::Device>& device,
         const std::string& input_filename);
 };

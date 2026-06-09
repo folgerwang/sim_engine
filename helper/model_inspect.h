@@ -218,6 +218,30 @@ struct RwHierNode {
 };
 bool loadRwHier(const std::string& path, std::vector<RwHierNode>& out);
 
+// ── Skeletal / node animation (render-ready) ──────────────────────────────
+// Baked beside hierarchy.rwhier as <group_dir>/animation.rwanim: every clip
+// in the source model, resampled to LINEARLY-interpolable keyframes.  Each
+// channel targets a hierarchy.rwhier node index (glTF node order / ufbx
+// scene->nodes order), so a baked character animates with NO source file.
+// Rotation values are stored quaternion XYZW; translation/scale use XYZ
+// (w unused).  This makes a character fully self-contained post-import.
+enum class RwAnimPath : uint8_t { kTranslation = 0, kRotation = 1, kScale = 2 };
+struct RwAnimChannel {
+    int32_t                node = -1;   // hierarchy.rwhier node index
+    RwAnimPath             path = RwAnimPath::kTranslation;
+    uint8_t                step = 0;    // 1 = constant/step, 0 = linear/slerp
+    std::vector<float>     times;       // seconds, ascending; parallel to values
+    std::vector<glm::vec4> values;      // T/S: xyz (w=0); R: quat xyzw
+};
+struct RwAnimClip {
+    std::string                name;
+    float                      duration = 0.0f;   // seconds
+    std::vector<RwAnimChannel> channels;
+};
+// Read every clip baked for a group.  Returns false (out left empty) when the
+// file is absent — the group simply has no animation in that case.
+bool loadRwAnim(const std::string& path, std::vector<RwAnimClip>& out);
+
 // ── Stable asset identity ────────────────────────────────────────────────
 // Deterministic 64-bit FNV-1a hash — unlike std::hash, identical across
 // runs, builds and machines, so IDs survive re-imports and can key

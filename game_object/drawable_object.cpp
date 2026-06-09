@@ -4789,6 +4789,14 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                         err_out = "baked .rwobj load failed: " + file_name;
                         return false;
                     }
+                } else if (ext == ".rwchar") {
+                    // Native skinned character: one DrawableData built from
+                    // the baked group (hierarchy + skinned .rwgeo + .rwanim).
+                    state->data = loadRwCharacter(device, file_name);
+                    if (!state->data) {
+                        err_out = "baked .rwchar load failed: " + file_name;
+                        return false;
+                    }
                 } else {
                     err_out = "unsupported mesh extension: " + ext;
                     return false;
@@ -6793,6 +6801,491 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
               << num_sections << " section(s), "
               << md.textures.size() << " texture(s))" << std::endl;
 
+    return drawable_object;
+}
+
+// ─── loadRwCharacter ───────────────────────────────────────────────────────
+// Builds ONE skinned DrawableData from a baked character group (see the
+// header doc).  Mirrors loadRwObjModel for geometry/material/texture and the
+// glTF loader's setupNodes/setupSkins/setupAnimation for the rig — all sourced
+// from raw data so no source model is needed at runtime.  Flows through the
+// same Phase-3 (updateDescriptorSets builds skin sets from skins_; pipeline
+// creation selects "_SKIN" from tag_.has_skin_set_0).
+std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::string& input_filename) {
+    namespace fs = std::filesystem;
+
+    const fs::path manifest(input_filename);
+    const fs::path group_dir = manifest.parent_path();
+    const std::string ref_name = manifest.stem().string();
+
+    // ── Skeleton ──────────────────────────────────────────────────────
+    std::vector<helper::RwHierNode> hier;
+    if (!helper::loadRwHier((group_dir / "hierarchy.rwhier").string(), hier) ||
+        hier.empty()) {
+        std::cout << "[rwchar] missing/empty hierarchy for '" << ref_name
+                  << "'" << std::endl;
+        return nullptr;
+    }
+
+    // ── Baked objects: mesh_ordinal → objects/NNN_*.rwgeo ─────────────
+    std::vector<std::pair<int, std::string>> ordinal_geo;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(group_dir / "objects", ec)) {
+        if (e.path().extension() != ".rwgeo") continue;
+        int ord = -1;
+        if (std::sscanf(e.path().filename().string().c_str(), "%d_", &ord)
+                == 1 && ord >= 0)
+            ordinal_geo.emplace_back(ord, e.path().string());
+    }
+    if (ordinal_geo.empty()) {
+        std::cout << "[rwchar] no baked objects for '" << ref_name << "'"
+                  << std::endl;
+        return nullptr;
+    }
+    std::sort(ordinal_geo.begin(), ordinal_geo.end());
+
+    auto drawable_object = std::make_shared<ego::DrawableData>(device);
+    drawable_object->m_use_local_matrix_only_ = false;
+
+    // Decompose a node-local matrix into TRS so animation channels (which set
+    // translation_/rotation_/scale_) compose cleanly; matrix_ stays identity.
+    auto decomposeTRS = [](const glm::mat4& m, glm::vec3& t, glm::quat& r,
+                           glm::vec3& s) {
+        t = glm::vec3(m[3]);
+        const glm::vec3 c0(m[0]), c1(m[1]), c2(m[2]);
+        s = glm::vec3(glm::length(c0), glm::length(c1), glm::length(c2));
+        const glm::mat3 rot(
+            s.x > 1e-8f ? glm::vec3(c0 / s.x) : glm::vec3(1, 0, 0),
+            s.y > 1e-8f ? glm::vec3(c1 / s.y) : glm::vec3(0, 1, 0),
+            s.z > 1e-8f ? glm::vec3(c2 / s.z) : glm::vec3(0, 0, 1));
+        r = glm::quat_cast(rot);
+    };
+
+    drawable_object->nodes_.resize(hier.size());
+    for (size_t i = 0; i < hier.size(); ++i) {
+        auto& n = drawable_object->nodes_[i];
+        n.name_ = hier[i].name;
+        n.parent_idx_ = hier[i].parent;
+        n.matrix_ = glm::mat4(1.0f);
+        decomposeTRS(hier[i].local, n.translation_, n.rotation_, n.scale_);
+    }
+    std::vector<int32_t> roots;
+    for (size_t i = 0; i < hier.size(); ++i) {
+        const int p = hier[i].parent;
+        if (p >= 0 && p < (int)hier.size())
+            drawable_object->nodes_[p].child_idx_.push_back((int32_t)i);
+        else
+            roots.push_back((int32_t)i);
+    }
+    drawable_object->scenes_.resize(1);
+    drawable_object->scenes_[0].nodes_ = roots;
+    drawable_object->default_scene_ = 0;
+
+    // Per-character VT texture cache (canonical .rwtex path → TextureInfo).
+    std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
+
+    for (const auto& [ordinal, geo_path] : ordinal_geo) {
+        int owner_node = -1;
+        for (size_t i = 0; i < hier.size(); ++i)
+            if (hier[i].mesh_ordinal == ordinal) { owner_node = (int)i; break; }
+
+        helper::ModelPreviewData md;
+        std::vector<std::string> tex_paths;
+        if (!helper::loadRwGeo(geo_path, md, &tex_paths,
+                               /*decode_textures=*/false) ||
+            md.positions.empty() || md.indices.empty() || md.sections.empty())
+            continue;
+        helper::dedupModelVertices(md);
+
+        const uint32_t vtx_count   = (uint32_t)md.positions.size();
+        const uint32_t index_count = (uint32_t)md.indices.size();
+        const bool skinned =
+            md.joints.size()  == md.positions.size() &&
+            md.weights.size() == md.positions.size() &&
+            !md.skin_joint_nodes.empty();
+
+        // CPU interleaved vertex buffer (pos/normal/uv).
+        helper::Mesh cpu_mesh;
+        cpu_mesh.vertex_data_ptr->resize(vtx_count);
+        for (uint32_t i = 0; i < vtx_count; ++i) {
+            auto& v = cpu_mesh.vertex_data_ptr->at(i);
+            v.position = md.positions[i];
+            v.normal = i < md.normals.size() ? md.normals[i]
+                                             : glm::vec3(0, 1, 0);
+            v.uv = i < md.uvs.size() ? md.uvs[i] : glm::vec2(0);
+        }
+        cpu_mesh.faces_ptr->reserve(index_count / 3);
+        for (uint32_t i = 0; i + 2 < index_count; i += 3)
+            cpu_mesh.faces_ptr->emplace_back(
+                md.indices[i], md.indices[i + 1], md.indices[i + 2]);
+
+        // GPU buffers for this object (vertex + index [+ joints + weights]).
+        const int vbuf = (int)drawable_object->buffers_.size();
+        drawable_object->buffers_.emplace_back();   // vertex
+        drawable_object->buffers_.emplace_back();   // index
+        renderer::Helper::createBuffer(
+            device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+            drawable_object->buffers_[vbuf].buffer,
+            drawable_object->buffers_[vbuf].memory,
+            std::source_location::current(),
+            vtx_count * sizeof(helper::VertexStruct),
+            cpu_mesh.vertex_data_ptr->data());
+
+        const bool use_16 = vtx_count < 65536;
+        const uint32_t ibytes = use_16 ? 2u : 4u;
+        const auto itype = use_16 ? renderer::IndexType::UINT16
+                                  : renderer::IndexType::UINT32;
+        if (use_16) {
+            std::vector<uint16_t> idx16(index_count);
+            for (uint32_t i = 0; i < index_count; ++i)
+                idx16[i] = (uint16_t)md.indices[i];
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[vbuf + 1].buffer,
+                drawable_object->buffers_[vbuf + 1].memory,
+                std::source_location::current(), idx16.size() * 2,
+                idx16.data());
+        } else {
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[vbuf + 1].buffer,
+                drawable_object->buffers_[vbuf + 1].memory,
+                std::source_location::current(), md.indices.size() * 4,
+                md.indices.data());
+        }
+
+        int jbuf = -1, wbuf = -1;
+        if (skinned) {
+            jbuf = (int)drawable_object->buffers_.size();
+            drawable_object->buffers_.emplace_back();   // joints
+            drawable_object->buffers_.emplace_back();   // weights
+            wbuf = jbuf + 1;
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[jbuf].buffer,
+                drawable_object->buffers_[jbuf].memory,
+                std::source_location::current(),
+                md.joints.size() * sizeof(glm::u16vec4), md.joints.data());
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[wbuf].buffer,
+                drawable_object->buffers_[wbuf].memory,
+                std::source_location::current(),
+                md.weights.size() * sizeof(glm::vec4), md.weights.data());
+        }
+
+        // Buffer views.
+        const int vbase = (int)drawable_object->buffer_views_.size();
+        drawable_object->buffer_views_.resize(vbase + (skinned ? 6 : 4));
+        const int pos_v = vbase + 0, nrm_v = vbase + 1, uv_v = vbase + 2,
+                  idx_v = vbase + 3, jnt_v = vbase + 4, wgt_v = vbase + 5;
+        {
+            auto& pv = drawable_object->buffer_views_[pos_v];
+            pv.buffer_idx = vbuf; pv.offset = 0;
+            pv.range = vtx_count * sizeof(helper::VertexStruct);
+            pv.stride = sizeof(helper::VertexStruct);
+            drawable_object->buffer_views_[nrm_v] = pv;
+            drawable_object->buffer_views_[nrm_v].offset = sizeof(glm::vec3);
+            drawable_object->buffer_views_[uv_v] = pv;
+            drawable_object->buffer_views_[uv_v].offset = 2 * sizeof(glm::vec3);
+            auto& iv = drawable_object->buffer_views_[idx_v];
+            iv.buffer_idx = vbuf + 1; iv.offset = 0;
+            iv.range = index_count * ibytes; iv.stride = ibytes;
+            if (skinned) {
+                auto& jv = drawable_object->buffer_views_[jnt_v];
+                jv.buffer_idx = jbuf; jv.offset = 0;
+                jv.range = vtx_count * sizeof(glm::u16vec4);
+                jv.stride = sizeof(glm::u16vec4);
+                auto& wv = drawable_object->buffer_views_[wgt_v];
+                wv.buffer_idx = wbuf; wv.offset = 0;
+                wv.range = vtx_count * sizeof(glm::vec4);
+                wv.stride = sizeof(glm::vec4);
+            }
+        }
+
+        // Skin (one per skinned object); joints_ index into nodes_ directly
+        // because skin_joint_nodes were baked as hierarchy.rwhier indices.
+        int skin_index = -1;
+        if (skinned) {
+            skin_index = (int)drawable_object->skins_.size();
+            drawable_object->skins_.emplace_back();
+            auto& sk = drawable_object->skins_.back();
+            sk.name_ = ref_name + "_skin";
+            sk.skeleton_root_ = -1;
+            sk.joints_.assign(md.skin_joint_nodes.begin(),
+                              md.skin_joint_nodes.end());
+            sk.inverse_bind_matrices_ = md.skin_inverse_bind;
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0, sk.joints_buffer_.buffer, sk.joints_buffer_.memory,
+                std::source_location::current(),
+                sk.inverse_bind_matrices_.size() * sizeof(glm::mat4),
+                sk.inverse_bind_matrices_.data());
+        }
+
+        // Textures (VT-only) with global indices.
+        const size_t tex_base = drawable_object->textures_.size();
+        drawable_object->textures_.resize(tex_base + md.textures.size());
+        for (size_t ti = 0; ti < md.textures.size() && ti < tex_paths.size();
+             ++ti) {
+            auto& dst = drawable_object->textures_[tex_base + ti];
+            std::string key = fs::path(tex_paths[ti])
+                                  .lexically_normal().generic_string();
+            for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+            auto cit = tex_gpu_cache.find(key);
+            if (cit != tex_gpu_cache.end()) { dst = cit->second; continue; }
+            helper::RwTexBaked tb;
+            if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
+                tb.w <= 0 || tb.h <= 0)
+                continue;
+            dst.size = glm::uvec3((uint32_t)tb.w, (uint32_t)tb.h, 1u);
+            dst.linear = false;
+            dst.source_filename_ = tex_paths[ti];
+            dst.vt_bc7_tiles = tb.bc7_tiles;
+            if (!dst.vt_bc7_tiles && tb.preview_w == tb.w &&
+                tb.preview_h == tb.h && !tb.preview_rgba.empty())
+                dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
+                    tb.preview_rgba.begin(), tb.preview_rgba.end());
+            tex_gpu_cache.emplace(key, dst);
+        }
+
+        // Materials (one per section), global texture indices.
+        const size_t mat_base = drawable_object->materials_.size();
+        drawable_object->materials_.resize(mat_base + md.sections.size());
+        for (size_t si = 0; si < md.sections.size(); ++si) {
+            const auto& sec = md.sections[si];
+            auto& mat = drawable_object->materials_[mat_base + si];
+            mat.name_ = ref_name + "_o" + std::to_string(ordinal) + "_s" +
+                        std::to_string(si);
+            if (sec.tex_index >= 0)
+                mat.base_color_idx_ = (int)tex_base + sec.tex_index;
+            if (sec.nrm_index >= 0)
+                mat.normal_idx_ = (int)tex_base + sec.nrm_index;
+            if (sec.mr_index >= 0)
+                mat.metallic_roughness_idx_ = (int)tex_base + sec.mr_index;
+            mat.alpha_cutoff_ = 0.1f;
+            mat.alpha_mask_ = true;
+            mat.alpha_mode_ = ego::AlphaMode::Mask;
+            device->createBuffer(
+                sizeof(glsl::PbrMaterialParams),
+                SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0, mat.uniform_buffer_.buffer, mat.uniform_buffer_.memory,
+                std::source_location::current());
+            glsl::PbrMaterialParams ubo{};
+            ubo.base_color_factor = sec.base_color;
+            ubo.specular_factor = glm::vec3(1.0f);
+            ubo.specular_color = glm::vec3(1.0f);
+            ubo.glossiness_factor = 1.0f;
+            ubo.metallic_roughness_specular_factor = 1.0f;
+            ubo.metallic_factor = sec.metallic;
+            ubo.roughness_factor = sec.roughness;
+            ubo.alpha_cutoff = 0.1f;
+            ubo.mip_count = 11;
+            ubo.normal_scale = 1.0f;
+            ubo.uv_set_flags = glm::vec4(0.0f);
+            ubo.exposure = 1.0f;
+            ubo.occlusion_strength = 1.0f;
+            ubo.tonemap_type = TONEMAP_DEFAULT;
+            ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+            ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+            device->updateBufferMemory(mat.uniform_buffer_.memory,
+                                       sizeof(ubo), &ubo);
+        }
+
+        // Mesh + primitives.
+        const int mesh_index = (int)drawable_object->meshes_.size();
+        drawable_object->meshes_.emplace_back();
+        auto& mesh = drawable_object->meshes_[mesh_index];
+        for (const auto& p : md.positions) {
+            mesh.bbox_min_ = glm::min(mesh.bbox_min_, p);
+            mesh.bbox_max_ = glm::max(mesh.bbox_max_, p);
+        }
+        mesh.vertex_position_ = std::make_shared<std::vector<glm::vec3>>(
+            md.positions.begin(), md.positions.end());
+        mesh.primitives_.resize(md.sections.size());
+        for (size_t si = 0; si < md.sections.size(); ++si) {
+            const auto& sec = md.sections[si];
+            auto& prim = mesh.primitives_[si];
+            prim.tag_.restart_enable = false;
+            prim.material_idx_ = (int32_t)(mat_base + si);
+            prim.tag_.topology =
+                (uint32_t)renderer::PrimitiveTopology::TRIANGLE_LIST;
+            prim.tag_.has_texcoord_0 = true;
+            prim.tag_.has_normal = true;
+            prim.tag_.double_sided = false;
+            prim.tag_.has_skin_set_0 = skinned;
+
+            uint32_t b = 0;
+            renderer::VertexInputBindingDescription bd = {};
+            renderer::VertexInputAttributeDescription ad = {};
+            bd.input_rate = renderer::VertexInputRate::VERTEX;
+            // position
+            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            prim.binding_descs_.push_back(bd);
+            ad.buffer_view = pos_v; ad.binding = b; ad.offset = 0;
+            ad.buffer_offset = 0; ad.location = VINPUT_POSITION;
+            ad.format = renderer::Format::R32G32B32_SFLOAT;
+            prim.attribute_descs_.push_back(ad); ++b;
+            // normal
+            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            prim.binding_descs_.push_back(bd);
+            ad.buffer_view = nrm_v; ad.binding = b; ad.offset = 0;
+            ad.buffer_offset = sizeof(glm::vec3); ad.location = VINPUT_NORMAL;
+            ad.format = renderer::Format::R32G32B32_SFLOAT;
+            prim.attribute_descs_.push_back(ad); ++b;
+            // uv
+            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            prim.binding_descs_.push_back(bd);
+            ad.buffer_view = uv_v; ad.binding = b; ad.offset = 0;
+            ad.buffer_offset = 2 * sizeof(glm::vec3);
+            ad.location = VINPUT_TEXCOORD0;
+            ad.format = renderer::Format::R32G32_SFLOAT;
+            prim.attribute_descs_.push_back(ad); ++b;
+            if (skinned) {
+                // joints (u16vec4 → R16G16B16A16_UINT)
+                bd.binding = b; bd.stride = sizeof(glm::u16vec4);
+                prim.binding_descs_.push_back(bd);
+                ad.buffer_view = jnt_v; ad.binding = b; ad.offset = 0;
+                ad.buffer_offset = 0; ad.location = VINPUT_JOINTS_0;
+                ad.format = renderer::Format::R16G16B16A16_UINT;
+                prim.attribute_descs_.push_back(ad); ++b;
+                // weights (vec4 → R32G32B32A32_SFLOAT)
+                bd.binding = b; bd.stride = sizeof(glm::vec4);
+                prim.binding_descs_.push_back(bd);
+                ad.buffer_view = wgt_v; ad.binding = b; ad.offset = 0;
+                ad.buffer_offset = 0; ad.location = VINPUT_WEIGHTS_0;
+                ad.format = renderer::Format::R32G32B32A32_SFLOAT;
+                prim.attribute_descs_.push_back(ad); ++b;
+            }
+
+            prim.index_desc_.resize(helper::c_num_lods + 1);
+            for (uint32_t l = 0; l < helper::c_num_lods + 1; ++l) {
+                prim.index_desc_[l].buffer_view = idx_v;
+                prim.index_desc_[l].offset = sec.first_index * ibytes;
+                prim.index_desc_[l].index_type = itype;
+                prim.index_desc_[l].index_count = sec.index_count;
+            }
+            glm::vec3 pmin(std::numeric_limits<float>::max());
+            glm::vec3 pmax(std::numeric_limits<float>::lowest());
+            const uint32_t se =
+                std::min(sec.first_index + sec.index_count, index_count);
+            for (uint32_t ii = sec.first_index; ii < se; ++ii) {
+                const uint32_t vi = md.indices[ii];
+                if (vi < vtx_count) {
+                    pmin = glm::min(pmin, md.positions[vi]);
+                    pmax = glm::max(pmax, md.positions[vi]);
+                }
+            }
+            prim.bbox_min_ = pmin; prim.bbox_max_ = pmax;
+            prim.generateHash();
+        }
+
+        if (owner_node >= 0) {
+            drawable_object->nodes_[owner_node].mesh_idx_ = mesh_index;
+            drawable_object->nodes_[owner_node].skin_idx_ = skin_index;
+        }
+    }
+
+    if (drawable_object->meshes_.empty()) return nullptr;
+
+    // ── Animations from animation.rwanim → AnimChannelInfo samples ────
+    {
+        std::vector<helper::RwAnimClip> clips;
+        if (helper::loadRwAnim((group_dir / "animation.rwanim").string(),
+                               clips) && !clips.empty()) {
+            drawable_object->animations_.resize(clips.size());
+            for (size_t ci = 0; ci < clips.size(); ++ci) {
+                auto& dst = drawable_object->animations_[ci];
+                for (const auto& ch : clips[ci].channels) {
+                    auto info = std::make_shared<ego::AnimChannelInfo>();
+                    info->node_idx_ = (uint32_t)ch.node;
+                    switch (ch.path) {
+                    case helper::RwAnimPath::kTranslation:
+                        info->type_ = ego::AnimChannelInfo::kTranslation;
+                        break;
+                    case helper::RwAnimPath::kScale:
+                        info->type_ = ego::AnimChannelInfo::kScale;
+                        break;
+                    case helper::RwAnimPath::kRotation:
+                    default:
+                        info->type_ = ego::AnimChannelInfo::kRotation;
+                        break;
+                    }
+                    info->samples_.reserve(ch.times.size());
+                    for (size_t k = 0; k < ch.times.size() &&
+                                       k < ch.values.size(); ++k)
+                        info->samples_.emplace_back(ch.times[k], ch.values[k]);
+                    dst.channels_.push_back(std::move(info));
+                }
+            }
+        }
+    }
+
+    // Scene bbox.
+    for (auto& scene : drawable_object->scenes_) {
+        scene.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
+        scene.bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
+        for (auto root : scene.nodes_)
+            calculateBbox(drawable_object, root, glm::mat4(1.0f),
+                          scene.bbox_min_, scene.bbox_max_);
+    }
+
+    // Bind-pose hierarchy + first joint upload (skins_ gate runs updateJoints).
+    drawable_object->update(device, 0, 0.0f, /*use_local_matrix_only=*/false);
+    setupRaytracing(drawable_object);
+
+    // ── Indirect draw buffer (same as the other native loaders) ───────
+    uint32_t num_prims = 0;
+    for (auto& mesh : drawable_object->meshes_)
+        for (auto& prim : mesh.primitives_) {
+            prim.indirect_draw_cmd_ofs_ =
+                num_prims * sizeof(renderer::DrawIndexedIndirectCommand) +
+                INDIRECT_DRAW_BUF_OFS;
+            num_prims++;
+        }
+    std::vector<uint32_t> idc(
+        sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) *
+            num_prims + 1);
+    auto* cmds = reinterpret_cast<renderer::DrawIndexedIndirectCommand*>(
+        idc.data() + 1);
+    idc[0] = 0;
+    uint32_t pi = 0;
+    for (const auto& mesh : drawable_object->meshes_)
+        for (const auto& prim : mesh.primitives_) {
+            cmds[pi].first_index = 0;
+            cmds[pi].first_instance = 0;
+            cmds[pi].index_count = (uint32_t)prim.index_desc_[0].index_count;
+            cmds[pi].instance_count = 0;
+            cmds[pi].vertex_offset = 0;
+            pi++;
+        }
+    renderer::Helper::createBuffer(
+        device,
+        SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT, STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+        drawable_object->indirect_draw_cmd_.buffer,
+        drawable_object->indirect_draw_cmd_.memory,
+        std::source_location::current(),
+        idc.size() * sizeof(uint32_t), idc.data());
+    drawable_object->num_prims_ = num_prims;
+
+    std::cout << "[rwchar] loaded '" << ref_name << "' ("
+              << drawable_object->nodes_.size() << " nodes, "
+              << drawable_object->meshes_.size() << " mesh(es), "
+              << drawable_object->skins_.size() << " skin(s), "
+              << drawable_object->animations_.size() << " clip(s))"
+              << std::endl;
     return drawable_object;
 }
 

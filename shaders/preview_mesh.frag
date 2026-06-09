@@ -103,11 +103,38 @@ void main() {
     const float r      = max(params.center_radius.w, 1e-4);
     const vec3  cam    = params.camera_pos.xyz;
     float metallic  = params.pbr_params.x;
-    float roughness = clamp(params.pbr_params.y, 0.03, 1.0);
+    // Floor roughness fairly high for the inspection preview: a near-mirror
+    // floor (0.03) turns noisy mesh normals into pinpoint specular sparkle.
+    float roughness = clamp(params.pbr_params.y, 0.20, 1.0);
     const float has_uv    = params.pbr_params.z;
     const int   map_flags = int(params.pbr_params.w + 0.5);
     const bool  has_nrm_map = (map_flags & 1) != 0;
     const bool  has_mr_map  = (map_flags & 2) != 0;
+
+    // Weight-debug mode (bit2): the editor packs a per-vertex weight into
+    // v_uv.x and turns the textured/PBR display OFF — render the mesh flat,
+    // coloured by that weight (jet ramp).  Used by the bone/weight inspector.
+    if ((map_flags & 4) != 0) {
+        float wt = clamp(v_uv.x, 0.0, 1.0);
+        vec3 heat = clamp(vec3(1.5 - abs(4.0 * wt - 3.0),
+                               1.5 - abs(4.0 * wt - 2.0),
+                               1.5 - abs(4.0 * wt - 1.0)), 0.0, 1.0);
+        if (wt <= 0.001) heat = vec3(0.12);   // unweighted → dark grey
+        outColor = vec4(heat, 1.0);
+        return;
+    }
+
+    // Segmentation mode (bit3): v_uv.x carries the dominant bone/joint index;
+    // map it to a distinct hue (golden-ratio spacing) so each body part /
+    // segment reads as its own flat colour.
+    if ((map_flags & 8) != 0) {
+        float h = fract(v_uv.x * 0.6180339887);          // distinct hue per idx
+        vec3  K = mod(vec3(5.0, 3.0, 1.0) + h * 6.0, 6.0);
+        vec3  c = vec3(0.95) - 0.95 * 0.65 *
+                  clamp(min(K, 4.0 - K), 0.0, 1.0);        // HSV(h,0.65,0.95)
+        outColor = vec4(c, 1.0);
+        return;
+    }
 
     // Base colour: texture (authored sRGB → linearise) x factor.
     vec3 albedo = params.base_color_factor.rgb;
@@ -123,11 +150,19 @@ void main() {
     // multiplies the per-section factors.
     if (has_uv > 0.5 && has_mr_map) {
         vec3 mr = texture(metal_rough_tex, v_uv).rgb;
-        roughness = clamp(roughness * mr.g, 0.03, 1.0);
+        roughness = clamp(roughness * mr.g, 0.20, 1.0);
         metallic  = clamp(metallic * mr.b, 0.0, 1.0);
     }
 
-    vec3 N = normalize(v_normal);
+    // Guard degenerate normals (the baked mesh has some near-zero / garbage
+    // normals; normalize() would yield a wild direction → blown-out specular
+    // "fireflies").  Fall back to the geometric face normal in that case.
+    vec3 N = v_normal;
+    {
+        float nl = length(N);
+        if (nl > 1e-3) N /= nl;
+        else N = normalize(cross(dFdx(v_world), dFdy(v_world)));
+    }
     vec3 V = normalize(cam - v_world);
 
     // Normal mapping — TBN from screen-space derivatives (the preview
