@@ -96,6 +96,9 @@ union PrimitiveHashTag {
         uint32_t                has_skin_set_0 : 1;
         uint32_t                restart_enable : 1;
         uint32_t                double_sided : 1;
+        // 8-bone skinning debug: JOINTS_1/WEIGHTS_1 streams present
+        // (implies has_skin_set_0; selects the _SKIN8 shader permutations).
+        uint32_t                has_skin_set_1 : 1;
         uint32_t                topology : 16;
     };
 };
@@ -464,6 +467,14 @@ class DrawableObject {
     // exactly as before.
     bool                        visible_ = true;
 
+    // PlayerController (external code) owns this wrapper's WORLD
+    // placement.  While set, the ECS RenderSystem must NOT push the
+    // scene-authored transform into the instance root each frame — the
+    // controller drives the rig through the root node and the two would
+    // double-transform / fight.  Set when the editor's scene player is
+    // adopted for play mode; cleared on scene unload.
+    bool                        controller_driven_ = false;
+
     // ── Per-wrapper "render only ONE sub-object" filter ────────────────
     // Set via setOnlyRenderSubObject(ordinal) where `ordinal` is the k-th
     // renderable (mesh) node — the same enumeration the Outliner children
@@ -656,6 +667,10 @@ public:
     // -> existing behaviour.
     void setVisible(bool v) { visible_ = v; }
     bool isVisible() const  { return visible_; }
+
+    // External-controller transform ownership — see controller_driven_.
+    void setControllerDriven(bool v) { controller_driven_ = v; }
+    bool isControllerDriven() const  { return controller_driven_; }
 
     // Restrict rendering to the `ordinal`-th renderable sub-object (the
     // k-th node with a mesh — the same order the Outliner children and the

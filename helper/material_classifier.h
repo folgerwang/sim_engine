@@ -132,6 +132,24 @@ public:
     // run the substring fallback for everything.
     bool wasRun() const { return was_run_; }
 
+    // Clear ALL collected names and classified verdicts so the next
+    // collect()/classifyAll() cycle starts from scratch (scene re-load
+    // or a re-bake).  NOT safe to call while classifyAll() is running
+    // on a worker thread — callers must ensure any in-flight future has
+    // been consumed first.
+    void reset() {
+        mat_collected_.clear();
+        obj_collected_.clear();
+        {
+            std::lock_guard<std::mutex> lock(classified_mu_);
+            mat_classified_.clear();
+            obj_classified_.clear();
+        }
+        mat_classified_count_.store(0, std::memory_order_release);
+        obj_classified_count_.store(0, std::memory_order_release);
+        was_run_ = false;
+    }
+
     // Live progress (worker-thread-published, main-thread-readable).
     // Use these for a UI progress bar — neither has happens-before
     // requirements with anything else, so the underlying atomics

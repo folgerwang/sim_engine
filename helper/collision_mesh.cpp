@@ -658,7 +658,8 @@ bool CollisionMesh::buildFromDrawablePrimitive(
     bool build_bvh,
     CollisionShape shape,
     float weld_eps,
-    float voxel_size) {
+    float voxel_size,
+    const glm::mat4& root_transform) {
 
     // Throttled diagnostic for each silent-drop reason.  Coverage
     // gaps in the collision overlay almost always come from one of
@@ -726,11 +727,12 @@ bool CollisionMesh::buildFromDrawablePrimitive(
 
     // First node referencing this mesh wins -- bakes parent
     // hierarchy into vertices_ so the per-draw model transform
-    // stays identity.
-    glm::mat4 xform(1.0f);
+    // stays identity.  root_transform (the editor placement / instance
+    // root) is composed on top so placed objects land in WORLD space.
+    glm::mat4 xform = root_transform;
     for (const auto& node : data.nodes_) {
         if (node.mesh_idx_ == static_cast<int32_t>(mesh_idx)) {
-            xform = node.cached_matrix_;
+            xform = root_transform * node.cached_matrix_;
             // Capture the node's name on the same pass we use for
             // the world transform.  Downstream classifiers (the AI
             // path in particular) get a SECOND identifier to look up
@@ -1760,6 +1762,89 @@ void CollisionWorld::waitForBVHs() {
         bvh_builder_thread_.join();
     }
     bvh_build_in_flight_.store(false);
+}
+
+// ── Bake support (.rwcmap collision-map files) ──────────────────────────
+namespace {
+
+template <typename T>
+void cmWrPod(std::ofstream& os, const T& v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+template <typename T>
+bool cmRdPod(std::ifstream& is, T& v) {
+    return static_cast<bool>(is.read(reinterpret_cast<char*>(&v), sizeof(T)));
+}
+void cmWrStr(std::ofstream& os, const std::string& s) {
+    const uint32_t n = (uint32_t)s.size();
+    cmWrPod(os, n);
+    if (n) os.write(s.data(), (std::streamsize)n);
+}
+bool cmRdStr(std::ifstream& is, std::string& s) {
+    uint32_t n = 0;
+    if (!cmRdPod(is, n) || n > (1u << 20)) return false;   // 1 MB name cap
+    s.resize(n);
+    if (n) return static_cast<bool>(is.read(&s[0], (std::streamsize)n));
+    return true;
+}
+
+} // namespace
+
+void CollisionMesh::serialize(std::ofstream& os) const {
+    cmWrStr(os, object_name_);
+    cmWrStr(os, material_name_);
+    cmWrPod(os, (uint32_t)category_);
+    cmWrPod(os, (uint64_t)orig_tri_count_);
+    cmWrPod(os, (uint64_t)src_mesh_idx_);
+    cmWrPod(os, (uint64_t)src_prim_idx_);
+    cmWrPod(os, (uint32_t)vertices_.size());
+    cmWrPod(os, (uint32_t)indices_.size());
+    if (!vertices_.empty())
+        os.write(reinterpret_cast<const char*>(vertices_.data()),
+                 (std::streamsize)(vertices_.size() * sizeof(glm::vec3)));
+    if (!indices_.empty())
+        os.write(reinterpret_cast<const char*>(indices_.data()),
+                 (std::streamsize)(indices_.size() * sizeof(int)));
+}
+
+bool CollisionMesh::deserialize(std::ifstream& is) {
+    uint32_t cat = 0, vc = 0, ic = 0;
+    uint64_t otc = 0, smi = 0, spi = 0;
+    if (!cmRdStr(is, object_name_)) return false;
+    if (!cmRdStr(is, material_name_)) return false;
+    if (!cmRdPod(is, cat)) return false;
+    if (!cmRdPod(is, otc)) return false;
+    if (!cmRdPod(is, smi)) return false;
+    if (!cmRdPod(is, spi)) return false;
+    if (!cmRdPod(is, vc) || !cmRdPod(is, ic)) return false;
+    // Sanity caps against corrupt files (50M verts / 150M indices).
+    if (vc > 50'000'000u || ic > 150'000'000u || ic % 3 != 0) return false;
+    category_       = (cat <= (uint32_t)MeshCategory::Ladder)
+                        ? (MeshCategory)cat : MeshCategory::Unknown;
+    orig_tri_count_ = (size_t)otc;
+    src_mesh_idx_   = (size_t)smi;
+    src_prim_idx_   = (size_t)spi;
+    src_drawable_   = nullptr;            // session-local; not serialized
+    vertices_.resize(vc);
+    indices_.resize(ic);
+    if (vc && !is.read(reinterpret_cast<char*>(vertices_.data()),
+                       (std::streamsize)(vc * sizeof(glm::vec3))))
+        return false;
+    if (ic && !is.read(reinterpret_cast<char*>(indices_.data()),
+                       (std::streamsize)(ic * sizeof(int))))
+        return false;
+    // Validate indices and recompute bounds; BVH stays unbuilt (the
+    // caller kicks CollisionWorld::buildBVHsAsync after loading).
+    for (int idx : indices_)
+        if (idx < 0 || (uint32_t)idx >= vc) return false;
+    bounds_ = AABB();
+    for (const auto& v : vertices_) {
+        bounds_.min_bounds = glm::min(bounds_.min_bounds, v);
+        bounds_.max_bounds = glm::max(bounds_.max_bounds, v);
+    }
+    bvh_root_.reset();
+    bvh_ready_.store(false, std::memory_order_release);
+    return true;
 }
 
 } // namespace helper

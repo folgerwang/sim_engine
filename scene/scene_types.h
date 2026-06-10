@@ -72,6 +72,14 @@ struct Scene {
     // active.  Empty = no scene music.  Serialized from format v2 on.
     std::string         music_path;
     float               music_volume = 1.0f;
+
+    // Baked walkable-collision map (.rwcmap under content/maps) this scene
+    // references.  When set and the file exists, scene load restores the
+    // collision world from it directly — the player can spawn and walk
+    // (WASD) immediately, without waiting for the runtime LLM-classifier
+    // collision build.  Empty = no bake; runtime build as usual.
+    // Serialized from format v4 on.
+    std::string         collision_map_path;
 };
 
 } // namespace scene

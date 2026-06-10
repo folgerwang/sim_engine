@@ -74,7 +74,9 @@ const char     kMagic[8] = { 'R', 'W', 'S', 'C', 'E', 'N', 'E', '\0' };
 // v2: + music_path (string) + music_volume (float32) after the object list.
 // v3: + per-object audio_clip (string) + audio_loop (u8) + audio_volume (f32)
 //     in each object record (after its transform) — BGM objects.
-const uint32_t kVersion  = 3;
+// v4: + collision_map_path (string) after the music trailer — baked
+//     walkable-collision map (.rwcmap) reference.
+const uint32_t kVersion  = 4;
 
 } // namespace
 
@@ -107,6 +109,9 @@ bool saveSceneBinary(const std::string& path, const Scene& scene) {
     // v2 trailer: scene music.
     writeStr(os, scene.music_path);
     writePod(os, scene.music_volume);
+
+    // v4 trailer: baked collision-map reference.
+    writeStr(os, scene.collision_map_path);
 
     return static_cast<bool>(os);
 }
@@ -194,6 +199,13 @@ bool loadSceneBinary(const std::string& path, Scene& out_scene) {
             return false;
         }
         if (!readPod(is, s.music_volume)) {
+            return false;
+        }
+    }
+
+    // v4 trailer: baked collision-map reference (absent before v4).
+    if (version >= 4) {
+        if (!readStr(is, s.collision_map_path)) {
             return false;
         }
     }

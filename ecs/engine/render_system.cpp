@@ -25,12 +25,18 @@ RenderSystem::gather(entt::registry& reg) {
 
         // Sync world transform from ECS -> drawable (covers parent moves and
         // editor edits; streamed loads already set it on attach).
-        if (const auto* wt = reg.try_get<WorldTransform>(e)) {
-            glm::vec3 t, s, skew;
-            glm::quat q;
-            glm::vec4 persp;
-            if (glm::decompose(wt->matrix, s, q, t, skew, persp)) {
-                r.drawable->setInstanceRootTransform(t, glm::normalize(q), s);
+        // EXCEPTION: controller-driven drawables (the adopted scene player
+        // in play mode) own their world placement via PlayerController's
+        // root-node writes — pushing the authored scene transform on top
+        // would double-transform the rig.  Still rendered, just not synced.
+        if (!r.drawable->isControllerDriven()) {
+            if (const auto* wt = reg.try_get<WorldTransform>(e)) {
+                glm::vec3 t, s, skew;
+                glm::quat q;
+                glm::vec4 persp;
+                if (glm::decompose(wt->matrix, s, q, t, skew, persp)) {
+                    r.drawable->setInstanceRootTransform(t, glm::normalize(q), s);
+                }
             }
         }
         out.push_back(r.drawable);

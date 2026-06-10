@@ -64,6 +64,12 @@ struct ModelPreviewData {
     // _CLOSENESS_0).  Parallel to weights when present; empty otherwise.  Used by
     // the debug display so it renders the baked distance, not a runtime recompute.
     std::vector<glm::vec4>      closeness;
+    // ── 8-bone skinning debug path: second skin set (influences 4..7) ──
+    // glTF JOINTS_1/WEIGHTS_1/_CLOSENESS_1.  Parallel to joints/weights/
+    // closeness when present; empty otherwise (4-bone legacy assets).
+    std::vector<glm::u16vec4>   joints1;
+    std::vector<glm::vec4>      weights1;
+    std::vector<glm::vec4>      closeness1;
     // Skin table: per joint, the node it binds to (index into the
     // group's hierarchy.rwhier node array — glTF node order) and the
     // inverse bind matrix.  Together with joints/weights this is the

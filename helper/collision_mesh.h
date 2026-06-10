@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <iosfwd>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -141,6 +142,12 @@ public:
     // detail but multiply triangle count cubically. The total grid
     // size is capped internally so a single oversized primitive
     // can't blow up memory.
+    //
+    // root_transform: extra world transform composed ON TOP of the
+    // node's cached matrix (root * node).  Pass the editor placement
+    // (DrawableObject's instance-root TRS) so scene objects placed at
+    // arbitrary positions bake collision in WORLD space; identity
+    // preserves the old behaviour for level meshes loaded at origin.
     bool buildFromDrawablePrimitive(
         const game_object::DrawableObject& drawable,
         size_t mesh_idx,
@@ -148,7 +155,8 @@ public:
         bool build_bvh = true,
         CollisionShape shape = CollisionShape::Decimate,
         float weld_eps = 0.1f,
-        float voxel_size = 0.05f);
+        float voxel_size = 0.05f,
+        const glm::mat4& root_transform = glm::mat4(1.0f));
 
     const std::string& materialName() const { return material_name_; }
 
@@ -257,6 +265,16 @@ public:
 
     bool empty() const { return indices_.empty(); }
     size_t triangleCount() const { return indices_.size() / 3; }
+
+    // ── Bake support (collision-map files, .rwcmap) ──────────────────
+    // serialize() writes this mesh's CPU data (vertices, indices, names,
+    // category, source identity) to the stream; the BVH is NOT written —
+    // it is rebuilt (async) after load.  deserialize() restores the same
+    // fields, recomputes bounds_, and leaves the BVH unbuilt; returns
+    // false on stream error or corrupt counts.  src_drawable_ stays null
+    // after a load (the pointer is session-local debug data).
+    void serialize(std::ofstream& os) const;
+    bool deserialize(std::ifstream& is);
 
     // Triangle count of the ORIGINAL source primitive this collision mesh
     // was built from, captured pre-weld/pre-decimate by

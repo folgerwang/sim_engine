@@ -721,6 +721,11 @@ static void setupMesh(
             assert(it->second >= 0);
             const tinygltf::Accessor& accessor = model.accessors[it->second];
 
+            // Custom attributes (leading '_', e.g. the auto-rig's
+            // _CLOSENESS_0/_CLOSENESS_1 debug payloads) have no vertex
+            // input slot — skip them instead of asserting.
+            if (!it->first.empty() && it->first[0] == '_') continue;
+
             assert(dst_binding < VINPUT_INSTANCE_BINDING_POINT);
 
             engine::renderer::VertexInputBindingDescription binding = {};
@@ -766,6 +771,15 @@ static void setupMesh(
             else if (it->first.compare("WEIGHTS_0") == 0) {
                 attribute.location = VINPUT_WEIGHTS_0;
                 primitive_info.tag_.has_skin_set_0 = true;
+            }
+            else if (it->first.compare("JOINTS_1") == 0) {
+                // 8-bone skinning debug: second skin set (influences 4..7).
+                attribute.location = VINPUT_JOINTS_1;
+                primitive_info.tag_.has_skin_set_1 = true;
+            }
+            else if (it->first.compare("WEIGHTS_1") == 0) {
+                attribute.location = VINPUT_WEIGHTS_1;
+                primitive_info.tag_.has_skin_set_1 = true;
             }
             else {
                 // add support here.
@@ -3453,14 +3467,16 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     bool has_texcoord_0,
     bool has_skin_set_0,
     bool has_material,
-    bool has_double_sided) {
+    bool has_double_sided,
+    bool has_skin_set_1 = false) {
     renderer::ShaderModuleList shader_modules(2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "") +
         (has_tangent ? "_TN" : (has_normals ? "_N" : ""));
     vert_feature_str = has_material ? vert_feature_str : "_NOMTL";
     auto frag_feature_str = vert_feature_str;
     if (has_skin_set_0) {
-        vert_feature_str += "_SKIN";
+        // _SKIN8 = both skin sets bound (8-bone debug); _SKIN = set 0 only.
+        vert_feature_str += has_skin_set_1 ? "_SKIN8" : "_SKIN";
     }
     if (has_double_sided) {
         frag_feature_str += "_DS";
@@ -3490,7 +3506,8 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     bool has_material,
     bool csm_layered = false,
     bool is_opaque = false,
-    bool csm_per_cascade = false) {
+    bool csm_per_cascade = false,
+    bool has_skin_set_1 = false) {
     // csm_layered: when true, add the geometry shader that broadcasts
     // each input triangle to all CSM_CASCADE_COUNT depth-array layers
     // in a single pass, eliminating the per-cascade vertex transform.
@@ -3528,7 +3545,8 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     vert_feature_str = has_material ? vert_feature_str : "_NOMTL";
     auto frag_feature_str = vert_feature_str;
     if (has_skin_set_0) {
-        vert_feature_str += "_SKIN";
+        // _SKIN8 = both skin sets bound (8-bone debug); _SKIN = set 0 only.
+        vert_feature_str += has_skin_set_1 ? "_SKIN8" : "_SKIN";
     }
     // CSMCASC suffix only exists for the four permutations the CSM
     // shadow path actually uses (HAS_UV_SET0 / HAS_SKIN_SET_0 matrix,
@@ -3582,7 +3600,8 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
         primitive.tag_.has_texcoord_0,
         primitive.tag_.has_skin_set_0,
         primitive.material_idx_ >= 0,
-        primitive.tag_.double_sided);
+        primitive.tag_.double_sided,
+        primitive.tag_.has_skin_set_1);
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
@@ -3650,7 +3669,8 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
         primitive.material_idx_ >= 0,
         csm_layered,
         is_opaque,
-        csm_per_cascade);
+        csm_per_cascade,
+        primitive.tag_.has_skin_set_1);
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
@@ -3673,7 +3693,9 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
                 (loc == VINPUT_POSITION) ||
                 (loc == VINPUT_TEXCOORD0 && primitive.tag_.has_texcoord_0) ||
                 (loc == VINPUT_JOINTS_0  && primitive.tag_.has_skin_set_0) ||
-                (loc == VINPUT_WEIGHTS_0 && primitive.tag_.has_skin_set_0);
+                (loc == VINPUT_WEIGHTS_0 && primitive.tag_.has_skin_set_0) ||
+                (loc == VINPUT_JOINTS_1  && primitive.tag_.has_skin_set_1) ||
+                (loc == VINPUT_WEIGHTS_1 && primitive.tag_.has_skin_set_1);
             if (keep) {
                 filtered.push_back(a);
                 kept_bindings.insert(a.binding);
@@ -6704,6 +6726,22 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         primitive_info.bbox_min_ = pmin;
         primitive_info.bbox_max_ = pmax;
 
+        // CPU-side per-primitive index companion.  The collision-mesh
+        // builder (CollisionMesh::buildFromDrawablePrimitive) iterates
+        // `vertex_indices_` and SILENTLY SKIPS primitives whose pointer
+        // is null — without this, every baked .rwobj placement dropped
+        // out of the collision bake with reason=null_vertex_indices and
+        // the bake produced an empty world.  Mirrors the FBX loader's
+        // capture (see the part_idx_list block in loadFbxModel).
+        if (sec_end > sec.first_index) {
+            auto idx_list = std::make_shared<std::vector<int32_t>>();
+            idx_list->reserve(sec_end - sec.first_index);
+            for (uint32_t ii = sec.first_index; ii < sec_end; ++ii) {
+                idx_list->push_back(static_cast<int32_t>(md.indices[ii]));
+            }
+            primitive_info.vertex_indices_ = std::move(idx_list);
+        }
+
         primitive_info.generateHash();
     }
 
@@ -6905,6 +6943,10 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             md.joints.size()  == md.positions.size() &&
             md.weights.size() == md.positions.size() &&
             !md.skin_joint_nodes.empty();
+        // 8-bone skinning debug: second skin set baked by the auto-rig.
+        const bool skinned8 = skinned &&
+            md.joints1.size()  == md.positions.size() &&
+            md.weights1.size() == md.positions.size();
 
         // CPU interleaved vertex buffer (pos/normal/uv).
         helper::Mesh cpu_mesh;
@@ -6959,7 +7001,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 md.indices.data());
         }
 
-        int jbuf = -1, wbuf = -1;
+        int jbuf = -1, wbuf = -1, jbuf1 = -1, wbuf1 = -1;
         if (skinned) {
             jbuf = (int)drawable_object->buffers_.size();
             drawable_object->buffers_.emplace_back();   // joints
@@ -6980,12 +7022,34 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 std::source_location::current(),
                 md.weights.size() * sizeof(glm::vec4), md.weights.data());
         }
+        if (skinned8) {
+            jbuf1 = (int)drawable_object->buffers_.size();
+            drawable_object->buffers_.emplace_back();   // joints set 1
+            drawable_object->buffers_.emplace_back();   // weights set 1
+            wbuf1 = jbuf1 + 1;
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[jbuf1].buffer,
+                drawable_object->buffers_[jbuf1].memory,
+                std::source_location::current(),
+                md.joints1.size() * sizeof(glm::u16vec4), md.joints1.data());
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[wbuf1].buffer,
+                drawable_object->buffers_[wbuf1].memory,
+                std::source_location::current(),
+                md.weights1.size() * sizeof(glm::vec4), md.weights1.data());
+        }
 
         // Buffer views.
         const int vbase = (int)drawable_object->buffer_views_.size();
-        drawable_object->buffer_views_.resize(vbase + (skinned ? 6 : 4));
+        drawable_object->buffer_views_.resize(
+            vbase + (skinned8 ? 8 : (skinned ? 6 : 4)));
         const int pos_v = vbase + 0, nrm_v = vbase + 1, uv_v = vbase + 2,
-                  idx_v = vbase + 3, jnt_v = vbase + 4, wgt_v = vbase + 5;
+                  idx_v = vbase + 3, jnt_v = vbase + 4, wgt_v = vbase + 5,
+                  jnt1_v = vbase + 6, wgt1_v = vbase + 7;
         {
             auto& pv = drawable_object->buffer_views_[pos_v];
             pv.buffer_idx = vbuf; pv.offset = 0;
@@ -7007,6 +7071,16 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 wv.buffer_idx = wbuf; wv.offset = 0;
                 wv.range = vtx_count * sizeof(glm::vec4);
                 wv.stride = sizeof(glm::vec4);
+            }
+            if (skinned8) {
+                auto& jv1 = drawable_object->buffer_views_[jnt1_v];
+                jv1.buffer_idx = jbuf1; jv1.offset = 0;
+                jv1.range = vtx_count * sizeof(glm::u16vec4);
+                jv1.stride = sizeof(glm::u16vec4);
+                auto& wv1 = drawable_object->buffer_views_[wgt1_v];
+                wv1.buffer_idx = wbuf1; wv1.offset = 0;
+                wv1.range = vtx_count * sizeof(glm::vec4);
+                wv1.stride = sizeof(glm::vec4);
             }
         }
 
@@ -7125,6 +7199,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             prim.tag_.has_normal = true;
             prim.tag_.double_sided = false;
             prim.tag_.has_skin_set_0 = skinned;
+            prim.tag_.has_skin_set_1 = skinned8;   // 8-bone debug path
 
             uint32_t b = 0;
             renderer::VertexInputBindingDescription bd = {};
@@ -7165,6 +7240,21 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 prim.binding_descs_.push_back(bd);
                 ad.buffer_view = wgt_v; ad.binding = b; ad.offset = 0;
                 ad.buffer_offset = 0; ad.location = VINPUT_WEIGHTS_0;
+                ad.format = renderer::Format::R32G32B32A32_SFLOAT;
+                prim.attribute_descs_.push_back(ad); ++b;
+            }
+            if (skinned8) {
+                // second skin set (influences 4..7, 8-bone debug path)
+                bd.binding = b; bd.stride = sizeof(glm::u16vec4);
+                prim.binding_descs_.push_back(bd);
+                ad.buffer_view = jnt1_v; ad.binding = b; ad.offset = 0;
+                ad.buffer_offset = 0; ad.location = VINPUT_JOINTS_1;
+                ad.format = renderer::Format::R16G16B16A16_UINT;
+                prim.attribute_descs_.push_back(ad); ++b;
+                bd.binding = b; bd.stride = sizeof(glm::vec4);
+                prim.binding_descs_.push_back(bd);
+                ad.buffer_view = wgt1_v; ad.binding = b; ad.offset = 0;
+                ad.buffer_offset = 0; ad.location = VINPUT_WEIGHTS_1;
                 ad.format = renderer::Format::R32G32B32A32_SFLOAT;
                 prim.attribute_descs_.push_back(ad); ++b;
             }

@@ -17,6 +17,10 @@
 //       uint8    visible
 //       Transform transform      (10 float32)
 //
+// v2+: music_path (string) + music_volume (f32) trailer.
+// v3+: per-object audio_clip (string) + audio_loop (u8) + audio_volume (f32).
+// v4+: collision_map_path (string) trailer — baked .rwcmap reference.
+//
 // Returns false on any I/O error, bad magic, or unknown version.
 // ─────────────────────────────────────────────────────────────────────────────
 #include <string>

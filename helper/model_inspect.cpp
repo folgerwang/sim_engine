@@ -163,7 +163,12 @@ void appendGltfPrim(const tinygltf::Model& model,
                     std::vector<uint32_t>&  indices,
                     std::vector<glm::u16vec4>* out_joints = nullptr,
                     std::vector<glm::vec4>*    out_weights = nullptr,
-                    std::vector<glm::vec4>*    out_closeness = nullptr) {
+                    std::vector<glm::vec4>*    out_closeness = nullptr,
+                    // 8-bone debug path: second skin set (JOINTS_1 /
+                    // WEIGHTS_1 / _CLOSENESS_1, influences 4..7).
+                    std::vector<glm::u16vec4>* out_joints1 = nullptr,
+                    std::vector<glm::vec4>*    out_weights1 = nullptr,
+                    std::vector<glm::vec4>*    out_closeness1 = nullptr) {
     const glm::mat3 nrm_mat(world);   // approximate (ok for previews)
     if (prim.mode != TINYGLTF_MODE_TRIANGLES && prim.mode != -1) return;
     auto pit = prim.attributes.find("POSITION");
@@ -238,57 +243,87 @@ void appendGltfPrim(const tinygltf::Model& model,
         const uint8_t* jraw = nullptr; size_t jc = 0, js = 0; int jt = 0;
         const uint8_t* wraw = nullptr; size_t wc = 0, ws = 0; int wt = 0;
         const uint8_t* craw = nullptr; size_t cc = 0, cs = 0; int ct = 0;
+        const uint8_t* jraw1 = nullptr; size_t jc1 = 0, js1 = 0; int jt1 = 0;
+        const uint8_t* wraw1 = nullptr; size_t wc1 = 0, ws1 = 0; int wt1 = 0;
+        const uint8_t* craw1 = nullptr; size_t cc1 = 0, cs1 = 0; int ct1 = 0;
         auto jit = prim.attributes.find("JOINTS_0");
         auto wit = prim.attributes.find("WEIGHTS_0");
         auto cit = prim.attributes.find("_CLOSENESS_0");   // auto-rig custom attr
+        auto jit1 = prim.attributes.find("JOINTS_1");      // 8-bone debug path
+        auto wit1 = prim.attributes.find("WEIGHTS_1");
+        auto cit1 = prim.attributes.find("_CLOSENESS_1");
         const bool has_j = jit != prim.attributes.end() &&
             rawAccessor(jit->second, jraw, jc, js, jt);
         const bool has_w = wit != prim.attributes.end() &&
             rawAccessor(wit->second, wraw, wc, ws, wt);
         const bool has_c = out_closeness && cit != prim.attributes.end() &&
             rawAccessor(cit->second, craw, cc, cs, ct);
+        const bool has_j1 = out_joints1 && jit1 != prim.attributes.end() &&
+            rawAccessor(jit1->second, jraw1, jc1, js1, jt1);
+        const bool has_w1 = out_weights1 && wit1 != prim.attributes.end() &&
+            rawAccessor(wit1->second, wraw1, wc1, ws1, wt1);
+        const bool has_c1 = out_closeness1 && cit1 != prim.attributes.end() &&
+            rawAccessor(cit1->second, craw1, cc1, cs1, ct1);
+
+        auto readJoints = [](const uint8_t* p4, int t) -> glm::u16vec4 {
+            glm::u16vec4 J(0);
+            for (int c = 0; c < 4; ++c) {
+                J[c] = (t == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+                    ? reinterpret_cast<const uint16_t*>(p4)[c]
+                    : (uint16_t)p4[c];   // UNSIGNED_BYTE
+            }
+            return J;
+        };
+        auto readWeights = [](const uint8_t* p4, int t) -> glm::vec4 {
+            glm::vec4 W(0.0f);
+            for (int c = 0; c < 4; ++c) {
+                float v = 0.0f;
+                if (t == TINYGLTF_COMPONENT_TYPE_FLOAT)
+                    v = reinterpret_cast<const float*>(p4)[c];
+                else if (t == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+                    v = reinterpret_cast<const uint16_t*>(p4)[c] / 65535.0f;
+                else if (t == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
+                    v = p4[c] / 255.0f;
+                W[c] = v;
+            }
+            return W;
+        };
 
         for (size_t i = 0; i < pc; ++i) {
-            glm::u16vec4 J(0);
-            glm::vec4    W(1.0f, 0.0f, 0.0f, 0.0f);
-            glm::vec4    C(0.0f);
-            if (has_j && i < jc) {
-                const uint8_t* p4 = jraw + i * js;
-                for (int c = 0; c < 4; ++c) {
-                    J[c] = (jt == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
-                        ? reinterpret_cast<const uint16_t*>(p4)[c]
-                        : (uint16_t)p4[c];   // UNSIGNED_BYTE
-                }
-            }
+            glm::u16vec4 J(0), J1(0);
+            glm::vec4    W(1.0f, 0.0f, 0.0f, 0.0f), W1(0.0f);
+            glm::vec4    C(0.0f), C1(0.0f);
+            if (has_j && i < jc)   J  = readJoints(jraw + i * js, jt);
+            if (has_j1 && i < jc1) J1 = readJoints(jraw1 + i * js1, jt1);
             if (has_w && i < wc) {
-                const uint8_t* p4 = wraw + i * ws;
-                for (int c = 0; c < 4; ++c) {
-                    float v = 0.0f;
-                    if (wt == TINYGLTF_COMPONENT_TYPE_FLOAT)
-                        v = reinterpret_cast<const float*>(p4)[c];
-                    else if (wt ==
-                             TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
-                        v = reinterpret_cast<const uint16_t*>(p4)[c] /
-                            65535.0f;
-                    else if (wt == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
-                        v = p4[c] / 255.0f;
-                    W[c] = v;
-                }
-                // Renormalise (quantised weights rarely sum to 1).
-                const float sum = W.x + W.y + W.z + W.w;
-                if (sum > 1e-6f) W /= sum;
-                else W = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+                W = readWeights(wraw + i * ws, wt);
+                if (has_w1 && i < wc1) W1 = readWeights(wraw1 + i * ws1, wt1);
+                // Renormalise across BOTH sets (quantised weights rarely sum
+                // to 1; an 8-bone vertex's set 0 alone sums to < 1 by design).
+                const float sum = W.x + W.y + W.z + W.w +
+                                  W1.x + W1.y + W1.z + W1.w;
+                if (sum > 1e-6f) { W /= sum; W1 /= sum; }
+                else { W = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f); W1 = glm::vec4(0.0f); }
             }
-            // _CLOSENESS_0 is float vec4, kept RAW (no renormalize).
+            // _CLOSENESS_* is float vec4, kept RAW (no renormalize).
             if (has_c && i < cc) {
                 const uint8_t* p4 = craw + i * cs;
                 for (int c = 0; c < 4; ++c)
                     C[c] = (ct == TINYGLTF_COMPONENT_TYPE_FLOAT)
                         ? reinterpret_cast<const float*>(p4)[c] : 0.0f;
             }
+            if (has_c1 && i < cc1) {
+                const uint8_t* p4 = craw1 + i * cs1;
+                for (int c = 0; c < 4; ++c)
+                    C1[c] = (ct1 == TINYGLTF_COMPONENT_TYPE_FLOAT)
+                        ? reinterpret_cast<const float*>(p4)[c] : 0.0f;
+            }
             out_joints->push_back(J);
             out_weights->push_back(W);
             if (out_closeness) out_closeness->push_back(C);
+            if (out_joints1)    out_joints1->push_back(J1);
+            if (out_weights1)   out_weights1->push_back(W1);
+            if (out_closeness1) out_closeness1->push_back(C1);
         }
     }
 
@@ -1403,7 +1438,11 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
                        std::vector<uint32_t>&  indices,
                        std::vector<glm::u16vec4>* joints = nullptr,
                        std::vector<glm::vec4>*    weights = nullptr,
-                       std::vector<glm::vec4>*    closeness = nullptr) {
+                       std::vector<glm::vec4>*    closeness = nullptr,
+                       // 8-bone debug path: second skin set, rides parallel.
+                       std::vector<glm::u16vec4>* joints1 = nullptr,
+                       std::vector<glm::vec4>*    weights1 = nullptr,
+                       std::vector<glm::vec4>*    closeness1 = nullptr) {
     const size_t vc = positions.size();
     if (vc == 0) return;
     const bool has_n  = normals.size() == vc;
@@ -1414,6 +1453,10 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
     // Closeness rides parallel to weights (first-occurrence wins); it is NOT
     // part of the dedup key — identical joints/weights imply ~identical closeness.
     const bool has_close = has_skin && closeness && closeness->size() == vc;
+    const bool has_skin1 = has_skin && joints1 && weights1 &&
+        joints1->size() == vc && weights1->size() == vc;
+    const bool has_close1 =
+        has_skin1 && closeness1 && closeness1->size() == vc;
 
     auto vert_hash = [&](uint32_t v) -> uint64_t {
         uint64_t h = 1469598103934665603ull;
@@ -1431,6 +1474,10 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
             mix(&(*joints)[v], sizeof(glm::u16vec4));
             mix(&(*weights)[v], sizeof(glm::vec4));
         }
+        if (has_skin1) {
+            mix(&(*joints1)[v], sizeof(glm::u16vec4));
+            mix(&(*weights1)[v], sizeof(glm::vec4));
+        }
         return h;
     };
 
@@ -1440,8 +1487,13 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
     std::vector<glm::u16vec4> djnt;
     std::vector<glm::vec4>    dwgt;
     std::vector<glm::vec4>    dcls;
+    std::vector<glm::u16vec4> djnt1;
+    std::vector<glm::vec4>    dwgt1;
+    std::vector<glm::vec4>    dcls1;
     if (has_skin) { djnt.reserve(vc / 2); dwgt.reserve(vc / 2); }
     if (has_close) dcls.reserve(vc / 2);
+    if (has_skin1) { djnt1.reserve(vc / 2); dwgt1.reserve(vc / 2); }
+    if (has_close1) dcls1.reserve(vc / 2);
     std::vector<uint32_t> remap(vc);
     std::unordered_map<uint64_t, std::vector<uint32_t>> buckets;
     buckets.reserve(vc);
@@ -1454,7 +1506,9 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
                 (!has_n  || dnrm[c] == normals[v]) &&
                 (!has_uv || duv[c] == uvs[v]) &&
                 (!has_skin ||
-                 (djnt[c] == (*joints)[v] && dwgt[c] == (*weights)[v]))) {
+                 (djnt[c] == (*joints)[v] && dwgt[c] == (*weights)[v])) &&
+                (!has_skin1 ||
+                 (djnt1[c] == (*joints1)[v] && dwgt1[c] == (*weights1)[v]))) {
                 found = c;
                 break;
             }
@@ -1469,6 +1523,11 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
                 dwgt.push_back((*weights)[v]);
             }
             if (has_close) dcls.push_back((*closeness)[v]);
+            if (has_skin1) {
+                djnt1.push_back((*joints1)[v]);
+                dwgt1.push_back((*weights1)[v]);
+            }
+            if (has_close1) dcls1.push_back((*closeness1)[v]);
             cands.push_back(found);
         }
         remap[v] = found;
@@ -1485,6 +1544,11 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
         *weights = std::move(dwgt);
     }
     if (has_close) *closeness = std::move(dcls);
+    if (has_skin1) {
+        *joints1  = std::move(djnt1);
+        *weights1 = std::move(dwgt1);
+    }
+    if (has_close1) *closeness1 = std::move(dcls1);
 }
 
 bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
@@ -1506,6 +1570,12 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     // Optional baked closeness (auto-rig distance field), parallel to weights.
     const bool has_close = has_skin &&
         d.closeness.size() == d.positions.size();
+    // 8-bone debug path: second skin set (influences 4..7).
+    const bool has_skin1 = has_skin &&
+        d.joints1.size() == d.positions.size() &&
+        d.weights1.size() == d.positions.size();
+    const bool has_close1 = has_skin1 &&
+        d.closeness1.size() == d.positions.size();
 
     // Dedup the parse helpers' triangle soup before writing — indexed,
     // shared vertices are what the GPU (and the cluster builder) want.
@@ -1520,10 +1590,19 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
         ? d.weights : std::vector<glm::vec4>();
     std::vector<glm::vec4>    closeness = has_close
         ? d.closeness : std::vector<glm::vec4>();
+    std::vector<glm::u16vec4> joints1   = has_skin1
+        ? d.joints1  : std::vector<glm::u16vec4>();
+    std::vector<glm::vec4>    weights1  = has_skin1
+        ? d.weights1 : std::vector<glm::vec4>();
+    std::vector<glm::vec4>    closeness1 = has_close1
+        ? d.closeness1 : std::vector<glm::vec4>();
     dedupSoupVertices(positions, normals, uvs, indices,
                       has_skin ? &joints : nullptr,
                       has_skin ? &weights : nullptr,
-                      has_close ? &closeness : nullptr);
+                      has_close ? &closeness : nullptr,
+                      has_skin1 ? &joints1 : nullptr,
+                      has_skin1 ? &weights1 : nullptr,
+                      has_close1 ? &closeness1 : nullptr);
 
     // v5: full PBR section refs (albedo + normal + metallic-roughness);
     // flags bit1 marks the optional skin blobs.  Older files (v1-v4)
@@ -1531,8 +1610,12 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     f.write(kRwGeoMagic5, 8);
     wrPod(f, (uint32_t)positions.size());
     wrPod(f, (uint32_t)indices.size());
+    // bit3 (8u) = second skin set blobs (8-bone debug), bit4 (16u) =
+    // second closeness blob.  Readers older than the 8-bone path ignore
+    // unknown bits only if they're clear — engine and bake ship together.
     wrPod(f, (uint32_t)((has_uv ? 1u : 0u) | (has_skin ? 2u : 0u) |
-                        (has_close ? 4u : 0u)));
+                        (has_close ? 4u : 0u) | (has_skin1 ? 8u : 0u) |
+                        (has_close1 ? 16u : 0u)));
     // v3: geometry is NODE-LOCAL; this matrix places it in source-world
     // space (standalone consumers apply it; hierarchical renderers compose
     // the rwhier chain instead).
@@ -1582,6 +1665,18 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     if (has_close) {
         f.write(reinterpret_cast<const char*>(closeness.data()),
                 (std::streamsize)(closeness.size() * sizeof(glm::vec4)));
+    }
+    // 8-bone debug path: second skin set blobs (flag bits 8/16), between
+    // the closeness block and the indices.
+    if (has_skin1) {
+        f.write(reinterpret_cast<const char*>(joints1.data()),
+                (std::streamsize)(joints1.size() * sizeof(glm::u16vec4)));
+        f.write(reinterpret_cast<const char*>(weights1.data()),
+                (std::streamsize)(weights1.size() * sizeof(glm::vec4)));
+    }
+    if (has_close1) {
+        f.write(reinterpret_cast<const char*>(closeness1.data()),
+                (std::streamsize)(closeness1.size() * sizeof(glm::vec4)));
     }
     f.write(reinterpret_cast<const char*>(indices.data()),
             (std::streamsize)(indices.size() * sizeof(uint32_t)));
@@ -1651,9 +1746,20 @@ void dedupModelVertices(ModelPreviewData& d) {
     const bool has_skin =
         d.joints.size() == d.positions.size() &&
         d.weights.size() == d.positions.size();
+    const bool has_close = has_skin &&
+        d.closeness.size() == d.positions.size();
+    const bool has_skin1 = has_skin &&
+        d.joints1.size() == d.positions.size() &&
+        d.weights1.size() == d.positions.size();
+    const bool has_close1 = has_skin1 &&
+        d.closeness1.size() == d.positions.size();
     dedupSoupVertices(d.positions, d.normals, d.uvs, d.indices,
                       has_skin ? &d.joints : nullptr,
-                      has_skin ? &d.weights : nullptr);
+                      has_skin ? &d.weights : nullptr,
+                      has_close ? &d.closeness : nullptr,
+                      has_skin1 ? &d.joints1 : nullptr,
+                      has_skin1 ? &d.weights1 : nullptr,
+                      has_close1 ? &d.closeness1 : nullptr);
 }
 
 bool loadRwHier(const std::string& path, std::vector<RwHierNode>& out) {
@@ -1757,6 +1863,8 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     const bool has_uv    = (flags & 1u) != 0;
     const bool has_skin  = v4 && (flags & 2u) != 0;
     const bool has_close = v4 && (flags & 4u) != 0;   // baked closeness block
+    const bool has_skin1  = v4 && (flags & 8u) != 0;  // 8-bone second set
+    const bool has_close1 = v4 && (flags & 16u) != 0;
 
     // v3+: node-local geometry + the node's world matrix (re-applied below
     // so standalone consumers keep seeing source-world coordinates).
@@ -1848,6 +1956,23 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     if (has_close) {
         out.closeness.resize(vc);
         if (!f.read(reinterpret_cast<char*>(out.closeness.data()),
+                    (std::streamsize)(vc * sizeof(glm::vec4))))
+            return false;
+    }
+    // 8-bone debug path: second skin set blobs (flag bits 8/16).
+    if (has_skin1) {
+        out.joints1.resize(vc);
+        out.weights1.resize(vc);
+        if (!f.read(reinterpret_cast<char*>(out.joints1.data()),
+                    (std::streamsize)(vc * sizeof(glm::u16vec4))))
+            return false;
+        if (!f.read(reinterpret_cast<char*>(out.weights1.data()),
+                    (std::streamsize)(vc * sizeof(glm::vec4))))
+            return false;
+    }
+    if (has_close1) {
+        out.closeness1.resize(vc);
+        if (!f.read(reinterpret_cast<char*>(out.closeness1.data()),
                     (std::streamsize)(vc * sizeof(glm::vec4))))
             return false;
     }
@@ -2068,9 +2193,12 @@ bool bakeModelToRenderReady(
                 const uint32_t first = (uint32_t)d.indices.size();
                 appendGltfPrim(model, prim, glm::mat4(1.0f),
                                d.positions, d.normals, d.uvs, d.indices,
-                               node_skinned ? &d.joints    : nullptr,
-                               node_skinned ? &d.weights   : nullptr,
-                               node_skinned ? &d.closeness : nullptr);
+                               node_skinned ? &d.joints     : nullptr,
+                               node_skinned ? &d.weights    : nullptr,
+                               node_skinned ? &d.closeness  : nullptr,
+                               node_skinned ? &d.joints1    : nullptr,
+                               node_skinned ? &d.weights1   : nullptr,
+                               node_skinned ? &d.closeness1 : nullptr);
                 const uint32_t count = (uint32_t)d.indices.size() - first;
                 if (count < 3) continue;
                 GeoSectionOut s;

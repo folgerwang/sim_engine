@@ -55,6 +55,15 @@ public:
         initialized_ = true;
     }
 
+    // Scene unload / player swap: forget the spawn so the application's
+    // one-shot spawn block re-runs against the NEW scene's player object
+    // (its !isSpawned() latch re-arms).  update() goes back to no-op
+    // until the next spawnAt().
+    void despawn() {
+        initialized_ = false;
+        walking_     = false;
+    }
+
     // Per-frame "follow the camera" hook.  Updates ONLY position +
     // yaw, without resetting animation phases (which spawnAt would).
     // The application calls this every frame after the one-shot

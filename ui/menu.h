@@ -70,6 +70,13 @@ struct EditorSceneObject {
     std::string*                         audio_clip   = nullptr;
     bool*                                audio_loop   = nullptr;
     float*                               audio_volume = nullptr;
+    // Collision-map object row (".rwcol" marker until assigned, then the
+    // ".rwcmap" path itself): no drawable; the Details panel shows the
+    // held map and assigns one from content/maps/collision.
+    bool                                 is_collision = false;
+    // Borrowed pointer to the row's asset_path (read-only display of the
+    // held .rwcmap; assignment goes through consumeCollisionMapAssign).
+    const std::string*                   collision_map = nullptr;
 };
 
 // Game-level state machine driven by the title-screen menu.
@@ -104,6 +111,14 @@ class Menu {
     // when this is true, which re-anchors the character to wherever
     // the user is currently looking.
     bool reset_player_position_requested_ = false;
+
+    // One-shot "bake the collision map for player walking" request —
+    // drained by consumeBakeCollisionMapRequest() from application.cpp.
+    // Set by the Tools > "Bake Collision Map (Player Walk)" menu item;
+    // the application serializes the built collision world to
+    // content/maps/<scene>.rwcmap and records the path in the scene so
+    // Save Scene persists the reference.
+    bool bake_collision_map_requested_ = false;
 
     // Per-frame debug overlay data — see setPlayerDebugInfo().
     bool      has_player_debug_info_ = false;
@@ -335,6 +350,16 @@ private:
     size_t               collision_build_total_  = 0;
     size_t               collision_build_meshes_ = 0;
 
+    // ── "No collision map" banner ────────────────────────────────────
+    // Pushed per-frame by the application: play mode wants to walk the
+    // player but no collision world exists (no baked .rwcmap loaded and
+    // no bake run yet).  draw() paints an amber banner pointing at
+    // Tools > Bake Collision Map while set.
+public:
+    void setNoCollisionMapWarning(bool on) { no_collision_map_warning_ = on; }
+private:
+    bool no_collision_map_warning_ = false;
+
     // Which CollisionShape mode application.cpp should pass to
     // CollisionMesh::buildFromDrawablePrimitive when (re)building
     // the collision world for visualisation. Three user-facing
@@ -546,11 +571,17 @@ public:
     bool camera_create_request_ = false; // "Create Camera Here" (view pose)
     bool player_create_request_ = false; // "Add Player Object"
     bool bgm_create_request_    = false; // "Add BGM Object"
+    bool collision_create_request_ = false; // "Add Collision Map"
     // Player "Skeleton Mesh" assignment (Details combo): scene index of
     // the player row + the character model path ("" = clear the mesh).
     bool        player_mesh_assign_pending_ = false;
     int         player_mesh_assign_idx_     = -1;
     std::string player_mesh_assign_path_;
+    // Collision object "Collision Map" assignment (Details combo): scene
+    // index of the collision row + the .rwcmap path ("" = clear).
+    bool        collision_map_assign_pending_ = false;
+    int         collision_map_assign_idx_     = -1;
+    std::string collision_map_assign_path_;
     // Scene-object rename (Details "Name" field): scene index + new name.
     bool        scene_rename_pending_ = false;
     int         scene_rename_idx_     = -1;
@@ -792,6 +823,11 @@ public:
                                                              // auto-rig distance
                                                              // closeness (parallel
                                                              // to joints/weights)
+    // 8-bone skinning debug: second influence set (4..7), parallel to the
+    // arrays above when present; empty for 4-bone legacy assets.
+    std::vector<glm::uvec4> preview_skin_joints1_;
+    std::vector<glm::vec4>  preview_skin_weights1_;
+    std::vector<glm::vec4>  preview_skin_closeness1_;
     std::vector<int32_t>    preview_node_parent_;            // skeleton
     std::vector<std::string> preview_node_name_;             // bone names
     std::vector<glm::mat4>  preview_node_bind_local_;        // node-local bind
@@ -1096,6 +1132,26 @@ public:
         out_path = player_mesh_assign_path_;
         return true;
     }
+    // "Add Collision Map": the app creates a collision scene object that
+    // holds the baked .rwcmap reference (assigned via the Details combo,
+    // or written automatically by Tools > Bake Collision Map).
+    bool consumeCreateCollisionRequest() {
+        if (collision_create_request_) {
+            collision_create_request_ = false;
+            return true;
+        }
+        return false;
+    }
+    // Collision object "Collision Map" assignment from the Details combo.
+    // out_path empty = clear the reference (no collision on next load).
+    bool consumeCollisionMapAssign(int& out_scene_idx,
+                                   std::string& out_path) {
+        if (!collision_map_assign_pending_) return false;
+        collision_map_assign_pending_ = false;
+        out_scene_idx = collision_map_assign_idx_;
+        out_path = collision_map_assign_path_;
+        return true;
+    }
     // Scene-object rename from the Details "Name" field.
     bool consumeSceneObjectRename(int& out_scene_idx,
                                   std::string& out_name) {
@@ -1345,6 +1401,15 @@ public:
     bool consumeResetPlayerPosition() {
         bool v = reset_player_position_requested_;
         reset_player_position_requested_ = false;
+        return v;
+    }
+
+    // One-shot Tools > "Bake Collision Map (Player Walk)" request.
+    // application.cpp drains this each frame; the bake itself runs there
+    // (and waits for collision_world_built_ before writing the file).
+    bool consumeBakeCollisionMapRequest() {
+        bool v = bake_collision_map_requested_;
+        bake_collision_map_requested_ = false;
         return v;
     }
 

@@ -1362,12 +1362,10 @@ bool Menu::draw(
     // has finished — the user wants a clean screen at that point.  The
     // collision bar below is gated to Building-only for the same reason.
     //
-    // DISABLED for now: the background mesh-category (LLM classifier)
-    // progress bar is turned off until the baking feature lands, at which
-    // point it will return as part of the bake UI.  Flip this back to true
-    // (or remove the flag) to restore the overlay — everything below still
-    // receives live status via setClassifierStatus().
-    constexpr bool kShowMeshCategoryProgressBar = false;
+    // RE-ENABLED with the bake feature: the classifier only runs as part
+    // of Tools > Bake Collision Map now, so this bar IS the bake UI's
+    // first phase (the collision-build bar below is the second).
+    constexpr bool kShowMeshCategoryProgressBar = true;
     if (kShowMeshCategoryProgressBar &&
         (classifier_status_ == ClassifierStatus::Pending ||
          classifier_status_ == ClassifierStatus::Ready   ||
@@ -1523,6 +1521,41 @@ bool Menu::draw(
                 "Collision: %s — %zu floor mesh(es) from %zu/%zu prims",
                 word, collision_build_meshes_,
                 collision_build_done_, collision_build_total_);
+        }
+        ImGui::End();
+    }
+
+    // ── "No collision map" banner ────────────────────────────────────
+    // Pushed per-frame by the application: play mode wants to walk the
+    // player, but no collision world exists (no baked .rwcmap on the
+    // scene, no bake run) — without it the player never spawns.  Point
+    // the user at the bake action instead of failing silently.
+    if (no_collision_map_warning_) {
+        ImVec2 vp_pos, vp_size, vp_c;
+        getViewportScreenRect(vp_pos, vp_size, vp_c);
+        const float bar_h = 44.0f;
+        const float bar_w = vp_size.x * 0.5f;
+        const float bar_x = vp_pos.x + (vp_size.x - bar_w) * 0.5f;
+        const float bar_y = vp_pos.y + 6.0f;
+        ImGui::SetNextWindowPos(ImVec2(bar_x, bar_y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(bar_w, bar_h), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.80f);
+        if (ImGui::Begin("##no_collision_map_banner", nullptr,
+            ImGuiWindowFlags_NoTitleBar  |
+            ImGuiWindowFlags_NoResize    |
+            ImGuiWindowFlags_NoMove      |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav))
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(1.0f, 0.72f, 0.25f, 1.0f));
+            ImGui::TextUnformatted(
+                "No collision map — player can't spawn/walk");
+            ImGui::PopStyleColor();
+            ImGui::TextUnformatted(
+                "Tools > Bake Collision Map (Player Walk), then Save Scene");
         }
         ImGui::End();
     }
@@ -2349,6 +2382,15 @@ bool Menu::draw(
 
             if (ImGui::MenuItem("Dump noise volumetric texture", NULL)) {
                 dump_volume_noise = true;
+            }
+
+            // Bake the runtime-built walkable collision world to
+            // content/maps/<scene>.rwcmap and reference it from the scene
+            // (Save Scene persists the reference; loading the scene then
+            // restores collision instantly so the player can spawn and
+            // walk with WASD without waiting for the classifier build).
+            if (ImGui::MenuItem("Bake Collision Map (Player Walk)", NULL)) {
+                bake_collision_map_requested_ = true;
             }
 
             if (ImGui::MenuItem("GPU Profiler", NULL, s_show_gpu_profiler)) {
@@ -3409,12 +3451,16 @@ bool Menu::draw(
     // ── Viewport Play / Stop button (editor only, top-left corner) ──────────
     // Toggles play mode: Play (green ▶) enters play mode (character is
     // controllable, clock visible); Stop (red ■) returns to edit mode (player
-    // frozen, camera flies the level).  Only appears once the level has fully
-    // loaded — in game AND the collision ("simplified mesh") build is Done
-    // (the same point at which the loading bars disappear).
+    // frozen, camera flies the level).
+    //
+    // No longer gated on CollisionBuildStatus::Done: collision is BAKE-
+    // driven now, so a scene that restores a baked .rwcmap never runs the
+    // incremental build (status stays Idle) — the old gate hid the game UI
+    // forever.  The button shows whenever the editor is in game; pressing
+    // Play without a collision world surfaces the "No collision map" banner
+    // (pointing at Tools > Bake Collision Map) instead of silently no-oping.
     if (editor_enabled_ &&
-        game_state_ == GameState::InGame &&
-        collision_build_status_ == CollisionBuildStatus::Done) {
+        game_state_ == GameState::InGame) {
         ImVec2 tb_pos, tb_size, tb_c;
         getViewportScreenRect(tb_pos, tb_size, tb_c);
         ImGui::SetNextWindowPos(ImVec2(tb_pos.x + 8.0f, tb_pos.y + 8.0f));
@@ -3843,6 +3889,13 @@ void Menu::drawEditorDockSpace() {
             if (ImGui::MenuItem("Add Player Object")) {
                 player_create_request_ = true;
                 scene_node_active_     = true;
+            }
+            // Collision-map object: holds the scene's baked .rwcmap
+            // reference (assign one in Details, or Tools > Bake Collision
+            // Map fills it in automatically).
+            if (ImGui::MenuItem("Add Collision Map")) {
+                collision_create_request_ = true;
+                scene_node_active_        = true;
             }
             // Capture the CURRENT editor view (position + facing) as a
             // scene camera in the Outliner under World.
@@ -4852,6 +4905,55 @@ void Menu::drawDetailsContent() {
                 }
                 ImGui::TextDisabled(
                     "(pick above or drag a character onto the slot)");
+            }
+
+            // ── Collision object: held .rwcmap + assignment combo ────────
+            // Mirrors the player's Skeleton Mesh slot: the combo lists the
+            // baked maps under content/maps/collision; picking one swaps
+            // the live collision world immediately (the app consumes
+            // consumeCollisionMapAssign).  "None" clears the reference —
+            // the scene loads with no collision until a map is assigned
+            // or baked again.
+            if (o.is_collision) {
+                ImGui::SeparatorText("Collision");
+                std::string cur = "None";
+                if (o.collision_map && !o.collision_map->empty() &&
+                    o.collision_map->size() > 7 &&
+                    o.collision_map->compare(
+                        o.collision_map->size() - 7, 7, ".rwcmap") == 0) {
+                    cur = std::filesystem::path(*o.collision_map)
+                              .filename().string();
+                }
+                if (ImGui::BeginCombo("Collision Map", cur.c_str())) {
+                    if (ImGui::Selectable("None", cur == "None")) {
+                        collision_map_assign_pending_ = true;
+                        collision_map_assign_idx_  = o.scene_index;
+                        collision_map_assign_path_.clear();
+                    }
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    if (fs::is_directory("content/maps/collision", ec)) {
+                        for (auto& e : fs::directory_iterator(
+                                 "content/maps/collision", ec)) {
+                            if (e.path().extension() != ".rwcmap") continue;
+                            const std::string label =
+                                e.path().filename().string();
+                            if (ImGui::Selectable(label.c_str(),
+                                                  label == cur)) {
+                                collision_map_assign_pending_ = true;
+                                collision_map_assign_idx_  = o.scene_index;
+                                collision_map_assign_path_ =
+                                    e.path().generic_string();
+                            }
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (o.collision_map && cur != "None") {
+                    ImGui::TextDisabled("%s", o.collision_map->c_str());
+                }
+                ImGui::TextDisabled(
+                    "(Tools > Bake Collision Map fills this in)");
             }
 
             // ── Camera: follow-target link ────────────────────────────
@@ -6743,48 +6845,71 @@ void Menu::tickPreviewAnimation() {
             // find which of the vertex's 4 influencing joints is the selected
             // node and read its closeness (0 where the bone has no influence).
             const uint32_t selNode = (uint32_t)preview_weight_bones_[sel];
+            const bool has8c =
+                preview_skin_joints1_.size() == vc &&
+                preview_skin_closeness1_.size() == vc;
             preview_surface_close_.assign(vc, 0.0f);
             for (size_t v = 0; v < vc; ++v) {
                 const glm::uvec4 J = preview_skin_joints_[v];
                 const glm::vec4  C = preview_skin_closeness_[v];
                 float c = 0.0f;
+                bool found = false;
                 for (int k = 0; k < 4; ++k)
-                    if (J[k] == selNode) { c = C[k]; break; }
+                    if (J[k] == selNode) { c = C[k]; found = true; break; }
+                if (!found && has8c) {   // 8-bone debug: second set (4..7)
+                    const glm::uvec4 J1 = preview_skin_joints1_[v];
+                    const glm::vec4  C1 = preview_skin_closeness1_[v];
+                    for (int k = 0; k < 4; ++k)
+                        if (J1[k] == selNode) { c = C1[k]; break; }
+                }
                 preview_surface_close_[v] = c;
             }
         }
     }
 
+    // 8-bone skinning debug: second influence set, parallel when present.
+    const bool has8 = preview_skin_joints1_.size() == vc &&
+                      preview_skin_weights1_.size() == vc;
     engine::helper::MeshPreviewPayload out = preview_anim_base_;
     for (size_t v = 0; v < vc; ++v) {
         const glm::uvec4 J = preview_skin_joints_[v];
         const glm::vec4  W = preview_skin_weights_[v];
+        const glm::uvec4 J1 = has8 ? preview_skin_joints1_[v] : glm::uvec4(0u);
+        const glm::vec4  W1 = has8 ? preview_skin_weights1_[v] : glm::vec4(0.0f);
         glm::mat4 m(0.0f);
         float wsum = 0.0f;
-        for (int k = 0; k < 4; ++k) {
-            float w = W[k];
-            if (w <= 0.0f) continue;
-            const uint32_t n = J[k];
-            if (n >= nn) continue;
-            if (n < preview_bone_weight_scale_.size())
-                w *= preview_bone_weight_scale_[n];   // tweakable influence
-            if (w <= 0.0f) continue;
-            m += jm[n] * w; wsum += w;
-        }
+        auto blend = [&](const glm::uvec4& Jx, const glm::vec4& Wx) {
+            for (int k = 0; k < 4; ++k) {
+                float w = Wx[k];
+                if (w <= 0.0f) continue;
+                const uint32_t n = Jx[k];
+                if (n >= nn) continue;
+                if (n < preview_bone_weight_scale_.size())
+                    w *= preview_bone_weight_scale_[n];   // tweakable influence
+                if (w <= 0.0f) continue;
+                m += jm[n] * w; wsum += w;
+            }
+        };
+        blend(J, W);
+        if (has8) blend(J1, W1);
         // Weight render: pack the selected bone's weight on this vertex into
         // uv.x (read by the preview shader's flat heat-map branch).
         if (wdebug && v < out.uvs.size()) {
             float wt = 0.0f;
-            for (int k = 0; k < 4; ++k)
+            for (int k = 0; k < 4; ++k) {
                 if ((int)J[k] == wsel_node) wt += W[k];
+                if (has8 && (int)J1[k] == wsel_node) wt += W1[k];
+            }
             out.uvs[v] = glm::vec2(wt, 0.0f);
         } else if (sdebug && v < out.uvs.size()) {
             // Segment render: pack the DOMINANT bone's node index into uv.x;
             // the shader maps it to a distinct hue.
-            int dk = 0; float dw = -1.0f;
-            for (int k = 0; k < 4; ++k)
-                if (W[k] > dw) { dw = W[k]; dk = k; }
-            out.uvs[v] = glm::vec2((float)J[dk], 0.0f);
+            uint32_t dn = J[0]; float dw = -1.0f;
+            for (int k = 0; k < 4; ++k) {
+                if (W[k] > dw) { dw = W[k]; dn = J[k]; }
+                if (has8 && W1[k] > dw) { dw = W1[k]; dn = J1[k]; }
+            }
+            out.uvs[v] = glm::vec2((float)dn, 0.0f);
         } else if (ddebug && v < out.uvs.size() &&
                    v < preview_surface_close_.size()) {
             // Distance render: closeness to the selected bone (heatmap branch).
@@ -7277,6 +7402,10 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
     std::vector<glm::uvec4>            sj;            // per vtx: 4 node indices
     std::vector<glm::vec4>             sw;            // per vtx: 4 weights
     std::vector<glm::vec4>             sc;            // per vtx: 4 baked closeness
+    // 8-bone skinning debug: second influence set (4..7), parallel to sj/sw/sc.
+    std::vector<glm::uvec4>            sj1;
+    std::vector<glm::vec4>             sw1;
+    std::vector<glm::vec4>             sc1;
     std::unordered_map<int, glm::mat4> invbind_map;   // skeleton node → inv bind
     bool all_skinned = true;
     int  first_skinned_ordinal = -1;   // owner mesh node (bind-space cancel)
@@ -7333,10 +7462,16 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
             }
             const bool obj_close =
                 obj_skinned && md.closeness.size() == md.positions.size();
+            // 8-bone skinning debug: second influence set (4..7).
+            const bool obj_skin8 = obj_skinned &&
+                md.joints1.size()  == md.positions.size() &&
+                md.weights1.size() == md.positions.size();
+            const bool obj_close8 = obj_skin8 &&
+                md.closeness1.size() == md.positions.size();
             for (size_t i = 0; i < md.positions.size(); ++i) {
-                glm::uvec4 J(0u);
-                glm::vec4  W(0.0f);
-                glm::vec4  C(0.0f);
+                glm::uvec4 J(0u), J1(0u);
+                glm::vec4  W(0.0f), W1(0.0f);
+                glm::vec4  C(0.0f), C1(0.0f);
                 if (obj_skinned) {
                     const glm::u16vec4 lj = md.joints[i];
                     for (int k = 0; k < 4; ++k) {
@@ -7347,9 +7482,22 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
                     W = md.weights[i];
                     if (obj_close) C = md.closeness[i];
                 }
+                if (obj_skin8) {
+                    const glm::u16vec4 lj1 = md.joints1[i];
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t local = lj1[k];
+                        J1[k] = (local < md.skin_joint_nodes.size())
+                            ? (uint32_t)md.skin_joint_nodes[local] : 0u;
+                    }
+                    W1 = md.weights1[i];
+                    if (obj_close8) C1 = md.closeness1[i];
+                }
                 sj.push_back(J);
                 sw.push_back(W);
                 sc.push_back(C);
+                sj1.push_back(J1);
+                sw1.push_back(W1);
+                sc1.push_back(C1);
             }
             if (obj_skinned)
                 for (size_t j = 0; j < md.skin_joint_nodes.size() &&
@@ -7456,6 +7604,11 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
         preview_skin_joints_    = std::move(sj);
         preview_skin_weights_   = std::move(sw);
         preview_skin_closeness_ = std::move(sc);
+        // 8-bone debug second set (all-zero weights for 4-bone assets — a
+        // zero weight contributes nothing to the CPU blend).
+        preview_skin_joints1_    = std::move(sj1);
+        preview_skin_weights1_   = std::move(sw1);
+        preview_skin_closeness1_ = std::move(sc1);
         preview_node_parent_.assign(hier.size(), -1);
         preview_node_name_.assign(hier.size(), std::string());
         preview_node_bind_local_.assign(hier.size(), glm::mat4(1.0f));
