@@ -60,6 +60,10 @@ struct ModelPreviewData {
     // (into the skin table below) + 4 normalized weights.
     std::vector<glm::u16vec4>   joints;
     std::vector<glm::vec4>      weights;
+    // Optional: baked distance-derived closeness for the same 4 joints (auto-rig
+    // _CLOSENESS_0).  Parallel to weights when present; empty otherwise.  Used by
+    // the debug display so it renders the baked distance, not a runtime recompute.
+    std::vector<glm::vec4>      closeness;
     // Skin table: per joint, the node it binds to (index into the
     // group's hierarchy.rwhier node array — glTF node order) and the
     // inverse bind matrix.  Together with joints/weights this is the

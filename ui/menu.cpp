@@ -6726,10 +6726,12 @@ void Menu::tickPreviewAnimation() {
     engine::helper::MeshPreview::setWeightDebug(wdebug || ddebug);  // shared heatmap
     engine::helper::MeshPreview::setSegmentDebug(sdebug);
 
-    // Distance mode: geodesic distance from the SELECTED bone over the cached
-    // bind surface → closeness = exp(-dist/tau) (red at the bone, fading out).
-    // Recomputed only when the selected bone changes.
-    if (ddebug && !preview_weight_bones_.empty() && !preview_weld_adj_.empty()) {
+    // Distance mode: show the auto-rig's BAKED closeness for the selected bone
+    // — NO runtime geodesic recompute.  preview_skin_closeness_ holds, per
+    // vertex, the closeness of its 4 influencing bones (parallel to joints); we
+    // read the column matching the selected node.  Refreshed only on selection.
+    if (ddebug && !preview_weight_bones_.empty() &&
+        preview_skin_closeness_.size() == vc) {
         int sel = preview_weight_sel_;
         if (sel < 0) sel = 0;
         if (sel >= (int)preview_weight_bones_.size())
@@ -6737,119 +6739,18 @@ void Menu::tickPreviewAnimation() {
         if (sel != preview_dist_sel_cached_ ||
             preview_surface_close_.size() != vc) {
             preview_dist_sel_cached_ = sel;
-            glm::vec3 bmn(1e30f), bmx(-1e30f);
-            for (const auto& p : preview_weld_pos_) {
-                bmn = glm::min(bmn, p); bmx = glm::max(bmx, p);
-            }
-            const float scale = glm::length(bmx - bmn);
-            const float tau   = glm::max(0.25f * scale, 1e-4f);
-            const int Wn = (int)preview_weld_pos_.size();
-            // BONE-RAY seeding (matches the auto-rig pass): straight-line
-            // nearest-joint assignment leaks across gaps (with the arm down the
-            // elbow is euclidean-near the waist, so the waist would wrongly seed
-            // the forearm).  Instead fire rays from points ALONG the selected
-            // bone's segment; the NEAREST surface hit in each direction is the
-            // limb that wraps the bone, so seeds land on the correct part and
-            // the geodesic distance is measured from there.
-            const int selNode = preview_weight_bones_[sel];
-            const glm::vec3 B = preview_joint_bind_world_[selNode];
-            const int par = (selNode < (int)preview_node_parent_.size())
-                                ? preview_node_parent_[selNode] : -1;
-            const glm::vec3 A =
-                (par >= 0 && par < (int)preview_joint_bind_world_.size())
-                    ? preview_joint_bind_world_[par] : B;
-            auto rayTriV = [&](const glm::vec3& o, const glm::vec3& d,
-                               const glm::ivec3& t, float& outT) -> bool {
-                const glm::vec3& v0 = preview_weld_pos_[t.x];
-                const glm::vec3& v1 = preview_weld_pos_[t.y];
-                const glm::vec3& v2 = preview_weld_pos_[t.z];
-                const glm::vec3 e1 = v1 - v0, e2 = v2 - v0;
-                const glm::vec3 pv = glm::cross(d, e2);
-                const float det = glm::dot(e1, pv);
-                if (std::fabs(det) < 1e-12f) return false;
-                const float inv = 1.0f / det;
-                const glm::vec3 tv = o - v0;
-                const float u = glm::dot(tv, pv) * inv;
-                if (u < -1e-5f || u > 1.0f + 1e-5f) return false;
-                const glm::vec3 qv = glm::cross(tv, e1);
-                const float vb = glm::dot(d, qv) * inv;
-                if (vb < -1e-5f || u + vb > 1.0f + 1e-5f) return false;
-                const float tt = glm::dot(e2, qv) * inv;
-                if (tt <= 1e-6f) return false;
-                outT = tt; return true;
-            };
-            std::vector<float> dist(Wn, 1e30f);
-            std::priority_queue<std::pair<float, int>,
-                                std::vector<std::pair<float, int>>,
-                                std::greater<std::pair<float, int>>> pq;
-            const int kBoneDirs = 64, kSamples = 4;
-            std::vector<std::pair<float, int>> hits;
-            for (int sp = 0; sp <= kSamples; ++sp) {
-                const float u = static_cast<float>(sp) / kSamples;
-                const glm::vec3 o = A + (B - A) * u;
-                for (int s = 0; s < kBoneDirs; ++s) {
-                    const float k     = static_cast<float>(s) + 0.5f;
-                    const float phi   = std::acos(1.0f - 2.0f * k / kBoneDirs);
-                    const float theta = 2.39996323f * static_cast<float>(s);
-                    const glm::vec3 d(std::sin(phi) * std::cos(theta),
-                                      std::sin(phi) * std::sin(theta),
-                                      std::cos(phi));
-                    float bestT = 1e30f; int bestTri = -1;
-                    for (size_t ti = 0; ti < preview_weld_tris_.size(); ++ti) {
-                        const glm::ivec3& tv = preview_weld_tris_[ti];
-                        float tt;
-                        if (!rayTriV(o, d, tv, tt)) continue;
-                        // Only seed the surface the bone EXITS (its own limb);
-                        // a foreign part across a gap is ENTERED (normal faces
-                        // the ray) and is rejected.
-                        const glm::vec3 fn = glm::cross(
-                            preview_weld_pos_[tv.y] - preview_weld_pos_[tv.x],
-                            preview_weld_pos_[tv.z] - preview_weld_pos_[tv.x]);
-                        if (glm::dot(fn, d) <= 0.0f) continue;
-                        if (tt < bestT) { bestT = tt; bestTri = (int)ti; }
-                    }
-                    if (bestTri >= 0) hits.push_back({ bestT, bestTri });
-                }
-            }
-            // Reject far outlier hits (rays that escaped into a neighbour) using
-            // the median nearest-hit distance as the local limb radius — keeps
-            // the bone's own cross-section.  No euclidean fallback: if no rays
-            // hit, the field is simply empty (geodesic-only).
-            if (!hits.empty()) {
-                std::vector<float> ds; ds.reserve(hits.size());
-                for (const auto& h : hits) ds.push_back(h.first);
-                std::nth_element(ds.begin(), ds.begin() + ds.size() / 2, ds.end());
-                const float cutoff = ds[ds.size() / 2] * 2.0f + 1e-4f;
-                for (const auto& h : hits) {
-                    if (h.first > cutoff) continue;
-                    const glm::ivec3& t = preview_weld_tris_[h.second];
-                    for (int c = 0; c < 3; ++c) {
-                        const int sw = t[c];
-                        if (dist[sw] > 0.0f) { dist[sw] = 0.0f; pq.push({0.0f, sw}); }
-                    }
-                }
-            }
-            while (!pq.empty()) {
-                const auto top = pq.top(); pq.pop();
-                const float d = top.first; const int u = top.second;
-                if (d > dist[u]) continue;
-                for (const auto& e : preview_weld_adj_[u]) {
-                    const float ndd = d + e.second;
-                    if (ndd < dist[e.first]) {
-                        dist[e.first] = ndd; pq.push({ndd, e.first});
-                    }
-                }
-            }
-            // Falloff ends at the "yellow" band (closeness kYellow) and is
-            // discarded beyond — matches the auto-rig weight cutoff so the
-            // heatmap shows exactly the kept influence region.
-            const float kYellow = 0.625f;
+            // Look up the SELECTED bone's baked closeness on every vertex:
+            // find which of the vertex's 4 influencing joints is the selected
+            // node and read its closeness (0 where the bone has no influence).
+            const uint32_t selNode = (uint32_t)preview_weight_bones_[sel];
             preview_surface_close_.assign(vc, 0.0f);
             for (size_t v = 0; v < vc; ++v) {
-                const float d = dist[preview_weld_id_[v]];
-                const float c = (d >= 1e29f) ? 0.0f : std::exp(-d / tau);
-                preview_surface_close_[v] =
-                    (c < kYellow) ? 0.0f : (c - kYellow) / (1.0f - kYellow);
+                const glm::uvec4 J = preview_skin_joints_[v];
+                const glm::vec4  C = preview_skin_closeness_[v];
+                float c = 0.0f;
+                for (int k = 0; k < 4; ++k)
+                    if (J[k] == selNode) { c = C[k]; break; }
+                preview_surface_close_[v] = c;
             }
         }
     }
@@ -7375,6 +7276,7 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
     // Animated-preview capture (used only when the whole group is skinned).
     std::vector<glm::uvec4>            sj;            // per vtx: 4 node indices
     std::vector<glm::vec4>             sw;            // per vtx: 4 weights
+    std::vector<glm::vec4>             sc;            // per vtx: 4 baked closeness
     std::unordered_map<int, glm::mat4> invbind_map;   // skeleton node → inv bind
     bool all_skinned = true;
     int  first_skinned_ordinal = -1;   // owner mesh node (bind-space cancel)
@@ -7429,9 +7331,12 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
                 }
                 if (any) first_skinned_ordinal = ord;
             }
+            const bool obj_close =
+                obj_skinned && md.closeness.size() == md.positions.size();
             for (size_t i = 0; i < md.positions.size(); ++i) {
                 glm::uvec4 J(0u);
                 glm::vec4  W(0.0f);
+                glm::vec4  C(0.0f);
                 if (obj_skinned) {
                     const glm::u16vec4 lj = md.joints[i];
                     for (int k = 0; k < 4; ++k) {
@@ -7440,9 +7345,11 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
                             ? (uint32_t)md.skin_joint_nodes[local] : 0u;
                     }
                     W = md.weights[i];
+                    if (obj_close) C = md.closeness[i];
                 }
                 sj.push_back(J);
                 sw.push_back(W);
+                sc.push_back(C);
             }
             if (obj_skinned)
                 for (size_t j = 0; j < md.skin_joint_nodes.size() &&
@@ -7546,8 +7453,9 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
 
         // Weights come straight from the asset now (the auto-rig pass does the
         // geodesic surface weighting at rig time — no preview-side de-bleed).
-        preview_skin_joints_  = std::move(sj);
-        preview_skin_weights_ = std::move(sw);
+        preview_skin_joints_    = std::move(sj);
+        preview_skin_weights_   = std::move(sw);
+        preview_skin_closeness_ = std::move(sc);
         preview_node_parent_.assign(hier.size(), -1);
         preview_node_name_.assign(hier.size(), std::string());
         preview_node_bind_local_.assign(hier.size(), glm::mat4(1.0f));
@@ -7610,11 +7518,19 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
             preview_weld_id_.assign(Vp, 0);
             preview_weld_pos_.clear();
             std::unordered_map<uint64_t, int> weld; weld.reserve(Vp * 2);
-            auto keyOf = [](const glm::vec3& p) -> uint64_t {
-                uint32_t u[3]; std::memcpy(u, &p, sizeof(u));
-                for (int i = 0; i < 3; ++i) if (u[i] == 0x80000000u) u[i] = 0u;
+            // Tolerance weld (snap to a grid) — MUST match the auto-rig's
+            // welding so the two geodesic graphs are identical and the soup-like
+            // surface reconnects (see auto_rig_plugin computeSkinWeights).
+            glm::vec3 pmn(1e30f), pmx(-1e30f);
+            for (const auto& pp : P) { pmn = glm::min(pmn, pp); pmx = glm::max(pmx, pp); }
+            const double weld_eps =
+                std::max((double)glm::length(pmx - pmn) * 1e-4, 1e-9);
+            auto keyOf = [weld_eps](const glm::vec3& p) -> uint64_t {
                 uint64_t h = 1469598103934665603ull;
-                for (int i = 0; i < 3; ++i) { h ^= u[i]; h *= 1099511628211ull; }
+                for (int i = 0; i < 3; ++i) {
+                    const int64_t qi = (int64_t)std::llround((double)p[i] / weld_eps);
+                    h ^= (uint64_t)qi; h *= 1099511628211ull;
+                }
                 return h;
             };
             for (int i = 0; i < Vp; ++i) {
@@ -7647,6 +7563,22 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
             preview_joint_bind_world_.assign(hier.size(), glm::vec3(0.0f));
             for (size_t i = 0; i < hier.size(); ++i)
                 preview_joint_bind_world_[i] = glm::vec3(nwb[i][3]);
+            // DIAGNOSTIC: same numbers the auto-rig logs as [AutoRig][dist-diag],
+            // so the two welded geodesic graphs can be compared directly.
+            {
+                size_t edges = 0;
+                for (const auto& a : preview_weld_adj_) edges += a.size();
+                glm::vec3 dmn(1e30f), dmx(-1e30f);
+                for (const auto& p : preview_weld_pos_) {
+                    dmn = glm::min(dmn, p); dmx = glm::max(dmx, p);
+                }
+                char b[256];
+                std::snprintf(b, sizeof(b),
+                    "[Preview][dist-diag] meshNv=%d weldedW=%d edges=%zu tris=%zu "
+                    "diag=%.4f", Vp, Wn, edges / 2, preview_weld_tris_.size(),
+                    glm::length(dmx - dmn));
+                EditorLog::get().push(b);   // → on-screen Output Log window
+            }
             preview_dist_sel_cached_ = -999;
             preview_surface_close_.clear();
         }

@@ -66,18 +66,23 @@ layout(location = 0) out ObjectVsPsData out_data;
 mat4 getSkinningMatrix()
 {
     mat4 skin = mat4(0);
+    float wsum = 0.0;
 #ifdef HAS_SKIN_SET_0
     skin += in_weights_0.x * joint_matrices[int(in_joints_0.x)]
           + in_weights_0.y * joint_matrices[int(in_joints_0.y)]
           + in_weights_0.z * joint_matrices[int(in_joints_0.z)]
           + in_weights_0.w * joint_matrices[int(in_joints_0.w)];
+    wsum += in_weights_0.x + in_weights_0.y + in_weights_0.z + in_weights_0.w;
 #endif
 #ifdef HAS_SKIN_SET_1
     skin += in_weights_1.x * joint_matrices[int(in_joints_1.x)]
           + in_weights_1.y * joint_matrices[int(in_joints_1.y)]
           + in_weights_1.z * joint_matrices[int(in_joints_1.z)]
           + in_weights_1.w * joint_matrices[int(in_joints_1.w)];
+    wsum += in_weights_1.x + in_weights_1.y + in_weights_1.z + in_weights_1.w;
 #endif
+    if (wsum > 1e-4) skin *= (1.0 / wsum);   // match the position path
+    else             skin = mat4(1.0);
     return skin;
 }
 
@@ -137,12 +142,15 @@ void main() {
     // skipping, which also keeps the path safe if joint_matrices is
     // empty or mis-sized.
     if (model_params.debug_skip_skinning == 0u) {
+        mat4 skin_matrix = mat4(0);
+        float wsum = 0.0;
 #ifdef HAS_SKIN_SET_0
-        mat4 skin_matrix =
+        skin_matrix +=
             in_weights_0.x * joint_matrices[int(in_joints_0.x)] +
             in_weights_0.y * joint_matrices[int(in_joints_0.y)] +
             in_weights_0.z * joint_matrices[int(in_joints_0.z)] +
             in_weights_0.w * joint_matrices[int(in_joints_0.w)];
+        wsum += in_weights_0.x + in_weights_0.y + in_weights_0.z + in_weights_0.w;
 #endif
 #ifdef HAS_SKIN_SET_1
         skin_matrix +=
@@ -150,7 +158,13 @@ void main() {
             in_weights_1.y * joint_matrices[int(in_joints_1.y)] +
             in_weights_1.z * joint_matrices[int(in_joints_1.z)] +
             in_weights_1.w * joint_matrices[int(in_joints_1.w)];
+        wsum += in_weights_1.x + in_weights_1.y + in_weights_1.z + in_weights_1.w;
 #endif
+        // Renormalize so weights that don't sum to 1 don't drag the vertex toward
+        // the origin; an unweighted vertex (wsum~0) stays at bind pose instead of
+        // collapsing to the object origin.  Mirrors the CPU preview path.
+        if (wsum > 1e-4) skin_matrix *= (1.0 / wsum);
+        else             skin_matrix = mat4(1.0);
         matrix_ls = matrix_ls * skin_matrix;
     }
 #endif

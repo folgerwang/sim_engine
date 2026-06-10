@@ -788,6 +788,10 @@ public:
     engine::helper::MeshPreviewPayload preview_anim_base_;   // BIND pose
     std::vector<glm::uvec4> preview_skin_joints_;            // per vtx: node idx
     std::vector<glm::vec4>  preview_skin_weights_;           // per vtx
+    std::vector<glm::vec4>  preview_skin_closeness_;         // per vtx: baked
+                                                             // auto-rig distance
+                                                             // closeness (parallel
+                                                             // to joints/weights)
     std::vector<int32_t>    preview_node_parent_;            // skeleton
     std::vector<std::string> preview_node_name_;             // bone names
     std::vector<glm::mat4>  preview_node_bind_local_;        // node-local bind
