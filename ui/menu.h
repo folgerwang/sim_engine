@@ -568,6 +568,12 @@ public:
     bool scene_save_request_   = false;
     bool scene_load_request_   = false;
     bool scene_create_request_ = false;  // "Create Scene" (empty + grid)
+    // Recent Scenes: most-recently-loaded scene paths (front = newest). The
+    // application owns persistence (writes/reads the on-disk list) and hands
+    // the list here via setRecentScenes(); clicking an entry in the Scene →
+    // Recent Scenes submenu fills recent_scene_load_request_ for the app.
+    std::vector<std::string> recent_scenes_;
+    std::string              recent_scene_load_request_;
     bool camera_create_request_ = false; // "Create Camera Here" (view pose)
     bool player_create_request_ = false; // "Add Player Object"
     bool bgm_create_request_    = false; // "Add BGM Object"
@@ -1094,6 +1100,23 @@ public:
     }
     bool consumeLoadSceneRequest() {
         if (scene_load_request_) { scene_load_request_ = false; return true; }
+        return false;
+    }
+    // Recent Scenes list (front = most recent). The application loads this
+    // from disk at startup and refreshes it after every successful load.
+    void setRecentScenes(std::vector<std::string> v) {
+        recent_scenes_ = std::move(v);
+    }
+    const std::vector<std::string>& recentScenes() const { return recent_scenes_; }
+    // True once after a Scene → Recent Scenes entry is clicked; out_path is the
+    // scene file to load. Mirrors consumeLoadSceneRequest but skips the OS
+    // dialog since the path is already known.
+    bool consumeRecentSceneLoadRequest(std::string& out_path) {
+        if (!recent_scene_load_request_.empty()) {
+            out_path = recent_scene_load_request_;
+            recent_scene_load_request_.clear();
+            return true;
+        }
         return false;
     }
     // "Create Scene" mode: clears the current scene to an empty grid the user

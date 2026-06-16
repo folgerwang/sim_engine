@@ -2053,6 +2053,26 @@ bool Menu::draw(
             // button / drag-and-drop) — no Scene-menu duplicate.
             if (ImGui::MenuItem("Save Scene"))      { scene_save_request_   = true; }
             if (ImGui::MenuItem("Load Scene..."))   { scene_load_request_   = true; }
+            // Recent Scenes: quick reload of recently opened scenes without the
+            // OS file dialog.  Entries show the file's basename; the full path
+            // is sent back via recent_scene_load_request_.
+            if (ImGui::BeginMenu("Recent Scenes")) {
+                if (recent_scenes_.empty()) {
+                    ImGui::MenuItem("(none)", NULL, false, /*enabled=*/false);
+                } else {
+                    for (const std::string& path : recent_scenes_) {
+                        const std::string label =
+                            std::filesystem::path(path).stem().string();
+                        if (ImGui::MenuItem(label.c_str())) {
+                            recent_scene_load_request_ = path;
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("%s", path.c_str());
+                        }
+                    }
+                }
+                ImGui::EndMenu();
+            }
             ImGui::EndMenu();
         }
 
