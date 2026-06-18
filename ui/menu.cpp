@@ -10,6 +10,7 @@
 #include <limits>
 #include <ctime>
 #include <queue>          // geodesic weight de-bleed (Dijkstra)
+#include <chrono>         // monotonic clock for the one-time viewport intro fade
 #include <functional>     // std::greater
 #include <unordered_map>
 #include <cstring>        // std::memcpy (exact-position vertex weld)
@@ -889,6 +890,32 @@ bool Menu::draw(
     // in-game.
     if (editor_enabled_) {
         drawEditorDockSpace();
+    }
+
+    // ── Main viewport intro: hold solid gray 1.5s, then fade in over 3s ──
+    // Plays once per program run.  A function-local static monotonic clock is
+    // used (not ImGui::GetTime or a Menu member) so it does NOT replay when the
+    // window is resized — those events recreate the swapchain/Menu/ImGui frame
+    // but leave this static origin untouched.
+    {
+        constexpr double kHold = 1.5;   // fully gray (half of the fade time)
+        constexpr double kFade = 3.0;   // gray -> live render
+        static const std::chrono::steady_clock::time_point kFadeOrigin =
+            std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - kFadeOrigin).count();
+        if (elapsed < kHold + kFade) {
+            double opacity = 1.0;                       // hold phase
+            if (elapsed > kHold)
+                opacity = 1.0 - (elapsed - kHold) / kFade;  // fade phase
+            if (opacity < 0.0) opacity = 0.0;
+            ImVec2 vp_pos, vp_size, vp_c;
+            getViewportScreenRect(vp_pos, vp_size, vp_c);
+            const int a = (int)(opacity * 255.0 + 0.5);
+            ImGui::GetBackgroundDrawList(ImGui::GetMainViewport())->AddRectFilled(
+                vp_pos, ImVec2(vp_pos.x + vp_size.x, vp_pos.y + vp_size.y),
+                IM_COL32(96, 96, 102, a));
+        }
     }
 
     // ── Hover-object tooltip ──────────────────────────────────────────
