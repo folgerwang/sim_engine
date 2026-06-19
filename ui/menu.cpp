@@ -865,7 +865,10 @@ void Menu::init(
     sel_mask_node_ = -3;
 
     // Debug Display GPU preview target: same descriptor-pool hazard as the
-    // selection mask — re-register its view with the fresh pool.
+    // selection mask — re-register its view with the fresh pool, and drop its
+    // deferred-free descriptor list WITHOUT RemoveTexture (those belonged to
+    // the now-destroyed pool).
+    engine::helper::MeshPreview::dropDeadImGuiDescriptors();
     engine::helper::MeshPreview::reregisterImGui();
 }
 
@@ -7999,6 +8002,11 @@ void Menu::drawDebugDisplayPanel() {
         ImGui::SetNextWindowFocus();
         preview_focus_ = false;
     }
+    // Keep this panel wide/tall enough that the skinned-preview toolbar
+    // (Bones / Weights / Segments / Dist) never clips, while still letting the
+    // user enlarge it.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(420.0f, 340.0f),
+                                        ImVec2(100000.0f, 100000.0f));
     if (ImGui::Begin("Debug Display")) {
         engine::game_object::DrawableObject* obj = nullptr;
         int node = -3;

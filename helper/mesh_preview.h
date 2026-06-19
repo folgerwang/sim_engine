@@ -110,6 +110,9 @@ public:
     static ImTextureID imguiId() { return s_im_id_; }
     // Re-register with a fresh ImGui descriptor pool (swapchain rebuild).
     static void reregisterImGui();
+    // Drop the retired-descriptor list WITHOUT freeing (their pool was just
+    // destroyed in a descriptor-pool rebuild, so RemoveTexture would be UB).
+    static void dropDeadImGuiDescriptors();
     // True once a preview has been rendered at least once.
     static bool hasImage() { return s_has_image_; }
 
@@ -221,8 +224,16 @@ private:
         uint64_t                               free_frame;
         std::shared_ptr<renderer::TextureInfo> tex;
     };
+    // Retired ImGui descriptor sets (from a resize re-register).  An in-flight
+    // or secondary-viewport draw may still sample the old descriptor this frame,
+    // so we free it a few frames later via collectGarbage instead of immediately.
+    struct DeadImId {
+        uint64_t    free_frame;
+        ImTextureID id;
+    };
     static std::vector<DeadBuffer>                 s_dead_;
     static std::vector<DeadTexture>                s_dead_tex_;
+    static std::vector<DeadImId>                   s_dead_im_;
 };
 
 } // namespace helper

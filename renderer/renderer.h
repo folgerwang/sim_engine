@@ -616,6 +616,8 @@ public:
         const std::shared_ptr<Sampler>& sampler,
         const std::shared_ptr<ImageView>& image_View);
 
+    static void removeImTextureID(ImTextureID id);
+
     static void submitQueue(
         const std::shared_ptr<Queue>& present_queue,
         const std::shared_ptr<Fence>& in_flight_fence,

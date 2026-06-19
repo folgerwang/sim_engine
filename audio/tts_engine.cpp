@@ -190,6 +190,19 @@ struct TtsState {
     std::atomic<uint64_t>   playing_handle{0};
     std::atomic<bool>       synthesizing{false};
     uint64_t                next_id = 1;
+
+    // Join the worker on static teardown so the std::thread destructor never
+    // runs while the thread is still joinable (which would call std::terminate
+    // during program exit / atexit).  Safety net independent of whether
+    // TtsEngine::shutdown() was called.
+    ~TtsState() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            quit = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
 };
 
 TtsState& S() {

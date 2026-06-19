@@ -1132,6 +1132,10 @@ ImTextureID Helper::addImTextureID(
     return (ImTextureID)ImGui_ImplVulkan_AddTexture(vk_sampler, vk_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
+void Helper::removeImTextureID(ImTextureID id) {
+    if (id) ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)id);
+}
+
 void Helper::submitQueue(
     const std::shared_ptr<Queue>& command_queue,
     const std::shared_ptr<Fence>& in_flight_fence,

@@ -169,6 +169,7 @@ uint32_t                                               MeshPreview::s_height_ = 
 uint32_t                                               MeshPreview::s_req_w_  = 0;
 uint32_t                                               MeshPreview::s_req_h_  = 0;
 uint64_t                                               MeshPreview::s_frame_  = 0;
+std::vector<MeshPreview::DeadImId>                     MeshPreview::s_dead_im_;
 std::vector<std::shared_ptr<renderer::DescriptorSet>>  MeshPreview::s_active_sets_;
 std::vector<MeshPreview::RecycleSet>                   MeshPreview::s_set_recycle_;
 std::vector<MeshPreview::GpuSection>                   MeshPreview::s_sections_;
@@ -331,6 +332,7 @@ void MeshPreview::destroyStaticMembers(
     for (auto& d : s_dead_tex_) { if (d.tex) d.tex->destroy(device); }
     s_dead_.clear();
     s_dead_tex_.clear();
+    s_dead_im_.clear();   // ImGui pool is torn down separately; just drop
     if (s_pos_buf_)  { s_pos_buf_->destroy(device);  s_pos_buf_.reset(); }
     if (s_nrm_buf_)  { s_nrm_buf_->destroy(device);  s_nrm_buf_.reset(); }
     if (s_uv_buf_)   { s_uv_buf_->destroy(device);   s_uv_buf_.reset(); }
@@ -395,6 +397,20 @@ void MeshPreview::collectGarbage(
             ++it;
         }
     }
+    for (auto it = s_dead_im_.begin(); it != s_dead_im_.end();) {
+        if (current_frame >= it->free_frame) {
+            renderer::Helper::removeImTextureID(it->id);
+            it = s_dead_im_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void MeshPreview::dropDeadImGuiDescriptors() {
+    // The descriptor pool these belonged to was just destroyed, so calling
+    // RemoveTexture would free from the wrong pool.  Drop without freeing.
+    s_dead_im_.clear();
 }
 
 void MeshPreview::applyPendingResize(
@@ -428,6 +444,12 @@ void MeshPreview::applyPendingResize(
         device, kDepthFormat, glm::uvec2(w, h), *s_depth_,
         std::source_location::current());
 
+    // Retire the OLD ImGui descriptor on the deferred-free list (this frame's
+    // draw data — including any secondary viewport rendered later in
+    // RenderPlatformWindowsDefault — may still reference it).  Then register a
+    // fresh descriptor for the new view.  Without this the old descriptor was
+    // leaked and could be sampled after its view was freed -> Vulkan crash.
+    if (s_im_id_) { s_dead_im_.push_back({ s_frame_ + 5, s_im_id_ }); s_im_id_ = 0; }
     reregisterImGui();        // new view -> new ImGui texture id
     s_camera_dirty_ = true;   // force a re-record at the new size
 }
