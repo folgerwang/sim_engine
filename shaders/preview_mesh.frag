@@ -124,6 +124,21 @@ void main() {
         return;
     }
 
+    // Weight-sum mode (bit4): the editor packs the TOTAL skin-weight sum of
+    // the vertex into v_uv.x.  Map 0 → red, 1 → white, 2+ → blue so a correctly
+    // normalized vertex (sum ~1) reads white, under-weighted reads red, and
+    // over-weighted reads blue.
+    if ((map_flags & 16) != 0) {
+        float s = v_uv.x;
+        vec3 c;
+        if (s < 1.0) c = mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0),
+                             clamp(s, 0.0, 1.0));
+        else         c = mix(vec3(1.0, 1.0, 1.0), vec3(0.0, 0.0, 1.0),
+                             clamp(s - 1.0, 0.0, 1.0));
+        outColor = vec4(c, 1.0);
+        return;
+    }
+
     // Segmentation mode (bit3): v_uv.x carries the dominant bone/joint index;
     // map it to a distinct hue (golden-ratio spacing) so each body part /
     // segment reads as its own flat colour.

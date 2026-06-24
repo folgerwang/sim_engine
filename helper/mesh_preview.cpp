@@ -193,6 +193,7 @@ bool      MeshPreview::s_camera_dirty_ = false;
 glm::mat4 MeshPreview::s_view_proj_  = glm::mat4(1.0f);
 bool      MeshPreview::s_weight_debug_ = false;
 bool      MeshPreview::s_segment_debug_ = false;
+bool      MeshPreview::s_weight_sum_debug_ = false;
 
 void MeshPreview::initStaticMembers(
     const std::shared_ptr<renderer::Device>& device,
@@ -826,8 +827,9 @@ void MeshPreview::recordPass(
             sec.metallic, sec.roughness,
             sec.has_tex ? 1.0f : 0.0f,
             (sec.has_nrm ? 1.0f : 0.0f) + (sec.has_mr ? 2.0f : 0.0f)
-                + (s_weight_debug_  ? 4.0f : 0.0f)    // bit2 = weight render
-                + (s_segment_debug_ ? 8.0f : 0.0f));  // bit3 = segment render
+                + (s_weight_debug_  ? 4.0f : 0.0f)     // bit2 = weight render
+                + (s_segment_debug_ ? 8.0f : 0.0f)     // bit3 = segment render
+                + (s_weight_sum_debug_ ? 16.0f : 0.0f)); // bit4 = weight-sum render
         cmd_buf->pushConstants(
             SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
             s_pipeline_layout_,

@@ -6916,8 +6916,12 @@ void Menu::tickPreviewAnimation() {
     }
     const bool sdebug = preview_show_segments_ && !wdebug;  // segment colouring
     const bool ddebug = preview_show_distance_ && !wdebug && !sdebug;
+    // Weight-sum colouring: total skin weight per vertex (0=red,1=white,2=blue).
+    const bool sumdebug =
+        preview_show_weight_sum_ && !wdebug && !sdebug && !ddebug;
     engine::helper::MeshPreview::setWeightDebug(wdebug || ddebug);  // shared heatmap
     engine::helper::MeshPreview::setSegmentDebug(sdebug);
+    engine::helper::MeshPreview::setWeightSumDebug(sumdebug);
 
     // Distance mode: show the auto-rig's BAKED closeness for the selected bone
     // — NO runtime geodesic recompute.  preview_skin_closeness_ holds, per
@@ -7005,6 +7009,15 @@ void Menu::tickPreviewAnimation() {
                    v < preview_surface_close_.size()) {
             // Distance render: closeness to the selected bone (heatmap branch).
             out.uvs[v] = glm::vec2(preview_surface_close_[v], 0.0f);
+        } else if (sumdebug && v < out.uvs.size()) {
+            // Weight-sum render: pack the RAW (pre-normalization) total of all
+            // skin influences on this vertex into uv.x.  Read by the preview
+            // shader's weight-sum branch (0=red, 1=white, 2=blue).  Uses the
+            // uploaded weights directly (no per-bone scale) so it reflects the
+            // baked skin data, surfacing verts that don't sum to ~1.
+            float sum = W.x + W.y + W.z + W.w;
+            if (has8) sum += W1.x + W1.y + W1.z + W1.w;
+            out.uvs[v] = glm::vec2(sum, 0.0f);
         }
         const glm::vec3& bp = preview_anim_base_.positions[v];
         if (wsum <= 1e-6f) {
@@ -7263,6 +7276,7 @@ void Menu::drawRenderDebugMenuContent() {
         { 12, "12: Hi-Z pyramid (mip)"     },
         { 13, "13: Mesh category (solid)"  },
         { 14, "14: Object ID (per mesh)"   },
+        { 15, "15: Weight sum (skin)"      },
     };
     for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
         const auto& item = kRenderDebugItems[i];
@@ -8278,6 +8292,7 @@ void Menu::drawDebugDisplayPanel() {
                     if (preview_show_weights_) {
                         preview_show_segments_ = false;
                         preview_show_distance_ = false;
+                        preview_show_weight_sum_ = false;
                     }
                 }
                 ImGui::SameLine();
@@ -8287,6 +8302,7 @@ void Menu::drawDebugDisplayPanel() {
                     if (preview_show_segments_) {
                         preview_show_weights_ = false;
                         preview_show_distance_ = false;
+                        preview_show_weight_sum_ = false;
                     }
                 }
                 ImGui::SameLine();
@@ -8296,8 +8312,19 @@ void Menu::drawDebugDisplayPanel() {
                     if (preview_show_distance_) {
                         preview_show_weights_  = false;
                         preview_show_segments_ = false;
+                        preview_show_weight_sum_ = false;
                     }
                     preview_dist_sel_cached_ = -999;   // force recompute
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(preview_show_weight_sum_ ? "Sum: On"
+                                                           : "Sum: Off")) {
+                    preview_show_weight_sum_ = !preview_show_weight_sum_;
+                    if (preview_show_weight_sum_) {
+                        preview_show_weights_  = false;
+                        preview_show_segments_ = false;
+                        preview_show_distance_ = false;
+                    }
                 }
             }
             // Skeleton overlay — shown for Bones mode OR Weights mode (the
@@ -8305,7 +8332,8 @@ void Menu::drawDebugDisplayPanel() {
             // bones, highlighting the selected bone white in Weights mode).
             const bool overlay_skel =
                 (preview_show_skeleton_ || preview_show_weights_ ||
-                 preview_show_segments_ || preview_show_distance_) &&
+                 preview_show_segments_ || preview_show_distance_ ||
+                 preview_show_weight_sum_) &&
                 preview_anim_ready_ &&
                 preview_joint_world_.size() == preview_node_parent_.size() &&
                 !preview_joint_world_.empty();

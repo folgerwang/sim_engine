@@ -130,6 +130,10 @@ public:
     // Segmentation render: mesh drawn flat, coloured by the dominant bone index
     // the caller packs into uv.x (distinct hue per segment).
     static void setSegmentDebug(bool on) { s_segment_debug_ = on; }
+    // Weight-sum render: mesh drawn flat, coloured by the TOTAL skin-weight sum
+    // the caller packs into uv.x (0 = red, 1 = white, 2+ = blue).  Surfaces
+    // verts whose influences don't add up to ~1 (the skinning failure mode).
+    static void setWeightSumDebug(bool on) { s_weight_sum_debug_ = on; }
     // Request a new target resolution (cheap; applied next render/rerender on
     // the main thread). Driven by the Debug Display panel size so the preview
     // re-renders at native resolution instead of upscaling a fixed 512^2.
@@ -216,6 +220,7 @@ private:
     static glm::mat4 s_view_proj_;   // world→clip of the last recorded pass
     static bool      s_weight_debug_;  // flat per-vertex-weight render mode
     static bool      s_segment_debug_; // flat per-segment (bone index) render
+    static bool      s_weight_sum_debug_; // flat total-weight-sum render mode
     struct DeadBuffer {
         uint64_t                              free_frame;
         std::shared_ptr<renderer::BufferInfo> buf;

@@ -336,6 +336,22 @@ void main() {
         // White → ssao_apply.comp multiplies by ao → vec3(ao) on screen.
         // See cluster_bindless.frag's matching branch for the rationale.
         outColor = vec4(1.0, 1.0, 1.0, 1.0);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_WEIGHT_SUM) {
+        // Per-vertex skin weight sum (interpolated across the triangle).
+        //   sum 0 → red, 1 → white, 2 → blue (clamped past 2).
+        // A correctly skinned vertex sums to ~1 and reads white; red flags
+        // unweighted/under-weighted verts, blue flags over-weighted ones.
+        float ws = ps_in_data.vertex_weight_sum;
+        if (ws < 0.0) {
+            // Non-skinned geometry carries no weights — paint dark grey.
+            outColor = vec4(0.05, 0.05, 0.05, 1.0);
+        } else if (ws < 1.0) {
+            outColor = vec4(mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0),
+                                clamp(ws, 0.0, 1.0)), 1.0);
+        } else {
+            outColor = vec4(mix(vec3(1.0, 1.0, 1.0), vec3(0.0, 0.0, 1.0),
+                                clamp(ws - 1.0, 0.0, 1.0)), 1.0);
+        }
     }
 #else
     outColor = baseColor;

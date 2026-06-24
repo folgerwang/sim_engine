@@ -180,6 +180,26 @@ void main() {
         in_loc_pos_scale.xyz;
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
+
+    // ── Weight-sum debug varying ─────────────────────────────────────────────
+    // Carry the raw (pre-normalization) sum of all skin influences so the
+    // WEIGHT_SUM render-debug mode can colour the mesh by it.  -1 marks a
+    // non-skinned vertex; computed independently of debug_skip_skinning so the
+    // visualization reflects the actual uploaded weights either way.
+    out_data.vertex_weight_sum = -1.0;
+#if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
+    {
+        float ws = 0.0;
+#ifdef HAS_SKIN_SET_0
+        ws += in_weights_0.x + in_weights_0.y + in_weights_0.z + in_weights_0.w;
+#endif
+#ifdef HAS_SKIN_SET_1
+        ws += in_weights_1.x + in_weights_1.y + in_weights_1.z + in_weights_1.w;
+#endif
+        out_data.vertex_weight_sum = ws;
+    }
+#endif
+
     out_data.vertex_tex_coord = vec4(0);
 #ifdef HAS_UV_SET0
     out_data.vertex_tex_coord.xy = in_tex_coord.xy;

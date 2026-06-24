@@ -862,6 +862,8 @@ public:
     bool                    preview_show_weights_ = false;
     bool                    preview_show_segments_ = false;  // colour by segment
     bool                    preview_show_distance_ = false;  // geodesic dist heat
+    bool                    preview_show_weight_sum_ = false;  // total skin-weight sum
+                                                               // (0=red,1=white,2=blue)
     // Cached welded BIND surface graph + bind joint positions, built once per
     // preview, for the geodesic distance-to-selected-bone debug.
     std::vector<int>                                preview_weld_id_;

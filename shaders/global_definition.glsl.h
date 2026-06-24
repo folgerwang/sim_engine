@@ -275,6 +275,22 @@
                                                     // per-cluster object id, so
                                                     // application.cpp force-flips to
                                                     // forward while it's active.
+#define DEBUG_RENDER_MODE_WEIGHT_SUM            15  // Per-vertex skinning weight sum.
+                                                    // Colours the character by the raw
+                                                    // (pre-normalization) sum of all
+                                                    // skin influences carried on the
+                                                    // vertex (ObjectVsPsData.vertex_
+                                                    // weight_sum, written by base.vert):
+                                                    //   0  → red    (no weight / unrigged
+                                                    //               vertex pulled to origin)
+                                                    //   1  → white  (correctly normalized)
+                                                    //   2+ → blue   (over-weighted)
+                                                    // Non-skinned geometry (sentinel < 0)
+                                                    // paints dark grey.  Forward-only like
+                                                    // CATEGORY / OBJECT_ID: the deferred
+                                                    // G-buffer doesn't carry per-vertex skin
+                                                    // weights, so application.cpp force-flips
+                                                    // to forward while it's active.
 
 #define LIGHT_COUNT                             1
 // 6 cascades (was 4): smaller extent ratio between adjacent cascades
@@ -1063,6 +1079,10 @@ struct PbrMaterialParams {
 struct ObjectVsPsData {
     vec3 vertex_position;
     vec4 vertex_tex_coord;
+    // Raw (pre-normalization) sum of this vertex's skin weights, written by
+    // base.vert for skinned primitives and consumed by the WEIGHT_SUM render-
+    // debug mode in base.frag.  -1 = non-skinned vertex (no weights).
+    float vertex_weight_sum;
 #ifdef HAS_NORMALS
     vec3 vertex_normal;
 #ifdef HAS_TANGENT
