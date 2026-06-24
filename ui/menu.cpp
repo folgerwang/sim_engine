@@ -54,6 +54,7 @@ extern "C" {
 #include "menu.h"
 #include "plugins/plugin_manager.h"
 #include "plugins/auto_rig/simple_rasterizer.h"  // model-thumbnail mesh loader + CPU rasterizer
+#include "plugins/auto_rig/auto_rig_plugin.h"     // Debug Display "skin layer only" source
 #include "game_object/mesh_load_task_manager.h"
 #include "scene_rendering/ssao.h"
 #include "scene_rendering/cluster_renderer.h"
@@ -901,7 +902,7 @@ bool Menu::draw(
     // window is resized — those events recreate the swapchain/Menu/ImGui frame
     // but leave this static origin untouched.
     {
-        constexpr double kHold = 1.5;   // fully gray (half of the fade time)
+        constexpr double kHold = 0.75;  // fully gray
         constexpr double kFade = 3.0;   // gray -> live render
         static const std::chrono::steady_clock::time_point kFadeOrigin =
             std::chrono::steady_clock::now();
@@ -5130,8 +5131,19 @@ void Menu::drawOutputPanel() {
         const bool changed = (cur_version != s_version);
         s_version = cur_version;
 
-        // Toolbar: clear / autoscroll / filter.
+        // Toolbar: clear / copy / autoscroll / filter.
         if (ImGui::SmallButton("Clear")) { EditorLog::get().clear(); s_lines.clear(); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy")) {
+            // Copy all (filtered) lines to the clipboard.
+            std::string all;
+            const bool hf = (s_filter[0] != '\0');
+            for (const std::string& ln : s_lines) {
+                if (hf && ln.find(s_filter) == std::string::npos) continue;
+                all += ln; all += '\n';
+            }
+            ImGui::SetClipboardText(all.c_str());
+        }
         ImGui::SameLine();
         ImGui::Checkbox("Auto-scroll", &s_autoscroll);
         ImGui::SameLine();
@@ -5145,7 +5157,9 @@ void Menu::drawOutputPanel() {
                           ImGuiWindowFlags_HorizontalScrollbar);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
         const bool has_filter = (s_filter[0] != '\0');
+        int li = 0;
         for (const std::string& ln : s_lines) {
+            ++li;
             if (has_filter && ln.find(s_filter) == std::string::npos) continue;
             // Subtle colour-coding by tag for readability.
             ImVec4 col(0.86f, 0.86f, 0.86f, 1.0f);
@@ -5159,8 +5173,14 @@ void Menu::drawOutputPanel() {
             else if (!ln.empty() && ln[0] == '[')
                 col = ImVec4(0.55f, 0.78f, 1.0f, 1.0f);   // [tag] lines
             ImGui::PushStyleColor(ImGuiCol_Text, col);
-            ImGui::TextUnformatted(ln.c_str());
+            // Selectable line: click copies just this line to the clipboard.
+            // "###" keeps the visible label = the full line, ID = the index.
+            const std::string lbl = ln + "###logln" + std::to_string(li);
+            if (ImGui::Selectable(lbl.c_str()))
+                ImGui::SetClipboardText(ln.c_str());
             ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Click to copy this line");
         }
         ImGui::PopStyleVar();
         if (s_autoscroll && changed)
@@ -6038,6 +6058,27 @@ void Menu::drawBrowserBody(const std::string& tree_root,
         }
         if (ImGui::BeginPopup("##cb_bg_ctx")) {
             if (is_content) {
+                // Enable/Disable every item in the OPEN folder, using the same
+                // content_disabled_ set the per-tile right-click toggle uses
+                // (disabled items render dimmed and are skipped by the loader /
+                // assembler at build time).  Keys are the entry path strings,
+                // exactly as inserted per-tile (e.path().string()).
+                auto setFolderEnabled = [&](bool enabled) {
+                    std::error_code lec;
+                    int n = 0;
+                    for (auto& e : fs::directory_iterator(cur_dir, lec)) {
+                        if (lec) break;
+                        const std::string ip = e.path().string();
+                        if (enabled) { if (content_disabled_.erase(ip) > 0) ++n; }
+                        else         { if (content_disabled_.insert(ip).second) ++n; }
+                    }
+                    EditorLog::get().push(
+                        std::string("[content] ") + (enabled ? "enabled " : "disabled ") +
+                        std::to_string(n) + " item(s) in " + cur_dir);
+                };
+                if (ImGui::MenuItem("Enable All (this folder)"))  setFolderEnabled(true);
+                if (ImGui::MenuItem("Disable All (this folder)")) setFolderEnabled(false);
+                ImGui::Separator();
                 if (ImGui::MenuItem("Import...")) {
                     content_import_request_ = true;
                     content_import_dir_     = cur_dir;
@@ -7017,6 +7058,75 @@ void Menu::stagePreviewPayload(engine::helper::MeshPreviewPayload&& payload) {
 // TriangleMesh adapter (scene-object selections + any path that still
 // produces an auto_rig mesh).  Carries UVs + the base-colour texture when
 // the mesh has them; untextured meshes shade as neutral PBR.
+bool Menu::stageAutoRigSkinLayer() {
+    if (!plugin_manager_) return false;
+    plugins::auto_rig::AutoRigPlugin* ar = nullptr;
+    for (auto& p : plugin_manager_->plugins())
+        if (auto* a = dynamic_cast<plugins::auto_rig::AutoRigPlugin*>(p.get())) {
+            ar = a; break;
+        }
+    if (!ar) return false;
+
+    const plugins::auto_rig::TriangleMesh& mesh = ar->getMesh();
+    const std::vector<uint8_t>&            skin = ar->getBaseSkinVerts();
+    if (mesh.positions.empty() || skin.size() != mesh.positions.size()) {
+        dbg_skin_status_ = "no baked skin classification "
+                           "(rebuild, then Run Auto-Rig / Bake)";
+        return false;   // nothing baked yet
+    }
+    size_t nskin_v = 0;
+    for (uint8_t s : skin) nskin_v += s;
+
+    engine::helper::MeshPreviewPayload p;
+    p.positions = mesh.positions;
+    // Normals: reuse the mesh's if present, else accumulate face normals.
+    if (mesh.normals.size() == mesh.positions.size()) {
+        p.normals = mesh.normals;
+    } else {
+        p.normals.assign(mesh.positions.size(), glm::vec3(0.0f));
+        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+            const uint32_t a = mesh.indices[t], b = mesh.indices[t+1],
+                           c = mesh.indices[t+2];
+            const glm::vec3 fn = glm::cross(mesh.positions[b] - mesh.positions[a],
+                                            mesh.positions[c] - mesh.positions[a]);
+            p.normals[a] += fn; p.normals[b] += fn; p.normals[c] += fn;
+        }
+        for (auto& n : p.normals) { float l = glm::length(n); if (l > 1e-12f) n /= l; }
+    }
+    // Keep ONLY triangles whose 3 vertices are all base skin.
+    p.indices.reserve(mesh.indices.size());
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        const uint32_t i0 = mesh.indices[t], i1 = mesh.indices[t+1],
+                       i2 = mesh.indices[t+2];
+        if (skin[i0] && skin[i1] && skin[i2]) {
+            p.indices.push_back(i0); p.indices.push_back(i1); p.indices.push_back(i2);
+        }
+    }
+    const size_t total_tris = mesh.indices.size() / 3;
+    const size_t kept_tris  = p.indices.size() / 3;
+    if (p.indices.empty()) {
+        dbg_skin_status_ = "classifier marked 0 tris as skin (nothing to show)";
+        return false;
+    }
+
+    engine::helper::MeshPreviewSection sec;
+    sec.first_index = 0;
+    sec.index_count = (uint32_t)p.indices.size();
+    p.sections.push_back(sec);
+
+    engine::helper::MeshPreview::setWeightDebug(false);
+    engine::helper::MeshPreview::setSegmentDebug(false);
+    stagePreviewPayload(std::move(p));
+
+    char cap[176];
+    std::snprintf(cap, sizeof(cap),
+        "base-skin layer: %zu / %zu tris kept  (%zu / %zu verts are skin)",
+        kept_tris, total_tris, nskin_v, skin.size());
+    dbg_skin_status_  = cap;
+    dbg_disp_caption_ = std::string("Auto-Rig ") + cap;
+    return true;
+}
+
 void Menu::installDebugPreview(plugins::auto_rig::TriangleMesh& mesh) {
     if (mesh.positions.empty() || mesh.indices.size() < 3) {
         retireDebugPreview();
@@ -8034,6 +8144,18 @@ void Menu::drawDebugDisplayPanel() {
                         "  /  " + kids[editor_selected_child_].first;
             }
         }
+
+        // Stage the auto-rig's last-baked BASE-SKIN layer (skin triangles only).
+        // Persists until another object is selected (selection didn't change
+        // here, so the rebuild above won't override it).
+        if (ImGui::SmallButton("Auto-Rig Skin Layer")) {
+            stageAutoRigSkinLayer();   // sets dbg_skin_status_ with counts/status
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(skin only, from last bake)");
+        if (!dbg_skin_status_.empty())
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "%s",
+                               dbg_skin_status_.c_str());
 
         // The image lives in helper::MeshPreview's persistent GPU target —
         // rendered by the app (real pipeline, three spot lights) whenever a

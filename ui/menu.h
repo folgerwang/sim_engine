@@ -77,6 +77,10 @@ struct EditorSceneObject {
     // Borrowed pointer to the row's asset_path (read-only display of the
     // held .rwcmap; assignment goes through consumeCollisionMapAssign).
     const std::string*                   collision_map = nullptr;
+    // Source asset file (content/...), used to scope Content Browser actions
+    // (e.g. Enable/Disable All) to objects whose asset lives in the open folder.
+    // Empty for objects with no content asset (Player/NPC/debug drawables).
+    std::string                          asset_path;
 };
 
 // Game-level state machine driven by the title-screen menu.
@@ -744,6 +748,9 @@ public:
     void installDebugPreview(plugins::auto_rig::TriangleMesh& mesh);
     void stagePreviewPayload(engine::helper::MeshPreviewPayload&& payload);
     void retireDebugPreview();
+    // Stage the auto-rig's last-baked mesh filtered to the base-skin layer
+    // (skin triangles only) into the Debug Display.  False if nothing baked.
+    bool stageAutoRigSkinLayer();
     engine::helper::MeshPreviewPayload preview_payload_;
     bool         preview_pending_ = false;   // payload staged, not rendered
     bool         preview_active_  = false;   // something to show in the panel
@@ -751,6 +758,7 @@ public:
     engine::game_object::DrawableObject* dbg_disp_obj_ = nullptr;
     int          dbg_disp_node_ = -3;       // -3 = nothing cached
     std::string  dbg_disp_caption_;         // shown above the image
+    std::string  dbg_skin_status_;          // "Auto-Rig Skin Layer" button status
     std::string  dbg_asset_key_;            // "path#sub" of asset preview
     // ── Arrow-key navigation between sibling objects ───────────────────
     // While the Debug Display shows a content preview, Left/Right (or
