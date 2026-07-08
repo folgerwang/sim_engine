@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <glm/glm.hpp>
 
@@ -54,6 +55,15 @@ inline constexpr MaterialId kInvalidMaterial = 0xFFFFFFFFu;
 // Component: the interned material an entity / sub-mesh renders with.
 struct MaterialRef {
     MaterialId id = kInvalidMaterial;
+};
+
+// Component: ALL interned materials an entity's drawable renders with, in
+// sub-material order (index-matched with DrawableData::materials_). Used
+// while DrawableObject is still a monolith (pre-shred): one entity owns one
+// drawable which owns N materials, so the entity carries the N interned ids
+// and the GC cleanup hook release()s each when the entity dies.
+struct MaterialSet {
+    std::vector<MaterialId> ids;
 };
 
 }  // namespace ecs

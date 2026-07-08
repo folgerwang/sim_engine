@@ -38,6 +38,44 @@ static bool     s_frustum_cull_active = false;
 static glm::vec4 s_frustum_planes[6];
 
 namespace ego = engine::game_object;
+
+// ── ECS material-dedup capture ──────────────────────────────────────────
+// Fill MaterialInfo::desc_ (the renderer-free ecs::MaterialDesc dedup
+// identity) from the just-built PbrMaterialParams UBO.  Called once per
+// material by every loader (glTF / FBX / .rwobj / .rwchar) right after the
+// UBO fill, so the desc always mirrors what the GPU material actually
+// renders with.  Texture slots key by the texture's source filename when
+// the loader recorded one (real path → dedups across assets); otherwise by
+// "<asset_key>#<index>" (embedded textures → dedups across instances of
+// the same asset, never falsely across different assets).
+static void captureMaterialDesc(
+    ego::MaterialInfo& m,
+    const glsl::PbrMaterialParams& ubo,
+    const std::vector<engine::renderer::TextureInfo>& textures,
+    const std::string& asset_key) {
+    auto tex_key = [&](int32_t idx) -> std::string {
+        if (idx < 0) return std::string();
+        if (idx < (int32_t)textures.size() &&
+            !textures[idx].source_filename_.empty())
+            return textures[idx].source_filename_;
+        return asset_key + "#" + std::to_string(idx);
+    };
+    auto& d = m.desc_;
+    d.base_color   = ubo.base_color_factor;
+    d.emissive     = ubo.emissive_factor;
+    d.metallic     = ubo.metallic_factor;
+    d.roughness    = ubo.roughness_factor;
+    d.alpha_cutoff = ubo.alpha_cutoff;
+    d.alpha_mode   =
+        m.alpha_mode_ == ego::AlphaMode::Blend ? engine::ecs::AlphaMode::kBlend :
+        m.alpha_mode_ == ego::AlphaMode::Mask  ? engine::ecs::AlphaMode::kMask
+                                               : engine::ecs::AlphaMode::kOpaque;
+    d.base_color_tex         = tex_key(m.base_color_idx_);
+    d.normal_tex             = tex_key(m.normal_idx_);
+    d.metallic_roughness_tex = tex_key(m.metallic_roughness_idx_);
+    d.emissive_tex           = tex_key(m.emissive_idx_);
+    d.occlusion_tex          = tex_key(m.occlusion_idx_);
+}
 namespace engine {
 
 namespace {
@@ -363,7 +401,8 @@ static void calculateBbox(
 static void setupMeshState(
     const std::shared_ptr<renderer::Device>& device,
     const tinygltf::Model& model,
-    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::string& asset_key) {
 
     // Buffer
     {
@@ -622,6 +661,10 @@ static void setupMeshState(
             ubo.specular_exponent = 1.0f;
 
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
+
+            // ECS dedup identity — mirrors exactly what was uploaded above.
+            captureMaterialDesc(
+                dst_material, ubo, drawable_object->textures_, asset_key);
         }
     }
 
@@ -857,7 +900,8 @@ std::hash<std::string> str_hash;
 static void setupMeshState(
     const std::shared_ptr<renderer::Device>& device,
     const ufbx_abi ufbx_scene* fbx_scene,
-    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::string& asset_key) {
 
     // allocate texture memory at first.
     std::vector<size_t> texture_hash_table;
@@ -1203,6 +1247,10 @@ static void setupMeshState(
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
 
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
+
+            // ECS dedup identity — mirrors exactly what was uploaded above.
+            captureMaterialDesc(
+                dst_material, ubo, drawable_object->textures_, asset_key);
         }
     }
 }
@@ -5722,6 +5770,15 @@ void DrawableObject::draw(
     // recording — exactly what we want when the user hides this drawable.
     if (!visible_) return;
 
+    // ECS object-level frustum cull: a coarse early-out computed by
+    // ecs::CullingSystem over the entity's WorldBounds.  FORWARD ONLY —
+    // shadow / CSM / depth passes must still record geometry that is
+    // outside the camera frustum (off-screen casters still throw
+    // shadows into view), and the app only arms this hint around the
+    // main forward pass anyway (cleared right after, so probe passes
+    // never observe it).
+    if (ecs_culled_hint_ && draw_mode == DrawMode::kForward) return;
+
     // Reset per-call debug counter BEFORE the isReady() guard so that
     // a not-ready drawable also prints "0 draws" rather than carrying
     // last frame's count.  Cheap; only used when m_debug_force_red_
@@ -6110,7 +6167,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     auto drawable_object = std::make_shared<ego::DrawableData>(device);
     drawable_object->meshes_.reserve(model.meshes.size());
 
-    setupMeshState(device, model, drawable_object);
+    setupMeshState(device, model, drawable_object, input_filename);
     setupMeshes(model, drawable_object);
     setupAnimations(model, drawable_object);
     setupSkins(device, model, drawable_object);
@@ -6194,7 +6251,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
 
     drawable_object->m_flip_v_ = true;
 
-    setupMeshState(device, fbx_scene, drawable_object);
+    setupMeshState(device, fbx_scene, drawable_object, input_filename);
     std::ostringstream log_buf;
     setupMeshes(device, fbx_scene, drawable_object, log_buf);
 //    setupAnimations(model, drawable_object);
@@ -6542,6 +6599,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
 
         device->updateBufferMemory(
             dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
+
+        // ECS dedup identity — .rwobj textures carry source paths, so two
+        // placements of the same baked object intern to the same ids.
+        captureMaterialDesc(
+            dst_material, ubo, drawable_object->textures_, ref_name);
     }
 
     // ── GPU buffers + views (same layout as the FBX path) ─────────────
@@ -7175,6 +7237,9 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
+            // ECS dedup identity — baked character sections.
+            captureMaterialDesc(
+                mat, ubo, drawable_object->textures_, ref_name);
         }
 
         // Mesh + primitives.

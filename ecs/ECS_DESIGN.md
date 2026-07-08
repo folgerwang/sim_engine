@@ -7,9 +7,10 @@ existing renderer (`DrawableObject`, `ObjectSceneView`, the cluster renderer)
 keeps working unchanged.
 
 The core is deliberately split from the renderer so it is unit-testable with no
-Vulkan dependency. `ecs/tests/ecs_core_tests.cpp` compiles and passes 36 checks
-covering GC timing, transform hierarchy, generational invalidation, and the
-streaming state machine.
+Vulkan dependency. `ecs/tests/ecs_core_tests.cpp` compiles and passes 78 checks
+covering GC timing, transform hierarchy, generational invalidation, the
+streaming state machine, frustum culling, animation sampling/playback, the
+material dedup cache, and the MaterialSet entity lifecycle.
 
 ---
 
@@ -254,8 +255,14 @@ The engine also already frustum-culls per-mesh at draw time, so object-level ECS
 culling is a *coarser early-out*, not a correctness fix. The clean way to wire
 it is to make rendering fully ECS-list-driven (gather rebuilds the per-frame
 draw list, with `Culled` filtered out) — which is the same refactor as the
-mesh/material/skin shred below. Until then `Culled` is computed and available
-for tools / spatial queries.
+mesh/material/skin shred below.
+
+**STATUS: wired via the "easiest safe win" path (see §14):** `Culled` is
+pushed as a transient per-drawable hint that `DrawableObject::draw()` honours
+for `DrawMode::kForward` only, armed just before and cleared just after the
+main forward pass. Neither membership nor `visible_` is touched, so both
+caveats above are sidestepped. The full ECS-list-driven rebuild remains the
+end-state refactor.
 
 ## 13. Remaining: DrawableObject shred (compile-in-the-loop work)
 
@@ -280,7 +287,7 @@ build + visual test after each move** — not in one blind pass. Suggested order
 
 ## 14. Status & wiring guide (current)
 
-**Core systems — built, unit-tested (71 checks), renderer-free:**
+**Core systems — built, unit-tested (78 checks), renderer-free:**
 transform, streaming, lifetime/GC, deferred-deleter, culling, animation,
 material dedup cache.
 
@@ -294,40 +301,52 @@ g++ -std=c++20 -I<sim_engine> -I<entt-include> -I<glm-include> \
 ```
 
 **Wired into the engine:** lifetime/GC, streaming, transform/hierarchy, render
-membership (reconcile), LocalBounds population.
+membership (reconcile), LocalBounds population, **animation**, **culling**,
+**material dedup (data level)**.
 
-**Built but NOT wired (need a build-and-see loop):** animation, culling,
-material dedup. Each rewires a piece of the render core, so do them one at a
-time with a visual check. Concrete hooks:
+### Animation — WIRED
+`application.cpp: updateEcsAnimation()` (runs from `tickEcs`, before the
+per-frame `DrawableObject::update` loop):
+1. `AnimationBridge::extractClips()` copies imported channels into
+   `ecs::AnimationClip`s, cached per drawable in `ecs_anim_clips_`.
+2. Ready animated drawables lazily get an `AnimationPlayer` (first clip) and
+   `setExternalAnimation(true)` so the imported channel evaluation steps aside.
+3. `AnimationSystem::update(reg, dt)` advances + samples every player.
+4. `AnimationBridge::applyPose()` writes each `AnimPose` onto the drawable's
+   node TRS; the existing joint-matrix/skinning path runs on top.
+Player/NPC procedural rigs never enter `imported_objects_`, so they are
+unaffected. The Details panel play/pause/scrub drives the player directly.
 
-### Animation
-1. Build an `AnimationClip` cache at import: the channels are already parsed in
-   `DrawableObject`; copy them into `ecs::AnimationClip` keyed by asset+clip name.
-2. Give animated entities an `AnimationPlayer{clip,...}`.
-3. In `tickEcs`, call `AnimationSystem::update(reg, dt)` (after transforms,
-   before the imported push).
-4. Add a small adapter: for each entity with an `AnimPose`, write
-   `pose.nodes[i]` (where `has_t/r/s`) onto the matching `DrawableObject` node
-   TRS, then let the existing joint-matrix/skinning path run. Retire the channel
-   evaluation currently inside `DrawableObject::update`.
+### Culling — WIRED (forward-pass early-out)
+`application.cpp: drawScene()`, immediately before the main forward pass
+(bounds were refreshed by `tickEcs` earlier the same frame, and the VP used is
+the one this pass renders with — no lag):
+1. `FrustumPlanes::fromViewProj(main_camera.getViewProjMatrix())`, then
+   `CullingSystem::update(reg, frustum)` (stats in `ecs_cull_stats_`).
+2. The `Culled` tag is pushed onto each ECS drawable as a **transient hint**
+   (`DrawableObject::setEcsCulledHint`), skipped for controller-driven
+   drawables (their entity bounds mirror the authored transform, not the
+   controller's live placement).
+3. `DrawableObject::draw()` early-outs on the hint for `DrawMode::kForward`
+   ONLY; the hints are cleared right after the forward pass (next to
+   `clearFrustumCull()`), so shadow / CSM / probe passes never observe them.
+`visible_` is untouched — no fight with the cluster renderer's forward-hide.
 
-### Culling
-1. `auto frustum = FrustumPlanes::fromViewProj(main_cam.proj * main_cam.view);`
-2. `CullingSystem::update(reg, frustum);` each frame after `updateTransforms`.
-3. Consume `Culled`: the clean path is to filter it inside
-   `reconcileImportedSceneViewMembership` (gather only un-culled), BUT first make
-   reconcile rebuild-based or it will churn add/remove at the frustum edge.
-   Do NOT toggle `DrawableObject::visible_` for culling — it fights the cluster
-   renderer's forward-hide. Easiest safe win: use `Culled` only as an early-out
-   in the forward draw loop, leaving membership alone.
-
-### Material dedup
-1. At import, fill a `MaterialDesc` per material and `intern()` it into a
-   `MaterialCache` member; store the returned `MaterialId` on the sub-mesh.
-2. Keep a parallel `MaterialId -> GPU material (textures + descriptor set)` table
-   built once per unique id — this is where the upload/VRAM savings land.
-3. On object destroy, `release()` each `MaterialId`; free the GPU material when
-   `refCount` hits 0 (via the DeferredDeleter).
+### Material dedup — WIRED at the data level (steps 2–3 remain)
+1. **(done)** Every loader (glTF / FBX / .rwobj / .rwchar) captures a
+   renderer-free `MaterialDesc` into `MaterialInfo::desc_` right after filling
+   the PBR UBO (`captureMaterialDesc` in drawable_object.cpp). Texture slots
+   key by source path when known, else `"<asset>#<index>"`.
+2. **(done)** `application.cpp: updateEcsMaterials()` (from `tickEcs`) interns
+   each ready Renderable's descs into `ecs_material_cache_` and attaches a
+   `MaterialSet` of ids; the GC cleanup hook (and streamed unload) `release()`s
+   them, so `liveCount()` = unique live materials vs `ecs_material_refs_` =
+   total live uses. Covered by `test_material_set_lifecycle`.
+3. **(remaining — build-and-see)** the `MaterialId -> GPU material (textures +
+   descriptor set)` table built once per unique id — this is where the
+   upload/VRAM savings land. Requires rerouting the per-drawable
+   `uniform_buffer_`/`desc_set_` creation in the four loaders through the
+   shared table, freeing via the DeferredDeleter at refcount 0.
 
 **Remaining (largest, deferred):** `MeshComponent` — moving the GPU vertex/index
 buffers + primitive list out of `DrawableObject`. This is the deepest render-core

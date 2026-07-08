@@ -5,6 +5,7 @@
 #include "helper/bvh.h"
 #include "helper/cluster_mesh.h"  // Optional "Nanite-lite" cluster sidecar.
 #include "cluster_debug_draw.h"   // Per-mesh GPU buffers for the cluster debug draw path.
+#include "ecs/material.h"         // Renderer-free MaterialDesc (dedup identity).
 
 namespace engine {
 namespace game_object {
@@ -75,6 +76,17 @@ struct MaterialInfo {
     // Consumers: isPrimitiveOpaque() in drawable_object.cpp uses this
     // to decide whether to bind the no-frag shadow pipeline.
     bool                   effective_opaque_ = true;
+
+    // ── ECS dedup identity ─────────────────────────────────────────────
+    // Renderer-free description of this material, captured at load time
+    // right after the PbrMaterialParams UBO is filled (all four loaders).
+    // Texture slots are keyed "<asset>#<texture-index>" so two instances
+    // of the same asset (or two sub-materials sharing a texture) hash
+    // identically.  Interned into the app's ecs::MaterialCache; the
+    // refcount tells us how many live uses each unique material has —
+    // the foundation for the shared MaterialId→GPU-material table
+    // (ECS_DESIGN.md §14, material dedup steps 2–3).
+    ecs::MaterialDesc      desc_;
 
     renderer::BufferInfo   uniform_buffer_;
     std::shared_ptr<renderer::DescriptorSet>  desc_set_;
@@ -382,6 +394,12 @@ public:
     DrawableData(const std::shared_ptr<renderer::Device>& device) : device_(device) {}
     ~DrawableData() {}
 
+    // Read-only view of the loaded materials (incl. the ECS MaterialDesc
+    // captured at load).  Only meaningful once ready_ is set — callers must
+    // gate on DrawableObject::isReady() first (async phase-2/3 may still be
+    // populating the vector on another thread before that).
+    const std::vector<MaterialInfo>& materials() const { return materials_; }
+
     // skip_animations: when true, the imported glTF animation channels
     // are NOT evaluated for this frame.  Node transforms keep whatever
     // values the caller has just written (e.g. PlayerController::
@@ -466,6 +484,12 @@ class DrawableObject {
     // scene-view lists.  Defaults to true so existing drawables behave
     // exactly as before.
     bool                        visible_ = true;
+
+    // Transient per-frame ECS frustum-cull hint — see setEcsCulledHint()
+    // in the public section.  Only honoured by draw() when the mode is
+    // kForward; every other pass ignores it.  The application clears it
+    // right after the main forward pass each frame.
+    bool                        ecs_culled_hint_ = false;
 
     // PlayerController (external code) owns this wrapper's WORLD
     // placement.  While set, the ECS RenderSystem must NOT push the
@@ -667,6 +691,25 @@ public:
     // -> existing behaviour.
     void setVisible(bool v) { visible_ = v; }
     bool isVisible() const  { return visible_; }
+
+    // ── ECS frustum-cull hint (forward pass only) ────────────────────
+    // Set per frame by the application from the ECS CullingSystem right
+    // before the main forward pass and cleared right after it, so probe /
+    // shadow / CSM passes are never affected.  When true, draw() early-
+    // outs for DrawMode::kForward only — a coarse object-level early-out
+    // on top of the existing per-mesh frustum cull.  Deliberately
+    // DISTINCT from visible_ (a persistent user/tool gate) and from the
+    // cluster renderer's forward-hide (which also rides visible_): this
+    // flag is transient and owned exclusively by the ECS cull pass.
+    void setEcsCulledHint(bool v) { ecs_culled_hint_ = v; }
+    bool isEcsCulledHint() const  { return ecs_culled_hint_; }
+
+    // Loaded materials (with their load-time ECS MaterialDescs), or nullptr
+    // until the async load has finalized (isReady()).  Used by the app's
+    // ECS material-dedup pass to intern each sub-material.
+    const std::vector<MaterialInfo>* getMaterials() const {
+        return (object_ && isReady()) ? &object_->materials() : nullptr;
+    }
 
     // External-controller transform ownership — see controller_driven_.
     void setControllerDriven(bool v) { controller_driven_ = v; }

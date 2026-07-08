@@ -351,6 +351,54 @@ static void test_material_cache() {
     std::printf("  [ok] material dedup cache\n");
 }
 
+// ── 8. MaterialSet entity lifecycle ──────────────────────────────────────────
+// Mirrors the engine wiring (application.cpp updateEcsMaterials + the GC
+// cleanup hook): entities carry a MaterialSet of interned ids; identical
+// materials across entities collapse to one id; the World cleanup hook
+// releases refs on entity death so the last user frees the entry.
+static void test_material_set_lifecycle() {
+    World w;
+    auto& reg = w.registry();
+
+    MaterialCache cache;
+    w.setCleanupHook([&cache](entt::registry& r, Entity e) {
+        if (auto* ms = r.try_get<MaterialSet>(e)) {
+            for (auto id : ms->ids) cache.release(id);
+            ms->ids.clear();
+        }
+    });
+
+    MaterialDesc wood;  wood.base_color_tex = "tex/wood.png";
+    MaterialDesc metal; metal.metallic = 1.0f; metal.base_color_tex = "tex/m.png";
+
+    // Two "drawable" entities sharing the wood material (e.g. two placements
+    // of the same asset), one of which also uses metal.
+    Entity e1 = w.create();
+    Entity e2 = w.create();
+    reg.emplace<MaterialSet>(e1, MaterialSet{{cache.intern(wood)}});
+    reg.emplace<MaterialSet>(
+        e2, MaterialSet{{cache.intern(wood), cache.intern(metal)}});
+
+    CHECK(cache.liveCount() == 2);                      // wood + metal, deduped
+    CHECK(reg.get<MaterialSet>(e1).ids[0] ==
+          reg.get<MaterialSet>(e2).ids[0]);             // same interned wood id
+    const MaterialId wood_id = reg.get<MaterialSet>(e1).ids[0];
+    CHECK(cache.refCount(wood_id) == 2);
+
+    // Kill e2: metal (last user) is freed, wood survives via e1.
+    w.destroy(e2);
+    w.collectGarbage();
+    CHECK(cache.liveCount() == 1);
+    CHECK(cache.refCount(wood_id) == 1);
+
+    // Kill e1: everything released.
+    w.destroy(e1);
+    w.collectGarbage();
+    CHECK(cache.liveCount() == 0);
+    CHECK(cache.get(wood_id) == nullptr);
+    std::printf("  [ok] MaterialSet entity lifecycle\n");
+}
+
 int main() {
     std::printf("ECS core tests:\n");
     test_deferred_deleter();
@@ -360,6 +408,7 @@ int main() {
     test_culling();
     test_animation();
     test_material_cache();
+    test_material_set_lifecycle();
     std::printf("ALL PASSED (%d checks)\n", g_checks);
     return 0;
 }
