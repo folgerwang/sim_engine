@@ -94,7 +94,10 @@ void main() {
     if (cluster_idx >= params.total_clusters) return;
 
     if (params.cull_phase == 1u) {
-        uint word = visibility_bits[cluster_idx >> 5u];
+        // Phase A gate: LAST frame's visible set (read half of the
+        // ping-pong buffer).
+        uint word = visibility_bits[params.vis_read_word_ofs +
+                                    (cluster_idx >> 5u)];
         uint mask = 1u << (cluster_idx & 31u);
         if ((word & mask) == 0u) return;
     }
@@ -258,6 +261,34 @@ void main() {
         trans_indirect_draws[base + 3] = draw.vertex_offset;
         trans_indirect_draws[base + 4] = cluster_idx;
     } else {
+        if (params.cull_phase == 2u) {
+            // Record EVERY opaque survivor in THIS frame's set (write
+            // half) so next frame's Phase A gate is complete.
+            // Per-lane atomicOr — kept un-coalesced because lanes
+            // within an AMD wave64 + workgroup_size 64 span TWO words
+            // (a wave covers 64 cluster_idx = words [N, N+1]) and a
+            // naïve subgroupOr+single-atomic would lose the upper
+            // word's bits.  The OR contention is negligible compared
+            // to the draw_count atomicAdds coalesced below — every
+            // lane writes a different bit (cluster_idx is unique), so
+            // hardware bit-merging is fast.
+            atomicOr(visibility_bits[params.vis_write_word_ofs +
+                                     (cluster_idx >> 5u)],
+                     1u << (cluster_idx & 31u));
+
+            // ── Disocclusion-only emit ─────────────────────────────
+            // If this cluster's bit is set in LAST frame's set (read
+            // half), Phase A already gated it through the SAME frustum
+            // + backface tests this frame and rasterised it.  Emitting
+            // it again here would draw the whole steady-state scene
+            // TWICE (Phase B draw cost ≈ Phase A draw cost — measured
+            // ~2 ms/frame).  Skip the draw; keep only the truly
+            // newly-visible clusters.
+            uint prev_word = visibility_bits[params.vis_read_word_ofs +
+                                             (cluster_idx >> 5u)];
+            if ((prev_word & (1u << (cluster_idx & 31u))) != 0u) return;
+        }
+
         uvec4 ballot     = subgroupBallot(true);
         uint  local_cnt  = subgroupBallotBitCount(ballot);
         uint  base_slot  = 0u;
@@ -273,18 +304,5 @@ void main() {
         indirect_draws[base + 3] = draw.vertex_offset;
         indirect_draws[base + 4] = cluster_idx;
         visible_cluster_indices[slot] = cluster_idx;
-
-        if (params.cull_phase == 2u) {
-            // Per-lane atomicOr — kept un-coalesced because lanes
-            // within an AMD wave64 + workgroup_size 64 span TWO words
-            // (a wave covers 64 cluster_idx = words [N, N+1]) and a
-            // naïve subgroupOr+single-atomic would lose the upper
-            // word's bits.  The OR contention is negligible compared
-            // to the draw_count atomicAdds we just coalesced — every
-            // lane writes a different bit (cluster_idx is unique), so
-            // hardware bit-merging is fast.
-            atomicOr(visibility_bits[cluster_idx >> 5u],
-                     1u << (cluster_idx & 31u));
-        }
     }
 }

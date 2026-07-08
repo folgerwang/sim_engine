@@ -41,8 +41,8 @@ static_assert(offsetof(glsl::ClusterCullPushConstants, lod_error_threshold)==88,
 static_assert(offsetof(glsl::ClusterCullPushConstants, use_bvh)           == 92,  "use_bvh offset");
 static_assert(offsetof(glsl::ClusterCullPushConstants, use_hiz_cull)      == 96,  "use_hiz_cull offset");
 static_assert(offsetof(glsl::ClusterCullPushConstants, cull_phase)        == 100, "cull_phase offset MISMATCH — std430 expects 100");
-static_assert(offsetof(glsl::ClusterCullPushConstants, pad0)              == 104, "pad0 offset");
-static_assert(offsetof(glsl::ClusterCullPushConstants, pad1)              == 108, "pad1 offset (must precede mat4 to push it to offset 112)");
+static_assert(offsetof(glsl::ClusterCullPushConstants, vis_read_word_ofs) == 104, "vis_read_word_ofs offset");
+static_assert(offsetof(glsl::ClusterCullPushConstants, vis_write_word_ofs)== 108, "vis_write_word_ofs offset (must precede mat4 to push it to offset 112)");
 static_assert(offsetof(glsl::ClusterCullPushConstants, last_view_proj)    == 112, "last_view_proj offset (std430 mat4 alignment forces 16B-aligned start)");
 static_assert(offsetof(glsl::ClusterCullPushConstants, hiz_size_mips_pad) == 176, "hiz_size_mips_pad offset");
 static_assert(sizeof(glsl::ClusterCullPushConstants) == 192,                       "ClusterCullPushConstants total size");
@@ -1202,17 +1202,21 @@ void ClusterRenderer::finalizeUploads() {
     }
 
     // ── Two-pass occlusion buffers ──────────────────────────────────────
-    // Persistent visibility bits — one bit per cluster.  Zero-initialised
-    // so frame 1's Phase A culls everything (renders nothing) and frame
-    // 1's Phase B (with empty Hi-Z) renders the full frustum-visible set,
-    // populating the bits for frame 2.
+    // Persistent visibility bits — one bit per cluster, PING-PONGED as
+    // two sets back to back (read = last frame, write = this frame; the
+    // parity flips in cullPhaseA).  Phase B reads the last-frame set to
+    // emit only newly-visible clusters (Phase A already drew the rest)
+    // and ORs the complete set into the write half for next frame.
+    // Zero-initialised so frame 1's Phase A culls everything (renders
+    // nothing) and frame 1's Phase B renders the full frustum-visible
+    // set, populating the bits for frame 2.
     {
-        const uint32_t vis_uint_count =
-            (total_clusters_all_meshes_ + 31u) / 32u;
-        std::vector<uint32_t> zeros(vis_uint_count, 0u);
+        vis_word_count_ = (total_clusters_all_meshes_ + 31u) / 32u;
+        vis_parity_     = 0;
+        std::vector<uint32_t> zeros(vis_word_count_ * 2u, 0u);
         visibility_bit_buffer_ = createSSBO(
             device_,
-            vis_uint_count * sizeof(uint32_t),
+            vis_word_count_ * 2u * sizeof(uint32_t),
             zeros.data());
     }
     // Phase A indirect output — same worst-case size as the single-pass
@@ -2142,7 +2146,10 @@ void ClusterRenderer::cull(
         const bool effective_hiz_cull =
             hiz_cull_override.value_or(use_hiz_occlusion_cull_);
         push.use_hiz_cull = effective_hiz_cull ? 1u : 0u;
-        push.pad0 = 0u;
+        // Legacy single-pass cull (phase 0) never touches the visibility
+        // bits, so the ping-pong offsets are irrelevant — zero them.
+        push.vis_read_word_ofs  = 0u;
+        push.vis_write_word_ofs = 0u;
         push.last_view_proj = last_view_proj;
         push.hiz_size_mips_pad = glm::vec4(
             float(hiz_size_.x), float(hiz_size_.y),
@@ -2283,8 +2290,8 @@ void ClusterRenderer::cullShadow(
         push.use_bvh             = 0;
         push.use_hiz_cull        = 0;     // no shadow-space Hi-Z yet
         push.cull_phase          = 0;
-        push.pad0                = 0;
-        push.pad1                = 0;
+        push.vis_read_word_ofs   = 0;     // phase 0: bits untouched
+        push.vis_write_word_ofs  = 0;
         push.last_view_proj      = glm::mat4(1.0f);
         push.hiz_size_mips_pad   = glm::vec4(0.0f);
 
@@ -2372,6 +2379,13 @@ void ClusterRenderer::cullPhaseA(
     cmd_buf->bindPipeline(
         er::PipelineBindPoint::COMPUTE, cull_pipeline_);
 
+    // Flip the visibility ping-pong ONCE per frame, here at the head of
+    // the two-pass sequence: last frame's write half becomes this
+    // frame's read half (Phase A gate + Phase B's already-drawn test),
+    // and the other half (cleared between A and B) receives this
+    // frame's set.
+    vis_parity_ ^= 1u;
+
     glsl::ClusterCullPushConstants push{};
     push.view_proj = view_proj;
     push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
@@ -2380,6 +2394,8 @@ void ClusterRenderer::cullPhaseA(
     push.use_hiz_cull = 0u;     // Phase A skips Hi-Z; the shader also
                                 // gates this internally on cull_phase != 1.
     push.cull_phase = 1u;
+    push.vis_read_word_ofs  = vis_parity_ ? vis_word_count_ : 0u;
+    push.vis_write_word_ofs = vis_parity_ ? 0u : vis_word_count_;
     push.last_view_proj = glm::mat4(1.0f);
     push.hiz_size_mips_pad = glm::vec4(0.0f);
 
@@ -2459,6 +2475,10 @@ void ClusterRenderer::cullPhaseB(
     // view_proj — no last-frame matrix needed.
     push.use_hiz_cull = use_hiz_occlusion_cull_ ? 1u : 0u;
     push.cull_phase = 2u;
+    // Same parity cullPhaseA established this frame: read = last frame's
+    // set (already-drawn detection), write = this frame's set.
+    push.vis_read_word_ofs  = vis_parity_ ? vis_word_count_ : 0u;
+    push.vis_write_word_ofs = vis_parity_ ? 0u : vis_word_count_;
     // Phase B reprojects against the CURRENT frame's view-proj because
     // the Hi-Z pyramid was built from THIS frame's Phase A depth (not
     // last frame's).  So pass view_proj for both.
@@ -2498,9 +2518,11 @@ void ClusterRenderer::clearVisibilityBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
     if (!gpu_ready_ || !visibility_bit_buffer_.buffer) return;
 
-    const uint32_t vis_uint_count =
-        (total_clusters_all_meshes_ + 31u) / 32u;
-    const uint64_t bytes = uint64_t(vis_uint_count) * sizeof(uint32_t);
+    // Clear ONLY this frame's WRITE half — the read half is last frame's
+    // set, which Phase B still needs for the already-drawn-in-A test.
+    const uint64_t bytes = uint64_t(vis_word_count_) * sizeof(uint32_t);
+    const uint64_t write_ofs =
+        uint64_t(vis_parity_ ? 0u : vis_word_count_) * sizeof(uint32_t);
     if (bytes == 0) return;
 
     // ── Pre-fill barrier ─────────────────────────────────────────────────
@@ -2524,7 +2546,7 @@ void ClusterRenderer::clearVisibilityBuffer(
 
     cmd_buf->fillBuffer(
         visibility_bit_buffer_.buffer,
-        /*offset*/ 0,
+        /*offset*/ write_ofs,
         /*size*/ bytes,
         /*data*/ 0u);
 

@@ -767,20 +767,26 @@ struct ClusterCullPushConstants {
     // of A's emit set and B's emit set is the canonical "visible this
     // frame" signal, with no leak from the previous frame's bits.
     uint    cull_phase;
-    // Two explicit pad uints before the next mat4.  std430 requires
-    // mat4 to start on a 16-byte boundary; without these uints, GLSL
-    // would insert 8 bytes of implicit padding (advancing
-    // last_view_proj from offset 108 to 112) — but glm::mat4 in this
-    // codebase has alignas 4 (no GLM_FORCE_DEFAULT_ALIGNED_GENTYPES),
-    // so the C++ struct would put last_view_proj at 108.  Result: a
-    // 4-byte size mismatch that pushes 188 bytes from CPU into a
-    // 192-byte std430 layout — drivers handle this inconsistently and
-    // on NV the entire push-constant view can corrupt, making
-    // diagnostics like `cull_phase != 1u` evaluate the wrong way.
-    // Two explicit pads bring last_view_proj to offset 112 in BOTH
-    // layouts, eliminating the mismatch.
-    uint    pad0;
-    uint    pad1;
+    // Ping-pong WORD offsets into VisibilityBitBuffer, which holds TWO
+    // bit sets back to back (words 0..N-1 and N..2N-1):
+    //   vis_read_word_ofs  → LAST frame's visible set.  Phase A's gate
+    //                        reads it, and Phase B reads it to detect
+    //                        "already drawn by Phase A this frame" so it
+    //                        emits ONLY the newly-visible (disoccluded)
+    //                        clusters instead of re-drawing everything.
+    //   vis_write_word_ofs → THIS frame's set.  Cleared between Phase A
+    //                        and Phase B; Phase B atomicOr's every opaque
+    //                        survivor (drawn or not) so next frame's
+    //                        Phase A gate is complete.
+    // The parity flips each frame in ClusterRenderer::cullPhaseA.
+    //
+    // These two uints ALSO serve as the explicit std430 padding that
+    // keeps last_view_proj at offset 112 in BOTH the GLSL and C++
+    // layouts (glm::mat4 here has alignas 4; without them the CPU
+    // struct would place the mat4 at 108 and the push-constant view
+    // can corrupt on NV).  Do not remove or reorder.
+    uint    vis_read_word_ofs;
+    uint    vis_write_word_ofs;
     // Reprojection matrix for the Hi-Z sample.  Named last_view_proj
     // for historical reasons — in the two-pass deferred path it's set
     // to the CURRENT frame's view_proj because the pyramid was built

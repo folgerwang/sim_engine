@@ -248,17 +248,21 @@ private:
         cull_desc_sets_shadow_;
 
     // ── Two-pass occlusion culling (Nanite-style) ────────────────────────
-    // Persistent per-cluster visibility bit set across frames.  Sized for
-    // ceil(total_clusters / 32) uints; bit N of element N/32 == "cluster N
-    // was drawn last frame".  Phase A reads it (and only emits clusters
-    // whose bit is set) so previously-visible clusters re-render first and
-    // produce a partial depth buffer.  Phase B clears + atomically OR-writes
-    // bits for every cluster that survives all three tests (frustum +
-    // backface + Hi-Z), so the SAME buffer becomes next frame's Phase A
-    // input.  Allocated zero-initialised in finalizeUploads — frame 1's
-    // Phase A renders nothing, Phase B (with empty Hi-Z) renders everything,
-    // and the buffer is correct from frame 2 onward.
+    // Persistent per-cluster visibility bit sets, PING-PONGED: the buffer
+    // holds TWO sets of ceil(total_clusters / 32) words back to back and
+    // vis_parity_ flips each frame (in cullPhaseA).  READ half = last
+    // frame's visible set: Phase A's gate, and Phase B's "already drawn
+    // by Phase A this frame" test (so B emits ONLY newly-visible
+    // clusters instead of re-drawing the whole steady-state scene —
+    // that double-draw measured ~2 ms/frame).  WRITE half = this frame's
+    // set: cleared between A and B (clearVisibilityBuffer clears just
+    // that half), then Phase B atomicOr's every opaque survivor so next
+    // frame's Phase A gate is complete.  Allocated zero-initialised in
+    // finalizeUploads — frame 1's Phase A renders nothing, Phase B
+    // renders the full frustum-visible set, correct from frame 2 onward.
     renderer::BufferInfo visibility_bit_buffer_;
+    uint32_t             vis_word_count_ = 0;  // words per HALF (one set)
+    uint32_t             vis_parity_     = 0;  // flipped in cullPhaseA
     // Phase A indirect draw output.  Worst-case sized identically to the
     // single-pass indirect_draw_buffer_ (5 uints per cluster).
     renderer::BufferInfo indirect_draw_buffer_phase_a_;
