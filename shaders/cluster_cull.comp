@@ -151,8 +151,26 @@ void main() {
             return;
         }
 
+        // ── Hi-Z stability guard (Phase B) ──────────────────────────
+        // A cluster Phase A drew THIS frame is part of the very depth
+        // pyramid Phase B tests against — a borderline self-occlusion
+        // reject here would strip its visibility bit, evict it from next
+        // frame's Phase A, and open a one-frame hole that flickers as
+        // the camera rotates (seen as geometry/shadow "on/off" and
+        // light-leak wedges at cluster boundaries).  Steady-state
+        // clusters may only leave the visible set via frustum/backface;
+        // Hi-Z stays fully active for clusters NOT drawn by Phase A
+        // (the actual disocclusion candidates it exists to filter).
+        bool drawn_by_phase_a = false;
+        if (params.cull_phase == 2u) {
+            uint pw = visibility_bits[params.vis_read_word_ofs +
+                                      (cluster_idx >> 5u)];
+            drawn_by_phase_a = (pw & (1u << (cluster_idx & 31u))) != 0u;
+        }
+
         if (params.use_hiz_cull == 1u &&
             params.cull_phase != 1u &&
+            !drawn_by_phase_a &&
             !skip_hiz_contribution) {
             vec2  ndc_min  = vec2(  1.0);
             vec2  ndc_max  = vec2( -1.0);

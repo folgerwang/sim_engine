@@ -94,15 +94,37 @@ float calculateShadowFactor(
     vec3  biased_world = position_world +
                          N * ((1.0 - NdotL) * CSM_NORMAL_BIAS_SCALE);
 
-    vec4 position_light_clip =
-        runtime_lights.light_view_proj[cascade_idx] * vec4(biased_world, 1.0);
-    vec3 position_light_NDC = position_light_clip.xyz / position_light_clip.w;
-    vec2 shadow_uv = position_light_NDC.xy * 0.5 + 0.5;
-    float current_depth = position_light_NDC.z;
+    // Per-cascade scale factors (see deferred_resolve.comp) + cascade
+    // PROMOTION: a receiver on the outer rim of its depth-selected
+    // cascade would sample the PCSS kernel outside the map (edge-clamp
+    // prefill = "no blocker" = LIT band along the cascade boundary).
+    // Step up until the kernel fits — mirrors deferred_resolve.comp.
+    vec2  shadow_uv;
+    float current_depth;
+    float w2uv;
+    for (;;) {
+        vec4 position_light_clip =
+            runtime_lights.light_view_proj[cascade_idx] *
+            vec4(biased_world, 1.0);
+        vec3 position_light_NDC =
+            position_light_clip.xyz / position_light_clip.w;
+        shadow_uv     = position_light_NDC.xy * 0.5 + 0.5;
+        current_depth = position_light_NDC.z;
+        w2uv = 0.5 *
+            length(runtime_lights.light_view_proj[cascade_idx][0].xyz);
 
-    // Per-cascade scale factors (see deferred_resolve.comp).
-    float w2uv    = 0.5 *
-        length(runtime_lights.light_view_proj[cascade_idx][0].xyz);
+        if (cascade_idx >= CSM_CASCADE_COUNT - 1) break;   // last — take it
+
+        float kernel_uv =
+            max(CSM_BLOCKER_RADIUS_WORLD, CSM_MAX_PCF_RADIUS_WORLD) * w2uv
+            + 1.0 / 2048.0;
+        bool fits =
+            all(greaterThanEqual(shadow_uv, vec2(kernel_uv))) &&
+            all(lessThanEqual(shadow_uv, vec2(1.0 - kernel_uv))) &&
+            current_depth >= 0.0 && current_depth <= 1.0;
+        if (fits) break;
+        ++cascade_idx;
+    }
     float z_scale = length(runtime_lights.light_view_proj[cascade_idx][2].xyz);
 
     float depth_bias =

@@ -334,7 +334,22 @@ float ssrtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
 }
 
 float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
-    // Cascade selection — same view-space-depth split as before.
+    // Cascade selection — view-space-depth split FIRST, then PROMOTION
+    // until the full PCSS sampling kernel fits inside the cascade's
+    // shadow map.
+    //
+    // Why promotion is required: at a cascade transition the receiver
+    // projects onto the outer RIM of its depth-selected cascade.  The
+    // blocker-search / PCF taps (fixed WORLD radius) then land OUTSIDE
+    // the cascade's [0,1] UV range; the edge-clamped reads return the
+    // caster-free prefill (1.0), the blocker search finds nothing, and
+    // the early-out returns fully LIT — a bright band exactly along the
+    // cascade boundary that shifts whenever the camera rotates (the
+    // cascade fit moves with the camera).  Successive cascade fits share
+    // their boundary slab corners, so the NEXT cascade always covers the
+    // rim region with interior margin — step up until the kernel fits
+    // (or we're at the last cascade, where edge-clamp is the best we
+    // can do).
     float view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
     int cascade = CSM_CASCADE_COUNT - 1;
     for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
@@ -352,11 +367,6 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     float NdotL = clamp(dot(N, L), 0.0, 1.0);
     vec3  biased_pos = world_pos + N * ((1.0 - NdotL) * CSM_NORMAL_BIAS_SCALE);
 
-    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(biased_pos, 1.0);
-    vec3 lndc  = lclip.xyz / lclip.w;
-    vec2 uv    = lndc.xy * 0.5 + 0.5;
-    float ref  = lndc.z;
-
     // Per-cascade world→UV scale.  For an orthographic projection
     // M = ortho_diag(2/w_x, 2/w_y, 1/(f-n), 1) * R * T, the first
     // column M[0] = (2/w_x * R_00, 2/w_y * R_10, 1/(f-n) * R_20, 0).
@@ -367,8 +377,32 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     // local UV (XY) and clip-Z spaces.  Without these conversions the
     // SAME constants represent different physical distances per
     // cascade, producing visible intensity / blur steps at boundaries.
-    float w2uv    = 0.5 *
-        length(runtime_lights.light_view_proj[cascade][0].xyz);
+    vec2  uv;
+    float ref;
+    float w2uv;
+    for (;;) {
+        vec4 lclip = runtime_lights.light_view_proj[cascade] *
+                     vec4(biased_pos, 1.0);
+        vec3 lndc  = lclip.xyz / lclip.w;
+        uv   = lndc.xy * 0.5 + 0.5;
+        ref  = lndc.z;
+        w2uv = 0.5 *
+            length(runtime_lights.light_view_proj[cascade][0].xyz);
+
+        if (cascade >= CSM_CASCADE_COUNT - 1) break;   // last — take it
+
+        // Kernel margin: the largest UV radius any tap below can use
+        // (blocker search disk vs PCF cap), plus a texel of slack.
+        float kernel_uv =
+            max(CSM_BLOCKER_RADIUS_WORLD, CSM_MAX_PCF_RADIUS_WORLD) * w2uv
+            + 1.0 / 2048.0;
+        bool fits =
+            all(greaterThanEqual(uv, vec2(kernel_uv))) &&
+            all(lessThanEqual(uv, vec2(1.0 - kernel_uv))) &&
+            ref >= 0.0 && ref <= 1.0;
+        if (fits) break;
+        ++cascade;   // rim receiver — the next cascade covers it interior
+    }
     float z_scale = length(runtime_lights.light_view_proj[cascade][2].xyz);
 
     // World-space depth bias → per-cascade clip-Z bias.

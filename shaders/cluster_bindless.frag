@@ -269,17 +269,40 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     float NdotL = clamp(dot(N, L), 0.0, 1.0);
     vec3  biased_pos = world_pos + N * ((1.0 - NdotL) * CSM_NORMAL_BIAS_SCALE);
 
-    vec4 lclip = runtime_lights.light_view_proj[cascade] * vec4(biased_pos, 1.0);
-    vec3 lndc  = lclip.xyz / lclip.w;
-    vec2 uv    = lndc.xy * 0.5 + 0.5;
-    float ref  = lndc.z;
-
     // Per-cascade world→UV (XY) and world→clip-Z (depth) scale factors.
     // See deferred_resolve.comp for the derivation.  Both are needed to
     // make BLUR RADIUS and DEPTH BIAS cascade-consistent in physical
     // (world) units.
-    float w2uv    = 0.5 *
-        length(runtime_lights.light_view_proj[cascade][0].xyz);
+    //
+    // Cascade PROMOTION (mirrors deferred_resolve.comp): a receiver on
+    // the outer rim of its depth-selected cascade would put the PCSS
+    // kernel outside the map — edge-clamped prefill reads = "no
+    // blocker" = a LIT band exactly along the cascade boundary.  Step
+    // up to the next cascade until the kernel fits.
+    vec2  uv;
+    float ref;
+    float w2uv;
+    for (;;) {
+        vec4 lclip = runtime_lights.light_view_proj[cascade] *
+                     vec4(biased_pos, 1.0);
+        vec3 lndc  = lclip.xyz / lclip.w;
+        uv   = lndc.xy * 0.5 + 0.5;
+        ref  = lndc.z;
+        w2uv = 0.5 *
+            length(runtime_lights.light_view_proj[cascade][0].xyz);
+
+        if (cascade >= CSM_CASCADE_COUNT - 1) break;   // last — take it
+
+        float kernel_uv =
+            max(CSM_BLOCKER_RADIUS_WORLD, CSM_MAX_PCF_RADIUS_WORLD) * w2uv
+            + 1.0 / 2048.0;
+        bool fits =
+            all(greaterThanEqual(uv, vec2(kernel_uv))) &&
+            all(lessThanEqual(uv, vec2(1.0 - kernel_uv))) &&
+            ref >= 0.0 && ref <= 1.0;
+        if (fits) break;
+        ++cascade;
+    }
     float z_scale = length(runtime_lights.light_view_proj[cascade][2].xyz);
 
     float depth_bias =
