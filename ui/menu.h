@@ -324,6 +324,12 @@ public:
     };
 private:
     ClassifierStatus classifier_status_ = ClassifierStatus::Idle;
+    // ── FPS cap (Tools menu).  0 = uncapped.  mainLoop sleeps each frame
+    // to hold this rate; while the classifier is running it clamps to 30
+    // regardless, so ML sharing the GPU doesn't starve presentation into
+    // black flashes.  Default 60: an editor doesn't need more, and the
+    // headroom keeps the machine responsive during training / generation.
+    int fps_cap_ = 60;
     float            classifier_elapsed_s_ = 0.0f;
     int              classifier_mats_done_ = 0;
     int              classifier_objs_done_ = 0;
@@ -579,6 +585,10 @@ public:
     // Recent Scenes submenu fills recent_scene_load_request_ for the app.
     std::vector<std::string> recent_scenes_;
     std::string              recent_scene_load_request_;
+    // Content Browser: double-clicking a .scene tile fills this with the file
+    // path; the app opens it ONLY if it isn't already the loaded scene
+    // (consumeContentSceneOpenRequest).
+    std::string              content_scene_open_request_;
     bool camera_create_request_ = false; // "Create Camera Here" (view pose)
     bool player_create_request_ = false; // "Add Player Object"
     bool bgm_create_request_    = false; // "Add BGM Object"
@@ -1150,6 +1160,17 @@ public:
         }
         return false;
     }
+    // Content Browser double-clicked a .scene tile.  The app loads it unless
+    // that file is already the live scene ("open if not already open") — so
+    // unlike Recent Scenes this never reverts unsaved edits by accident.
+    bool consumeContentSceneOpenRequest(std::string& out_path) {
+        if (!content_scene_open_request_.empty()) {
+            out_path = content_scene_open_request_;
+            content_scene_open_request_.clear();
+            return true;
+        }
+        return false;
+    }
     // "Create Scene" mode: clears the current scene to an empty grid the user
     // builds from scratch.  Serviced by the application a frame later (it tears
     // down the live imports), which is why it is a consume-once request.
@@ -1414,6 +1435,14 @@ public:
     // can render without each frame re-reading anything from the
     // async machinery.  Application calls this from the same place
     // it polls s_mat_classifier_future.
+    // Frame cap consumed by RealWorldApplication::mainLoop (0 = uncapped).
+    int  fpsCap() const { return fps_cap_; }
+    // True while the async material classifier is running — mainLoop clamps
+    // the frame cap to 30 for the duration.
+    bool classifierBusy() const {
+        return classifier_status_ == ClassifierStatus::Pending;
+    }
+
     void setClassifierStatus(
         ClassifierStatus status,
         float elapsed_s,

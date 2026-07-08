@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -1845,6 +1846,158 @@ bool CollisionMesh::deserialize(std::ifstream& is) {
     bvh_root_.reset();
     bvh_ready_.store(false, std::memory_order_release);
     return true;
+}
+
+// ── Collision streaming over a baked .rwcmap ────────────────────────────
+// See the header comment on openStreamingSource / updateStreaming.  The
+// file header layout matches application.cpp's writer:
+//   char[8] "RWCMAP\0\0", u32 version, u32 count, then `count` serialized
+//   CollisionMesh payloads back to back.
+namespace {
+
+constexpr char kStreamCmapMagic[8] = {'R','W','C','M','A','P','\0','\0'};
+
+// Squared distance from a point to an AABB (0 inside).
+float aabbDistanceSq(const AABB& b, const glm::vec3& p) {
+    const glm::vec3 c = glm::clamp(p, b.min_bounds, b.max_bounds);
+    const glm::vec3 d = p - c;
+    return glm::dot(d, d);
+}
+
+}  // namespace
+
+bool CollisionWorld::openStreamingSource(const std::string& path,
+                                         float load_radius,
+                                         float unload_radius) {
+    closeStreamingSource();
+
+    std::ifstream is(path, std::ios::binary);
+    if (!is) {
+        std::cout << "[collision-stream] cannot open '" << path << "'"
+                  << std::endl;
+        return false;
+    }
+    char magic[8] = {0};
+    uint32_t version = 0, count = 0;
+    if (!is.read(magic, 8) ||
+        std::memcmp(magic, kStreamCmapMagic, 8) != 0 ||
+        !is.read(reinterpret_cast<char*>(&version), 4) || version < 1 ||
+        !is.read(reinterpret_cast<char*>(&count), 4) || count > (1u << 20)) {
+        std::cout << "[collision-stream] '" << path
+                  << "' is not a valid .rwcmap" << std::endl;
+        return false;
+    }
+
+    // One-time index scan: deserialize each mesh to learn its byte offset
+    // and world AABB, then immediately drop the payload.  After this the
+    // only per-mesh cost until stream-in is a 40-byte StreamEntry.
+    stream_entries_.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        StreamEntry e;
+        e.offset = (int64_t)is.tellg();
+        CollisionMesh tmp;
+        if (!tmp.deserialize(is)) {
+            std::cout << "[collision-stream] '" << path
+                      << "' corrupt at mesh " << i << "/" << count
+                      << std::endl;
+            stream_entries_.clear();
+            return false;
+        }
+        e.bounds = tmp.bounds();
+        stream_entries_.push_back(e);
+    }
+
+    stream_path_          = path;
+    stream_load_radius_   = load_radius;
+    stream_unload_radius_ = std::max(unload_radius, load_radius);
+    stream_source_open_   = true;
+    std::cout << "[collision-stream] indexed '" << path << "': "
+              << stream_entries_.size() << " mesh(es), load/unload radius "
+              << stream_load_radius_ << "/" << stream_unload_radius_ << " m"
+              << std::endl;
+    return true;
+}
+
+void CollisionWorld::closeStreamingSource() {
+    stream_entries_.clear();
+    stream_path_.clear();
+    stream_source_open_ = false;
+}
+
+size_t CollisionWorld::updateStreaming(
+    const glm::vec3& focus,
+    const std::shared_ptr<renderer::Device>& device,
+    const std::function<void(std::function<void()>)>& defer_release,
+    size_t max_loads_per_call) {
+    if (!stream_source_open_) return 0;
+    size_t changed = 0;
+    const float load_sq   = stream_load_radius_ * stream_load_radius_;
+    const float unload_sq = stream_unload_radius_ * stream_unload_radius_;
+
+    // ── Unload: resident meshes beyond the unload radius ──────────────
+    for (auto& e : stream_entries_) {
+        if (e.resident_idx < 0) continue;
+        if (aabbDistanceSq(e.bounds, focus) <= unload_sq) continue;
+
+        const int32_t k    = e.resident_idx;
+        const int32_t tail = (int32_t)meshes_.size() - 1;
+        std::shared_ptr<CollisionMesh> victim = meshes_[k];
+
+        // Swap-erase, then repoint whichever stream entry owned the moved
+        // tail mesh (resident_entry_ is the reverse map).
+        meshes_[k]         = meshes_[tail];
+        resident_entry_[k] = resident_entry_[tail];
+        meshes_.pop_back();
+        resident_entry_.pop_back();
+        if (k < (int32_t)meshes_.size() && resident_entry_[k] >= 0) {
+            stream_entries_[resident_entry_[k]].resident_idx = k;
+        }
+        e.resident_idx = -1;
+
+        // Frame-delayed release: in-flight command buffers may still
+        // reference the mesh's GPU debug buffers, and the async BVH
+        // builder may hold the shared_ptr a little longer (it just
+        // finishes a tree for a mesh about to die — harmless).
+        defer_release([victim, device]() mutable {
+            if (device) victim->debugBuffers().destroy(device);
+            victim.reset();
+        });
+        ++changed;
+    }
+
+    // ── Load: non-resident meshes inside the load radius (budgeted) ───
+    size_t loads = 0;
+    std::ifstream is;   // opened lazily on the first needed load
+    for (auto& e : stream_entries_) {
+        if (loads >= max_loads_per_call) break;
+        if (e.resident_idx >= 0) continue;
+        if (aabbDistanceSq(e.bounds, focus) > load_sq) continue;
+
+        if (!is.is_open()) {
+            is.open(stream_path_, std::ios::binary);
+            if (!is) {
+                std::cout << "[collision-stream] source '" << stream_path_
+                          << "' unreadable — will retry" << std::endl;
+                break;
+            }
+        }
+        is.clear();
+        is.seekg((std::streamoff)e.offset);
+        auto m = std::make_shared<CollisionMesh>();
+        if (!m->deserialize(is) || m->empty()) continue;   // skip corrupt
+
+        e.resident_idx = (int32_t)meshes_.size();
+        meshes_.push_back(std::move(m));
+        resident_entry_.push_back(
+            (int32_t)(&e - stream_entries_.data()));
+        ++loads;
+        ++changed;
+    }
+    // BVHs for the newcomers build on the background thread; queries
+    // brute-force per mesh until each tree lands.  No-op if a build is
+    // already in flight — the next update that loads something retries.
+    if (loads > 0) buildBVHsAsync();
+    return changed;
 }
 
 } // namespace helper

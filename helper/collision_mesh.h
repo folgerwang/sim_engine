@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include "renderer/renderer.h"
@@ -358,7 +360,10 @@ public:
     ~CollisionWorld() { waitForBVHs(); }
 
     void addMesh(std::shared_ptr<CollisionMesh> mesh) {
-        if (mesh && !mesh->empty()) meshes_.push_back(std::move(mesh));
+        if (mesh && !mesh->empty()) {
+            meshes_.push_back(std::move(mesh));
+            resident_entry_.push_back(-1);   // not a streamed mesh
+        }
     }
     // clear() tears down the mesh list; the async builder (if any)
     // could still be holding shared_ptrs to those meshes, so we have
@@ -368,6 +373,8 @@ public:
     void clear() {
         waitForBVHs();
         meshes_.clear();
+        resident_entry_.clear();
+        for (auto& e : stream_entries_) e.resident_idx = -1;
     }
     bool empty() const { return meshes_.empty(); }
     size_t meshCount() const { return meshes_.size(); }
@@ -433,8 +440,62 @@ public:
     void destroyDebugBuffers(
         const std::shared_ptr<renderer::Device>& device);
 
+    // ── Streaming over a baked .rwcmap ────────────────────────────────
+    // Once a collision map is baked, the whole world doesn't need to be
+    // resident.  openStreamingSource() scans the file ONCE, recording
+    // each mesh's AABB + byte offset (payloads are dropped immediately),
+    // then updateStreaming() keeps exactly the meshes near `focus`
+    // loaded:
+    //
+    //   not resident  --(dist <= load_radius)-->  deserialize @ offset
+    //   resident      --(dist >  unload_radius)-> deferred release
+    //
+    // load_radius < unload_radius gives hysteresis so a mesh sitting on
+    // the boundary doesn't thrash.  Unloads go through `defer_release`
+    // (the app passes the ECS DeferredDeleter) so GPU debug buffers that
+    // in-flight command buffers still reference are freed frames later,
+    // and the async BVH builder holding a shared_ptr just finishes
+    // harmlessly.  Queries (raycastDown / resolveCapsule / drawDebug)
+    // only ever see the resident subset.
+    bool openStreamingSource(const std::string& path,
+                             float load_radius,
+                             float unload_radius);
+    void closeStreamingSource();
+    bool streamingActive() const { return stream_source_open_; }
+    size_t streamEntryCount() const { return stream_entries_.size(); }
+
+    // One streaming step.  At most `max_loads_per_call` meshes are
+    // deserialized per call (bounds the per-frame file-I/O hitch; pass
+    // SIZE_MAX to prime an area synchronously, e.g. right after load).
+    // Returns loads + unloads performed (0 = steady state).  Kicks the
+    // async BVH builder when anything was loaded.
+    size_t updateStreaming(
+        const glm::vec3& focus,
+        const std::shared_ptr<renderer::Device>& device,
+        const std::function<void(std::function<void()>)>& defer_release,
+        size_t max_loads_per_call = 4);
+
 private:
     std::vector<std::shared_ptr<CollisionMesh>> meshes_;
+
+    // ── Streaming bookkeeping ─────────────────────────────────────────
+    // stream_entries_: one per mesh in the .rwcmap (bounds + offset +
+    // where it currently lives in meshes_, -1 = not resident).
+    // resident_entry_: parallel to meshes_ — maps a resident mesh back
+    // to its stream entry (-1 for meshes added via addMesh, i.e. a
+    // non-streamed / freshly-baked world).  Kept in sync by addMesh,
+    // clear and the swap-erase inside updateStreaming.
+    struct StreamEntry {
+        AABB    bounds;
+        int64_t offset       = 0;   // byte offset of the mesh payload
+        int32_t resident_idx = -1;
+    };
+    std::vector<StreamEntry> stream_entries_;
+    std::vector<int32_t>     resident_entry_;
+    std::string              stream_path_;
+    bool                     stream_source_open_   = false;
+    float                    stream_load_radius_   = 150.0f;
+    float                    stream_unload_radius_ = 200.0f;
 
     // Async BVH builder bookkeeping.  `bvh_build_in_flight_` gates
     // re-entry from buildBVHsAsync() so a second call while a build

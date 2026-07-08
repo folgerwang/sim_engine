@@ -2451,6 +2451,25 @@ bool Menu::draw(
                 s_show_gpu_profiler = !s_show_gpu_profiler;
             }
 
+            // ── FPS cap ───────────────────────────────────────────────
+            // MAILBOX presents uncapped; capping frees GPU time slices
+            // for ML jobs sharing the card (classifier / fine-tune /
+            // image gen) so presentation stops flashing black.  While
+            // the classifier runs, the app clamps to 30 regardless.
+            ImGui::Separator();
+            if (ImGui::BeginMenu("FPS Cap")) {
+                static const int   kCaps[]   = {0, 120, 60, 30};
+                static const char* kLabels[] = {"Off (uncapped)", "120",
+                                                "60 (default)", "30"};
+                for (int ci = 0; ci < 4; ++ci) {
+                    if (ImGui::MenuItem(kLabels[ci], NULL,
+                                        fps_cap_ == kCaps[ci])) {
+                        fps_cap_ = kCaps[ci];
+                    }
+                }
+                ImGui::EndMenu();
+            }
+
             ImGui::EndMenu();
         }
 
@@ -5859,6 +5878,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // Skeletal animation clip (Qwen-generated or baked).  Double-
                 // click previews it on the standard rig in the Debug Display.
                 const bool is_anim = (ext == ".anim");
+                // Saved scene file (Scene → Save Scene).  Double-click opens
+                // it — the app no-ops if it is already the loaded scene.
+                const bool is_scene = (ext == ".scene");
                 // Import GROUP folder (holds import.rwmeta + .rwobj files):
                 // placeable as a whole — every object, original layout.
                 bool is_group_dir = false;
@@ -5902,6 +5924,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                                ? ImVec4(0.45f, 0.33f, 0.18f, 1.0f)
                                    : is_audio  ? ImVec4(0.40f, 0.30f, 0.22f, 1.0f)
                                    : is_anim   ? ImVec4(0.20f, 0.38f, 0.42f, 1.0f)
+                                   : is_scene  ? ImVec4(0.42f, 0.36f, 0.20f, 1.0f)
                                                : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, c);
                     std::string glyph = is_dir    ? "DIR"
@@ -5910,6 +5933,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                       : audio_playing ? "||>"
                                       : is_audio  ? "SND"
                                       : is_anim   ? "ANM"
+                                      : is_scene  ? "SCN"
                         : (ext.size() > 1 ? ext.substr(1) : "?");
                     for (auto& ch : glyph) ch = (char)std::toupper((unsigned char)ch);
                     clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
@@ -5933,6 +5957,12 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     buildStandardRigAnimPreview(
                         e.path().string(),
                         e.path().stem().string());
+                }
+                // Double-click a .scene → ask the app to open it.  The app
+                // skips the load when this file is already the live scene,
+                // so a stray double-click can't dump unsaved edits.
+                if (tile_dbl && is_scene) {
+                    content_scene_open_request_ = e.path().string();
                 }
 
                 // Drag a placeable tile into the 3D viewport to add it to
