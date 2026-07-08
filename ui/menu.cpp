@@ -1328,7 +1328,10 @@ bool Menu::draw(
         ImVec2 avp_pos, avp_size, avp_c;
         getViewportScreenRect(avp_pos, avp_size, avp_c);
         if (avp_size.x > 1.0f && avp_size.y > 1.0f) {
-            ImDrawList* afg = ImGui::GetForegroundDrawList();
+            // BACKGROUND draw list: the labels composite over the 3D viewport
+            // but stay BEHIND ImGui windows, so menus/popups aren't overdrawn
+            // by the X/Y/Z glyphs.  (Foreground would paint over the menu.)
+            ImDrawList* afg = ImGui::GetBackgroundDrawList();
             afg->PushClipRect(
                 avp_pos,
                 ImVec2(avp_pos.x + avp_size.x, avp_pos.y + avp_size.y),
@@ -3866,6 +3869,8 @@ void Menu::drawEditorDockSpace() {
     drawFluxGeneratePopup();
     // Shared text-to-audio popup — same single-instance rule.
     drawAudioGeneratePopup();
+    // Shared text-to-animation popup (Qwen → .anim).
+    drawAnimGeneratePopup();
 
     // ── Drag & drop placement into the 3D viewport ──────────────────────
     // The viewport is the pass-through central dock node (no ImGui window),
@@ -5838,6 +5843,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // through the engine's SFX bus, click again to stop.
                 const bool is_audio = (ext == ".wav" || ext == ".mp3" ||
                                        ext == ".flac");
+                // Skeletal animation clip (Qwen-generated or baked).  Double-
+                // click previews it on the standard rig in the Debug Display.
+                const bool is_anim = (ext == ".anim");
                 // Import GROUP folder (holds import.rwmeta + .rwobj files):
                 // placeable as a whole — every object, original layout.
                 bool is_group_dir = false;
@@ -5880,6 +5888,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                    : audio_playing
                                                ? ImVec4(0.45f, 0.33f, 0.18f, 1.0f)
                                    : is_audio  ? ImVec4(0.40f, 0.30f, 0.22f, 1.0f)
+                                   : is_anim   ? ImVec4(0.20f, 0.38f, 0.42f, 1.0f)
                                                : ImVec4(0.28f, 0.28f, 0.33f, 1.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, c);
                     std::string glyph = is_dir    ? "DIR"
@@ -5887,6 +5896,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                       : is_geo    ? "GEO"
                                       : audio_playing ? "||>"
                                       : is_audio  ? "SND"
+                                      : is_anim   ? "ANM"
                         : (ext.size() > 1 ? ext.substr(1) : "?");
                     for (auto& ch : glyph) ch = (char)std::toupper((unsigned char)ch);
                     clicked = ImGui::Button(glyph.c_str(), ImVec2(cell, cell));
@@ -5903,6 +5913,13 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
                 if (tile_dbl && (is_dir || (is_content && is_model))) {
                     cur_dir = e.path().string();
+                }
+                // Double-click a .anim → preview it on the standard rig in the
+                // right-side Debug Display (works in either browser).
+                if (tile_dbl && is_anim) {
+                    buildStandardRigAnimPreview(
+                        e.path().string(),
+                        e.path().stem().string());
                 }
 
                 // Drag a placeable tile into the 3D viewport to add it to
@@ -6096,6 +6113,10 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             if (ImGui::MenuItem("Generate Audio...")) {
                 agen_popup_pending_ = true;
                 agen_folder_        = cur_dir;
+            }
+            if (ImGui::MenuItem("Generate Animation...")) {
+                nanim_popup_pending_ = true;
+                nanim_folder_        = cur_dir;
             }
             ImGui::EndPopup();
         }
@@ -6661,6 +6682,344 @@ void Menu::drawAudioGeneratePopup() {
                 "Failed — see Output Log.");
     }
     ImGui::End();
+}
+
+// ── Text-to-animation popup (Qwen via Ollama → binary .anim) ────────────────
+// Unlike FLUX/audio (detached Python subprocesses), this runs the generator
+// in-process on a worker thread (plugins::auto_rig::generateAnimationFile).
+void Menu::drawAnimGeneratePopup() {
+    namespace fs = std::filesystem;
+
+    // Poll the worker.
+    if (nanim_status_ == 1 && nanim_future_.valid() &&
+        nanim_future_.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+        bool ok = false;
+        try { ok = nanim_future_.get(); }
+        catch (const std::exception& e) { nanim_err_ = e.what(); ok = false; }
+        if (ok) {
+            nanim_status_ = 2;
+            EditorLog::get().push("[anim] generated: " + nanim_out_path_);
+        } else {
+            nanim_status_ = 3;
+            EditorLog::get().push("[anim] generation FAILED: " + nanim_err_);
+        }
+    }
+
+    static bool s_open = false;
+    if (nanim_popup_pending_) {
+        nanim_popup_pending_ = false;
+        if (nanim_folder_.empty()) nanim_folder_ = content_dir_;
+        s_open = true;
+    }
+    if (!s_open) return;
+
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 380.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 280.0f),
+                                        ImVec2(8192.0f, 8192.0f));
+    if (ImGui::Begin("Generate Animation", &s_open,
+                     ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextDisabled("Generate .anim into:");
+        ImGui::TextUnformatted(nanim_folder_.c_str());
+        ImGui::TextDisabled("Local model: Qwen via Ollama  (needs `ollama serve`)");
+        ImGui::Separator();
+
+        ImGui::TextUnformatted("Motion prompt");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputText("##nanim_prompt", nanim_prompt_, sizeof(nanim_prompt_));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("e.g. \"walk forward\", \"wave right hand\", "
+                              "\"jump\", \"idle breathing\"");
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Name (optional)");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputTextWithHint("##nanim_name",
+            "leave empty for an auto name", nanim_name_, sizeof(nanim_name_));
+
+        ImGui::Spacing();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderInt("Seconds", &nanim_seconds_, 1, 10);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderInt("FPS", &nanim_fps_, 12, 30);
+
+        ImGui::Separator();
+        const bool busy = (nanim_status_ == 1);
+        if (busy) ImGui::BeginDisabled();
+        if (ImGui::Button("Generate", ImVec2(160, 0)) && nanim_prompt_[0]) {
+            std::string base = nanim_name_[0]
+                ? std::string(nanim_name_)
+                : ("anim_" + std::to_string((long long)std::time(nullptr)));
+            fs::path bp(base);
+            if (bp.extension() != ".anim") bp.replace_extension(".anim");
+            nanim_out_path_ = (fs::path(nanim_folder_) / bp).string();
+            const std::string prompt = nanim_prompt_;
+            const int secs = nanim_seconds_, fps = nanim_fps_;
+            const std::string outp = nanim_out_path_;
+            nanim_err_.clear();
+            nanim_status_ = 1;
+            EditorLog::get().push("[anim] generating '" + prompt + "' -> " + outp);
+            nanim_future_ = std::async(std::launch::async,
+                [this, prompt, secs, fps, outp]() {
+                    return plugins::auto_rig::generateAnimationFile(
+                        prompt, secs, fps, outp, nanim_err_);
+                });
+        }
+        if (busy) ImGui::EndDisabled();
+
+        if (nanim_status_ == 1)
+            ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.30f, 1.0f),
+                "Generating... (Qwen — CPU inference can take a while)");
+        else if (nanim_status_ == 2) {
+            ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.50f, 1.0f),
+                "Done — %s added.",
+                fs::path(nanim_out_path_).filename().string().c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Preview"))
+                buildStandardRigAnimPreview(nanim_out_path_,
+                    fs::path(nanim_out_path_).stem().string());
+            ImGui::TextDisabled("(double-click the .anim tile to preview anytime)");
+        } else if (nanim_status_ == 3)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                "Failed — see Output Log.");
+    }
+    ImGui::End();
+}
+
+// ── Animated standard-rig skeleton preview from a .anim file ────────────────
+// Builds a canonical 19-joint humanoid (T-pose), a procedural "bone" mesh
+// rigged 1:1 to it, converts the AnimClip into the engine's RwAnimClip, and
+// populates the same preview_* members buildRwGroupPreview uses — so the
+// existing tickPreviewAnimation() plays it (with the bone overlay) in the
+// right-side Debug Display.
+void Menu::buildStandardRigAnimPreview(const std::string& anim_path,
+                                       const std::string& caption) {
+    namespace ar = plugins::auto_rig;
+    ar::AnimClip clip;
+    if (!ar::loadAnimClip(clip, anim_path)) {
+        EditorLog::get().push("[anim] preview: failed to load " + anim_path);
+        return;
+    }
+    const std::vector<std::string>& names   = ar::getStandardJointNames();
+    const std::vector<int>&         parents = ar::getStandardJointParents();
+    const int N = (int)names.size();
+
+    // Canonical T-pose bind positions (metres; Y up, +X = character's left).
+    std::vector<glm::vec3> bind(N, glm::vec3(0.0f));
+    bind[0]  = {  0.00f, 1.00f, 0.0f };   // hips
+    bind[1]  = {  0.00f, 1.15f, 0.0f };   // spine
+    bind[2]  = {  0.00f, 1.35f, 0.0f };   // chest
+    bind[3]  = {  0.00f, 1.52f, 0.0f };   // neck
+    bind[4]  = {  0.00f, 1.66f, 0.0f };   // head
+    bind[5]  = {  0.12f, 1.45f, 0.0f };   // left_shoulder
+    bind[6]  = {  0.25f, 1.45f, 0.0f };   // left_upper_arm
+    bind[7]  = {  0.50f, 1.45f, 0.0f };   // left_lower_arm
+    bind[8]  = {  0.72f, 1.45f, 0.0f };   // left_hand
+    bind[9]  = { -0.12f, 1.45f, 0.0f };   // right_shoulder
+    bind[10] = { -0.25f, 1.45f, 0.0f };   // right_upper_arm
+    bind[11] = { -0.50f, 1.45f, 0.0f };   // right_lower_arm
+    bind[12] = { -0.72f, 1.45f, 0.0f };   // right_hand
+    bind[13] = {  0.10f, 0.92f, 0.0f };   // left_upper_leg
+    bind[14] = {  0.10f, 0.52f, 0.0f };   // left_lower_leg
+    bind[15] = {  0.10f, 0.08f, 0.05f };  // left_foot (toe fwd)
+    bind[16] = { -0.10f, 0.92f, 0.0f };   // right_upper_leg
+    bind[17] = { -0.10f, 0.52f, 0.0f };   // right_lower_leg
+    bind[18] = { -0.10f, 0.08f, 0.05f };  // right_foot
+
+    // Skeleton node arrays + bind world matrices (rotation = identity).
+    preview_node_parent_.assign(N, -1);
+    preview_node_name_.assign(N, std::string());
+    preview_node_bind_local_.assign(N, glm::mat4(1.0f));
+    preview_node_invbind_.assign(N, glm::mat4(1.0f));
+    preview_node_rot_limit_.assign(N, 3.14159265f);
+    for (int i = 0; i < N; ++i) {
+        preview_node_parent_[i] = parents[i];
+        preview_node_name_[i]   = names[i];
+        const glm::vec3 off =
+            (parents[i] >= 0) ? (bind[i] - bind[parents[i]]) : bind[i];
+        preview_node_bind_local_[i] = glm::translate(glm::mat4(1.0f), off);
+        preview_node_invbind_[i] =
+            glm::translate(glm::mat4(1.0f), -bind[i]);   // inverse(T(bind))
+        // Rotation cap (radians) so garbage angles can't fold a limb through
+        // the body, while allowing the FULL natural human range (arms reach
+        // down to the sides and overhead).  MUST match rot_cap_deg() in the
+        // training pipeline (ml_training/anim_finetune/anim_common.py).
+        const std::string& n = names[i];
+        auto has = [&](const char* s){ return n.find(s) != std::string::npos; };
+        float lim = 3.14159265f;
+        if      (has("lower_leg"))                  lim = 2.62f;  // 150 deg
+        else if (has("lower_arm"))                  lim = 2.53f;  // 145 deg
+        else if (has("shoulder") || has("upper_arm")) lim = 2.88f; // 165 deg
+        else if (has("upper_leg"))                  lim = 1.92f;  // 110 deg
+        else if (has("spine") || has("chest") ||
+                 has("neck")  || has("head"))       lim = 0.70f;  // 40 deg
+        else if (has("hand")  || has("foot"))       lim = 1.05f;  // 60 deg
+        preview_node_rot_limit_[i] = lim;
+    }
+    preview_mesh_node_inv_ = glm::mat4(1.0f);
+
+    // Procedural geometry: octahedron marker at each joint (weighted to that
+    // joint) + a "bone" diamond per parent→child segment (weighted to PARENT,
+    // since a rigid bone rotates with its parent joint).
+    engine::helper::MeshPreviewPayload p;
+    std::vector<glm::uvec4> sj;
+    std::vector<glm::vec4>  sw, sc;
+    auto addVert = [&](const glm::vec3& pos, int joint) {
+        p.positions.push_back(pos);
+        p.normals.push_back(glm::vec3(0.0f));       // recomputed below
+        p.uvs.push_back(glm::vec2(0.0f));
+        sj.push_back(glm::uvec4((uint32_t)joint, 0, 0, 0));
+        sw.push_back(glm::vec4(1.0f, 0.0f, 0.0f, 0.0f));
+        sc.push_back(glm::vec4(1.0f, 0.0f, 0.0f, 0.0f));
+    };
+    auto addTri = [&](uint32_t a, uint32_t b, uint32_t c) {
+        p.indices.push_back(a); p.indices.push_back(b); p.indices.push_back(c);
+    };
+    auto addOcta = [&](const glm::vec3& c, float r, int joint) {
+        const uint32_t b = (uint32_t)p.positions.size();
+        addVert(c + glm::vec3( r, 0, 0), joint);   // 0 +x
+        addVert(c + glm::vec3(-r, 0, 0), joint);   // 1 -x
+        addVert(c + glm::vec3( 0, r, 0), joint);   // 2 +y
+        addVert(c + glm::vec3( 0,-r, 0), joint);   // 3 -y
+        addVert(c + glm::vec3( 0, 0, r), joint);   // 4 +z
+        addVert(c + glm::vec3( 0, 0,-r), joint);   // 5 -z
+        addTri(b+0,b+2,b+4); addTri(b+2,b+1,b+4); addTri(b+1,b+3,b+4); addTri(b+3,b+0,b+4);
+        addTri(b+2,b+0,b+5); addTri(b+1,b+2,b+5); addTri(b+3,b+1,b+5); addTri(b+0,b+3,b+5);
+    };
+    auto addBone = [&](const glm::vec3& a, const glm::vec3& bpt, float r, int joint) {
+        glm::vec3 axis = bpt - a;
+        const float len = glm::length(axis);
+        if (len < 1e-5f) return;
+        axis /= len;
+        glm::vec3 ref = (std::fabs(axis.y) < 0.9f) ? glm::vec3(0,1,0)
+                                                   : glm::vec3(1,0,0);
+        const glm::vec3 u = glm::normalize(glm::cross(axis, ref));
+        const glm::vec3 v = glm::normalize(glm::cross(axis, u));
+        const glm::vec3 mid = a + axis * (len * 0.18f);   // ring near the base
+        const uint32_t base = (uint32_t)p.positions.size();
+        addVert(a, joint);                                 // 0 tip-base
+        addVert(mid + u * r, joint);                       // 1 ring
+        addVert(mid + v * r, joint);                       // 2
+        addVert(mid - u * r, joint);                       // 3
+        addVert(mid - v * r, joint);                       // 4
+        addVert(bpt, joint);                               // 5 tip-end
+        // base pyramid (a → ring)
+        addTri(base+0,base+1,base+2); addTri(base+0,base+2,base+3);
+        addTri(base+0,base+3,base+4); addTri(base+0,base+4,base+1);
+        // end pyramid (ring → b)
+        addTri(base+5,base+2,base+1); addTri(base+5,base+3,base+2);
+        addTri(base+5,base+4,base+3); addTri(base+5,base+1,base+4);
+    };
+
+    // Scale features to the rig size.
+    const float jr = 0.022f, br = 0.014f;
+    for (int i = 0; i < N; ++i) addOcta(bind[i], jr, i);
+    for (int i = 0; i < N; ++i)
+        if (parents[i] >= 0) addBone(bind[parents[i]], bind[i], br, parents[i]);
+
+    // Recompute vertex normals from faces (smooth) for shading.
+    for (size_t t = 0; t + 2 < p.indices.size(); t += 3) {
+        const uint32_t i0 = p.indices[t], i1 = p.indices[t+1], i2 = p.indices[t+2];
+        const glm::vec3 fn = glm::cross(p.positions[i1] - p.positions[i0],
+                                        p.positions[i2] - p.positions[i0]);
+        p.normals[i0] += fn; p.normals[i1] += fn; p.normals[i2] += fn;
+    }
+    for (auto& n : p.normals) { float l = glm::length(n); if (l > 1e-9f) n /= l; }
+
+    engine::helper::MeshPreviewSection sec;
+    sec.first_index = 0;
+    sec.index_count = (uint32_t)p.indices.size();
+    p.sections.push_back(sec);
+
+    // Skin arrays (single influence each; no second set).
+    preview_skin_joints_    = std::move(sj);
+    preview_skin_weights_   = std::move(sw);
+    preview_skin_closeness_ = std::move(sc);
+    preview_skin_joints1_.clear();
+    preview_skin_weights1_.clear();
+    preview_skin_closeness1_.clear();
+    preview_anim_base_ = p;                      // BIND-pose copy before move
+
+    // Weight-debug bone list = all joints.
+    preview_weight_bones_.clear();
+    for (int i = 0; i < N; ++i) preview_weight_bones_.push_back(i);
+    preview_weight_sel_ = 0;
+    preview_bone_weight_scale_.assign(N, 1.0f);
+
+    // Distance-debug weld cache unused here.
+    preview_weld_id_.clear(); preview_weld_pos_.clear();
+    preview_weld_adj_.clear(); preview_weld_tris_.clear();
+    preview_joint_bind_world_.assign(N, glm::vec3(0.0f));
+    for (int i = 0; i < N; ++i) preview_joint_bind_world_[i] = bind[i];
+    preview_dist_sel_cached_ = -999;
+    preview_surface_close_.clear();
+
+    // Convert AnimClip → RwAnimClip (rotation per joint; root translation
+    // becomes an ABSOLUTE hips translation = bind + offset).
+    engine::helper::RwAnimClip rc;
+    rc.name     = clip.name;
+    rc.duration = clip.duration > 0.0f ? clip.duration : 1.0f;
+    for (const auto& tr : clip.tracks) {
+        if (tr.joint < 0 || tr.joint >= N) continue;
+        engine::helper::RwAnimChannel ch;
+        ch.node = tr.joint;
+        ch.path = engine::helper::RwAnimPath::kRotation;
+        ch.step = 0;
+        for (const auto& k : tr.rot) {
+            ch.times.push_back(k.time);
+            ch.values.push_back(glm::vec4(k.rot.x, k.rot.y, k.rot.z, k.rot.w));
+        }
+        rc.channels.push_back(std::move(ch));
+    }
+    if (!clip.root_pos.empty()) {
+        engine::helper::RwAnimChannel ch;
+        ch.node = 0;                                  // hips (root)
+        ch.path = engine::helper::RwAnimPath::kTranslation;
+        ch.step = 0;
+        for (const auto& k : clip.root_pos) {
+            ch.times.push_back(k.time);
+            ch.values.push_back(glm::vec4(bind[0] + k.v, 0.0f));
+        }
+        rc.channels.push_back(std::move(ch));
+    }
+    preview_clip_ = std::move(rc);
+
+    // Stage + enable playback (mirrors buildRwGroupPreview ordering).
+    preview_nav_ = PreviewNav::None;
+    stagePreviewPayload(std::move(p));        // clears preview_anim_ready_
+    finishAssetPreview(anim_path,
+        "Anim: " + caption + "  (standard rig: " + std::to_string(N) +
+        " joints)");
+    dbg_preview_skinned_   = true;
+    preview_show_skeleton_ = true;
+    preview_anim_time_     = 0.0f;
+    preview_anim_speed_    = 1.0f;            // a prior scrub may have left it 0
+    preview_anim_playing_  = true;
+    preview_anim_ready_    = true;            // AFTER stage (which cleared it)
+
+    // Diagnostic: report the clip's actual content so a "no motion" preview is
+    // easy to triage (0 tracks = generation/parse issue; tiny max-angle = the
+    // model returned near-bind rotations).
+    float tmin = 1e30f, tmax = -1e30f, maxdeg = 0.0f;
+    for (const auto& tr : clip.tracks)
+        for (const auto& k : tr.rot) {
+            tmin = std::min(tmin, k.time); tmax = std::max(tmax, k.time);
+            glm::quat q = glm::normalize(k.rot);
+            const float ang = glm::degrees(2.0f *
+                std::acos(glm::clamp(std::fabs(q.w), 0.0f, 1.0f)));
+            maxdeg = std::max(maxdeg, ang);
+        }
+    if (clip.tracks.empty()) { tmin = 0.0f; tmax = 0.0f; }
+    char dbg[256];
+    std::snprintf(dbg, sizeof(dbg),
+        "[anim] preview '%s': rig=%d joints, %d tracks, %d keys, %d channels, "
+        "dur=%.2fs, key t=[%.2f..%.2f], maxRot=%.1f deg %s",
+        clip.name.c_str(), N, (int)clip.tracks.size(), (int)clip.keyCount(),
+        (int)preview_clip_.channels.size(), clip.duration, tmin, tmax, maxdeg,
+        (clip.tracks.empty() ? "(EMPTY clip — generation produced no tracks)"
+         : maxdeg < 2.0f ? "(near-bind rotations — model gave ~0 motion)" : ""));
+    EditorLog::get().push(dbg);
 }
 
 // ── Sub-object names for a content asset (virtual-folder view) ──────────────

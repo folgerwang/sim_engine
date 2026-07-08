@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <filesystem>
 #include <cstdint>
+#include <future>                  // text-to-animation worker (Generate Animation)
 #include "renderer/renderer.h"
 #include "helper/mesh_preview.h"   // Debug Display GPU preview payload
 #include "helper/model_inspect.h"  // RwAnimClip (animated preview)
@@ -1038,6 +1039,26 @@ private:
     std::string agen_last_prompt_;           // for the Regenerate button
     int         agen_last_type_     = 0;
     float       agen_last_dur_      = 12.0f;
+
+    // ── Text-to-animation generation (Content Browser right-click) ──────────
+    // In-process Qwen/Ollama (no subprocess): a worker thread runs
+    // plugins::auto_rig::generateAnimationFile() and writes a binary .anim into
+    // the folder.  nanim_status_: 0 idle, 1 running, 2 done, 3 error.
+    void drawAnimGeneratePopup();    // popup + worker poll (once per frame)
+    bool        nanim_popup_pending_ = false;
+    char        nanim_prompt_[512]   = "walk forward";
+    char        nanim_name_[128]     = {0};   // optional output name (empty = auto)
+    int         nanim_seconds_       = 3;
+    int         nanim_fps_           = 24;
+    std::string nanim_folder_;                // folder to generate into
+    std::string nanim_out_path_;              // current output .anim
+    int         nanim_status_        = 0;
+    std::string nanim_err_;                   // worker error (read post-join)
+    std::future<bool> nanim_future_;
+    // Build an animated standard-rig skeleton preview from a .anim file and
+    // stage it into the right-side Debug Display (double-click a .anim tile).
+    void buildStandardRigAnimPreview(const std::string& anim_path,
+                                     const std::string& caption);
 
     // Content Browser audio preview (click a wav/mp3/flac tile to toggle).
     uint64_t    audio_preview_handle_ = 0;
