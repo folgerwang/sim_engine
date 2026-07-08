@@ -5748,6 +5748,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             int cols = (int)(avail / (cell + 14.0f));
             if (cols < 1) cols = 1;
             if (is_content) browser_grid_cols_ = cols;
+            // Fixed column origin: tiles are pinned to grid_x0 + k*(cell+14)
+            // so a label wider than the tile can't shift the next column.
+            const float grid_x0 = ImGui::GetCursorPosX();
             for (size_t i = 0; i < subs.size(); ++i) {
                 ImGui::PushID((int)i);
                 ImGui::BeginGroup();
@@ -5756,7 +5759,12 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 ImGui::Button("MESH", ImVec2(cell, cell));
                 ImGui::PopStyleColor();
                 std::string disp = subs[i];
-                if (disp.size() > 11) disp = disp.substr(0, 9) + "..";
+                if (ImGui::CalcTextSize(disp.c_str()).x > cell) {
+                    while (disp.size() > 1 &&
+                           ImGui::CalcTextSize((disp + "..").c_str()).x > cell)
+                        disp.pop_back();
+                    disp += "..";
+                }
                 ImGui::TextUnformatted(disp.c_str());
                 ImGui::EndGroup();
 
@@ -5788,7 +5796,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                         "  /  " + subs[i]);
                 }
                 ImGui::PopID();
-                if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
+                if ((int)((i + 1) % (size_t)cols) != 0)
+                    ImGui::SameLine(grid_x0 +
+                        (float)((i + 1) % (size_t)cols) * (cell + 14.0f));
             }
             if (subs.empty())
                 ImGui::TextDisabled("(no sub-objects — single-mesh asset)");
@@ -5819,6 +5829,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             int cols = (int)(avail / (cell + 14.0f));
             if (cols < 1) cols = 1;
             if (is_content) browser_grid_cols_ = cols;
+            // Fixed column origin (see the sub-object grid above): pin each
+            // column to grid_x0 + k*(cell+14) so wide labels can't skew the row.
+            const float grid_x0 = ImGui::GetCursorPosX();
 
             for (size_t i = 0; i < items.size(); ++i) {
                 const fs::directory_entry& e = items[i];
@@ -5938,9 +5951,15 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     ImGui::TextUnformatted(name.c_str());
                     ImGui::EndDragDropSource();
                 }
-                // Truncated one-line label (keeps the grid aligned).
+                // Truncated one-line label (keeps the grid aligned):
+                // trimmed by pixel width so it never exceeds the tile.
                 std::string disp = name;
-                if (disp.size() > 11) disp = disp.substr(0, 9) + "..";
+                if (ImGui::CalcTextSize(disp.c_str()).x > cell) {
+                    while (disp.size() > 1 &&
+                           ImGui::CalcTextSize((disp + "..").c_str()).x > cell)
+                        disp.pop_back();
+                    disp += "..";
+                }
                 ImGui::TextUnformatted(disp.c_str());
                 ImGui::EndGroup();
                 if (tile_disabled) ImGui::PopStyleVar();   // end grey-out
@@ -6058,7 +6077,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     }
                 }
 
-                if ((int)((i + 1) % (size_t)cols) != 0) ImGui::SameLine();
+                if ((int)((i + 1) % (size_t)cols) != 0)
+                    ImGui::SameLine(grid_x0 +
+                        (float)((i + 1) % (size_t)cols) * (cell + 14.0f));
             }
             if (items.empty()) ImGui::TextDisabled("(empty)");
         } else {
