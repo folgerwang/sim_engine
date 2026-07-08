@@ -339,6 +339,30 @@ private:
     std::shared_ptr<renderer::DescriptorSet>
         cluster_mesh_data_desc_set_;
 
+    // ── Software-RT shadow BVH (world-space raytraced shadows) ─────────
+    // CPU-built binary BVH over every cluster's bounding-sphere AABB,
+    // rebuilt at the end of each finalizeUploads.  Traversed per pixel
+    // by deferred_resolve.comp (COMPUTE) to trace sun-shadow rays against
+    // the actual merged cluster geometry — no RT hardware involved.
+    //   rt_bvh_nodes_buffer_  : glsl::RtBvhNode[]   (32 B / node)
+    //   rt_bvh_leaves_buffer_ : uint[] global cluster indices per leaf
+    // rt_shadow_desc_set_ (COMPUTE visibility) bundles the five geometry
+    // SSBOs the mesh-data set exposes PLUS the two BVH buffers:
+    //   0 cull infos  1 draw infos  2 merged VB  3 merged IB
+    //   4 material params  5 BVH nodes  6 BVH leaf cluster indices
+    // The application binds it at set RUNTIME_LIGHTS_PARAMS_SET + 1 of
+    // the deferred-resolve pipeline (its own identically-defined layout
+    // keeps the pipeline creatable before the first finalize).
+    renderer::BufferInfo rt_bvh_nodes_buffer_;
+    renderer::BufferInfo rt_bvh_leaves_buffer_;
+    uint32_t             rt_bvh_node_count_ = 0;
+    bool                 rt_shadow_ready_   = false;
+    std::shared_ptr<renderer::DescriptorSetLayout>
+        rt_shadow_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet>
+        rt_shadow_desc_set_;
+    void buildRtShadowBvh();   // called from finalizeUploads
+
     // ── CSM silhouette prepass pipeline ─────────────────────────────────
     // Pre-fills each cascade's main-camera-frustum interior with depth=1
     // before the real shadow draws.  Combined with a render-pass clear
@@ -947,6 +971,15 @@ public:
     bool& getDebugDrawBBox() { return debug_draw_bbox_; }
     bool& getDebugDistanceCull() { return debug_distance_cull_; }
     bool& getUseHiZOcclusionCull() { return use_hiz_occlusion_cull_; }
+
+    // ── Software-RT shadow accessors ────────────────────────────────────
+    // rtShadowReady(): the BVH + descriptor set exist (finalizeUploads
+    // ran with geometry present) — the app gates FEATURE_INPUT_RT_SHADOW
+    // on this so the resolve shader never traverses an empty tree.
+    bool rtShadowReady() const { return rt_shadow_ready_; }
+    const std::shared_ptr<renderer::DescriptorSet>& getRtShadowDescSet() const {
+        return rt_shadow_desc_set_;
+    }
     const std::vector<glsl::ClusterCullInfo>& getDebugSampleClusters() const {
         return debug_sample_clusters_;
     }

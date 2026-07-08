@@ -2152,6 +2152,39 @@ bool Menu::draw(
                     turn_off_shadow_pass_ = !turn_off_shadow_pass_;
                 }
 
+                // ── Shadow technique ─────────────────────────────────
+                // CSM (default): cascaded shadow maps, rendered by the
+                // shadow pass and sampled everywhere.
+                // Screen-space raytraced (software): NO shadow maps at
+                // all — deferred_resolve.comp ray-marches the G-buffer
+                // depth toward the sun per pixel.  Experimental / for
+                // perf comparison: only deferred (cluster) pixels get
+                // shadows, and only on-screen geometry can cast them.
+                // Compare "CSM Shadow" vs "Deferred Resolve Compute" in
+                // the GPU profiler to read the cost delta.
+                if (ImGui::BeginMenu("Shadow technique")) {
+                    const ShadowTechnique cur = shadow_technique_;
+                    if (ImGui::MenuItem("CSM (cascaded shadow maps)", NULL,
+                                        cur == ShadowTechnique::kCsm)) {
+                        shadow_technique_ = ShadowTechnique::kCsm;
+                    }
+                    if (ImGui::MenuItem(
+                            "Screen-space raytraced (software, experimental)",
+                            NULL, cur == ShadowTechnique::kSsrt)) {
+                        shadow_technique_ = ShadowTechnique::kSsrt;
+                    }
+                    // TRUE software RT: per-pixel rays traced against the
+                    // cluster BVH in world space — off-screen casters
+                    // work.  Needs the cluster path finalized; the app
+                    // falls back to unshadowed until the BVH is built.
+                    if (ImGui::MenuItem(
+                            "World-space raytraced (software BVH, experimental)",
+                            NULL, cur == ShadowTechnique::kRtBvh)) {
+                        shadow_technique_ = ShadowTechnique::kRtBvh;
+                    }
+                    ImGui::EndMenu();
+                }
+
                 // CSM silhouette prepass — see the member field comment in
                 // menu.h and csm_silhouette_prepass.mesh's header.  Off →
                 // the shadow pass clears depth to 1.0 (legacy) and skips

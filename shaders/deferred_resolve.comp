@@ -63,6 +63,38 @@ layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
     RuntimeLightsParams runtime_lights;
 };
 
+// ─── Software-RT shadow data (world-space raytraced shadows) ─────────
+// Bound by the app from ClusterRenderer's rt_shadow_desc_set_ — the same
+// merged cluster geometry the bindless raster path draws, plus a CPU-
+// built BVH over cluster bounds.  Only statically reachable through
+// rtShadowFactor(), which main() calls under FEATURE_INPUT_RT_SHADOW.
+#define RT_SHADOW_DATA_SET (RUNTIME_LIGHTS_PARAMS_SET + 1)
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 0) readonly buffer RtCullInfos {
+    ClusterCullInfo rt_cull_infos[];
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 1) readonly buffer RtDrawInfos {
+    ClusterDrawInfo rt_draw_infos[];
+};
+// Merged bindless vertex buffer read as raw floats: BindlessVertex is
+// {vec3 position, vec3 normal, vec2 uv, vec4 tangent} = 12 floats,
+// position at float offset 0.
+#define RT_VERTEX_STRIDE_FLOATS 12u
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 2) readonly buffer RtVertices {
+    float rt_vertices[];
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 3) readonly buffer RtIndices {
+    uint rt_indices[];
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 4) readonly buffer RtMaterials {
+    BindlessMaterialParams rt_materials[];
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 5) readonly buffer RtBvhNodes {
+    RtBvhNode rt_bvh_nodes[];
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 6) readonly buffer RtBvhLeaves {
+    uint rt_bvh_leaf_clusters[];
+};
+
 // Octahedral decode — companion of the encode in cluster_bindless.frag
 // (GBUFFER_OUTPUT branch).  Maps a 2D unit-square coordinate back onto a
 // unit sphere with no singularities and ~7 bits of angular precision per
@@ -127,6 +159,178 @@ vec2 csmVogelDisk(int i, int n, float phi) {
 float csmIGN(vec2 pixel) {
     return fract(52.9829189 *
                  fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+// ─── Software screen-space raytraced sun shadows ────────────────────
+// FEATURE_INPUT_SSRT_SHADOW: instead of sampling the CSM cascade array,
+// march a ray from the pixel's reconstructed world position toward the
+// sun THROUGH SCREEN SPACE, testing each step against the G-buffer
+// depth.  Pure compute + depth reads — no RT hardware, no shadow-map
+// rendering at all (the app skips the whole CSM pass in this mode).
+//
+// Inherent limits (accepted for this experiment):
+//   • only occluders VISIBLE ON SCREEN can cast shadows — geometry
+//     behind the camera or off-frame casts nothing;
+//   • the depth buffer is a single layer, so occluder thickness is a
+//     heuristic (kSsrtThickness) — very thick objects can leak light
+//     when the ray passes "behind" their visible front shell.
+const int   SSRT_STEPS         = 24;     // depth taps per pixel
+const float SSRT_MAX_DIST      = 12.0;   // world meters of caster search
+const float SSRT_THICKNESS     = 0.40;   // occluder thickness heuristic (m)
+const float SSRT_SURFACE_BIAS  = 0.03;   // self-intersection guard (m)
+
+// ─── World-space software raytraced sun shadows ──────────────────────
+// FEATURE_INPUT_RT_SHADOW: trace the pixel's sun ray through the CPU-
+// built cluster BVH and Möller–Trumbore-test the triangles of every
+// intersected cluster.  TRUE world-space occlusion: casters do not need
+// to be on screen.  Pure compute — this is the "software RT" datapoint
+// to compare against CSM ("CSM Shadow" scope goes to ~0; this cost lands
+// in "Deferred Resolve Compute").
+const float RT_SHADOW_MAX_DIST = 300.0;  // caster search range (m)
+const float RT_SHADOW_BIAS     = 0.03;   // launch offset (m)
+const int   RT_BVH_STACK_SIZE  = 48;
+
+// Slab test vs node AABB.  inv_dir precomputed by the caller; returns
+// true when the ray's [0, t_max] interval overlaps the box.
+bool rtRayAabb(vec3 ro, vec3 inv_dir, float t_max, vec3 bmin, vec3 bmax) {
+    vec3 t0 = (bmin - ro) * inv_dir;
+    vec3 t1 = (bmax - ro) * inv_dir;
+    vec3 tmin3 = min(t0, t1);
+    vec3 tmax3 = max(t0, t1);
+    float t_enter = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float t_exit  = min(min(tmax3.x, tmax3.y), tmax3.z);
+    return t_exit >= max(t_enter, 0.0) && t_enter <= t_max;
+}
+
+// Möller–Trumbore, double-sided, any-hit semantics.
+bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2) {
+    vec3 e1 = v1 - v0;
+    vec3 e2 = v2 - v0;
+    vec3 pv = cross(rd, e2);
+    float det = dot(e1, pv);
+    if (abs(det) < 1e-8) return false;
+    float inv_det = 1.0 / det;
+    vec3 tv = ro - v0;
+    float u = dot(tv, pv) * inv_det;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 qv = cross(tv, e1);
+    float v = dot(rd, qv) * inv_det;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float t = dot(e2, qv) * inv_det;
+    return t > RT_SHADOW_BIAS && t < t_max;
+}
+
+vec3 rtFetchPosition(uint vertex_idx) {
+    uint base = vertex_idx * RT_VERTEX_STRIDE_FLOATS;
+    return vec3(rt_vertices[base + 0u],
+                rt_vertices[base + 1u],
+                rt_vertices[base + 2u]);
+}
+
+float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
+    vec3 L  = normalize(-runtime_lights.lights[0].direction);
+    vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
+    vec3 inv_dir = 1.0 / L;   // GLSL inf per component when L axis == 0 — fine for the slab test
+
+    uint stack[RT_BVH_STACK_SIZE];
+    int  sp = 0;
+    stack[sp++] = 0u;   // root
+
+    while (sp > 0) {
+        RtBvhNode node = rt_bvh_nodes[stack[--sp]];
+        if (!rtRayAabb(ro, inv_dir, RT_SHADOW_MAX_DIST,
+                       node.aabb_min, node.aabb_max)) continue;
+
+        if (node.prim_count == 0u) {
+            // Inner node: children are adjacent (left, left+1).
+            if (sp + 2 <= RT_BVH_STACK_SIZE) {
+                stack[sp++] = node.left_first;
+                stack[sp++] = node.left_first + 1u;
+            }
+            continue;
+        }
+
+        // Leaf: test each referenced cluster's triangles.
+        for (uint p = 0u; p < node.prim_count; ++p) {
+            uint cluster_idx = rt_bvh_leaf_clusters[node.left_first + p];
+
+            // Cheap sphere reject before touching triangle data.
+            vec4 bs = rt_cull_infos[cluster_idx].bounds_sphere;
+            vec3 oc = bs.xyz - ro;
+            float t_ca = dot(oc, L);
+            float d2 = dot(oc, oc) - t_ca * t_ca;
+            if (t_ca < -bs.w || t_ca - bs.w > RT_SHADOW_MAX_DIST ||
+                d2 > bs.w * bs.w) continue;
+
+            ClusterDrawInfo draw = rt_draw_infos[cluster_idx];
+            // Translucent clusters don't occlude the sun (matches the
+            // raster shadow path, which skips them at cull time).
+            uint mflags = rt_materials[draw.material_idx].flags;
+            if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+
+            uint tri_count = draw.index_count / 3u;
+            for (uint t = 0u; t < tri_count; ++t) {
+                uint i0 = rt_indices[draw.index_offset + t * 3u + 0u]
+                          + draw.vertex_offset;
+                uint i1 = rt_indices[draw.index_offset + t * 3u + 1u]
+                          + draw.vertex_offset;
+                uint i2 = rt_indices[draw.index_offset + t * 3u + 2u]
+                          + draw.vertex_offset;
+                if (rtRayTri(ro, L, RT_SHADOW_MAX_DIST,
+                             rtFetchPosition(i0),
+                             rtFetchPosition(i1),
+                             rtFetchPosition(i2))) {
+                    return 0.0;   // any hit — occluded
+                }
+            }
+        }
+    }
+    return 1.0;
+}
+
+float ssrtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
+    vec3 L = normalize(-runtime_lights.lights[0].direction);
+
+    // Nudge off the surface along BOTH the normal and the ray so step 0
+    // doesn't immediately re-hit the pixel's own surface.
+    vec3 ro = world_pos + world_normal * SSRT_SURFACE_BIAS
+                        + L * SSRT_SURFACE_BIAS;
+
+    // Stratified jittered start de-bands the stepped edge (same IGN
+    // dither the PCSS kernel uses).
+    float jitter = csmIGN(screen_pixel);
+    float t_step = SSRT_MAX_DIST / float(SSRT_STEPS);
+    float t      = t_step * (0.5 + jitter);
+
+    float a = camera_info.depth_params.x;   // proj[2][2]
+    float b = camera_info.depth_params.y;   // proj[3][2]
+
+    for (int i = 0; i < SSRT_STEPS; ++i) {
+        vec3 p = ro + L * t;
+        t += t_step;
+        vec4 clip = camera_info.view_proj * vec4(p, 1.0);
+        if (clip.w <= 1e-4) break;              // behind the camera
+        vec3 ndc = clip.xyz / clip.w;
+        if (ndc.z <= 0.0 || ndc.z >= 1.0) break;
+        vec2 suv = ndc.xy * 0.5 + 0.5;
+        if (any(lessThan(suv, vec2(0.0))) ||
+            any(greaterThan(suv, vec2(1.0))))
+            break;                              // ray left the screen
+
+        float scene_z = texture(gbuf_depth, suv).r;
+        if (scene_z >= 1.0) continue;           // sky behind this tap
+
+        // Linearise both depths (Vulkan [0,1] perspective:
+        // linZ = b / (a + z)) and test "ray point is behind a visible
+        // surface, within its assumed thickness".
+        float lin_scene = b / (a + scene_z);
+        float lin_ray   = b / (a + ndc.z);
+        float dz        = lin_ray - lin_scene;
+        if (dz > SSRT_SURFACE_BIAS && dz < SSRT_THICKNESS) {
+            return 0.0;                         // occluded — hard shadow
+        }
+    }
+    return 1.0;
 }
 
 float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
@@ -319,7 +523,16 @@ void main() {
     float NdotL = max(dot(N, L), 0.0);
 
     float shad = 1.0;
-    if ((camera_info.input_features & FEATURE_INPUT_SHADOW_DISABLED) == 0u) {
+    if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
+        // World-space software raytraced shadows (cluster BVH traversal).
+        shad = rtShadowFactor(world_pos, N_geom);
+    } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
+        // Software screen-space raytraced shadows — checked BEFORE the
+        // disabled flag: the app sets SHADOW_DISABLED alongside SSRT to
+        // silence CSM sampling in the forward shaders, but the deferred
+        // pixels still get ray-marched shadows here.
+        shad = ssrtShadowFactor(world_pos, N_geom, vec2(px));
+    } else if ((camera_info.input_features & FEATURE_INPUT_SHADOW_DISABLED) == 0u) {
         // Use the geometric (un-perturbed) normal for shadow biasing —
         // normal-mapped perturbations can give inconsistent bias at
         // texel-detail scale and re-introduce acne on bumpy surfaces.

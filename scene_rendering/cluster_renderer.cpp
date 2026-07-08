@@ -11,7 +11,10 @@
 #include "game_object/drawable_object.h"
 #include "virtual_texture.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <limits>
 #include <source_location>
 #include <cstring>
 #include <cctype>
@@ -1449,6 +1452,11 @@ void ClusterRenderer::finalizeUploads() {
             static_cast<uint32_t>(
                 mat_count_safe * sizeof(glsl::BindlessMaterialParams)));
         device_->updateDescriptorSets(mesh_writes);
+
+        // Software-RT shadow acceleration structure + descriptor set —
+        // rebuilt alongside the mesh-data set so the resolve shader's
+        // world-space shadow rays always trace CURRENT geometry.
+        buildRtShadowBvh();
     }
 
     std::printf(
@@ -4463,6 +4471,170 @@ void ClusterRenderer::recreate(
 
 // ─── Destroy ──────────────────────────────────────────────────────────────
 
+// ─── Software-RT shadow BVH (world-space raytraced shadows) ──────────────
+// Median-split binary BVH over every cluster's bounding-sphere AABB.
+// Leaves hold ≤ kRtBvhLeafSize cluster indices.  Children of an inner node
+// are allocated ADJACENTLY (right = left + 1) so a node only stores the
+// left index.  Built single-threaded on the CPU from staging_cull_infos_
+// (a few hundred ms worst case for Bistro-scale cluster counts — runs
+// inside finalizeUploads, which is already a load-time hitch) and uploaded
+// as two SSBOs for deferred_resolve.comp's per-pixel traversal.
+void ClusterRenderer::buildRtShadowBvh() {
+    rt_shadow_ready_ = false;
+    if (staging_cull_infos_.empty() || total_clusters_all_meshes_ == 0) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr uint32_t kRtBvhLeafSize = 4u;
+
+    const uint32_t n =
+        std::min<uint32_t>(total_clusters_all_meshes_,
+                           (uint32_t)staging_cull_infos_.size());
+
+    // Per-cluster AABB (sphere-derived) + centroid.
+    struct Prim { glm::vec3 mn, mx, c; uint32_t idx; };
+    std::vector<Prim> prims(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const glm::vec4 s = staging_cull_infos_[i].bounds_sphere;
+        const glm::vec3 ctr(s.x, s.y, s.z);
+        const glm::vec3 ext(s.w);
+        prims[i] = { ctr - ext, ctr + ext, ctr, i };
+    }
+
+    std::vector<glsl::RtBvhNode> nodes;
+    nodes.reserve(2 * (size_t)n);
+    std::vector<uint32_t> leaf_indices;
+    leaf_indices.reserve(n);
+
+    // Explicit stack: (node index, prim range) — children pre-allocated
+    // adjacently before pushing so left_first is final at pop time.
+    struct Item { uint32_t node; uint32_t first, count; };
+    std::vector<Item> stack;
+    nodes.push_back({});
+    stack.push_back({0u, 0u, n});
+
+    while (!stack.empty()) {
+        const Item it = stack.back();
+        stack.pop_back();
+
+        glm::vec3 mn(std::numeric_limits<float>::max());
+        glm::vec3 mx(std::numeric_limits<float>::lowest());
+        for (uint32_t i = 0; i < it.count; ++i) {
+            mn = glm::min(mn, prims[it.first + i].mn);
+            mx = glm::max(mx, prims[it.first + i].mx);
+        }
+        glsl::RtBvhNode& node = nodes[it.node];
+        node.aabb_min = mn;
+        node.aabb_max = mx;
+
+        if (it.count <= kRtBvhLeafSize) {
+            node.left_first = (uint32_t)leaf_indices.size();
+            node.prim_count = it.count;
+            for (uint32_t i = 0; i < it.count; ++i) {
+                leaf_indices.push_back(prims[it.first + i].idx);
+            }
+            continue;
+        }
+
+        // Median split on the widest centroid axis.
+        glm::vec3 cmin(std::numeric_limits<float>::max());
+        glm::vec3 cmax(std::numeric_limits<float>::lowest());
+        for (uint32_t i = 0; i < it.count; ++i) {
+            cmin = glm::min(cmin, prims[it.first + i].c);
+            cmax = glm::max(cmax, prims[it.first + i].c);
+        }
+        const glm::vec3 cext = cmax - cmin;
+        const int axis = (cext.x > cext.y)
+                             ? (cext.x > cext.z ? 0 : 2)
+                             : (cext.y > cext.z ? 1 : 2);
+        const uint32_t half = it.count / 2u;
+        std::nth_element(
+            prims.begin() + it.first,
+            prims.begin() + it.first + half,
+            prims.begin() + it.first + it.count,
+            [axis](const Prim& a, const Prim& b) {
+                return a.c[axis] < b.c[axis];
+            });
+
+        const uint32_t left = (uint32_t)nodes.size();
+        nodes.push_back({});
+        nodes.push_back({});
+        nodes[it.node].left_first = left;
+        nodes[it.node].prim_count = 0u;
+        stack.push_back({left,      it.first,        half});
+        stack.push_back({left + 1u, it.first + half, it.count - half});
+    }
+
+    rt_bvh_node_count_    = (uint32_t)nodes.size();
+    rt_bvh_nodes_buffer_  = createSSBO(
+        device_, nodes.size() * sizeof(glsl::RtBvhNode), nodes.data());
+    rt_bvh_leaves_buffer_ = createSSBO(
+        device_, leaf_indices.size() * sizeof(uint32_t), leaf_indices.data());
+
+    // ── COMPUTE-visible descriptor set: geometry + BVH ───────────────
+    if (!rt_shadow_desc_set_layout_) {
+        std::vector<er::DescriptorSetLayoutBinding> rt_bindings(7);
+        for (int i = 0; i < 7; ++i) {
+            rt_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
+                i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_BUFFER);
+        }
+        rt_shadow_desc_set_layout_ =
+            device_->createDescriptorSetLayout(rt_bindings);
+    }
+    if (!rt_shadow_desc_set_) {
+        rt_shadow_desc_set_ = device_->createDescriptorSets(
+            descriptor_pool_, rt_shadow_desc_set_layout_, 1)[0];
+    }
+    er::WriteDescriptorList rt_writes;
+    rt_writes.reserve(7);
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 0,
+        cull_info_buffer_.buffer,
+        static_cast<uint32_t>(
+            total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo)));
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 1,
+        draw_info_buffer_.buffer,
+        static_cast<uint32_t>(
+            total_clusters_all_meshes_ * sizeof(glsl::ClusterDrawInfo)));
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 2,
+        merged_vertex_buffer_.buffer,
+        static_cast<uint32_t>(
+            total_merged_vertices_ * sizeof(BindlessVertex)));
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 3,
+        merged_index_buffer_.buffer,
+        static_cast<uint32_t>(total_merged_indices_ * sizeof(uint32_t)));
+    const uint32_t rt_mat_count = std::max(
+        static_cast<uint32_t>(staging_material_params_.size()), 1u);
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 4,
+        material_params_buffer_.buffer,
+        static_cast<uint32_t>(
+            rt_mat_count * sizeof(glsl::BindlessMaterialParams)));
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 5,
+        rt_bvh_nodes_buffer_.buffer,
+        static_cast<uint32_t>(nodes.size() * sizeof(glsl::RtBvhNode)));
+    er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 6,
+        rt_bvh_leaves_buffer_.buffer,
+        static_cast<uint32_t>(leaf_indices.size() * sizeof(uint32_t)));
+    device_->updateDescriptorSets(rt_writes);
+
+    rt_shadow_ready_ = true;
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf(
+        "[CLUSTER_RENDERER] RT shadow BVH: %u clusters -> %u nodes, "
+        "%zu leaf refs (%.1f ms build, %.1f MB)\n",
+        n, rt_bvh_node_count_, leaf_indices.size(), ms,
+        (nodes.size() * sizeof(glsl::RtBvhNode) +
+         leaf_indices.size() * 4.0) / (1024.0 * 1024.0));
+}
+
 void ClusterRenderer::destroy() {
     bindless_pipeline_.reset();
     bindless_translucent_pipeline_.reset();
@@ -4482,6 +4654,11 @@ void ClusterRenderer::destroy() {
     // Mesh-shader CSM cluster data set (allocated in finalizeUploads).
     cluster_mesh_data_desc_set_.reset();
     cluster_mesh_data_desc_set_layout_.reset();
+
+    // Software-RT shadow BVH set (buffers release via shared_ptrs).
+    rt_shadow_desc_set_.reset();
+    rt_shadow_desc_set_layout_.reset();
+    rt_shadow_ready_ = false;
 
     // CSM silhouette prepass pipeline.
     silhouette_prepass_pipeline_.reset();

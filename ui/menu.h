@@ -153,6 +153,18 @@ class Menu {
     // turn off to measure baseline shadow pass cost without the
     // optimization.  See csm_silhouette_prepass.mesh for details.
     bool csm_silhouette_prepass_enabled_ = true;
+    // Rendering > Shadow > Shadow technique.  Both raytraced variants
+    // skip the CSM render pass entirely and shade only deferred
+    // (cluster) pixels — forward-lit pixels render unshadowed while
+    // active.  Experimental, for perf comparison against CSM.
+public:
+    enum class ShadowTechnique : int {
+        kCsm    = 0,   // cascaded shadow maps (default)
+        kSsrt   = 1,   // screen-space ray march vs the depth buffer
+        kRtBvh  = 2,   // world-space software RT vs the cluster BVH
+    };
+private:
+    ShadowTechnique shadow_technique_ = ShadowTechnique::kCsm;
 
 public:
     // ─── CSM drawable-shadow draw mode ────────────────────────────────────
@@ -1696,6 +1708,16 @@ public:
 
     inline bool isCsmSilhouettePrepassEnabled() const {
         return csm_silhouette_prepass_enabled_;
+    }
+    // Shadow technique (Rendering > Shadow).
+    inline ShadowTechnique getShadowTechnique() const {
+        return shadow_technique_;
+    }
+    inline bool isSsrtShadowsOn() const {
+        return shadow_technique_ == ShadowTechnique::kSsrt;
+    }
+    inline bool isRtShadowsOn() const {
+        return shadow_technique_ == ShadowTechnique::kRtBvh;
     }
 
     // Current selected CSM drawable-shadow draw-mode (see enum comment above).

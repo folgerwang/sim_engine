@@ -197,6 +197,25 @@
 // primitive.  Takes precedence over FEATURE_INPUT_FLOOR_ONLY; the CPU
 // sets one or the other, never both.
 #define FEATURE_INPUT_ISOLATE_MESH              0x00000008
+// Shadow technique selector (Rendering > Shadow > Shadow technique):
+// when set, deferred_resolve.comp computes sun shadows by SOFTWARE
+// screen-space ray marching against the G-buffer depth (no RT hardware,
+// no shadow maps) instead of sampling the CSM cascade array.  The app
+// also sets FEATURE_INPUT_SHADOW_DISABLED alongside it so forward-path
+// shaders (which have no G-buffer to march) skip CSM sampling, and the
+// CSM render pass itself is skipped — the perf delta between the two
+// techniques is then directly visible in the GPU profiler ("CSM Shadow"
+// vs "Deferred Resolve Compute").
+#define FEATURE_INPUT_SSRT_SHADOW               0x00000010
+// World-space SOFTWARE ray-traced sun shadows (no RT hardware): when set,
+// deferred_resolve.comp traces each pixel's sun ray through a CPU-built
+// BVH over the cluster set (RtBvhNode SSBO) and Möller–Trumbore-tests
+// the triangles of intersected clusters from the merged bindless VB/IB.
+// True world-space occlusion — off-screen casters work, unlike SSRT.
+// The app sets this only when ClusterRenderer::rtShadowReady(); like
+// SSRT it also raises SHADOW_DISABLED so forward shaders skip CSM, and
+// the CSM render pass is skipped entirely.
+#define FEATURE_INPUT_RT_SHADOW                 0x00000020
 
 // Debug render mode is packed into bits 16..23 of camera_info.input_features
 // (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack
@@ -1254,6 +1273,23 @@ struct RuntimeLightsParams {
     // to whole-tile primitive culling at the PD.
     vec4            cascade_slab_corners_ws[CSM_CASCADE_COUNT * 8];
     Light           lights[LIGHT_COUNT];
+};
+
+// ── Software-RT shadow BVH node (see ClusterRenderer::buildRtShadowBvh) ──
+// Binary BVH over the cluster set, built on the CPU at finalizeUploads and
+// traversed per pixel by deferred_resolve.comp's rtShadowFactor.  32 bytes,
+// std430-packed (vec3 + uint pairs pack with no padding):
+//   inner node: prim_count == 0, left_first = index of the LEFT child
+//               (right child is always left_first + 1 — siblings are
+//               allocated adjacently by the builder).
+//   leaf node : prim_count  > 0, left_first = offset into the leaf
+//               cluster-index SSBO; prim_count entries follow, each a
+//               global cluster index whose triangles the ray tests.
+struct RtBvhNode {
+    vec3    aabb_min;
+    uint    left_first;
+    vec3    aabb_max;
+    uint    prim_count;
 };
 
 struct VertexBufferInfo {
