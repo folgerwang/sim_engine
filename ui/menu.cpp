@@ -3543,7 +3543,12 @@ bool Menu::draw(
 
     // ---- GPU Profiler window -----------------------------------------------
     if (s_show_gpu_profiler && gpu_profiler_) {
+        gpu_profiler_->setWindowOpen(true);
         gpu_profiler_->drawImGui();
+        // The window's [X] clears the profiler's own flag inside
+        // drawImGui — mirror it back so the menu checkmark follows and
+        // the window actually stays closed next frame.
+        s_show_gpu_profiler = gpu_profiler_->windowOpen();
     }
     // ------------------------------------------------------------------------
 

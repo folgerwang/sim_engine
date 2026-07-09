@@ -502,7 +502,12 @@ void GpuProfiler::drawImGui()
         (int)m_paused_, m_frame_count_);
 #endif
 
-    m_show_window_ = true;
+    // Respect the window's close button: ImGui::Begin's p_open writes
+    // m_show_window_ = false when the user clicks [X]; stay closed until
+    // the caller re-opens via setWindowOpen(true) (the menu item does).
+    // (This used to force m_show_window_ = true every call, which reset
+    // the [X] within the same frame and made the window unclosable.)
+    if (!m_show_window_) return;
 
     // (Space-bar pause/resume is handled in the application's GLFW
     // key callback — it sets a static flag that drawFrame consumes

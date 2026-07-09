@@ -127,6 +127,13 @@ public:
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 
+    // Window visibility: the ImGui window's [X] close button clears
+    // m_show_window_ via Begin's p_open; the menu re-opens it with
+    // setWindowOpen(true) and mirrors windowOpen() back into its own
+    // checkmark so the two stay in sync.
+    bool windowOpen() const { return m_show_window_; }
+    void setWindowOpen(bool v) { m_show_window_ = v; }
+
     // Toggle/set pause state of the flame-chart display. When paused, the
     // timeline stops auto-scrolling so you can inspect any frame.
     void togglePause() { m_paused_ = !m_paused_; }
