@@ -71,6 +71,14 @@ struct EditorSceneObject {
     std::string*                         audio_clip   = nullptr;
     bool*                                audio_loop   = nullptr;
     float*                               audio_volume = nullptr;
+
+    // Point-light object (".rwlight" marker) — Details edits these in
+    // place (colour picker / intensity / radius), same live-pointer
+    // pattern as the BGM fields above.
+    bool                                 is_light = false;
+    glm::vec3*                           light_color     = nullptr;
+    float*                               light_intensity = nullptr;
+    float*                               light_radius    = nullptr;
     // Collision-map object row (".rwcol" marker until assigned, then the
     // ".rwcmap" path itself): no drawable; the Details panel shows the
     // held map and assigns one from content/maps/collision.
@@ -153,6 +161,8 @@ class Menu {
     // turn off to measure baseline shadow pass cost without the
     // optimization.  See csm_silhouette_prepass.mesh for details.
     bool csm_silhouette_prepass_enabled_ = true;
+    // RT shadow/AO bilateral smooth pass (trace → filter → shade).
+    bool rt_smoothing_ = true;
     // Rendering > Shadow > Shadow technique.  Both raytraced variants
     // skip the CSM render pass entirely and shade only deferred
     // (cluster) pixels — forward-lit pixels render unshadowed while
@@ -163,6 +173,8 @@ public:
         kSsrt   = 1,   // screen-space ray march vs the depth buffer
         kRtBvh  = 2,   // world-space software RT vs the cluster BVH
         kHwRt   = 3,   // world-space HARDWARE RT (default; ray query TLAS)
+        kRestir = 4,   // ReSTIR DI: area sun + authored point lights,
+                       // reservoir temporal reuse, 1 shadow ray/pixel
     };
 private:
     // Hardware RT is the default shadow technique (deferred rendering is
@@ -609,6 +621,7 @@ public:
     bool camera_create_request_ = false; // "Create Camera Here" (view pose)
     bool player_create_request_ = false; // "Add Player Object"
     bool bgm_create_request_    = false; // "Add BGM Object"
+    bool light_create_request_  = false; // "Add Point Light" (.rwlight)
     bool collision_create_request_ = false; // "Add Collision Map"
     // Player "Skeleton Mesh" assignment (Details combo): scene index of
     // the player row + the character model path ("" = clear the mesh).
@@ -1208,6 +1221,15 @@ public:
         if (bgm_create_request_) { bgm_create_request_ = false; return true; }
         return false;
     }
+    // "Add Point Light": the app creates a ".rwlight" scene object 2.5 m in
+    // front of the camera; colour / intensity / radius live in Details.
+    bool consumeCreateLightRequest() {
+        if (light_create_request_) {
+            light_create_request_ = false;
+            return true;
+        }
+        return false;
+    }
     // "Add Player Object": the app creates an EMPTY player scene object
     // in front of the camera; the skeleton mesh is assigned afterwards
     // via the Details panel (consumePlayerMeshAssign below).
@@ -1727,6 +1749,13 @@ public:
     inline bool isHwRtShadowsOn() const {
         return shadow_technique_ == ShadowTechnique::kHwRt;
     }
+    inline bool isRestirOn() const {
+        return shadow_technique_ == ShadowTechnique::kRestir;
+    }
+    // Edge-aware bilateral smoothing of the RT shadow/AO (Rendering >
+    // Shadow > "Smooth RT shadow/AO").  Applies to the software/hardware
+    // RT techniques (not ReSTIR — its estimator owns its own noise).
+    inline bool isRtSmoothingOn() const { return rt_smoothing_; }
 
     // Current selected CSM drawable-shadow draw-mode (see enum comment above).
     inline CsmDrawMode getCsmDrawMode() const { return csm_draw_mode_; }

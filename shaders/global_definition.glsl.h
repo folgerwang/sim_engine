@@ -216,6 +216,24 @@
 // SSRT it also raises SHADOW_DISABLED so forward shaders skip CSM, and
 // the CSM render pass is skipped entirely.
 #define FEATURE_INPUT_RT_SHADOW                 0x00000020
+// ReSTIR direct lighting (Rendering > Shadow > Shadow technique): per-pixel
+// reservoir resampling over the scene's point lights + the sun treated as an
+// AREA light (disk) — soft shadows and many-light support at ONE BVH shadow
+// ray per pixel, with temporal reuse via the G-buffer velocity.  Like the
+// other RT modes it skips the CSM pass and raises SHADOW_DISABLED for the
+// forward shaders.
+// NOTE: 0x40 / 0x80 belong to HW_RT_SHADOW / RT_AO (below) — ReSTIR's
+// bits live at 0x100/0x200.  They briefly collided, which made selecting
+// the HW-RT technique implicitly raise the ReSTIR bit (and ReSTIR raise
+// RT_AO); keep every new flag unique against the WHOLE list.
+#define FEATURE_INPUT_RESTIR                    0x00000100
+// Reservoir ping-pong parity for the current frame: 0 → read half A / write
+// half B, 1 → the reverse.  Flipped by the app each frame.
+#define FEATURE_INPUT_RESTIR_PARITY             0x00000200
+// Low 4 bits of the app's frame counter (bits 28..31) — combined with the
+// pixel hash to decorrelate ReSTIR candidate sampling across frames.
+#define FEATURE_INPUT_FRAME_SHIFT               28
+#define FEATURE_INPUT_FRAME_MASK                0xF0000000
 // World-space HARDWARE ray-traced sun shadows (VK_KHR_ray_query): the
 // HW-RT variant of deferred_resolve.comp (compiled with -DHW_RT_SHADOW)
 // ray-queries the cluster TLAS instead of walking the software BVH.
@@ -1324,6 +1342,30 @@ struct RtBvhNode {
     uint    left_first;
     vec3    aabb_max;
     uint    prim_count;
+};
+
+// ── ReSTIR direct lighting (deferred_resolve.comp) ───────────────────────
+// One authored point light (.rwlight scene object).  32 bytes, std430.
+struct RestirPointLight {
+    vec3    position;
+    float   radius;      // falloff cutoff distance (m)
+    vec3    color;
+    float   intensity;   // color * intensity = radiant intensity
+};
+
+// Per-pixel reservoir, ping-ponged (two screen-sized halves in one SSBO).
+// 16 bytes, std430:
+//   id_m       : light id (16 bits: 0 = empty, 1 = sun, 2+k = point k)
+//                | sample count M (16 bits, clamped by temporal reuse)
+//   w_sum      : RIS weight sum
+//   target_pdf : p-hat of the SELECTED sample (unshadowed contribution)
+//   dir_oct    : selected sun-disk direction, 2×16-bit octahedral
+//                (unused for point lights — their sample is the position)
+struct RestirReservoir {
+    uint    id_m;
+    float   w_sum;
+    float   target_pdf;
+    uint    dir_oct;
 };
 
 struct VertexBufferInfo {

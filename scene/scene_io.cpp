@@ -76,7 +76,10 @@ const char     kMagic[8] = { 'R', 'W', 'S', 'C', 'E', 'N', 'E', '\0' };
 //     in each object record (after its transform) — BGM objects.
 // v4: + collision_map_path (string) after the music trailer — baked
 //     walkable-collision map (.rwcmap) reference.
-const uint32_t kVersion  = 4;
+// v5: + per-object light_color (3×f32) + light_intensity (f32) +
+//     light_radius (f32) in each object record (after the audio fields)
+//     — point-light objects (.rwlight) for the ReSTIR lighting path.
+const uint32_t kVersion  = 5;
 
 } // namespace
 
@@ -104,6 +107,12 @@ bool saveSceneBinary(const std::string& path, const Scene& scene) {
         writeStr(os, o.audio_clip);
         writePod(os, static_cast<uint8_t>(o.audio_loop ? 1 : 0));
         writePod(os, o.audio_volume);
+        // v5 per-object light attributes (.rwlight objects).
+        writePod(os, o.light_color.x);
+        writePod(os, o.light_color.y);
+        writePod(os, o.light_color.z);
+        writePod(os, o.light_intensity);
+        writePod(os, o.light_radius);
     }
 
     // v2 trailer: scene music.
@@ -190,6 +199,14 @@ bool loadSceneBinary(const std::string& path, Scene& out_scene) {
             if (!readPod(is, loop)) return false;
             if (!readPod(is, o.audio_volume)) return false;
             o.audio_loop = (loop != 0);
+        }
+        // v5 per-object light attributes (absent pre-v5 — defaults stand).
+        if (version >= 5) {
+            if (!readPod(is, o.light_color.x)) return false;
+            if (!readPod(is, o.light_color.y)) return false;
+            if (!readPod(is, o.light_color.z)) return false;
+            if (!readPod(is, o.light_intensity)) return false;
+            if (!readPod(is, o.light_radius)) return false;
         }
     }
 

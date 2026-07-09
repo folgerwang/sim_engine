@@ -543,11 +543,19 @@ private:
     // renderer → push constant → shader) so toggling at runtime is
     // enough; no rebuild needed.
     //
-    // Default ON: the two-pass orchestration + 4-tap test has been
-    // verified to produce correct results in dense scenes (Bistro)
-    // and the perf win from rejecting fully-occluded clusters in
-    // Phase B easily covers the cost of the Hi-Z build dispatch.
-    bool use_hiz_occlusion_cull_ = true;
+    // Default OFF — the 4-corner-tap test is NOT conservative: the
+    // chosen mip's texel spans ~half the footprint's larger dimension,
+    // so a footprint can cover 3 texels per axis and the UNSAMPLED
+    // middle texel (possibly far/sky) is ignored while 4 near
+    // foreground corner taps vote "occluded".  Wrong rejections used to
+    // read as one-frame flicker; with the Phase B dedup they became
+    // STABLE holes (a rejected disoccluded cluster is never drawn and
+    // never sets its visibility bit, so nothing rescues it) — seen as
+    // meshes disappearing after camera rotation.  Since the dedup
+    // already reduces Phase B's steady-state draw to ~zero, Hi-Z here
+    // buys little; keep it opt-in until the gather is made conservative
+    // (full texel-grid loop over the footprint instead of 4 corners).
+    bool use_hiz_occlusion_cull_ = false;
 
     // Hi-Z pyramid handles supplied via setHiZTexture().  view + sampler
     // get bound at descriptor binding 11 of the cull set; size + mip

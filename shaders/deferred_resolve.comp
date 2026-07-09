@@ -109,6 +109,36 @@ layout(std430, set = RT_SHADOW_DATA_SET, binding = 5) readonly buffer RtBvhNodes
 layout(std430, set = RT_SHADOW_DATA_SET, binding = 6) readonly buffer RtBvhLeaves {
     uint rt_bvh_leaf_clusters[];
 };
+
+// ─── ReSTIR direct lighting data (app-owned, set 2) ──────────────────
+// binding 7: per-pixel reservoirs, TWO screen-sized halves back to back
+//            (ping-pong: FEATURE_INPUT_RESTIR_PARITY selects read/write).
+// binding 8: authored point lights (.rwlight scene objects), uploaded
+//            every frame; header.x = light count.
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 7)
+    buffer RestirReservoirBuf {
+    RestirReservoir restir_reservoirs[];
+};
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 8)
+    readonly buffer RestirLightsBuf {
+    uvec4            restir_light_header;   // x = light count
+    RestirPointLight restir_lights[];
+};
+
+// ─── RT shadow/AO smoothing (three-dispatch flow) ─────────────────────
+// pass_mode 1 (GEN):   trace shadow+AO only, store raw (shad, ao) into
+//                      rt_raw_out, skip all shading.
+// (rt_filter.comp then runs an edge-aware bilateral blur raw→filtered.)
+// pass_mode 2 (APPLY): skip tracing; read the FILTERED (shad, ao) from
+//                      rt_filtered_in and run the full shading.
+// pass_mode 0:         legacy single dispatch (trace + shade, no filter).
+layout(push_constant) uniform ResolvePC {
+    uint pass_mode;
+} rpc;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 9, rg16f)
+    uniform writeonly image2D rt_raw_out;
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 10, rg16f)
+    uniform readonly image2D rt_filtered_in;
 // Base-colour textures — the SAME views the bindless raster set exposes,
 // re-written onto this COMPUTE-visible set by buildRtShadowBvh().
 // Sampled ONLY on alpha-masked triangle hits so foliage / fence cards
@@ -276,9 +306,11 @@ const int   RT_ALPHA_HIT_BUDGET = 8;
 const float RT_SUN_TAN_RADIUS      = 0.01;
 // Multi-ray, single-frame sampling (no temporal accumulation): the IGN
 // dither pattern is STATIC per pixel, so the result is a stable ordered
-// dither rather than animated noise.
-const int   RT_SOFT_SAMPLES_HW     = 4;   // hardware ray query — cheap rays
-const int   RT_SOFT_SAMPLES_SW     = 2;   // software BVH walk — pricey rays
+// dither rather than animated noise.  Doubled from 4/2: more rays = more
+// discrete visibility levels per pixel, which the à-trous smooth pass
+// then blends into clean penumbra ramps (fewer levels = residual bands).
+const int   RT_SOFT_SAMPLES_HW     = 8;   // hardware ray query — cheap rays
+const int   RT_SOFT_SAMPLES_SW     = 4;   // software BVH walk — pricey rays
 
 // Random direction in the sun cone: xi in [0,1)^2, concentric disk via
 // sqrt, oriented on an L-orthonormal basis.
@@ -525,6 +557,261 @@ float rtAoFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
             ro, rtCosHemisphereDir(world_normal, xi), RT_AO_RADIUS);
     }
     return open / float(RT_AO_SAMPLES_SW);
+}
+
+// ═══ ReSTIR direct lighting (FEATURE_INPUT_RESTIR) ═══════════════════
+// Reservoir-based spatiotemporal importance resampling over the scene's
+// authored point lights + the sun treated as an AREA light (disk).  Per
+// pixel, per frame:
+//   1. RIS over a handful of candidates (1 sun-disk direction + N
+//      uniform light picks), target p-hat = luminance of the unshadowed
+//      contribution at this pixel.
+//   2. Temporal reuse: reproject via the G-buffer velocity, re-evaluate
+//      the previous winner's p-hat at THIS pixel, merge reservoirs
+//      (history clamped to RESTIR_M_CLAMP × the per-frame candidates).
+//   3. ONE occlusion ray for the merged winner (soft sun penumbras come
+//      from the per-frame disk directions being temporally integrated).
+//   4. Shade winner × W.   Spatial reuse: v2.
+const uint  RESTIR_SUN_ID           = 1u;   // reservoir ids: 0=empty, 2+k=light k
+const int   RESTIR_LIGHT_CANDIDATES = 8;
+const float RESTIR_M_CLAMP          = 20.0;
+
+// PCG hash / rng.
+uint restirPcg(uint v) {
+    v = v * 747796405u + 2891336453u;
+    v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (v >> 22u) ^ v;
+}
+float restirRand(inout uint s) {
+    s = restirPcg(s);
+    return float(s) * (1.0 / 4294967296.0);
+}
+
+// Snorm octahedral encode/decode (2×16 bit) for the sun-disk direction.
+uint restirOctEncode(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 e = (n.z >= 0.0)
+        ? n.xy
+        : (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0,
+                                   n.y >= 0.0 ? 1.0 : -1.0);
+    return packSnorm2x16(e);
+}
+vec3 restirOctDecodeDir(uint p) {
+    vec2 e = unpackSnorm2x16(p);
+    vec3 n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    float t = max(-n.z, 0.0);
+    n.x += (n.x >= 0.0) ? -t : t;
+    n.y += (n.y >= 0.0) ? -t : t;
+    return normalize(n);
+}
+
+float restirLuma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// Unshadowed contribution f(sample) at this pixel.  id = RESTIR_SUN_ID
+// evaluates the given sun-disk direction; id = 2+k evaluates point light
+// k.  Also returns the occlusion ray for the sample.
+vec3 restirEvalSample(uint id, vec3 sun_dir,
+                      vec3 world_pos, vec3 N, vec3 albedo, vec3 V,
+                      out vec3 o_ray_dir, out float o_ray_tmax) {
+    if (id == RESTIR_SUN_ID) {
+        vec3 radiance = runtime_lights.lights[0].color *
+                        runtime_lights.lights[0].intensity;
+        float ndl = max(dot(N, sun_dir), 0.0);
+        vec3  H    = normalize(sun_dir + V);
+        float spec = pow(max(dot(N, H), 0.0), 32.0);
+        o_ray_dir  = sun_dir;
+        o_ray_tmax = RT_SHADOW_MAX_DIST;
+        return albedo * radiance * (ndl / M_PI) +
+               radiance * (0.05 * spec / M_PI);
+    }
+    uint k = id - 2u;
+    if (k >= restir_light_header.x) {
+        o_ray_dir = vec3(0.0, 1.0, 0.0); o_ray_tmax = 0.0;
+        return vec3(0.0);
+    }
+    RestirPointLight lp = restir_lights[k];
+    vec3  to_l = lp.position - world_pos;
+    float d    = length(to_l);
+    if (d >= lp.radius || d < 1e-3) {
+        o_ray_dir = vec3(0.0, 1.0, 0.0); o_ray_tmax = 0.0;
+        return vec3(0.0);
+    }
+    vec3  Ld  = to_l / d;
+    float ndl = max(dot(N, Ld), 0.0);
+    // Inverse-square with a smooth window to zero at the cutoff radius
+    // (UE-style), so lights never pop at their range boundary.
+    float win = clamp(1.0 - pow(d / lp.radius, 4.0), 0.0, 1.0);
+    float att = lp.intensity * win * win / (d * d + 1e-2);
+    vec3  radiance = lp.color * att;
+    vec3  H    = normalize(Ld + V);
+    float spec = pow(max(dot(N, H), 0.0), 32.0);
+    o_ray_dir  = Ld;
+    o_ray_tmax = max(d - 2.0 * RT_SHADOW_BIAS, 0.0);
+    return albedo * radiance * (ndl / M_PI) +
+           radiance * (0.05 * spec / M_PI);
+}
+
+// Streaming reservoir update.  w already includes the candidate's 1/pdf.
+void restirUpdate(inout uint r_id, inout uint r_dir, inout float r_wsum,
+                  inout float r_m, inout float r_phat,
+                  uint id, uint dir, float p_hat, float w, inout uint rng) {
+    r_wsum += w;
+    r_m    += 1.0;
+    if (r_wsum > 0.0 && restirRand(rng) * r_wsum <= w) {
+        r_id   = id;
+        r_dir  = dir;
+        r_phat = p_hat;
+    }
+}
+
+#ifdef HW_RT_SHADOW
+// Prototype — defined in the HW-RT block below; ReSTIR dispatches the
+// winner's occlusion ray to whichever backend this variant has.
+float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max);
+#endif
+
+// Full per-pixel ReSTIR direct lighting.  Returns the shaded direct term
+// (sun + point lights), and reports the winner's visibility for the
+// SHADOW debug view.
+vec3 restirDirectLighting(ivec2 px, ivec2 sz, vec2 uv,
+                          vec3 world_pos, vec3 N, vec3 N_geom,
+                          vec3 albedo, vec3 V, out float o_debug_vis) {
+    const uint parity =
+        (camera_info.input_features & FEATURE_INPUT_RESTIR_PARITY) != 0u
+            ? 1u : 0u;
+    const uint frame_bits =
+        (camera_info.input_features & FEATURE_INPUT_FRAME_MASK)
+            >> FEATURE_INPUT_FRAME_SHIFT;
+    const uint pixel_count = uint(sz.x * sz.y);
+    const uint write_ofs   = parity * pixel_count;
+    const uint read_ofs    = (1u - parity) * pixel_count;
+
+    uint rng = restirPcg(uint(px.x) * 1973u + uint(px.y) * 9277u +
+                         frame_bits * 26699u + 1u);
+
+    const uint  light_count = min(restir_light_header.x, 0xFFF0u);
+    vec3 L = normalize(-runtime_lights.lights[0].direction);
+
+    // ── 1. Initial candidates ────────────────────────────────────────
+    uint  r_id = 0u, r_dir = 0u;
+    float r_wsum = 0.0, r_m = 0.0, r_phat = 0.0;
+    vec3  ray_dir; float ray_tmax;
+
+    // Sun-disk candidate.  The sun's color×intensity is authored as the
+    // TOTAL directional radiance (delta-light convention — the legacy
+    // path shades with it directly), so the candidate is treated as one
+    // DISCRETE light sampled with pdf 1: w = p-hat, NO solid-angle pdf
+    // division.  The cone-jittered direction is temporal anti-aliasing
+    // of the delta direction — the BRDF is effectively constant across
+    // the 0.6° disk, and the soft penumbra emerges from the per-frame
+    // VISIBILITY of the jittered rays being integrated by temporal
+    // reuse.  (Dividing by the cone pdf here — a factor of ~3000 — is
+    // the measure-mixing bug that shaded the sun black.)
+    {
+        vec2 xi = vec2(restirRand(rng), restirRand(rng));
+        vec3 sd = rtSunConeDir(L, xi);
+        float p_hat = restirLuma(restirEvalSample(
+            RESTIR_SUN_ID, sd, world_pos, N, albedo, V,
+            ray_dir, ray_tmax));
+        restirUpdate(r_id, r_dir, r_wsum, r_m, r_phat,
+                     RESTIR_SUN_ID, restirOctEncode(sd),
+                     p_hat, p_hat, rng);
+    }
+    // Uniform point-light candidates (pdf = 1/count each).
+    if (light_count > 0u) {
+        for (int i = 0; i < RESTIR_LIGHT_CANDIDATES; ++i) {
+            uint k = min(uint(restirRand(rng) * float(light_count)),
+                         light_count - 1u);
+            float p_hat = restirLuma(restirEvalSample(
+                2u + k, L, world_pos, N, albedo, V, ray_dir, ray_tmax));
+            restirUpdate(r_id, r_dir, r_wsum, r_m, r_phat,
+                         2u + k, 0u, p_hat,
+                         p_hat * float(light_count), rng);
+        }
+    }
+    const float m_initial = r_m;
+
+    // ── 2. Temporal reuse ────────────────────────────────────────────
+    // Reproject via RT3 velocity (curNDC − prevNDC → uv delta = ×0.5).
+    {
+        vec2 vel = texture(gbuf_velocity, uv).rg;
+        vec2 prev_uv = uv - vel * 0.5;
+        if (all(greaterThanEqual(prev_uv, vec2(0.0))) &&
+            all(lessThan(prev_uv, vec2(1.0)))) {
+            ivec2 ppx = ivec2(prev_uv * vec2(sz));
+            RestirReservoir prev =
+                restir_reservoirs[read_ofs +
+                                  uint(ppx.y) * uint(sz.x) + uint(ppx.x)];
+            uint  p_id = prev.id_m & 0xFFFFu;
+            float p_m  = float(prev.id_m >> 16u);
+            bool valid =
+                p_id >= 1u && p_id < 2u + light_count + 1u &&
+                (p_id == RESTIR_SUN_ID || (p_id - 2u) < light_count) &&
+                p_m > 0.0 &&
+                !isnan(prev.w_sum) && !isinf(prev.w_sum) &&
+                prev.w_sum >= 0.0 &&
+                !isnan(prev.target_pdf) && !isinf(prev.target_pdf) &&
+                prev.target_pdf > 0.0;
+            if (valid) {
+                p_m = min(p_m, RESTIR_M_CLAMP * max(m_initial, 1.0));
+                float prev_W = prev.w_sum / max(p_m * prev.target_pdf, 1e-6);
+                vec3  p_dirv = restirOctDecodeDir(prev.dir_oct);
+                float p_hat_now = restirLuma(restirEvalSample(
+                    p_id, p_dirv, world_pos, N, albedo, V,
+                    ray_dir, ray_tmax));
+                float w = p_hat_now * prev_W * p_m;
+                if (w > 0.0) {
+                    restirUpdate(r_id, r_dir, r_wsum, r_m, r_phat,
+                                 p_id, prev.dir_oct, p_hat_now, w, rng);
+                    r_m += p_m - 1.0;   // update() added 1; history adds p_m
+                }
+            }
+        }
+    }
+
+    // ── 3. Winner visibility (ONE ray) + 4. shade ────────────────────
+    vec3  direct = vec3(0.0);
+    float vis    = 1.0;
+    if (r_id != 0u && r_phat > 0.0 && r_wsum > 0.0) {
+        vec3 f = restirEvalSample(
+            r_id, restirOctDecodeDir(r_dir),
+            world_pos, N, albedo, V, ray_dir, ray_tmax);
+        float slope = 1.0 - clamp(dot(N_geom, ray_dir), 0.0, 1.0);
+        vec3 ro = world_pos +
+                  N_geom * (RT_SHADOW_BIAS * (1.0 + 3.0 * slope)) +
+                  ray_dir * RT_SHADOW_BIAS;
+        if (dot(N_geom, ray_dir) <= 0.0) {
+            vis = 0.0;             // facing away — geometrically shadowed
+        } else {
+#ifdef HW_RT_SHADOW
+            vis = ((camera_info.input_features &
+                    FEATURE_INPUT_HW_RT_SHADOW) != 0u)
+                      ? hwRtShadowRayVisible(ro, ray_dir, ray_tmax)
+                      : rtShadowRayVisible(ro, ray_dir, ray_tmax);
+#else
+            vis = rtShadowRayVisible(ro, ray_dir, ray_tmax);
+#endif
+        }
+        float W = r_wsum / max(r_m * r_phat, 1e-6);
+        direct = f * W * vis;
+        // Visibility feedback: an occluded winner decays instead of
+        // persisting through temporal reuse (kills shadow ghosting while
+        // keeping the sample alive enough to re-test as things move).
+        if (vis <= 0.0) r_wsum *= 0.25;
+    }
+    o_debug_vis = vis;
+
+    // ── Persist this frame's reservoir ───────────────────────────────
+    RestirReservoir outr;
+    outr.id_m       = (r_id & 0xFFFFu) |
+                      (uint(clamp(r_m, 0.0, 65535.0)) << 16u);
+    outr.w_sum      = r_wsum;
+    outr.target_pdf = r_phat;
+    outr.dir_oct    = r_dir;
+    restir_reservoirs[write_ofs +
+                      uint(px.y) * uint(sz.x) + uint(px.x)] = outr;
+
+    return direct;
 }
 
 #ifdef HW_RT_SHADOW
@@ -840,8 +1127,14 @@ void main() {
 
     // Sky / empty pixels: depth was never written by the cluster G-buffer
     // pass.  Skip — sky envmap pass paints these later in drawScene.
+    // In GEN mode store a neutral (lit, open) sample first so the blur
+    // pass never smears uninitialised texels across geometry edges.
     float z = texture(gbuf_depth, uv).r;
-    if (z >= 1.0) return;
+    if (z >= 1.0) {
+        if (rpc.pass_mode == 1u)
+            imageStore(rt_raw_out, px, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
 
     vec4 albedo_ao = texture(gbuf_albedo_ao, uv);
     // Cluster G-buffer is CLEARed to (0,0,0,0) before the pass and the
@@ -849,7 +1142,11 @@ void main() {
     // alpha sentinel of < 0.5 means "no cluster fragment hit this pixel".
     // Forward base (terrain/grass/hair/...) already lit these pixels in
     // its own forward pass; leave their colour alone.
-    if (albedo_ao.a < 0.5) return;
+    if (albedo_ao.a < 0.5) {
+        if (rpc.pass_mode == 1u)
+            imageStore(rt_raw_out, px, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
 
     vec4 nr          = texture(gbuf_normal_rough, uv);
     vec4 em          = texture(gbuf_emissive_metal, uv);
@@ -882,7 +1179,23 @@ void main() {
                      runtime_lights.lights[0].intensity;
     float NdotL = max(dot(N, L), 0.0);
 
+    // ── ReSTIR direct lighting (sun as area light + point lights) ────
+    // Replaces the single-sun direct term entirely; ambient IBL and the
+    // RT-AO logic below still apply.  The winner's visibility feeds the
+    // SHADOW debug view via `shad`.
+    bool restir_active =
+        (camera_info.input_features & FEATURE_INPUT_RESTIR) != 0u;
+    vec3 restir_direct = vec3(0.0);
+
     float shad = 1.0;
+    if (rpc.pass_mode == 2u) {
+        // APPLY pass: shadow + AO were traced by the GEN dispatch and
+        // smoothed by rt_filter.comp — no tracing here.  Values are
+        // consumed after the AO block below.
+    } else if (restir_active) {
+        restir_direct = restirDirectLighting(
+            px, sz, uv, world_pos, N, N_geom, albedo, V, shad);
+    } else
 #ifdef HW_RT_SHADOW
     if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
         // Hardware ray query vs the cluster TLAS (cone-jittered soft
@@ -924,27 +1237,50 @@ void main() {
     // occlusion-tested per pixel by the shadow rays above, so darkening
     // it again would double-occlude.
     float rt_ao = 1.0;
-    if ((camera_info.input_features & FEATURE_INPUT_RT_AO) != 0u) {
+    if (rpc.pass_mode != 2u &&
+        (camera_info.input_features & FEATURE_INPUT_RT_AO) != 0u) {
 #ifdef HW_RT_SHADOW
         if ((camera_info.input_features &
              FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
             rt_ao = hwRtAoFactor(world_pos, N_geom, vec2(px));
         } else
 #endif
-        if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
+        if ((camera_info.input_features &
+             (FEATURE_INPUT_RT_SHADOW | FEATURE_INPUT_RESTIR)) != 0u) {
             rt_ao = rtAoFactor(world_pos, N_geom, vec2(px));
         }
+    }
+
+    // ── Smooth-pass routing ──────────────────────────────────────────
+    // GEN: hand the RAW (pre-shaping) shadow + AO to the filter chain and
+    // stop — the APPLY dispatch does the shading.  APPLY: pick up the
+    // bilateral-filtered pair.  The AO response curve applies AFTER the
+    // filter either way, so smoothing operates in linear visibility.
+    if (rpc.pass_mode == 1u) {
+        imageStore(rt_raw_out, px, vec4(shad, rt_ao, 0.0, 0.0));
+        return;
+    }
+    if (rpc.pass_mode == 2u) {
+        vec2 f = imageLoad(rt_filtered_in, px).rg;
+        shad  = clamp(f.r, 0.0, 1.0);
+        rt_ao = clamp(f.g, 0.0, 1.0);
     }
 
     rt_ao = pow(clamp(rt_ao, 0.0, 1.0), RT_AO_POWER);
 
     // Lambertian diffuse + Blinn-Phong specular — bit-identical to
     // cluster_bindless.frag's forward path so visual parity holds.
+    // Under ReSTIR the direct term comes fully from the reservoir winner
+    // (sun-disk sample OR a point light); the legacy sun terms zero out.
     vec3 ambient = getIBLRadianceLambertian(N, albedo) * (ao * rt_ao);
-    vec3 diffuse = albedo * light_col * (NdotL * shad / M_PI);
+    vec3 diffuse = restir_active
+        ? restir_direct
+        : albedo * light_col * (NdotL * shad / M_PI);
     vec3  H        = normalize(L + V);
     float spec     = pow(max(dot(N, H), 0.0), 32.0) * shad;
-    vec3  specular = light_col * (0.05 * spec / M_PI);
+    vec3  specular = restir_active
+        ? vec3(0.0)   // winner eval already includes its specular lobe
+        : light_col * (0.05 * spec / M_PI);
 
     // RT AO partially dims the direct terms too (RT_AO_DIRECT_FRACTION)
     // for parity with the screen-space SSAO look, which multiplied the

@@ -1,0 +1,73 @@
+#version 450
+// ─── rt_filter.comp ─────────────────────────────────────────────────────
+// Edge-aware bilateral smoothing for the ray-traced shadow + AO pair.
+//
+// Runs between the deferred resolve's GEN dispatch (which traces raw
+// per-pixel shadow/AO into raw_in with IGN dither grain) and its APPLY
+// dispatch (which shades with the filtered result).  5×5 kernel, weights:
+//   spatial : gaussian falloff over the tap offset
+//   depth   : relative depth difference vs the CENTER pixel — adaptive,
+//             so foreground/background boundaries don't bleed.  Raw
+//             (non-linear) depth compared RELATIVE to the center value
+//             works across the whole range without needing the
+//             projection constants.
+// Sky / unwritten pixels (depth == 1) pass through untouched and are
+// excluded as neighbours, so geometry edges against sky stay crisp.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rg16f) uniform readonly  image2D raw_in;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D filtered_out;
+layout(set = 0, binding = 2) uniform sampler2D depth_tex;
+
+// À-trous iteration control: taps sample at px + offset·step_px.  The app
+// runs THREE iterations (step 1, 2, 4) ping-ponging the two images — an
+// effective ~29×29 footprint for 3×25 taps, which is what turns the few
+// discrete ray-count levels of a wide penumbra into a smooth ramp instead
+// of contour BANDS (a single small kernel just reorganises the dither
+// into stairsteps).
+layout(push_constant) uniform FilterPC {
+    uint step_px;
+} fpc;
+
+const int   RTF_RADIUS        = 2;      // 5×5 taps per iteration
+const float RTF_SPATIAL_SIGMA = 0.18;   // exp(-d² · this), d in TAP units
+// Depth acceptance: |zq − zc| / max(zc-slack) — tuned for reversed-ish
+// non-linear Vulkan depth where nearby surfaces have tiny deltas.
+const float RTF_DEPTH_REL     = 0.0015;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(filtered_out);
+    if (px.x >= sz.x || px.y >= sz.y) return;
+
+    vec2  uv = (vec2(px) + vec2(0.5)) / vec2(sz);
+    float zc = texture(depth_tex, uv).r;
+    if (zc >= 1.0) {
+        imageStore(filtered_out, px, imageLoad(raw_in, px));
+        return;
+    }
+
+    vec2  sum  = vec2(0.0);
+    float wsum = 0.0;
+    const int step_px = int(max(fpc.step_px, 1u));
+    for (int dy = -RTF_RADIUS; dy <= RTF_RADIUS; ++dy) {
+        for (int dx = -RTF_RADIUS; dx <= RTF_RADIUS; ++dx) {
+            ivec2 q = clamp(px + ivec2(dx, dy) * step_px,
+                            ivec2(0), sz - 1);
+            vec2  quv = (vec2(q) + vec2(0.5)) / vec2(sz);
+            float zq  = texture(depth_tex, quv).r;
+            if (zq >= 1.0) continue;   // sky — not a valid neighbour
+
+            float dz = abs(zq - zc);
+            float wz = exp(-dz / max(RTF_DEPTH_REL * (1.0 - zc), 1e-6));
+            float ws = exp(-float(dx * dx + dy * dy) * RTF_SPATIAL_SIGMA);
+            float w  = wz * ws;
+
+            sum  += imageLoad(raw_in, q).rg * w;
+            wsum += w;
+        }
+    }
+
+    vec2 f = (wsum > 1e-5) ? sum / wsum : imageLoad(raw_in, px).rg;
+    imageStore(filtered_out, px, vec4(f, 0.0, 0.0));
+}

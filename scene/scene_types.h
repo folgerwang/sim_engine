@@ -58,6 +58,15 @@ struct Object {
     std::string audio_clip;           // path to the music file ("" = unset)
     bool        audio_loop   = true;  // repeat
     float       audio_volume = 1.0f;  // 0..1
+
+    // Point-light object — asset_path ends ".rwlight".  Position comes from
+    // transform.translation (standard gizmo / Details transform editing);
+    // the fields below are the photometric attributes (Details panel).
+    // Consumed by the ReSTIR direct-lighting path in deferred_resolve.comp.
+    // Serialized from scene format v5.
+    glm::vec3   light_color     = glm::vec3(1.0f, 0.85f, 0.6f);  // lantern-ish
+    float       light_intensity = 20.0f;  // radiant intensity scale
+    float       light_radius    = 12.0f;  // falloff cutoff distance (m)
 };
 
 // The authored scene.  Default-constructed = empty scene named "Untitled" at

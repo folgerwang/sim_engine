@@ -2194,7 +2194,26 @@ bool Menu::draw(
                             NULL, cur == ShadowTechnique::kHwRt)) {
                         shadow_technique_ = ShadowTechnique::kHwRt;
                     }
+                    // ReSTIR DI: the sun becomes an AREA light (soft
+                    // penumbras) and authored point lights (Outliner →
+                    // Add Point Light) shade with ONE shadow ray/pixel
+                    // via reservoir temporal reuse.  Uses the HW ray-
+                    // query backend when available, else the software
+                    // BVH.
+                    if (ImGui::MenuItem(
+                            "ReSTIR (soft sun + point lights, experimental)",
+                            NULL, cur == ShadowTechnique::kRestir)) {
+                        shadow_technique_ = ShadowTechnique::kRestir;
+                    }
                     ImGui::EndMenu();
+                }
+
+                // Edge-aware bilateral filter over the RT shadow + AO
+                // (kills the per-pixel dither grain).  RT techniques
+                // only; ReSTIR excluded.
+                if (ImGui::MenuItem("Smooth RT shadow/AO", NULL,
+                                    rt_smoothing_)) {
+                    rt_smoothing_ = !rt_smoothing_;
                 }
 
                 // CSM silhouette prepass — see the member field comment in
@@ -3593,25 +3612,29 @@ bool Menu::draw(
                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking |
                 ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing)) {
-            const float bs = 30.0f;
+            const float bs = 90.0f;   // 3× the original 30 px button
             const ImVec2 bp = ImGui::GetCursorScreenPos();
             const bool clicked = ImGui::Button("##playstop", ImVec2(bs, bs));
             ImDrawList* d = ImGui::GetWindowDrawList();
             const ImVec2 cc(bp.x + bs * 0.5f, bp.y + bs * 0.5f);
+            // Semi-transparent (~55%) so the big 90 px button doesn't
+            // block the viewport content underneath; full opacity on
+            // hover for clear affordance.
+            const int icon_a = ImGui::IsItemHovered() ? 255 : 140;
             if (play_mode_) {
-                d->AddRectFilled(ImVec2(cc.x - 6, cc.y - 6),
-                                 ImVec2(cc.x + 6, cc.y + 6),
-                                 IM_COL32(240, 80, 80, 255), 2.0f);   // ■ stop
+                d->AddRectFilled(ImVec2(cc.x - 18, cc.y - 18),
+                                 ImVec2(cc.x + 18, cc.y + 18),
+                                 IM_COL32(240, 80, 80, icon_a), 6.0f); // ■ stop
             } else if (play_icon_id_) {
                 // assets/icon/play.png (falls back to the drawn triangle below).
                 d->AddImage(play_icon_id_, bp, ImVec2(bp.x + bs, bp.y + bs),
                             ImVec2(0, 0), ImVec2(1, 1),
-                            IM_COL32(255, 255, 255, 255));
+                            IM_COL32(255, 255, 255, icon_a));
             } else {
-                d->AddTriangleFilled(ImVec2(cc.x - 5, cc.y - 8),
-                                     ImVec2(cc.x - 5, cc.y + 8),
-                                     ImVec2(cc.x + 8, cc.y),
-                                     IM_COL32(90, 220, 120, 255));     // ▶ play
+                d->AddTriangleFilled(ImVec2(cc.x - 15, cc.y - 24),
+                                     ImVec2(cc.x - 15, cc.y + 24),
+                                     ImVec2(cc.x + 24, cc.y),
+                                     IM_COL32(90, 220, 120, icon_a));  // ▶ play
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(play_mode_ ? "Stop — return to edit mode"
@@ -4033,6 +4056,13 @@ void Menu::drawEditorDockSpace() {
             if (ImGui::MenuItem("Add BGM Object")) {
                 bgm_create_request_ = true;
                 scene_node_active_  = true;
+            }
+            // Point light for the ReSTIR direct-lighting path: position
+            // via the standard transform gizmo; colour / intensity /
+            // radius in Details.  Placed 2.5 m in front of the camera.
+            if (ImGui::MenuItem("Add Point Light")) {
+                light_create_request_ = true;
+                scene_node_active_    = true;
             }
             ImGui::EndPopup();
         }
@@ -5182,6 +5212,30 @@ void Menu::drawDetailsContent() {
                     ImGui::SliderFloat("Volume", o.audio_volume,
                                        0.0f, 1.0f, "%.2f");
                 }
+            }
+
+            // ── Point-light attributes (.rwlight rows) ────────────────
+            // Live pointers into the scene object — edits apply next
+            // frame via updateRestirLights() and persist with Save Scene.
+            if (o.is_light && o.light_color) {
+                ImGui::SeparatorText("Point Light");
+                ImGui::ColorEdit3("Color",
+                                  &o.light_color->x,
+                                  ImGuiColorEditFlags_Float);
+                if (o.light_intensity) {
+                    ImGui::SetNextItemWidth(
+                        ImGui::GetContentRegionAvail().x * 0.6f);
+                    ImGui::DragFloat("Intensity", o.light_intensity,
+                                     0.25f, 0.0f, 10000.0f, "%.2f");
+                }
+                if (o.light_radius) {
+                    ImGui::SetNextItemWidth(
+                        ImGui::GetContentRegionAvail().x * 0.6f);
+                    ImGui::DragFloat("Radius (m)", o.light_radius,
+                                     0.1f, 0.1f, 500.0f, "%.1f");
+                }
+                ImGui::TextDisabled(
+                    "Shades via Rendering > Shadow > ReSTIR technique");
             }
         } else if (o.is_bgm && o.audio_clip) {
             // BGM object with no transform pane shown above — render the
