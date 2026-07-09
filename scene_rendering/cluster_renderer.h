@@ -441,6 +441,18 @@ private:
     uint32_t hw_rt_skel_blas_tri_cap_ = 0;  // BLAS sized for this many tris
     renderer::BufferInfo hw_rt_frame_instance_buffer_;  // TLAS rebuild input
     void writeRtSkeletonDescriptors();  // rewrite RT-set bindings 8..11
+    // Change detection for updateRtSkeletons: pose = model matrix +
+    // joint matrices, cached per input slot.  When every skeleton's
+    // pose is bytewise identical to last frame, the whole update
+    // (CPU skinning + uploads + BLAS/TLAS rebuild) is skipped — the
+    // GPU state from the previous update is still valid.  Invalidated
+    // by finalize (buildHwRtShadowAs rebuilds a static-only TLAS).
+    struct RtSkelPoseCache {
+        glm::mat4              model = glm::mat4(1.0f);
+        std::vector<glm::mat4> jm;
+    };
+    std::vector<RtSkelPoseCache> rt_skel_cache_;
+    bool rt_skel_have_gpu_state_ = false;
 
     // ── CSM silhouette prepass pipeline ─────────────────────────────────
     // Pre-fills each cascade's main-camera-frustum interior with depth=1

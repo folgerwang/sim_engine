@@ -1,5 +1,7 @@
 #include <iostream>
 #include <set>
+#include <cstdlib>   // std::getenv (RW_NO_VSYNC present-mode override)
+#include <cstdio>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -2291,13 +2293,42 @@ VkSurfaceFormatKHR chooseSwapSurfaceFormat(
 
 renderer::PresentMode chooseSwapPresentMode(
     const std::vector<VkPresentModeKHR>& availablePresentModes) {
+    // RW_NO_VSYNC=1 → prefer IMMEDIATE: uncaps present pacing entirely.
+    // Useful for profiling — in WINDOWED mode the DWM compositor paces
+    // presents at display refresh even under MAILBOX, so any GPU frame
+    // over one refresh interval snaps to HALF rate (e.g. 14.5 ms work on
+    // a 75 Hz panel → exactly 37.5 fps with a ~15 ms "Fence Wait +
+    // Acquire" block that looks like a CPU/GPU sync bug but isn't).
+    const char* no_vsync = std::getenv("RW_NO_VSYNC");
+    const bool want_immediate = no_vsync && no_vsync[0] == '1';
+
+    renderer::PresentMode chosen = renderer::PresentMode::FIFO_KHR;
     for (const auto& availablePresentMode : availablePresentModes) {
+        if (want_immediate &&
+            availablePresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            chosen = renderer::PresentMode::IMMEDIATE_KHR;
+            break;
+        }
         if (availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
-            return renderer::PresentMode::MAILBOX_KHR;
+            chosen = renderer::PresentMode::MAILBOX_KHR;
+            if (!want_immediate) break;
         }
     }
-
-    return renderer::PresentMode::FIFO_KHR;
+    // One-time log so present pacing is never a profiling mystery.
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        const char* name =
+            chosen == renderer::PresentMode::IMMEDIATE_KHR ? "IMMEDIATE"
+            : chosen == renderer::PresentMode::MAILBOX_KHR ? "MAILBOX"
+                                                           : "FIFO (vsync)";
+        std::printf("[swapchain] present mode: %s%s\n", name,
+                    want_immediate &&
+                            chosen != renderer::PresentMode::IMMEDIATE_KHR
+                        ? " (RW_NO_VSYNC set but IMMEDIATE unavailable)"
+                        : "");
+    }
+    return chosen;
 }
 
 VkExtent2D chooseSwapExtent(

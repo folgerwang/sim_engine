@@ -12,6 +12,7 @@
 #include "virtual_texture.h"
 
 #include "glm/gtc/packing.hpp"   // packHalf2x16 for the RT pos+uv repack
+#include "helper/thread_pool.h"  // parallel CPU skinning (updateRtSkeletons)
 
 #include <algorithm>
 #include <chrono>
@@ -5078,6 +5079,9 @@ void ClusterRenderer::buildHwRtShadowAs() {
     device_->updateDescriptorSets(hw_writes);
 
     hw_rt_shadow_ready_ = true;
+    // The TLAS just rebuilt static-only — force the next updateRtSkeletons
+    // to run fully so the skeleton instance is re-added.
+    rt_skel_have_gpu_state_ = false;
     const double hw_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     std::printf(
@@ -5135,6 +5139,47 @@ void ClusterRenderer::updateRtSkeletons(
         return;
     }
 
+    // ── 0. Change detection ───────────────────────────────────────────
+    // Pose = model matrix + joint matrices.  If every skeleton's pose
+    // is bytewise identical to the previous update, all GPU state
+    // (positions, chunks, headers, BLAS, TLAS) is still valid — skip
+    // the whole update.  Frees idle characters (and the editor at
+    // rest) from the ~7 ms skinning bill.
+    {
+        static const std::vector<glm::mat4> s_empty_jm;
+        bool same = rt_skel_have_gpu_state_ &&
+                    rt_skel_cache_.size() == skeletons.size();
+        if (same) {
+            for (size_t i = 0; i < skeletons.size(); ++i) {
+                const auto& jm = skeletons[i].joint_matrices
+                                     ? *skeletons[i].joint_matrices
+                                     : s_empty_jm;
+                const auto& c = rt_skel_cache_[i];
+                if (skeletons[i].model != c.model ||
+                    jm.size() != c.jm.size() ||
+                    (!jm.empty() &&
+                     std::memcmp(jm.data(), c.jm.data(),
+                                 jm.size() * sizeof(glm::mat4)) != 0)) {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if (same) return;
+        rt_skel_cache_.resize(skeletons.size());
+        for (size_t i = 0; i < skeletons.size(); ++i) {
+            rt_skel_cache_[i].model = skeletons[i].model;
+            rt_skel_cache_[i].jm    = skeletons[i].joint_matrices
+                                          ? *skeletons[i].joint_matrices
+                                          : s_empty_jm;
+        }
+    }
+
+    // Fixed worker pool for the skinning burst — created once, sized to
+    // hardware_concurrency.  parallelFor is only ever entered from the
+    // render thread, so the "no re-entry from workers" rule holds.
+    static helper::ThreadPool s_skel_pool;
+
     // ── 1. CPU-skin every skeleton into world space ───────────────────
     std::vector<glm::vec4>          all_pos;
     std::vector<uint32_t>           all_idx;
@@ -5158,33 +5203,43 @@ void ClusterRenderer::updateRtSkeletons(
             s.joints1->size() == s.positions->size() &&
             s.weights1->size() == s.positions->size();
 
-        all_pos.reserve(vbase + s.positions->size());
-        for (size_t v = 0; v < s.positions->size(); ++v) {
-            const glm::u16vec4& j0 = (*s.joints)[v];
-            const glm::vec4&    w0 = (*s.weights)[v];
-            glm::mat4 skin =
-                w0.x * jm[std::min((uint32_t)j0.x, jm_n - 1u)] +
-                w0.y * jm[std::min((uint32_t)j0.y, jm_n - 1u)] +
-                w0.z * jm[std::min((uint32_t)j0.z, jm_n - 1u)] +
-                w0.w * jm[std::min((uint32_t)j0.w, jm_n - 1u)];
-            float wsum = w0.x + w0.y + w0.z + w0.w;
-            if (has_set1) {
-                const glm::u16vec4& j1 = (*s.joints1)[v];
-                const glm::vec4&    w1 = (*s.weights1)[v];
-                skin += w1.x * jm[std::min((uint32_t)j1.x, jm_n - 1u)] +
-                        w1.y * jm[std::min((uint32_t)j1.y, jm_n - 1u)] +
-                        w1.z * jm[std::min((uint32_t)j1.z, jm_n - 1u)] +
-                        w1.w * jm[std::min((uint32_t)j1.w, jm_n - 1u)];
-                wsum += w1.x + w1.y + w1.z + w1.w;
+        const size_t vcount = s.positions->size();
+        all_pos.resize(vbase + vcount);
+        // Parallel skinning: block-granular (1024 verts per task) so the
+        // per-invocation std::function overhead amortises to nothing.
+        // Each block writes a disjoint all_pos range — no sharing.
+        const size_t kVertBlock = 1024;
+        const size_t nblocks = (vcount + kVertBlock - 1) / kVertBlock;
+        s_skel_pool.parallelFor(nblocks, [&](size_t b) {
+            const size_t v0 = b * kVertBlock;
+            const size_t v1 = std::min(v0 + kVertBlock, vcount);
+            for (size_t v = v0; v < v1; ++v) {
+                const glm::u16vec4& j0 = (*s.joints)[v];
+                const glm::vec4&    w0 = (*s.weights)[v];
+                glm::mat4 skin =
+                    w0.x * jm[std::min((uint32_t)j0.x, jm_n - 1u)] +
+                    w0.y * jm[std::min((uint32_t)j0.y, jm_n - 1u)] +
+                    w0.z * jm[std::min((uint32_t)j0.z, jm_n - 1u)] +
+                    w0.w * jm[std::min((uint32_t)j0.w, jm_n - 1u)];
+                float wsum = w0.x + w0.y + w0.z + w0.w;
+                if (has_set1) {
+                    const glm::u16vec4& j1 = (*s.joints1)[v];
+                    const glm::vec4&    w1 = (*s.weights1)[v];
+                    skin += w1.x * jm[std::min((uint32_t)j1.x, jm_n - 1u)] +
+                            w1.y * jm[std::min((uint32_t)j1.y, jm_n - 1u)] +
+                            w1.z * jm[std::min((uint32_t)j1.z, jm_n - 1u)] +
+                            w1.w * jm[std::min((uint32_t)j1.w, jm_n - 1u)];
+                    wsum += w1.x + w1.y + w1.z + w1.w;
+                }
+                // Match base.vert: normalize by the weight sum; identity
+                // for unweighted verts.
+                if (wsum > 1e-4f) skin *= (1.0f / wsum);
+                else              skin  = glm::mat4(1.0f);
+                const glm::vec4 wp =
+                    s.model * (skin * glm::vec4((*s.positions)[v], 1.0f));
+                all_pos[vbase + v] = glm::vec4(glm::vec3(wp), 1.0f);
             }
-            // Match base.vert: normalize by the weight sum; identity for
-            // unweighted verts.
-            if (wsum > 1e-4f) skin *= (1.0f / wsum);
-            else              skin  = glm::mat4(1.0f);
-            const glm::vec4 wp =
-                s.model * (skin * glm::vec4((*s.positions)[v], 1.0f));
-            all_pos.push_back(glm::vec4(glm::vec3(wp), 1.0f));
-        }
+        });
 
         glsl::RtSkelHeader h{};
         h.tri_offset   = (uint32_t)(all_idx.size() / 3u);
@@ -5196,15 +5251,17 @@ void ClusterRenderer::updateRtSkeletons(
                               + vbase);
         }
 
-        // Chunk AABBs + skeleton AABB.
-        glm::vec3 smin(std::numeric_limits<float>::max());
-        glm::vec3 smax(std::numeric_limits<float>::lowest());
+        // Chunk AABBs (parallel — each chunk is independent), then the
+        // skeleton AABB as a cheap serial reduction over the chunks.
         const uint32_t chunk_n =
             (h.tri_count + RT_SKEL_CHUNK_TRIS - 1u) / RT_SKEL_CHUNK_TRIS;
-        for (uint32_t c = 0; c < chunk_n; ++c) {
+        const uint32_t chunk_base = h.chunk_offset;
+        all_chunks.resize((chunk_base + chunk_n) * 2u);
+        s_skel_pool.parallelFor(chunk_n, [&](size_t c) {
             glm::vec3 cmin(std::numeric_limits<float>::max());
             glm::vec3 cmax(std::numeric_limits<float>::lowest());
-            const uint32_t t0i = (h.tri_offset + c * RT_SKEL_CHUNK_TRIS) * 3u;
+            const uint32_t t0i =
+                (h.tri_offset + (uint32_t)c * RT_SKEL_CHUNK_TRIS) * 3u;
             const uint32_t t1i = std::min(
                 (uint32_t)all_idx.size(),
                 t0i + RT_SKEL_CHUNK_TRIS * 3u);
@@ -5213,10 +5270,16 @@ void ClusterRenderer::updateRtSkeletons(
                 cmin = glm::min(cmin, p);
                 cmax = glm::max(cmax, p);
             }
-            all_chunks.push_back(glm::vec4(cmin, 0.0f));
-            all_chunks.push_back(glm::vec4(cmax, 0.0f));
-            smin = glm::min(smin, cmin);
-            smax = glm::max(smax, cmax);
+            all_chunks[(chunk_base + c) * 2u + 0u] = glm::vec4(cmin, 0.0f);
+            all_chunks[(chunk_base + c) * 2u + 1u] = glm::vec4(cmax, 0.0f);
+        });
+        glm::vec3 smin(std::numeric_limits<float>::max());
+        glm::vec3 smax(std::numeric_limits<float>::lowest());
+        for (uint32_t c = 0; c < chunk_n; ++c) {
+            smin = glm::min(smin,
+                            glm::vec3(all_chunks[(chunk_base + c) * 2u]));
+            smax = glm::max(smax,
+                            glm::vec3(all_chunks[(chunk_base + c) * 2u + 1u]));
         }
         h.aabb_min = glm::vec4(smin, 0.0f);
         h.aabb_max = glm::vec4(smax, 0.0f);
@@ -5279,6 +5342,9 @@ void ClusterRenderer::updateRtSkeletons(
         device_->updateBufferMemory(rt_skel_header_buffer_.memory,
                                     hdr.size(), hdr.data());
     }
+    // GPU state is now consistent with rt_skel_cache_ — identical poses
+    // next frame skip the whole update (see the change detection above).
+    rt_skel_have_gpu_state_ = true;
 
     // Heartbeat (every ~5 s at 60 fps) so "no character shadows" is
     // debuggable: shows how many skeletons made it through the guards.
@@ -5543,6 +5609,8 @@ void ClusterRenderer::destroy() {
     hw_rt_desc_set_.reset();
     hw_rt_desc_set_layout_.reset();
     hw_rt_shadow_ready_ = false;
+    rt_skel_have_gpu_state_ = false;
+    rt_skel_cache_.clear();
 
     // CSM silhouette prepass pipeline.
     silhouette_prepass_pipeline_.reset();
