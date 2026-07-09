@@ -346,15 +346,31 @@ private:
     // the actual merged cluster geometry — no RT hardware involved.
     //   rt_bvh_nodes_buffer_  : glsl::RtBvhNode[]   (32 B / node)
     //   rt_bvh_leaves_buffer_ : uint[] global cluster indices per leaf
-    // rt_shadow_desc_set_ (COMPUTE visibility) bundles the five geometry
-    // SSBOs the mesh-data set exposes PLUS the two BVH buffers:
-    //   0 cull infos  1 draw infos  2 merged VB  3 merged IB
+    //   rt_pos_uv_buffer_     : vec4[] { position.xyz, packHalf2x16(uv) }
+    //                           — SoA repack of the merged VB: ONE 16 B
+    //                           fetch per vertex in the triangle loop
+    //                           instead of 3 floats scattered over the
+    //                           48 B interleaved stride; the UV rides
+    //                           along for the alpha-cutoff hit test.
+    // rt_shadow_desc_set_ (COMPUTE visibility) bindings:
+    //   0 cull infos  1 draw infos  2 packed pos+uv  3 merged IB
     //   4 material params  5 BVH nodes  6 BVH leaf cluster indices
+    //   7 base-colour textures[MAX_CLUSTER_TEXTURES] — sampled only on
+    //     alpha-masked hits so cutout casters shadow by texture
+    //     silhouette (parity with the raster CSM alpha-test path).
     // The application binds it at set RUNTIME_LIGHTS_PARAMS_SET + 1 of
     // the deferred-resolve pipeline (its own identically-defined layout
     // keeps the pipeline creatable before the first finalize).
+    // ALL trace-visible buffers are DEVICE_LOCAL copies — the shared
+    // cluster buffers are HOST_VISIBLE for the CPU-cull/debug paths, and
+    // a per-pixel traversal reading over PCIe is a 10-100× slowdown.
     renderer::BufferInfo rt_bvh_nodes_buffer_;
     renderer::BufferInfo rt_bvh_leaves_buffer_;
+    renderer::BufferInfo rt_pos_uv_buffer_;
+    renderer::BufferInfo rt_cull_infos_buffer_;
+    renderer::BufferInfo rt_draw_infos_buffer_;
+    renderer::BufferInfo rt_indices_buffer_;
+    renderer::BufferInfo rt_materials_buffer_;
     uint32_t             rt_bvh_node_count_ = 0;
     bool                 rt_shadow_ready_   = false;
     std::shared_ptr<renderer::DescriptorSetLayout>
@@ -362,6 +378,69 @@ private:
     std::shared_ptr<renderer::DescriptorSet>
         rt_shadow_desc_set_;
     void buildRtShadowBvh();   // called from finalizeUploads
+
+    // ── Hardware-RT shadow acceleration structure (ray query) ──────────
+    // One static BLAS over the merged cluster geometry, TWO geometries:
+    //   geometry 0 — OPAQUE flag: all triangles of clusters whose material
+    //                is neither translucent nor alpha-masked; ray-query
+    //                candidates auto-commit in fixed function (fast path).
+    //   geometry 1 — NO opaque flag: alpha-masked clusters' triangles;
+    //                each candidate reaches deferred_resolve.comp, which
+    //                alpha-tests the base-colour texel at the hit UV and
+    //                confirms only solid texels.
+    // Translucent clusters are excluded entirely (they never occlude the
+    // sun — parity with the raster + software-RT paths).  Index values
+    // are pre-resolved to GLOBAL vertex indices (cluster vertex_offset
+    // baked in) so both geometries share rt_pos_uv_buffer_ as the vertex
+    // source and the shader can fetch UVs with the same indices.
+    // hw_rt_desc_set_ (COMPUTE): 0 TLAS, 1 masked index buffer (uint[]),
+    // 2 per-masked-triangle material id (uint[]).  The application binds
+    // it at set RUNTIME_LIGHTS_PARAMS_SET + 2 of the deferred-resolve
+    // HW-RT pipeline; its layout MUST stay identically defined in
+    // application.cpp::initDeferredResolve.
+    renderer::BufferInfo hw_rt_opaque_index_buffer_;
+    renderer::BufferInfo hw_rt_masked_index_buffer_;
+    renderer::BufferInfo hw_rt_masked_tri_mat_buffer_;
+    renderer::BufferInfo hw_rt_blas_buffer_;
+    renderer::BufferInfo hw_rt_blas_scratch_buffer_;
+    renderer::BufferInfo hw_rt_tlas_buffer_;
+    renderer::BufferInfo hw_rt_tlas_scratch_buffer_;
+    renderer::BufferInfo hw_rt_instance_buffer_;
+    renderer::AccelerationStructure hw_rt_blas_handle_{};
+    renderer::AccelerationStructure hw_rt_tlas_handle_{};
+    uint64_t hw_rt_static_blas_address_ = 0;   // cached for TLAS rebuilds
+    bool hw_rt_shadow_ready_ = false;
+    std::shared_ptr<renderer::DescriptorSetLayout> hw_rt_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet>       hw_rt_desc_set_;
+    void buildHwRtShadowAs();  // called from buildRtShadowBvh
+
+    // ── RT-shadow skeletons (skinned characters, both RT modes) ────────
+    // Characters deform every frame, so they can't live in the static
+    // structures above.  updateRtSkeletons() CPU-skins each registered
+    // character into WORLD-space vec4 positions (a few characters × tens
+    // of k verts ≈ well under a ms) and:
+    //   SW mode — writes header/chunk-AABB/position/index SSBOs (RT set
+    //             bindings 8..11); rtShadowFactor tests skeleton AABB →
+    //             chunk AABBs (RT_SKEL_CHUNK_TRIS tris each) → triangles.
+    //   HW mode — rebuilds ONE skeleton BLAS over the concatenated
+    //             triangles (FAST_BUILD) + the shared TLAS (static
+    //             instance + skeleton instance) on the frame cmd buffer.
+    // Buffers are HOST_VISIBLE|HOST_COHERENT and single-buffered — same
+    // per-frame overwrite policy the engine already uses for the skinning
+    // joints_buffer_.  Characters are always OPAQUE casters.
+    renderer::BufferInfo rt_skel_header_buffer_;   // counts + RtSkelHeader[]
+    renderer::BufferInfo rt_skel_chunk_buffer_;    // 2×vec4 AABB per chunk
+    renderer::BufferInfo rt_skel_pos_buffer_;      // skinned world vec4
+    renderer::BufferInfo rt_skel_index_buffer_;    // global-vertex u32 tris
+    uint32_t rt_skel_chunk_cap_ = 0;   // capacities (elements)
+    uint32_t rt_skel_pos_cap_   = 0;
+    uint32_t rt_skel_idx_cap_   = 0;
+    renderer::BufferInfo hw_rt_skel_blas_buffer_;
+    renderer::BufferInfo hw_rt_skel_blas_scratch_;
+    renderer::AccelerationStructure hw_rt_skel_blas_handle_{};
+    uint32_t hw_rt_skel_blas_tri_cap_ = 0;  // BLAS sized for this many tris
+    renderer::BufferInfo hw_rt_frame_instance_buffer_;  // TLAS rebuild input
+    void writeRtSkeletonDescriptors();  // rewrite RT-set bindings 8..11
 
     // ── CSM silhouette prepass pipeline ─────────────────────────────────
     // Pre-fills each cascade's main-camera-frustum interior with depth=1
@@ -980,6 +1059,32 @@ public:
     const std::shared_ptr<renderer::DescriptorSet>& getRtShadowDescSet() const {
         return rt_shadow_desc_set_;
     }
+    // hwRtShadowReady(): BLAS/TLAS + descriptor set exist.  The app gates
+    // FEATURE_INPUT_HW_RT_SHADOW (and the HW resolve pipeline dispatch)
+    // on this, so no dummy TLAS is ever needed.
+    bool hwRtShadowReady() const { return hw_rt_shadow_ready_; }
+    const std::shared_ptr<renderer::DescriptorSet>& getHwRtShadowDescSet() const {
+        return hw_rt_desc_set_;
+    }
+
+    // ── RT-shadow skeletons (skinned characters, both RT modes) ────────
+    // Call once per frame (compute context, before the deferred resolve)
+    // with every ready skinned character.  See the member-block comment
+    // for the full design.  Empty vector is fine (clears the skeleton
+    // set and keeps the TLAS static-only).
+    struct RtSkeletonFrameData {
+        const std::vector<glm::vec3>*    positions      = nullptr;
+        const std::vector<glm::u16vec4>* joints         = nullptr;
+        const std::vector<glm::vec4>*    weights        = nullptr;
+        const std::vector<glm::u16vec4>* joints1        = nullptr;  // optional
+        const std::vector<glm::vec4>*    weights1       = nullptr;  // optional
+        const std::vector<uint32_t>*     indices        = nullptr;
+        const std::vector<glm::mat4>*    joint_matrices = nullptr;
+        glm::mat4                        model = glm::mat4(1.0f);
+    };
+    void updateRtSkeletons(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const std::vector<RtSkeletonFrameData>& skeletons);
     const std::vector<glsl::ClusterCullInfo>& getDebugSampleClusters() const {
         return debug_sample_clusters_;
     }

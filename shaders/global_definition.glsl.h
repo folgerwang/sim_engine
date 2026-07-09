@@ -216,6 +216,15 @@
 // SSRT it also raises SHADOW_DISABLED so forward shaders skip CSM, and
 // the CSM render pass is skipped entirely.
 #define FEATURE_INPUT_RT_SHADOW                 0x00000020
+// World-space HARDWARE ray-traced sun shadows (VK_KHR_ray_query): the
+// HW-RT variant of deferred_resolve.comp (compiled with -DHW_RT_SHADOW)
+// ray-queries the cluster TLAS instead of walking the software BVH.
+// Alpha-masked casters live in a non-opaque BLAS geometry whose
+// candidates are alpha-tested in the shader; opaque casters resolve in
+// fixed function.  The app sets this only when ClusterRenderer::
+// hwRtShadowReady() AND dispatches the HW pipeline variant; like the
+// other RT modes it raises SHADOW_DISABLED and skips the CSM pass.
+#define FEATURE_INPUT_HW_RT_SHADOW              0x00000040
 
 // Debug render mode is packed into bits 16..23 of camera_info.input_features
 // (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack
@@ -704,6 +713,24 @@ struct ClusterDrawInfo {
 // Bistro has 600+ DDS textures; 256 covers the most common base-colour set
 // without blowing the descriptor pool budget.
 #define MAX_CLUSTER_TEXTURES 256
+
+// ── RT-shadow skeleton (skinned character) casters ───────────────────
+// Written per frame by ClusterRenderer::updateRtSkeletons after CPU
+// skinning; read by deferred_resolve.comp's software RT path (bindings
+// 8..11 of the RT shadow set).  Triangles are grouped into fixed chunks
+// of RT_SKEL_CHUNK_TRIS with per-chunk world AABBs, so the shader tests
+// skeleton AABB → chunk AABB → Möller–Trumbore.  Positions are WORLD
+// space (skinning already applied) and all skeleton casters are opaque.
+#define RT_SKEL_CHUNK_TRIS 128
+#define RT_SKEL_MAX        16
+struct RtSkelHeader {
+    vec4 aabb_min;      // xyz = skeleton world AABB min, w unused
+    vec4 aabb_max;      // xyz = skeleton world AABB max, w unused
+    uint tri_offset;    // first triangle in rt_skel_indices (×3 = index)
+    uint tri_count;
+    uint chunk_offset;  // first chunk (2 vec4s each) in rt_skel_chunks
+    uint pad0;
+};
 
 // Flags for BindlessMaterialParams.flags — bits 0..7 are dedicated to
 // boolean material flags; bits 8..15 store the MeshCategory enum value

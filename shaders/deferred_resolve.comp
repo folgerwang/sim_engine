@@ -1,5 +1,18 @@
-#version 450
+// 460 (not 450): GL_EXT_ray_query only registers its types/builtins on
+// GLSL 4.60+, and the HW-RT variant of this shader ray-queries the
+// cluster TLAS.  460 is a strict superset of 450 for everything else
+// here, so the non-RT variant is unaffected.
+#version 460
 #extension GL_ARB_separate_shader_objects : enable
+// For rt_base_color_textures[] — the alpha-cutoff test in rtShadowFactor
+// indexes the texture array by a per-cluster material id (divergent).
+#extension GL_EXT_nonuniform_qualifier : enable
+#ifdef HW_RT_SHADOW
+// HW-RT pipeline variant (deferred_resolve_hwrt_comp.spv): traces sun
+// shadows with VK_KHR_ray_query against the cluster TLAS instead of the
+// software BVH.  Compiled with --target-env=vulkan1.2.
+#extension GL_EXT_ray_query : enable
+#endif
 #include "global_definition.glsl.h"
 #include "functions.glsl.h"
 
@@ -75,12 +88,14 @@ layout(std430, set = RT_SHADOW_DATA_SET, binding = 0) readonly buffer RtCullInfo
 layout(std430, set = RT_SHADOW_DATA_SET, binding = 1) readonly buffer RtDrawInfos {
     ClusterDrawInfo rt_draw_infos[];
 };
-// Merged bindless vertex buffer read as raw floats: BindlessVertex is
-// {vec3 position, vec3 normal, vec2 uv, vec4 tangent} = 12 floats,
-// position at float offset 0.
-#define RT_VERTEX_STRIDE_FLOATS 12u
-layout(std430, set = RT_SHADOW_DATA_SET, binding = 2) readonly buffer RtVertices {
-    float rt_vertices[];
+// Packed position + UV: vec4 = { position.xyz, packHalf2x16(uv) }.
+// Built CPU-side in buildRtShadowBvh() from the merged vertex staging
+// data.  ONE coalesced 16 B fetch per vertex instead of three floats
+// scattered across the 48 B interleaved BindlessVertex stride (the
+// dominant bandwidth cost of the triangle loop), and the UV rides along
+// for free so alpha-cutoff casters can be texture-tested at the hit.
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 2) readonly buffer RtPosUv {
+    vec4 rt_pos_uv[];
 };
 layout(std430, set = RT_SHADOW_DATA_SET, binding = 3) readonly buffer RtIndices {
     uint rt_indices[];
@@ -94,6 +109,58 @@ layout(std430, set = RT_SHADOW_DATA_SET, binding = 5) readonly buffer RtBvhNodes
 layout(std430, set = RT_SHADOW_DATA_SET, binding = 6) readonly buffer RtBvhLeaves {
     uint rt_bvh_leaf_clusters[];
 };
+// Base-colour textures — the SAME views the bindless raster set exposes,
+// re-written onto this COMPUTE-visible set by buildRtShadowBvh().
+// Sampled ONLY on alpha-masked triangle hits so foliage / fence cards
+// shadow by their texture silhouette instead of their full quad
+// (parity with the raster CSM path's alpha-cutoff fragment shader).
+layout(set = RT_SHADOW_DATA_SET, binding = 7)
+    uniform sampler2D rt_base_color_textures[MAX_CLUSTER_TEXTURES];
+// ── RT-shadow skeleton casters (skinned characters) ──────────────────
+// Written per frame by ClusterRenderer::updateRtSkeletons (CPU-skinned
+// WORLD-space positions).  The software path (rtShadowFactor) tests
+// skeleton AABB → chunk AABB → triangles; the hardware path gets the
+// same geometry through its own skeleton BLAS instance in the TLAS.
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 8)
+    readonly buffer RtSkelHeaders {
+    uvec4        rt_skel_counts;    // x = skeleton count
+    RtSkelHeader rt_skel_headers[];
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 9)
+    readonly buffer RtSkelChunks {
+    vec4 rt_skel_chunks[];          // AABB min/max pairs per chunk
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 10)
+    readonly buffer RtSkelPositions {
+    vec4 rt_skel_pos[];             // skinned world positions
+};
+layout(std430, set = RT_SHADOW_DATA_SET, binding = 11)
+    readonly buffer RtSkelIndices {
+    uint rt_skel_indices[];         // triangle list (global vertex ids)
+};
+
+#ifdef HW_RT_SHADOW
+// ─── Hardware-RT shadow data (ray query) ─────────────────────────────
+// Bound from ClusterRenderer's hw_rt_desc_set_ — only in the HW-RT
+// pipeline variant, and only dispatched when hwRtShadowReady(), so no
+// dummy TLAS is ever required.
+//   0  TLAS over the merged cluster geometry (geom 0 opaque, geom 1
+//      alpha-masked / non-opaque)
+//   1  masked geometry's index buffer (GLOBAL vertex ids — same ids
+//      rt_pos_uv[] uses, so hit UVs come from the packed buffer)
+//   2  per-masked-triangle material id (into rt_materials[])
+#define HW_RT_SHADOW_DATA_SET (RT_SHADOW_DATA_SET + 1)
+layout(set = HW_RT_SHADOW_DATA_SET, binding = 0)
+    uniform accelerationStructureEXT hw_rt_tlas;
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 1)
+    readonly buffer HwRtMaskedIndices {
+    uint hw_rt_masked_indices[];
+};
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 2)
+    readonly buffer HwRtMaskedTriMats {
+    uint hw_rt_masked_tri_mat[];
+};
+#endif
 
 // Octahedral decode — companion of the encode in cluster_bindless.frag
 // (GBUFFER_OUTPUT branch).  Maps a 2D unit-square coordinate back onto a
@@ -189,6 +256,13 @@ const float SSRT_SURFACE_BIAS  = 0.03;   // self-intersection guard (m)
 const float RT_SHADOW_MAX_DIST = 300.0;  // caster search range (m)
 const float RT_SHADOW_BIAS     = 0.03;   // launch offset (m)
 const int   RT_BVH_STACK_SIZE  = 48;
+// Transparent-texel hit budget per ray.  Correct alpha-cutoff handling
+// means a ray no longer terminates on the first foliage card it grazes —
+// through dense vegetation it can march hundreds of triangles + texture
+// samples.  After this many transparent hits the ray is, for sun-shadow
+// purposes, inside a canopy: call it occluded and stop.  Bounds the
+// worst case at a bias that over-darkens (never light-leaks).
+const int   RT_ALPHA_HIT_BUDGET = 8;
 
 // Slab test vs node AABB.  inv_dir precomputed by the caller; returns
 // true when the ray's [0, t_max] interval overlaps the box.
@@ -202,8 +276,11 @@ bool rtRayAabb(vec3 ro, vec3 inv_dir, float t_max, vec3 bmin, vec3 bmax) {
     return t_exit >= max(t_enter, 0.0) && t_enter <= t_max;
 }
 
-// Möller–Trumbore, double-sided, any-hit semantics.
-bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2) {
+// Möller–Trumbore, double-sided, any-hit semantics.  Barycentrics (u, v)
+// are returned so alpha-masked hits can interpolate the vertex UVs and
+// texture-test the cutoff.
+bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
+              out float o_u, out float o_v) {
     vec3 e1 = v1 - v0;
     vec3 e2 = v2 - v0;
     vec3 pv = cross(rd, e2);
@@ -217,14 +294,9 @@ bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2) {
     float v = dot(rd, qv) * inv_det;
     if (v < 0.0 || u + v > 1.0) return false;
     float t = dot(e2, qv) * inv_det;
+    o_u = u;
+    o_v = v;
     return t > RT_SHADOW_BIAS && t < t_max;
-}
-
-vec3 rtFetchPosition(uint vertex_idx) {
-    uint base = vertex_idx * RT_VERTEX_STRIDE_FLOATS;
-    return vec3(rt_vertices[base + 0u],
-                rt_vertices[base + 1u],
-                rt_vertices[base + 2u]);
 }
 
 float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
@@ -235,6 +307,7 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
     uint stack[RT_BVH_STACK_SIZE];
     int  sp = 0;
     stack[sp++] = 0u;   // root
+    int alpha_hits = 0;     // transparent-texel hits so far (budgeted)
 
     while (sp > 0) {
         RtBvhNode node = rt_bvh_nodes[stack[--sp]];
@@ -265,8 +338,23 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
             ClusterDrawInfo draw = rt_draw_infos[cluster_idx];
             // Translucent clusters don't occlude the sun (matches the
             // raster shadow path, which skips them at cull time).
-            uint mflags = rt_materials[draw.material_idx].flags;
+            BindlessMaterialParams m = rt_materials[draw.material_idx];
+            uint mflags = uint(m.flags);
             if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+
+            // Alpha-cutoff casters (foliage, fences, decals): a geometric
+            // hit is only an occluder if the base-colour texel at the hit
+            // point passes the cutoff — otherwise the ray continues
+            // through the transparent part of the card.  Matches the
+            // raster CSM path, which runs those materials through the
+            // alpha-test fragment shader.
+            bool masked = (mflags & BINDLESS_MAT_ALPHA_MASK) != 0u;
+            if (masked && m.base_color_tex_idx < 0) {
+                // No texture — the constant factor decides for the whole
+                // cluster: below the cutoff nothing here ever occludes.
+                if (m.base_color_factor.a < m.alpha_cutoff) continue;
+                masked = false;   // at/above cutoff: behaves opaque
+            }
 
             uint tri_count = draw.index_count / 3u;
             for (uint t = 0u; t < tri_count; ++t) {
@@ -276,17 +364,118 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
                           + draw.vertex_offset;
                 uint i2 = rt_indices[draw.index_offset + t * 3u + 2u]
                           + draw.vertex_offset;
+                vec4 p0 = rt_pos_uv[i0];
+                vec4 p1 = rt_pos_uv[i1];
+                vec4 p2 = rt_pos_uv[i2];
+                float hu, hv;
+                if (!rtRayTri(ro, L, RT_SHADOW_MAX_DIST,
+                              p0.xyz, p1.xyz, p2.xyz, hu, hv)) {
+                    continue;
+                }
+                if (!masked) return 0.0;   // opaque hit — occluded
+
+                // Interpolate UV at the hit and alpha-test the texel.
+                vec2 uv0 = unpackHalf2x16(floatBitsToUint(p0.w));
+                vec2 uv1 = unpackHalf2x16(floatBitsToUint(p1.w));
+                vec2 uv2 = unpackHalf2x16(floatBitsToUint(p2.w));
+                vec2 huv = uv0 * (1.0 - hu - hv) + uv1 * hu + uv2 * hv;
+                float a = textureLod(
+                    rt_base_color_textures[
+                        nonuniformEXT(m.base_color_tex_idx)],
+                    huv, 0.0).a * m.base_color_factor.a;
+                if (a >= m.alpha_cutoff) return 0.0;   // solid texel
+                // Transparent texel — keep marching, but bounded: deep
+                // inside vegetation the answer is "shadowed" anyway.
+                if (++alpha_hits >= RT_ALPHA_HIT_BUDGET) return 0.0;
+            }
+        }
+    }
+
+    // ── Skeleton casters (skinned characters, CPU-skinned per frame) ──
+    // Not part of the static BVH (they deform); a handful of characters
+    // with per-skeleton + per-chunk AABB rejection keeps this cheap for
+    // rays that don't pass near a character.  Always opaque.
+    const uint skel_n = min(rt_skel_counts.x, uint(RT_SKEL_MAX));
+    for (uint s = 0u; s < skel_n; ++s) {
+        RtSkelHeader h = rt_skel_headers[s];
+        if (!rtRayAabb(ro, inv_dir, RT_SHADOW_MAX_DIST,
+                       h.aabb_min.xyz, h.aabb_max.xyz)) continue;
+        const uint chunk_n =
+            (h.tri_count + uint(RT_SKEL_CHUNK_TRIS) - 1u) /
+            uint(RT_SKEL_CHUNK_TRIS);
+        for (uint c = 0u; c < chunk_n; ++c) {
+            vec3 cmin = rt_skel_chunks[(h.chunk_offset + c) * 2u + 0u].xyz;
+            vec3 cmax = rt_skel_chunks[(h.chunk_offset + c) * 2u + 1u].xyz;
+            if (!rtRayAabb(ro, inv_dir, RT_SHADOW_MAX_DIST, cmin, cmax))
+                continue;
+            const uint t0i = h.tri_offset + c * uint(RT_SKEL_CHUNK_TRIS);
+            const uint t1i = min(h.tri_offset + h.tri_count,
+                                 t0i + uint(RT_SKEL_CHUNK_TRIS));
+            for (uint t = t0i; t < t1i; ++t) {
+                float hu, hv;
                 if (rtRayTri(ro, L, RT_SHADOW_MAX_DIST,
-                             rtFetchPosition(i0),
-                             rtFetchPosition(i1),
-                             rtFetchPosition(i2))) {
-                    return 0.0;   // any hit — occluded
+                             rt_skel_pos[rt_skel_indices[t * 3u + 0u]].xyz,
+                             rt_skel_pos[rt_skel_indices[t * 3u + 1u]].xyz,
+                             rt_skel_pos[rt_skel_indices[t * 3u + 2u]].xyz,
+                             hu, hv)) {
+                    return 0.0;   // opaque — occluded
                 }
             }
         }
     }
     return 1.0;
 }
+
+#ifdef HW_RT_SHADOW
+// ─── Hardware ray-query sun shadow ───────────────────────────────────
+// Fixed-function traversal of the cluster TLAS.  Opaque geometry commits
+// in hardware (TERMINATE_ON_FIRST_HIT makes it an any-hit query); only
+// alpha-masked candidates surface to the shader, where the base-colour
+// texel at the hit UV decides occlusion — identical policy to the
+// software path's masked handling.
+float hwRtShadowFactor(vec3 world_pos, vec3 world_normal) {
+    vec3 L  = normalize(-runtime_lights.lights[0].direction);
+    vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq, hw_rt_tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu,
+        ro, RT_SHADOW_BIAS, L, RT_SHADOW_MAX_DIST);
+
+    while (rayQueryProceedEXT(rq)) {
+        // Only non-opaque (masked) triangle candidates reach here.
+        if (rayQueryGetIntersectionTypeEXT(rq, false) ==
+            gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const int prim =
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            const uint mat_id = hw_rt_masked_tri_mat[prim];
+            BindlessMaterialParams m = rt_materials[mat_id];
+
+            uint i0 = hw_rt_masked_indices[3 * prim + 0];
+            uint i1 = hw_rt_masked_indices[3 * prim + 1];
+            uint i2 = hw_rt_masked_indices[3 * prim + 2];
+            vec2 uv0 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i0].w));
+            vec2 uv1 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i1].w));
+            vec2 uv2 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i2].w));
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+            vec2 huv = uv0 * (1.0 - bary.x - bary.y)
+                     + uv1 * bary.x + uv2 * bary.y;
+
+            float a = (m.base_color_tex_idx >= 0)
+                ? textureLod(rt_base_color_textures[
+                      nonuniformEXT(m.base_color_tex_idx)], huv, 0.0).a
+                      * m.base_color_factor.a
+                : m.base_color_factor.a;
+            if (a >= m.alpha_cutoff) {
+                rayQueryConfirmIntersectionEXT(rq);   // solid texel
+            }
+        }
+    }
+    return (rayQueryGetIntersectionTypeEXT(rq, true) ==
+            gl_RayQueryCommittedIntersectionNoneEXT) ? 1.0 : 0.0;
+}
+#endif
 
 float ssrtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     vec3 L = normalize(-runtime_lights.lights[0].direction);
@@ -557,9 +746,24 @@ void main() {
     float NdotL = max(dot(N, L), 0.0);
 
     float shad = 1.0;
+#ifdef HW_RT_SHADOW
+    if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
+        // Hardware ray query vs the cluster TLAS.  Same facing-away
+        // early-out as the software path.
+        shad = (dot(N_geom, L) <= 0.0)
+                   ? 0.0
+                   : hwRtShadowFactor(world_pos, N_geom);
+    } else
+#endif
     if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
         // World-space software raytraced shadows (cluster BVH traversal).
-        shad = rtShadowFactor(world_pos, N_geom);
+        // Surfaces facing away from the sun are geometrically
+        // self-shadowed — skip the (expensive) BVH walk entirely.
+        // Kills the trace for roughly the back half of the scene's
+        // pixels at zero visual cost (diffuse/spec are ~0 there anyway).
+        shad = (dot(N_geom, L) <= 0.0)
+                   ? 0.0
+                   : rtShadowFactor(world_pos, N_geom);
     } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
         // Software screen-space raytraced shadows — checked BEFORE the
         // disabled flag: the app sets SHADOW_DISABLED alongside SSRT to

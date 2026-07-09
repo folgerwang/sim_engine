@@ -2182,6 +2182,15 @@ bool Menu::draw(
                             NULL, cur == ShadowTechnique::kRtBvh)) {
                         shadow_technique_ = ShadowTechnique::kRtBvh;
                     }
+                    // HARDWARE RT: ray queries against a TLAS over the
+                    // same cluster geometry (alpha-cutoff casters live in
+                    // a non-opaque BLAS geometry and are texture-tested).
+                    // Falls back to unshadowed until the AS is built.
+                    if (ImGui::MenuItem(
+                            "World-space raytraced (hardware, ray query)",
+                            NULL, cur == ShadowTechnique::kHwRt)) {
+                        shadow_technique_ = ShadowTechnique::kHwRt;
+                    }
                     ImGui::EndMenu();
                 }
 
@@ -4905,9 +4914,14 @@ void Menu::drawDetailsContent() {
                         player_mesh_assign_path_.clear();
                     }
                     // Characters under content/player/ (import.rwmeta
-                    // with type=character).  Bake-only imports record the
-                    // ORIGINAL model in source= (no copy in content);
-                    // older imports carried a copied main= file.
+                    // with type=character).  CONTENT-ONLY RENDERING:
+                    // resolve to the baked character manifest
+                    // (<group>/<leaf>.rwchar) written at import — the
+                    // original model (main=/source=) is import INPUT
+                    // only and is never loaded for rendering.  Groups
+                    // imported before the .rwchar bake existed won't
+                    // have one: they're skipped here and need a
+                    // re-import.
                     namespace fs = std::filesystem;
                     std::error_code ec;
                     for (auto& e :
@@ -4916,20 +4930,20 @@ void Menu::drawDetailsContent() {
                         std::ifstream meta(
                             (e.path() / "import.rwmeta").string());
                         if (!meta) continue;
-                        std::string line, main_file, source_file;
+                        std::string line;
                         bool is_char = false;
                         while (std::getline(meta, line)) {
-                            if (line == "type=character") is_char = true;
-                            else if (line.rfind("main=", 0) == 0)
-                                main_file = line.substr(5);
-                            else if (line.rfind("source=", 0) == 0)
-                                source_file = line.substr(7);
+                            if (line == "type=character") { is_char = true; break; }
                         }
                         std::string model_path;
-                        if (!main_file.empty())
-                            model_path = (e.path() / main_file).string();
-                        else if (!source_file.empty())
-                            model_path = source_file;
+                        {
+                            const std::string leaf =
+                                e.path().filename().string();
+                            const fs::path rwchar =
+                                e.path() / (leaf + ".rwchar");
+                            if (fs::exists(rwchar, ec))
+                                model_path = rwchar.string();
+                        }
                         if (!is_char || model_path.empty()) continue;
                         const std::string label =
                             e.path().filename().string();
@@ -4981,27 +4995,49 @@ void Menu::drawDetailsContent() {
                             }
                         }
                         if (fs::is_directory(p, ec)) {
-                            // Group folder → resolve the character's
-                            // model: copied main= (legacy) or the
-                            // original source= (bake-only imports).
+                            // Group folder → CONTENT-ONLY: resolve to
+                            // the baked <leaf>.rwchar manifest.  The
+                            // original model (main=/source=) is import
+                            // input only — never loaded for rendering.
                             std::ifstream meta(
                                 (fs::path(p) / "import.rwmeta").string());
-                            std::string line, main_file, source_file;
+                            std::string line;
                             bool is_char = false;
                             while (meta && std::getline(meta, line)) {
-                                if (line == "type=character")
+                                if (line == "type=character") {
                                     is_char = true;
-                                else if (line.rfind("main=", 0) == 0)
-                                    main_file = line.substr(5);
-                                else if (line.rfind("source=", 0) == 0)
-                                    source_file = line.substr(7);
+                                    break;
+                                }
                             }
-                            if (is_char && !main_file.empty())
-                                p = (fs::path(p) / main_file).string();
-                            else if (is_char && !source_file.empty())
-                                p = source_file;
-                            else
+                            if (is_char) {
+                                const std::string leaf =
+                                    fs::path(p).filename().string();
+                                const fs::path rwchar =
+                                    fs::path(p) / (leaf + ".rwchar");
+                                if (fs::exists(rwchar, ec)) {
+                                    p = rwchar.string();
+                                } else {
+                                    EditorLog::get().push(
+                                        "[player] '" + leaf +
+                                        "' has no baked .rwchar — "
+                                        "re-import the character "
+                                        "(originals are import-only).");
+                                    p.clear();
+                                }
+                            } else {
                                 p.clear();
+                            }
+                        }
+                        // Hard content-only gate: whatever path arrived
+                        // (dragged file, resolved group), only a baked
+                        // .rwchar may bind to the skeleton-mesh slot.
+                        if (!p.empty() &&
+                            fs::path(p).extension() != ".rwchar") {
+                            EditorLog::get().push(
+                                "[player] rejected '" + p +
+                                "' — rendering uses baked content only; "
+                                "import the character first.");
+                            p.clear();
                         }
                         if (!p.empty()) {
                             player_mesh_assign_pending_ = true;
@@ -5867,6 +5903,9 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     e.path().extension() == ".rwmeta") continue;
                 if (is_content &&
                     e.path().filename() == "asset_index.tsv") continue;
+                // ".disabled" markers are the persistent form of the
+                // per-tile Enabled toggle — never shown as tiles.
+                if (e.path().extension() == ".disabled") continue;
                 (e.is_directory() ? dirs : files).push_back(e);
             }
             auto byname = [](const fs::directory_entry& a, const fs::directory_entry& b) {
@@ -5929,9 +5968,18 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                   ? getThumbnail(e.path().string()) : 0;
 
                 ImGui::PushID((int)i);
-                // Debug enable flag: disabled assets are greyed out in the grid
-                // (purely a browser marker — the 3D scene is unaffected).
+                // Debug enable flag: disabled assets are greyed out in the
+                // grid.  Persistent form is a "<path>.disabled" sidecar
+                // marker, which the .rwchar loader honours at load time —
+                // a disabled sub-mesh is SKIPPED everywhere (forward, CSM,
+                // both RT shadow paths).  The in-memory set mirrors the
+                // sidecars for cheap per-frame dimming.
                 const std::string item_path = e.path().string();
+                {
+                    std::error_code dec;
+                    if (fs::exists(item_path + ".disabled", dec))
+                        content_disabled_.insert(item_path);
+                }
                 const bool tile_disabled =
                     content_disabled_.find(item_path) != content_disabled_.end();
                 if (tile_disabled)
@@ -6062,11 +6110,27 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 if (ImGui::BeginPopupContextItem("##cbctx")) {
                     // Debug enable/disable: greys the tile out (browser only).
                     if (ImGui::MenuItem("Enabled", nullptr, !tile_disabled)) {
-                        if (tile_disabled) content_disabled_.erase(item_path);
-                        else               content_disabled_.insert(item_path);
+                        // Persist as a "<path>.disabled" sidecar so the
+                        // loaders skip the item across sessions (the
+                        // .rwchar loader drops disabled sub-meshes from
+                        // forward, CSM and both RT shadow paths).
+                        std::error_code mec;
+                        if (tile_disabled) {
+                            content_disabled_.erase(item_path);
+                            fs::remove(fs::path(item_path + ".disabled"),
+                                       mec);
+                        } else {
+                            content_disabled_.insert(item_path);
+                            std::ofstream(item_path + ".disabled") << "1\n";
+                        }
                         // Force the Debug Display to rebuild (it dedups by key)
                         // so a group preview drops/re-adds this object now.
                         dbg_asset_key_.clear();
+                        EditorLog::get().push(
+                            std::string("[content] ") +
+                            (tile_disabled ? "enabled '" : "disabled '") +
+                            item_path + "' — already-loaded characters "
+                            "need an app restart to pick this up.");
                     }
                     ImGui::Separator();
                     if (is_content &&
@@ -6169,9 +6233,16 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     int n = 0;
                     for (auto& e : fs::directory_iterator(cur_dir, lec)) {
                         if (lec) break;
+                        if (e.path().extension() == ".disabled") continue;
                         const std::string ip = e.path().string();
-                        if (enabled) { if (content_disabled_.erase(ip) > 0) ++n; }
-                        else         { if (content_disabled_.insert(ip).second) ++n; }
+                        std::error_code mec;
+                        if (enabled) {
+                            if (content_disabled_.erase(ip) > 0) ++n;
+                            fs::remove(fs::path(ip + ".disabled"), mec);
+                        } else {
+                            if (content_disabled_.insert(ip).second) ++n;
+                            std::ofstream(ip + ".disabled") << "1\n";
+                        }
                     }
                     EditorLog::get().push(
                         std::string("[content] ") + (enabled ? "enabled " : "disabled ") +
@@ -8029,8 +8100,13 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
     for (const auto& geo : geos) {
         if (p.positions.size() >= kMaxGroupVerts) { ++skipped; continue; }
         // Skip objects disabled in the Content Browser — they're left out of
-        // the assembled Debug Display preview.
+        // the assembled Debug Display preview.  Check the persistent
+        // sidecar too (the in-memory set is only seeded while browsing).
         if (content_disabled_.find(geo) != content_disabled_.end()) continue;
+        {
+            std::error_code dec;
+            if (fs::exists(geo + ".disabled", dec)) continue;
+        }
         engine::helper::ModelPreviewData md;
         std::vector<std::string> tpaths;
         if (!engine::helper::loadRwGeo(geo, md, &tpaths) ||

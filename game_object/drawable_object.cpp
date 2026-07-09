@@ -2127,6 +2127,152 @@ static void setupSkins(
     }
 }
 
+// ── RT-shadow skeleton capture (glTF path) ───────────────────────────
+// CPU snapshot of every skinned primitive's POSITION / JOINTS_0 /
+// WEIGHTS_0 + indices, concatenated across meshes, decoded from the
+// tinygltf accessors (u8/u16 joints, float/normalized-u8/u16 weights,
+// u8/u16/u32 indices).  Consumed by ClusterRenderer::updateRtSkeletons,
+// which CPU-skins it into world space per frame so the character casts
+// shadows in both RT shadow modes.  The .rwchar loader captures the
+// same structure from its own MeshData.
+static void captureRtSkinSource(
+    const tinygltf::Model& model,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    if (model.skins.empty()) return;
+
+    auto src = std::make_shared<ego::RtSkinSource>();
+    for (const auto& mesh : model.meshes) {
+        for (const auto& prim : mesh.primitives) {
+            auto itp = prim.attributes.find("POSITION");
+            auto itj = prim.attributes.find("JOINTS_0");
+            auto itw = prim.attributes.find("WEIGHTS_0");
+            if (itp == prim.attributes.end() ||
+                itj == prim.attributes.end() ||
+                itw == prim.attributes.end() ||
+                prim.indices < 0) {
+                continue;   // non-skinned primitive
+            }
+            // Skip non-opaque primitives: character assets often carry a
+            // translucent shadow-catcher / ground quad (invisible in the
+            // forward pass) — treating it as an opaque RT caster paints a
+            // big black square under the character.  Parity rule: BLEND
+            // never casts; near-zero constant base alpha never casts.
+            if (prim.material >= 0 &&
+                prim.material < (int)model.materials.size()) {
+                const auto& mat = model.materials[prim.material];
+                if (mat.alphaMode == "BLEND") continue;
+                const auto& bcf =
+                    mat.pbrMetallicRoughness.baseColorFactor;
+                if (bcf.size() == 4 && bcf[3] < 0.5) continue;
+            }
+
+            const auto& pa = model.accessors[itp->second];
+            const auto& ja = model.accessors[itj->second];
+            const auto& wa = model.accessors[itw->second];
+            if (pa.count == 0 ||
+                ja.count != pa.count || wa.count != pa.count) continue;
+
+            const uint32_t vbase = (uint32_t)src->positions.size();
+
+            // POSITION — always float vec3 per the glTF spec.
+            {
+                const auto& bv = model.bufferViews[pa.bufferView];
+                const uint8_t* base = model.buffers[bv.buffer].data.data() +
+                                      pa.byteOffset + bv.byteOffset;
+                const size_t stride =
+                    bv.byteStride ? bv.byteStride : 3 * sizeof(float);
+                for (size_t v = 0; v < pa.count; ++v) {
+                    glm::vec3 p;
+                    std::memcpy(&p, base + v * stride, sizeof(p));
+                    src->positions.push_back(p);
+                }
+            }
+            // JOINTS_0 — u8vec4 or u16vec4.
+            {
+                const auto& bv = model.bufferViews[ja.bufferView];
+                const uint8_t* base = model.buffers[bv.buffer].data.data() +
+                                      ja.byteOffset + bv.byteOffset;
+                const bool u8 = ja.componentType ==
+                                TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+                const size_t stride =
+                    bv.byteStride ? bv.byteStride : (u8 ? 4u : 8u);
+                for (size_t v = 0; v < ja.count; ++v) {
+                    const uint8_t* d = base + v * stride;
+                    if (u8) {
+                        src->joints.push_back(
+                            glm::u16vec4(d[0], d[1], d[2], d[3]));
+                    } else {
+                        uint16_t t[4];
+                        std::memcpy(t, d, sizeof(t));
+                        src->joints.push_back(
+                            glm::u16vec4(t[0], t[1], t[2], t[3]));
+                    }
+                }
+            }
+            // WEIGHTS_0 — float4 or normalized u8/u16 vec4.
+            {
+                const auto& bv = model.bufferViews[wa.bufferView];
+                const uint8_t* base = model.buffers[bv.buffer].data.data() +
+                                      wa.byteOffset + bv.byteOffset;
+                const int ct = wa.componentType;
+                const size_t comp =
+                    (ct == TINYGLTF_COMPONENT_TYPE_FLOAT)          ? 4u
+                    : (ct == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) ? 2u
+                                                                     : 1u;
+                const size_t stride =
+                    bv.byteStride ? bv.byteStride : comp * 4u;
+                for (size_t v = 0; v < wa.count; ++v) {
+                    const uint8_t* d = base + v * stride;
+                    glm::vec4 w;
+                    if (comp == 4) {
+                        std::memcpy(&w, d, sizeof(w));
+                    } else if (comp == 2) {
+                        uint16_t t[4];
+                        std::memcpy(t, d, sizeof(t));
+                        w = glm::vec4(t[0], t[1], t[2], t[3]) / 65535.0f;
+                    } else {
+                        w = glm::vec4(d[0], d[1], d[2], d[3]) / 255.0f;
+                    }
+                    src->weights.push_back(w);
+                }
+            }
+            // Indices — u8/u16/u32 scalar, rebased onto the concatenated
+            // capture arrays.
+            {
+                const auto& ia = model.accessors[prim.indices];
+                const auto& bv = model.bufferViews[ia.bufferView];
+                const uint8_t* base = model.buffers[bv.buffer].data.data() +
+                                      ia.byteOffset + bv.byteOffset;
+                for (size_t i = 0; i < ia.count; ++i) {
+                    uint32_t idx = 0;
+                    switch (ia.componentType) {
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                        idx = base[i];
+                        break;
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+                        uint16_t t;
+                        std::memcpy(&t, base + i * 2u, 2u);
+                        idx = t;
+                        break;
+                    }
+                    default:
+                        std::memcpy(&idx, base + i * 4u, 4u);
+                        break;
+                    }
+                    src->indices.push_back(idx + vbase);
+                }
+            }
+        }
+    }
+
+    if (!src->positions.empty() && src->indices.size() >= 3) {
+        std::printf(
+            "[RT_SKEL] glTF skin capture: %zu verts, %zu tris\n",
+            src->positions.size(), src->indices.size() / 3);
+        drawable_object->rt_skin_source_ = std::move(src);
+    }
+}
+
 static void setupNode(
     const tinygltf::Model& model,
     const uint32_t node_idx,
@@ -4521,6 +4667,10 @@ void DrawableData::updateJoints(
                 skin.inverse_bind_matrices_[i];
         }
 
+        // Keep a CPU copy for the RT-shadow skeleton path (CPU-skins the
+        // character into world space each frame from these).
+        skin.joint_matrices_cpu_ = joint_matrices;
+
         renderer::Helper::updateBufferWithSrcData(
             device,
             joint_matrices.size() * sizeof(glm::mat4),
@@ -6171,6 +6321,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     setupMeshes(model, drawable_object);
     setupAnimations(model, drawable_object);
     setupSkins(device, model, drawable_object);
+    captureRtSkinSource(model, drawable_object);
     setupNodes(model, drawable_object);
     setupModel(model, drawable_object);
     for (auto& scene : drawable_object->scenes_) {
@@ -6934,6 +7085,18 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
     std::error_code ec;
     for (auto& e : fs::directory_iterator(group_dir / "objects", ec)) {
         if (e.path().extension() != ".rwgeo") continue;
+        // Content-Browser "Enabled" toggle: a sibling .disabled marker
+        // removes the sub-mesh from the loaded character entirely —
+        // it never reaches the forward pass, CSM, or either RT shadow
+        // path (the RT skin capture runs in the same load loop).
+        {
+            std::error_code dec;
+            if (fs::exists(e.path().string() + ".disabled", dec)) {
+                std::cout << "[rwchar] sub-mesh disabled, skipping: "
+                          << e.path().filename().string() << std::endl;
+                continue;
+            }
+        }
         int ord = -1;
         if (std::sscanf(e.path().filename().string().c_str(), "%d_", &ord)
                 == 1 && ord >= 0)
@@ -7166,6 +7329,62 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 std::source_location::current(),
                 sk.inverse_bind_matrices_.size() * sizeof(glm::mat4),
                 sk.inverse_bind_matrices_.data());
+
+            // Bind-pose snapshot for the RT-shadow skeleton path — the
+            // auto-rig MeshData already has everything CPU-side, so this
+            // is a straight copy (a few MB per character).  ClusterRenderer
+            // CPU-skins it into world space each frame so the character
+            // casts shadows in both RT shadow modes.
+            // APPEND across the group's skinned sub-meshes (one .rwgeo
+            // per sub-mesh — the loop visits each): indices are rebased
+            // onto the concatenated arrays.  All sub-meshes of a baked
+            // character share the hierarchy-indexed joint set, so one
+            // joint-matrix array (skins_[0]) skins the whole snapshot.
+            if (!drawable_object->rt_skin_source_) {
+                drawable_object->rt_skin_source_ =
+                    std::make_shared<RtSkinSource>();
+            }
+            auto& rt_src = *drawable_object->rt_skin_source_;
+            const uint32_t rt_vbase = (uint32_t)rt_src.positions.size();
+            rt_src.positions.insert(rt_src.positions.end(),
+                                    md.positions.begin(),
+                                    md.positions.end());
+            rt_src.joints.insert(rt_src.joints.end(),
+                                 md.joints.begin(), md.joints.end());
+            rt_src.weights.insert(rt_src.weights.end(),
+                                  md.weights.begin(), md.weights.end());
+            if (skinned8) {
+                // Set-1 arrays must stay PARALLEL to positions across the
+                // whole concatenation — pad earlier meshes' gap if this
+                // is the first skinned8 mesh.
+                rt_src.joints1.resize(rt_vbase, glm::u16vec4(0));
+                rt_src.weights1.resize(rt_vbase, glm::vec4(0.0f));
+                rt_src.joints1.insert(rt_src.joints1.end(),
+                                      md.joints1.begin(),
+                                      md.joints1.end());
+                rt_src.weights1.insert(rt_src.weights1.end(),
+                                       md.weights1.begin(),
+                                       md.weights1.end());
+            } else if (!rt_src.joints1.empty()) {
+                rt_src.joints1.resize(rt_src.positions.size(),
+                                      glm::u16vec4(0));
+                rt_src.weights1.resize(rt_src.positions.size(),
+                                       glm::vec4(0.0f));
+            }
+            // Indices per SECTION, skipping non-opaque ones (translucent
+            // shadow-catcher / glass sections must not cast — same rule
+            // as the glTF capture and the cluster RT path).
+            rt_src.indices.reserve(rt_src.indices.size() +
+                                   md.indices.size());
+            for (const auto& sec : md.sections) {
+                if (sec.base_color.a < 0.5f) continue;
+                const uint32_t iend = std::min(
+                    (uint32_t)md.indices.size(),
+                    sec.first_index + sec.index_count);
+                for (uint32_t k = sec.first_index; k < iend; ++k) {
+                    rt_src.indices.push_back(md.indices[k] + rt_vbase);
+                }
+            }
         }
 
         // Textures (VT-only) with global indices.

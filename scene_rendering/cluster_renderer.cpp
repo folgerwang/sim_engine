@@ -11,6 +11,8 @@
 #include "game_object/drawable_object.h"
 #include "virtual_texture.h"
 
+#include "glm/gtc/packing.hpp"   // packHalf2x16 for the RT pos+uv repack
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -4478,7 +4480,43 @@ void ClusterRenderer::recreate(
 // left index.  Built single-threaded on the CPU from staging_cull_infos_
 // (a few hundred ms worst case for Bistro-scale cluster counts — runs
 // inside finalizeUploads, which is already a load-time hitch) and uploaded
-// as two SSBOs for deferred_resolve.comp's per-pixel traversal.
+// as SSBOs for deferred_resolve.comp's per-pixel traversal.
+//
+// DEVICE_LOCAL is non-negotiable for every buffer the trace touches: the
+// shared cluster buffers (cull/draw infos, merged VB/IB, materials) are
+// HOST_VISIBLE for the CPU-cull/debug paths, and a per-pixel traversal
+// reading host memory over PCIe is a 10-100× slowdown.  So the RT set
+// gets its own device-local copies, built here from the staging arrays.
+
+// DEVICE_LOCAL variant of createSSBO — Helper::createBuffer stages the
+// upload automatically when the memory property is exactly DEVICE_LOCAL.
+// as_input=true additionally makes the buffer usable as acceleration-
+// structure build input (device address + AS_BUILD_INPUT usage) for the
+// hardware-RT shadow BLAS.
+static renderer::BufferInfo createDeviceSSBO(
+    const std::shared_ptr<er::Device>& device,
+    uint64_t size,
+    const void* data,
+    bool as_input = false) {
+    renderer::BufferInfo info;
+    er::Helper::createBuffer(
+        device,
+        SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, TRANSFER_DST_BIT) |
+        (as_input
+             ? (SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
+                SET_FLAG_BIT(BufferUsage,
+                    ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR))
+             : 0),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        as_input ? SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT) : 0,
+        info.buffer,
+        info.memory,
+        std::source_location::current(),
+        size,
+        data);
+    return info;
+}
+
 void ClusterRenderer::buildRtShadowBvh() {
     rt_shadow_ready_ = false;
     if (staging_cull_infos_.empty() || total_clusters_all_meshes_ == 0) {
@@ -4566,15 +4604,92 @@ void ClusterRenderer::buildRtShadowBvh() {
     }
 
     rt_bvh_node_count_    = (uint32_t)nodes.size();
-    rt_bvh_nodes_buffer_  = createSSBO(
+    rt_bvh_nodes_buffer_  = createDeviceSSBO(
         device_, nodes.size() * sizeof(glsl::RtBvhNode), nodes.data());
-    rt_bvh_leaves_buffer_ = createSSBO(
+    rt_bvh_leaves_buffer_ = createDeviceSSBO(
         device_, leaf_indices.size() * sizeof(uint32_t), leaf_indices.data());
 
-    // ── COMPUTE-visible descriptor set: geometry + BVH ───────────────
+    // ── Packed position + UV SoA (binding 2) ─────────────────────────
+    // The trace's inner loop is memory-bound on vertex fetches: the
+    // interleaved BindlessVertex is 48 B with position at offset 0, so
+    // reading 3 positions touches 3 cache lines' worth of stride.
+    // Repack to vec4 { pos.xyz, packHalf2x16(uv) } — one coalesced 16 B
+    // load per vertex, and the UV comes along free for the alpha-cutoff
+    // texture test on masked casters.
+    {
+        std::vector<glm::vec4> pos_uv(staging_vertices_.size());
+        for (size_t i = 0; i < staging_vertices_.size(); ++i) {
+            const BindlessVertex& v = staging_vertices_[i];
+            const uint32_t packed_uv = glm::packHalf2x16(v.uv);
+            pos_uv[i] = glm::vec4(v.position,
+                                  glm::uintBitsToFloat(packed_uv));
+        }
+        // as_input: also the vertex source of the hardware-RT BLAS
+        // (positions at offset 0, stride 16 B, format R32G32B32_SFLOAT).
+        rt_pos_uv_buffer_ = createDeviceSSBO(
+            device_, pos_uv.size() * sizeof(glm::vec4), pos_uv.data(),
+            /*as_input*/ true);
+    }
+
+    // ── Device-local copies of the shared cluster buffers ────────────
+    // cull_info_buffer_ / draw_info_buffer_ / merged_index_buffer_ /
+    // material_params_buffer_ are all HOST_VISIBLE (CPU-cull + debug
+    // paths map them).  The trace reads cull+draw infos per leaf cluster
+    // and indices per TRIANGLE — over PCIe that dominates the whole
+    // dispatch.  VRAM cost is a one-time duplicate of data we already
+    // keep staged on the CPU.
+    rt_cull_infos_buffer_ = createDeviceSSBO(
+        device_,
+        staging_cull_infos_.size() * sizeof(glsl::ClusterCullInfo),
+        staging_cull_infos_.data());
+    rt_draw_infos_buffer_ = createDeviceSSBO(
+        device_,
+        staging_draw_infos_.size() * sizeof(glsl::ClusterDrawInfo),
+        staging_draw_infos_.data());
+    rt_indices_buffer_ = createDeviceSSBO(
+        device_,
+        staging_indices_.size() * sizeof(uint32_t),
+        staging_indices_.data());
+    {
+        std::vector<glsl::BindlessMaterialParams> mat_fallback;
+        const glsl::BindlessMaterialParams* mat_data =
+            staging_material_params_.data();
+        size_t mat_n = staging_material_params_.size();
+        if (mat_n == 0) {           // keep the binding legal
+            mat_fallback.resize(1);
+            std::memset(mat_fallback.data(), 0,
+                        sizeof(glsl::BindlessMaterialParams));
+            mat_data = mat_fallback.data();
+            mat_n    = 1;
+        }
+        rt_materials_buffer_ = createDeviceSSBO(
+            device_,
+            mat_n * sizeof(glsl::BindlessMaterialParams),
+            mat_data);
+    }
+
+    // ── COMPUTE-visible descriptor set: geometry + BVH + textures ────
     if (!rt_shadow_desc_set_layout_) {
-        std::vector<er::DescriptorSetLayoutBinding> rt_bindings(7);
+        std::vector<er::DescriptorSetLayoutBinding> rt_bindings(12);
         for (int i = 0; i < 7; ++i) {
+            rt_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
+                i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_BUFFER);
+        }
+        // Binding 7: base-colour texture array for the alpha-cutoff hit
+        // test.  MUST stay identically defined in application.cpp's
+        // dummy layout (initDeferredResolve) — identically-defined
+        // layouts are compatible per the Vulkan spec.
+        auto tex_binding =
+            er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                7, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER);
+        tex_binding.descriptor_count = MAX_CLUSTER_TEXTURES;
+        rt_bindings[7] = tex_binding;
+        // Bindings 8..11: RT-shadow skeleton casters (headers, chunk
+        // AABBs, skinned world positions, triangle indices) — written
+        // per frame by updateRtSkeletons.
+        for (int i = 8; i < 12; ++i) {
             rt_bindings[i] = er::helper::getBufferDescriptionSetLayoutBinding(
                 i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                 er::DescriptorType::STORAGE_BUFFER);
@@ -4587,31 +4702,31 @@ void ClusterRenderer::buildRtShadowBvh() {
             descriptor_pool_, rt_shadow_desc_set_layout_, 1)[0];
     }
     er::WriteDescriptorList rt_writes;
-    rt_writes.reserve(7);
+    rt_writes.reserve(7 + MAX_CLUSTER_TEXTURES);
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 0,
-        cull_info_buffer_.buffer,
+        rt_cull_infos_buffer_.buffer,
         static_cast<uint32_t>(
             total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo)));
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 1,
-        draw_info_buffer_.buffer,
+        rt_draw_infos_buffer_.buffer,
         static_cast<uint32_t>(
             total_clusters_all_meshes_ * sizeof(glsl::ClusterDrawInfo)));
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 2,
-        merged_vertex_buffer_.buffer,
+        rt_pos_uv_buffer_.buffer,
         static_cast<uint32_t>(
-            total_merged_vertices_ * sizeof(BindlessVertex)));
+            total_merged_vertices_ * sizeof(glm::vec4)));
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 3,
-        merged_index_buffer_.buffer,
+        rt_indices_buffer_.buffer,
         static_cast<uint32_t>(total_merged_indices_ * sizeof(uint32_t)));
     const uint32_t rt_mat_count = std::max(
         static_cast<uint32_t>(staging_material_params_.size()), 1u);
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 4,
-        material_params_buffer_.buffer,
+        rt_materials_buffer_.buffer,
         static_cast<uint32_t>(
             rt_mat_count * sizeof(glsl::BindlessMaterialParams)));
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
@@ -4622,7 +4737,44 @@ void ClusterRenderer::buildRtShadowBvh() {
         er::DescriptorType::STORAGE_BUFFER, 6,
         rt_bvh_leaves_buffer_.buffer,
         static_cast<uint32_t>(leaf_indices.size() * sizeof(uint32_t)));
+    // Binding 7: the same base-colour texture views the bindless raster
+    // set exposes, made COMPUTE-visible for the alpha-cutoff hit test.
+    // Unused slots fall back to the dummy texture (same convention as
+    // the raster set).
+    for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
+        auto tex_write = std::make_shared<er::TextureDescriptor>();
+        tex_write->binding           = 7;
+        tex_write->dst_array_element = ti;
+        tex_write->desc_type         = er::DescriptorType::COMBINED_IMAGE_SAMPLER;
+        tex_write->desc_set          = rt_shadow_desc_set_;
+        tex_write->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        tex_write->sampler           = default_sampler_;
+        tex_write->texture           =
+            (ti < staging_tex_views_.size() && staging_tex_views_[ti])
+                ? staging_tex_views_[ti]
+                : dummy_texture_.view;
+        rt_writes.push_back(tex_write);
+    }
     device_->updateDescriptorSets(rt_writes);
+
+    // Bindings 8..11 (skeleton casters): ensure a valid header buffer
+    // exists with skeleton count 0 so the shader's skeleton loop is a
+    // no-op until updateRtSkeletons runs, and write all four bindings.
+    if (!rt_skel_header_buffer_.buffer) {
+        std::vector<uint8_t> zeros(
+            sizeof(glm::uvec4) + RT_SKEL_MAX * sizeof(glsl::RtSkelHeader), 0);
+        er::Helper::createBuffer(
+            device_,
+            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                            HOST_COHERENT_BIT),
+            0,
+            rt_skel_header_buffer_.buffer,
+            rt_skel_header_buffer_.memory,
+            std::source_location::current(),
+            zeros.size(), zeros.data());
+    }
+    writeRtSkeletonDescriptors();
 
     rt_shadow_ready_ = true;
     const double ms = std::chrono::duration<double, std::milli>(
@@ -4633,6 +4785,719 @@ void ClusterRenderer::buildRtShadowBvh() {
         n, rt_bvh_node_count_, leaf_indices.size(), ms,
         (nodes.size() * sizeof(glsl::RtBvhNode) +
          leaf_indices.size() * 4.0) / (1024.0 * 1024.0));
+
+    // Hardware-RT variant of the same data (BLAS/TLAS for ray query).
+    buildHwRtShadowAs();
+}
+
+// ─── Hardware-RT shadow acceleration structure ────────────────────────────
+// See the member-block comment in cluster_renderer.h.  Mirrors the AS-build
+// sequence of ray_tracing/raytracing_shadow.cpp, but over the merged cluster
+// geometry with a two-geometry opaque/alpha-masked split so ray queries can
+// alpha-test cutout casters and fast-path everything else.
+void ClusterRenderer::buildHwRtShadowAs() {
+    hw_rt_shadow_ready_ = false;
+    if (total_clusters_all_meshes_ == 0 ||
+        staging_indices_.empty() || staging_draw_infos_.empty()) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Re-finalize: release the previous build before overwriting handles.
+    if (hw_rt_blas_handle_) {
+        device_->destroyAccelerationStructure(hw_rt_blas_handle_);
+        hw_rt_blas_handle_ = {};
+    }
+    if (hw_rt_tlas_handle_) {
+        device_->destroyAccelerationStructure(hw_rt_tlas_handle_);
+        hw_rt_tlas_handle_ = {};
+    }
+
+    // ── 1. Partition triangles by material class ─────────────────────
+    // Indices are resolved to GLOBAL vertex ids (cluster vertex_offset
+    // baked in) so both geometries index rt_pos_uv_buffer_ directly and
+    // the shader can fetch hit UVs with the same values.
+    std::vector<uint32_t> opaque_idx;
+    std::vector<uint32_t> masked_idx;
+    std::vector<uint32_t> masked_tri_mat;
+    opaque_idx.reserve(staging_indices_.size());
+    for (uint32_t ci = 0; ci < total_clusters_all_meshes_; ++ci) {
+        const glsl::ClusterDrawInfo& draw = staging_draw_infos_[ci];
+        if (draw.material_idx >= staging_material_params_.size()) continue;
+        const glsl::BindlessMaterialParams& m =
+            staging_material_params_[draw.material_idx];
+        const uint32_t flags = static_cast<uint32_t>(m.flags);
+        // Translucent never occludes the sun (parity with raster + SW RT).
+        if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u;
+        if (masked && m.base_color_tex_idx < 0) {
+            // Texture-less cutout: constant alpha decides once.
+            if (m.base_color_factor.a < m.alpha_cutoff) continue;
+            masked = false;
+        }
+        std::vector<uint32_t>& dst = masked ? masked_idx : opaque_idx;
+        for (uint32_t k = 0; k < draw.index_count; ++k) {
+            dst.push_back(
+                staging_indices_[draw.index_offset + k] + draw.vertex_offset);
+        }
+        if (masked) {
+            const uint32_t tri_n = draw.index_count / 3u;
+            for (uint32_t t = 0; t < tri_n; ++t) {
+                masked_tri_mat.push_back(draw.material_idx);
+            }
+        }
+    }
+    const uint32_t opaque_tris = (uint32_t)opaque_idx.size() / 3u;
+    const uint32_t masked_tris = (uint32_t)masked_idx.size() / 3u;
+    if (opaque_tris + masked_tris == 0) return;
+    // Keep the SSBO bindings legal when there are no masked casters.
+    if (masked_idx.empty())     masked_idx.assign(3, 0u);
+    if (masked_tri_mat.empty()) masked_tri_mat.assign(1, 0u);
+
+    hw_rt_opaque_index_buffer_ = createDeviceSSBO(
+        device_, opaque_idx.size() * sizeof(uint32_t), opaque_idx.data(),
+        /*as_input*/ true);
+    hw_rt_masked_index_buffer_ = createDeviceSSBO(
+        device_, masked_idx.size() * sizeof(uint32_t), masked_idx.data(),
+        /*as_input*/ true);
+    hw_rt_masked_tri_mat_buffer_ = createDeviceSSBO(
+        device_, masked_tri_mat.size() * sizeof(uint32_t),
+        masked_tri_mat.data());
+
+    // ── 2. BLAS: geometry 0 = opaque, geometry 1 = alpha-masked ──────
+    const auto vertex_addr = rt_pos_uv_buffer_.buffer->getDeviceAddress();
+    auto makeTriGeom = [&](const renderer::BufferInfo& idx_buf,
+                           uint32_t tri_count,
+                           bool opaque) {
+        auto g = std::make_shared<er::AccelerationStructureGeometry>();
+        g->geometry_type = er::GeometryType::TRIANGLES_KHR;
+        g->flags = opaque ? SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR) : 0;
+        g->max_primitive_count = tri_count;
+        auto& tri = g->geometry.triangles;
+        tri.struct_type = er::StructureType::
+            ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tri.p_next        = nullptr;
+        tri.vertex_format = er::Format::R32G32B32_SFLOAT;
+        tri.vertex_data.device_address = vertex_addr;
+        tri.vertex_stride = sizeof(glm::vec4);   // pos.xyz + packed uv
+        tri.max_vertex    = total_merged_vertices_ > 0
+                                ? total_merged_vertices_ - 1 : 0;
+        tri.index_type    = er::IndexType::UINT32;
+        tri.index_data.device_address = idx_buf.buffer->getDeviceAddress();
+        tri.transform_data.device_address = 0;   // identity
+        return g;
+    };
+
+    er::AccelerationStructureGeometryList blas_geoms;
+    std::vector<er::AccelerationStructureBuildRangeInfo> blas_ranges;
+    // Geometry order is a shader contract: candidates only ever come
+    // from the NON-opaque geometry, but keep opaque first for clarity.
+    if (opaque_tris > 0) {
+        blas_geoms.push_back(
+            makeTriGeom(hw_rt_opaque_index_buffer_, opaque_tris, true));
+        blas_ranges.push_back({opaque_tris, 0u, 0u, 0u});
+    }
+    if (masked_tris > 0) {
+        blas_geoms.push_back(
+            makeTriGeom(hw_rt_masked_index_buffer_, masked_tris, false));
+        blas_ranges.push_back({masked_tris, 0u, 0u, 0u});
+    }
+
+    er::AccelerationStructureBuildGeometryInfo blas_info{};
+    blas_info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
+    blas_info.flags =
+        SET_FLAG_BIT(BuildAccelerationStructure, PREFER_FAST_TRACE_BIT_KHR);
+    blas_info.geometries = blas_geoms;
+
+    er::AccelerationStructureBuildSizesInfo blas_sizes{};
+    blas_sizes.struct_type = er::StructureType::
+        ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    device_->getAccelerationStructureBuildSizes(
+        er::AccelerationStructureBuildType::DEVICE_KHR,
+        blas_info, blas_sizes);
+
+    device_->createBuffer(
+        blas_sizes.as_size,
+        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
+        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        hw_rt_blas_buffer_.buffer,
+        hw_rt_blas_buffer_.memory,
+        std::source_location::current());
+    hw_rt_blas_handle_ = device_->createAccelerationStructure(
+        hw_rt_blas_buffer_.buffer,
+        er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
+    device_->createBuffer(
+        blas_sizes.build_scratch_size,
+        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
+        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        hw_rt_blas_scratch_buffer_.buffer,
+        hw_rt_blas_scratch_buffer_.memory,
+        std::source_location::current());
+
+    blas_info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+    blas_info.dst_as = hw_rt_blas_handle_;
+    blas_info.scratch_data.device_address =
+        hw_rt_blas_scratch_buffer_.buffer->getDeviceAddress();
+    {
+        auto cmd_buf = device_->setupTransientCommandBuffer();
+        cmd_buf->buildAccelerationStructures({blas_info}, blas_ranges);
+        device_->submitAndWaitTransientCommandBuffer();
+    }
+    const auto blas_addr =
+        device_->getAccelerationStructureDeviceAddress(hw_rt_blas_handle_);
+
+    // ── 3. TLAS: single identity instance ────────────────────────────
+    er::AccelerationStructureInstance instance{};
+    instance.transform = { 1.0f, 0.0f, 0.0f, 0.0f,
+                           0.0f, 1.0f, 0.0f, 0.0f,
+                           0.0f, 0.0f, 1.0f, 0.0f };
+    instance.instance_custom_index = 0;
+    instance.mask = 0xFF;
+    instance.instance_shader_binding_table_record_offset = 0;
+    instance.flags =
+        SET_FLAG_BIT(GeometryInstance, TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
+    instance.acceleration_structure_reference = blas_addr;
+
+    er::Helper::createBuffer(
+        device_,
+        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
+        SET_FLAG_BIT(BufferUsage,
+            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        hw_rt_instance_buffer_.buffer,
+        hw_rt_instance_buffer_.memory,
+        std::source_location::current(),
+        sizeof(instance),
+        &instance);
+
+    // Cache the static instance's BLAS address — the per-frame skeleton
+    // path (updateRtSkeletons) rebuilds the TLAS with static + skeleton
+    // instances and needs it.
+    hw_rt_static_blas_address_ = blas_addr;
+
+    auto tlas_geom = std::make_shared<er::AccelerationStructureGeometry>();
+    tlas_geom->geometry_type = er::GeometryType::INSTANCES_KHR;
+    tlas_geom->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
+    // Sized for TWO instances (static clusters + the skeleton BLAS) so
+    // the per-frame rebuild fits without recreating the TLAS buffers.
+    tlas_geom->max_primitive_count = 2;
+    tlas_geom->geometry.instances.struct_type = er::StructureType::
+        ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlas_geom->geometry.instances.p_next = nullptr;
+    tlas_geom->geometry.instances.array_of_pointers = 0;
+    tlas_geom->geometry.instances.data.device_address =
+        hw_rt_instance_buffer_.buffer->getDeviceAddress();
+
+    er::AccelerationStructureBuildGeometryInfo tlas_info{};
+    tlas_info.type = er::AccelerationStructureType::TOP_LEVEL_KHR;
+    tlas_info.flags =
+        SET_FLAG_BIT(BuildAccelerationStructure, PREFER_FAST_TRACE_BIT_KHR);
+    tlas_info.geometries = { tlas_geom };
+
+    er::AccelerationStructureBuildSizesInfo tlas_sizes{};
+    tlas_sizes.struct_type = er::StructureType::
+        ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    device_->getAccelerationStructureBuildSizes(
+        er::AccelerationStructureBuildType::DEVICE_KHR,
+        tlas_info, tlas_sizes);
+
+    device_->createBuffer(
+        tlas_sizes.as_size,
+        SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
+        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        hw_rt_tlas_buffer_.buffer,
+        hw_rt_tlas_buffer_.memory,
+        std::source_location::current());
+    hw_rt_tlas_handle_ = device_->createAccelerationStructure(
+        hw_rt_tlas_buffer_.buffer,
+        er::AccelerationStructureType::TOP_LEVEL_KHR);
+    device_->createBuffer(
+        tlas_sizes.build_scratch_size,
+        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
+        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+        hw_rt_tlas_scratch_buffer_.buffer,
+        hw_rt_tlas_scratch_buffer_.memory,
+        std::source_location::current());
+
+    tlas_info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+    tlas_info.dst_as = hw_rt_tlas_handle_;
+    tlas_info.scratch_data.device_address =
+        hw_rt_tlas_scratch_buffer_.buffer->getDeviceAddress();
+    {
+        std::vector<er::AccelerationStructureBuildRangeInfo> tlas_ranges = {
+            {1u, 0u, 0u, 0u} };
+        auto cmd_buf = device_->setupTransientCommandBuffer();
+        cmd_buf->buildAccelerationStructures({tlas_info}, tlas_ranges);
+        device_->submitAndWaitTransientCommandBuffer();
+    }
+
+    // ── 4. COMPUTE-visible descriptor set ─────────────────────────────
+    // MUST stay identically defined in application.cpp's
+    // initDeferredResolve (the app builds the HW resolve pipeline layout
+    // before the first finalize).
+    if (!hw_rt_desc_set_layout_) {
+        std::vector<er::DescriptorSetLayoutBinding> b(3);
+        b[0] = er::helper::getBufferDescriptionSetLayoutBinding(
+            0, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::ACCELERATION_STRUCTURE_KHR);
+        b[1] = er::helper::getBufferDescriptionSetLayoutBinding(
+            1, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_BUFFER);
+        b[2] = er::helper::getBufferDescriptionSetLayoutBinding(
+            2, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            er::DescriptorType::STORAGE_BUFFER);
+        hw_rt_desc_set_layout_ = device_->createDescriptorSetLayout(b);
+    }
+    if (!hw_rt_desc_set_) {
+        hw_rt_desc_set_ = device_->createDescriptorSets(
+            descriptor_pool_, hw_rt_desc_set_layout_, 1)[0];
+    }
+    er::WriteDescriptorList hw_writes;
+    hw_writes.reserve(3);
+    er::Helper::addOneAccelerationStructure(hw_writes, hw_rt_desc_set_,
+        er::DescriptorType::ACCELERATION_STRUCTURE_KHR, 0,
+        { hw_rt_tlas_handle_ });
+    er::Helper::addOneBuffer(hw_writes, hw_rt_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 1,
+        hw_rt_masked_index_buffer_.buffer,
+        static_cast<uint32_t>(masked_idx.size() * sizeof(uint32_t)));
+    er::Helper::addOneBuffer(hw_writes, hw_rt_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 2,
+        hw_rt_masked_tri_mat_buffer_.buffer,
+        static_cast<uint32_t>(masked_tri_mat.size() * sizeof(uint32_t)));
+    device_->updateDescriptorSets(hw_writes);
+
+    hw_rt_shadow_ready_ = true;
+    const double hw_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf(
+        "[CLUSTER_RENDERER] HW RT shadow AS: %u opaque + %u masked tris "
+        "(%.1f ms build, BLAS %.1f MB)\n",
+        opaque_tris, masked_tris, hw_ms,
+        blas_sizes.as_size / (1024.0 * 1024.0));
+}
+
+// ─── RT-shadow skeletons ──────────────────────────────────────────────────
+// See the member-block comment in cluster_renderer.h.
+
+// (Re)write RT-set bindings 8..11.  Falls back to the header buffer for
+// any skeleton buffer that doesn't exist yet — the header's zero count
+// keeps the shader loop a no-op, so the placeholders are never read.
+void ClusterRenderer::writeRtSkeletonDescriptors() {
+    if (!rt_shadow_desc_set_ || !rt_skel_header_buffer_.buffer) return;
+    auto pick = [&](const renderer::BufferInfo& b) -> const auto& {
+        return b.buffer ? b : rt_skel_header_buffer_;
+    };
+    const uint32_t header_bytes = static_cast<uint32_t>(
+        sizeof(glm::uvec4) + RT_SKEL_MAX * sizeof(glsl::RtSkelHeader));
+    er::WriteDescriptorList w;
+    w.reserve(4);
+    er::Helper::addOneBuffer(w, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 8,
+        rt_skel_header_buffer_.buffer, header_bytes);
+    er::Helper::addOneBuffer(w, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 9,
+        pick(rt_skel_chunk_buffer_).buffer,
+        rt_skel_chunk_buffer_.buffer
+            ? rt_skel_chunk_cap_ * 2u * (uint32_t)sizeof(glm::vec4)
+            : header_bytes);
+    er::Helper::addOneBuffer(w, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 10,
+        pick(rt_skel_pos_buffer_).buffer,
+        rt_skel_pos_buffer_.buffer
+            ? rt_skel_pos_cap_ * (uint32_t)sizeof(glm::vec4)
+            : header_bytes);
+    er::Helper::addOneBuffer(w, rt_shadow_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 11,
+        pick(rt_skel_index_buffer_).buffer,
+        rt_skel_index_buffer_.buffer
+            ? rt_skel_idx_cap_ * (uint32_t)sizeof(uint32_t)
+            : header_bytes);
+    device_->updateDescriptorSets(w);
+}
+
+void ClusterRenderer::updateRtSkeletons(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::vector<RtSkeletonFrameData>& skeletons) {
+
+    if (!gpu_ready_ || !rt_shadow_desc_set_ ||
+        !rt_skel_header_buffer_.buffer) {
+        return;
+    }
+
+    // ── 1. CPU-skin every skeleton into world space ───────────────────
+    std::vector<glm::vec4>          all_pos;
+    std::vector<uint32_t>           all_idx;
+    std::vector<glm::vec4>          all_chunks;   // min,max pairs
+    std::vector<glsl::RtSkelHeader> headers;
+
+    for (const auto& s : skeletons) {
+        if (headers.size() >= RT_SKEL_MAX) break;
+        if (!s.positions || !s.joints || !s.weights || !s.indices ||
+            !s.joint_matrices || s.joint_matrices->empty() ||
+            s.positions->empty() || s.indices->size() < 3 ||
+            s.joints->size() != s.positions->size() ||
+            s.weights->size() != s.positions->size()) {
+            continue;
+        }
+        const auto& jm = *s.joint_matrices;
+        const uint32_t jm_n = (uint32_t)jm.size();
+        const uint32_t vbase = (uint32_t)all_pos.size();
+        const bool has_set1 =
+            s.joints1 && s.weights1 &&
+            s.joints1->size() == s.positions->size() &&
+            s.weights1->size() == s.positions->size();
+
+        all_pos.reserve(vbase + s.positions->size());
+        for (size_t v = 0; v < s.positions->size(); ++v) {
+            const glm::u16vec4& j0 = (*s.joints)[v];
+            const glm::vec4&    w0 = (*s.weights)[v];
+            glm::mat4 skin =
+                w0.x * jm[std::min((uint32_t)j0.x, jm_n - 1u)] +
+                w0.y * jm[std::min((uint32_t)j0.y, jm_n - 1u)] +
+                w0.z * jm[std::min((uint32_t)j0.z, jm_n - 1u)] +
+                w0.w * jm[std::min((uint32_t)j0.w, jm_n - 1u)];
+            float wsum = w0.x + w0.y + w0.z + w0.w;
+            if (has_set1) {
+                const glm::u16vec4& j1 = (*s.joints1)[v];
+                const glm::vec4&    w1 = (*s.weights1)[v];
+                skin += w1.x * jm[std::min((uint32_t)j1.x, jm_n - 1u)] +
+                        w1.y * jm[std::min((uint32_t)j1.y, jm_n - 1u)] +
+                        w1.z * jm[std::min((uint32_t)j1.z, jm_n - 1u)] +
+                        w1.w * jm[std::min((uint32_t)j1.w, jm_n - 1u)];
+                wsum += w1.x + w1.y + w1.z + w1.w;
+            }
+            // Match base.vert: normalize by the weight sum; identity for
+            // unweighted verts.
+            if (wsum > 1e-4f) skin *= (1.0f / wsum);
+            else              skin  = glm::mat4(1.0f);
+            const glm::vec4 wp =
+                s.model * (skin * glm::vec4((*s.positions)[v], 1.0f));
+            all_pos.push_back(glm::vec4(glm::vec3(wp), 1.0f));
+        }
+
+        glsl::RtSkelHeader h{};
+        h.tri_offset   = (uint32_t)(all_idx.size() / 3u);
+        h.tri_count    = (uint32_t)(s.indices->size() / 3u);
+        h.chunk_offset = (uint32_t)(all_chunks.size() / 2u);
+        all_idx.reserve(all_idx.size() + s.indices->size());
+        for (uint32_t idx : *s.indices) {
+            all_idx.push_back(std::min(idx, (uint32_t)s.positions->size() - 1u)
+                              + vbase);
+        }
+
+        // Chunk AABBs + skeleton AABB.
+        glm::vec3 smin(std::numeric_limits<float>::max());
+        glm::vec3 smax(std::numeric_limits<float>::lowest());
+        const uint32_t chunk_n =
+            (h.tri_count + RT_SKEL_CHUNK_TRIS - 1u) / RT_SKEL_CHUNK_TRIS;
+        for (uint32_t c = 0; c < chunk_n; ++c) {
+            glm::vec3 cmin(std::numeric_limits<float>::max());
+            glm::vec3 cmax(std::numeric_limits<float>::lowest());
+            const uint32_t t0i = (h.tri_offset + c * RT_SKEL_CHUNK_TRIS) * 3u;
+            const uint32_t t1i = std::min(
+                (uint32_t)all_idx.size(),
+                t0i + RT_SKEL_CHUNK_TRIS * 3u);
+            for (uint32_t i = t0i; i < t1i; ++i) {
+                const glm::vec3 p(all_pos[all_idx[i]]);
+                cmin = glm::min(cmin, p);
+                cmax = glm::max(cmax, p);
+            }
+            all_chunks.push_back(glm::vec4(cmin, 0.0f));
+            all_chunks.push_back(glm::vec4(cmax, 0.0f));
+            smin = glm::min(smin, cmin);
+            smax = glm::max(smax, cmax);
+        }
+        h.aabb_min = glm::vec4(smin, 0.0f);
+        h.aabb_max = glm::vec4(smax, 0.0f);
+        headers.push_back(h);
+    }
+
+    // ── 2. (Re)create / grow the HOST_VISIBLE buffers ─────────────────
+    auto ensure = [&](renderer::BufferInfo& buf, uint32_t& cap_elems,
+                      uint32_t need_elems, uint32_t elem_bytes,
+                      bool as_input) -> bool {
+        if (need_elems <= cap_elems && buf.buffer) return false;
+        uint32_t new_cap = std::max(cap_elems, 256u);
+        while (new_cap < need_elems) new_cap *= 2u;
+        buf = {};
+        er::Helper::createBuffer(
+            device_,
+            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
+            (as_input
+                 ? (SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
+                    SET_FLAG_BIT(BufferUsage,
+                        ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR))
+                 : 0),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                            HOST_COHERENT_BIT),
+            as_input ? SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT) : 0,
+            buf.buffer, buf.memory,
+            std::source_location::current(),
+            uint64_t(new_cap) * elem_bytes, nullptr);
+        cap_elems = new_cap;
+        return true;
+    };
+    bool rewrote = false;
+    if (!headers.empty()) {
+        rewrote |= ensure(rt_skel_chunk_buffer_, rt_skel_chunk_cap_,
+                          (uint32_t)(all_chunks.size() / 2u), 2u * sizeof(glm::vec4),
+                          false);
+        rewrote |= ensure(rt_skel_pos_buffer_, rt_skel_pos_cap_,
+                          (uint32_t)all_pos.size(), sizeof(glm::vec4), true);
+        rewrote |= ensure(rt_skel_index_buffer_, rt_skel_idx_cap_,
+                          (uint32_t)all_idx.size(), sizeof(uint32_t), true);
+        if (rewrote) writeRtSkeletonDescriptors();
+
+        device_->updateBufferMemory(rt_skel_pos_buffer_.memory,
+            all_pos.size() * sizeof(glm::vec4), all_pos.data());
+        device_->updateBufferMemory(rt_skel_index_buffer_.memory,
+            all_idx.size() * sizeof(uint32_t), all_idx.data());
+        device_->updateBufferMemory(rt_skel_chunk_buffer_.memory,
+            all_chunks.size() * sizeof(glm::vec4), all_chunks.data());
+    }
+    {
+        // Header buffer: count + entries (count 0 disables the loop).
+        std::vector<uint8_t> hdr(
+            sizeof(glm::uvec4) + RT_SKEL_MAX * sizeof(glsl::RtSkelHeader), 0);
+        glm::uvec4 counts((uint32_t)headers.size(), 0u, 0u, 0u);
+        std::memcpy(hdr.data(), &counts, sizeof(counts));
+        if (!headers.empty()) {
+            std::memcpy(hdr.data() + sizeof(glm::uvec4), headers.data(),
+                        headers.size() * sizeof(glsl::RtSkelHeader));
+        }
+        device_->updateBufferMemory(rt_skel_header_buffer_.memory,
+                                    hdr.size(), hdr.data());
+    }
+
+    // Heartbeat (every ~5 s at 60 fps) so "no character shadows" is
+    // debuggable: shows how many skeletons made it through the guards.
+    {
+        static int s_frame = 0;
+        if ((s_frame++ % 300) == 0) {
+            std::printf(
+                "[RT_SKEL] update: %zu/%zu skeleton(s), %u tris, hw_as=%d\n",
+                headers.size(), skeletons.size(),
+                (uint32_t)(all_idx.size() / 3u),
+                hw_rt_shadow_ready_ ? 1 : 0);
+        }
+    }
+
+    // ── 3. Hardware mode: skeleton BLAS rebuild + TLAS rebuild ────────
+    if (!hw_rt_shadow_ready_ || !cmd_buf) return;
+
+    const uint32_t skel_tris = (uint32_t)(all_idx.size() / 3u);
+    const bool has_skels = !headers.empty() && skel_tris > 0;
+    // NOTE: even with NO skeletons this frame we still fall through to
+    // the TLAS rebuild below (static instance only) — an early return
+    // here would leave the LAST frame's skeleton instance in the TLAS
+    // forever (phantom shadows from unbound / hidden characters).
+
+    // (Re)create the skeleton BLAS when the triangle budget grows.
+    if (has_skels &&
+        (skel_tris > hw_rt_skel_blas_tri_cap_ || !hw_rt_skel_blas_handle_)) {
+        if (hw_rt_skel_blas_handle_) {
+            device_->destroyAccelerationStructure(hw_rt_skel_blas_handle_);
+            hw_rt_skel_blas_handle_ = {};
+        }
+        uint32_t tri_cap = std::max(1024u, hw_rt_skel_blas_tri_cap_);
+        while (tri_cap < skel_tris) tri_cap *= 2u;
+
+        auto g = std::make_shared<er::AccelerationStructureGeometry>();
+        g->geometry_type = er::GeometryType::TRIANGLES_KHR;
+        g->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
+        g->max_primitive_count = tri_cap;
+        auto& tri = g->geometry.triangles;
+        tri.struct_type = er::StructureType::
+            ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tri.p_next        = nullptr;
+        tri.vertex_format = er::Format::R32G32B32_SFLOAT;
+        tri.vertex_data.device_address =
+            rt_skel_pos_buffer_.buffer->getDeviceAddress();
+        tri.vertex_stride = sizeof(glm::vec4);
+        tri.max_vertex    = rt_skel_pos_cap_ - 1u;
+        tri.index_type    = er::IndexType::UINT32;
+        tri.index_data.device_address =
+            rt_skel_index_buffer_.buffer->getDeviceAddress();
+        tri.transform_data.device_address = 0;
+
+        er::AccelerationStructureBuildGeometryInfo info{};
+        info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
+        info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
+                                  PREFER_FAST_BUILD_BIT_KHR);
+        info.geometries = { g };
+        er::AccelerationStructureBuildSizesInfo sz{};
+        sz.struct_type = er::StructureType::
+            ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        device_->getAccelerationStructureBuildSizes(
+            er::AccelerationStructureBuildType::DEVICE_KHR, info, sz);
+
+        hw_rt_skel_blas_buffer_ = {};
+        device_->createBuffer(
+            sz.as_size,
+            SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
+            SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            hw_rt_skel_blas_buffer_.buffer,
+            hw_rt_skel_blas_buffer_.memory,
+            std::source_location::current());
+        hw_rt_skel_blas_handle_ = device_->createAccelerationStructure(
+            hw_rt_skel_blas_buffer_.buffer,
+            er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
+        hw_rt_skel_blas_scratch_ = {};
+        device_->createBuffer(
+            sz.build_scratch_size,
+            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
+            SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            hw_rt_skel_blas_scratch_.buffer,
+            hw_rt_skel_blas_scratch_.memory,
+            std::source_location::current());
+        hw_rt_skel_blas_tri_cap_ = tri_cap;
+    }
+
+    // Per-frame TLAS instance buffer (static + skeleton).
+    if (!hw_rt_frame_instance_buffer_.buffer) {
+        er::Helper::createBuffer(
+            device_,
+            SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
+            SET_FLAG_BIT(BufferUsage,
+                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                            HOST_COHERENT_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            hw_rt_frame_instance_buffer_.buffer,
+            hw_rt_frame_instance_buffer_.memory,
+            std::source_location::current(),
+            2 * sizeof(er::AccelerationStructureInstance), nullptr);
+    }
+
+    // Barriers: previous frame's resolve reads (compute ray query) must
+    // finish before this frame's AS builds overwrite BLAS/TLAS memory,
+    // and the host-written vertex data must be visible to the build.
+    er::BufferResourceInfo as_read_compute = {
+        SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_READ_BIT_KHR),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    er::BufferResourceInfo as_write_build = {
+        SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_WRITE_BIT_KHR),
+        SET_FLAG_BIT(PipelineStage, ACCELERATION_STRUCTURE_BUILD_BIT_KHR) };
+    if (has_skels) {
+        cmd_buf->addBufferBarrier(
+            hw_rt_skel_blas_buffer_.buffer, as_read_compute, as_write_build);
+    }
+    cmd_buf->addBufferBarrier(
+        hw_rt_tlas_buffer_.buffer, as_read_compute, as_write_build);
+
+    // Skeleton BLAS rebuild (positions changed this frame).
+    if (has_skels) {
+        auto g = std::make_shared<er::AccelerationStructureGeometry>();
+        g->geometry_type = er::GeometryType::TRIANGLES_KHR;
+        g->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
+        g->max_primitive_count = skel_tris;
+        auto& tri = g->geometry.triangles;
+        tri.struct_type = er::StructureType::
+            ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tri.p_next        = nullptr;
+        tri.vertex_format = er::Format::R32G32B32_SFLOAT;
+        tri.vertex_data.device_address =
+            rt_skel_pos_buffer_.buffer->getDeviceAddress();
+        tri.vertex_stride = sizeof(glm::vec4);
+        tri.max_vertex    = rt_skel_pos_cap_ - 1u;
+        tri.index_type    = er::IndexType::UINT32;
+        tri.index_data.device_address =
+            rt_skel_index_buffer_.buffer->getDeviceAddress();
+        tri.transform_data.device_address = 0;
+
+        er::AccelerationStructureBuildGeometryInfo info{};
+        info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
+        info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
+                                  PREFER_FAST_BUILD_BIT_KHR);
+        info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+        info.dst_as = hw_rt_skel_blas_handle_;
+        info.geometries = { g };
+        info.scratch_data.device_address =
+            hw_rt_skel_blas_scratch_.buffer->getDeviceAddress();
+        std::vector<er::AccelerationStructureBuildRangeInfo> ranges = {
+            { skel_tris, 0u, 0u, 0u } };
+        cmd_buf->buildAccelerationStructures({ info }, ranges);
+    }
+
+    // BLAS write → TLAS build read.
+    if (has_skels) {
+        er::BufferResourceInfo as_read_build = {
+            SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_READ_BIT_KHR),
+            SET_FLAG_BIT(PipelineStage,
+                         ACCELERATION_STRUCTURE_BUILD_BIT_KHR) };
+        cmd_buf->addBufferBarrier(
+            hw_rt_skel_blas_buffer_.buffer, as_write_build, as_read_build);
+    }
+
+    // TLAS rebuild: static instance + (when present) skeleton instance.
+    const uint32_t inst_count = has_skels ? 2u : 1u;
+    {
+        er::AccelerationStructureInstance insts[2] = {};
+        er::TransformMatrix identity = { 1.0f, 0.0f, 0.0f, 0.0f,
+                                         0.0f, 1.0f, 0.0f, 0.0f,
+                                         0.0f, 0.0f, 1.0f, 0.0f };
+        insts[0].transform = identity;
+        insts[0].instance_custom_index = 0;
+        insts[0].mask = 0xFF;
+        insts[0].instance_shader_binding_table_record_offset = 0;
+        insts[0].flags = SET_FLAG_BIT(
+            GeometryInstance, TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
+        insts[0].acceleration_structure_reference =
+            hw_rt_static_blas_address_;
+        if (has_skels) {
+            insts[1] = insts[0];
+            insts[1].instance_custom_index = 1;
+            insts[1].acceleration_structure_reference =
+                device_->getAccelerationStructureDeviceAddress(
+                    hw_rt_skel_blas_handle_);
+        }
+        device_->updateBufferMemory(hw_rt_frame_instance_buffer_.memory,
+                                    sizeof(insts), insts);
+
+        auto tlas_geom =
+            std::make_shared<er::AccelerationStructureGeometry>();
+        tlas_geom->geometry_type = er::GeometryType::INSTANCES_KHR;
+        tlas_geom->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
+        tlas_geom->max_primitive_count = 2;
+        tlas_geom->geometry.instances.struct_type = er::StructureType::
+            ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        tlas_geom->geometry.instances.p_next = nullptr;
+        tlas_geom->geometry.instances.array_of_pointers = 0;
+        tlas_geom->geometry.instances.data.device_address =
+            hw_rt_frame_instance_buffer_.buffer->getDeviceAddress();
+
+        er::AccelerationStructureBuildGeometryInfo info{};
+        info.type = er::AccelerationStructureType::TOP_LEVEL_KHR;
+        info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
+                                  PREFER_FAST_TRACE_BIT_KHR);
+        info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+        info.dst_as = hw_rt_tlas_handle_;
+        info.geometries = { tlas_geom };
+        info.scratch_data.device_address =
+            hw_rt_tlas_scratch_buffer_.buffer->getDeviceAddress();
+        std::vector<er::AccelerationStructureBuildRangeInfo> ranges = {
+            { inst_count, 0u, 0u, 0u } };
+        cmd_buf->buildAccelerationStructures({ info }, ranges);
+    }
+
+    // TLAS write → resolve compute read.
+    cmd_buf->addBufferBarrier(
+        hw_rt_tlas_buffer_.buffer, as_write_build, as_read_compute);
 }
 
 void ClusterRenderer::destroy() {
@@ -4659,6 +5524,25 @@ void ClusterRenderer::destroy() {
     rt_shadow_desc_set_.reset();
     rt_shadow_desc_set_layout_.reset();
     rt_shadow_ready_ = false;
+
+    // Hardware-RT shadow AS (buffers release via shared_ptrs; the AS
+    // handles need explicit destruction).
+    if (hw_rt_blas_handle_) {
+        device_->destroyAccelerationStructure(hw_rt_blas_handle_);
+        hw_rt_blas_handle_ = {};
+    }
+    if (hw_rt_tlas_handle_) {
+        device_->destroyAccelerationStructure(hw_rt_tlas_handle_);
+        hw_rt_tlas_handle_ = {};
+    }
+    if (hw_rt_skel_blas_handle_) {
+        device_->destroyAccelerationStructure(hw_rt_skel_blas_handle_);
+        hw_rt_skel_blas_handle_ = {};
+        hw_rt_skel_blas_tri_cap_ = 0;
+    }
+    hw_rt_desc_set_.reset();
+    hw_rt_desc_set_layout_.reset();
+    hw_rt_shadow_ready_ = false;
 
     // CSM silhouette prepass pipeline.
     silhouette_prepass_pipeline_.reset();

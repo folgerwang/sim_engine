@@ -159,12 +159,17 @@ class Menu {
     // active.  Experimental, for perf comparison against CSM.
 public:
     enum class ShadowTechnique : int {
-        kCsm    = 0,   // cascaded shadow maps (default)
+        kCsm    = 0,   // cascaded shadow maps
         kSsrt   = 1,   // screen-space ray march vs the depth buffer
         kRtBvh  = 2,   // world-space software RT vs the cluster BVH
+        kHwRt   = 3,   // world-space HARDWARE RT (default; ray query TLAS)
     };
 private:
-    ShadowTechnique shadow_technique_ = ShadowTechnique::kCsm;
+    // Hardware RT is the default shadow technique (deferred rendering is
+    // also on by default, which the RT resolve path requires).  The app
+    // falls back to unshadowed until the cluster AS is built, and CSM
+    // remains selectable from Rendering > Shadow technique.
+    ShadowTechnique shadow_technique_ = ShadowTechnique::kHwRt;
 
 public:
     // ─── CSM drawable-shadow draw mode ────────────────────────────────────
@@ -1718,6 +1723,9 @@ public:
     }
     inline bool isRtShadowsOn() const {
         return shadow_technique_ == ShadowTechnique::kRtBvh;
+    }
+    inline bool isHwRtShadowsOn() const {
+        return shadow_technique_ == ShadowTechnique::kHwRt;
     }
 
     // Current selected CSM drawable-shadow draw-mode (see enum comment above).

@@ -41,6 +41,7 @@ const std::vector<const char*> device_extensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
     VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+    VK_KHR_RAY_QUERY_EXTENSION_NAME,   // rayQueryEXT in deferred_resolve.comp (HW RT shadows)
     VK_KHR_MAINTENANCE3_EXTENSION_NAME,
     VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
     VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
@@ -2085,6 +2086,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
 
     VkPhysicalDeviceBufferDeviceAddressFeatures enabled_buffer_device_address_features{};
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR enabled_ray_tracing_pipeline_features{};
+    VkPhysicalDeviceRayQueryFeaturesKHR enabled_ray_query_features{};
     VkPhysicalDeviceAccelerationStructureFeaturesKHR enabled_acceleration_structure_features{};
     VkPhysicalDeviceMeshShaderFeaturesEXT enabled_mesh_shader_features{};
     VkPhysicalDeviceMaintenance4Features enabled_maintenance4_features{};
@@ -2099,9 +2101,15 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_ray_tracing_pipeline_features.rayTracingPipeline = VK_TRUE;
     enabled_ray_tracing_pipeline_features.pNext = &enabled_buffer_device_address_features;
 
+    // Ray queries in non-RT stages (deferred_resolve.comp traces sun-shadow
+    // rays against the cluster TLAS when the HW RT shadow mode is active).
+    enabled_ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    enabled_ray_query_features.rayQuery = VK_TRUE;
+    enabled_ray_query_features.pNext = &enabled_ray_tracing_pipeline_features;
+
     enabled_acceleration_structure_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
     enabled_acceleration_structure_features.accelerationStructure = VK_TRUE;
-    enabled_acceleration_structure_features.pNext = &enabled_ray_tracing_pipeline_features;
+    enabled_acceleration_structure_features.pNext = &enabled_ray_query_features;
 
     enabled_mesh_shader_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
     enabled_mesh_shader_features.meshShader = VK_TRUE;

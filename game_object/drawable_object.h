@@ -204,6 +204,26 @@ struct SkinInfo {
     std::vector<glm::mat4>  inverse_bind_matrices_;
     renderer::BufferInfo    joints_buffer_;
     std::shared_ptr<renderer::DescriptorSet>    desc_set_;
+    // CPU copy of the last joint matrices uploaded to joints_buffer_
+    // (updateJoints).  Consumed by the RT-shadow skeleton path, which
+    // CPU-skins the character into world space each frame.
+    std::vector<glm::mat4>  joint_matrices_cpu_;
+};
+
+// ── RT-shadow skeleton source ────────────────────────────────────────
+// Bind-pose snapshot of a skinned character, captured at .rwchar load
+// time (the auto-rig path keeps all of this on the CPU in MeshData).
+// ClusterRenderer::updateRtSkeletons CPU-skins it into world space each
+// frame so both RT shadow modes (software BVH loop + hardware BLAS) can
+// treat the character as a shadow caster.  Topology is static; only
+// positions deform.
+struct RtSkinSource {
+    std::vector<glm::vec3>    positions;       // bind pose
+    std::vector<glm::u16vec4> joints;          // 4 influences
+    std::vector<glm::vec4>    weights;
+    std::vector<glm::u16vec4> joints1;         // optional set 1 (8-bone)
+    std::vector<glm::vec4>    weights1;
+    std::vector<uint32_t>     indices;         // triangle list
 };
 
 struct MeshInfo {
@@ -370,6 +390,9 @@ struct DrawableData {
     std::vector<MeshInfo>       meshes_;
     std::vector<AnimationInfo>  animations_;
     std::vector<SkinInfo>       skins_;
+    // Bind-pose CPU snapshot for the RT-shadow skeleton path — non-null
+    // only for skinned characters loaded through the .rwchar path.
+    std::shared_ptr<RtSkinSource> rt_skin_source_;
     std::vector<renderer::BufferInfo>     buffers_;
     std::vector<BufferView>     buffer_views_;
 
@@ -399,6 +422,25 @@ public:
     // gate on DrawableObject::isReady() first (async phase-2/3 may still be
     // populating the vector on another thread before that).
     const std::vector<MaterialInfo>& materials() const { return materials_; }
+
+    // ── RT-shadow skeleton access ─────────────────────────────────────
+    // Source is non-null only for .rwchar-loaded skinned characters.
+    // The world matrix is the cached matrix of the node that OWNS the
+    // skin — controller/animation placement flows through the node
+    // hierarchy, so this is the full world placement the raster path
+    // uses.  Joint matrices are the CPU copies cached by updateJoints.
+    const std::shared_ptr<RtSkinSource>& getRtSkinSource() const {
+        return rt_skin_source_;
+    }
+    glm::mat4 getRtSkinWorldMatrix() const {
+        for (const auto& n : nodes_) {
+            if (n.skin_idx_ > -1) return n.getCachedMatrix();
+        }
+        return glm::mat4(1.0f);
+    }
+    const std::vector<glm::mat4>* getRtSkinJointMatrices() const {
+        return skins_.empty() ? nullptr : &skins_[0].joint_matrices_cpu_;
+    }
 
     // skip_animations: when true, the imported glTF animation channels
     // are NOT evaluated for this frame.  Node transforms keep whatever
@@ -644,6 +686,19 @@ public:
     // with the ready_ flag.
     bool isReady() const {
         return object_ && object_->ready_.load(std::memory_order_acquire);
+    }
+
+    // RT-shadow skeleton forwarders (see DrawableData) — only valid when
+    // isReady().  Source is non-null only for .rwchar skinned characters.
+    const std::shared_ptr<RtSkinSource>& getRtSkinSource() const {
+        static const std::shared_ptr<RtSkinSource> s_null;
+        return isReady() ? object_->getRtSkinSource() : s_null;
+    }
+    glm::mat4 getRtSkinWorldMatrix() const {
+        return isReady() ? object_->getRtSkinWorldMatrix() : glm::mat4(1.0f);
+    }
+    const std::vector<glm::mat4>* getRtSkinJointMatrices() const {
+        return isReady() ? object_->getRtSkinJointMatrices() : nullptr;
     }
 
     // Access mesh info for cluster upload. Only valid when isReady().
