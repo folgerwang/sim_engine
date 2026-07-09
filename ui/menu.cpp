@@ -1324,7 +1324,10 @@ bool Menu::draw(
     // by setPlayerDebugInfo) into the viewport and paint a colour-matched
     // glyph there.  Same NDC→pixel mapping as the selection bbox above; the
     // Vulkan projection already flips Y, so [-1,1]→[0,1] remap is enough.
-    if (show_scene_grid_) {
+    // Hidden in play mode alongside the grid/gizmo draw itself (the
+    // show_scene_grid_ toggle latches on from "Create Scene" and must
+    // not leak editor aids into gameplay).
+    if (show_scene_grid_ && !play_mode_) {
         ImVec2 avp_pos, avp_size, avp_c;
         getViewportScreenRect(avp_pos, avp_size, avp_c);
         if (avp_size.x > 1.0f && avp_size.y > 1.0f) {
@@ -4057,6 +4060,11 @@ void Menu::drawOutlinerPanel() {
         // mesh nodes) nested underneath; single-mesh objects render as
         // flat leaves.
         ImGui::BeginChild("##outliner_list", ImVec2(0, list_h), true);
+        // Deeper per-level indent than the global 18 px style — with the
+        // editor's monospace font that was under two characters, which
+        // made group/child nesting almost invisible in deep scenes.
+        // Scoped to the outliner list only.
+        ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 32.0f);
 
         // Renders one editor object (leaf or group) at its outliner index.
         auto draw_object_row = [&](int i) {
@@ -4252,6 +4260,7 @@ void Menu::drawOutlinerPanel() {
         editor_scroll_to_selected_ = false;   // one-shot consumed this draw
         if (editor_objects_.empty() && !scene_node_active_)
             ImGui::TextDisabled("(no scene objects yet)");
+        ImGui::PopStyleVar();   // IndentSpacing (outliner list scope)
         ImGui::EndChild();
         // Dropping a content asset anywhere on the Outliner list adds it to
         // the scene — same as dropping into the viewport / Add to Scene.

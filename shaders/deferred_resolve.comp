@@ -264,6 +264,64 @@ const int   RT_BVH_STACK_SIZE  = 48;
 // worst case at a bias that over-darkens (never light-leaks).
 const int   RT_ALPHA_HIT_BUDGET = 8;
 
+// ── Soft shadows (both RT modes) ─────────────────────────────────────
+// The sun is a disk, not a point: each shadow ray gets a random
+// direction inside a cone around L, so penumbras widen with caster
+// distance (contact-hardening comes free).  Multiple jittered rays are
+// averaged; the IGN dither decorrelates neighbouring pixels so the
+// residual noise reads as grain rather than banding.
+// RT_SUN_TAN_RADIUS is tan(angular radius): the real sun is ~0.0047
+// (0.27°); the default is padded for a visibly soft edge.  Set the
+// sample counts to 1 for the old hard shadows.
+const float RT_SUN_TAN_RADIUS      = 0.01;
+// Multi-ray, single-frame sampling (no temporal accumulation): the IGN
+// dither pattern is STATIC per pixel, so the result is a stable ordered
+// dither rather than animated noise.
+const int   RT_SOFT_SAMPLES_HW     = 4;   // hardware ray query — cheap rays
+const int   RT_SOFT_SAMPLES_SW     = 2;   // software BVH walk — pricey rays
+
+// Random direction in the sun cone: xi in [0,1)^2, concentric disk via
+// sqrt, oriented on an L-orthonormal basis.
+vec3 rtSunConeDir(vec3 L, vec2 xi) {
+    vec3 t = (abs(L.z) < 0.999)
+                 ? normalize(cross(L, vec3(0.0, 0.0, 1.0)))
+                 : vec3(1.0, 0.0, 0.0);
+    vec3 b = cross(L, t);
+    float r   = RT_SUN_TAN_RADIUS * sqrt(xi.x);
+    float phi = 6.28318530718 * xi.y;
+    return normalize(L + r * (cos(phi) * t + sin(phi) * b));
+}
+
+// ── Ray-traced ambient occlusion (FEATURE_INPUT_RT_AO) ───────────────
+// Short cosine-weighted hemisphere rays traced with whichever RT
+// backend this pipeline variant uses.  Replaces the screen-space SSAO
+// post pass while an RT shadow mode is active: true world-space AO —
+// off-screen and behind-camera geometry occludes correctly.
+const float RT_AO_RADIUS     = 2.0;   // occluder search range (m)
+const int   RT_AO_SAMPLES_HW = 4;
+const int   RT_AO_SAMPLES_SW = 2;
+// Response shaping.  The raw factor is a linear visibility average,
+// which reads weak — the power curve deepens partial occlusion (corners,
+// under-awning, contact regions) without crushing open areas.
+const float RT_AO_POWER = 2.0;
+// SSAO-parity: the old screen-space pass multiplied the FINAL colour,
+// so it also dimmed sunlit pixels.  Pure ambient-only AO is physically
+// nicer but far subtler; this fraction lets RT AO dim direct light too.
+// 0 = ambient-only (physical), 1 = full SSAO-style darkening.
+const float RT_AO_DIRECT_FRACTION = 0.4;
+
+// Cosine-weighted hemisphere direction around n (xi in [0,1)^2).
+vec3 rtCosHemisphereDir(vec3 n, vec2 xi) {
+    vec3 t = (abs(n.z) < 0.999)
+                 ? normalize(cross(n, vec3(0.0, 0.0, 1.0)))
+                 : vec3(1.0, 0.0, 0.0);
+    vec3 b = cross(n, t);
+    float r   = sqrt(xi.x);
+    float phi = 6.28318530718 * xi.y;
+    float z   = sqrt(max(0.0, 1.0 - xi.x));
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * z);
+}
+
 // Slab test vs node AABB.  inv_dir precomputed by the caller; returns
 // true when the ray's [0, t_max] interval overlaps the box.
 bool rtRayAabb(vec3 ro, vec3 inv_dir, float t_max, vec3 bmin, vec3 bmax) {
@@ -299,10 +357,11 @@ bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
     return t > RT_SHADOW_BIAS && t < t_max;
 }
 
-float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
-    vec3 L  = normalize(-runtime_lights.lights[0].direction);
-    vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
-    vec3 inv_dir = 1.0 / L;   // GLSL inf per component when L axis == 0 — fine for the slab test
+// One ray (origin + direction, bounded by t_max) vs the static cluster
+// BVH + the skeleton casters.  Returns 1.0 unoccluded / 0.0 occluded.
+// Shadow rays pass RT_SHADOW_MAX_DIST; AO rays pass RT_AO_RADIUS.
+float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
+    vec3 inv_dir = 1.0 / rd;   // GLSL inf per component when rd axis == 0 — fine for the slab test
 
     uint stack[RT_BVH_STACK_SIZE];
     int  sp = 0;
@@ -311,7 +370,7 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
 
     while (sp > 0) {
         RtBvhNode node = rt_bvh_nodes[stack[--sp]];
-        if (!rtRayAabb(ro, inv_dir, RT_SHADOW_MAX_DIST,
+        if (!rtRayAabb(ro, inv_dir, t_max,
                        node.aabb_min, node.aabb_max)) continue;
 
         if (node.prim_count == 0u) {
@@ -330,9 +389,9 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
             // Cheap sphere reject before touching triangle data.
             vec4 bs = rt_cull_infos[cluster_idx].bounds_sphere;
             vec3 oc = bs.xyz - ro;
-            float t_ca = dot(oc, L);
+            float t_ca = dot(oc, rd);
             float d2 = dot(oc, oc) - t_ca * t_ca;
-            if (t_ca < -bs.w || t_ca - bs.w > RT_SHADOW_MAX_DIST ||
+            if (t_ca < -bs.w || t_ca - bs.w > t_max ||
                 d2 > bs.w * bs.w) continue;
 
             ClusterDrawInfo draw = rt_draw_infos[cluster_idx];
@@ -368,7 +427,7 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
                 vec4 p1 = rt_pos_uv[i1];
                 vec4 p2 = rt_pos_uv[i2];
                 float hu, hv;
-                if (!rtRayTri(ro, L, RT_SHADOW_MAX_DIST,
+                if (!rtRayTri(ro, rd, t_max,
                               p0.xyz, p1.xyz, p2.xyz, hu, hv)) {
                     continue;
                 }
@@ -398,7 +457,7 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
     const uint skel_n = min(rt_skel_counts.x, uint(RT_SKEL_MAX));
     for (uint s = 0u; s < skel_n; ++s) {
         RtSkelHeader h = rt_skel_headers[s];
-        if (!rtRayAabb(ro, inv_dir, RT_SHADOW_MAX_DIST,
+        if (!rtRayAabb(ro, inv_dir, t_max,
                        h.aabb_min.xyz, h.aabb_max.xyz)) continue;
         const uint chunk_n =
             (h.tri_count + uint(RT_SKEL_CHUNK_TRIS) - 1u) /
@@ -406,14 +465,14 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
         for (uint c = 0u; c < chunk_n; ++c) {
             vec3 cmin = rt_skel_chunks[(h.chunk_offset + c) * 2u + 0u].xyz;
             vec3 cmax = rt_skel_chunks[(h.chunk_offset + c) * 2u + 1u].xyz;
-            if (!rtRayAabb(ro, inv_dir, RT_SHADOW_MAX_DIST, cmin, cmax))
+            if (!rtRayAabb(ro, inv_dir, t_max, cmin, cmax))
                 continue;
             const uint t0i = h.tri_offset + c * uint(RT_SKEL_CHUNK_TRIS);
             const uint t1i = min(h.tri_offset + h.tri_count,
                                  t0i + uint(RT_SKEL_CHUNK_TRIS));
             for (uint t = t0i; t < t1i; ++t) {
                 float hu, hv;
-                if (rtRayTri(ro, L, RT_SHADOW_MAX_DIST,
+                if (rtRayTri(ro, rd, t_max,
                              rt_skel_pos[rt_skel_indices[t * 3u + 0u]].xyz,
                              rt_skel_pos[rt_skel_indices[t * 3u + 1u]].xyz,
                              rt_skel_pos[rt_skel_indices[t * 3u + 2u]].xyz,
@@ -426,6 +485,48 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
     return 1.0;
 }
 
+// Soft sun shadow: average RT_SOFT_SAMPLES_SW cone-jittered rays.  The
+// IGN pair is decorrelated per sample by golden-ratio-ish offsets so a
+// 2-sample pixel doesn't reuse the same disk point.
+float rtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
+    vec3 L  = normalize(-runtime_lights.lights[0].direction);
+    // Slope-scaled launch offset: at grazing sun angles a flat 3 cm
+    // normal bias leaves the origin inside its own surface's thickness,
+    // producing self-shadow acne (reads as noise / a shadow offset).
+    // Scale up to 4× as N·L falls off, plus a small step along the ray.
+    float slope = 1.0 - clamp(dot(world_normal, L), 0.0, 1.0);
+    vec3 ro = world_pos +
+              world_normal * (RT_SHADOW_BIAS * (1.0 + 3.0 * slope)) +
+              L * RT_SHADOW_BIAS;
+    float lit = 0.0;
+    for (int i = 0; i < RT_SOFT_SAMPLES_SW; ++i) {
+        vec2 xi = vec2(
+            csmIGN(screen_pixel + vec2(17.0 * float(i), 31.0 * float(i))),
+            csmIGN(screen_pixel.yx +
+                   vec2(47.0 + 13.0 * float(i), 5.0 + 7.0 * float(i))));
+        lit += rtShadowRayVisible(ro, rtSunConeDir(L, xi),
+                                  RT_SHADOW_MAX_DIST);
+    }
+    return lit / float(RT_SOFT_SAMPLES_SW);
+}
+
+// Software ray-traced AO: short cosine-hemisphere rays vs the same BVH
+// + skeleton casters.  Returns 1 = open, 0 = fully occluded.
+float rtAoFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
+    vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
+    float open = 0.0;
+    for (int i = 0; i < RT_AO_SAMPLES_SW; ++i) {
+        vec2 xi = vec2(
+            csmIGN(screen_pixel + vec2(23.0 * float(i) + 3.0,
+                                       29.0 * float(i) + 11.0)),
+            csmIGN(screen_pixel.yx + vec2(53.0 + 19.0 * float(i),
+                                          2.0 + 41.0 * float(i))));
+        open += rtShadowRayVisible(
+            ro, rtCosHemisphereDir(world_normal, xi), RT_AO_RADIUS);
+    }
+    return open / float(RT_AO_SAMPLES_SW);
+}
+
 #ifdef HW_RT_SHADOW
 // ─── Hardware ray-query sun shadow ───────────────────────────────────
 // Fixed-function traversal of the cluster TLAS.  Opaque geometry commits
@@ -433,15 +534,12 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal) {
 // alpha-masked candidates surface to the shader, where the base-colour
 // texel at the hit UV decides occlusion — identical policy to the
 // software path's masked handling.
-float hwRtShadowFactor(vec3 world_pos, vec3 world_normal) {
-    vec3 L  = normalize(-runtime_lights.lights[0].direction);
-    vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
-
+float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(
         rq, hw_rt_tlas,
         gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu,
-        ro, RT_SHADOW_BIAS, L, RT_SHADOW_MAX_DIST);
+        ro, RT_SHADOW_BIAS, rd, t_max);
 
     while (rayQueryProceedEXT(rq)) {
         // Only non-opaque (masked) triangle candidates reach here.
@@ -474,6 +572,45 @@ float hwRtShadowFactor(vec3 world_pos, vec3 world_normal) {
     }
     return (rayQueryGetIntersectionTypeEXT(rq, true) ==
             gl_RayQueryCommittedIntersectionNoneEXT) ? 1.0 : 0.0;
+}
+
+// Soft sun shadow: average RT_SOFT_SAMPLES_HW cone-jittered ray queries
+// (same cone + IGN scheme as the software path).
+float hwRtShadowFactor(vec3 world_pos, vec3 world_normal,
+                       vec2 screen_pixel) {
+    vec3 L  = normalize(-runtime_lights.lights[0].direction);
+    // Slope-scaled launch offset — see rtShadowFactor.
+    float slope = 1.0 - clamp(dot(world_normal, L), 0.0, 1.0);
+    vec3 ro = world_pos +
+              world_normal * (RT_SHADOW_BIAS * (1.0 + 3.0 * slope)) +
+              L * RT_SHADOW_BIAS;
+    float lit = 0.0;
+    for (int i = 0; i < RT_SOFT_SAMPLES_HW; ++i) {
+        vec2 xi = vec2(
+            csmIGN(screen_pixel + vec2(17.0 * float(i), 31.0 * float(i))),
+            csmIGN(screen_pixel.yx +
+                   vec2(47.0 + 13.0 * float(i), 5.0 + 7.0 * float(i))));
+        lit += hwRtShadowRayVisible(ro, rtSunConeDir(L, xi),
+                                    RT_SHADOW_MAX_DIST);
+    }
+    return lit / float(RT_SOFT_SAMPLES_HW);
+}
+
+// Hardware ray-traced AO: short cosine-hemisphere ray queries.
+float hwRtAoFactor(vec3 world_pos, vec3 world_normal,
+                   vec2 screen_pixel) {
+    vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
+    float open = 0.0;
+    for (int i = 0; i < RT_AO_SAMPLES_HW; ++i) {
+        vec2 xi = vec2(
+            csmIGN(screen_pixel + vec2(23.0 * float(i) + 3.0,
+                                       29.0 * float(i) + 11.0)),
+            csmIGN(screen_pixel.yx + vec2(53.0 + 19.0 * float(i),
+                                          2.0 + 41.0 * float(i))));
+        open += hwRtShadowRayVisible(
+            ro, rtCosHemisphereDir(world_normal, xi), RT_AO_RADIUS);
+    }
+    return open / float(RT_AO_SAMPLES_HW);
 }
 #endif
 
@@ -748,22 +885,23 @@ void main() {
     float shad = 1.0;
 #ifdef HW_RT_SHADOW
     if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
-        // Hardware ray query vs the cluster TLAS.  Same facing-away
-        // early-out as the software path.
+        // Hardware ray query vs the cluster TLAS (cone-jittered soft
+        // shadow).  Same facing-away early-out as the software path.
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
-                   : hwRtShadowFactor(world_pos, N_geom);
+                   : hwRtShadowFactor(world_pos, N_geom, vec2(px));
     } else
 #endif
     if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
-        // World-space software raytraced shadows (cluster BVH traversal).
+        // World-space software raytraced shadows (cluster BVH traversal,
+        // cone-jittered soft shadow).
         // Surfaces facing away from the sun are geometrically
         // self-shadowed — skip the (expensive) BVH walk entirely.
         // Kills the trace for roughly the back half of the scene's
         // pixels at zero visual cost (diffuse/spec are ~0 there anyway).
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
-                   : rtShadowFactor(world_pos, N_geom);
+                   : rtShadowFactor(world_pos, N_geom, vec2(px));
     } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
         // Software screen-space raytraced shadows — checked BEFORE the
         // disabled flag: the app sets SHADOW_DISABLED alongside SSRT to
@@ -779,15 +917,42 @@ void main() {
         shad = shadowFactor(world_pos, N_geom, vec2(px));
     }
 
+    // Ray-traced AO — replaces the screen-space SSAO post pass while an
+    // RT shadow mode is active (the app skips that pass and raises
+    // FEATURE_INPUT_RT_AO instead; every other mode keeps SSAO).
+    // Folded into the AMBIENT term only: direct sun light is already
+    // occlusion-tested per pixel by the shadow rays above, so darkening
+    // it again would double-occlude.
+    float rt_ao = 1.0;
+    if ((camera_info.input_features & FEATURE_INPUT_RT_AO) != 0u) {
+#ifdef HW_RT_SHADOW
+        if ((camera_info.input_features &
+             FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
+            rt_ao = hwRtAoFactor(world_pos, N_geom, vec2(px));
+        } else
+#endif
+        if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
+            rt_ao = rtAoFactor(world_pos, N_geom, vec2(px));
+        }
+    }
+
+    rt_ao = pow(clamp(rt_ao, 0.0, 1.0), RT_AO_POWER);
+
     // Lambertian diffuse + Blinn-Phong specular — bit-identical to
     // cluster_bindless.frag's forward path so visual parity holds.
-    vec3 ambient = getIBLRadianceLambertian(N, albedo) * ao;
+    vec3 ambient = getIBLRadianceLambertian(N, albedo) * (ao * rt_ao);
     vec3 diffuse = albedo * light_col * (NdotL * shad / M_PI);
     vec3  H        = normalize(L + V);
     float spec     = pow(max(dot(N, H), 0.0), 32.0) * shad;
     vec3  specular = light_col * (0.05 * spec / M_PI);
 
-    vec3 color = ambient + diffuse + specular + emissive;
+    // RT AO partially dims the direct terms too (RT_AO_DIRECT_FRACTION)
+    // for parity with the screen-space SSAO look, which multiplied the
+    // final colour.  rt_ao is 1.0 whenever RT AO is inactive.
+    vec3 color = ambient +
+                 (diffuse + specular) *
+                     mix(1.0, rt_ao, RT_AO_DIRECT_FRACTION) +
+                 emissive;
 
     // Render-debug overrides — same modes/codes as the forward path so
     // toggling deferred mode in the menu stays consistent for debugging.

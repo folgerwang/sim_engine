@@ -129,7 +129,6 @@ public:
         m_view_camera_->setDebugIsolateMaterial(material_idx);
     }
 
-
     virtual void destroy(
         const std::shared_ptr<renderer::Device>& device);
 

@@ -225,6 +225,13 @@
 // hwRtShadowReady() AND dispatches the HW pipeline variant; like the
 // other RT modes it raises SHADOW_DISABLED and skips the CSM pass.
 #define FEATURE_INPUT_HW_RT_SHADOW              0x00000040
+// Ray-traced ambient occlusion: short cosine-hemisphere rays traced by
+// deferred_resolve.comp with whichever RT backend is active (software
+// BVH under FEATURE_INPUT_RT_SHADOW, ray query under HW_RT_SHADOW).
+// The app raises this only while an RT shadow mode is on AND the AO
+// toggle is enabled; the screen-space SSAO post pass is skipped in that
+// case (RT AO replaces it — every other mode keeps SSAO).
+#define FEATURE_INPUT_RT_AO                     0x00000080
 
 // Debug render mode is packed into bits 16..23 of camera_info.input_features
 // (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack
