@@ -133,6 +133,31 @@ class Menu {
     // Save Scene persists the reference.
     bool bake_collision_map_requested_ = false;
 
+    // ── AI terrain generation (Tools > Generate Terrain) ──────────────
+    // Spawns tools/terrain/terrain_from_text.py detached (FLUX satellite-
+    // view heightmap + torch erosion conversion); polls for the output
+    // PNG / "<out>.err" — same contract as the FLUX image popup.
+    bool        terrain_gen_popup_open_  = false;
+    bool        terrain_apply_request_   = false; // "Rebuild Terrain Now"
+    char        terrain_prompt_buf_[512] = {};
+    bool        terrain_gen_install_     = true;
+    bool        terrain_gen_color_       = true;  // + color satellite map
+    int         terrain_gen_status_      = 0;  // 0 idle 1 run 2 done 3 fail
+    std::string terrain_gen_out_;
+    std::string terrain_gen_err_;
+    void drawTerrainGenPopup();
+
+    // ── Full-size image viewer (double-click an image tile) ───────────
+    // Loads the ORIGINAL image (thumbnails are downscaled cache files)
+    // into a single-slot texture; the previous texture is retired via
+    // retired_thumbs_ so in-flight frames never touch a freed view.
+    bool        image_viewer_open_ = false;
+    std::string image_viewer_path_;
+    std::shared_ptr<renderer::TextureInfo> image_viewer_info_;
+    ImTextureID image_viewer_id_ = ImTextureID(0);
+    void openImageViewer(const std::string& path);
+    void drawImageViewer();
+
     // Per-frame debug overlay data — see setPlayerDebugInfo().
     bool      has_player_debug_info_ = false;
     glm::vec3 player_world_pos_     = glm::vec3(0.0f);
@@ -1226,6 +1251,15 @@ public:
     bool consumeCreateLightRequest() {
         if (light_create_request_) {
             light_create_request_ = false;
+            return true;
+        }
+        return false;
+    }
+    // "Rebuild Terrain Now" (Generate Terrain popup): hot-reload
+    // assets/map.png and re-run the tile creator — no restart needed.
+    bool consumeTerrainApplyRequest() {
+        if (terrain_apply_request_) {
+            terrain_apply_request_ = false;
             return true;
         }
         return false;

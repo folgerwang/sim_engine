@@ -2515,6 +2515,12 @@ bool Menu::draw(
                 s_show_gpu_profiler = !s_show_gpu_profiler;
             }
 
+            // AI terrain: text → FLUX satellite heightmap → erosion model
+            // → 16-bit terrain map (optionally installed as assets/map.png).
+            if (ImGui::MenuItem("Generate Terrain (AI)...")) {
+                terrain_gen_popup_open_ = true;
+            }
+
             // ── FPS cap ───────────────────────────────────────────────
             // MAILBOX presents uncapped; capping frees GPU time slices
             // for ML jobs sharing the card (classifier / fine-tune /
@@ -3569,6 +3575,12 @@ bool Menu::draw(
         // the window actually stays closed next frame.
         s_show_gpu_profiler = gpu_profiler_->windowOpen();
     }
+
+    // ---- AI terrain generation popup (Tools > Generate Terrain) ------------
+    drawTerrainGenPopup();
+
+    // ---- Full-size image viewer (double-click an image tile) ---------------
+    drawImageViewer();
     // ------------------------------------------------------------------------
 
     // ---- Plugin windows ----------------------------------------------------
@@ -5553,6 +5565,87 @@ std::string Menu::ensureThumbnail(const std::string& src) {
     return thumb.string();
 }
 
+// ── Full-size image viewer ──────────────────────────────────────────────────
+void Menu::openImageViewer(const std::string& path) {
+    // Retire any previous full-size texture (same GPU-safety pattern as
+    // stale thumbnails: keep the shared_ptr alive until a safe drain).
+    if (image_viewer_info_) retired_thumbs_.push_back(image_viewer_info_);
+    image_viewer_info_.reset();
+    image_viewer_id_   = ImTextureID(0);
+    image_viewer_path_ = path;
+    image_viewer_open_ = true;
+}
+
+void Menu::drawImageViewer() {
+    if (!image_viewer_open_) {
+        // Window closed — release the texture (retired, GPU-safe).
+        if (image_viewer_info_) {
+            retired_thumbs_.push_back(image_viewer_info_);
+            image_viewer_info_.reset();
+            image_viewer_id_ = ImTextureID(0);
+            image_viewer_path_.clear();
+        }
+        return;
+    }
+
+    // Lazy full-res load.  Same guard as getThumbnail: never do main-thread
+    // GPU uploads while the async mesh loader is busy (queue/pool hazard);
+    // just retry on a later frame — the window shows "Loading..." meanwhile.
+    if (!image_viewer_id_ && !image_viewer_path_.empty() &&
+        !(mesh_load_task_manager_ &&
+          mesh_load_task_manager_->inFlightCount() > 0)) {
+        try {
+            image_viewer_info_ = std::make_shared<renderer::TextureInfo>();
+            engine::helper::createTextureImage(
+                device_, image_viewer_path_,
+                renderer::Format::R8G8B8A8_UNORM, true,
+                *image_viewer_info_, std::source_location::current());
+            if (image_viewer_info_->view) {
+                image_viewer_id_ = renderer::Helper::addImTextureID(
+                    sampler_, image_viewer_info_->view);
+            }
+        } catch (...) {
+            image_viewer_info_.reset();
+            EditorLog::get().push("[viewer] failed to load image: " +
+                                  image_viewer_path_);
+            image_viewer_open_ = false;
+            return;
+        }
+    }
+
+    const std::string title =
+        std::filesystem::path(image_viewer_path_).filename().string() +
+        "###image_viewer";
+    // Fit the window to the image, capped at ~85% of the main viewport;
+    // the image scales down uniformly to fit (never upscaled past 1:1).
+    const ImVec2 vp = ImGui::GetMainViewport()->WorkSize;
+    ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(
+        ImVec2(ImGui::GetMainViewport()->WorkPos.x + vp.x * 0.5f,
+               ImGui::GetMainViewport()->WorkPos.y + vp.y * 0.5f),
+        ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::Begin(title.c_str(), &image_viewer_open_,
+                     ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoDocking)) {
+        if (image_viewer_id_ && image_viewer_info_) {
+            const float iw = float(image_viewer_info_->size.x);
+            const float ih = float(image_viewer_info_->size.y);
+            const float max_w = vp.x * 0.85f;
+            const float max_h = vp.y * 0.85f;
+            float scale = 1.0f;
+            if (iw > max_w) scale = max_w / iw;
+            if (ih * scale > max_h) scale = max_h / ih;
+            ImGui::Image(image_viewer_id_,
+                         ImVec2(iw * scale, ih * scale));
+            ImGui::TextDisabled("%.0f x %.0f%s", iw, ih,
+                                scale < 1.0f ? "  (fit to screen)" : "");
+        } else {
+            ImGui::TextDisabled("Loading...");
+        }
+    }
+    ImGui::End();
+}
+
 ImTextureID Menu::getThumbnail(const std::string& src) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -5793,6 +5886,141 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     EditorLog::get().push("[flux] launching generation -> " + gen_out_path_);
     std::system(cmd.c_str());
     gen_status_ = 1;   // running
+}
+
+// ── AI terrain generation popup (Tools > Generate Terrain) ──────────────────
+// Text → FLUX satellite-view heightmap → torch erosion conversion → 16-bit
+// terrain PNG, optionally installed as assets/map.png.  Detached python
+// process (same launch/poll contract as the FLUX image popup: output PNG =
+// success, "<out>.err" = failure).
+void Menu::drawTerrainGenPopup() {
+    namespace fs = std::filesystem;
+
+    // Poll a running generation.
+    if (terrain_gen_status_ == 1) {
+        std::error_code ec;
+        if (fs::exists(terrain_gen_out_, ec)) {
+            terrain_gen_status_ = 2;
+            EditorLog::get().push(
+                "[terrain] heightmap ready: " + terrain_gen_out_ +
+                (terrain_gen_install_
+                     ? "  (installed as assets/map.png — restart the "
+                       "engine to apply)"
+                     : ""));
+        } else if (fs::exists(terrain_gen_out_ + ".err", ec)) {
+            terrain_gen_status_ = 3;
+            std::ifstream ef(terrain_gen_out_ + ".err", std::ios::binary);
+            terrain_gen_err_.assign(std::istreambuf_iterator<char>(ef),
+                                    std::istreambuf_iterator<char>());
+            EditorLog::get().push("[terrain] generation FAILED: " +
+                                  terrain_gen_err_);
+        }
+    }
+
+    if (!terrain_gen_popup_open_) return;
+    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Generate Terrain (AI)", &terrain_gen_popup_open_,
+                     ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Describe the terrain.  FLUX renders a satellite-view "
+            "heightmap; a GPU erosion model converts it into a terrain "
+            "heightfield (2048x2048, 16-bit).");
+        ImGui::InputTextMultiline("##terrain_prompt", terrain_prompt_buf_,
+                                  sizeof(terrain_prompt_buf_),
+                                  ImVec2(-1.0f, 64.0f));
+        ImGui::Checkbox("Install as active terrain (assets/map.png)",
+                        &terrain_gen_install_);
+        // Second FLUX pass conditioned on the finished heightfield —
+        // produces <name>_color.png with matching layout (rock/snow on
+        // peaks, vegetation in valleys, water in channels).
+        ImGui::Checkbox("Also generate color satellite map",
+                        &terrain_gen_color_);
+
+        const bool busy = (terrain_gen_status_ == 1);
+        if (busy) ImGui::BeginDisabled();
+        if (ImGui::Button("Generate", ImVec2(120, 0))) {
+            const std::string p(terrain_prompt_buf_);
+            if (!p.empty()) {
+                std::error_code ec;
+                fs::create_directories("content/terrain/.terrain_tmp", ec);
+                const std::string base =
+                    "terrain_" +
+                    std::to_string((long long)std::time(nullptr));
+                terrain_gen_out_ =
+                    (fs::path("content/terrain") / (base + ".png")).string();
+                const std::string pfile =
+                    (fs::path("content/terrain/.terrain_tmp") /
+                     (base + ".prompt.txt")).string();
+                { std::ofstream pf(pfile, std::ios::binary); pf << p; }
+                terrain_gen_err_.clear();
+#ifdef _WIN32
+                const std::string cmd =
+                    "cmd /c start \"terrain\" /B python "
+                    "\"tools\\terrain\\terrain_from_text.py\""
+                    " --prompt-file \"" + pfile + "\""
+                    " --out \"" + terrain_gen_out_ + "\"" +
+                    (terrain_gen_install_ ? " --install" : "") +
+                    (terrain_gen_color_   ? " --color"   : "");
+#else
+                const std::string cmd =
+                    "python3 \"tools/terrain/terrain_from_text.py\""
+                    " --prompt-file \"" + pfile + "\""
+                    " --out \"" + terrain_gen_out_ + "\"" +
+                    (terrain_gen_install_ ? " --install" : "") +
+                    (terrain_gen_color_   ? " --color"   : "") + " &";
+#endif
+                EditorLog::get().push(
+                    "[terrain] launching generation -> " + terrain_gen_out_);
+                std::system(cmd.c_str());
+                terrain_gen_status_ = 1;
+            }
+        }
+        if (busy) ImGui::EndDisabled();
+
+        if (terrain_gen_status_ != 1) ImGui::SameLine();
+        if (terrain_gen_status_ == 1) {
+            // Progress: the script overwrites "<out>.progress" with
+            // "<frac> <stage label>" (diffusion steps included — it parses
+            // FLUX's tqdm output).  Poll it here; missing file = starting.
+            // Full-width bar on its OWN row under the (disabled) button.
+            float       frac  = 0.01f;
+            std::string label = "starting python...";
+            {
+                std::ifstream pf(terrain_gen_out_ + ".progress",
+                                 std::ios::binary);
+                if (pf) {
+                    pf >> frac;
+                    std::getline(pf, label);
+                    if (!label.empty() && label[0] == ' ')
+                        label.erase(0, 1);
+                }
+            }
+            char overlay[192];
+            std::snprintf(overlay, sizeof(overlay), "%s  %.0f%%",
+                          label.c_str(), frac * 100.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                                  ImVec4(1.0f, 0.78f, 0.31f, 1.0f));
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
+            ImGui::PopStyleColor();
+        } else if (terrain_gen_status_ == 2) {
+            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f), "Done.");
+            if (terrain_gen_install_) {
+                ImGui::SameLine();
+                // Hot reload: the app re-reads assets/map.png and re-runs
+                // the tile creator compute — new terrain, no restart.
+                if (ImGui::Button("Rebuild Terrain Now")) {
+                    terrain_apply_request_ = true;
+                }
+            }
+        } else if (terrain_gen_status_ == 3) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                               "Failed — see Editor Log.");
+        }
+        // The generated PNG lands in content/terrain/, so it also shows
+        // up in the Content Browser for preview / reuse as a ref image.
+    }
+    ImGui::End();
 }
 
 // ── Shared directory-browser body ───────────────────────────────────────────
@@ -6112,6 +6340,11 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // so a stray double-click can't dump unsaved edits.
                 if (tile_dbl && is_scene) {
                     content_scene_open_request_ = e.path().string();
+                }
+                // Double-click an image → full-size viewer (the tile only
+                // shows the downscaled thumbnail).
+                if (tile_dbl && is_img) {
+                    openImageViewer(e.path().string());
                 }
 
                 // Drag a placeable tile into the 3D viewport to add it to
