@@ -64,6 +64,22 @@ public:
         float cur_time,
         bool depth_only = false);
 
+    // Draws the visible tile meshes INTO a caller-supplied color/depth
+    // target (LOAD, not CLEAR) — used by the main frame loop to render
+    // the terrain on top of object_scene_view_'s forward pass output,
+    // sharing its depth buffer so terrain and scene objects occlude each
+    // other correctly.  (draw() above renders into this view's OWN
+    // buffers, which nothing composites — see application.cpp.)
+    void drawTilesInto(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const std::shared_ptr<renderer::ImageView>& color_view,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& buffer_size,
+        const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
+        int dbuf_idx,
+        float delta_t,
+        float cur_time);
+
     // Re-allocate descriptor sets from the new pool and resize buffers.
     void recreate(
         const renderer::PipelineRenderbufferFormats& renderbuffer_formats,

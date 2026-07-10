@@ -335,6 +335,93 @@ void TerrainSceneView::draw(
     }
 }
 
+void TerrainSceneView::drawTilesInto(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const std::shared_ptr<renderer::ImageView>& color_view,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& buffer_size,
+    const std::shared_ptr<renderer::DescriptorSet>& prt_desc_set,
+    int dbuf_idx,
+    float delta_t,
+    float cur_time) {
+
+    if (!m_b_render_terrain_ || m_visible_tiles_.empty()) return;
+
+    const renderer::DescriptorSetList& tile_desc_set_list =
+        { prt_desc_set,
+          m_camera_object_->getViewCameraDescriptorSet(),
+          m_tile_res_desc_sets_[dbuf_idx] };
+
+    {
+        // LOAD everything: the forward pass already filled these targets;
+        // the tiles depth-test against the scene's own depth buffer.
+        er::RenderingAttachmentInfo attachment_info;
+        attachment_info.image_view = color_view;
+        attachment_info.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        attachment_info.store_op = er::AttachmentStoreOp::STORE;
+
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = depth_view;
+        depth_attachment_info.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { buffer_size.x, buffer_size.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = { attachment_info };
+        renderingInfo.depth_attachments = { depth_attachment_info };
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(buffer_size.x);
+    viewports[0].height = float(buffer_size.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = buffer_size;
+    cmd_buf->setViewports(viewports, 0, 1);
+    cmd_buf->setScissors(scissors, 0, 1);
+
+    for (auto& tile : m_visible_tiles_) {
+        tile->draw(
+            cmd_buf,
+            m_tile_pipeline_layout_,
+            m_tile_pipeline_,
+            tile_desc_set_list,
+            buffer_size,
+            delta_t,
+            cur_time);
+
+        if (m_b_render_grass_) {
+            tile->drawGrass(
+                cmd_buf,
+                m_tile_grass_pipeline_layout_,
+                m_tile_grass_pipeline_,
+                tile_desc_set_list,
+                m_camera_object_->getCameraPosition(),
+                buffer_size,
+                delta_t,
+                cur_time);
+        }
+    }
+
+    // NOTE: the water pass is not drawn here — it refracts through a copy
+    // of THIS view's color/depth (duplicateColorAndDepthBuffer), which
+    // doesn't exist for an external target.  Wire it up when needed.
+
+    cmd_buf->endDynamicRendering();
+}
+
 void TerrainSceneView::recreate(
     const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const glm::uvec2& new_buffer_size) {

@@ -1899,9 +1899,12 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescript
         SRC_COLOR_TEX_INDEX);
     bindings[1] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_DEPTH_TEX_INDEX);
+    // FRAGMENT: tile.frag samples the rock layer to derive the shading
+    // normal from the ACTUAL heightfield (see the normal fix there).
     bindings[2] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ROCK_LAYER_BUFFER_INDEX,
-        SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, MESH_BIT_EXT, COMPUTE_BIT));
+        SET_4_FLAG_BITS(ShaderStage, VERTEX_BIT, MESH_BIT_EXT, COMPUTE_BIT,
+                        FRAGMENT_BIT));
     bindings[3] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SOIL_WATER_LAYER_BUFFER_INDEX,
         SET_3_FLAG_BITS(ShaderStage, VERTEX_BIT, MESH_BIT_EXT, COMPUTE_BIT));
@@ -2990,6 +2993,11 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
 void TileObject::destroyAllTiles(
     const std::shared_ptr<renderer::Device>& device) {
     for (auto& tile_mesh : s_tile_meshes_) {
+        // Return the cache slot: terrain hot-reload (createTerrainFromMaps)
+        // destroys all tiles and expects updateAllTiles() to re-allocate
+        // them next frame — without this the free list stays empty and no
+        // tile (mesh) is ever created again.  Harmless at shutdown.
+        s_available_block_indexes_.push_back(tile_mesh.second->block_idx_);
         tile_mesh.second->destroy(device);
     }
     s_tile_meshes_.clear();

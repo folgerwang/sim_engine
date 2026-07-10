@@ -25,6 +25,7 @@ vec3  kSunDir = vec3(-0.624695f, 0.468521f, -0.624695f);
 
 layout(set = TILE_PARAMS_SET, binding = SRC_COLOR_TEX_INDEX) uniform sampler2D src_tex;
 layout(set = TILE_PARAMS_SET, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D src_depth;
+layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SRC_MAP_MASK_INDEX) uniform sampler2D src_map_mask;
 layout(set = TILE_PARAMS_SET, binding = SRC_TEMP_TEX_INDEX) uniform sampler3D src_temp;
 layout(set = TILE_PARAMS_SET, binding = DETAIL_NOISE_TEXTURE_INDEX) uniform sampler3D src_detail_noise_tex;
@@ -32,8 +33,23 @@ layout(set = TILE_PARAMS_SET, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampl
 
 void main() {
     vec3 pos = in_data.vertex_position;
-    vec3 tnor = terrainNormal(vec2(pos.x, pos.z), 0.0625f, 100.0f);
-    // bump map
+    // Shading normal from the ACTUAL heightfield (rock layer) instead of
+    // the analytic FBM terrainNormal(), which bears no relation to the
+    // installed heightmap — that mismatch made slope/ridge transitions
+    // shade harshly.  Central differences over one rock-layer texel; the
+    // same texture the vertex shader displaces with, so shading matches
+    // geometry exactly and is smooth across tile borders.
+    vec2 rock_texel_uv = 1.0f / vec2(textureSize(rock_layer, 0));
+    vec2 texel_ws = rock_texel_uv / tile_params.inv_world_range;   // meters
+    vec2 huv = in_data.world_map_uv;
+    float h_xn = texture(rock_layer, huv - vec2(rock_texel_uv.x, 0.0f)).x;
+    float h_xp = texture(rock_layer, huv + vec2(rock_texel_uv.x, 0.0f)).x;
+    float h_zn = texture(rock_layer, huv - vec2(0.0f, rock_texel_uv.y)).x;
+    float h_zp = texture(rock_layer, huv + vec2(0.0f, rock_texel_uv.y)).x;
+    vec3 tnor = normalize(vec3((h_xn - h_xp) / (2.0f * texel_ws.x),
+                               1.0f,
+                               (h_zn - h_zp) / (2.0f * texel_ws.y)));
+    // bump map (small-scale detail on steeper areas, unchanged)
     vec4 tt = fbmd_8(pos * 0.3f * vec3(1.0f, 0.2f, 1.0f));
     vec3 normal = normalize(tnor + 0.8f*(1.0f - abs(tnor.y))*0.8f*vec3(tt.y, tt.z, tt.w));
 

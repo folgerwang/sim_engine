@@ -138,13 +138,21 @@ class Menu {
     // view heightmap + torch erosion conversion); polls for the output
     // PNG / "<out>.err" — same contract as the FLUX image popup.
     bool        terrain_gen_popup_open_  = false;
-    bool        terrain_apply_request_   = false; // "Rebuild Terrain Now"
+    bool        terrain_apply_request_   = false; // auto + "Rebuild Terrain Now"
     char        terrain_prompt_buf_[512] = {};
     bool        terrain_gen_install_     = true;
     bool        terrain_gen_color_       = true;  // + color satellite map
+    // Peak height as a fraction of the engine's 2000 m full range
+    // (python --height-scale).  0.25 => ~500 m peaks.
+    float       terrain_gen_height_scale_ = 0.25f;
     int         terrain_gen_status_      = 0;  // 0 idle 1 run 2 done 3 fail
     std::string terrain_gen_out_;
     std::string terrain_gen_err_;
+    // Texture-map pair the apply request carries: the generated heightmap
+    // and (if --color) the matching albedo/satellite map.  Consumed by the
+    // app's createTerrainFromMaps().
+    std::string terrain_apply_height_;
+    std::string terrain_apply_albedo_;
     void drawTerrainGenPopup();
 
     // ── Full-size image viewer (double-click an image tile) ───────────
@@ -1265,11 +1273,16 @@ public:
         }
         return false;
     }
-    // "Rebuild Terrain Now" (Generate Terrain popup): hot-reload
-    // assets/map.png and re-run the tile creator — no restart needed.
-    bool consumeTerrainApplyRequest() {
+    // Terrain apply (Generate Terrain popup): fired automatically when
+    // the pipeline finishes writing the heightmap + albedo pair, and by
+    // the manual "Rebuild Terrain Now" button.  Hands the app the two
+    // texture-map paths for createTerrainFromMaps() — no restart needed.
+    bool consumeTerrainApplyRequest(std::string& height_png,
+                                    std::string& albedo_png) {
         if (terrain_apply_request_) {
             terrain_apply_request_ = false;
+            height_png = terrain_apply_height_;
+            albedo_png = terrain_apply_albedo_;
             return true;
         }
         return false;

@@ -5653,9 +5653,13 @@ ImTextureID Menu::getThumbnail(const std::string& src) {
 
     auto it = thumb_cache_.find(src);
     if (it != thumb_cache_.end()) {
-        // Reuse the cached texture unless the source changed since we built it.
-        if (it->second.failed) return 0;
-        if (ec || src_time == it->second.src_time) return it->second.id;
+        // Reuse the cached entry unless the source changed since we built
+        // it.  This applies to FAILED entries too: the browser can catch a
+        // freshly generated file mid-write (stbi fails on the partial
+        // PNG) — the failure is retried once the source's mtime moves,
+        // instead of hiding the thumbnail forever.
+        if (ec || src_time == it->second.src_time)
+            return it->second.failed ? 0 : it->second.id;
         // Source is newer — retire the stale GPU texture (kept alive so ImGui
         // never touches a freed descriptor) and rebuild below.
         if (it->second.info) retired_thumbs_.push_back(it->second.info);
@@ -5896,17 +5900,36 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
 void Menu::drawTerrainGenPopup() {
     namespace fs = std::filesystem;
 
-    // Poll a running generation.
+    // Poll a running generation.  Completion = "<out>.done" sentinel, NOT
+    // the output PNG: the python writes the sentinel after every artifact
+    // is fully flushed, so the auto-apply below never reads a PNG that is
+    // still being written (stbi would fail -> engine runtime_error).
     if (terrain_gen_status_ == 1) {
         std::error_code ec;
-        if (fs::exists(terrain_gen_out_, ec)) {
+        if (fs::exists(terrain_gen_out_ + ".done", ec)) {
+            fs::remove(terrain_gen_out_ + ".done", ec);
             terrain_gen_status_ = 2;
+            // Both texture maps are on disk — create the terrain from
+            // them now: the app consumes this request, reloads the maps,
+            // and regenerates the tile meshes.  No button, no restart.
+            terrain_apply_height_ = terrain_gen_out_;
+            terrain_apply_albedo_.clear();
+            if (terrain_gen_color_) {
+                const std::string color_png =
+                    (fs::path(terrain_gen_out_).parent_path() /
+                     (fs::path(terrain_gen_out_).stem().string() +
+                      "_color.png")).string();
+                if (fs::exists(color_png, ec))
+                    terrain_apply_albedo_ = color_png;
+            }
+            terrain_apply_request_ = true;
             EditorLog::get().push(
                 "[terrain] heightmap ready: " + terrain_gen_out_ +
+                (terrain_apply_albedo_.empty()
+                     ? "" : "  (+ color map)") +
+                "  — creating terrain" +
                 (terrain_gen_install_
-                     ? "  (installed as assets/map.png — restart the "
-                       "engine to apply)"
-                     : ""));
+                     ? " (also installed as assets/map.png)" : ""));
         } else if (fs::exists(terrain_gen_out_ + ".err", ec)) {
             terrain_gen_status_ = 3;
             std::ifstream ef(terrain_gen_out_ + ".err", std::ios::binary);
@@ -5944,6 +5967,13 @@ void Menu::drawTerrainGenPopup() {
         // peaks, vegetation in valleys, water in channels).
         ImGui::Checkbox("Also generate color satellite map",
                         &terrain_gen_color_);
+        // Peak height: the tile creator maps white to 2000 m, far too
+        // dramatic for a full-range normalized AI map — scale it down in
+        // the python (--height-scale) before the 16-bit write.
+        ImGui::SliderFloat("Peak height (m)",
+                           &terrain_gen_height_scale_,
+                           0.05f, 1.0f,
+                           "%.2f x 2000");
 
         const bool busy = (terrain_gen_status_ == 1);
         if (busy) ImGui::BeginDisabled();
@@ -5962,19 +5992,23 @@ void Menu::drawTerrainGenPopup() {
                      (base + ".prompt.txt")).string();
                 { std::ofstream pf(pfile, std::ios::binary); pf << p; }
                 terrain_gen_err_.clear();
+                char hs_arg[48];
+                std::snprintf(hs_arg, sizeof(hs_arg),
+                              " --height-scale %.3f",
+                              terrain_gen_height_scale_);
 #ifdef _WIN32
                 const std::string cmd =
                     "cmd /c start \"terrain\" /B python "
                     "\"tools\\terrain\\terrain_from_text.py\""
                     " --prompt-file \"" + pfile + "\""
-                    " --out \"" + terrain_gen_out_ + "\"" +
+                    " --out \"" + terrain_gen_out_ + "\"" + hs_arg +
                     (terrain_gen_install_ ? " --install" : "") +
                     (terrain_gen_color_   ? " --color"   : "");
 #else
                 const std::string cmd =
                     "python3 \"tools/terrain/terrain_from_text.py\""
                     " --prompt-file \"" + pfile + "\""
-                    " --out \"" + terrain_gen_out_ + "\"" +
+                    " --out \"" + terrain_gen_out_ + "\"" + hs_arg +
                     (terrain_gen_install_ ? " --install" : "") +
                     (terrain_gen_color_   ? " --color"   : "") + " &";
 #endif
@@ -6012,14 +6046,13 @@ void Menu::drawTerrainGenPopup() {
             ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
             ImGui::PopStyleColor();
         } else if (terrain_gen_status_ == 2) {
-            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f), "Done.");
-            if (terrain_gen_install_) {
-                ImGui::SameLine();
-                // Hot reload: the app re-reads assets/map.png and re-runs
-                // the tile creator compute — new terrain, no restart.
-                if (ImGui::Button("Rebuild Terrain Now")) {
-                    terrain_apply_request_ = true;
-                }
+            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f),
+                               "Done — terrain created.");
+            ImGui::SameLine();
+            // Manual re-apply of the last generated maps (the terrain is
+            // already created automatically on completion).
+            if (ImGui::Button("Rebuild Terrain Now")) {
+                terrain_apply_request_ = true;   // paths still set above
             }
         } else if (terrain_gen_status_ == 3) {
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
