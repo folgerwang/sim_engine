@@ -5926,9 +5926,17 @@ void Menu::drawTerrainGenPopup() {
             "Describe the terrain.  FLUX renders a satellite-view "
             "heightmap; a GPU erosion model converts it into a terrain "
             "heightfield (2048x2048, 16-bit).");
+        // Soft-wrap to the box width (same callback the image-gen prompt
+        // uses) so long prompts wrap instead of scrolling off the right edge.
+        const float tp_box_w = ImGui::GetContentRegionAvail().x;
+        GenWrapUD tp_ud;
+        tp_ud.wrap_w = tp_box_w - ImGui::GetStyle().FramePadding.x * 2.0f
+                                - ImGui::GetStyle().ScrollbarSize - 4.0f;
         ImGui::InputTextMultiline("##terrain_prompt", terrain_prompt_buf_,
                                   sizeof(terrain_prompt_buf_),
-                                  ImVec2(-1.0f, 64.0f));
+                                  ImVec2(tp_box_w, 64.0f),
+                                  ImGuiInputTextFlags_CallbackAlways,
+                                  &GenPromptWrapCallback, &tp_ud);
         ImGui::Checkbox("Install as active terrain (assets/map.png)",
                         &terrain_gen_install_);
         // Second FLUX pass conditioned on the finished heightfield —
@@ -6187,6 +6195,13 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             if (subs.empty())
                 ImGui::TextDisabled("(no sub-objects — single-mesh asset)");
         } else if (fs::exists(cur_dir, ec) && fs::is_directory(cur_dir, ec)) {
+            // Multi-selection resets when the browsed folder changes, so stale
+            // paths from another directory can't linger as highlights.
+            if (is_content && content_browser_last_dir_ != cur_dir) {
+                content_selected_.clear();
+                content_sel_anchor_.clear();
+                content_browser_last_dir_ = cur_dir;
+            }
             std::vector<fs::directory_entry> items;   // dirs first, then files
             std::vector<fs::directory_entry> dirs, files;
             for (auto& e : fs::directory_iterator(cur_dir, ec)) {
@@ -6406,57 +6421,124 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     }
                 }
 
+                // Multi-selection highlight (blue border), on top of the amber
+                // preview highlight above.
+                if (is_content && content_selected_.count(item_path)) {
+                    const ImVec2 sra = ImGui::GetItemRectMin();
+                    const ImVec2 srb = ImGui::GetItemRectMax();
+                    ImGui::GetWindowDrawList()->AddRect(
+                        ImVec2(sra.x - 2.0f, sra.y - 2.0f),
+                        ImVec2(srb.x + 2.0f, srb.y + 2.0f),
+                        IM_COL32(90, 160, 255, 255), 4.0f, 0, 2.5f);
+                }
+
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name.c_str());
+                // Right-clicking a tile NOT in the current selection replaces
+                // the selection with just that tile, so the menu acts sensibly.
+                if (is_content &&
+                    ImGui::IsItemClicked(ImGuiMouseButton_Right) &&
+                    !content_selected_.count(item_path)) {
+                    content_selected_.clear();
+                    content_selected_.insert(item_path);
+                    content_sel_anchor_ = item_path;
+                }
                 // Right-click a tile → context actions.
                 if (ImGui::BeginPopupContextItem("##cbctx")) {
-                    // Debug enable/disable: greys the tile out (browser only).
+                    std::vector<std::string> sel_set;
+                    if (is_content && content_selected_.count(item_path))
+                        sel_set.assign(content_selected_.begin(),
+                                       content_selected_.end());
+                    else
+                        sel_set.push_back(item_path);
+                    const int  sel_n = (int)sel_set.size();
+                    const bool multi = sel_n > 1;
+
                     if (ImGui::MenuItem("Enabled", nullptr, !tile_disabled)) {
-                        // Persist as a "<path>.disabled" sidecar so the
-                        // loaders skip the item across sessions (the
-                        // .rwchar loader drops disabled sub-meshes from
-                        // forward, CSM and both RT shadow paths).
+                        const bool enable = tile_disabled;
                         std::error_code mec;
-                        if (tile_disabled) {
-                            content_disabled_.erase(item_path);
-                            fs::remove(fs::path(item_path + ".disabled"),
-                                       mec);
-                        } else {
-                            content_disabled_.insert(item_path);
-                            std::ofstream(item_path + ".disabled") << "1\n";
+                        for (const auto& sp : sel_set) {
+                            if (enable) {
+                                content_disabled_.erase(sp);
+                                fs::remove(fs::path(sp + ".disabled"), mec);
+                            } else {
+                                content_disabled_.insert(sp);
+                                std::ofstream(sp + ".disabled") << "1\n";
+                            }
                         }
-                        // Force the Debug Display to rebuild (it dedups by key)
-                        // so a group preview drops/re-adds this object now.
                         dbg_asset_key_.clear();
                         EditorLog::get().push(
                             std::string("[content] ") +
-                            (tile_disabled ? "enabled '" : "disabled '") +
-                            item_path + "' — already-loaded characters "
-                            "need an app restart to pick this up.");
+                            (enable ? "enabled " : "disabled ") +
+                            std::to_string(sel_n) + " item(s) — already-loaded "
+                            "characters need an app restart to pick this up.");
                     }
                     ImGui::Separator();
                     if (is_content &&
                         (is_model || is_object || is_group_dir) &&
-                        ImGui::MenuItem("Add to Scene")) {
-                        place_asset_request_ = e.path().string();
+                        ImGui::MenuItem(multi
+                            ? (std::string("Add to Scene (") +
+                               std::to_string(sel_n) + ")").c_str()
+                            : "Add to Scene")) {
+                        for (const auto& sp : sel_set) {
+                            std::string se = fs::path(sp).extension().string();
+                            for (auto& c : se)
+                                c = (char)std::tolower((unsigned char)c);
+                            const bool placeable =
+                                se == ".gltf" || se == ".glb" ||
+                                se == ".obj"  || se == ".fbx" ||
+                                se == ".rwobj" ||
+                                (fs::is_directory(sp, ec) &&
+                                 fs::exists(fs::path(sp) / "import.rwmeta", ec));
+                            if (placeable) place_asset_queue_.push_back(sp);
+                        }
                     }
-                            // Background music is set by dragging a clip onto a BGM
-                    // scene object (right-click viewport → Add BGM Object).
                     if (ImGui::MenuItem("Rename")) {
                         rename_target_ = e.path().string();
                         std::snprintf(rename_buf_, sizeof(rename_buf_), "%s",
                                       name.c_str());
                         rename_open_ = true;
                     }
-                    // Remove from the project (Content Browser only) —
-                    // confirmed via the modal below since it's destructive.
-                    if (is_content && ImGui::MenuItem("Delete")) {
-                        delete_target_ = e.path().string();
-                        delete_is_dir_ = is_dir;
-                        delete_open_   = true;
+                    if (is_content && ImGui::MenuItem(multi
+                            ? (std::string("Delete (") +
+                               std::to_string(sel_n) + ")").c_str()
+                            : "Delete")) {
+                        delete_paths_.assign(sel_set.begin(), sel_set.end());
+                        delete_open_ = true;
                     }
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();
+
+                // ── Multi-selection click (Ctrl / Shift / plain) ───────────
+                ImGuiIO& io_sel = ImGui::GetIO();
+                const bool mod_ctrl  = is_content && io_sel.KeyCtrl;
+                const bool mod_shift = is_content && io_sel.KeyShift;
+                if (clicked && is_content && mod_ctrl) {
+                    if (content_selected_.count(item_path))
+                        content_selected_.erase(item_path);
+                    else
+                        content_selected_.insert(item_path);
+                    content_sel_anchor_ = item_path;
+                } else if (clicked && is_content && mod_shift) {
+                    int ai = -1, ci = -1;
+                    for (int k = 0; k < (int)items.size(); ++k) {
+                        const std::string sp = items[k].path().string();
+                        if (sp == content_sel_anchor_) ai = k;
+                        if (sp == item_path)           ci = k;
+                    }
+                    if (ci >= 0) {
+                        if (ai < 0) ai = ci;
+                        content_selected_.clear();
+                        const int lo = std::min(ai, ci), hi = std::max(ai, ci);
+                        for (int k = lo; k <= hi; ++k)
+                            content_selected_.insert(items[k].path().string());
+                    }
+                } else if (clicked && is_content) {
+                    content_selected_.clear();
+                    content_selected_.insert(item_path);
+                    content_sel_anchor_ = item_path;
+                }
+                const bool plain_click = clicked && !mod_ctrl && !mod_shift;
 
                 // Folders open on click.  Content-Browser model assets are
                 // Explorer-style: a click previews the asset in the Debug
@@ -6464,7 +6546,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // of its sub-objects.  .rwobj object assets preview their
                 // single sub-object on click / double-click.  "Add to
                 // Scene" lives in the tile's right-click menu.
-                if (clicked && is_dir) {
+                if (plain_click && is_dir) {
                     if (is_group_dir && is_content) {
                         // Group folder, Explorer-style: a single CLICK previews
                         // the assembled collection in the Debug Display; a
@@ -6473,14 +6555,14 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     } else {
                         cur_dir = e.path().string();   // plain folder: enter
                     }
-                } else if (clicked && is_content && is_model) {
+                } else if (plain_click && is_content && is_model) {
                     buildAssetPreview(e.path().string(), -1, name);
-                } else if (clicked && is_content && is_object) {
+                } else if (plain_click && is_content && is_object) {
                     // Prefers the baked .rwgeo/.rwtex render-ready data.
                     buildRwObjPreview(e.path().string(), name);
-                } else if (clicked && is_content && is_geo) {
+                } else if (plain_click && is_content && is_geo) {
                     buildRwGeoPreview(e.path().string(), name);
-                } else if (clicked && is_audio) {
+                } else if (plain_click && is_audio) {
                     // Toggle preview: clicking the playing clip stops it;
                     // clicking another clip switches to it.
                     const std::string p = e.path().string();
@@ -6514,6 +6596,15 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             ImGui::TextDisabled("(folder not found: %s)", cur_dir.c_str());
         }
 
+        // Left-click empty grid space clears the multi-selection (Content
+        // Browser only; not while Ctrl/Shift are held for additive picking).
+        if (is_content && ImGui::IsWindowHovered() &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !ImGui::IsAnyItemHovered() &&
+            !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift) {
+            content_selected_.clear();
+            content_sel_anchor_.clear();
+        }
         // Right-click the grid background (not a tile) → context menu.
         // Content Browser: Import / New Folder live here (no toolbar).
         // Both browsers: FLUX image generation into the current folder.
@@ -6631,9 +6722,22 @@ void Menu::drawBrowserBody(const std::string& tree_root,
         if (delete_open_) { ImGui::OpenPopup("Delete##cb"); delete_open_ = false; }
         if (ImGui::BeginPopupModal("Delete##cb", nullptr,
                                    ImGuiWindowFlags_AlwaysAutoResize)) {
-            const fs::path tgt(delete_target_);
-            ImGui::Text("Delete '%s'?", tgt.filename().string().c_str());
-            if (delete_is_dir_) {
+            std::vector<std::string> del_list = delete_paths_;
+            if (del_list.empty() && !delete_target_.empty())
+                del_list.push_back(delete_target_);
+            const fs::path tgt(del_list.empty() ? std::string() : del_list[0]);
+            if (del_list.size() > 1)
+                ImGui::Text("Delete %d selected items?", (int)del_list.size());
+            else
+                ImGui::Text("Delete '%s'?", tgt.filename().string().c_str());
+            if (del_list.size() > 1) {
+                ImGui::TextDisabled("Folders remove everything inside; models "
+                                    "also drop rwmeta / exploded / thumbnail.");
+                ImGui::BeginChild("##dl", ImVec2(360,120), true);
+                for (const auto& dp : del_list)
+                    ImGui::BulletText("%s", fs::path(dp).filename().string().c_str());
+                ImGui::EndChild();
+            } else if (delete_is_dir_) {
                 ImGui::TextDisabled(
                     "The folder and EVERYTHING inside it will be removed.");
             } else {
@@ -6660,41 +6764,43 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             ImGui::SameLine();
             const bool del_cancel = ImGui::Button("Cancel", ImVec2(120, 0));
 
-            if (del_ok && !delete_target_.empty()) {
-                std::error_code dec;
-                if (delete_is_dir_) {
-                    fs::remove_all(tgt, dec);
-                } else {
-                    fs::remove(tgt, dec);
-                    // Import artifacts that travel with a model file.
-                    std::error_code dec2;
-                    fs::remove(fs::path(delete_target_ + ".rwmeta"), dec2);
-                    const fs::path exploded = tgt.parent_path() / tgt.stem();
-                    if (fs::is_directory(exploded, dec2))
-                        fs::remove_all(exploded, dec2);
-                    const fs::path thumb = tgt.parent_path() / ".thumbnails" /
-                        (tgt.filename().string() + ".png");
-                    fs::remove(thumb, dec2);
-                }
-                if (dec) {
-                    EditorLog::get().push("[delete] failed: " + dec.message());
-                } else {
-                    EditorLog::get().push("[delete] removed '" +
-                        tgt.filename().string() + "'");
-                }
-                // Drop stale caches for the removed path.
-                asset_children_cache_.erase(delete_target_);
-                auto itc = thumb_cache_.find(delete_target_);
-                if (itc != thumb_cache_.end()) {
-                    if (itc->second.info)
-                        retired_thumbs_.push_back(itc->second.info);
-                    thumb_cache_.erase(itc);
-                }
-                // If the browser was sitting inside the deleted item
-                // (folder, or a model opened as a virtual folder), back out.
-                if (cur_dir.rfind(delete_target_, 0) == 0)
-                    cur_dir = tree_root;
+            if (del_ok && !del_list.empty()) {
+                auto deleteOne = [&](const std::string& path) {
+                    const fs::path t(path);
+                    std::error_code dec;
+                    if (fs::is_directory(t, dec)) {
+                        fs::remove_all(t, dec);
+                    } else {
+                        fs::remove(t, dec);
+                        std::error_code dec2;
+                        fs::remove(fs::path(path + ".rwmeta"), dec2);
+                        const fs::path exploded = t.parent_path() / t.stem();
+                        if (fs::is_directory(exploded, dec2))
+                            fs::remove_all(exploded, dec2);
+                        const fs::path thumb = t.parent_path() / ".thumbnails" /
+                            (t.filename().string() + ".png");
+                        fs::remove(thumb, dec2);
+                    }
+                    if (dec)
+                        EditorLog::get().push("[delete] failed: " +
+                            t.filename().string() + " — " + dec.message());
+                    else
+                        EditorLog::get().push("[delete] removed '" +
+                            t.filename().string() + "'");
+                    asset_children_cache_.erase(path);
+                    auto itc = thumb_cache_.find(path);
+                    if (itc != thumb_cache_.end()) {
+                        if (itc->second.info)
+                            retired_thumbs_.push_back(itc->second.info);
+                        thumb_cache_.erase(itc);
+                    }
+                    if (cur_dir.rfind(path, 0) == 0) cur_dir = tree_root;
+                    content_selected_.erase(path);
+                };
+                for (const auto& dp : del_list) deleteOne(dp);
+                delete_paths_.clear();
                 delete_target_.clear();
+                content_sel_anchor_.clear();
                 ImGui::CloseCurrentPopup();
             }
             if (del_cancel) ImGui::CloseCurrentPopup();

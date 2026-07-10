@@ -861,6 +861,14 @@ public:
     // DISABLED — greyed out in the grid.  Purely a browser-side marker; does
     // not affect the 3D scene.  Toggled from each tile's right-click menu.
     std::unordered_set<std::string> content_disabled_;
+    // ── Content Browser multi-selection ──────────────────────────────────
+    // Absolute paths of the tiles currently selected in the asset grid.
+    // Ctrl+click toggles, Shift+click selects a range from content_sel_anchor_
+    // over the current grid order, a plain click selects just one.  Drives the
+    // blue tile highlight and the bulk Delete / Add-to-Scene / Enable actions.
+    std::unordered_set<std::string> content_selected_;
+    std::string content_sel_anchor_;          // Shift+click range pivot
+    std::string content_browser_last_dir_;    // dir change -> clear selection
     // File Browser current folder — raw disk view rooted at the project dir.
     std::string  file_dir_          = ".";
     float        file_left_w_       = 0.0f;   // File Browser splitter width
@@ -868,6 +876,7 @@ public:
     bool         content_import_request_ = false;  // "Import…" clicked
     std::string  content_import_dir_;              // folder to import into
     std::string  place_asset_request_;             // asset to add to the scene
+    std::vector<std::string> place_asset_queue_;   // bulk "Add to Scene" queue
     // "New Folder" dialog state (Content Browser context menu).
     bool         newfolder_open_ = false;
     char         newfolder_buf_[128] = "";
@@ -949,6 +958,7 @@ public:
     std::string  delete_target_;
     bool         delete_open_   = false;
     bool         delete_is_dir_ = false;
+    std::vector<std::string> delete_paths_;        // multi-select delete set
     // Streaming-import status (pushed by the app each frame while its
     // background copy thread runs) — drawn as a progress bar at the top of
     // the Content Browser until the import finishes.
@@ -1330,6 +1340,14 @@ public:
         if (!place_asset_request_.empty()) {
             out_path = place_asset_request_;
             place_asset_request_.clear();
+            return true;
+        }
+        // Bulk "Add to Scene": drain one queued path per call.  The app polls
+        // this once per frame, so a multi-selection places one asset per frame
+        // until the queue empties (no app-side change needed).
+        if (!place_asset_queue_.empty()) {
+            out_path = place_asset_queue_.front();
+            place_asset_queue_.erase(place_asset_queue_.begin());
             return true;
         }
         return false;
