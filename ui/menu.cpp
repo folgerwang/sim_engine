@@ -4910,6 +4910,58 @@ void Menu::drawDetailsContent() {
             if (ImGui::Checkbox("Visible", &vis)) o.obj->setVisible(vis);
             ImGui::Text("Loaded: %s", o.obj->isReady() ? "yes" : "(streaming)");
 
+            // ── Draw-path debug (PCG / "is this thing on screen?") ────
+            // Force red: base.frag overrides this drawable's pixels with
+            // solid red — instantly answers whether some geometry on
+            // screen belongs to THIS object.  Log draws: per-second
+            // [placed.draw] stdout report + the reach counters below.
+            bool dbg_red = o.obj->getDebugForceRed();
+            if (ImGui::Checkbox("Force red (debug)", &dbg_red))
+                o.obj->setDebugForceRed(dbg_red);
+            ImGui::SameLine();
+            bool dbg_log = o.obj->getDebugLogDraws();
+            if (ImGui::Checkbox("Log draws", &dbg_log))
+                o.obj->setDebugLogDraws(dbg_log);
+            if (o.obj->isReady() && (dbg_log || dbg_red)) {
+                // Reach counters from the most recent draw() — each gate
+                // in the draw path that can silently early-out bumps one
+                // of these (reset at the top of every draw()).
+                const auto& dd = o.obj->getDrawableData();
+                ImGui::TextDisabled(
+                    "draw(): called=%u notready=%u meshes=%u "
+                    "frustumcull=%u cluster=%u prims=%u pipenull=%u",
+                    dd.m_debug_draw_called_,
+                    dd.m_debug_draw_not_ready_,
+                    dd.m_debug_draw_mesh_entered_,
+                    dd.m_debug_draw_mesh_culled_frustum_,
+                    dd.m_debug_draw_mesh_taken_by_cluster_,
+                    dd.m_debug_draw_prims_iterated_,
+                    dd.m_debug_draw_prim_pipeline_null_);
+                const glm::vec3 bmn = o.obj->getModelBboxMin();
+                const glm::vec3 bmx = o.obj->getModelBboxMax();
+                if (bmn.x <= bmx.x) {
+                    ImGui::TextDisabled(
+                        "model bbox (%.1f, %.1f, %.1f) .. (%.1f, %.1f, %.1f)",
+                        bmn.x, bmn.y, bmn.z, bmx.x, bmx.y, bmx.z);
+                }
+                // Where base.vert's PER-INSTANCE transform comes from.
+                // "game_objects_buffer" means the mesh rides a GPU sim
+                // entity (camera_pos@frame0 + gravity drift) — it renders
+                // OFFSET from the editor placement and sinks over time,
+                // while the CPU-side selection bbox stays at the correct
+                // spot.  Static placed imports should read "identity".
+                if (!o.obj->getUseNodeTransformOnly()) {
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                        "instance xform: game_objects_buffer (sim-driven!)"
+                        "  skins=%d anims=%d",
+                        (int)dd.skins_.size(), (int)dd.animations_.size());
+                } else {
+                    ImGui::TextDisabled(
+                        "instance xform: identity (node-only)");
+                }
+            }
+
             if (anim_has_) {
                 ImGui::SeparatorText("Animation");
                 bool playing = anim_playing_;
@@ -6084,6 +6136,13 @@ void Menu::drawTerrainGenPopup() {
         // peaks, vegetation in valleys, water in channels).
         ImGui::Checkbox("Also generate color satellite map",
                         &terrain_gen_color_);
+        // Layout-first: FLUX renders a flat-color LAND-COVER map first
+        // (water/grass/forest/town/road/rock/snow/sand palette).  The
+        // heightmap, albedo AND the PCG proxies all derive from those
+        // exact class masks (<name>_seg.png) — towns get buildings by
+        // construction instead of color-heuristic guessing.
+        ImGui::Checkbox("Layout-first (land-cover masks drive height/PCG)",
+                        &terrain_gen_layout_);
         // Peak height: the tile creator maps white to 2000 m, far too
         // dramatic for a full-range normalized AI map — scale it down in
         // the python (--height-scale) before the 16-bit write.
@@ -6121,14 +6180,16 @@ void Menu::drawTerrainGenPopup() {
                     " --prompt-file \"" + pfile + "\""
                     " --out \"" + terrain_gen_out_ + "\"" + hs_arg +
                     (terrain_gen_install_ ? " --install" : "") +
-                    (terrain_gen_color_   ? " --color"   : "");
+                    (terrain_gen_color_   ? " --color"   : "") +
+                    (terrain_gen_layout_  ? " --layout"  : "");
 #else
                 const std::string cmd =
                     "python3 \"tools/terrain/terrain_from_text.py\""
                     " --prompt-file \"" + pfile + "\""
                     " --out \"" + terrain_gen_out_ + "\"" + hs_arg +
                     (terrain_gen_install_ ? " --install" : "") +
-                    (terrain_gen_color_   ? " --color"   : "") + " &";
+                    (terrain_gen_color_   ? " --color"   : "") +
+                    (terrain_gen_layout_  ? " --layout"  : "") + " &";
 #endif
                 EditorLog::get().push(
                     "[terrain] launching generation -> " + terrain_gen_out_);

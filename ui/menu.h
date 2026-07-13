@@ -142,6 +142,10 @@ class Menu {
     char        terrain_prompt_buf_[512] = {};
     bool        terrain_gen_install_     = true;
     bool        terrain_gen_color_       = true;  // + color satellite map
+    // Layout-first generation: FLUX renders a flat-color land-cover map
+    // whose quantized class masks (<out>_seg.png) drive the heightmap,
+    // albedo and PCG placement (python --layout).
+    bool        terrain_gen_layout_      = true;
     // Peak height as a fraction of the engine's 2000 m full range
     // (python --height-scale).  0.25 => ~500 m peaks.
     float       terrain_gen_height_scale_ = 0.25f;
