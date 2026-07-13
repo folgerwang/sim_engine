@@ -46,6 +46,4 @@ float terrainDetailHeight(vec2 pos_xz_ws, float base_h, float fade) {
     // tile; cell = kDetailTileMeters / (kDetailTileRes - 1)).
     vec2 texels = (rel - vec2(t)) * float(kDetailTileRes - 1);
     vec2 uv = (texels + 0.5f) / float(kDetailTileRes);
-    float hd = texture(detail_height_tiles, vec3(uv, float(slot))).x * kTerrainHeightAmpMeters;
-    return mix(base_h, hd, fade);
-}
+    float hd = texture(detail_height_tiles, vec3(uv, float(
