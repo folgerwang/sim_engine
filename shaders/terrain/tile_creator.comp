@@ -62,25 +62,23 @@ void main()
     vec2 map_coords = tile_params.world_min + (pixel_coords + 0.25f) * tile_step;
     vec2 map_coords1 = map_coords + 0.5f * tile_step;
 
-    vec2 height_noise_00 = terrainMap(map_coords, 0.00025f, 2000.0f);
-    vec2 height_noise_01 = terrainMap(vec2(map_coords1.x, map_coords.y), 0.00025f, 2000.0f);
-    vec2 height_noise_10 = terrainMap(vec2(map_coords.x, map_coords1.y), 0.00025f, 2000.0f);
-    vec2 height_noise_11 = terrainMap(map_coords1, 0.00025f, 2000.0f);
-
     ivec2 scoord_0 = pixel_coords * 2;
     ivec2 scoord_1 = pixel_coords * 2 + ivec2(1, 0);
     ivec2 scoord_2 = pixel_coords * 2 + ivec2(0, 1);
     ivec2 scoord_3 = pixel_coords * 2 + ivec2(1, 1);
 
-    float height_noise_scale = 0.2f;
-    float heightmap_00 = sampleHeightmapSmooth((scoord_0 + 0.5f) * inv_segment_count * 0.5f) * 2000.0f;
-    imageStore(rock_layer, scoord_0, vec4(heightmap_00 + height_noise_00.x * height_noise_scale));
-    float heightmap_10 = sampleHeightmapSmooth((scoord_1 + 0.5f) * inv_segment_count * 0.5f) * 2000.0f;
-    imageStore(rock_layer, scoord_1, vec4(heightmap_10 + height_noise_10.x * height_noise_scale));
-    float heightmap_01 = sampleHeightmapSmooth((scoord_2 + 0.5f) * inv_segment_count * 0.5f) * 2000.0f;
-    imageStore(rock_layer, scoord_2, vec4(heightmap_01 + height_noise_01.x * height_noise_scale));
-    float heightmap_11 = sampleHeightmapSmooth((scoord_3 + 0.5f) * inv_segment_count * 0.5f) * 2000.0f;
-    imageStore(rock_layer, scoord_3, vec4(heightmap_11 + height_noise_11.x * height_noise_scale));
+    // NOTE: the analytic FBM (terrainMap * 0.2) previously mixed in here
+    // is GONE — the runtime 1 m detail tiles (terrain_detail_worker.py)
+    // provide the high-frequency relief, and the base rock layer must
+    // agree with them at the detail fade boundary.
+    float heightmap_00 = sampleHeightmapSmooth((scoord_0 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
+    imageStore(rock_layer, scoord_0, vec4(heightmap_00));
+    float heightmap_10 = sampleHeightmapSmooth((scoord_1 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
+    imageStore(rock_layer, scoord_1, vec4(heightmap_10));
+    float heightmap_01 = sampleHeightmapSmooth((scoord_2 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
+    imageStore(rock_layer, scoord_2, vec4(heightmap_01));
+    float heightmap_11 = sampleHeightmapSmooth((scoord_3 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
+    imageStore(rock_layer, scoord_3, vec4(heightmap_11));
 
     const float kWaterInitLevel = 1.0f;
     const float kSoilInitLevel = 5.0f;

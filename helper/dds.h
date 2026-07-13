@@ -256,7 +256,9 @@ struct DDS_PIXELFORMAT
         uint32_t        reserved2;
     };
 
-    typedef enum DXGI_FORMAT {
+    // Plain enum (no typedef): C++ doesn't need it, and `typedef enum X
+    // {...};` without a declarator name triggers C4091.
+    enum DXGI_FORMAT {
         DXGI_FORMAT_UNKNOWN = 0,
         DXGI_FORMAT_R32G32B32A32_TYPELESS = 1,
         DXGI_FORMAT_R32G32B32A32_FLOAT = 2,

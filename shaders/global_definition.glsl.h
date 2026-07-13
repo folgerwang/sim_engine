@@ -124,9 +124,23 @@
 
 #define DETAIL_NOISE_TEXTURE_INDEX          (TILE_BASE_PARAMS_INDEX + 26) // 33
 #define ROUGH_NOISE_TEXTURE_INDEX           (TILE_BASE_PARAMS_INDEX + 27) // 34
-#define PERMUTATION_TEXTURE_INDEX           (TILE_BASE_PARAMS_INDEX + 28) // 35     
+#define PERMUTATION_TEXTURE_INDEX           (TILE_BASE_PARAMS_INDEX + 28) // 35
 #define PERMUTATION_2D_TEXTURE_INDEX        (TILE_BASE_PARAMS_INDEX + 29) // 36
 #define GRAD_TEXTURE_INDEX                  (TILE_BASE_PARAMS_INDEX + 30) // 37
+// Runtime 1 m terrain detail streaming (TerrainDetailStream).
+#define TERRAIN_DETAIL_HEIGHT_INDEX         (TILE_BASE_PARAMS_INDEX + 31) // 38: R16 2049^2 array
+#define TERRAIN_DETAIL_TABLE_INDEX          (TILE_BASE_PARAMS_INDEX + 32) // 39: int slot_map[256] SSBO
+// Virtual-textured terrain albedo (shared VirtualTextureManager pools).
+#define TERRAIN_VT_POOL_ALBEDO_INDEX        (TILE_BASE_PARAMS_INDEX + 33) // 40
+#define TERRAIN_VT_POOL_NORMAL_INDEX        (TILE_BASE_PARAMS_INDEX + 34) // 41
+#define TERRAIN_VT_POOL_MR_AO_INDEX         (TILE_BASE_PARAMS_INDEX + 35) // 42
+#define TERRAIN_VT_POOL_EMISSIVE_INDEX      (TILE_BASE_PARAMS_INDEX + 36) // 43
+#define TERRAIN_VT_PAGE_TABLE_INDEX         (TILE_BASE_PARAMS_INDEX + 37) // 44
+#define TERRAIN_VT_META_INDEX               (TILE_BASE_PARAMS_INDEX + 38) // 45
+#define TERRAIN_VT_FEEDBACK_INDEX           (TILE_BASE_PARAMS_INDEX + 39) // 46
+// 1 m albedo detail tiles (RGBA8 2048^2 array, streamed with the height
+// tiles; near-field surface colour, fading to the global VT albedo).
+#define TERRAIN_DETAIL_COLOR_INDEX          (TILE_BASE_PARAMS_INDEX + 40) // 47
 #define PERM_GRAD_TEXTURE_INDEX             (TILE_BASE_PARAMS_INDEX + 31) // 38
 #define PERM_GRAD_4D_TEXTURE_INDEX          (TILE_BASE_PARAMS_INDEX + 32) // 39
 #define GRAD_4D_TEXTURE_INDEX               (TILE_BASE_PARAMS_INDEX + 33) // 40
@@ -378,8 +392,42 @@
 #define kRayleighScaleHeight                    8e3
 #define kMieScaleHeight                         1.2e3
 
-#define kWorldMapSize                           16384.0f                  // meters
-#define kCloudMapSize                           32768.0f
+#define kWorldMapSize                           32768.0f                  // meters (32 km; matches tools/terrain WORLD_SIZE_M)
+#define kCloudMapSize                           65536.0f
+
+// Terrain detail streaming: the world is split into 16x16 detail tiles of
+// 2048 m; each is generated on demand at 2048^2 (1 m/texel) by
+// tools/terrain/terrain_detail_worker.py and streamed into a texture-array
+// cache around the camera (see TerrainDetailStream).
+// Extent of the GENERATED TERRAIN MAP (heightmap/albedo), decoupled from
+// kWorldMapSize: FLUX draws photo-scale content, and stretching it over
+// 32 km made the in-world terrain a 16x-magnified blur that never
+// matched the map previews.  8192 px over 4096 m = 0.5 m/texel native.
+// Beyond the map edge the clamp sampler continues the border heights.
+#define kTerrainMapMeters                       4096.0f
+// Height of a WHITE heightmap texel.  Scaled with kTerrainMapMeters
+// (was 2000 m over 32 km): keeping amp/extent constant preserves slopes
+// — without this, shrinking the extent x8 turned every hill into a
+// needle canyon.
+#define kTerrainHeightAmpMeters                 250.0f
+// Beyond the map edge the clamp sampler would stretch the border texels
+// into infinite stripes; instead the surround fades to a low neutral
+// plain over this band.
+#define kTerrainSurroundHeightMeters            18.0f
+#define kTerrainSurroundFadeMeters              768.0f
+#define kDetailTileMeters                       (kTerrainMapMeters / 16.0f)  // 256 m
+#define kDetailTilesPerSide                     16
+// 2049: texel centers on integer world meters, so the shared border
+// row/column of adjacent tiles holds bit-identical heights (exact seams).
+#define kDetailTileRes                          2049
+#define kDetailCacheSlots                       9         // 3x3 ring around camera
+// Camera-distance band over which rendered height blends detail -> base,
+// so the edge of the loaded detail region never shows a hard step.
+// (Fade END must stay inside the loaded 3x3 ring: 1.5 tiles = 3072 m.)
+// (Scaled with kDetailTileMeters: fade END must stay inside the loaded
+// 3x3 detail ring = 1.5 tiles.)
+#define kDetailFadeStartMeters                  192.0f
+#define kDetailFadeEndMeters                    320.0f
 
 #define kDetailNoiseTextureSize                 256
 #define kRoughNoiseTextureSize                  32
@@ -657,11 +705,15 @@ struct TileParams {
     vec2            range;
     vec2            inv_screen_size;
     uint            segment_count;
-    uint            offset;
+    uint            offset;         // packed edge-neighbour segment counts
     float           inv_segment_count;
     float           delta_t;
     float           time;
     uint            tile_index;
+    // Virtual-texture id of the terrain albedo (VT_INVALID_ID = fall
+    // back to the plain src_map_mask sample).
+    uint            vt_albedo_id;
+    uint            pad_0;
 };
 
 struct DebugDrawParams {

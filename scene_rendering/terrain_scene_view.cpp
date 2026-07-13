@@ -139,7 +139,12 @@ void TerrainSceneView::updateTileResDescriptorSet(
     const std::vector<std::shared_ptr<renderer::ImageView>>& temp_tex,
     const std::shared_ptr<renderer::ImageView>& map_mask_tex,
     const std::shared_ptr<renderer::ImageView>& detail_volume_noise_tex,
-    const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex) {
+    const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+    const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
+    uint32_t terrain_detail_table_bytes,
+    const ego::TileVtBindings& vt_bindings) {
         ego::TileObject::updateTileResDescriptorSet(
             device,
             descriptor_pool,
@@ -151,7 +156,12 @@ void TerrainSceneView::updateTileResDescriptorSet(
             temp_tex,
             map_mask_tex,
             detail_volume_noise_tex,
-            rough_volume_noise_tex);
+            rough_volume_noise_tex,
+            terrain_detail_height_array,
+            terrain_detail_color_array,
+            terrain_detail_table,
+            terrain_detail_table_bytes,
+            vt_bindings);
 }
 
 void TerrainSceneView::duplicateColorAndDepthBuffer(
@@ -402,7 +412,7 @@ void TerrainSceneView::drawTilesInto(
             delta_t,
             cur_time);
 
-        if (m_b_render_grass_) {
+        if (m_b_render_grass_ && !tile->isOuter()) {
             tile->drawGrass(
                 cmd_buf,
                 m_tile_grass_pipeline_layout_,

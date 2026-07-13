@@ -4,6 +4,22 @@
 namespace engine {
 namespace game_object {
 
+// Raw handles of the shared VirtualTextureManager, passed down so the
+// tile descriptor set can bind the RVT pools without game_object
+// depending on scene_rendering.  All members optional: when `sampler`
+// is null the VT bindings are skipped (terrain albedo falls back to the
+// plain map-mask sample; the shader gates on vt_albedo_id).
+struct TileVtBindings {
+    std::shared_ptr<renderer::Sampler>   sampler;
+    std::shared_ptr<renderer::ImageView> pool_views[4];
+    std::shared_ptr<renderer::Buffer>    page_table;
+    uint32_t                             page_table_bytes = 0;
+    std::shared_ptr<renderer::Buffer>    meta;
+    uint32_t                             meta_bytes = 0;
+    std::shared_ptr<renderer::Buffer>    feedback;
+    uint32_t                             feedback_bytes = 0;
+};
+
 // Sample the procedural ground height at world XZ position. Used by
 // PlayerController for terrain-clamp / collision and by any other code
 // that needs the same height the renderer would draw at this XZ.
@@ -22,6 +38,11 @@ class TileObject {
         kMinNumGrass = 1024,
         kMaxNumGrass = 8192,
         kSegmentCount = 32 - 1,
+        // View-distance mesh LODs: segment count per tile is
+        // kLodSegmentCounts[lod_] (127/63/31/15 => 1/2/4/8 m grid on a
+        // 128 m tile).  Cracks between neighbouring LODs are killed by
+        // edge-snapping in tile.vert (see edge_segments_packed_).
+        kNumMeshLods = 4,
         kNumCachedBlocks = (kCacheTileSize * 2 + 1) * (kCacheTileSize * 2 + 1)
     };
 
@@ -31,6 +52,14 @@ class TileObject {
     glm::ivec4  neighbors_;
     glm::vec2 min_;
     glm::vec2 max_;
+
+    // View-distance mesh LOD (0 = finest, kNumMeshLods-1 = coarsest),
+    // refreshed by updateAllTiles() from the camera distance.
+    uint32_t lod_ = 2;
+    bool is_outer_ = false;
+    // Neighbour SEGMENT COUNTS packed one byte per edge (x-, x+, y-, y+),
+    // pushed to tile.vert via TileParams.offset for crack-free stitching.
+    uint32_t edge_segments_packed_ = 0;
 
     renderer::BufferInfo index_buffer_;
 
@@ -42,7 +71,19 @@ class TileObject {
 
     static std::unordered_map<size_t, std::shared_ptr<TileObject>> s_tile_meshes_;
     static std::vector<uint32_t> s_available_block_indexes_;
+    // Shared grid index buffers, one per mesh LOD (all tiles of a LOD use
+    // the same topology; the vertex shader derives positions from
+    // TileParams).
+    static renderer::BufferInfo s_lod_index_buffers_[size_t(TileConst::kNumMeshLods)];
 public:
+    static const uint32_t kLodSegmentCounts[size_t(TileConst::kNumMeshLods)];
+    // Virtual-texture id of the terrain albedo (0xFFFFFFFF = none; the
+    // application registers the generated colour map with the shared
+    // VirtualTextureManager on terrain apply).
+    static uint32_t s_terrain_vt_albedo_id;
+    static void setTerrainVtAlbedoId(uint32_t id) {
+        s_terrain_vt_albedo_id = id;
+    }
     static renderer::TextureInfo s_rock_layer_;
     static renderer::TextureInfo s_soil_water_layer_[2];
     static renderer::TextureInfo s_grass_snow_layer_;
@@ -79,6 +120,17 @@ public:
         neighbors_ = neighbors;
     }
 
+    inline void setLod(uint32_t lod) { lod_ = lod; }
+    inline uint32_t getLod() const { return lod_; }
+    inline void setEdgeSegmentsPacked(uint32_t packed) {
+        edge_segments_packed_ = packed;
+    }
+    // Outer-ring tiles (512 m / 2048 m distant terrain): no grass, no
+    // soil/water sim, no cache block — pure heightfield geometry.
+    inline void setOuter(bool v) { is_outer_ = v; }
+    inline bool isOuter() const { return is_outer_; }
+    inline float getWorldSize() const { return max_.x - min_.x; }
+
     void destroy(
         const std::shared_ptr<renderer::Device>& device);
 
@@ -96,7 +148,8 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
         const glm::vec2& min,
-        const glm::vec2& max);
+        const glm::vec2& max,
+        bool outer = false);
 
     static void initStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
@@ -139,7 +192,12 @@ public:
             const std::vector<std::shared_ptr<renderer::ImageView>>& temp_tex,
             const std::shared_ptr<renderer::ImageView>& map_mask_tex,
             const std::shared_ptr<renderer::ImageView>& detail_volume_noise_tex,
-            const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex);
+            const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex,
+            const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
+            const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+            const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
+            uint32_t terrain_detail_table_bytes,
+            const TileVtBindings& vt_bindings);
 
     static void generateTileBuffers(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);

@@ -5892,6 +5892,81 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     gen_status_ = 1;   // running
 }
 
+// ── Terrain prompt presets / history ────────────────────────────────────────
+// One line per prompt: 'F' or 'R', a tab, then the text with newlines
+// escaped as "\n".  Favorites first, then recents (capped).
+namespace {
+std::string escapePromptNl(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\n') out += "\\n";
+        else if (c != '\r') out += c;
+    }
+    return out;
+}
+std::string unescapePromptNl(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == 'n') {
+            out += '\n';
+            ++i;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+constexpr const char* kTerrainPromptsFile = "assets/terrain_prompts.txt";
+}  // namespace
+
+void Menu::loadTerrainPrompts() {
+    terrain_prompts_.clear();
+    std::ifstream f(kTerrainPromptsFile, std::ios::binary);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() < 3 || line[1] != '\t') continue;
+        terrain_prompts_.emplace_back(line[0] == 'F',
+                                      unescapePromptNl(line.substr(2)));
+    }
+}
+
+void Menu::saveTerrainPrompts() {
+    std::ofstream f(kTerrainPromptsFile, std::ios::binary);
+    for (const auto& e : terrain_prompts_) {
+        f << (e.first ? 'F' : 'R') << '\t'
+          << escapePromptNl(e.second) << '\n';
+    }
+}
+
+void Menu::addTerrainPrompt(const std::string& p, bool favorite) {
+    if (p.empty()) return;
+    // Drop existing copies; a previously favorited prompt stays favorite.
+    for (auto it = terrain_prompts_.begin(); it != terrain_prompts_.end();) {
+        if (it->second == p) {
+            favorite = favorite || it->first;
+            it = terrain_prompts_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Favorites live at the front; recents right after the favorites.
+    auto insert_at = terrain_prompts_.begin();
+    if (!favorite) {
+        while (insert_at != terrain_prompts_.end() && insert_at->first)
+            ++insert_at;
+    }
+    terrain_prompts_.insert(insert_at, { favorite, p });
+    // Cap the recents (favorites are kept forever).
+    int recents = 0;
+    for (auto it = terrain_prompts_.begin(); it != terrain_prompts_.end();) {
+        if (!it->first && ++recents > 15) it = terrain_prompts_.erase(it);
+        else ++it;
+    }
+    saveTerrainPrompts();
+}
+
 // ── AI terrain generation popup (Tools > Generate Terrain) ──────────────────
 // Text → FLUX satellite-view heightmap → torch erosion conversion → 16-bit
 // terrain PNG, optionally installed as assets/map.png.  Detached python
@@ -5941,14 +6016,22 @@ void Menu::drawTerrainGenPopup() {
     }
 
     if (!terrain_gen_popup_open_) return;
-    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(960, 0), ImGuiCond_FirstUseEver);
+    // Pin the WIDTH: with AlwaysAutoResize alone, the auto-layout feeds
+    // back through GetContentRegionAvail()-sized items (prompt box /
+    // combo) and the window creeps wider every time text is added.
+    // Constraints keep width fixed at 960 while height still auto-fits.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(960.0f, 0.0f),
+                                        ImVec2(960.0f, 10000.0f));
     if (ImGui::Begin("Generate Terrain (AI)", &terrain_gen_popup_open_,
                      ImGuiWindowFlags_NoDocking |
                      ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextWrapped(
-            "Describe the terrain.  FLUX renders a satellite-view "
-            "heightmap; a GPU erosion model converts it into a terrain "
-            "heightfield (2048x2048, 16-bit).");
+            "Describe the terrain (the map covers a 4 km area at 0.5 m "
+            "per texel, so towns and rivers render at natural size).  "
+            "FLUX renders a satellite-view heightmap; a GPU erosion "
+            "model refines it and upscales to an 8192x8192 base map; "
+            "0.125 m ML detail streams in near the camera.");
         // Soft-wrap to the box width (same callback the image-gen prompt
         // uses) so long prompts wrap instead of scrolling off the right edge.
         const float tp_box_w = ImGui::GetContentRegionAvail().x;
@@ -5960,6 +6043,40 @@ void Menu::drawTerrainGenPopup() {
                                   ImVec2(tp_box_w, 64.0f),
                                   ImGuiInputTextFlags_CallbackAlways,
                                   &GenPromptWrapCallback, &tp_ud);
+        // ── Prompt presets / history ─────────────────────────────────
+        if (!terrain_prompts_loaded_) {
+            terrain_prompts_loaded_ = true;
+            loadTerrainPrompts();
+        }
+        ImGui::SetNextItemWidth(tp_box_w - 64.0f);
+        if (ImGui::BeginCombo("##terrain_prompt_load",
+                              "Load prompt (* favorite, recent)...")) {
+            for (size_t i = 0; i < terrain_prompts_.size(); ++i) {
+                const bool fav = terrain_prompts_[i].first;
+                const std::string& txt = terrain_prompts_[i].second;
+                std::string label = (fav ? "* " : "   ");
+                std::string one_line = txt;
+                for (auto& ch : one_line) if (ch == '\n') ch = ' ';
+                label += one_line.substr(0, 72);
+                if (one_line.size() > 72) label += "...";
+                ImGui::PushID((int)i);
+                if (ImGui::Selectable(label.c_str())) {
+                    std::snprintf(terrain_prompt_buf_,
+                                  sizeof(terrain_prompt_buf_),
+                                  "%s", txt.c_str());
+                }
+                ImGui::PopID();
+            }
+            if (terrain_prompts_.empty())
+                ImGui::TextDisabled("(empty — Generate or Save to add)");
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        // Star the current prompt: kept forever, listed first.
+        if (ImGui::Button("Save##terrain_prompt") &&
+            terrain_prompt_buf_[0] != '\0') {
+            addTerrainPrompt(terrain_prompt_buf_, /*favorite*/ true);
+        }
         ImGui::Checkbox("Install as active terrain (assets/map.png)",
                         &terrain_gen_install_);
         // Second FLUX pass conditioned on the finished heightfield —
@@ -5973,13 +6090,14 @@ void Menu::drawTerrainGenPopup() {
         ImGui::SliderFloat("Peak height (m)",
                            &terrain_gen_height_scale_,
                            0.05f, 1.0f,
-                           "%.2f x 2000");
+                           "%.2f x 250");
 
         const bool busy = (terrain_gen_status_ == 1);
         if (busy) ImGui::BeginDisabled();
         if (ImGui::Button("Generate", ImVec2(120, 0))) {
             const std::string p(terrain_prompt_buf_);
             if (!p.empty()) {
+                addTerrainPrompt(p, /*favorite*/ false);   // recents history
                 std::error_code ec;
                 fs::create_directories("content/terrain/.terrain_tmp", ec);
                 const std::string base =

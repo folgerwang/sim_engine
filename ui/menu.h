@@ -153,6 +153,14 @@ class Menu {
     // app's createTerrainFromMaps().
     std::string terrain_apply_height_;
     std::string terrain_apply_albedo_;
+    // Prompt presets/history for the terrain popup, persisted to
+    // assets/terrain_prompts.txt ('F' = favorite via the Save button,
+    // 'R' = recent, auto-added on Generate; newlines escaped as "\n").
+    std::vector<std::pair<bool, std::string>> terrain_prompts_;
+    bool terrain_prompts_loaded_ = false;
+    void loadTerrainPrompts();
+    void saveTerrainPrompts();
+    void addTerrainPrompt(const std::string& p, bool favorite);
     void drawTerrainGenPopup();
 
     // ── Full-size image viewer (double-click an image tile) ───────────

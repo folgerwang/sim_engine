@@ -1661,9 +1661,79 @@ renderer::WriteDescriptorList addTileResourceTextures(
     const std::shared_ptr<renderer::ImageView>& temp_tex,
     const std::shared_ptr<renderer::ImageView>& map_mask_tex,
     const std::shared_ptr<renderer::ImageView>& detail_noise_tex,
-    const std::shared_ptr<renderer::ImageView>& rough_noise_tex) {
+    const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+    const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
+    uint32_t terrain_detail_table_bytes,
+    const TileVtBindings& vt_bindings) {
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(11);
+    descriptor_writes.reserve(21);
+
+    // Virtual-textured terrain albedo (shared RVT pools).
+    if (vt_bindings.sampler) {
+        const uint32_t pool_bindings[4] = {
+            TERRAIN_VT_POOL_ALBEDO_INDEX,
+            TERRAIN_VT_POOL_NORMAL_INDEX,
+            TERRAIN_VT_POOL_MR_AO_INDEX,
+            TERRAIN_VT_POOL_EMISSIVE_INDEX };
+        for (uint32_t l = 0; l < 4; ++l) {
+            renderer::Helper::addOneTexture(
+                descriptor_writes,
+                description_set,
+                renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                pool_bindings[l],
+                vt_bindings.sampler,
+                vt_bindings.pool_views[l],
+                renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+        renderer::Helper::addOneBuffer(
+            descriptor_writes, description_set,
+            renderer::DescriptorType::STORAGE_BUFFER,
+            TERRAIN_VT_PAGE_TABLE_INDEX,
+            vt_bindings.page_table, vt_bindings.page_table_bytes);
+        renderer::Helper::addOneBuffer(
+            descriptor_writes, description_set,
+            renderer::DescriptorType::STORAGE_BUFFER,
+            TERRAIN_VT_META_INDEX,
+            vt_bindings.meta, vt_bindings.meta_bytes);
+        renderer::Helper::addOneBuffer(
+            descriptor_writes, description_set,
+            renderer::DescriptorType::STORAGE_BUFFER,
+            TERRAIN_VT_FEEDBACK_INDEX,
+            vt_bindings.feedback, vt_bindings.feedback_bytes);
+    }
+
+    // Runtime 1 m terrain detail (TerrainDetailStream).
+    if (terrain_detail_height_array) {
+        renderer::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            TERRAIN_DETAIL_HEIGHT_INDEX,
+            clamp_texture_sampler,
+            terrain_detail_height_array,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+    if (terrain_detail_color_array) {
+        renderer::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            TERRAIN_DETAIL_COLOR_INDEX,
+            clamp_texture_sampler,
+            terrain_detail_color_array,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+    if (terrain_detail_table) {
+        renderer::Helper::addOneBuffer(
+            descriptor_writes,
+            description_set,
+            renderer::DescriptorType::STORAGE_BUFFER,
+            TERRAIN_DETAIL_TABLE_INDEX,
+            terrain_detail_table,
+            terrain_detail_table_bytes);
+    }
 
     // src color.
     renderer::Helper::addOneTexture(
@@ -1894,7 +1964,7 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createTileFlowUpdateDescri
 
 static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescriptorSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(11);
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(20);
     bindings[0] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         SRC_COLOR_TEX_INDEX);
     bindings[1] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
@@ -1929,6 +1999,45 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescript
     bindings[10] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         ROUGH_NOISE_TEXTURE_INDEX,
         SET_2_FLAG_BITS(ShaderStage, FRAGMENT_BIT, COMPUTE_BIT));
+    // Runtime 1 m terrain detail (TerrainDetailStream): height tile array
+    // + world-tile -> array-slice table.  Vertex displaces with it,
+    // fragment derives shading normals from it.
+    bindings[11] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_DETAIL_HEIGHT_INDEX,
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT));
+    bindings[12] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        TERRAIN_DETAIL_TABLE_INDEX,
+        SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
+    // Virtual-textured terrain albedo (shared VirtualTextureManager):
+    // 4 layer pools + page table + meta + streaming feedback.
+    bindings[13] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_VT_POOL_ALBEDO_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT));
+    bindings[14] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_VT_POOL_NORMAL_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT));
+    bindings[15] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_VT_POOL_MR_AO_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT));
+    bindings[16] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_VT_POOL_EMISSIVE_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT));
+    bindings[17] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        TERRAIN_VT_PAGE_TABLE_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
+    bindings[18] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        TERRAIN_VT_META_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
+    bindings[19] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        TERRAIN_VT_FEEDBACK_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_DETAIL_COLOR_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT)));
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -1992,6 +2101,12 @@ size_t generateHash(
 // static member definition.
 std::unordered_map<size_t, std::shared_ptr<TileObject>> TileObject::s_tile_meshes_;
 std::vector<uint32_t> TileObject::s_available_block_indexes_;
+renderer::BufferInfo TileObject::s_lod_index_buffers_[size_t(TileObject::TileConst::kNumMeshLods)];
+// 128 m tile: 1 / 2 / 4 / 8 m mesh grid.  Values must fit one byte (edge
+// stitching packs neighbour segment counts into TileParams.offset).
+const uint32_t TileObject::kLodSegmentCounts[size_t(TileObject::TileConst::kNumMeshLods)] = {
+    127, 63, 31, 15 };
+uint32_t TileObject::s_terrain_vt_albedo_id = 0xFFFFFFFFu;
 renderer::TextureInfo TileObject::s_rock_layer_;
 renderer::TextureInfo TileObject::s_soil_water_layer_[2];
 renderer::TextureInfo TileObject::s_grass_snow_layer_;
@@ -2186,12 +2301,21 @@ std::shared_ptr<TileObject> TileObject::addOneTile(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::DescriptorPool> descriptor_pool,
     const glm::vec2& min,
-    const glm::vec2& max) {
+    const glm::vec2& max,
+    bool outer /*= false*/) {
     auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
     auto hash_value = generateHash(min, max, segment_count);
     auto result = s_tile_meshes_.find(hash_value);
     if (result == s_tile_meshes_.end()) {
-        if (s_available_block_indexes_.size() > 0) {
+        if (outer) {
+            // Outer-ring distant tile: pure heightfield geometry — takes
+            // NO cache block (block 0 as a harmless placeholder; grass /
+            // soil-water never runs for outer tiles).
+            auto tile = std::make_shared<TileObject>(
+                device, descriptor_pool, min, max, hash_value, 0u);
+            tile->setOuter(true);
+            s_tile_meshes_[hash_value] = tile;
+        } else if (s_available_block_indexes_.size() > 0) {
             auto block_index = s_available_block_indexes_.back();
             s_available_block_indexes_.pop_back();
             s_tile_meshes_[hash_value] =
@@ -2234,11 +2358,14 @@ std::shared_ptr<renderer::DescriptorSetLayout> TileObject::getTileResDescSetLayo
     return s_tile_res_desc_set_layout_;
 }
 
+// NOTE: these define the TERRAIN MAP's world footprint (see
+// kTerrainMapMeters) — deliberately smaller than kWorldMapSize so the
+// generated maps render at their content's natural scale.
 glm::vec2 TileObject::getWorldMin() {
-    return glm::vec2(-kWorldMapSize / 2.0f);
+    return glm::vec2(-kTerrainMapMeters / 2.0f);
 }
 glm::vec2 TileObject::getWorldRange() {
-    return glm::vec2(kWorldMapSize);
+    return glm::vec2(kTerrainMapMeters);
 }
 
 float TileObject::getMinDistToCamera(const glm::vec2& camera_pos) {
@@ -2440,6 +2567,10 @@ void TileObject::destroyStaticMembers(
     s_grass_snow_layer_.destroy(device);
     s_water_normal_.destroy(device);
     s_water_flow_.destroy(device);
+    for (auto& lod_ib : s_lod_index_buffers_) {
+        lod_ib.destroy(device);
+        lod_ib = renderer::BufferInfo{};
+    }
 }
 
 void TileObject::createMeshBuffers(
@@ -2457,6 +2588,26 @@ void TileObject::createMeshBuffers(
         std::source_location::current(),
         index_buffer_size,
         index_buffer.data());
+
+    // Shared per-LOD index buffers (created once; every tile of a LOD
+    // binds the same topology, positions come from TileParams).
+    if (!s_lod_index_buffers_[0].buffer) {
+        for (size_t l = 0; l < size_t(TileConst::kNumMeshLods); ++l) {
+            auto lod_indices = generateTileMeshIndex(kLodSegmentCounts[l]);
+            auto lod_bytes = static_cast<uint32_t>(
+                sizeof(lod_indices[0]) * lod_indices.size());
+            renderer::Helper::createBuffer(
+                device,
+                SET_2_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+                0,
+                s_lod_index_buffers_[l].buffer,
+                s_lod_index_buffers_[l].memory,
+                std::source_location::current(),
+                lod_bytes,
+                lod_indices.data());
+        }
+    }
 }
 
 void addQuadIndex(
@@ -2608,7 +2759,12 @@ void TileObject::updateTileResDescriptorSet(
     const std::vector<std::shared_ptr<renderer::ImageView>>& temp_tex,
     const std::shared_ptr<renderer::ImageView>& map_mask_tex,
     const std::shared_ptr<renderer::ImageView>& detail_volume_noise_tex,
-    const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex) {
+    const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+    const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
+    uint32_t terrain_detail_table_bytes,
+    const TileVtBindings& vt_bindings) {
 
     for (int dbuf_idx = 0; dbuf_idx < 2; dbuf_idx++) {
         // create a global ibl texture descriptor set.
@@ -2626,7 +2782,12 @@ void TileObject::updateTileResDescriptorSet(
             temp_tex[dbuf_idx],
             map_mask_tex,
             detail_volume_noise_tex,
-            rough_volume_noise_tex);
+            rough_volume_noise_tex,
+            terrain_detail_height_array,
+            terrain_detail_color_array,
+            terrain_detail_table,
+            terrain_detail_table_bytes,
+            vt_bindings);
         device->updateDescriptorSets(tile_res_descs);
     }
 }
@@ -2774,12 +2935,19 @@ void TileObject::draw(
     const glm::uvec2 display_size,
     float delta_t,
     float cur_time) {
-    auto segment_count = static_cast<uint32_t>(TileConst::kSegmentCount);
+    // View-distance mesh LOD: shared per-LOD index buffer + per-tile
+    // segment count; tile.vert snaps edge vertices onto coarser
+    // neighbours (edge_segments_packed_) so LOD transitions are
+    // crack-free.
+    const uint32_t lod = glm::min(
+        lod_, uint32_t(TileConst::kNumMeshLods) - 1u);
+    auto segment_count = kLodSegmentCounts[lod];
 
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::GRAPHICS,
         tile_pipeline);
-    cmd_buf->bindIndexBuffer(index_buffer_.buffer, 0, renderer::IndexType::UINT32);
+    cmd_buf->bindIndexBuffer(
+        s_lod_index_buffers_[lod].buffer, 0, renderer::IndexType::UINT32);
 
     glsl::TileParams tile_params = {};
     tile_params.world_min = getWorldMin();
@@ -2788,11 +2956,16 @@ void TileObject::draw(
     tile_params.range = max_ - min_;
     tile_params.segment_count = segment_count;
     tile_params.inv_segment_count = 1.0f / segment_count;
-    tile_params.offset = 0;
+    tile_params.offset = edge_segments_packed_;
     tile_params.inv_screen_size = glm::vec2(1.0f / display_size.x, 1.0f / display_size.y);
     tile_params.delta_t = delta_t;
     tile_params.time = cur_time;
     tile_params.tile_index = block_idx_;
+    tile_params.vt_albedo_id = s_terrain_vt_albedo_id;
+    // Outer-ring tiles ride slightly BELOW the fine terrain (bias in cm)
+    // so partial overlaps with the inner rings never z-fight — the fine
+    // surface always wins; beyond the fine ring the dip is invisible.
+    tile_params.pad_0 = is_outer_ ? (lod == 3u ? 800u : 150u) : 0u;
     cmd_buf->pushConstants(
         SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
         tile_pipeline_layout,
@@ -2847,6 +3020,7 @@ void TileObject::drawGrass(
     tile_params.delta_t = delta_t;
     tile_params.time = cur_time;
     tile_params.tile_index = block_idx_;
+    tile_params.vt_albedo_id = 0xFFFFFFFFu;   // grass doesn't sample VT
     cmd_buf->pushConstants(
 #if USE_MESH_SHADER
         SET_2_FLAG_BITS(ShaderStage, MESH_BIT_EXT, FRAGMENT_BIT),
@@ -2907,10 +3081,24 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
     // remove all the tiles outside of cache zone.
     for (auto& tile : s_tile_meshes_) {
         if (tile.second) {
-            bool inside = tile.second->validTileBySize(
-                min_cache_tile_idx,
-                max_cache_tile_idx,
-                tile_size);
+            bool inside;
+            if (tile.second->isOuter()) {
+                // Outer-ring distant tiles: keep while the camera stays
+                // within ~half a ring step of their coverage band.
+                const glm::vec2 center =
+                    (tile.second->min_ + tile.second->max_) * 0.5f;
+                const float sz = tile.second->getWorldSize();
+                const float d = std::max(
+                    std::abs(center.x - camera_pos.x),
+                    std::abs(center.y - camera_pos.y));
+                const float keep = (sz <= 512.0f) ? 4608.0f : 18432.0f;
+                inside = d <= keep + sz;
+            } else {
+                inside = tile.second->validTileBySize(
+                    min_cache_tile_idx,
+                    max_cache_tile_idx,
+                    tile_size);
+            }
 
             if (!inside) {
                 to_delete_tiles.push_back(tile.second->getHash());
@@ -2919,7 +3107,11 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
     }
 
     for (auto& hash_value : to_delete_tiles) {
-        s_available_block_indexes_.push_back(s_tile_meshes_[hash_value]->block_idx_);
+        // Outer tiles never took a cache block — nothing to return.
+        if (!s_tile_meshes_[hash_value]->isOuter()) {
+            s_available_block_indexes_.push_back(
+                s_tile_meshes_[hash_value]->block_idx_);
+        }
         auto search_result = s_tile_meshes_.find(hash_value);
         assert(search_result != s_tile_meshes_.end());
         search_result->second->destroy(device);
@@ -2940,28 +3132,120 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
         }
     }
 
+    // ── View-distance mesh LOD ──────────────────────────────────────────
+    // Pass 1: pick each tile's LOD from its distance to the camera.
+    // Thresholds roughly double so adjacent tiles differ by at most one
+    // or two LODs; the edge snap in tile.vert handles any delta anyway.
+    for (auto& blk : blocks) {
+        if (!blk) continue;
+        const float d = blk->getMinDistToCamera(camera_pos);
+        uint32_t lod;
+        if      (d < 384.0f)  lod = 0;   // 1 m grid
+        else if (d < 896.0f)  lod = 1;   // 2 m
+        else if (d < 1920.0f) lod = 2;   // 4 m
+        else                  lod = 3;   // 8 m
+        blk->setLod(lod);
+    }
+
+    // Pass 2: hand every tile its 4 edge-neighbours' SEGMENT COUNTS
+    // (packed one byte per edge: x-, x+, y-, y+) so tile.vert can snap
+    // shared-edge vertices onto the coarser side — crack-free stitching.
     int32_t i = 0;
     auto row_size = cache_tile_size * 2 + 1;
     for (int y = min_cache_tile_idx.y; y <= max_cache_tile_idx.y; y++) {
         for (int x = min_cache_tile_idx.x; x <= max_cache_tile_idx.x; x++) {
-            glm::ivec4 neighbors = glm::ivec4(
-                x == min_cache_tile_idx.x ? -1 : (blocks[i - 1] ? blocks[i - 1]->block_idx_ : -1),
-                x == max_cache_tile_idx.x ? -1 : (blocks[i + 1] ? blocks[i + 1]->block_idx_ : -1),
-                y == min_cache_tile_idx.y ? -1 : (blocks[i - row_size] ? blocks[i - row_size]->block_idx_ : -1),
-                y == max_cache_tile_idx.y ? -1 : (blocks[i + row_size] ? blocks[i + row_size]->block_idx_ : -1));
             if (blocks[i]) {
-                blocks[i]->setNeighbors(neighbors);
+                auto& self = blocks[i];
+                const uint32_t own_seg = kLodSegmentCounts[self->getLod()];
+                auto edge_seg = [&](const std::shared_ptr<TileObject>& nb)
+                    -> uint32_t {
+                    return nb ? kLodSegmentCounts[nb->getLod()] : own_seg;
+                };
+                const uint32_t seg_xn = (x == min_cache_tile_idx.x)
+                    ? own_seg : edge_seg(blocks[i - 1]);
+                const uint32_t seg_xp = (x == max_cache_tile_idx.x)
+                    ? own_seg : edge_seg(blocks[i + 1]);
+                const uint32_t seg_yn = (y == min_cache_tile_idx.y)
+                    ? own_seg : edge_seg(blocks[i - row_size]);
+                const uint32_t seg_yp = (y == max_cache_tile_idx.y)
+                    ? own_seg : edge_seg(blocks[i + row_size]);
+                self->setEdgeSegmentsPacked(
+                    (seg_xn & 0xFF) |
+                    ((seg_xp & 0xFF) << 8) |
+                    ((seg_yn & 0xFF) << 16) |
+                    ((seg_yp & 0xFF) << 24));
+                // neighbors_ keeps the block indices (legacy, unread).
+                self->setNeighbors(glm::ivec4(
+                    x == min_cache_tile_idx.x ? -1 : (blocks[i - 1] ? blocks[i - 1]->block_idx_ : -1),
+                    x == max_cache_tile_idx.x ? -1 : (blocks[i + 1] ? blocks[i + 1]->block_idx_ : -1),
+                    y == min_cache_tile_idx.y ? -1 : (blocks[i - row_size] ? blocks[i - row_size]->block_idx_ : -1),
+                    y == max_cache_tile_idx.y ? -1 : (blocks[i + row_size] ? blocks[i + row_size]->block_idx_ : -1)));
             }
             i++;
         }
     }
 
+    // ── Outer rings: distant terrain at coarser tile sizes ──────────────
+    // Ring 1: 512 m tiles out to ~±4.6 km (4 m..16 m grid); ring 2:
+    // 2048 m tiles out to ~±18 km (137 m grid, horizon fill).  Tiles
+    // fully covered by the finer region are skipped.  Heights come from
+    // the same global rock layer, so surfaces agree; ring boundaries can
+    // show sub-meter T-junction seams at >1 km — acceptable for now.
+    const glm::vec2 visi_min = glm::vec2(min_visi_tile_idx) * tile_size
+                               - tile_size * 0.5f;
+    const glm::vec2 visi_max = glm::vec2(max_visi_tile_idx) * tile_size
+                               + tile_size * 0.5f;
+    auto addRing = [&](float ring_tile_m, int ring_count,
+                       const glm::vec2& skip_min, const glm::vec2& skip_max,
+                       uint32_t lod) {
+        const glm::ivec2 c = glm::ivec2(glm::floor(camera_pos / ring_tile_m));
+        for (int y = c.y - ring_count; y <= c.y + ring_count; ++y) {
+            for (int x = c.x - ring_count; x <= c.x + ring_count; ++x) {
+                const glm::vec2 tmin = glm::vec2(x, y) * ring_tile_m;
+                const glm::vec2 tmax = tmin + ring_tile_m;
+                // Skip if fully inside the finer region.
+                if (tmin.x >= skip_min.x && tmin.y >= skip_min.y &&
+                    tmax.x <= skip_max.x && tmax.y <= skip_max.y)
+                    continue;
+                // Keep inside the world.
+                if (tmax.x < -kWorldMapSize * 0.5f ||
+                    tmax.y < -kWorldMapSize * 0.5f ||
+                    tmin.x > kWorldMapSize * 0.5f ||
+                    tmin.y > kWorldMapSize * 0.5f)
+                    continue;
+                auto tile = addOneTile(device, descriptor_pool,
+                                       tmin, tmax, /*outer*/ true);
+                if (tile) {
+                    tile->setLod(lod);
+                    const uint32_t seg = kLodSegmentCounts[lod];
+                    tile->setEdgeSegmentsPacked(
+                        (seg & 0xFF) | ((seg & 0xFF) << 8) |
+                        ((seg & 0xFF) << 16) | ((seg & 0xFF) << 24));
+                }
+            }
+        }
+    };
+    // 512 m tiles: ±9 => ~±4.6 km coverage, 31 segs = 16 m grid
+    // (uniform within the ring => no intra-ring T-junctions).
+    addRing(512.0f, 9, visi_min, visi_max, /*lod*/ 2);
+    const glm::vec2 ring1_min =
+        (glm::floor(camera_pos / 512.0f) - glm::vec2(9.0f)) * 512.0f;
+    const glm::vec2 ring1_max =
+        (glm::floor(camera_pos / 512.0f) + glm::vec2(10.0f)) * 512.0f;
+    // 2048 m tiles: ±9 => ~±18 km, 15 segs (horizon fill).
+    addRing(2048.0f, 9, ring1_min, ring1_max, /*lod*/ 3);
+
     for (auto& tile : s_tile_meshes_) {
         if (tile.second) {
-            bool inside = tile.second->validTileBySize(
-                min_visi_tile_idx,
-                max_visi_tile_idx,
-                tile_size);
+            bool inside;
+            if (tile.second->isOuter()) {
+                inside = true;   // outer tiles draw whenever cached
+            } else {
+                inside = tile.second->validTileBySize(
+                    min_visi_tile_idx,
+                    max_visi_tile_idx,
+                    tile_size);
+            }
 
             if (inside) {
                 visible_tiles.push_back(tile.second);
@@ -2970,6 +3254,7 @@ std::vector<std::shared_ptr<TileObject>> TileObject::updateAllTiles(
     }
 
     for (auto& tile : visible_tiles) {
+        if (tile->isOuter()) continue;   // no grass on distant ring tiles
         renderer::DrawIndexedIndirectCommand indirect_draw_cmd_buffer;
         auto ratio = glm::clamp((tile->getMinDistToCamera(camera_pos) - 256.0f) / 1024.0f, 0.0f, 1.0f);
         auto min_num_grass = static_cast<float>(TileConst::kMinNumGrass);
@@ -2997,7 +3282,10 @@ void TileObject::destroyAllTiles(
         // destroys all tiles and expects updateAllTiles() to re-allocate
         // them next frame — without this the free list stays empty and no
         // tile (mesh) is ever created again.  Harmless at shutdown.
-        s_available_block_indexes_.push_back(tile_mesh.second->block_idx_);
+        // (Outer-ring tiles never took a block.)
+        if (!tile_mesh.second->isOuter()) {
+            s_available_block_indexes_.push_back(tile_mesh.second->block_idx_);
+        }
         tile_mesh.second->destroy(device);
     }
     s_tile_meshes_.clear();
