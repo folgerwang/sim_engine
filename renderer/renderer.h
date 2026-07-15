@@ -507,6 +507,22 @@ public:
         void* pixels,
         const std::source_location& src_location);
 
+    // Read back a presented swapchain image into CPU memory.  Unlike
+    // dumpTextureImage (which starts from UNDEFINED and leaves the image in
+    // SHADER_READ_ONLY), this preserves the existing contents by treating the
+    // current layout as PRESENT_SRC_KHR and restores it to PRESENT_SRC_KHR
+    // afterwards so the image can be presented again.  `pixels` receives
+    // image_size.x * image_size.y * bytes_per_pixel bytes in the swapchain's
+    // native channel order (typically BGRA for B8G8R8A8 surfaces).
+    static void dumpSwapchainImage(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<Image>& swapchain_image,
+        Format format,
+        const glm::uvec3& image_size,
+        const uint32_t& bytes_per_pixel,
+        void* pixels,
+        const std::source_location& src_location);
+
     static void create3DTextureImage(
         const std::shared_ptr<renderer::Device>& device,
         Format depth_format,

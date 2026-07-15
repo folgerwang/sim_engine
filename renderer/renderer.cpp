@@ -685,6 +685,59 @@ void Helper::dumpTextureImage(
     device->freeMemory(staging_buffer_memory);
 }
 
+void Helper::dumpSwapchainImage(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<Image>& swapchain_image,
+    Format format,
+    const glm::uvec3& image_size,
+    const uint32_t& bytes_per_pixel,
+    void* pixels,
+    const std::source_location& src_location) {
+
+    VkDeviceSize buffer_size = static_cast<VkDeviceSize>(
+        image_size.x * image_size.y * image_size.z * bytes_per_pixel);
+
+    std::shared_ptr<Buffer> staging_buffer;
+    std::shared_ptr<DeviceMemory> staging_buffer_memory;
+    device->createBuffer(
+        buffer_size,
+        SET_FLAG_BIT(BufferUsage, TRANSFER_DST_BIT),
+        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        0,
+        staging_buffer,
+        staging_buffer_memory,
+        src_location);
+
+    auto cmd_buf = device->setupTransientCommandBuffer();
+    // The image is currently presentable — transition to TRANSFER_SRC
+    // without discarding its contents (do NOT use UNDEFINED as old layout).
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        swapchain_image,
+        format,
+        ImageLayout::PRESENT_SRC_KHR,
+        ImageLayout::TRANSFER_SRC_OPTIMAL);
+    vk::helper::copyImageToBuffer(
+        cmd_buf,
+        swapchain_image,
+        staging_buffer,
+        image_size);
+    // Restore the presentable layout so the swapchain image can be reused.
+    vk::helper::transitionImageLayout(
+        cmd_buf,
+        swapchain_image,
+        format,
+        ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ImageLayout::PRESENT_SRC_KHR);
+    device->submitAndWaitTransientCommandBuffer();
+
+    device->dumpBufferMemory(staging_buffer_memory, buffer_size, pixels);
+
+    device->destroyBuffer(staging_buffer);
+    device->freeMemory(staging_buffer_memory);
+}
+
 void Helper::create3DTextureImage(
     const std::shared_ptr<renderer::Device>& device,
     Format format,

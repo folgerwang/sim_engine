@@ -2642,6 +2642,28 @@ void transitionImageLayout(
         source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         destination_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     }
+    // ── Swapchain readback (screenshot / render-buffer dump) ─────────────
+    // A presented swapchain image sits in PRESENT_SRC_KHR.  To copy it into
+    // a host-visible staging buffer we transition it to TRANSFER_SRC and,
+    // once the copy is done, restore it to PRESENT_SRC so the image can be
+    // presented again.  Both directions are gated on the whole pipeline so
+    // the barrier is correct regardless of what produced/consumes the image.
+    else if (old_layout == renderer::ImageLayout::PRESENT_SRC_KHR &&
+        new_layout == renderer::ImageLayout::TRANSFER_SRC_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    else if (old_layout == renderer::ImageLayout::TRANSFER_SRC_OPTIMAL &&
+        new_layout == renderer::ImageLayout::PRESENT_SRC_KHR) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+
+        source_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destination_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    }
     else {
         throw std::invalid_argument("unsupported layout transition!");
     }

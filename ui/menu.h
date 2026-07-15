@@ -138,6 +138,10 @@ class Menu {
     // view heightmap + torch erosion conversion); polls for the output
     // PNG / "<out>.err" — same contract as the FLUX image popup.
     bool        terrain_gen_popup_open_  = false;
+    // Last value returned by draw() (camera focus/pause).  Reused when draw()
+    // is called with hide_ui=true so a clean-capture frame doesn't disturb
+    // camera-pause state.
+    bool        last_in_focus_           = false;
     bool        terrain_apply_request_   = false; // auto + "Rebuild Terrain Now"
     char        terrain_prompt_buf_[512] = {};
     bool        terrain_gen_install_     = true;
@@ -1953,6 +1957,10 @@ public:
         const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
         const std::shared_ptr<renderer::RenderPass>& render_pass);
 
+    // When hide_ui is true, the ImGui frame is still begun and the final
+    // (present-layout) render pass still runs, but NO panels/overlays are
+    // built — the presented frame shows only the 3D scene.  Used by the
+    // terrain verify loop to capture a clean, UI-free viewport.
     bool draw(
         const std::shared_ptr<renderer::CommandBuffer>& command_buffer,
         const std::shared_ptr<renderer::RenderPass>& render_pass,
@@ -1960,7 +1968,8 @@ public:
         const glm::uvec2& screen_size,
         const std::shared_ptr<scene_rendering::Skydome>& skydome,
         bool& dump_volume_noise,
-        const float& delta_t);
+        const float& delta_t,
+        bool hide_ui = false);
 
     void destroy();
 

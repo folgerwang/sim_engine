@@ -880,11 +880,30 @@ bool Menu::draw(
     const glm::uvec2& screen_size,
     const std::shared_ptr<scene_rendering::Skydome>& skydome,
     bool& dump_volume_noise,
-    const float& delta_t) {
+    const float& delta_t,
+    bool hide_ui/* = false*/) {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+
+    // ── Clean-viewport capture path (terrain verify loop) ─────────────
+    // Begin/end the ImGui frame and run the final present-layout render
+    // pass with an EMPTY draw list so the swapchain keeps the 3D scene
+    // (composited earlier in drawScene) but gains no UI overlay.  We must
+    // still run the pass: it is what transitions the swapchain image to
+    // PRESENT_SRC_KHR.  Returning early here skips ALL panel building.
+    if (hide_ui) {
+        std::vector<er::ClearValue> clear_values;
+        clear_values.resize(2);
+        clear_values[0].color = { 0.0f, 0.0f, 0.0f, 1.0f };
+        clear_values[1].depth_stencil = { 1.0f, 0 };
+        cmd_buf->beginRenderPass(render_pass, framebuffer, screen_size,
+                                 clear_values);
+        renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
+        cmd_buf->endRenderPass();
+        return last_in_focus_;
+    }
 
     // ── UE-style editor dock layout ───────────────────────────────────
     // Drawn first (as a transparent pass-through host) so the 3D scene
@@ -3850,6 +3869,7 @@ bool Menu::draw(
         ImGui::RenderPlatformWindowsDefault();
     }
 
+    last_in_focus_ = in_focus;   // remembered for hide_ui capture frames
     return in_focus;
 }
 
