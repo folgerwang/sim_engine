@@ -142,6 +142,34 @@ void CameraObject::updateCamera(
     const bool& camera_rot_update) {
 
     if (!m_is_ortho_) {
+        // ── Hold-to-accelerate fly camera ────────────────────────────
+        // Holding a movement key ramps the speed: the first ~0.35 s move
+        // at base speed (precise nudges stay precise), then a smooth
+        // quadratic ramp climbs to 8x over the next ~2.5 s so crossing a
+        // 4 km map doesn't take a minute.  Releasing (or switching to a
+        // non-movement key) resets instantly to base speed.
+        const bool moving =
+            input_key == GLFW_KEY_W || input_key == GLFW_KEY_S ||
+            input_key == GLFW_KEY_A || input_key == GLFW_KEY_D;
+        if (m_base_camera_speed_ < 0.0f) {
+            m_base_camera_speed_ = m_view_camera_params_.camera_speed;
+        }
+        if (moving) {
+            m_move_hold_time_ += delta_t;
+        } else {
+            m_move_hold_time_ = 0.0f;
+        }
+        constexpr float kRampDelay = 0.35f;   // s at base speed first
+        constexpr float kRampTime  = 2.5f;    // s to reach full speed
+        constexpr float kMaxMult   = 8.0f;    // top speed factor
+        float mult = 1.0f;
+        if (m_move_hold_time_ > kRampDelay) {
+            const float t = std::min(
+                (m_move_hold_time_ - kRampDelay) / kRampTime, 1.0f);
+            mult = 1.0f + (kMaxMult - 1.0f) * t * t;
+        }
+        m_view_camera_params_.camera_speed = m_base_camera_speed_ * mult;
+
         m_view_camera_params_.camera_follow_dist = 5.0f;
         m_view_camera_params_.key = input_key;
         m_view_camera_params_.frame_count = frame_count;

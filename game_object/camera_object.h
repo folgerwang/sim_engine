@@ -26,6 +26,13 @@ protected:
     std::shared_ptr<ego::ViewCamera> m_view_camera_;
     std::shared_ptr<er::DescriptorSet> m_view_camera_desc_set_;
     bool m_is_ortho_ = false;
+    // ── Hold-to-accelerate fly camera state ──────────────────────────
+    // Seconds a movement key (WASD) has been continuously held; drives a
+    // speed ramp in updateCamera.  -1 base speed = "capture on first use"
+    // (the concrete camera constructors set camera_speed after this
+    // object is built, so it can't be captured at construction time).
+    float m_move_hold_time_    = 0.0f;
+    float m_base_camera_speed_ = -1.0f;
 
 public:
     CameraObject(
