@@ -83,6 +83,124 @@ layout(set = TILE_PARAMS_SET, binding = SRC_TEMP_TEX_INDEX) uniform sampler3D sr
 layout(set = TILE_PARAMS_SET, binding = DETAIL_NOISE_TEXTURE_INDEX) uniform sampler3D src_detail_noise_tex;
 layout(set = TILE_PARAMS_SET, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampler3D src_rough_noise_tex;
 
+// ─────────────────────────────────────────────────────────────────────
+//  TERRAIN MATERIAL SYSTEM
+// ─────────────────────────────────────────────────────────────────────
+// Splat-style layer blend. The generated map supplies COLOUR but no
+// surface character, so close up the terrain read as a blurry stretched
+// photo ("blocky"). Here each surface type contributes its own
+// high-frequency detail, and the ML albedo is demoted to a low-frequency
+// TINT — the world keeps its generated colour identity and gains texture.
+//
+//  weights : ML albedo colour (layout-aligned with the generator's
+//            segmentation by construction) re-weighted by SLOPE and
+//            ALTITUDE — steep ground sheds soil/snow to rock, etc.
+//  detail  : SOLID 3D noise sampled at WORLD position, so there is no
+//            projection to seam on cliffs (triplanar for free) and no
+//            visible tiling grid — which is what made the old surface
+//            look like blocks.
+//  fade    : detail attenuates with view distance so it never aliases
+//            into shimmer at range.
+
+// fBm from the bound solid-noise volume; p is a world-space position.
+float terrainSolidFbm(vec3 p, float scale) {
+    float n  = 1.00f * texture(src_detail_noise_tex, p * scale).x;
+    n       += 0.50f * texture(src_detail_noise_tex, p * scale * 2.13f).x;
+    n       += 0.25f * texture(src_detail_noise_tex, p * scale * 4.79f).x;
+    return n * (1.0f / 1.75f);
+}
+
+// Material weights packed as (grass, rock, sand, snow), normalised.
+vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
+    float luma = dot(macro, vec3(0.299f, 0.587f, 0.114f));
+    float mx   = max(macro.r, max(macro.g, macro.b));
+    float mn   = min(macro.r, min(macro.g, macro.b));
+    float sat  = (mx - mn) / max(mx, 1e-4f);
+    float green = macro.g - 0.5f * (macro.r + macro.b);
+
+    // colour-driven base weights
+    float w_grass = smoothstep(0.010f, 0.090f, green);
+    float w_snow  = smoothstep(0.60f, 0.80f, luma)
+                  * (1.0f - smoothstep(0.08f, 0.22f, sat));
+    float w_sand  = smoothstep(0.04f, 0.16f, macro.r - macro.b)
+                  * smoothstep(0.30f, 0.50f, luma)
+                  * (1.0f - w_grass);
+    // rock takes whatever the others don't claim
+    float w_rock  = clamp(1.0f - (w_grass + w_snow + w_sand), 0.0f, 1.0f);
+    // ...plus bare low-saturation mid-luma ground reads as rock outright
+    w_rock += (1.0f - smoothstep(0.05f, 0.18f, sat)) * 0.35f
+            * (1.0f - w_snow);
+
+    // ── slope override: steep faces can't hold soil, sand or snow ──
+    float steep = smoothstep(0.35f, 0.72f, slope01);
+    w_grass *= (1.0f - steep);
+    w_sand  *= (1.0f - steep * 1.15f);
+    w_snow  *= (1.0f - steep * 0.85f);
+    w_rock  += steep * 1.25f;
+
+    // ── altitude: snow line only where it is already pale/cold ─────
+    float high = smoothstep(120.0f, 190.0f, alt_m);
+    w_snow += high * (1.0f - steep) * 0.5f * smoothstep(0.35f, 0.6f, luma);
+
+    vec4 w = max(vec4(w_grass, w_rock, w_sand, w_snow), vec4(0.0f));
+    return w / max(w.x + w.y + w.z + w.w, 1e-4f);
+}
+
+// Per-material high-frequency detail. Returns a multiplier around 1.0
+// (albedo modulation) and writes the blended roughness.
+vec3 terrainMaterialDetail(vec3 pos_ws, vec4 w, float fade,
+                           out float roughness) {
+    // metre-scale features per material (bigger scale = finer grain)
+    float n_grass = terrainSolidFbm(pos_ws, 0.55f);   // ~2 m clumping
+    float n_rock  = terrainSolidFbm(pos_ws, 0.16f);   // ~6 m strata
+    float n_rockf = texture(src_detail_noise_tex, pos_ws * 1.30f).x;
+    float n_sand  = texture(src_detail_noise_tex, pos_ws * 2.20f).x;
+    float n_snow  = terrainSolidFbm(pos_ws, 0.42f);
+
+    // contrast per material: rock is the most varied, snow the least
+    float d_grass = 1.0f + (n_grass - 0.5f) * 0.55f;
+    float d_rock  = 1.0f + ((n_rock - 0.5f) * 0.70f
+                          + (n_rockf - 0.5f) * 0.30f);
+    float d_sand  = 1.0f + (n_sand  - 0.5f) * 0.22f;
+    float d_snow  = 1.0f + (n_snow  - 0.5f) * 0.14f;
+
+    float m = w.x * d_grass + w.y * d_rock + w.z * d_sand + w.w * d_snow;
+    m = mix(1.0f, m, fade);
+
+    // slight per-material hue push so materials read apart even where
+    // the macro map is flat (grass greener, rock cooler, sand warmer)
+    vec3 tint = w.x * vec3(0.94f, 1.06f, 0.90f)
+              + w.y * vec3(1.00f, 0.99f, 1.02f)
+              + w.z * vec3(1.08f, 1.02f, 0.88f)
+              + w.w * vec3(1.00f, 1.01f, 1.04f);
+    tint = mix(vec3(1.0f), tint, fade * 0.75f);
+
+    roughness = clamp(w.x * 0.93f + w.y * 0.76f
+                    + w.z * 0.95f + w.w * 0.58f, 0.05f, 1.0f);
+    // roughness breakup so specular doesn't sheet uniformly
+    roughness = clamp(roughness
+        + (texture(src_rough_noise_tex, pos_ws * 0.35f).x - 0.5f)
+          * 0.10f * fade, 0.05f, 1.0f);
+
+    return vec3(m) * tint;
+}
+
+// Bump the shading normal with the same solid noise field, so the
+// detail is lit rather than being flat painted-on variation.
+vec3 terrainMaterialNormal(vec3 pos_ws, vec3 n, vec4 w, float fade) {
+    if (fade <= 0.001f) return n;
+    // amplitude: rock bumps hardest, snow barely at all
+    float amp = (w.x * 0.35f + w.y * 0.85f + w.z * 0.20f + w.w * 0.10f)
+              * fade;
+    if (amp <= 0.001f) return n;
+    const float e = 0.35f;                       // metres
+    float c  = terrainSolidFbm(pos_ws, 0.55f);
+    float dx = terrainSolidFbm(pos_ws + vec3(e, 0.0f, 0.0f), 0.55f) - c;
+    float dz = terrainSolidFbm(pos_ws + vec3(0.0f, 0.0f, e), 0.55f) - c;
+    vec3 bumped = normalize(n + vec3(-dx, 0.0f, -dz) * amp * 6.0f);
+    return normalize(mix(n, bumped, 0.85f));
+}
+
 void main() {
     vec3 pos = in_data.vertex_position;
     // Shading normal from the ACTUAL rendered heightfield: base rock
@@ -184,12 +302,27 @@ void main() {
         normal = normalize(mix(normal, vec3(0.0f, 1.0f, 0.0f), sfade));
     }
 
-    MaterialInfo material_info;
-    material_info.baseColor = albedo;
-
     vec3 view_vec = camera_info.position.xyz - in_data.vertex_position;
     float view_dist = length(view_vec);
     vec3 view = normalize(view_vec);
+
+    // ── Terrain material layers ──────────────────────────────────────
+    // Applied AFTER the macro colour is resolved (VT / map-mask / 1 m
+    // tiles) so it modulates whatever the generator produced, and
+    // attenuated with distance so high-frequency detail never aliases
+    // into shimmer on far hillsides.
+    float mat_fade = 1.0f - smoothstep(kTerrainMatDetailNear,
+                                       kTerrainMatDetailFar, view_dist);
+    float mat_rough = 0.85f;
+    if (mat_fade > 0.001f) {
+        float slope01 = clamp(1.0f - normal.y, 0.0f, 1.0f);
+        vec4 mat_w = terrainMaterialWeights(albedo, slope01, pos.y);
+        albedo *= terrainMaterialDetail(pos, mat_w, mat_fade, mat_rough);
+        normal  = terrainMaterialNormal(pos, normal, mat_w, mat_fade);
+    }
+
+    MaterialInfo material_info;
+    material_info.baseColor = albedo;
 
     vec3 f_diffuse = vec3(0);
     vec3 f_specular = vec3(0);
@@ -215,8 +348,14 @@ void main() {
     float ior = 1.5;
     float f0_ior = 0.04;
 
-    material_info.metallic = 0.3f;//material.metallic_factor;
-    material_info.perceptualRoughness = 0.8f;//material.roughness_factor;
+    // Terrain is DIELECTRIC: soil, rock, sand and snow have no metallic
+    // component.  The old 0.3 metallic drained the diffuse response and
+    // tinted the specular with the base colour — that is a large part of
+    // why the surface read as flat plastic sheeting rather than ground.
+    material_info.metallic = 0.0f;
+    // Roughness now comes from the material blend (rock polishes toward
+    // 0.76, snow to 0.58, loose grass/sand stay ~0.95).
+    material_info.perceptualRoughness = mat_rough;
 
     // Achromatic f0 based on IOR.
     vec3 f0 = vec3(f0_ior);

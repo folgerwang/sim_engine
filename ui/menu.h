@@ -983,6 +983,10 @@ public:
     bool         delete_open_   = false;
     bool         delete_is_dir_ = false;
     std::vector<std::string> delete_paths_;        // multi-select delete set
+    // Folder-tree "Clear" action: empties a folder's CONTENTS but keeps
+    // the folder itself.  Confirmed through a modal (destructive).
+    std::string  clear_target_;
+    bool         clear_open_    = false;
     // Streaming-import status (pushed by the app each frame while its
     // background copy thread runs) — drawn as a progress bar at the top of
     // the Content Browser until the import finishes.

@@ -415,6 +415,12 @@
 // plain over this band.
 #define kTerrainSurroundHeightMeters            18.0f
 #define kTerrainSurroundFadeMeters              768.0f
+// Terrain material-layer detail band (tile.frag): full-strength surface
+// detail out to _NEAR, faded out by _FAR.  Beyond that the macro albedo
+// carries the surface alone — high-frequency detail at range only buys
+// specular shimmer under camera motion.
+#define kTerrainMatDetailNear                   180.0f
+#define kTerrainMatDetailFar                    900.0f
 #define kDetailTileMeters                       (kTerrainMapMeters / 16.0f)  // 256 m
 #define kDetailTilesPerSide                     16
 // 2049: texel centers on integer world meters, so the shared border

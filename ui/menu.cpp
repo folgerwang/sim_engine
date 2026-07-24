@@ -5818,6 +5818,21 @@ void Menu::drawFolderTree(const std::string& dir, int depth,
     // Click on the label (not the open/close arrow) selects the folder.
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
         cur_dir = dir;
+    // Right-click a folder → folder actions.  The popup id is derived from
+    // the PATH (not the display name) so sibling folders that share a name
+    // at different depths don't collide on one popup.
+    if (ImGui::BeginPopupContextItem(dir.c_str())) {
+        ImGui::TextDisabled("%s", name.c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Clear")) {
+            clear_target_ = dir;
+            clear_open_ = true;      // confirmation modal, drawn below
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Delete every item inside this folder\n"
+                              "(the folder itself is kept)");
+        ImGui::EndPopup();
+    }
     if (open && !subs.empty()) {
         for (auto& s : subs)
             drawFolderTree(s.path().string(), depth + 1, cur_dir);
@@ -7036,6 +7051,101 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 ImGui::CloseCurrentPopup();
             }
             if (del_cancel) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        // ── Clear Folder dialog (folder-tree right-click → "Clear") ───────
+        // Empties a folder's CONTENTS and keeps the folder.  Destructive and
+        // not undoable, so it is confirmed, states the exact count, and names
+        // the folder being emptied.
+        if (clear_open_) { ImGui::OpenPopup("Clear Folder##cb"); clear_open_ = false; }
+        if (ImGui::BeginPopupModal("Clear Folder##cb", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            const fs::path ctgt(clear_target_);
+            // Count what would go (top-level entries; hidden caches included).
+            int n_files = 0, n_dirs = 0;
+            {
+                std::error_code cec;
+                for (auto it = fs::directory_iterator(ctgt, cec);
+                     !cec && it != fs::directory_iterator(); ++it) {
+                    std::error_code d2;
+                    if (it->is_directory(d2)) ++n_dirs; else ++n_files;
+                }
+            }
+            ImGui::Text("Clear '%s'?", ctgt.filename().string().c_str());
+            ImGui::TextDisabled("%s", clear_target_.c_str());
+            ImGui::Spacing();
+            if (n_files == 0 && n_dirs == 0) {
+                ImGui::TextDisabled("The folder is already empty.");
+            } else {
+                ImGui::Text("%d file%s and %d subfolder%s will be deleted.",
+                            n_files, n_files == 1 ? "" : "s",
+                            n_dirs,  n_dirs  == 1 ? "" : "s");
+                ImGui::TextDisabled(
+                    "Everything inside is removed permanently; the folder\n"
+                    "itself is kept.  This cannot be undone.\n"
+                    "Objects already placed in the scene keep rendering,\n"
+                    "but will fail to load after a scene reload.");
+            }
+            ImGui::Spacing();
+            const bool clr_empty = (n_files == 0 && n_dirs == 0);
+            if (clr_empty) ImGui::BeginDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
+            const bool clr_ok = ImGui::Button("Clear", ImVec2(120, 0));
+            ImGui::PopStyleColor();
+            if (clr_empty) ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool clr_cancel = ImGui::Button("Cancel", ImVec2(120, 0));
+
+            if (clr_ok && !clear_target_.empty()) {
+                int removed = 0, failed = 0;
+                std::vector<std::string> victims;
+                {
+                    std::error_code cec;
+                    for (auto it = fs::directory_iterator(ctgt, cec);
+                         !cec && it != fs::directory_iterator(); ++it)
+                        victims.push_back(it->path().string());
+                }
+                for (const auto& vp : victims) {
+                    std::error_code rec;
+                    fs::remove_all(fs::path(vp), rec);
+                    if (rec) {
+                        ++failed;
+                        EditorLog::get().push("[clear] failed: " +
+                            fs::path(vp).filename().string() +
+                            " — " + rec.message());
+                    } else {
+                        ++removed;
+                    }
+                    // drop caches that referenced the removed path
+                    asset_children_cache_.erase(vp);
+                    auto itc = thumb_cache_.find(vp);
+                    if (itc != thumb_cache_.end()) {
+                        if (itc->second.info)
+                            retired_thumbs_.push_back(itc->second.info);
+                        thumb_cache_.erase(itc);
+                    }
+                    content_selected_.erase(vp);
+                }
+                EditorLog::get().push("[clear] '" +
+                    ctgt.filename().string() + "': removed " +
+                    std::to_string(removed) + " item(s)" +
+                    (failed ? (", " + std::to_string(failed) + " failed")
+                            : std::string()));
+                // If the browser was inside a now-deleted subfolder, walk it
+                // back to the folder we just cleared.
+                if (cur_dir.rfind(clear_target_, 0) == 0 &&
+                    cur_dir != clear_target_)
+                    cur_dir = clear_target_;
+                content_sel_anchor_.clear();
+                clear_target_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            if (clr_cancel) {
+                clear_target_.clear();
+                ImGui::CloseCurrentPopup();
+            }
             ImGui::EndPopup();
         }
 
