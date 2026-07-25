@@ -419,8 +419,13 @@
 // detail out to _NEAR, faded out by _FAR.  Beyond that the macro albedo
 // carries the surface alone — high-frequency detail at range only buys
 // specular shimmer under camera motion.
-#define kTerrainMatDetailNear                   180.0f
-#define kTerrainMatDetailFar                    900.0f
+// NOTE these must stay generous: the terrain macro albedo is virtual-
+// textured but CLAMPED to mip 1 (8 m/texel — see tile.frag), so beyond
+// the 1 m detail-tile ring the raw surface is literally 8 m blocks.  The
+// material layers are what break those texels up, so they need to reach
+// as far as the terrain is legible, not just the near field.
+#define kTerrainMatDetailNear                   600.0f
+#define kTerrainMatDetailFar                    2600.0f
 #define kDetailTileMeters                       (kTerrainMapMeters / 16.0f)  // 256 m
 #define kDetailTilesPerSide                     16
 // 2049: texel centers on integer world meters, so the shared border

@@ -671,6 +671,11 @@ public:
     bool player_create_request_ = false; // "Add Player Object"
     bool bgm_create_request_    = false; // "Add BGM Object"
     bool light_create_request_  = false; // "Add Point Light" (.rwlight)
+    // Outliner delete: editor_objects_ index awaiting removal, -1 = none.
+    int  delete_object_request_ = -1;
+    // Confirmation modal state for that delete.
+    int  outliner_delete_idx_   = -1;
+    bool outliner_delete_open_  = false;
     bool collision_create_request_ = false; // "Add Collision Map"
     // Player "Skeleton Mesh" assignment (Details combo): scene index of
     // the player row + the character model path ("" = clear the mesh).
@@ -1282,6 +1287,24 @@ public:
     // repeat/volume in its Details panel.
     bool consumeCreateBgmRequest() {
         if (bgm_create_request_) { bgm_create_request_ = false; return true; }
+        return false;
+    }
+    // Outliner "Delete": remove a scene object.  The Outliner could only
+    // ever ADD rows — there was no way to take one back out, so a bad
+    // import (or a duplicated terrain PCG row) stuck around for the rest
+    // of the session.  Carries the editor_objects_ index the user acted
+    // on; the app maps it to its own scene/imported lists and erases it.
+    bool consumeDeleteObjectRequest(int& out_index) {
+        if (delete_object_request_ >= 0) {
+            out_index = delete_object_request_;
+            delete_object_request_ = -1;
+            // The row is about to disappear and every later index shifts
+            // down, so drop the selection rather than leave it dangling on
+            // whatever object slides into this slot.
+            editor_selected_ = -1;
+            editor_selected_child_ = -1;
+            return true;
+        }
         return false;
     }
     // "Add Point Light": the app creates a ".rwlight" scene object 2.5 m in

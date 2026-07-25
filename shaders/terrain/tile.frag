@@ -150,9 +150,12 @@ vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
 // (albedo modulation) and writes the blended roughness.
 vec3 terrainMaterialDetail(vec3 pos_ws, vec4 w, float fade,
                            out float roughness) {
-    // metre-scale features per material (bigger scale = finer grain)
-    float n_grass = terrainSolidFbm(pos_ws, 0.55f);   // ~2 m clumping
-    float n_rock  = terrainSolidFbm(pos_ws, 0.16f);   // ~6 m strata
+    // Two bands per material: a MACRO band at the scale of the macro
+    // albedo's 8 m texels (this is what actually dissolves the blocky
+    // steps) plus a fine band for close-range grain.
+    float m_break = terrainSolidFbm(pos_ws, 0.035f);   // ~28 m patches
+    float n_grass = terrainSolidFbm(pos_ws, 0.55f);    // ~2 m clumping
+    float n_rock  = terrainSolidFbm(pos_ws, 0.16f);    // ~6 m strata
     float n_rockf = texture(src_detail_noise_tex, pos_ws * 1.30f).x;
     float n_sand  = texture(src_detail_noise_tex, pos_ws * 2.20f).x;
     float n_snow  = terrainSolidFbm(pos_ws, 0.42f);
@@ -165,6 +168,11 @@ vec3 terrainMaterialDetail(vec3 pos_ws, vec4 w, float fade,
     float d_snow  = 1.0f + (n_snow  - 0.5f) * 0.14f;
 
     float m = w.x * d_grass + w.y * d_rock + w.z * d_sand + w.w * d_snow;
+    // macro breakup, applied at ALL distances the material system runs:
+    // straight lerps between 8 m texels leave visible plateaus, so a
+    // low-frequency multiplier is what stops the surface reading as
+    // flat tiles at range.
+    m *= 1.0f + (m_break - 0.5f) * 0.38f;
     m = mix(1.0f, m, fade);
 
     // slight per-material hue push so materials read apart even where

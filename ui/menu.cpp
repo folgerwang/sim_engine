@@ -4134,6 +4134,26 @@ void Menu::drawOutlinerPanel() {
         ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 32.0f);
 
         // Renders one editor object (leaf or group) at its outliner index.
+        // Right-click context menu shared by every Outliner row.  Selects
+        // the row first so the menu always acts on what was clicked.
+        auto object_row_ctx = [&](int i) {
+            if (ImGui::BeginPopupContextItem()) {
+                if (editor_selected_ != i) {
+                    editor_selected_ = i;
+                    editor_selected_child_ = -1;
+                }
+                ImGui::TextDisabled("%s", editor_objects_[i].name.empty()
+                    ? "Object" : editor_objects_[i].name.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Focus")) requestEditorFocus(i, -1);
+                if (ImGui::MenuItem("Delete")) {
+                    outliner_delete_idx_ = i;
+                    outliner_delete_open_ = true;
+                }
+                ImGui::EndPopup();
+            }
+        };
+
         auto draw_object_row = [&](int i) {
             EditorSceneObject& eo = editor_objects_[i];
             const std::string base =
@@ -4149,6 +4169,7 @@ void Menu::drawOutlinerPanel() {
                     editor_selected_ = i;
                     editor_selected_child_ = -1;
                 }
+                object_row_ctx(i);
                 if (ImGui::IsItemHovered() && dbl) requestEditorFocus(i, -1);
                 if (editor_scroll_to_selected_ && sel) ImGui::SetScrollHereY(0.5f);
                 return;
@@ -4179,6 +4200,7 @@ void Menu::drawOutlinerPanel() {
                 editor_selected_ = i;
                 editor_selected_child_ = -1;
             }
+            object_row_ctx(i);
             if (ghover && dbl && !ImGui::IsItemToggledOpen())
                 requestEditorFocus(i, -1);
             if (open) {
@@ -4327,8 +4349,60 @@ void Menu::drawOutlinerPanel() {
         editor_scroll_to_selected_ = false;   // one-shot consumed this draw
         if (editor_objects_.empty() && !scene_node_active_)
             ImGui::TextDisabled("(no scene objects yet)");
+        // Delete key removes the selected row (same path as the context
+        // menu).  Only while the Outliner list has focus, so pressing
+        // Delete in a text field or the viewport doesn't nuke an object.
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            !ImGui::GetIO().WantTextInput &&
+            ImGui::IsKeyPressed(ImGuiKey_Delete) &&
+            editor_selected_ >= 0 &&
+            editor_selected_ < (int)editor_objects_.size()) {
+            outliner_delete_idx_ = editor_selected_;
+            outliner_delete_open_ = true;
+        }
         ImGui::PopStyleVar();   // IndentSpacing (outliner list scope)
         ImGui::EndChild();
+        // ── Outliner delete confirmation ──────────────────────────────────
+        // Removes the object from the SCENE (the asset on disk is untouched).
+        if (outliner_delete_open_) {
+            ImGui::OpenPopup("Delete Object##outliner");
+            outliner_delete_open_ = false;
+        }
+        if (ImGui::BeginPopupModal("Delete Object##outliner", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            const bool idx_ok =
+                outliner_delete_idx_ >= 0 &&
+                outliner_delete_idx_ < (int)editor_objects_.size();
+            const std::string dname =
+                idx_ok ? (editor_objects_[outliner_delete_idx_].name.empty()
+                              ? std::string("Object")
+                              : editor_objects_[outliner_delete_idx_].name)
+                       : std::string("(gone)");
+            ImGui::Text("Remove '%s' from the scene?", dname.c_str());
+            ImGui::TextDisabled(
+                "The object is removed from this scene only.\n"
+                "Its asset on disk is not deleted.");
+            ImGui::Spacing();
+            if (!idx_ok) ImGui::BeginDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
+            const bool od_ok = ImGui::Button("Delete", ImVec2(120, 0));
+            ImGui::PopStyleColor();
+            if (!idx_ok) ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool od_cancel = ImGui::Button("Cancel", ImVec2(120, 0));
+            if (od_ok && idx_ok) {
+                delete_object_request_ = outliner_delete_idx_;
+                outliner_delete_idx_ = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            if (od_cancel) {
+                outliner_delete_idx_ = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         // Dropping a content asset anywhere on the Outliner list adds it to
         // the scene — same as dropping into the viewport / Add to Scene.
         // (EndChild submits the list as an item, so it can host a target.)
