@@ -71,6 +71,16 @@ public:
         return m_depth_buffer_;
     }
 
+    // The SAMPLED companion of m_depth_buffer_, allocated alongside it in
+    // AllocRenderBuffers and kept in SHADER_READ_ONLY_OPTIMAL.  A pass
+    // cannot sample the very depth image it is depth-testing against
+    // (VUID-vkCmdDraw-None-09600), so anything that needs to read scene
+    // depth mid-frame blits into this copy first.  The ground-decal pass
+    // is the consumer; see ObjectSceneView::duplicateDepthBuffer.
+    std::shared_ptr<er::TextureInfo> getDepthBufferCopy() const {
+        return m_depth_buffer_copy_;
+    }
+
     void destroy(
         const std::shared_ptr<er::Device>& device);
 };

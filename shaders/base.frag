@@ -42,6 +42,39 @@ layout(location = 0) in ObjectVsPsData ps_in_data;
 
 layout(location = 0) out vec4 outColor;
 
+#ifdef DECAL
+// ── Ground-decal soft blend ──────────────────────────────────────────
+// Road ribbons are laid ON the terrain, so wherever the ribbon and the
+// ground agree the decal should paint solid, and wherever the ribbon
+// lifts away from -- or slices through -- what is already in the depth
+// buffer it should dissolve instead of drawing a hard silhouette edge.
+//
+// The blend factor is the distance, in metres along the view ray,
+// between this fragment and the scene depth already rendered (terrain
+// first, then props).  DECAL_FADE_START is a tolerance rather than
+// zero: build_road_spline_mesh crowns the carriageway ~0.20 m above the
+// shoulder deliberately, for camber and for z-fight margin, so a fade
+// starting at 0 would make the road CENTRE transparent and its EDGE
+// opaque -- exactly backwards.  Inside the tolerance the ribbon is
+// solid; past DECAL_FADE_END it is gone.
+// Both are PERPENDICULAR metres -- see the ray_gap -> depth_gap
+// conversion in main().  Reading them as "how far off the ground",
+// independent of where the camera stands, is the whole point.
+const float DECAL_FADE_START = 0.30;   // metres of intentional lift
+const float DECAL_FADE_END   = 1.20;   // fully dissolved beyond this
+
+// depth_params.xy are proj[2].z and proj[3].z, so this inverts the
+// projection's z row without caring whether the depth range is [-1,1]
+// or [0,1]:
+//     clip.z = A*z_view + B,   clip.w = -z_view
+//  => window_z = B/d - A    => d = B / (window_z + A)
+// Returns positive metres in front of the eye.
+float linearizeSceneDepth(float window_z) {
+    return camera_info.depth_params.y /
+           (window_z + camera_info.depth_params.x);
+}
+#endif // DECAL
+
 #include "pbr_lighting.glsl.h"
 
 // PCSS soft shadow with cascade-consistent WORLD-SPACE blur radius.
@@ -307,7 +340,11 @@ void main() {
             1.0f);
 
 
-#ifdef ALPHAMODE_MASK
+// A decal is alpha-BLENDED, not alpha-tested: its whole job is to be
+// partially transparent at the margins, so the cutout branch (which
+// discards low alpha and then forces a to 1.0) would destroy exactly
+// the signal we need.  Skip it on that permutation only.
+#if defined(ALPHAMODE_MASK) && !defined(DECAL)
     // Late discard to avoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
     if(baseColor.a < material.alpha_cutoff)
     {
@@ -316,8 +353,73 @@ void main() {
     baseColor.a = 1.0;
 #endif // ALPHAMODE_MASK
 
+#ifdef DECAL
+    // The depth copy is the same resolution and the same viewport as
+    // this render target, so gl_FragCoord indexes it directly -- no
+    // screen-size uniform and no filtering wanted (a filtered depth
+    // read would interpolate across silhouettes and invent surfaces
+    // that are not there).
+    float scene_win_z =
+        texelFetch(scene_depth_sampler, ivec2(gl_FragCoord.xy), 0).r;
+    // Positive when the decal floats in FRONT of the scene, which is
+    // the only direction worth fading -- a decal behind the scene has
+    // already been rejected by the depth test.
+    float ray_gap =
+        max(linearizeSceneDepth(scene_win_z) -
+            linearizeSceneDepth(gl_FragCoord.z), 0.0);
+    // ── Along-ray gap -> PERPENDICULAR gap ───────────────────────────
+    // What DECAL_FADE_START/END want to measure is "how far is this
+    // decal floating off the surface underneath it" -- a property of
+    // the geometry alone.  ray_gap is not that: it is the separation
+    // measured ALONG THE VIEW RAY, which for two near-parallel
+    // surfaces is perpendicular_gap / |dot(V, N)| and therefore blows
+    // up at grazing angles.  A ground-hugging quad lifted 9 cm, seen
+    // from eye height 1.7 m at 20 m range, has sin(elevation) ~ 0.085
+    // and so reads as a 1.06 m gap -- past DECAL_FADE_END, i.e. it
+    // dissolves to nothing precisely where a player stands and looks
+    // out across the ground.  That is why the road only ever looked
+    // right close up and under the feet, and why ground clutter was
+    // invisible entirely.
+    //
+    // Multiplying back by |dot(V, N)| recovers the perpendicular
+    // separation, which is view-independent: a decal 9 cm off the
+    // ground now reads as 9 cm from every angle.  V is the
+    // fragment->eye direction and N the GEOMETRIC normal, both
+    // world-space and both already computed above for the lighting.
+    //
+    // Exactly edge-on (dot -> 0) the perpendicular gap tends to zero
+    // and the decal stays solid, which is the correct limit: a surface
+    // seen edge-on has no visible float to dissolve.  No epsilon floor
+    // here on purpose -- a floor would reintroduce the angle
+    // dependence this line exists to remove.
+    float depth_gap = ray_gap * abs(dot(v, normal_info.ng));
+    float decal_alpha =
+        1.0 - smoothstep(DECAL_FADE_START, DECAL_FADE_END, depth_gap);
+
+    // ── Ground-clutter distance fade ─────────────────────────────────
+    // Zero end distance = "this decal does not fade with range" (the
+    // road ribbon), so the whole thing costs one scalar compare there.
+    // Distance is measured in world space from the eye to the FRAGMENT
+    // rather than to the patch centre: a 3 m quad viewed edge-on at the
+    // fade boundary would otherwise pop as a unit, and per-fragment
+    // costs nothing extra since vertex_position is already interpolated
+    // in for the lighting.
+    if (model_params.clutter_fade_end_m > 0.0) {
+        float view_dist =
+            distance(camera_info.position.xyz, ps_in_data.vertex_position);
+        decal_alpha *= 1.0 - smoothstep(model_params.clutter_fade_start_m,
+                                        model_params.clutter_fade_end_m,
+                                        view_dist);
+    }
+
+    // baseColor.a still carries the material's own alpha here (the
+    // road-fade skirt's texture ramp), so the two multiply rather than
+    // one overriding the other.
+    outColor = vec4(toneMap(material, color), baseColor.a * decal_alpha);
+#else
     // regular shading
     outColor = vec4(toneMap(material, color), baseColor.a);
+#endif // DECAL
 
     // ── Runtime render-debug override ────────────────────────────────────────
     // Driven by the "Render Debug" menu (packed into camera_info.input_features

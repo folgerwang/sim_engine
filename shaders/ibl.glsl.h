@@ -10,6 +10,10 @@ layout(set = PBR_GLOBAL_PARAMS_SET, binding = LAMBERTIAN_ENV_TEX_INDEX) uniform 
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = CHARLIE_LUT_INDEX) uniform sampler2D charlie_lut;
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = CHARLIE_ENV_TEX_INDEX) uniform samplerCube charlie_env_sampler;
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = DIRECT_SHADOW_INDEX) uniform sampler2DArray direct_shadow_sampler;
+// Post-terrain scene depth.  Declared unconditionally so every consumer
+// of this header agrees with the single set-0 layout; only base.frag's
+// DECAL permutation actually fetches from it.
+layout(set = PBR_GLOBAL_PARAMS_SET, binding = SCENE_DEPTH_TEX_INDEX) uniform sampler2D scene_depth_sampler;
 
 vec3 getIBLRadianceGGX(vec3 n, vec3 v, float perceptualRoughness, vec3 specularColor, float mip_count)
 {

@@ -89,6 +89,134 @@ void ObjectSceneView::duplicateColorAndDepthBuffer(
         m_depth_buffer_copy_->size);
 }
 
+void ObjectSceneView::duplicateDepthBuffer(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf) {
+    if (!m_depth_buffer_ || !m_depth_buffer_copy_) {
+        return;
+    }
+
+    er::ImageResourceInfo depth_src_info = {
+        er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        SET_FLAG_BIT(Access, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, LATE_FRAGMENT_TESTS_BIT) };
+
+    er::ImageResourceInfo depth_dst_info = {
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
+
+    // Both src states are passed twice (old == new) so the depth image
+    // round-trips back to DEPTH_STENCIL_ATTACHMENT_OPTIMAL and the decal
+    // pass that follows can keep depth-testing against it; likewise the
+    // copy ends where the fragment shader expects to find it.
+    er::Helper::blitImage(
+        cmd_buf,
+        m_depth_buffer_->image,
+        m_depth_buffer_copy_->image,
+        depth_src_info,
+        depth_src_info,
+        depth_dst_info,
+        depth_dst_info,
+        SET_FLAG_BIT(ImageAspect, DEPTH_BIT),
+        SET_FLAG_BIT(ImageAspect, DEPTH_BIT),
+        m_depth_buffer_->size,
+        m_depth_buffer_copy_->size);
+}
+
+void ObjectSceneView::drawDecals(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    int dbuf_idx,
+    float delta_t,
+    float cur_time) {
+
+    if (m_decal_objects_.empty() || !m_color_buffer_ || !m_depth_buffer_) {
+        return;
+    }
+
+    // Snapshot terrain+props depth into the sampleable copy.  Sampling
+    // m_depth_buffer_ directly while it is bound as the depth attachment
+    // would trip VUID-vkCmdDraw-None-09600.
+    duplicateDepthBuffer(cmd_buf);
+
+    renderer::DescriptorSetList desc_set_list = desc_sets;
+    desc_set_list[VIEW_PARAMS_SET] =
+        m_camera_object_->getViewCameraDescriptorSet();
+
+    {
+        std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+        color_attachment_infos.reserve(1);
+        er::RenderingAttachmentInfo attachment_info;
+        attachment_info.image_view = m_color_buffer_->view;
+        attachment_info.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        // LOAD, not CLEAR/DONT_CARE — the whole point of this pass is to
+        // blend onto the terrain and props already sitting in there.
+        attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        attachment_info.store_op = er::AttachmentStoreOp::STORE;
+        color_attachment_infos.push_back(attachment_info);
+
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = m_depth_buffer_->view;
+        depth_attachment_info.image_layout =
+            er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        // STORE rather than DONT_CARE: the decal pipeline does not write
+        // depth, but later passes in the frame still read this buffer,
+        // so its terrain+props contents must survive the pass.
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = color_attachment_infos;
+        renderingInfo.depth_attachments = { depth_attachment_info };
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(m_buffer_size_.x);
+    viewports[0].height = float(m_buffer_size_.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = m_buffer_size_;
+
+    // Publish the eye position for drawMesh's ground-clutter distance
+    // cull.  Deliberately read from the SAME struct base.frag reads
+    // (ViewCameraInfo::position, reached through the VIEW_PARAMS_SET
+    // descriptor bound just above) so the CPU tile cull and the GPU
+    // alpha ramp can never disagree about where the camera is — a
+    // mismatch would show up as tiles vanishing while still partly
+    // opaque, which is the exact artifact this pass exists to avoid.
+    ego::DrawableObject::setViewerWorldPos(
+        m_camera_object_->getCameraViewInfo().position);
+
+    for (auto& decal_obj : m_decal_objects_) {
+        decal_obj->draw(
+            cmd_buf,
+            desc_set_list,
+            viewports,
+            scissors,
+            false,
+            ego::DrawableObject::DrawMode::kDecal,
+            0u);
+    }
+
+    // Scoped to this pass: no other draw path has a meaningful eye
+    // position published, and a stale one silently culling geometry
+    // elsewhere would be a nasty thing to debug.
+    ego::DrawableObject::clearViewerWorldPos();
+
+    cmd_buf->endDynamicRendering();
+}
+
 void ObjectSceneView::draw(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_sets,

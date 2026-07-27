@@ -17,6 +17,14 @@ namespace scene_rendering {
 class ObjectSceneView : public ego::ViewObject {
     std::vector<std::shared_ptr<ego::DrawableObject>> m_drawable_objects_;
 
+    // Ground decals (currently the road ribbon + fade skirt loaded from
+    // <map>_pcg_decal.glb).  Deliberately a SEPARATE list rather than a
+    // flag checked inside the main loop: decals must be drawn in their
+    // own pass, at a different point in the frame (after the terrain
+    // tiles, so there is completed ground depth to blend against) and
+    // with a different pipeline state (alpha blend on, depth write off).
+    std::vector<std::shared_ptr<ego::DrawableObject>> m_decal_objects_;
+
     bool m_b_render_blend_ = false;
 
 public:
@@ -43,8 +51,50 @@ public:
             m_drawable_objects_.end());
     }
 
+    void addDecalObject(
+        const std::shared_ptr<ego::DrawableObject>& decal_object) {
+        m_decal_objects_.push_back(decal_object);
+    }
+
+    void removeDecalObject(
+        const std::shared_ptr<ego::DrawableObject>& decal_object) {
+        m_decal_objects_.erase(
+            std::remove(m_decal_objects_.begin(), m_decal_objects_.end(),
+                        decal_object),
+            m_decal_objects_.end());
+    }
+
+    bool hasDecalObjects() const { return !m_decal_objects_.empty(); }
+
     void duplicateColorAndDepthBuffer(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+
+    // Depth-only variant of the above.  The decal pass needs scene depth
+    // but not scene colour, and the colour blit is a full-resolution
+    // copy of an HDR target every frame — not something to pay for when
+    // nothing reads it.
+    void duplicateDepthBuffer(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf);
+
+    // ── Ground-decal pass ────────────────────────────────────────────
+    // Call AFTER the forward pass AND after the terrain tiles have been
+    // drawn into this view's color/depth buffers.  Blits depth into
+    // m_depth_buffer_copy_ (so the fragment shader can sample the scene
+    // depth it is simultaneously depth-testing against), then re-opens
+    // colour and depth with LOAD_OP_LOAD and draws every registered
+    // decal through DrawMode::kDecal — depth test ON so houses still
+    // occlude the road, depth write OFF so decals never occlude each
+    // other, and alpha blend on so the depth-difference factor computed
+    // in base.frag's DECAL permutation actually reaches the framebuffer.
+    //
+    // The caller must have written this view's depth copy into
+    // SCENE_DEPTH_TEX_INDEX of the set-0 descriptor passed in desc_sets.
+    void drawDecals(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        int dbuf_idx,
+        float delta_t,
+        float cur_time);
 
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
