@@ -152,6 +152,15 @@
 // 1 m albedo detail tiles (RGBA8 2048^2 array, streamed with the height
 // tiles; near-field surface colour, fading to the global VT albedo).
 #define TERRAIN_DETAIL_COLOR_INDEX          (TILE_BASE_PARAMS_INDEX + 40) // 47
+// 1 m packed PBR surface detail tiles (RGBA8 2048^2 array, streamed
+// alongside the height and colour tiles).  One image rather than the
+// macro map's separate normal and ORM because this one is RESIDENT:
+// nine slots of 2048^2 RGBA8 is ~151 MB that stays allocated whether
+// the camera looks at it or not, so a second array would double that
+// for two channels.  R,G = tangent normal XY (Z reconstructed),
+// B = roughness, A = micro-occlusion (cavity only -- the macro ORM
+// already carries the ridge occlusion for the same ground).
+#define TERRAIN_DETAIL_SURFACE_INDEX        (TILE_BASE_PARAMS_INDEX + 41) // 48
 #define PERM_GRAD_TEXTURE_INDEX             (TILE_BASE_PARAMS_INDEX + 31) // 38
 #define PERM_GRAD_4D_TEXTURE_INDEX          (TILE_BASE_PARAMS_INDEX + 32) // 39
 #define GRAD_4D_TEXTURE_INDEX               (TILE_BASE_PARAMS_INDEX + 33) // 40
@@ -766,6 +775,17 @@ struct TileParams {
     // back to the plain src_map_mask sample).
     uint            vt_albedo_id;
     uint            pad_0;
+    // Companion ids for the macro normal and ORM maps registered from
+    // <heightmap>_nrm.png / _orm.png.  registerMaterial returns ONE id
+    // covering every layer it was actually given, and all four pools
+    // share a slot allocator, so these hold the SAME value as
+    // vt_albedo_id whenever the file existed — they are per-layer
+    // PRESENCE flags, not independent addresses.  VT_INVALID_ID means
+    // the map was absent and that layer must stay procedural: sampling
+    // a pool the registration never filled would read whatever other
+    // material happens to own those physical slots.
+    uint            vt_normal_id;
+    uint            vt_mr_ao_id;
 };
 
 struct DebugDrawParams {

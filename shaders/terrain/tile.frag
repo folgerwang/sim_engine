@@ -34,20 +34,115 @@ layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler
 layout(set = TILE_PARAMS_SET, binding = TERRAIN_DETAIL_COLOR_INDEX)
     uniform sampler2DArray detail_color_tiles;
 
-// Near-field surface colour from the 1 m tile if resident; `fallback`
-// (global albedo) otherwise / beyond the fade band.
-vec3 terrainDetailAlbedo(vec2 pos_xz_ws, vec3 fallback, float fade) {
-    if (fade <= 0.0f) return fallback;
-    vec2 rel = (pos_xz_ws + vec2(kTerrainMapMeters * 0.5f)) / kDetailTileMeters;
+// One detail-colour tap.  w = 0 when the tile is out of range or not
+// resident.  textureLod(0) rather than texture(): the array is created
+// with num_mips = 1 (terrain_detail_stream.cpp), so there is no LOD to
+// select and the explicit form is identical — but it is also safe in the
+// divergent control flow below, where implicit derivatives would not be.
+vec4 terrainDetailTap(vec2 p) {
+    vec2 rel = (p + vec2(kTerrainMapMeters * 0.5f)) / kDetailTileMeters;
     ivec2 t = ivec2(floor(rel));
     if (any(lessThan(t, ivec2(0))) ||
         any(greaterThanEqual(t, ivec2(kDetailTilesPerSide))))
-        return fallback;
+        return vec4(0.0f);
     int slot = detail_color_slot[t.y * kDetailTilesPerSide + t.x];
-    if (slot < 0) return fallback;
+    if (slot < 0) return vec4(0.0f);
     vec2 uv = rel - vec2(t);
-    vec3 c = texture(detail_color_tiles, vec3(uv, float(slot))).rgb;
-    return mix(fallback, c, fade);
+    return vec4(textureLod(detail_color_tiles,
+                           vec3(uv, float(slot)), 0.0f).rgb, 1.0f);
+}
+
+// Near-field surface colour from the 1 m tile if resident; `fallback`
+// (global albedo) otherwise / beyond the fade band.
+//
+// blur_dir/blur_m implement ANISOTROPIC filtering along the slope.  The
+// tile is indexed by world XZ, so on a steep face one XZ metre covers
+// 1/n.y metres of surface ALONG THE GRADIENT ONLY — the along-contour
+// direction is not stretched at all.  A mip bias cannot help here (the
+// array has a single mip), and an isotropic blur would throw away the
+// good direction, so we low-pass with a few taps along the gradient and
+// leave the perpendicular axis untouched.  That is exactly what a correct
+// anisotropic sample would do, and it is what stops the macro colour
+// being dragged into 40 m vertical streaks down a cliff.
+vec3 terrainDetailAlbedo(vec2 pos_xz_ws, vec3 fallback, float fade,
+                         vec2 blur_dir, float blur_m) {
+    if (fade <= 0.0f) return fallback;
+    vec4 acc = terrainDetailTap(pos_xz_ws) * 3.0f;
+    if (blur_m > 0.05f) {          // flat ground keeps the single tap
+        vec2 d1 = blur_dir * (blur_m * 0.5f);
+        vec2 d2 = blur_dir * blur_m;
+        acc += (terrainDetailTap(pos_xz_ws - d1)
+              + terrainDetailTap(pos_xz_ws + d1)) * 2.0f;
+        acc +=  terrainDetailTap(pos_xz_ws - d2)
+              + terrainDetailTap(pos_xz_ws + d2);
+    }
+    if (acc.w <= 0.0f) return fallback;
+    return mix(fallback, acc.rgb / acc.w, fade);
+}
+
+// 1 m packed PBR surface detail tiles, streamed alongside the colour
+// tiles: R,G = tangent normal XY (Z reconstructed), B = roughness,
+// A = micro-occlusion.  One image rather than a normal array plus an ORM
+// array because nine 2048^2 RGBA8 slots stay resident whether or not the
+// camera is looking at any of them.
+layout(set = TILE_PARAMS_SET, binding = TERRAIN_DETAIL_SURFACE_INDEX)
+    uniform sampler2DArray detail_surf_tiles;
+
+// One packed-surface tap.  w = 0 when the tile is out of range or has no
+// resident SURFACE slot — which is NOT the same as having no colour
+// slot, hence the separate table (see tile_detail.glsl.h).  textureLod(0)
+// for the same reason as terrainDetailTap: single mip, divergent flow.
+vec4 terrainDetailSurfTap(vec2 p, out float w) {
+    w = 0.0f;
+    vec2 rel = (p + vec2(kTerrainMapMeters * 0.5f)) / kDetailTileMeters;
+    ivec2 t = ivec2(floor(rel));
+    if (any(lessThan(t, ivec2(0))) ||
+        any(greaterThanEqual(t, ivec2(kDetailTilesPerSide))))
+        return vec4(0.0f);
+    int slot = detail_surf_slot[t.y * kDetailTilesPerSide + t.x];
+    if (slot < 0) return vec4(0.0f);
+    w = 1.0f;
+    return textureLod(detail_surf_tiles, vec3(rel - vec2(t), float(slot)),
+                      0.0f);
+}
+
+// Near-field packed surface, filtered with the SAME five anisotropic taps
+// as terrainDetailAlbedo.  Deliberately the same kernel: the normal and
+// the colour describe one surface, and a normal left sharper than the
+// albedo it belongs to would sparkle down exactly the cliff the colour
+// was just blurred along.
+//
+// Returns the AUTHORITY of the result in [0,1] — how much of this pixel
+// genuinely came from a resident 1 m tile, faded by camera distance.
+// Zero means the caller keeps everything it already had.
+float terrainDetailSurface(vec2 pos_xz_ws, float fade,
+                           vec2 blur_dir, float blur_m,
+                           out vec2 nrm_xy, out float rough, out float ao) {
+    nrm_xy = vec2(0.0f);
+    rough  = 0.0f;
+    ao     = 1.0f;
+    if (fade <= 0.0f) return 0.0f;
+    float w;
+    float acc_w = 0.0f;
+    vec4  acc = terrainDetailSurfTap(pos_xz_ws, w) * 3.0f;
+    acc_w += w * 3.0f;
+    if (blur_m > 0.05f) {          // flat ground keeps the single tap
+        vec2 d1 = blur_dir * (blur_m * 0.5f);
+        vec2 d2 = blur_dir * blur_m;
+        acc += terrainDetailSurfTap(pos_xz_ws - d1, w) * 2.0f; acc_w += w * 2.0f;
+        acc += terrainDetailSurfTap(pos_xz_ws + d1, w) * 2.0f; acc_w += w * 2.0f;
+        acc += terrainDetailSurfTap(pos_xz_ws - d2, w);        acc_w += w;
+        acc += terrainDetailSurfTap(pos_xz_ws + d2, w);        acc_w += w;
+    }
+    if (acc_w <= 0.0f) return 0.0f;
+    acc /= acc_w;
+    // Decoding AFTER the average is identical to averaging the decoded
+    // values — the .rg * 2 - 1 mapping is affine — and costs one madd
+    // instead of five.
+    nrm_xy = acc.rg * 2.0f - 1.0f;
+    rough  = acc.b;
+    ao     = acc.a;
+    return fade;
 }
 
 // ── Virtual-textured terrain albedo ─────────────────────────────────
@@ -86,31 +181,134 @@ layout(set = TILE_PARAMS_SET, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampl
 // ─────────────────────────────────────────────────────────────────────
 //  TERRAIN MATERIAL SYSTEM
 // ─────────────────────────────────────────────────────────────────────
-// Splat-style layer blend. The generated map supplies COLOUR but no
-// surface character, so close up the terrain read as a blurry stretched
-// photo ("blocky"). Here each surface type contributes its own
-// high-frequency detail, and the ML albedo is demoted to a low-frequency
-// TINT — the world keeps its generated colour identity and gains texture.
+// The generated map supplies COLOUR but no surface character, so on its
+// own the terrain reads as a blurry stretched photo.  Detail is added
+// here — but the way it is added matters more than how much:
+//
+// The previous version sampled a handful of ISOLATED noise bands (~28 m,
+// ~6 m, ~2 m, ~0.45 m) out of the bound volume-cloud texture.  That
+// produced the "low-res texture blended with high-res noise" look, for
+// three separate reasons, all fixed below:
+//
+//  1. SPECTRAL GAP.  The macro albedo carries structure down to ~0.5 m
+//     and then stops; the noise bands started at 28 m and 6 m with heavy
+//     contrast.  Two disjoint bands with nothing between them can only
+//     read as two surfaces stacked on top of each other.  Now ONE field
+//     spans 64 m -> 0.12 m continuously with equal energy per octave
+//     (1/f, pink), which is the spectrum real ground has.
+//  2. CELLULAR SIGNATURE.  src_detail_noise_tex is the volume-cloud
+//     noise: perlin fBm MULTIPLIED BY worley.  Its worley cells are what
+//     showed up as distinct blobby patches.  Its mean is also ~0.37, not
+//     the 0.5 the old code subtracted, so every band additionally
+//     darkened the ground by ~13% of its contrast.  We now use the
+//     analytic value noise from tile_common (zero DC bias, no cells) and
+//     get exact derivatives from the same evaluation for free.
+//  3. UNCORRELATED COLOUR AND LIGHT.  Colour noise and normal noise were
+//     separate fields at separate scales, so the mottling was painted on
+//     rather than lit.  One field now drives colour, relief and
+//     roughness together.
 //
 //  weights : ML albedo colour (layout-aligned with the generator's
 //            segmentation by construction) re-weighted by SLOPE and
 //            ALTITUDE — steep ground sheds soil/snow to rock, etc.
-//  detail  : SOLID 3D noise sampled at WORLD position, so there is no
-//            projection to seam on cliffs (triplanar for free) and no
-//            visible tiling grid — which is what made the old surface
-//            look like blocks.
-//  fade    : detail attenuates with view distance so it never aliases
-//            into shimmer at range.
+//  fade    : per-OCTAVE, on its own view-distance ramp (an octave is
+//            worth shading while its features still cover a couple of
+//            pixels).  There is no single detail on/off band to see, and
+//            fine grain survives right up to the camera.
 
-// fBm from the bound solid-noise volume; p is a world-space position.
-float terrainSolidFbm(vec3 p, float scale) {
-    float n  = 1.00f * texture(src_detail_noise_tex, p * scale).x;
-    n       += 0.50f * texture(src_detail_noise_tex, p * scale * 2.13f).x;
-    n       += 0.25f * texture(src_detail_noise_tex, p * scale * 4.79f).x;
-    return n * (1.0f / 1.75f);
+// Normalisation constants measured from the field (fp32, 4 km extent):
+// the raw 8-octave mean has rms 0.165 and unit-relief slope rms 0.461.
+#define kGroundFieldNorm   2.00f     // -> value rms ~0.33
+#define kGroundSlopeNorm   2.17f     // -> slope rms ~1.00 per unit relief
+
+// hash1(vec2) is fract(a*b*(a+b)) with a,b = 50*fract(p/pi), so it
+// collapses to EXACTLY 0 along the whole p.x == 0 and p.y == 0 lattice
+// lines.  Sampled straight off world coordinates that paints a hard dark
+// cross through the world origin, once per octave, all left-aligned on the
+// same two lines - i.e. right through the town.  Shifting by more than the
+// map's corner radius (2048 * sqrt2 = 2896 m, which rotation cannot grow)
+// puts both lines permanently outside the map.
+#define kGroundOrigin vec2(5119.0f, 6871.0f)
+
+// One octave on one world plane.  Returns (value, d/du, d/dv) with the
+// gradient rotated back out of the octave's frame into that plane's own
+// axes.  rot_t is R^T and orthonormal, so the gradient rms - and therefore
+// kGroundSlopeNorm - is unaffected by the rotation.
+vec3 terrainGroundOctave(vec2 c, float inv_period, mat2 rot, mat2 rot_t) {
+    vec3 n = noised((rot * c + kGroundOrigin) * inv_period);
+    return vec3(n.x, rot_t * vec2(n.y, n.z));
 }
 
-// Material weights packed as (grass, rock, sand, snow), normalised.
+// Pink (1/f) ground micro-surface field, world-anchored and TRIPLANAR.
+//   returns : signed surface value, rms ~0.33, clamped to [-1, 1]
+//   grad    : matching world-space gradient, rms ~1.0 — multiply by the
+//             material's relief (in slope units) before use
+// A single XZ projection smears into vertical streaks on cliffs, and the
+// taller the face the longer the streak, so the three world-plane
+// projections are blended by the normal instead.  The weights are
+// sharpened to ^4 and thresholded, so flat ground lands ~1.0 on the Y
+// plane and pays for ONE evaluation; only genuinely steep faces pay for
+// two or three.
+float terrainGroundField(vec3 pos_ws, vec3 n_ws, float dist, out vec3 grad) {
+    const float kP0  = 64.0f;        // coarsest period, metres
+    const float kLac = 2.31f;
+
+    vec3 tw = abs(n_ws); tw *= tw; tw *= tw;          // ^4
+    tw /= max(tw.x + tw.y + tw.z, 1e-4f);
+    bool do_x = tw.x > 0.01f;      // face spans world ZY
+    bool do_y = tw.y > 0.01f;      // ground, spans world XZ
+    bool do_z = tw.z > 0.01f;      // face spans world XY
+
+    // Rotating each octave also breaks up the axis-aligned grid ringing of
+    // stacked value noise.
+    mat2 rot   = mat2(1.0f, 0.0f, 0.0f, 1.0f);  // R_i
+    mat2 rot_t = mat2(1.0f, 0.0f, 0.0f, 1.0f);  // (R_i)^T
+    float period = kP0;
+    float sum = 0.0f, w_sum = 0.0f, sw_sum = 0.0f;
+    grad = vec3(0.0f);
+    for (int i = 0; i < 8; ++i) {
+        // ~2 px at 1080p / 60 deg is period/dist ~= 1/515, so start the
+        // ramp before that and finish well after it.
+        float w = 1.0f - smoothstep(period * 380.0f, period * 1100.0f,
+                                    dist);
+        if (w <= 0.004f) break;      // coarse -> fine, so nothing later
+                                     // survives either
+        float ip = 1.0f / period;
+        float v  = 0.0f;
+        vec3  g  = vec3(0.0f);
+        if (do_y) {
+            vec3 o = terrainGroundOctave(pos_ws.xz, ip, rot, rot_t);
+            v += tw.y * o.x;
+            g += tw.y * vec3(o.y, 0.0f, o.z);
+        }
+        if (do_x) {
+            vec3 o = terrainGroundOctave(pos_ws.zy, ip, rot, rot_t);
+            v += tw.x * o.x;
+            g += tw.x * vec3(0.0f, o.z, o.y);
+        }
+        if (do_z) {
+            vec3 o = terrainGroundOctave(pos_ws.xy, ip, rot, rot_t);
+            v += tw.z * o.x;
+            g += tw.z * vec3(o.y, o.z, 0.0f);
+        }
+        sum   += v * w;
+        w_sum += w;
+        // The macro heightfield already owns the large-scale slope, so
+        // bias the RELIEF toward the finer octaves (colour stays flat 1/f).
+        float sw = w * (0.28f + 0.72f * float(i) * (1.0f / 7.0f));
+        grad   += g * sw;
+        sw_sum += sw;
+        rot    = m2  * rot;
+        rot_t  = m2i * rot_t;
+        period /= kLac;
+    }
+    grad *= kGroundSlopeNorm / max(sw_sum, 1e-3f);
+    return clamp(sum * (kGroundFieldNorm / max(w_sum, 1e-3f)),
+                 -1.0f, 1.0f);
+}
+
+// Material weights packed as (grass, rock, loose, snow), normalised.
+// "loose" is bare ground — soil, dirt, gravel, sand.
 vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
     float luma = dot(macro, vec3(0.299f, 0.587f, 0.114f));
     float mx   = max(macro.r, max(macro.g, macro.b));
@@ -122,19 +320,20 @@ vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
     float w_grass = smoothstep(0.010f, 0.090f, green);
     float w_snow  = smoothstep(0.60f, 0.80f, luma)
                   * (1.0f - smoothstep(0.08f, 0.22f, sat));
-    float w_sand  = smoothstep(0.04f, 0.16f, macro.r - macro.b)
-                  * smoothstep(0.30f, 0.50f, luma)
-                  * (1.0f - w_grass);
+    // Bare ground: warm (r > b) OR simply low-saturation and not pale.
+    // The low-saturation half of this used to fall through to ROCK, which
+    // is why ordinary dirt, graded roads and dry grass got rock's hard
+    // high-contrast treatment and read as dark blotches on flat land.
+    float w_loose = max(smoothstep(0.02f, 0.14f, macro.r - macro.b),
+                        1.0f - smoothstep(0.06f, 0.20f, sat))
+                  * (1.0f - w_grass) * (1.0f - w_snow);
     // rock takes whatever the others don't claim
-    float w_rock  = clamp(1.0f - (w_grass + w_snow + w_sand), 0.0f, 1.0f);
-    // ...plus bare low-saturation mid-luma ground reads as rock outright
-    w_rock += (1.0f - smoothstep(0.05f, 0.18f, sat)) * 0.35f
-            * (1.0f - w_snow);
+    float w_rock  = clamp(1.0f - (w_grass + w_snow + w_loose), 0.0f, 1.0f);
 
     // ── slope override: steep faces can't hold soil, sand or snow ──
     float steep = smoothstep(0.35f, 0.72f, slope01);
     w_grass *= (1.0f - steep);
-    w_sand  *= (1.0f - steep * 1.15f);
+    w_loose *= (1.0f - steep * 1.15f);
     w_snow  *= (1.0f - steep * 0.85f);
     w_rock  += steep * 1.25f;
 
@@ -142,71 +341,53 @@ vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
     float high = smoothstep(120.0f, 190.0f, alt_m);
     w_snow += high * (1.0f - steep) * 0.5f * smoothstep(0.35f, 0.6f, luma);
 
-    vec4 w = max(vec4(w_grass, w_rock, w_sand, w_snow), vec4(0.0f));
+    vec4 w = max(vec4(w_grass, w_rock, w_loose, w_snow), vec4(0.0f));
     return w / max(w.x + w.y + w.z + w.w, 1e-4f);
 }
 
-// Per-material high-frequency detail. Returns a multiplier around 1.0
-// (albedo modulation) and writes the blended roughness.
-vec3 terrainMaterialDetail(vec3 pos_ws, vec4 w, float fade,
-                           out float roughness) {
-    // Two bands per material: a MACRO band at the scale of the macro
-    // albedo's 8 m texels (this is what actually dissolves the blocky
-    // steps) plus a fine band for close-range grain.
-    float m_break = terrainSolidFbm(pos_ws, 0.035f);   // ~28 m patches
-    float n_grass = terrainSolidFbm(pos_ws, 0.55f);    // ~2 m clumping
-    float n_rock  = terrainSolidFbm(pos_ws, 0.16f);    // ~6 m strata
-    float n_rockf = texture(src_detail_noise_tex, pos_ws * 1.30f).x;
-    float n_sand  = texture(src_detail_noise_tex, pos_ws * 2.20f).x;
-    float n_snow  = terrainSolidFbm(pos_ws, 0.42f);
-
-    // contrast per material: rock is the most varied, snow the least
-    float d_grass = 1.0f + (n_grass - 0.5f) * 0.55f;
-    float d_rock  = 1.0f + ((n_rock - 0.5f) * 0.70f
-                          + (n_rockf - 0.5f) * 0.30f);
-    float d_sand  = 1.0f + (n_sand  - 0.5f) * 0.22f;
-    float d_snow  = 1.0f + (n_snow  - 0.5f) * 0.14f;
-
-    float m = w.x * d_grass + w.y * d_rock + w.z * d_sand + w.w * d_snow;
-    // macro breakup, applied at ALL distances the material system runs:
-    // straight lerps between 8 m texels leave visible plateaus, so a
-    // low-frequency multiplier is what stops the surface reading as
-    // flat tiles at range.
-    m *= 1.0f + (m_break - 0.5f) * 0.38f;
-    m = mix(1.0f, m, fade);
+// Colour + roughness response to the shared field. Returns an albedo
+// multiplier around 1.0.
+vec3 terrainSurfaceShade(vec4 w, float f, out float roughness) {
+    // Contrast per material: rock strata vary hardest, snow least.  These
+    // are ~1/2 the old values because the field now has energy at every
+    // scale instead of dumping it all into two bands — the same visible
+    // richness with none of the blotching.
+    float k = w.x * 0.34f + w.y * 0.46f + w.z * 0.28f + w.w * 0.10f;
+    // Hollows darken more than crests brighten: crevices hold shadow and
+    // damp.  This asymmetry is most of what makes the field read as
+    // surface texture rather than painted-on patches.
+    float m = 1.0f + k * (f < 0.0f ? f * 1.45f : f);
 
     // slight per-material hue push so materials read apart even where
-    // the macro map is flat (grass greener, rock cooler, sand warmer)
-    vec3 tint = w.x * vec3(0.94f, 1.06f, 0.90f)
+    // the macro map is flat (grass greener, rock cooler, loose warmer)
+    vec3 tint = w.x * vec3(0.95f, 1.05f, 0.92f)
               + w.y * vec3(1.00f, 0.99f, 1.02f)
-              + w.z * vec3(1.08f, 1.02f, 0.88f)
+              + w.z * vec3(1.05f, 1.01f, 0.93f)
               + w.w * vec3(1.00f, 1.01f, 1.04f);
-    tint = mix(vec3(1.0f), tint, fade * 0.75f);
+    // crests read drier/warmer, hollows cooler and less saturated
+    tint *= mix(vec3(0.985f, 1.000f, 1.020f),
+                vec3(1.020f, 1.000f, 0.975f), 0.5f + 0.5f * f);
 
     roughness = clamp(w.x * 0.93f + w.y * 0.76f
                     + w.z * 0.95f + w.w * 0.58f, 0.05f, 1.0f);
-    // roughness breakup so specular doesn't sheet uniformly
-    roughness = clamp(roughness
-        + (texture(src_rough_noise_tex, pos_ws * 0.35f).x - 0.5f)
-          * 0.10f * fade, 0.05f, 1.0f);
+    // damp hollows polish slightly, dry crests stay rough — correlated
+    // with the same field, so the specular agrees with the colour
+    roughness = clamp(roughness + f * 0.07f, 0.05f, 1.0f);
 
     return vec3(m) * tint;
 }
 
-// Bump the shading normal with the same solid noise field, so the
-// detail is lit rather than being flat painted-on variation.
-vec3 terrainMaterialNormal(vec3 pos_ws, vec3 n, vec4 w, float fade) {
-    if (fade <= 0.001f) return n;
-    // amplitude: rock bumps hardest, snow barely at all
-    float amp = (w.x * 0.35f + w.y * 0.85f + w.z * 0.20f + w.w * 0.10f)
-              * fade;
-    if (amp <= 0.001f) return n;
-    const float e = 0.35f;                       // metres
-    float c  = terrainSolidFbm(pos_ws, 0.55f);
-    float dx = terrainSolidFbm(pos_ws + vec3(e, 0.0f, 0.0f), 0.55f) - c;
-    float dz = terrainSolidFbm(pos_ws + vec3(0.0f, 0.0f, e), 0.55f) - c;
-    vec3 bumped = normalize(n + vec3(-dx, 0.0f, -dz) * amp * 6.0f);
-    return normalize(mix(n, bumped, 0.85f));
+// Light the same field instead of only painting it: relief is expressed
+// as an rms SLOPE per material, so it stays plausible at every distance.
+vec3 terrainSurfaceNormal(vec3 n, vec4 w, vec3 grad) {
+    float relief = w.x * 0.10f + w.y * 0.26f
+                 + w.z * 0.13f + w.w * 0.04f;
+    // The field is triplanar now, so its gradient is meaningful on ANY
+    // face — no more damping by n.y.  Perturb along the surface TANGENT
+    // plane rather than assuming the XZ projection; on flat ground this
+    // reduces exactly to the old n + (-g.x, 0, -g.z).
+    vec3 t = grad - dot(grad, n) * n;
+    return normalize(n - t * relief);
 }
 
 void main() {
@@ -238,6 +419,38 @@ void main() {
                                  1.0f,
                                  (h_zn - h_zp) / (2.0f * eps)));
 
+    // ── Anisotropy guard for the top-down macro albedo ────────────────
+    // Every macro colour source (map mask, VT pages, 1 m detail tiles) is
+    // indexed by world XZ.  On a steep face a tiny XZ footprint covers a
+    // tall strip of surface, but the samplers' derivatives only see XZ, so
+    // they happily pick a SHARP mip and drag it down the whole face — that
+    // is the vertical smearing on the cliffs.  One XZ metre spans 1/n.y
+    // metres of surface, so bias the LOD by log2 of that stretch: the
+    // bogus stretched detail blurs out and the (now triplanar) procedural
+    // field supplies the surface character in its place.  Flat ground has
+    // n.y = 1 and is completely unaffected.
+    //
+    // The VT pool and map mask are mipped, so an LOD bias is enough there
+    // (and biasing the VT also stops cliffs requesting sharp pages they
+    // cannot use).  The 1 m detail tiles have a single mip, so they get
+    // real anisotropic taps instead — see terrainDetailAlbedo().
+    float macro_lod_bias = clamp(-log2(max(normal.y, 0.02f)), 0.0f, 4.0f);
+    float macro_blur_m   = clamp(0.5f * (1.0f / max(normal.y, 0.05f) - 1.0f),
+                                 0.0f, 3.0f);
+    vec2  macro_blur_dir = normalize(normal.xz
+                                     + vec2(1e-5f, 0.0f));   // gradient dir
+
+    // Macro (4 m/texel, whole-world) surface maps, filled from the VT
+    // pools below when <heightmap>_nrm.png / _orm.png were registered.
+    // Defaults are the "no map" identity: flat tangent normal, no
+    // occlusion, and an authority of zero so the procedural estimate
+    // stays in charge wherever a map was never authored.
+    vec2  macro_nrm_xy = vec2(0.0f);
+    float macro_nrm_w  = 0.0f;
+    float macro_rough  = 0.0f;
+    float macro_ao     = 1.0f;
+    float macro_mr_w   = 0.0f;
+
     // Surface colour comes ONLY from the ML-generated albedo (VT-backed
     // colour satellite map, or the plain map-mask fallback) — the old
     // procedural rock/soil tinting and temperature snow mix are gone.
@@ -246,11 +459,15 @@ void main() {
     // Terrain surface colour: virtual-textured when a VT id is set
     // (streamed pages, 1 m albedo detail tiles later), otherwise the
     // plain full-world map-mask sample.
-    albedo = texture(src_map_mask, in_data.world_map_uv).rgb;
+    albedo = texture(src_map_mask, in_data.world_map_uv,
+                     macro_lod_bias).rgb;
     if (tile_params.vt_albedo_id != VT_INVALID_ID) {
         VirtualTextureMeta vmeta =
             vt_meta[vtIndexOf(tile_params.vt_albedo_id)];
-        float lod_cont = vtComputeLod(vmeta, in_data.world_map_uv);
+        // Bias here rather than at the sample so the FEEDBACK request goes
+        // coarse too: cliffs stop pulling sharp pages they cannot use.
+        float lod_cont = vtComputeLod(vmeta, in_data.world_map_uv)
+                       + macro_lod_bias;
         uint  mip_max  = max(1u, vmeta.mip_count) - 1u;
         // Never use/request below mip 1: mip-0 requests for a screen-
         // filling 8k VT flood the page pool (LRU thrash against the
@@ -283,29 +500,60 @@ void main() {
         // termination); keep the map-mask sample if nothing resolves.
         vec2 phys_uv;
         uint walk_mip = vt_mip;
+        bool  vt_hit      = false;
+        float vt_pool_lod = 0.0f;
         for (uint i = 0u; i < VT_MAX_MIPS; ++i) {
             if (walk_mip > mip_max) break;
             if (vtResolve(tile_params.vt_albedo_id, in_data.world_map_uv,
                           vmeta, walk_mip, phys_uv)) {
+                vt_pool_lod = (walk_mip == vt_mip) ? vt_frac : 0.0f;
                 albedo = textureLod(vt_pool_albedo, phys_uv,
-                                    walk_mip == vt_mip ? vt_frac : 0.0f).rgb;
+                                    vt_pool_lod).rgb;
+                vt_hit = true;
                 break;
             }
             ++walk_mip;
+        }
+        if (vt_hit) {
+            // Same phys_uv, same pool lod: all four VT pools share one
+            // slot allocator and one page-table entry, so the albedo's
+            // resolve already located the normal and ORM pages too.  The
+            // ids are per-layer PRESENCE flags — sampling a pool the
+            // registration never filled would read whatever other
+            // material happens to own those physical slots.
+            if (tile_params.vt_normal_id != VT_INVALID_ID) {
+                macro_nrm_xy = textureLod(vt_pool_normal, phys_uv,
+                                          vt_pool_lod).rg * 2.0f - 1.0f;
+                macro_nrm_w  = 1.0f;
+            }
+            if (tile_params.vt_mr_ao_id != VT_INVALID_ID) {
+                // glTF ORM convention: R = occlusion, G = roughness,
+                // B = metallic (terrain is dielectric, ignored here).
+                vec4 mra = textureLod(vt_pool_mr_ao, phys_uv, vt_pool_lod);
+                macro_ao    = mra.r;
+                macro_rough = mra.g;
+                macro_mr_w  = 1.0f;
+            }
         }
     }
     // Near-field: the streamed 1 m albedo tile takes over from the
     // (4 m/texel) global map, fading with the same camera-distance band
     // as the height detail so colour and relief transition together.
-    albedo = terrainDetailAlbedo(pos.xz, albedo, detail_fade);
+    albedo = terrainDetailAlbedo(pos.xz, albedo, detail_fade,
+                                 macro_blur_dir, macro_blur_m);
     // Beyond the terrain map: neutral surround (matches the height fade
     // in tile.vert — no stretched border stripes in colour or shading).
+    // sfade lives in function scope, not inside the block below: the
+    // authored surface maps have to be damped by it too.  vtResolve()
+    // takes fract() of the uv, so a fragment past the map edge would
+    // otherwise wrap the far side of the world onto the surround and
+    // light it with somebody else's ridge occlusion.
+    float sfade;
     {
         vec2 ov = (in_data.world_map_uv
                    - clamp(in_data.world_map_uv, 0.0f, 1.0f))
                   / tile_params.inv_world_range;
-        float sfade = smoothstep(0.0f, kTerrainSurroundFadeMeters,
-                                 length(ov));
+        sfade = smoothstep(0.0f, kTerrainSurroundFadeMeters, length(ov));
         albedo = mix(albedo, vec3(0.16f, 0.20f, 0.14f), sfade);
         normal = normalize(mix(normal, vec3(0.0f, 1.0f, 0.0f), sfade));
     }
@@ -316,18 +564,59 @@ void main() {
 
     // ── Terrain material layers ──────────────────────────────────────
     // Applied AFTER the macro colour is resolved (VT / map-mask / 1 m
-    // tiles) so it modulates whatever the generator produced, and
-    // attenuated with distance so high-frequency detail never aliases
-    // into shimmer on far hillsides.
-    float mat_fade = 1.0f - smoothstep(kTerrainMatDetailNear,
-                                       kTerrainMatDetailFar, view_dist);
-    float mat_rough = 0.85f;
-    if (mat_fade > 0.001f) {
-        float slope01 = clamp(1.0f - normal.y, 0.0f, 1.0f);
-        vec4 mat_w = terrainMaterialWeights(albedo, slope01, pos.y);
-        albedo *= terrainMaterialDetail(pos, mat_w, mat_fade, mat_rough);
-        normal  = terrainMaterialNormal(pos, normal, mat_w, mat_fade);
+    // tiles) so it modulates whatever the generator produced.  There is
+    // no global distance gate any more: terrainGroundField() retires one
+    // octave at a time as each stops covering pixels, so the surface
+    // never aliases at range and never loses its grain up close.
+    float slope01 = clamp(1.0f - normal.y, 0.0f, 1.0f);
+    vec4  mat_w   = terrainMaterialWeights(albedo, slope01, pos.y);
+    vec3  g_grad;
+    float g_field = terrainGroundField(pos, normal, view_dist, g_grad);
+    float mat_rough;
+    albedo *= terrainSurfaceShade(mat_w, g_field, mat_rough);
+    normal  = terrainSurfaceNormal(normal, mat_w, g_grad);
+
+    // ── Authored surface maps over the procedural estimate ───────────
+    // Three sources of relief, stacked by scale: the 1 m ML detail tile
+    // wins where it is resident, the 4 m macro map carries the rest of
+    // the 32 km, and the procedural field stays underneath BOTH — it is
+    // the only one of the three with energy below a metre, and it is all
+    // there is where neither map exists.  Nothing is switched off; the
+    // authored data cross-fades in on top of what is already there.
+    vec2  det_nrm_xy; float det_rough, det_ao;
+    float det_w = terrainDetailSurface(pos.xz, detail_fade,
+                                       macro_blur_dir, macro_blur_m,
+                                       det_nrm_xy, det_rough, det_ao);
+    vec2  surf_nrm_xy  = mix(macro_nrm_xy, det_nrm_xy, det_w);
+    float surf_nrm_w   = mix(macro_nrm_w, 1.0f, det_w) * (1.0f - sfade);
+    float surf_rough   = mix(macro_rough, det_rough, det_w);
+    float surf_rough_w = mix(macro_mr_w, 1.0f, det_w) * (1.0f - sfade);
+    // Occlusion MULTIPLIES rather than cross-fades: the macro ORM's red
+    // channel is ridge occlusion integrated over the whole 32 km, and the
+    // detail tile's alpha is micro-cavity only (the worker runs its AO
+    // with sky=False for exactly this reason), so the two are different
+    // stacking effects, not two estimates of one thing.
+    float surf_ao = mix(macro_ao * mix(1.0f, det_ao, det_w), 1.0f, sfade);
+
+    if (surf_nrm_w > 0.0f) {
+        // Tangent frame of the terrain surface: the height field is
+        // parameterised by world XZ, so T is world +X and B is world +Z,
+        // re-orthogonalised against the shading normal.  cross(T, normal)
+        // — NOT cross(normal, T) — is what keeps B on +Z: (T,B,N) here is
+        // LEFT-handed (T x B = X x Z = -Y), and that is the frame the
+        // python side encoded its tangent normals in.
+        vec3 T = normalize(vec3(1.0f, 0.0f, 0.0f) - normal * normal.x);
+        vec3 B = cross(T, normal);
+        vec2 nxy = surf_nrm_xy * surf_nrm_w;
+        float nz = sqrt(max(1e-4f, 1.0f - min(dot(nxy, nxy), 0.9999f)));
+        normal = normalize(nxy.x * T + nxy.y * B + nz * normal);
     }
+    // Authored roughness replaces the guess in proportion to how much of
+    // it is real, but keeps the ground field's damp-hollow / dry-crest
+    // modulation on top: that lives below the 4 m texel and below the 1 m
+    // one too, so no map can carry it.
+    mat_rough = clamp(mix(mat_rough, surf_rough + g_field * 0.07f,
+                          surf_rough_w), 0.05f, 1.0f);
 
     MaterialInfo material_info;
     material_info.baseColor = albedo;
@@ -373,8 +662,12 @@ void main() {
 
     #ifdef USE_IBL
     float mip_count = 10;
-    f_specular += getIBLRadianceGGX(normal, view, material_info.perceptualRoughness, material_info.f0, mip_count);
-    f_diffuse += getIBLRadianceLambertian(normal, material_info.albedoColor);
+    // Authored occlusion attenuates AMBIENT light only — that is what an
+    // occlusion map means, and IBL is the ambient term here.  Applying it
+    // to a direct sun term instead would darken lit slopes that the sky
+    // simply cannot see, which is the classic AO-as-shadow mistake.
+    f_specular += getIBLRadianceGGX(normal, view, material_info.perceptualRoughness, material_info.f0, mip_count) * surf_ao;
+    f_diffuse += getIBLRadianceLambertian(normal, material_info.albedoColor) * surf_ao;
     #endif
 
     //vec3 color = vec3(noise_value.w);

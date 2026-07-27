@@ -84,6 +84,20 @@ public:
     static void setTerrainVtAlbedoId(uint32_t id) {
         s_terrain_vt_albedo_id = id;
     }
+    // Same id as the albedo whenever <heightmap>_nrm.png / _orm.png were
+    // on disk at registration, 0xFFFFFFFF when they were not.  Separate
+    // from the albedo id rather than a "have surface maps" bool because
+    // the two files are independent: a world can ship a normal map and
+    // no ORM, and the shader has to keep the procedural roughness in
+    // that case while still using the authored normal.
+    static uint32_t s_terrain_vt_normal_id;
+    static uint32_t s_terrain_vt_mr_ao_id;
+    static void setTerrainVtNormalId(uint32_t id) {
+        s_terrain_vt_normal_id = id;
+    }
+    static void setTerrainVtMrAoId(uint32_t id) {
+        s_terrain_vt_mr_ao_id = id;
+    }
     static renderer::TextureInfo s_rock_layer_;
     static renderer::TextureInfo s_soil_water_layer_[2];
     static renderer::TextureInfo s_grass_snow_layer_;
@@ -195,6 +209,7 @@ public:
             const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex,
             const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
             const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+            const std::shared_ptr<renderer::ImageView>& terrain_detail_surf_array,
             const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
             uint32_t terrain_detail_table_bytes,
             const TileVtBindings& vt_bindings);

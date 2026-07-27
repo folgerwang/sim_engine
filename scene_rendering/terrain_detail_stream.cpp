@@ -25,6 +25,11 @@ namespace {
 constexpr uint32_t kTileRes   = kDetailTileRes;          // 2049
 constexpr uint32_t kSlots     = kDetailCacheSlots;       // 9 (3x3)
 constexpr int      kTilesSide = kDetailTilesPerSide;     // 16
+// The colour and surface companion tiles are 2048^2, not 2049^2: the
+// height tile carries a shared border texel so neighbouring tiles are
+// bit-identical along the seam, while the companions are texel-area
+// images at exactly 1 m and need no such duplicate.
+constexpr uint32_t kCompanionRes = 2048;
 
 double nowSeconds() {
     using namespace std::chrono;
@@ -41,6 +46,58 @@ std::string reqPath(const std::string& dir, int tx, int ty) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "req_%02d_%02d", tx, ty);
     return (fs::path(dir) / buf).string();
+}
+
+// One RGBA8 `res`^2 texture ARRAY with kSlots layers, memory bound and
+// every layer transitioned to SHADER_READ_ONLY so sampling is defined
+// before anything has been uploaded (the table is all -1 anyway).
+//
+// The 1 m colour tiles and the 1 m packed surface tiles are the same
+// shape and differ only in what the bytes mean, so they are allocated
+// by the same code.  Two near-identical thirty-line blocks sitting in
+// a constructor is precisely where a copy-paste divergence — a stale
+// format, a layer count that did not get updated — goes unnoticed.
+void createSlotArray(
+    const std::shared_ptr<er::Device>& device,
+    uint32_t res,
+    uint32_t layers,
+    std::shared_ptr<er::Image>& image,
+    std::shared_ptr<er::DeviceMemory>& memory,
+    std::shared_ptr<er::ImageView>& view) {
+    image = device->createImage(
+        er::ImageType::TYPE_2D,
+        glm::uvec3(res, res, 1),
+        er::Format::R8G8B8A8_UNORM,
+        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, TRANSFER_DST_BIT),
+        er::ImageTiling::OPTIMAL,
+        er::ImageLayout::UNDEFINED,
+        std::source_location::current(),
+        /*flags*/ 0,
+        /*sharing*/ false,
+        /*num_samples*/ 1,
+        /*num_mips*/ 1,
+        /*num_layers*/ layers);
+    auto reqs = device->getImageMemoryRequirements(image);
+    memory = device->allocateMemory(
+        reqs.size,
+        reqs.memory_type_bits,
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        /*allocate_flags*/ 0);
+    device->bindImageMemory(image, memory);
+    view = device->createImageView(
+        image,
+        er::ImageViewType::VIEW_2D_ARRAY,
+        er::Format::R8G8B8A8_UNORM,
+        SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+        std::source_location::current(),
+        0, 1, 0, layers);
+    er::Helper::transitionImageLayout(
+        device,
+        image,
+        er::Format::R8G8B8A8_UNORM,
+        er::ImageLayout::UNDEFINED,
+        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        0, 1, 0, layers);
 }
 
 }  // namespace
@@ -90,41 +147,17 @@ TerrainDetailStream::TerrainDetailStream(
 
     // 1 m albedo tile array (RGBA8, 2048^2 per slot — see the worker's
     // generate_color_tile; ~16 MB per slot, 9 slots).
-    const uint32_t kColorRes = 2048;
-    color_array_image_ = device->createImage(
-        er::ImageType::TYPE_2D,
-        glm::uvec3(kColorRes, kColorRes, 1),
-        er::Format::R8G8B8A8_UNORM,
-        SET_2_FLAG_BITS(ImageUsage, SAMPLED_BIT, TRANSFER_DST_BIT),
-        er::ImageTiling::OPTIMAL,
-        er::ImageLayout::UNDEFINED,
-        std::source_location::current(),
-        /*flags*/ 0,
-        /*sharing*/ false,
-        /*num_samples*/ 1,
-        /*num_mips*/ 1,
-        /*num_layers*/ kSlots);
-    auto color_reqs = device->getImageMemoryRequirements(color_array_image_);
-    color_array_memory_ = device->allocateMemory(
-        color_reqs.size,
-        color_reqs.memory_type_bits,
-        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-        /*allocate_flags*/ 0);
-    device->bindImageMemory(color_array_image_, color_array_memory_);
-    color_array_view_ = device->createImageView(
-        color_array_image_,
-        er::ImageViewType::VIEW_2D_ARRAY,
-        er::Format::R8G8B8A8_UNORM,
-        SET_FLAG_BIT(ImageAspect, COLOR_BIT),
-        std::source_location::current(),
-        0, 1, 0, kSlots);
-    er::Helper::transitionImageLayout(
-        device,
-        color_array_image_,
-        er::Format::R8G8B8A8_UNORM,
-        er::ImageLayout::UNDEFINED,
-        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        0, 1, 0, kSlots);
+    createSlotArray(device, kCompanionRes, kSlots,
+                    color_array_image_, color_array_memory_,
+                    color_array_view_);
+    // 1 m packed PBR surface tile array, same shape as the colour one:
+    // R,G = tangent normal XY, B = roughness, A = micro-occlusion (see
+    // the worker's generate_surface_tile).  Another ~151 MB resident,
+    // which is why it is one packed image and not a normal map plus a
+    // separate ORM map.
+    createSlotArray(device, kCompanionRes, kSlots,
+                    surf_array_image_, surf_array_memory_,
+                    surf_array_view_);
 
     // Slot table SSBO (host-visible: tiny, updated rarely).
     er::Helper::createBuffer(
@@ -138,6 +171,7 @@ TerrainDetailStream::TerrainDetailStream(
         sizeof(TableCpu));
     for (auto& s : table_cpu_.slot_map) s = -1;
     for (auto& s : table_cpu_.color_slot) s = -1;
+    for (auto& s : table_cpu_.surf_slot) s = -1;
     uploadTable(device);
 }
 
@@ -157,6 +191,7 @@ void TerrainDetailStream::setSource(
     for (auto& s : slots_) s = Slot{};
     for (auto& s : table_cpu_.slot_map) s = -1;
     for (auto& s : table_cpu_.color_slot) s = -1;
+    for (auto& s : table_cpu_.surf_slot) s = -1;
     uploadTable(device);
     if (!tiles_dir_.empty()) {
         std::error_code ec;
@@ -217,6 +252,7 @@ void TerrainDetailStream::update(
             !want[s.tile_y * kTilesSide + s.tile_x]) {
             table_cpu_.slot_map[s.tile_y * kTilesSide + s.tile_x] = -1;
             table_cpu_.color_slot[s.tile_y * kTilesSide + s.tile_x] = -1;
+            table_cpu_.surf_slot[s.tile_y * kTilesSide + s.tile_x] = -1;
             requested_.erase(s.tile_y * kTilesSide + s.tile_x);
             s = Slot{};
             table_dirty = true;
@@ -248,28 +284,36 @@ void TerrainDetailStream::update(
         submitTileLoad(device, loader, tx, ty, slot);
     }
 
-    // ── Colour retry ────────────────────────────────────────────────
-    // A tile can go resident without its 1 m colour (the worker writes
-    // the colour AFTER... older workers wrote the height PNG first, and
-    // ML colour tiles can simply take longer).  Re-load such tiles once
-    // the colour file shows up, else the near field stays on the blurry
-    // global map forever.
+    // ── Companion-tile retry ────────────────────────────────────────
+    // A tile can go resident without its 1 m colour or its 1 m surface
+    // (older workers wrote the height PNG first, and the ML companions
+    // can simply take longer).  Re-load such tiles once the missing
+    // file shows up, else the near field stays on the blurry global map
+    // and the shader-derived normals forever.
     {
-        static double s_last_color_scan = 0.0;
+        static double s_last_companion_scan = 0.0;
         const double now = nowSeconds();
-        if (now - s_last_color_scan > 2.0) {
-            s_last_color_scan = now;
+        if (now - s_last_companion_scan > 2.0) {
+            s_last_companion_scan = now;
             for (int i = 0; i < (int)kSlots; ++i) {
                 Slot& s = slots_[i];
                 if (s.tile_x < 0 || s.loading) continue;
                 const int key = s.tile_y * kTilesSide + s.tile_x;
                 if (table_cpu_.slot_map[key] != i) continue;
-                if (table_cpu_.color_slot[key] >= 0) continue;
                 const std::string cpng =
                     tilePngPath(tiles_dir_, s.tile_x, s.tile_y);
-                const std::string color_png =
-                    cpng.substr(0, cpng.size() - 4) + "_color.png";
-                if (fs::exists(color_png, ec)) {
+                const std::string stem = cpng.substr(0, cpng.size() - 4);
+                // Both are checked, and either one alone is reason to
+                // reload: the reload re-reads whichever companions are
+                // on disk, so picking up a late surface tile cannot
+                // lose a colour tile that arrived earlier.
+                const bool need_color =
+                    table_cpu_.color_slot[key] < 0 &&
+                    fs::exists(stem + "_color.png", ec);
+                const bool need_surf =
+                    table_cpu_.surf_slot[key] < 0 &&
+                    fs::exists(stem + "_surf.png", ec);
+                if (need_color || need_surf) {
                     // Unmap while reloading: the upload rewrites this
                     // array layer on the loader queue, and in-flight
                     // frames must not keep sampling it meanwhile (the
@@ -299,17 +343,22 @@ void TerrainDetailStream::submitTileLoad(
     // (tile_XX_YY_color.png) rides along when present.
     auto staging = std::make_shared<er::BufferInfo>();
         auto color_staging = std::make_shared<er::BufferInfo>();
+        auto surf_staging = std::make_shared<er::BufferInfo>();
         auto has_color = std::make_shared<bool>(false);
+        auto has_surf = std::make_shared<bool>(false);
         TerrainDetailStream* self = this;
         auto image = height_array_image_;
         auto color_image = color_array_image_;
+        auto surf_image = surf_array_image_;
         const std::string color_png =
             png.substr(0, png.size() - 4) + "_color.png";
+        const std::string surf_png =
+            png.substr(0, png.size() - 4) + "_surf.png";
         loader->submit(
             png,
             /*phase2*/
-            [png, color_png, staging, color_staging, has_color,
-             image, color_image, slot](
+            [png, color_png, surf_png, staging, color_staging, surf_staging,
+             has_color, has_surf, image, color_image, surf_image, slot](
                 const std::shared_ptr<er::Device>& dev,
                 const std::shared_ptr<er::CommandBuffer>& cmd_buf,
                 std::string& error_out) -> bool {
@@ -367,60 +416,81 @@ void TerrainDetailStream::submitTileLoad(
                     er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     0, 1, slot, 1);
 
-                // Optional 1 m albedo tile (2048^2 RGBA8).
-                int cw = 0, ch = 0, ccomp = 0;
-                stbi_uc* cpix = stbi_load(color_png.c_str(),
-                                          &cw, &ch, &ccomp, STBI_rgb_alpha);
-                if (cpix && cw == 2048 && ch == 2048) {
-                    const uint64_t cbytes = (uint64_t)cw * ch * 4;
-                    er::Helper::createBuffer(
-                        dev,
-                        SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
-                        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
-                                        HOST_COHERENT_BIT),
-                        0,
-                        color_staging->buffer,
-                        color_staging->memory,
-                        std::source_location::current(),
-                        cbytes,
-                        cpix);
-                    er::Helper::transitionImageLayout(
-                        cmd_buf, color_image, er::Format::R8G8B8A8_UNORM,
-                        er::ImageLayout::UNDEFINED,
-                        er::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        0, 1, slot, 1);
-                    er::BufferImageCopyInfo cregion = region;
-                    cregion.image_extent = glm::uvec3(cw, ch, 1);
-                    cmd_buf->copyBufferToImage(
-                        color_staging->buffer, color_image, { cregion },
-                        er::ImageLayout::TRANSFER_DST_OPTIMAL);
-                    er::Helper::transitionImageLayout(
-                        cmd_buf, color_image, er::Format::R8G8B8A8_UNORM,
-                        er::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        0, 1, slot, 1);
-                    *has_color = true;
-                }
-                if (cpix) stbi_image_free(cpix);
+                // Optional 1 m companion tiles.  Both are 2048^2 RGBA8
+                // into the same slot of a different array and differ
+                // only in what the four channels mean, so they load
+                // through the same code — the surface tile is exactly
+                // as optional as the colour tile, and a missing one
+                // must cost the tile nothing but its own detail.
+                auto load_companion =
+                    [&](const std::string& path,
+                        const std::shared_ptr<er::Image>& img,
+                        const std::shared_ptr<er::BufferInfo>& buf) -> bool {
+                    int cw = 0, ch = 0, ccomp = 0;
+                    stbi_uc* cpix = stbi_load(path.c_str(), &cw, &ch, &ccomp,
+                                              STBI_rgb_alpha);
+                    bool ok = false;
+                    if (cpix && cw == (int)kCompanionRes &&
+                        ch == (int)kCompanionRes) {
+                        const uint64_t cbytes = (uint64_t)cw * ch * 4;
+                        er::Helper::createBuffer(
+                            dev,
+                            SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
+                            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                            HOST_COHERENT_BIT),
+                            0,
+                            buf->buffer,
+                            buf->memory,
+                            std::source_location::current(),
+                            cbytes,
+                            cpix);
+                        er::Helper::transitionImageLayout(
+                            cmd_buf, img, er::Format::R8G8B8A8_UNORM,
+                            er::ImageLayout::UNDEFINED,
+                            er::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            0, 1, slot, 1);
+                        er::BufferImageCopyInfo cregion = region;
+                        cregion.image_extent = glm::uvec3(cw, ch, 1);
+                        cmd_buf->copyBufferToImage(
+                            buf->buffer, img, { cregion },
+                            er::ImageLayout::TRANSFER_DST_OPTIMAL);
+                        er::Helper::transitionImageLayout(
+                            cmd_buf, img, er::Format::R8G8B8A8_UNORM,
+                            er::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            0, 1, slot, 1);
+                        ok = true;
+                    }
+                    if (cpix) stbi_image_free(cpix);
+                    return ok;
+                };
+                *has_color = load_companion(color_png, color_image,
+                                            color_staging);
+                *has_surf  = load_companion(surf_png, surf_image,
+                                            surf_staging);
                 return true;
             },
             /*phase3*/
-            [self, staging, color_staging, has_color, slot, tx, ty,
-             device]() {
+            [self, staging, color_staging, surf_staging, has_color, has_surf,
+             slot, tx, ty, device]() {
                 Slot& s = self->slots_[slot];
                 s.loading = false;
                 if (s.tile_x == tx && s.tile_y == ty) {
                     self->table_cpu_.slot_map[ty * kTilesSide + tx] = slot;
                     self->table_cpu_.color_slot[ty * kTilesSide + tx] =
                         *has_color ? slot : -1;
+                    self->table_cpu_.surf_slot[ty * kTilesSide + tx] =
+                        *has_surf ? slot : -1;
                     self->uploadTable(device);
                     std::cout << "[terrain-detail] tile (" << tx << "," << ty
                               << ") resident in slot " << slot
                               << (*has_color ? " (+1m albedo)" : "")
+                              << (*has_surf ? " (+1m surface)" : "")
                               << std::endl;
                 }
                 staging->destroy(device);
                 color_staging->destroy(device);
+                surf_staging->destroy(device);
             });
 }
 
@@ -460,6 +530,9 @@ void TerrainDetailStream::destroy(
     if (color_array_view_)  device->destroyImageView(color_array_view_);
     if (color_array_image_) device->destroyImage(color_array_image_);
     if (color_array_memory_) device->freeMemory(color_array_memory_);
+    if (surf_array_view_)  device->destroyImageView(surf_array_view_);
+    if (surf_array_image_) device->destroyImage(surf_array_image_);
+    if (surf_array_memory_) device->freeMemory(surf_array_memory_);
     if (table_buffer_) device->destroyBuffer(table_buffer_);
     if (table_memory_) device->freeMemory(table_memory_);
     height_array_view_.reset();
@@ -468,6 +541,9 @@ void TerrainDetailStream::destroy(
     color_array_view_.reset();
     color_array_image_.reset();
     color_array_memory_.reset();
+    surf_array_view_.reset();
+    surf_array_image_.reset();
+    surf_array_memory_.reset();
     table_buffer_.reset();
     table_memory_.reset();
 }

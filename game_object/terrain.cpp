@@ -1664,11 +1664,12 @@ renderer::WriteDescriptorList addTileResourceTextures(
     const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
     const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
     const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_surf_array,
     const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
     uint32_t terrain_detail_table_bytes,
     const TileVtBindings& vt_bindings) {
     renderer::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(21);
+    descriptor_writes.reserve(22);
 
     // Virtual-textured terrain albedo (shared RVT pools).
     if (vt_bindings.sampler) {
@@ -1723,6 +1724,22 @@ renderer::WriteDescriptorList addTileResourceTextures(
             TERRAIN_DETAIL_COLOR_INDEX,
             clamp_texture_sampler,
             terrain_detail_color_array,
+            renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+    // 1 m packed PBR surface tiles: R,G = tangent normal XY,
+    // B = roughness, A = micro-occlusion.  Clamp sampler, same as the
+    // colour array — the fragment shader guards every tap on the slot
+    // table, so a UV never legitimately leaves its own tile, and a
+    // repeat sampler would silently wrap a rounding error at the border
+    // to the far side of the tile instead of pinning it to the edge.
+    if (terrain_detail_surf_array) {
+        renderer::Helper::addOneTexture(
+            descriptor_writes,
+            description_set,
+            renderer::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            TERRAIN_DETAIL_SURFACE_INDEX,
+            clamp_texture_sampler,
+            terrain_detail_surf_array,
             renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
     if (terrain_detail_table) {
@@ -2038,6 +2055,12 @@ static std::shared_ptr<renderer::DescriptorSetLayout> CreateTileResourceDescript
     bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
         TERRAIN_DETAIL_COLOR_INDEX,
         SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT)));
+    // 1 m packed surface tiles.  Fragment only: the vertex stage
+    // displaces with the detail HEIGHT, and a normal or a roughness has
+    // nothing to say about where a vertex goes.
+    bindings.push_back(renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        TERRAIN_DETAIL_SURFACE_INDEX,
+        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT)));
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -2107,6 +2130,11 @@ renderer::BufferInfo TileObject::s_lod_index_buffers_[size_t(TileObject::TileCon
 const uint32_t TileObject::kLodSegmentCounts[size_t(TileObject::TileConst::kNumMeshLods)] = {
     127, 63, 31, 15 };
 uint32_t TileObject::s_terrain_vt_albedo_id = 0xFFFFFFFFu;
+// Invalid until createTerrainFromMaps finds the companion maps beside the
+// heightmap; a terrain that never had them renders exactly as it did
+// before they existed.
+uint32_t TileObject::s_terrain_vt_normal_id = 0xFFFFFFFFu;
+uint32_t TileObject::s_terrain_vt_mr_ao_id  = 0xFFFFFFFFu;
 renderer::TextureInfo TileObject::s_rock_layer_;
 renderer::TextureInfo TileObject::s_soil_water_layer_[2];
 renderer::TextureInfo TileObject::s_grass_snow_layer_;
@@ -2764,6 +2792,7 @@ void TileObject::updateTileResDescriptorSet(
     const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex,
     const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
     const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+    const std::shared_ptr<renderer::ImageView>& terrain_detail_surf_array,
     const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
     uint32_t terrain_detail_table_bytes,
     const TileVtBindings& vt_bindings) {
@@ -2787,6 +2816,7 @@ void TileObject::updateTileResDescriptorSet(
             rough_volume_noise_tex,
             terrain_detail_height_array,
             terrain_detail_color_array,
+            terrain_detail_surf_array,
             terrain_detail_table,
             terrain_detail_table_bytes,
             vt_bindings);
@@ -2964,6 +2994,8 @@ void TileObject::draw(
     tile_params.time = cur_time;
     tile_params.tile_index = block_idx_;
     tile_params.vt_albedo_id = s_terrain_vt_albedo_id;
+    tile_params.vt_normal_id = s_terrain_vt_normal_id;
+    tile_params.vt_mr_ao_id = s_terrain_vt_mr_ao_id;
     // Outer-ring tiles ride slightly BELOW the fine terrain (bias in cm)
     // so partial overlaps with the inner rings never z-fight — the fine
     // surface always wins; beyond the fine ring the dip is invisible.
@@ -3023,6 +3055,8 @@ void TileObject::drawGrass(
     tile_params.time = cur_time;
     tile_params.tile_index = block_idx_;
     tile_params.vt_albedo_id = 0xFFFFFFFFu;   // grass doesn't sample VT
+    tile_params.vt_normal_id = 0xFFFFFFFFu;
+    tile_params.vt_mr_ao_id = 0xFFFFFFFFu;
     cmd_buf->pushConstants(
 #if USE_MESH_SHADER
         SET_2_FLAG_BITS(ShaderStage, MESH_BIT_EXT, FRAGMENT_BIT),

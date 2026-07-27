@@ -50,6 +50,7 @@ public:
         const std::shared_ptr<renderer::ImageView>& rough_volume_noise_tex,
         const std::shared_ptr<renderer::ImageView>& terrain_detail_height_array,
         const std::shared_ptr<renderer::ImageView>& terrain_detail_color_array,
+        const std::shared_ptr<renderer::ImageView>& terrain_detail_surf_array,
         const std::shared_ptr<renderer::Buffer>& terrain_detail_table,
         uint32_t terrain_detail_table_bytes,
         const ego::TileVtBindings& vt_bindings = {});

@@ -22,6 +22,13 @@ layout(std430, set = TILE_PARAMS_SET, binding = TERRAIN_DETAIL_TABLE_INDEX)
     // Layout mirrors TerrainDetailStream::TableCpu.
     int detail_slot_map[kDetailTilesPerSide * kDetailTilesPerSide];
     int detail_color_slot[kDetailTilesPerSide * kDetailTilesPerSide];
+    // Separate from detail_color_slot even though both are written by
+    // the same tile load: the surface tile is produced by a later stage
+    // of the worker than the colour tile, so a world generated before
+    // surface tiles existed has colour on disk and no _surf.png beside
+    // it.  One shared slot index would then either lose the colour or
+    // claim a surface that is not there.
+    int detail_surf_slot[kDetailTilesPerSide * kDetailTilesPerSide];
 };
 
 // 0 = pure base map, 1 = pure detail.

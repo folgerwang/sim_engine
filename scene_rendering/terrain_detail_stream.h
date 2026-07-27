@@ -36,10 +36,16 @@ namespace scene_rendering {
 class TerrainDetailStream {
 public:
     // GPU-side TerrainDetailTable mirror (layout must match the SSBO in
-    // tile_detail.glsl.h: two int[256] arrays back-to-back).
+    // tile_detail.glsl.h: three int[256] arrays back-to-back).
     struct TableCpu {
         int32_t slot_map[16 * 16];    // world tile -> array slice (-1)
         int32_t color_slot[16 * 16];  // -1 when no 1 m colour tile
+        // -1 when no 1 m packed surface tile.  Tracked separately from
+        // color_slot rather than folded into it because the two files
+        // are written by different stages of the worker and a world
+        // generated before surface tiles existed has one and not the
+        // other; a single flag would have to lie about one of them.
+        int32_t surf_slot[16 * 16];
     };
 
     TerrainDetailStream(
@@ -66,6 +72,9 @@ public:
     const std::shared_ptr<renderer::ImageView>& getColorArrayView() const {
         return color_array_view_;
     }
+    const std::shared_ptr<renderer::ImageView>& getSurfArrayView() const {
+        return surf_array_view_;
+    }
     const std::shared_ptr<renderer::Buffer>& getTableBuffer() const {
         return table_buffer_;
     }
@@ -84,8 +93,8 @@ private:
     void requestTile(int tx, int ty);
     int  findFreeSlot() const;
     // Decode + upload tile (tx,ty) into `slot` via the async loader
-    // (height + optional 1 m colour).  Used for first loads and for
-    // colour retries (see update()).
+    // (height + optional 1 m colour + optional 1 m packed surface).
+    // Used for first loads and for companion-tile retries (see update()).
     void submitTileLoad(
         const std::shared_ptr<renderer::Device>& device,
         game_object::MeshLoadTaskManager* loader,
@@ -100,6 +109,14 @@ private:
     std::shared_ptr<renderer::Image>       color_array_image_;
     std::shared_ptr<renderer::DeviceMemory> color_array_memory_;
     std::shared_ptr<renderer::ImageView>   color_array_view_;
+    // 1 m packed PBR surface tiles (RGBA8 2048^2 per slot):
+    // R,G = tangent normal XY, B = roughness, A = micro-occlusion.
+    // One array rather than a normal array plus an ORM array because
+    // every one of these costs ~151 MB resident across the nine slots
+    // whether or not the camera is pointing at any of them.
+    std::shared_ptr<renderer::Image>       surf_array_image_;
+    std::shared_ptr<renderer::DeviceMemory> surf_array_memory_;
+    std::shared_ptr<renderer::ImageView>   surf_array_view_;
     std::shared_ptr<renderer::Buffer>      table_buffer_;
     std::shared_ptr<renderer::DeviceMemory> table_memory_;
 
