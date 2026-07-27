@@ -259,6 +259,30 @@ struct MeshInfo {
     int32_t cluster_global_mesh_idx_ = -1;
 };
 
+// One per-instance world transform, byte-identical to glsl::Instance-
+// DataInfo (see shaders/global_definition.glsl.h) so a vector of these
+// can be memcpy'd straight into instance_buffer_.
+//
+// Column convention is base.vert's, NOT a glm::mat4's rows:
+//     position_ws = mat3(mat_rot_0, mat_rot_1, mat_rot_2) * position_ls
+//                 + mat_pos_scale.xyz
+// GLSL's mat3x3(a,b,c) builds from COLUMNS, so mat_rot_i is column i of
+// the rotation*scale basis and mat_pos_scale.xyz is the translation.
+// That matches glm's column-major mat4 exactly: mat_rot_i == M[i] for
+// M = translate(T) * mat4_cast(R) * scale(S).  Get this wrong and every
+// instance renders transposed — sheared and mirrored, not obviously
+// "rotated", which is a miserable thing to debug.
+//
+// mat_pos_scale.w is 1.0 and unused; the name is inherited from the
+// per-frame compute path (update_instance_buffer.comp) which packs the
+// same four vec4s.
+struct BakedInstanceXform {
+    glm::vec4                   mat_rot_0{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec4                   mat_rot_1{0.0f, 1.0f, 0.0f, 0.0f};
+    glm::vec4                   mat_rot_2{0.0f, 0.0f, 1.0f, 0.0f};
+    glm::vec4                   mat_pos_scale{0.0f, 0.0f, 0.0f, 1.0f};
+};
+
 struct NodeInfo {
     std::string                 name_;
     int32_t                     parent_idx_ = -1;
@@ -266,6 +290,21 @@ struct NodeInfo {
 
     int32_t                     mesh_idx_ = -1;
     int32_t                     skin_idx_ = -1;
+
+    // ── EXT_mesh_gpu_instancing ──────────────────────────────────────
+    // Accessor indices read straight off node.extensions in setupNode.
+    // -1 = the node did not carry the extension.  ROTATION and SCALE are
+    // optional per the extension spec (a node may instance translations
+    // only), TRANSLATION in practice is always present; bakeInstance-
+    // Transforms substitutes identity for whichever is missing.
+    int32_t                     inst_translation_acc_ = -1;
+    int32_t                     inst_rotation_acc_ = -1;
+    int32_t                     inst_scale_acc_ = -1;
+    // Filled by bakeInstanceTransforms: this node's slice of
+    // DrawableData::baked_instances_.  inst_count_ == 0 means "not
+    // instanced" and the drawable's single identity slot 0 is used.
+    uint32_t                    inst_offset_ = 0;
+    uint32_t                    inst_count_ = 0;
 
     glm::vec3                   translation_{};
     glm::vec3                   scale_{1.0f};
@@ -335,6 +374,23 @@ struct DrawableData {
     // node's world transform, so the only thing that can hide the
     // draw is genuine culling / pipeline / material breakage.
     bool m_debug_skip_skinning_ = false;
+    // ── Ground-clutter distance fade (DrawMode::kDecal only) ─────────
+    // Pushed to base.frag as ModelParams::clutter_fade_{start,end}_m and
+    // used on the CPU by drawMesh to reject whole per-tile MeshInfos
+    // beyond the end distance.  0/0 = no fade, which is what every
+    // drawable except the <map>_pcg_clutter.glb import carries — the
+    // road ribbon shares the decal pipeline and must NOT dissolve with
+    // range.
+    //
+    // STAGING SLOT, not the authority.  DrawableData is shared between
+    // every wrapper that loaded the same file (see the dedup cache in
+    // createAsync), so a per-drawable property cannot be stored here and
+    // survive; the owning wrapper copies its own values in at the top of
+    // DrawableObject::draw, exactly as m_current_instance_world_ and
+    // m_only_render_node_ are staged.  Set via DrawableObject::
+    // setClutterFade.
+    float m_clutter_fade_start_m_ = 0.0f;
+    float m_clutter_fade_end_m_ = 0.0f;
     // Force-override the root node's local scale when > 0.  Wired by
     // setRootNodeTransform so the override travels through every
     // subsequent applyPose call from PlayerController without needing
@@ -402,6 +458,38 @@ struct DrawableData {
     uint32_t                    num_prims_ = 0;
     renderer::BufferInfo        indirect_draw_cmd_;
     renderer::BufferInfo        instance_buffer_;
+
+    // ── Baked GPU instancing (EXT_mesh_gpu_instancing) ───────────────
+    // Non-empty only for assets that carried the extension — today the
+    // PCG tree scatter, "<map>_pcg_trees.glb", where 30 species meshes
+    // stand in for several thousand drawn trees.
+    //
+    // The engine's DEFAULT instancing is a crowd system: every primitive
+    // of every drawable gets the same instance_count (kNumDrawableInstance,
+    // which is 1) and the same transform, rewritten every frame by
+    // update_instance_buffer.comp from the shared game_objects_buffer_.
+    // Baked instancing is the opposite shape — a fixed, per-node,
+    // load-time table that nothing rewrites.  The two cannot coexist on
+    // one drawable, which is what has_baked_instances_ arbitrates: when
+    // it is set, BOTH per-frame compute passes (updateInstanceBuffer and
+    // updateIndirectDrawBuffer) skip this drawable entirely, because
+    // either one would overwrite the baked table — the first with the
+    // game-object transform, the second by stamping kNumDrawableInstance
+    // over every primitive's instance_count.
+    //
+    // Slot 0 is ALWAYS a reserved identity transform, so a mixed file
+    // (some nodes instanced, some not) still renders its plain nodes at
+    // first_instance=0, count=1 — i.e. exactly as before.
+    std::vector<BakedInstanceXform> baked_instances_;
+    // mesh index -> (first_instance, instance_count) for the indirect
+    // draw fill, which walks meshes/primitives rather than nodes.  Empty
+    // when nothing is instanced.  A mesh referenced by two instanced
+    // nodes would be ambiguous here; the writer emits one mesh per
+    // instanced node, and bakeInstanceTransforms warns if that is ever
+    // violated rather than silently picking one.
+    std::unordered_map<int32_t, std::pair<uint32_t, uint32_t>>
+                                mesh_instance_range_;
+    bool                        has_baked_instances_ = false;
 
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> update_instance_buffer_desc_set_;
@@ -516,6 +604,13 @@ class DrawableObject {
     glm::vec3                   instance_root_s_ = glm::vec3(1.0f);
     bool                        instance_root_valid_ = false;
 
+    // Per-wrapper ground-clutter distance fade, in metres.  0/0 = no
+    // fade (the default, and what every drawable except the clutter glb
+    // keeps).  Lives here rather than in the shared DrawableData for the
+    // same reason instance_root_* does — see setClutterFade.
+    float                       clutter_fade_start_m_ = 0.0f;
+    float                       clutter_fade_end_m_ = 0.0f;
+
     // Per-wrapper visibility gate.  When false, DrawableObject::draw()
     // early-returns BEFORE doing any work (no instance buffer bind, no
     // node walk, no shadow recording either, since the same draw() runs
@@ -595,6 +690,19 @@ private:
     // <=256 verts/tris; everything else falls back to the GS pipeline
     // inside drawMesh.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_mesh_shader_pipeline_list_;
+    // Ground-decal forward pipeline.  Same vertex layout, same layout
+    // object and the same forward renderbuffer formats as
+    // drawable_pipeline_list_; what differs is the fragment permutation
+    // (base_frag*_DECAL.spv, which fades itself out by the distance
+    // between its own depth and the scene depth already in the buffer)
+    // and the fixed-function state (alpha blend ON, depth write OFF,
+    // depth test still ON so houses occlude the road).  Keyed by the
+    // SAME PrimitiveInfo hash as the forward list — the two never share
+    // a map, so there is no collision to disambiguate, and a primitive
+    // drawn both ways gets one entry in each.
+    // Selected by DrawMode::kDecal; populated only for objects the host
+    // registered via ObjectSceneView::addDecalObject.
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_decal_pipeline_list_;
     static std::shared_ptr<renderer::DescriptorSetLayout> mesh_shader_shadow_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout>      mesh_shader_shadow_pipeline_layout_;
     static std::unordered_map<std::string, std::shared_ptr<DrawableData>> drawable_object_list_;
@@ -852,6 +960,27 @@ public:
         return object_ ? object_->m_debug_skip_skinning_ : false;
     }
 
+    // ── Ground-clutter distance fade ─────────────────────────────────
+    // start_m: last distance at which the drawable is fully opaque.
+    // end_m:   distance at which it has completely dissolved; whole
+    //          MeshInfos whose bounding sphere lies entirely beyond it
+    //          are skipped on the CPU before any draw is recorded.
+    // Pass (0, 0) to disable — that is the default, and it is what the
+    // road decal keeps.  Only meaningful for drawables rendered through
+    // DrawMode::kDecal; base.frag reads the values in its DECAL branch
+    // and no other permutation does.
+    //
+    // Stored on the WRAPPER, deliberately: this is callable the instant
+    // createAsync returns, long before object_ exists, and it must not be
+    // clobbered by a sibling wrapper that deduped onto the same
+    // DrawableData.  draw() copies it down each frame.
+    void setClutterFade(float start_m, float end_m) {
+        clutter_fade_start_m_ = start_m;
+        clutter_fade_end_m_ = end_m;
+    }
+    float getClutterFadeStart() const { return clutter_fade_start_m_; }
+    float getClutterFadeEnd() const { return clutter_fade_end_m_; }
+
     // ── Debug giant-size override ────────────────────────────────────
     // Force-overrides the root node's scale to (s, s, s) on every
     // subsequent setRootNodeTransform call (which PlayerController
@@ -980,6 +1109,17 @@ public:
                         // SSBOs.  Ineligible primitives (skinned,
                         // cutout, UINT16 indices, >256 verts/tris) fall
                         // back to the GS pipeline inside drawMesh.
+        kDecal,         // Ground-decal forward pass.  Lit exactly like
+                        // kForward — same VS, same material bindings —
+                        // but runs AFTER the terrain tiles, with alpha
+                        // blend on and depth write off, and uses the
+                        // _DECAL fragment permutation which samples the
+                        // scene depth copy at SCENE_DEPTH_TEX_INDEX and
+                        // dissolves itself wherever the decal mesh
+                        // separates from the ground already rendered
+                        // there.  That is what makes the road ribbon
+                        // blend into the terrain instead of drawing a
+                        // hard silhouette edge over it.
     };
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
@@ -1030,6 +1170,15 @@ public:
     // world space (Gribb-Hartmann, normalised).
     static void setFrustumCullPlanes(const glm::vec4 planes[6]);
     static void clearFrustumCull();
+
+    // Per-frame eye position in world space, used by drawMesh's clutter
+    // distance cull.  Kept separate from the frustum planes because the
+    // decal pass runs at a different point in the frame than the forward
+    // pass and the cull must be live for it; ObjectSceneView::drawDecals
+    // sets it from its camera object.  Until it is set the distance cull
+    // is inert (nothing is culled), which is the safe default.
+    static void setViewerWorldPos(const glm::vec3& pos);
+    static void clearViewerWorldPos();
 
     static void initGameObjectBuffer(
         const std::shared_ptr<renderer::Device>& device);

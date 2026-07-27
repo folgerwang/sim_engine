@@ -37,6 +37,16 @@ static uint32_t num_draw_meshes = 0;
 static bool     s_frustum_cull_active = false;
 static glm::vec4 s_frustum_planes[6];
 
+// ── Per-frame eye position (set by ObjectSceneView::drawDecals) ────────
+// Drives the ground-clutter distance cull in drawMesh.  Deliberately
+// NOT derived from the frustum planes: recovering an eye point from six
+// planes is an intersection solve that would silently degenerate for an
+// orthographic projection (the shadow cascades use one), and the decal
+// pass runs after the forward pass anyway, so it has its own natural
+// place to publish the camera position.
+static bool      s_viewer_pos_valid = false;
+static glm::vec3 s_viewer_pos_ws = glm::vec3(0.0f);
+
 namespace ego = engine::game_object;
 
 // ── ECS material-dedup capture ──────────────────────────────────────────
@@ -381,15 +391,47 @@ static void calculateBbox(
         cur_matrix *= node.matrix_;
 
         if (node.mesh_idx_ >= 0) {
-            glm::vec3 bbox_min, bbox_max;
-            transformBbox(
-                cur_matrix,
-                drawable_object->meshes_[node.mesh_idx_].bbox_min_,
-                drawable_object->meshes_[node.mesh_idx_].bbox_max_,
-                bbox_min,
-                bbox_max);
-            output_bbox_min = min(output_bbox_min, bbox_min);
-            output_bbox_max = max(output_bbox_max, bbox_max);
+            const auto& mesh_bbox_min =
+                drawable_object->meshes_[node.mesh_idx_].bbox_min_;
+            const auto& mesh_bbox_max =
+                drawable_object->meshes_[node.mesh_idx_].bbox_max_;
+
+            if (node.inst_count_ > 0 &&
+                node.inst_offset_ + node.inst_count_ <=
+                    drawable_object->baked_instances_.size()) {
+                // ── Baked GPU instancing ─────────────────────────────
+                // The node's mesh sits at the local origin and every
+                // real copy stands somewhere else on the map, so the
+                // untransformed bbox would claim the whole scatter
+                // occupies one tree's worth of space at (0,0,0).  That
+                // bbox feeds shadow-cascade fitting and editor framing,
+                // both of which would then be badly wrong.  Union the
+                // per-instance boxes instead — one pass over the baked
+                // table at load, never per frame.
+                for (uint32_t i = 0; i < node.inst_count_; ++i) {
+                    const auto& x =
+                        drawable_object->baked_instances_[node.inst_offset_ + i];
+                    const glm::mat4 inst_mat(
+                        x.mat_rot_0, x.mat_rot_1, x.mat_rot_2,
+                        glm::vec4(glm::vec3(x.mat_pos_scale), 1.0f));
+                    glm::vec3 bbox_min, bbox_max;
+                    transformBbox(
+                        inst_mat * cur_matrix,
+                        mesh_bbox_min, mesh_bbox_max, bbox_min, bbox_max);
+                    output_bbox_min = min(output_bbox_min, bbox_min);
+                    output_bbox_max = max(output_bbox_max, bbox_max);
+                }
+            } else {
+                glm::vec3 bbox_min, bbox_max;
+                transformBbox(
+                    cur_matrix,
+                    mesh_bbox_min,
+                    mesh_bbox_max,
+                    bbox_min,
+                    bbox_max);
+                output_bbox_min = min(output_bbox_min, bbox_min);
+                output_bbox_max = max(output_bbox_max, bbox_max);
+            }
         }
 
         for (auto& child_idx : node.child_idx_) {
@@ -2321,6 +2363,44 @@ static void setupNode(
     node_info.mesh_idx_ = node.mesh;
     node_info.skin_idx_ = node.skin;
 
+    // ── EXT_mesh_gpu_instancing ──────────────────────────────────────
+    // Record the accessor indices only; the actual transforms are read
+    // in bakeInstanceTransforms, which needs the whole model at once so
+    // it can lay every node's slice into one flat table.
+    //
+    // tinygltf keeps unknown extensions as generic Values, so this is a
+    // plain map walk — no loader support required, which is also why a
+    // build without this patch loads the same file and simply draws one
+    // copy per node (the extension is declared in extensionsUsed and
+    // deliberately NOT in extensionsRequired).
+    {
+        const auto ext_it = node.extensions.find("EXT_mesh_gpu_instancing");
+        if (ext_it != node.extensions.end() && ext_it->second.IsObject()) {
+            const auto& attribs = ext_it->second.Has("attributes")
+                ? ext_it->second.Get("attributes")
+                : ext_it->second;
+            if (ext_it->second.Has("attributes") && attribs.IsObject()) {
+                // Has/Get/IsNumber/GetNumberAsInt rather than the typed
+                // Get<int>() overload: this is exactly the idiom the
+                // KHR_materials_pbrSpecularGlossiness fallback above uses
+                // to pull a texture index out of a generic Value, so it is
+                // known to compile against the vendored tinygltf.
+                const auto read_acc =
+                    [&attribs](const std::string& key) -> int32_t {
+                    if (!attribs.Has(key)) {
+                        return -1;
+                    }
+                    const auto& v = attribs.Get(key);
+                    return v.IsNumber()
+                        ? static_cast<int32_t>(v.GetNumberAsInt()) : -1;
+                };
+                node_info.inst_translation_acc_ = read_acc("TRANSLATION");
+                node_info.inst_rotation_acc_    = read_acc("ROTATION");
+                node_info.inst_scale_acc_       = read_acc("SCALE");
+            }
+        }
+    }
+
     // Draw child nodes.
     node_info.child_idx_.resize(node.children.size());
     for (size_t i = 0; i < node.children.size(); i++) {
@@ -2354,6 +2434,267 @@ static void setupModel(
             dst_scene.nodes_[i_node] = src_scene.nodes[i_node];
         }
     }
+}
+
+// ── EXT_mesh_gpu_instancing: read one float accessor ────────────────────
+// Returns count*num_components floats, honouring both the accessor's and
+// the bufferView's byteOffset AND the bufferView's byteStride.  Tightly-
+// packed data (what terrain_pcg.py's write_instanced_glb emits) takes the
+// stride==0 fast path; the strided branch exists so an interleaved file
+// from another tool doesn't read garbage.
+//
+// Every tinygltf call here is one already used elsewhere in this file:
+// TINYGLTF_COMPONENT_TYPE_FLOAT and TINYGLTF_TYPE_VEC3/VEC4 as in the
+// animation-sampler reader, and Accessor::ByteStride(bufferView) as in
+// setupMesh's vertex-binding setup.  Nothing new is assumed about the
+// vendored header.
+static bool readFloatAccessor(
+    const tinygltf::Model& model,
+    int32_t accessor_idx,
+    uint32_t expect_components,
+    std::vector<float>& out) {
+
+    if (accessor_idx < 0 ||
+        accessor_idx >= static_cast<int32_t>(model.accessors.size())) {
+        return false;
+    }
+    const auto& acc = model.accessors[accessor_idx];
+    if (acc.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) {
+        // The extension permits normalized byte/short for ROTATION.  We
+        // don't emit that and don't decode it — but say so instead of
+        // quietly producing identity rotations, which would look like a
+        // scatter bug rather than a loader gap.
+        std::cout << "[instancing] accessor " << accessor_idx
+                  << " has non-float componentType " << acc.componentType
+                  << " — unsupported, instances will be wrong" << std::endl;
+        return false;
+    }
+    // Compare acc.type directly rather than going through a component-count
+    // helper: TINYGLTF_TYPE_VEC3/VEC4 are the spellings this file already
+    // uses, so there is no chance of naming a helper the vendored copy
+    // does not export.
+    const int expect_type =
+        (expect_components == 3) ? TINYGLTF_TYPE_VEC3 : TINYGLTF_TYPE_VEC4;
+    if (acc.type != expect_type) {
+        std::cout << "[instancing] accessor " << accessor_idx
+                  << " has type " << acc.type << ", expected "
+                  << expect_type << " (VEC" << expect_components << ")"
+                  << std::endl;
+        return false;
+    }
+    if (acc.bufferView < 0 ||
+        acc.bufferView >= static_cast<int>(model.bufferViews.size())) {
+        return false;
+    }
+    const auto& bv = model.bufferViews[acc.bufferView];
+    if (bv.buffer < 0 || bv.buffer >= static_cast<int>(model.buffers.size())) {
+        return false;
+    }
+    const auto& buf = model.buffers[bv.buffer];
+    const size_t elem_size = sizeof(float) * expect_components;
+    // ByteStride() already resolves "0 means tightly packed" against the
+    // accessor's own type/componentType, and returns -1 if the view is
+    // malformed.  Fall back to the packed size on that error rather than
+    // reading with a negative stride.
+    const int reported_stride = acc.ByteStride(bv);
+    const size_t stride = (reported_stride > 0)
+        ? static_cast<size_t>(reported_stride) : elem_size;
+    const size_t base = bv.byteOffset + acc.byteOffset;
+    if (base + (acc.count ? (acc.count - 1) * stride + elem_size : 0) >
+        buf.data.size()) {
+        std::cout << "[instancing] accessor " << accessor_idx
+                  << " runs past the end of its buffer — skipped" << std::endl;
+        return false;
+    }
+    out.resize(acc.count * expect_components);
+    for (size_t i = 0; i < acc.count; ++i) {
+        memcpy(&out[i * expect_components],
+               buf.data.data() + base + i * stride,
+               elem_size);
+    }
+    return true;
+}
+
+// ── EXT_mesh_gpu_instancing: build the flat per-instance table ──────────
+// Walks every node that setupNode tagged with instance accessors and lays
+// its transforms end-to-end into DrawableData::baked_instances_, recording
+// each node's (offset, count).  Slot 0 is reserved as identity so nodes
+// WITHOUT the extension keep working unchanged at first_instance=0,
+// instance_count=1.
+//
+// Must run while the tinygltf::Model is still alive — it is a stack local
+// in loadGltfModel, so this cannot be deferred to buffer-creation time.
+static void bakeInstanceTransforms(
+    const tinygltf::Model& model,
+    std::shared_ptr<ego::DrawableData>& drawable_object) {
+
+    bool any = false;
+    for (const auto& n : drawable_object->nodes_) {
+        if (n.inst_translation_acc_ >= 0 || n.inst_rotation_acc_ >= 0 ||
+            n.inst_scale_acc_ >= 0) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return;
+    }
+
+    // Slot 0: identity, for every non-instanced node in this same file.
+    drawable_object->baked_instances_.clear();
+    drawable_object->baked_instances_.emplace_back();
+
+    size_t total = 0;
+    for (uint32_t node_idx = 0;
+         node_idx < drawable_object->nodes_.size(); ++node_idx) {
+        auto& node = drawable_object->nodes_[node_idx];
+        if (node.inst_translation_acc_ < 0 && node.inst_rotation_acc_ < 0 &&
+            node.inst_scale_acc_ < 0) {
+            continue;
+        }
+
+        std::vector<float> t, r, s;
+        const bool has_t =
+            readFloatAccessor(model, node.inst_translation_acc_, 3, t);
+        const bool has_r =
+            readFloatAccessor(model, node.inst_rotation_acc_, 4, r);
+        const bool has_s =
+            readFloatAccessor(model, node.inst_scale_acc_, 3, s);
+
+        // Instance count is whichever attribute is present; the spec
+        // requires all present attributes to agree, so take the max and
+        // let the per-attribute guards below cover a short one rather
+        // than dropping the node.
+        size_t count = 0;
+        if (has_t) count = std::max(count, t.size() / 3);
+        if (has_r) count = std::max(count, r.size() / 4);
+        if (has_s) count = std::max(count, s.size() / 3);
+        if (count == 0) {
+            continue;
+        }
+
+        node.inst_offset_ =
+            static_cast<uint32_t>(drawable_object->baked_instances_.size());
+        node.inst_count_ = static_cast<uint32_t>(count);
+
+        for (size_t i = 0; i < count; ++i) {
+            const glm::vec3 tr =
+                (has_t && (i + 1) * 3 <= t.size())
+                    ? glm::vec3(t[i * 3 + 0], t[i * 3 + 1], t[i * 3 + 2])
+                    : glm::vec3(0.0f);
+            // glTF stores quaternions xyzw; glm::quat's 4-float ctor is
+            // (w, x, y, z).  Swapping these is the classic silent
+            // instancing bug — every tree tilts by a plausible-looking
+            // but wrong amount, which reads as "the scatter is noisy".
+            const glm::quat rot =
+                (has_r && (i + 1) * 4 <= r.size())
+                    ? glm::quat(r[i * 4 + 3], r[i * 4 + 0],
+                                r[i * 4 + 1], r[i * 4 + 2])
+                    : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            const glm::vec3 sc =
+                (has_s && (i + 1) * 3 <= s.size())
+                    ? glm::vec3(s[i * 3 + 0], s[i * 3 + 1], s[i * 3 + 2])
+                    : glm::vec3(1.0f);
+
+            const glm::mat3 basis = glm::mat3_cast(glm::normalize(rot)) *
+                                    glm::mat3(sc.x, 0.0f, 0.0f,
+                                              0.0f, sc.y, 0.0f,
+                                              0.0f, 0.0f, sc.z);
+            ego::BakedInstanceXform x;
+            // Columns, matching base.vert's mat3x3(rot_0, rot_1, rot_2).
+            x.mat_rot_0 = glm::vec4(basis[0], 0.0f);
+            x.mat_rot_1 = glm::vec4(basis[1], 0.0f);
+            x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
+            x.mat_pos_scale = glm::vec4(tr, 1.0f);
+            drawable_object->baked_instances_.push_back(x);
+        }
+        total += count;
+
+        // Mirror the range onto the mesh so the indirect-draw fill (which
+        // iterates meshes, not nodes) can find it.
+        if (node.mesh_idx_ >= 0) {
+            auto it =
+                drawable_object->mesh_instance_range_.find(node.mesh_idx_);
+            if (it != drawable_object->mesh_instance_range_.end()) {
+                std::cout << "[instancing] mesh " << node.mesh_idx_
+                          << " is referenced by more than one instanced node;"
+                             " only the first range is drawn" << std::endl;
+            } else {
+                drawable_object->mesh_instance_range_[node.mesh_idx_] =
+                    { node.inst_offset_, node.inst_count_ };
+            }
+        }
+    }
+
+    drawable_object->has_baked_instances_ =
+        drawable_object->baked_instances_.size() > 1;
+    if (drawable_object->has_baked_instances_) {
+        std::cout << "[instancing] EXT_mesh_gpu_instancing: "
+                  << drawable_object->mesh_instance_range_.size()
+                  << " instanced mesh(es), " << total
+                  << " instances baked (+1 identity slot)" << std::endl;
+    }
+}
+
+// ── Allocate a drawable's instance_buffer_ ──────────────────────────────
+// Shared by the sync and async load paths, which used to carry identical
+// copies of the plain createBuffer call.  Two shapes:
+//
+//   • no baked instances (every drawable today except the PCG trees):
+//     kNumDrawableInstance slots, contents undefined — update_instance_-
+//     buffer.comp fills them every frame.  Byte-for-byte the old
+//     behaviour.
+//
+//   • baked instances: sized to hold the whole baked table and uploaded
+//     WITH it, since nothing will write this buffer again.
+//
+// Note the size is max(kNumDrawableInstance, baked) rather than just the
+// baked count.  kNumDrawableInstance is 1 today, but it doubles as
+// DrawableObject::max_alloc_game_objects_in_buffer, which sizes the
+// engine-wide game_objects_buffer_ and the update_game_objects dispatch —
+// so raising it to fit a few thousand trees would resize a buffer shared
+// by every drawable in the scene.  Sizing per-drawable here gets the same
+// result with none of that blast radius, and the max() keeps the buffer
+// legal for the compute path if a baked drawable ever also runs it.
+static void createInstanceBuffer(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<ego::DrawableData>& data) {
+
+    static_assert(
+        sizeof(ego::BakedInstanceXform) == sizeof(glsl::InstanceDataInfo),
+        "BakedInstanceXform must stay byte-identical to the GLSL struct");
+
+    const auto usage =
+        SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT);
+    const auto mem_prop = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT);
+
+    if (data->has_baked_instances_) {
+        const size_t count = std::max<size_t>(
+            kNumDrawableInstance, data->baked_instances_.size());
+        // Pad to `count` so a short table still fills the allocation.
+        std::vector<ego::BakedInstanceXform> staged = data->baked_instances_;
+        staged.resize(count);
+        renderer::Helper::createBuffer(
+            device,
+            usage,
+            mem_prop,
+            0,
+            data->instance_buffer_.buffer,
+            data->instance_buffer_.memory,
+            std::source_location::current(),
+            staged.size() * sizeof(ego::BakedInstanceXform),
+            staged.data());
+        return;
+    }
+
+    device->createBuffer(
+        kNumDrawableInstance * sizeof(glsl::InstanceDataInfo),
+        usage,
+        mem_prop,
+        0,
+        data->instance_buffer_.buffer,
+        data->instance_buffer_.memory,
+        std::source_location::current());
 }
 
 static void setupNode(
@@ -3123,6 +3464,49 @@ static void drawMesh(
         }
     }
 
+    // ── Ground-clutter distance cull (forward/decal pass only) ──────────────
+    // The shader already fades clutter out over [start, end] metres, so
+    // anything wholly past `end` contributes exactly nothing — but it
+    // would still cost a pipeline bind, a push, a descriptor bind and a
+    // draw call per primitive.  With a quarter-million grass quads split
+    // into 128 m tiles that is the difference between the feature being
+    // affordable and not.
+    //
+    // This is why terrain_pcg.py emits the clutter GLB as one node per
+    // 128 m tile: the test below is per-MeshInfo, so a single-node mesh
+    // would be all-or-nothing and would never cull.
+    //
+    // Kept as its own block rather than folded into the frustum test
+    // above: that one is gated on !m_use_node_transform_only_ (the
+    // skinned-character bypass), which has nothing to do with range, and
+    // the two conditions would be confusing to read fused together.  The
+    // duplicated sphere math only runs for drawables that actually set a
+    // fade distance — i.e. the clutter import and nothing else.
+    if (!depth_only && s_viewer_pos_valid &&
+        drawable_object->m_clutter_fade_end_m_ > 0.0f) {
+        glm::vec3 local_center = (mesh_info.bbox_min_ + mesh_info.bbox_max_) * 0.5f;
+        glm::vec3 local_half   = (mesh_info.bbox_max_ - mesh_info.bbox_min_) * 0.5f;
+        float local_radius     = glm::length(local_half);
+
+        glm::vec3 world_center =
+            glm::vec3(model_params.model_mat * glm::vec4(local_center, 1.0f));
+        float sx = glm::length(glm::vec3(model_params.model_mat[0]));
+        float sy = glm::length(glm::vec3(model_params.model_mat[1]));
+        float sz = glm::length(glm::vec3(model_params.model_mat[2]));
+        float world_radius = local_radius * glm::max(sx, glm::max(sy, sz));
+
+        // Nearest point of the tile's bounding sphere to the eye.  Using
+        // the sphere rather than the centre means a tile straddling the
+        // boundary is kept until its closest corner is also past it —
+        // erring toward drawing geometry the shader will then fade to
+        // zero, never toward popping a still-visible tile out.
+        float near_dist =
+            glm::distance(world_center, s_viewer_pos_ws) - world_radius;
+        if (near_dist > drawable_object->m_clutter_fade_end_m_) {
+            return;
+        }
+    }
+
     // ── --cluster-debug override (forward pass only) ──────────────────────
     // When the CLI flag is live and this MeshInfo actually had its cluster
     // sidecar + GPU expansion built (only the FBX-path static meshes do so
@@ -3480,6 +3864,14 @@ static void drawNodes(
             // the skinning branch).
             model_params.debug_skip_skinning =
                 drawable_object->m_debug_skip_skinning_ ? 1u : 0u;
+            // Ground-clutter distance fade.  0/0 for every drawable that
+            // hasn't called setClutterFade — including the road decal,
+            // which shares the DECAL permutation — and base.frag skips
+            // the whole ramp on a zero end distance.
+            model_params.clutter_fade_start_m =
+                drawable_object->m_clutter_fade_start_m_;
+            model_params.clutter_fade_end_m =
+                drawable_object->m_clutter_fade_end_m_;
 
             drawMesh(cmd_buf,
                 drawable_object,
@@ -3662,7 +4054,12 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     bool has_skin_set_0,
     bool has_material,
     bool has_double_sided,
-    bool has_skin_set_1 = false) {
+    bool has_skin_set_1 = false,
+    // Ground-decal permutation.  Fragment stage only — the decal reads
+    // gl_FragCoord and the scene depth copy, and touches nothing the
+    // vertex stage produces, so every base_vert*.spv is reused verbatim
+    // and there is deliberately no base_vert_*_DECAL.
+    bool is_decal = false) {
     renderer::ShaderModuleList shader_modules(2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "") +
         (has_tangent ? "_TN" : (has_normals ? "_N" : ""));
@@ -3675,7 +4072,13 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     if (has_double_sided) {
         frag_feature_str += "_DS";
     }
-    
+    // Appended AFTER _DS — CompileShaders.cmake registers the decal
+    // permutations as base_frag<layout>[_DS]_DECAL.spv, so the order of
+    // these two suffixes is part of the filename contract.
+    if (is_decal) {
+        frag_feature_str += "_DECAL";
+    }
+
     shader_modules[0] =
         renderer::helper::loadShaderModule(
             device,
@@ -3786,7 +4189,10 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const ego::PrimitiveInfo& primitive) {
+    const ego::PrimitiveInfo& primitive,
+    // true → build the DrawMode::kDecal variant of this same primitive:
+    // _DECAL fragment shader, alpha blending on, depth writes off.
+    bool is_decal = false) {
     auto shader_modules = getDrawableShaderModules(
         device,
         primitive.tag_.has_normal,
@@ -3795,7 +4201,60 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
         primitive.tag_.has_skin_set_0,
         primitive.material_idx_ >= 0,
         primitive.tag_.double_sided,
-        primitive.tag_.has_skin_set_1);
+        primitive.tag_.has_skin_set_1,
+        is_decal);
+
+    // ── Decal fixed-function state ────────────────────────────────────
+    // Derived from the caller's info rather than plumbed in from the
+    // application: rasterization and multisample state must match the
+    // forward pass exactly (same cull mode, same sample count, or the
+    // decal would not line up with the geometry it is blending onto),
+    // and only two of the four members actually differ.  Building it
+    // here keeps the difference next to the shader permutation that
+    // depends on it instead of splitting one decision across two files.
+    //
+    //   • SRC_ALPHA / ONE_MINUS_SRC_ALPHA — the textbook "over" blend.
+    //     NOT the engine's existing color_blend_attachment, which is
+    //     ONE / SRC_ALPHA (a premultiplied-style blend meant for the
+    //     full-screen passes) and would brighten the road instead of
+    //     dissolving it.
+    //   • depth test ON, depth write OFF — houses and anything else
+    //     already in the buffer still occlude the ribbon, but the
+    //     ribbon does not occlude the decals drawn after it, and the
+    //     depth buffer the later passes read stays exactly as the
+    //     terrain left it.
+    //
+    // Function-local statics: GraphicPipelineInfo holds shared_ptrs, so
+    // the state must outlive this call, and every decal pipeline in the
+    // scene wants the identical state anyway.
+    static auto s_decal_blend_attachments =
+        std::vector<renderer::PipelineColorBlendAttachmentState>(
+            1,
+            renderer::helper::fillPipelineColorBlendAttachmentState(
+                SET_FLAG_BIT(ColorComponent, ALL_BITS),
+                true,
+                renderer::BlendFactor::SRC_ALPHA,
+                renderer::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                renderer::BlendOp::ADD,
+                renderer::BlendFactor::ONE,
+                renderer::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                renderer::BlendOp::ADD));
+    static auto s_decal_blend_state_info =
+        std::make_shared<renderer::PipelineColorBlendStateCreateInfo>(
+            renderer::helper::fillPipelineColorBlendStateCreateInfo(
+                s_decal_blend_attachments));
+    static auto s_decal_depth_stencil_info =
+        std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+            renderer::helper::fillPipelineDepthStencilStateCreateInfo(
+                /*depth_test_enable*/ true,
+                /*depth_write_enable*/ false));
+
+    renderer::GraphicPipelineInfo decal_pipeline_info = graphic_pipeline_info;
+    decal_pipeline_info.blend_state_info = s_decal_blend_state_info;
+    decal_pipeline_info.depth_stencil_info = s_decal_depth_stencil_info;
+
+    const renderer::GraphicPipelineInfo& effective_pipeline_info =
+        is_decal ? decal_pipeline_info : graphic_pipeline_info;
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
@@ -3838,13 +4297,27 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
         binding_descs,
         attribute_descs,
         topology_info,
-        graphic_pipeline_info,
+        effective_pipeline_info,
         shader_modules,
         renderbuffer_formats,
         rasterization_state_override,
         std::source_location::current());
 
     return drawable_pipeline;
+}
+
+// Ground-decal forward pipeline.  Thin wrapper so the population sites
+// read the same way the shadow/CSM ones do; all of the difference lives
+// in createDrawablePipeline's is_decal branch.
+static std::shared_ptr<renderer::Pipeline> createDrawableDecalPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+    return createDrawablePipeline(
+        device, renderbuffer_formats, pipeline_layout,
+        graphic_pipeline_info, primitive, /*is_decal*/ true);
 }
 
 static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
@@ -4107,6 +4580,32 @@ static void buildMeshShaderShadowResources(
     if (!drawable || !mesh_shadow_desc_set_layout ||
         !mesh_shadow_pipeline_layout ||
         !drawable->instance_buffer_.buffer) {
+        return;
+    }
+
+    // ── Baked GPU instancing: use the indirect shadow path instead ───
+    // The mesh-shader shadow dispatch is drawMeshTasks(1,1,1) — one
+    // instance, reading instance slot 0.  That is correct for the crowd
+    // system it was written for (kNumDrawableInstance == 1) but not for a
+    // baked drawable, where it would cast exactly ONE shadow per species
+    // at the reserved identity slot while thousands of trees stood in
+    // full light.  The symptom would be maddening: geometry and shadows
+    // both present, but disagreeing.
+    //
+    // Leaving the per-primitive desc set null routes these primitives
+    // down the GS / drawIndexedIndirect fallback that drawMesh already
+    // implements, and that path reads the same indirect command as the
+    // forward pass — so first_instance and instance_count are honoured
+    // and every tree casts its own shadow.  Nothing is lost for any
+    // other drawable; only the instanced ones opt out.
+    //
+    // TODO: to put instanced geometry back on the mesh-shader path, the
+    // task shader needs the instance range in its push constants and
+    // must amplify by count as well as by cascade.
+    if (drawable->has_baked_instances_) {
+        std::cout << "[instancing] mesh-shader CSM skipped for this"
+                     " drawable; shadows use the indirect path so every"
+                     " instance casts one" << std::endl;
         return;
     }
 
@@ -4485,6 +4984,7 @@ std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_layered_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_per_cascade_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_mesh_shader_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_decal_pipeline_list_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::mesh_shader_shadow_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout>      DrawableObject::mesh_shader_shadow_pipeline_layout_;
 std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
@@ -4804,6 +5304,30 @@ DrawableObject::DrawableObject(
                 }
 
                 {
+                    // Ground-decal pipeline.  Built for EVERY drawable,
+                    // not just the ones the host will register as
+                    // decals: the map is keyed by primitive layout and
+                    // shared process-wide, the host's decal/non-decal
+                    // decision is made later (and can change at load
+                    // order we do not control here), and skipping it
+                    // would mean a decal GLB whose layout happens to
+                    // match an already-loaded prop finds no pipeline.
+                    // Cost is one extra pipeline per DISTINCT vertex
+                    // layout, not per object.
+                    auto hash_value = primitive.getHash();
+                    auto result = drawable_decal_pipeline_list_.find(hash_value);
+                    if (result == drawable_decal_pipeline_list_.end()) {
+                        drawable_decal_pipeline_list_[hash_value] =
+                            createDrawableDecalPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
+                }
+
+                {
                     // Hash distinguishes opaque vs masked variants of
                     // the same primitive layout; is_opaque selects the
                     // no-frag-shader pipeline shape.
@@ -4871,14 +5395,7 @@ DrawableObject::DrawableObject(
             }
         }
 
-        device->createBuffer(
-            kNumDrawableInstance * sizeof(glsl::InstanceDataInfo),
-            SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
-            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-            0,
-            object_->instance_buffer_.buffer,
-            object_->instance_buffer_.memory,
-            std::source_location::current());
+        createInstanceBuffer(device, object_);
 
         object_->generateSharedDescriptorSet(
             device,
@@ -5097,6 +5614,22 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                         }
                     }
                     {
+                        // Ground-decal pipeline — see the sync ctor for
+                        // why every drawable gets one.
+                        auto hash_value = primitive.getHash();
+                        auto result =
+                            drawable_decal_pipeline_list_.find(hash_value);
+                        if (result == drawable_decal_pipeline_list_.end()) {
+                            drawable_decal_pipeline_list_[hash_value] =
+                                createDrawableDecalPipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
+                    {
                         const bool is_opaque =
                             isPrimitiveOpaque(primitive, data->materials_);
                         auto hash_value =
@@ -5157,14 +5690,7 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                 }
             }
 
-            device->createBuffer(
-                kNumDrawableInstance * sizeof(glsl::InstanceDataInfo),
-                SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT),
-                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-                0,
-                data->instance_buffer_.buffer,
-                data->instance_buffer_.memory,
-                std::source_location::current());
+            createInstanceBuffer(device, data);
 
             data->generateSharedDescriptorSet(
                 device,
@@ -5304,6 +5830,15 @@ void DrawableObject::setFrustumCullPlanes(const glm::vec4 planes[6]) {
 
 void DrawableObject::clearFrustumCull() {
     s_frustum_cull_active = false;
+}
+
+void DrawableObject::setViewerWorldPos(const glm::vec3& pos) {
+    s_viewer_pos_ws = pos;
+    s_viewer_pos_valid = true;
+}
+
+void DrawableObject::clearViewerWorldPos() {
+    s_viewer_pos_valid = false;
 }
 
 void DrawableObject::initGameObjectBuffer(
@@ -5532,6 +6067,15 @@ void DrawableObject::recreateStaticMembers(
     }
     drawable_pipeline_list_.clear();
 
+    // The decal list is rebuilt in the same sweep as the forward list —
+    // both are keyed by primitive.getHash() and both target the kForward
+    // renderbuffer formats, so anything that invalidates one (a swap
+    // chain format change) invalidates the other.
+    for (auto& pipeline : drawable_decal_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_decal_pipeline_list_.clear();
+
     for (auto& object : drawable_object_list_) {
         for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
             for (int i_prim = 0; i_prim < object.second->meshes_[i_mesh].primitives_.size(); i_prim++) {
@@ -5541,6 +6085,16 @@ void DrawableObject::recreateStaticMembers(
                 if (result == drawable_pipeline_list_.end()) {
                     drawable_pipeline_list_[hash_value] =
                         createDrawablePipeline(
+                            device,
+                            renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                            drawable_pipeline_layout_,
+                            graphic_pipeline_info,
+                            primitive);
+                }
+                auto decal_result = drawable_decal_pipeline_list_.find(hash_value);
+                if (decal_result == drawable_decal_pipeline_list_.end()) {
+                    drawable_decal_pipeline_list_[hash_value] =
+                        createDrawableDecalPipeline(
                             device,
                             renderbuffer_formats[int(renderer::RenderPasses::kForward)],
                             drawable_pipeline_layout_,
@@ -5677,6 +6231,10 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_pipeline_list_.clear();
+    for (auto& pipeline : drawable_decal_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_decal_pipeline_list_.clear();
     for (auto& pipeline : drawable_shadow_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -5788,6 +6346,18 @@ void DrawableObject::updateInstanceBuffer(
         return;
     }
 
+    // ── Baked GPU instancing opt-out ─────────────────────────────────
+    // This drawable's instance_buffer_ was filled once at load from
+    // EXT_mesh_gpu_instancing and is the ONLY record of where its copies
+    // stand.  update_instance_buffer.comp would overwrite every slot —
+    // with the shared game_objects_buffer_ transform, or (because static
+    // placed imports set use_node_transform_only_) with a flat identity,
+    // collapsing several thousand scattered trees onto the world origin.
+    // Nothing needs to run per frame here: the table is static.
+    if (object_->has_baked_instances_) {
+        return;
+    }
+
     // Pre-dispatch barrier: WAR — the previous frame's reads of this
     // buffer must complete before we overwrite it.  Both consumers of
     // the instance buffer must be covered:
@@ -5866,6 +6436,18 @@ void DrawableObject::updateIndirectDrawBuffer(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
 
     if (!isReady()) {
+        return;
+    }
+
+    // ── Baked GPU instancing opt-out ─────────────────────────────────
+    // update_gltf_indirect_draw.comp stamps `instance_count =
+    // kNumDrawableInstance` over EVERY primitive command unconditionally.
+    // For a baked drawable that would flatten each species' per-node
+    // count back to 1 — one tree per species instead of the whole
+    // scatter — while leaving first_instance intact, so the survivor
+    // would be a single arbitrary tree per species.  The CPU fill in
+    // loadDrawable already wrote the final counts; leave them alone.
+    if (object_->has_baked_instances_) {
         return;
     }
 
@@ -6005,6 +6587,15 @@ void DrawableObject::draw(
         }
         object_->m_only_render_node_ =
             (only_render_ordinal_ >= 0) ? only_render_node_ : -1;
+
+        // ── Stage the ground-clutter fade for this draw call ────────────
+        // Same staging contract as the two above: the values are owned by
+        // this wrapper (they are set at import time, before object_ even
+        // exists), and DrawableData may be shared with other wrappers of
+        // the same file, so they are copied down per draw rather than
+        // written once.
+        object_->m_clutter_fade_start_m_ = clutter_fade_start_m_;
+        object_->m_clutter_fade_end_m_ = clutter_fade_end_m_;
     }
 
     // Skip while the async load is still in flight. The menu spinner
@@ -6021,10 +6612,14 @@ void DrawableObject::draw(
         return;
     }
 
+    // kDecal is tested BEFORE depth_only so a stray depth_only=true from
+    // a caller cannot silently demote a decal draw into the shadow list;
+    // the decal pass never wants a depth-only pipeline.
     auto& pipeline_list =
         (draw_mode == DrawMode::kCsmLayered)    ? drawable_csm_layered_pipeline_list_     :
         (draw_mode == DrawMode::kCsmPerCascade) ? drawable_csm_per_cascade_pipeline_list_ :
         (draw_mode == DrawMode::kCsmMeshShader) ? drawable_csm_mesh_shader_pipeline_list_ :
+        (draw_mode == DrawMode::kDecal)         ? drawable_decal_pipeline_list_           :
         depth_only                              ? drawable_shadow_pipeline_list_           :
                                                   drawable_pipeline_list_;
 
@@ -6324,6 +6919,9 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     captureRtSkinSource(model, drawable_object);
     setupNodes(model, drawable_object);
     setupModel(model, drawable_object);
+    // Must be here, not at buffer-creation time: `model` is a stack local
+    // and the instance accessors live in its buffers.
+    bakeInstanceTransforms(model, drawable_object);
     for (auto& scene : drawable_object->scenes_) {
         for (auto& node : scene.nodes_) {
             calculateBbox(drawable_object, scene.nodes_[0], glm::mat4(1.0f), scene.bbox_min_, scene.bbox_max_);
@@ -6358,16 +6956,47 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     indirect_draw_cmd_buffer[0] = 0;
     uint32_t prim_idx = 0;
     uint32_t cur_lod = 0;
+    int32_t mesh_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
+        // ── Baked GPU instancing ─────────────────────────────────────
+        // For a normal drawable instance_count stays 0 here and update_-
+        // gltf_indirect_draw.comp stamps kNumDrawableInstance over it
+        // every frame.  A baked drawable skips that compute pass (see
+        // updateIndirectDrawBuffer), so THIS fill is the only thing that
+        // ever writes the command — the counts must be final.
+        //
+        // first_instance is what makes per-node ranges work at all: it
+        // offsets Vulkan's instance-rate vertex-attribute fetch, so each
+        // species reads its own slice of the baked table.  base.vert
+        // needs no change for this — it consumes the instance transform
+        // purely as vertex attributes (locations 10/12/13/14) and never
+        // reads gl_InstanceIndex, so the offset is applied by the fixed-
+        // function fetch before the shader ever sees it.
+        uint32_t first_instance = 0;
+        uint32_t instance_count = 0;
+        if (drawable_object->has_baked_instances_) {
+            const auto it =
+                drawable_object->mesh_instance_range_.find(mesh_idx);
+            if (it != drawable_object->mesh_instance_range_.end()) {
+                first_instance = it->second.first;
+                instance_count = it->second.second;
+            } else {
+                // Non-instanced node in an instanced file: one copy at
+                // the reserved identity slot 0.
+                first_instance = 0;
+                instance_count = 1;
+            }
+        }
         for (const auto& prim : mesh.primitives_) {
             indirect_draw_buf[prim_idx].first_index = 0;
-            indirect_draw_buf[prim_idx].first_instance = 0;
+            indirect_draw_buf[prim_idx].first_instance = first_instance;
             indirect_draw_buf[prim_idx].index_count =
                 static_cast<uint32_t>(prim.index_desc_[cur_lod].index_count);
-            indirect_draw_buf[prim_idx].instance_count = 0;
+            indirect_draw_buf[prim_idx].instance_count = instance_count;
             indirect_draw_buf[prim_idx].vertex_offset = 0;
             prim_idx++;
         }
+        mesh_idx++;
     }
 
     renderer::Helper::createBuffer(
