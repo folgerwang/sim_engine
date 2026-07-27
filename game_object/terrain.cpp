@@ -2359,8 +2359,10 @@ std::shared_ptr<renderer::DescriptorSetLayout> TileObject::getTileResDescSetLayo
 }
 
 // NOTE: these define the TERRAIN MAP's world footprint (see
-// kTerrainMapMeters) — deliberately smaller than kWorldMapSize so the
-// generated maps render at their content's natural scale.
+// kTerrainMapMeters), which is EQUAL to kWorldMapSize — the generated
+// terrain covers the whole world.  It was briefly smaller, as a
+// workaround for the diffusion model drawing photo-scale content; that
+// is now handled by asking it for a regional-scale scene instead.
 glm::vec2 TileObject::getWorldMin() {
     return glm::vec2(-kTerrainMapMeters / 2.0f);
 }

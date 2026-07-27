@@ -53,6 +53,17 @@
 #define CHARLIE_ENV_TEX_INDEX       4
 #define THIN_FILM_LUT_INDEX         5
 #define DIRECT_SHADOW_INDEX         6
+// ── Scene depth for the ground-decal pass ────────────────────────────
+// A copy of ObjectSceneView's depth buffer taken AFTER the forward pass
+// and AFTER the terrain tiles pass, i.e. holding the completed ground +
+// props depth.  Only the DECAL permutation of base.frag reads it, to
+// derive a soft blend factor from the distance between the decal
+// fragment and whatever already occupies that pixel.  It lives on set 0
+// because exactly one descriptor set of that layout exists app-wide, so
+// wiring it costs one binding and one write -- set 1 (VIEW_PARAMS)
+// would have meant two CameraObject instances and two write paths, and
+// the shadow camera has no scene depth to offer.
+#define SCENE_DEPTH_TEX_INDEX       7
 
 // PBR_MATERIAL_PARAMS_SET
 #define PBR_CONSTANT_INDEX          8
@@ -399,22 +410,32 @@
 // 2048 m; each is generated on demand at 2048^2 (1 m/texel) by
 // tools/terrain/terrain_detail_worker.py and streamed into a texture-array
 // cache around the camera (see TerrainDetailStream).
-// Extent of the GENERATED TERRAIN MAP (heightmap/albedo), decoupled from
-// kWorldMapSize: FLUX draws photo-scale content, and stretching it over
-// 32 km made the in-world terrain a 16x-magnified blur that never
-// matched the map previews.  8192 px over 4096 m = 0.5 m/texel native.
+// Extent of the GENERATED TERRAIN MAP (heightmap/albedo).  EQUAL to
+// kWorldMapSize: the generated terrain covers the whole world, 8192 px
+// over 32768 m = 4 m/texel native macro, with the streamed 1 m detail
+// tiles carrying the near field.
+//
+// This sat at 4096 m for a while as a workaround for FLUX drawing
+// photo-scale content — a village-sized crop stretched over 32 km reads
+// as a 16x-magnified blur.  The fix for that is to make the diffusion
+// model draw REGIONAL content (the prompts in tools/terrain/
+// terrain_from_text.py now say "32 kilometer wide area" in Landsat/
+// Sentinel vocabulary) and to let the detail tiles carry the near
+// field, not to shrink the world the player walks around in.
 // Beyond the map edge the clamp sampler continues the border heights.
-#define kTerrainMapMeters                       4096.0f
-// Height of a WHITE heightmap texel.  Scaled with kTerrainMapMeters
-// (was 2000 m over 32 km): keeping amp/extent constant preserves slopes
-// — without this, shrinking the extent x8 turned every hill into a
-// needle canyon.
-#define kTerrainHeightAmpMeters                 250.0f
+#define kTerrainMapMeters                       32768.0f
+// Height of a WHITE heightmap texel.  Moves WITH kTerrainMapMeters:
+// slope is amp/extent, so holding the RATIO fixed is what keeps hills
+// as hills.  Raising the extent 8x without the amplitude would flatten
+// every mountain into a plain, exactly as shrinking the extent alone
+// once turned them into needle canyons.
+#define kTerrainHeightAmpMeters                 2000.0f
 // Beyond the map edge the clamp sampler would stretch the border texels
 // into infinite stripes; instead the surround fades to a low neutral
-// plain over this band.
-#define kTerrainSurroundHeightMeters            18.0f
-#define kTerrainSurroundFadeMeters              768.0f
+// plain over this band.  (Both scaled x8 with the map: a 768 m fade at
+// the edge of a 32 km world is a visible hard step.)
+#define kTerrainSurroundHeightMeters            144.0f
+#define kTerrainSurroundFadeMeters              6144.0f
 // Terrain material-layer detail band (tile.frag): full-strength surface
 // detail out to _NEAR, faded out by _FAR.  Beyond that the macro albedo
 // carries the surface alone — high-frequency detail at range only buys
@@ -426,7 +447,7 @@
 // as far as the terrain is legible, not just the near field.
 #define kTerrainMatDetailNear                   600.0f
 #define kTerrainMatDetailFar                    2600.0f
-#define kDetailTileMeters                       (kTerrainMapMeters / 16.0f)  // 256 m
+#define kDetailTileMeters                       (kTerrainMapMeters / 16.0f)  // 2048 m
 #define kDetailTilesPerSide                     16
 // 2049: texel centers on integer world meters, so the shared border
 // row/column of adjacent tiles holds bit-identical heights (exact seams).
@@ -434,11 +455,12 @@
 #define kDetailCacheSlots                       9         // 3x3 ring around camera
 // Camera-distance band over which rendered height blends detail -> base,
 // so the edge of the loaded detail region never shows a hard step.
-// (Fade END must stay inside the loaded 3x3 ring: 1.5 tiles = 3072 m.)
-// (Scaled with kDetailTileMeters: fade END must stay inside the loaded
-// 3x3 detail ring = 1.5 tiles.)
-#define kDetailFadeStartMeters                  192.0f
-#define kDetailFadeEndMeters                    320.0f
+// Scaled with kDetailTileMeters, and the constraint that fixes the
+// ceiling: the fade END must stay inside the loaded 3x3 tile ring,
+// whose half-extent is 1.5 tiles = 3072 m.  2560 m leaves a 512 m
+// margin for the camera being off-centre within its own tile.
+#define kDetailFadeStartMeters                  1536.0f
+#define kDetailFadeEndMeters                    2560.0f
 
 #define kDetailNoiseTextureSize                 256
 #define kRoughNoiseTextureSize                  32
@@ -559,6 +581,25 @@ struct ModelParams {
     // the draw not running at all.  drawNodes pushes this for every
     // primitive of a drawable that has setDebugSkipSkinning(true).
     uint debug_skip_skinning;
+    // ── Ground-clutter distance fade ─────────────────────────────────
+    // Consumed ONLY by the DECAL permutation of base.frag.  A grass
+    // tuft is a 2-3 m quad: at 60 m it is a couple of pixels wide and
+    // aliases into shimmer, and drawing a quarter-million of them to
+    // the horizon is unaffordable regardless.  So clutter dissolves
+    // over a band and the CPU culls whole tiles past the end.
+    //
+    // These are PER-DRAWABLE rather than a global constant because the
+    // road ribbon shares this exact pipeline, and a road that
+    // evaporates 50 m ahead of the camera would be absurd.  Zero (the
+    // default drawNodes writes for every non-clutter drawable) means
+    // "no distance fade" -- the shader branches out entirely.
+    //
+    // Mirrored in terrain_pcg.py as CLUTTER_FADE_START_M /
+    // CLUTTER_FADE_END_M, which is where the patch budget is sized
+    // against them; change one, change the other.
+    float clutter_fade_start_m;
+    float clutter_fade_end_m;
+    vec2 model_params_pad0;
 };
 
 struct PrtLightParams {
