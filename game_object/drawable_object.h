@@ -235,6 +235,41 @@ struct MeshInfo {
     // positive normalized float, NOT the most negative.  Use ::lowest().
     glm::vec3                   bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
 
+    // ── Instance-expanded bounds (EXT_mesh_gpu_instancing) ───────────
+    // bbox_min_/bbox_max_ above bound the mesh's VERTEX DATA.  For a
+    // GPU-instanced mesh that is the wrong box to cull against: the
+    // vertices are one tree modelled around the origin, while the
+    // thousands of copies the draw actually puts on screen live wherever
+    // the instance buffer says.  Culling the origin-sized box makes the
+    // WHOLE species blink out the moment the world origin leaves the
+    // frustum — which is exactly the "trees appear and disappear when I
+    // move the camera" symptom, and why it took a camera *move* rather
+    // than a camera *distance* to trigger it.
+    //
+    // bakeInstanceTransforms fills these with the union of the vertex
+    // bbox transformed by every baked instance, in the same space
+    // model_mat expects (i.e. post-instance, pre-node), so the existing
+    // `model_mat * local_center` cull math needs no other change.
+    //
+    // has_inst_bbox_ stays false for every mesh in every file that does
+    // NOT carry the extension, and cullBboxMin/Max then return the
+    // vertex bbox byte-for-byte — so this is a strict no-op for all
+    // existing assets.
+    glm::vec3                   inst_bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
+    glm::vec3                   inst_bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
+    bool                        has_inst_bbox_ = false;
+
+    // The box any CULL or BOUNDS query should use.  Prefer these over
+    // bbox_min_/bbox_max_ anywhere the question is "where on screen does
+    // this mesh end up"; use the raw pair only when the question is
+    // genuinely about the vertex data itself.
+    glm::vec3 cullBboxMin() const {
+        return has_inst_bbox_ ? inst_bbox_min_ : bbox_min_;
+    }
+    glm::vec3 cullBboxMax() const {
+        return has_inst_bbox_ ? inst_bbox_max_ : bbox_max_;
+    }
+
     // "Nanite-lite" cluster sidecar. Built at load time *only* when
     // engine::helper::clusterRenderingEnabled() is true (i.e. the
     // --cluster-debug CLI flag was set). Otherwise it stays empty and costs

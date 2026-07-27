@@ -2577,6 +2577,39 @@ static void bakeInstanceTransforms(
             static_cast<uint32_t>(drawable_object->baked_instances_.size());
         node.inst_count_ = static_cast<uint32_t>(count);
 
+        // ── Instance-expanded bounds ─────────────────────────────────
+        // The mesh this node instances is modelled around the origin;
+        // its vertex bbox therefore says nothing about where the copies
+        // land.  Accumulate the union of that bbox transformed by every
+        // instance as we go, so MeshInfo::cullBbox* can answer "where
+        // does this draw actually put pixels".  Without it the ECS
+        // CullingSystem tags the whole trees drawable Culled whenever
+        // the world ORIGIN is off-screen and every tree on the map
+        // disappears from the forward pass (shadows stay, since the
+        // hint is forward-only) — see MeshInfo::inst_bbox_min_.
+        //
+        // This is the same union calculateBbox() above already performs
+        // for the SCENE bbox (shadow-cascade fitting / editor framing) —
+        // that path was correct all along; the per-MESH box the culls
+        // read was the one nobody expanded.  Kept inline rather than
+        // calling transformBbox() in a second pass because this is the
+        // only place the per-instance basis is already built; the corner
+        // enumeration below is arithmetically identical to it.
+        ego::MeshInfo* inst_mesh =
+            (node.mesh_idx_ >= 0 &&
+             static_cast<size_t>(node.mesh_idx_) <
+                 drawable_object->meshes_.size())
+                ? &drawable_object->meshes_[node.mesh_idx_]
+                : nullptr;
+        // A mesh whose bbox never got filled (no primitives, or an
+        // accessor without min/max) still holds the ::max()/::lowest()
+        // sentinels; expanding those would produce an infinite box that
+        // silently disables culling for that mesh.  Skip instead.
+        const bool mesh_bbox_valid =
+            inst_mesh && inst_mesh->bbox_min_.x <= inst_mesh->bbox_max_.x &&
+            inst_mesh->bbox_min_.y <= inst_mesh->bbox_max_.y &&
+            inst_mesh->bbox_min_.z <= inst_mesh->bbox_max_.z;
+
         for (size_t i = 0; i < count; ++i) {
             const glm::vec3 tr =
                 (has_t && (i + 1) * 3 <= t.size())
@@ -2607,6 +2640,28 @@ static void bakeInstanceTransforms(
             x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
             x.mat_pos_scale = glm::vec4(tr, 1.0f);
             drawable_object->baked_instances_.push_back(x);
+
+            if (mesh_bbox_valid) {
+                // All 8 corners, not just min/max: `basis` carries an
+                // arbitrary rotation, so transforming the two extreme
+                // corners alone would miss the box entirely for any
+                // instance turned off-axis — and every tree here is
+                // yaw-randomised.
+                const glm::vec3& bn = inst_mesh->bbox_min_;
+                const glm::vec3& bx = inst_mesh->bbox_max_;
+                for (int cx = 0; cx < 8; ++cx) {
+                    const glm::vec3 corner(
+                        (cx & 1) ? bx.x : bn.x,
+                        (cx & 2) ? bx.y : bn.y,
+                        (cx & 4) ? bx.z : bn.z);
+                    const glm::vec3 w = basis * corner + tr;
+                    inst_mesh->inst_bbox_min_ =
+                        glm::min(inst_mesh->inst_bbox_min_, w);
+                    inst_mesh->inst_bbox_max_ =
+                        glm::max(inst_mesh->inst_bbox_max_, w);
+                }
+                inst_mesh->has_inst_bbox_ = true;
+            }
         }
         total += count;
 
@@ -3433,9 +3488,16 @@ static void drawMesh(
         // the camera".  We trade a few extra GPU vertices on this
         // single character for visual correctness.
         //
-        // Compute local-space bounding sphere from AABB.
-        glm::vec3 local_center = (mesh_info.bbox_min_ + mesh_info.bbox_max_) * 0.5f;
-        glm::vec3 local_half   = (mesh_info.bbox_max_ - mesh_info.bbox_min_) * 0.5f;
+        // Compute local-space bounding sphere from AABB.  cullBbox* and
+        // not bbox_* : for a GPU-instanced mesh the vertex bbox bounds
+        // one copy at the origin while the draw scatters thousands of
+        // them across the map, so culling the vertex bbox would reject
+        // the entire instanced draw whenever the origin is off-screen.
+        // Identical to bbox_* for every non-instanced mesh.
+        glm::vec3 bb_min = mesh_info.cullBboxMin();
+        glm::vec3 bb_max = mesh_info.cullBboxMax();
+        glm::vec3 local_center = (bb_min + bb_max) * 0.5f;
+        glm::vec3 local_half   = (bb_max - bb_min) * 0.5f;
         float local_radius     = glm::length(local_half);
 
         // Transform center to world space.
@@ -3484,8 +3546,14 @@ static void drawMesh(
     // fade distance — i.e. the clutter import and nothing else.
     if (!depth_only && s_viewer_pos_valid &&
         drawable_object->m_clutter_fade_end_m_ > 0.0f) {
-        glm::vec3 local_center = (mesh_info.bbox_min_ + mesh_info.bbox_max_) * 0.5f;
-        glm::vec3 local_half   = (mesh_info.bbox_max_ - mesh_info.bbox_min_) * 0.5f;
+        // cullBbox* for the same reason as the frustum test above; the
+        // clutter glb is not instanced today, so this is currently a
+        // no-op, but the two tests must not disagree about where a mesh
+        // is if the clutter bake ever adopts the extension.
+        glm::vec3 cb_min = mesh_info.cullBboxMin();
+        glm::vec3 cb_max = mesh_info.cullBboxMax();
+        glm::vec3 local_center = (cb_min + cb_max) * 0.5f;
+        glm::vec3 local_half   = (cb_max - cb_min) * 0.5f;
         float local_radius     = glm::length(local_half);
 
         glm::vec3 world_center =
@@ -6816,11 +6884,21 @@ glm::mat4 DrawableObject::getNodeWorldMatrixByName(
     return object_->nodes_[idx].cached_matrix_;
 }
 
+// NOTE both of these use MeshInfo::cullBbox*, not bbox_min_/bbox_max_.
+// The one caller that matters is application.cpp's lazy LocalBounds fill,
+// which feeds eecs::CullingSystem — so for a GPU-instanced file this has
+// to be the box the INSTANCES occupy, not the box the vertex data
+// occupies.  For the PCG trees those differ by the whole map: the species
+// meshes are modelled around the origin and scattered by the instance
+// buffer, so the vertex-data union is one tree at (0,0,0) and the ECS cull
+// dropped every tree on the map from the forward pass the moment the
+// origin left the frustum.  cullBbox* is identical to the raw pair for
+// every non-instanced mesh, so nothing else changes.
 glm::vec3 DrawableObject::getModelBboxMin() const {
     if (!object_ || !object_->ready_.load(std::memory_order_acquire))
         return glm::vec3(0.0f);
     glm::vec3 mn(std::numeric_limits<float>::max());
-    for (const auto& m : object_->meshes_) mn = glm::min(mn, m.bbox_min_);
+    for (const auto& m : object_->meshes_) mn = glm::min(mn, m.cullBboxMin());
     if (mn.x == std::numeric_limits<float>::max()) return glm::vec3(0.0f);
     return mn;
 }
@@ -6829,7 +6907,7 @@ glm::vec3 DrawableObject::getModelBboxMax() const {
     if (!object_ || !object_->ready_.load(std::memory_order_acquire))
         return glm::vec3(0.0f);
     glm::vec3 mx(std::numeric_limits<float>::lowest());
-    for (const auto& m : object_->meshes_) mx = glm::max(mx, m.bbox_max_);
+    for (const auto& m : object_->meshes_) mx = glm::max(mx, m.cullBboxMax());
     if (mx.x == std::numeric_limits<float>::lowest()) return glm::vec3(0.0f);
     return mx;
 }
