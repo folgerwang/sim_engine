@@ -2049,6 +2049,19 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     device_features.imageCubeArray = VK_TRUE;
     device_features.shaderInt16 = VK_TRUE;
     device_features.multiDrawIndirect = VK_TRUE;
+    // drawIndirectFirstInstance: the GPU-instanced PCG trees put a non-zero
+    // firstInstance in their indirect draw commands, one range per species,
+    // so each species' draw fetches its own slice of the baked instance
+    // table.  Vulkan forbids a non-zero firstInstance in an INDIRECT draw
+    // unless this feature is enabled (VUID-vkCmdDrawIndexedIndirect-
+    // firstInstance-00554) — and the failure is the quiet kind: drivers
+    // that don't validate simply ignore the offset, so every species reads
+    // instance slot 0 and the whole forest collapses onto one identity
+    // transform at the world origin.  That reads as "the scatter didn't
+    // run" rather than "a device feature is missing", which is a long way
+    // to walk for one line.  Core since Vulkan 1.0 and universal on
+    // desktop GPUs.
+    device_features.drawIndirectFirstInstance = VK_TRUE;
     device_features.multiViewport = VK_TRUE;
     device_features.depthClamp = VK_TRUE;  // required for CSM / depth-clamp rasterization
     device_features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;  // bindless texture array indexing

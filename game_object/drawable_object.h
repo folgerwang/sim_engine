@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <unordered_map>
+#include <utility>        // std::pair, for DrawableData::mesh_instance_range_
 #include "renderer/renderer.h"
 #include "helper/bvh.h"
 #include "helper/cluster_mesh.h"  // Optional "Nanite-lite" cluster sidecar.
