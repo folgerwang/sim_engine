@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <limits>
 #include <algorithm>
+#include <cctype>
 #include <stdexcept>
 #include <memory>
 #include <chrono>
@@ -697,6 +698,33 @@ static void setupMeshState(
             // this also flags forced-glass materials as translucent.
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Blend ? FEATURE_MATERIAL_BLEND : 0);
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
+            // Foliage subsurface scattering for the forward (base.frag /
+            // pbr_lighting) path — the same leaf-name convention the
+            // cluster upload uses for BINDLESS_MAT_FOLIAGE_SSS, so a
+            // freshly imported tree is translucent from its very first
+            // frame, before its clusters finalize into the bindless
+            // pipeline.  terrain_pcg ships "tree_<species>_leaf" /
+            // "tree_leafN"; wood and bark never match.
+            {
+                std::string lname = src_material.name;
+                std::transform(lname.begin(), lname.end(), lname.begin(),
+                               [](unsigned char c) {
+                                   return std::tolower(c);
+                               });
+                if (lname.find("leaf") != std::string::npos ||
+                    lname.find("foliage") != std::string::npos) {
+                    ubo.material_features |= FEATURE_MATERIAL_SUBSURFACE;
+                    // Same lobe the cluster paths use
+                    // (foliageTranslucency in functions.glsl.h):
+                    // thickness 0 = fully thin slab; the small colour
+                    // term is the view-independent leak.
+                    ubo.subsurface_scale            = 1.6f;
+                    ubo.subsurface_distortion       = 0.35f;
+                    ubo.subsurface_power            = 3.0f;
+                    ubo.subsurface_thickness_factor = 0.0f;
+                    ubo.subsurface_color_factor     = glm::vec3(0.06f);
+                }
+            }
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
             ubo.specular_color = glm::vec3(1.0f, 1.0f, 1.0f);

@@ -662,12 +662,19 @@ void main() {
     //         roughness.z + flags.w — roughness is a 0.5 default until we
     //                                  plumb metal-rough textures through
     //                                  BindlessMaterialParams; flags.w
-    //                                  reserved for shading-model bits.
+    //                                  carries shading-model bits: 1.0 =
+    //                                  foliage subsurface (thin-leaf
+    //                                  translucency in deferred_resolve).
     // Slot 2: emissive.rgb + metallic.a — both default 0 for the same
     //                                     reason; cluster materials don't
     //                                     yet author either channel.
     out_albedo_ao      = vec4(albedo, 1.0);
-    out_normal_rough   = vec4(octEncodeDir(N), 0.5, 0.0);
+    // flags.w: BINDLESS_MAT_FOLIAGE_SSS → 1.0 so deferred_resolve adds
+    // the thin-leaf translucency term for this pixel (RGBA8 target —
+    // the bit survives quantisation exactly).
+    out_normal_rough   = vec4(
+        octEncodeDir(N), 0.5,
+        (mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0 ? 1.0 : 0.0);
     // Slot 2 was emissive.rgb + metallic.a, but cluster materials don't
     // author either yet — both default to 0 in the deferred resolve.
     // Repurpose .rg for the octahedral-encoded GEOMETRIC normal so the
@@ -747,6 +754,16 @@ void main() {
     vec3  specular = light_col * (0.05 * spec / M_PI);
 
     vec3 color = ambient + diffuse + specular;
+
+    // Thin-leaf subsurface scattering — sunlight transmitted through
+    // foliage (flagged per material at cluster upload).  Kept in the
+    // live-forward path so a freshly placed tree looks the same before
+    // and after its clusters finalize into the deferred G-buffer path
+    // (deferred_resolve.comp applies the identical term via the
+    // normal_rough.w flag).
+    if ((mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0) {
+        color += foliageTranslucency(N, V, L, albedo, light_col, shad);
+    }
 
 #if defined(OIT_OUTPUT) || defined(ALPHA_BLEND_OUTPUT)
     // ── Image-based glass shading ───────────────────────────────────────

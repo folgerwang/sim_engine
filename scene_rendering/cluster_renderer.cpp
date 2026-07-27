@@ -697,6 +697,33 @@ void ClusterRenderer::uploadMeshClusters(
                 if (prims[prim_idx].tag_.double_sided) {
                     mp.flags |= BINDLESS_MAT_DOUBLE_SIDED;
                 }
+                // Foliage subsurface scattering — thin-leaf translucency
+                // in cluster_bindless.frag (forward) / deferred_resolve
+                // (via the normal_rough.w G-buffer flag).  Tagged by
+                // material NAME because that is the one signal every
+                // leaf source shares: terrain_pcg's instanced trees
+                // ship "tree_<species>_leaf", its props/bush foliage
+                // "tree_leafN", and stock assets follow the same
+                // convention ("leaf" / "foliage" substrings).  Wood,
+                // trunk and bark materials never match, which is the
+                // point — translucency on a trunk reads as glow.
+                {
+                    int32_t mat_idx = prims[prim_idx].material_idx_;
+                    if (mat_idx >= 0 &&
+                        static_cast<size_t>(mat_idx) <
+                            drawable_data.materials_.size()) {
+                        std::string lname =
+                            drawable_data.materials_[mat_idx].name_;
+                        std::transform(lname.begin(), lname.end(),
+                                       lname.begin(), [](unsigned char c) {
+                                           return std::tolower(c);
+                                       });
+                        if (lname.find("leaf") != std::string::npos ||
+                            lname.find("foliage") != std::string::npos) {
+                            mp.flags |= BINDLESS_MAT_FOLIAGE_SSS;
+                        }
+                    }
+                }
             }
         }
 

@@ -73,6 +73,47 @@ float rsi(vec3 r0, vec3 rd, float sr) {
     return (-b + sqrt((b * b) - 4.0 * a * c)) / (2.0 * a);
 }
 
+// ── Foliage translucency (thin-slab subsurface scattering) ──────────
+// Barré-Brisebois & Bouchard, "Approximating Translucency for a Fast,
+// Cheap and Convincing Subsurface Scattering Look" (GDC 2011).  A leaf
+// is a thin slab: sunlight entering the BACK face exits the front
+// tinted by the pigment, strongest when the camera looks toward the
+// light through the leaf.  The distorted transmission direction
+// (L + N*distortion) tilts the lobe so leaves angled across the light
+// still glow along their surface, and the pow() sharpens the lobe so
+// the effect reads as backlighting rather than uniform brightening.
+//
+// The tint squares the albedo: transmitted light traverses the pigment
+// layer, so its spectrum is filtered ~twice as hard as reflected light
+// — this is what makes backlit leaves read as saturated green-gold.
+//
+// `shad` is the sun visibility.  Translucency is NOT multiplied by it
+// directly: the leaves that should glow the most are exactly the ones
+// inside their own canopy's shadow map.  mix keeps a fraction of the
+// term in shadow (interior canopy glow) while still killing most of it
+// behind genuine occluders (a mountain, a wall).
+//
+// Consumers: cluster_bindless.frag forward branch (flag test on
+// BINDLESS_MAT_FOLIAGE_SSS) and deferred_resolve.comp (flag decoded
+// from gbuf_normal_rough.w).  Divide-by-π matches the Lambertian
+// direct term both paths use, so the scale constant is comparable.
+const float FOLIAGE_SSS_DISTORTION  = 0.35;
+const float FOLIAGE_SSS_POWER       = 3.0;
+const float FOLIAGE_SSS_SCALE       = 1.6;
+const float FOLIAGE_SSS_AMBIENT     = 0.10;  // view-independent leak
+const float FOLIAGE_SSS_SHADOW_MIN  = 0.30;  // in-shadow fraction kept
+
+vec3 foliageTranslucency(vec3 N, vec3 V, vec3 L, vec3 albedo,
+                         vec3 light_col, float shad) {
+    vec3  Lt   = normalize(L + N * FOLIAGE_SSS_DISTORTION);
+    float back = pow(clamp(dot(V, -Lt), 0.0, 1.0), FOLIAGE_SSS_POWER)
+                 * FOLIAGE_SSS_SCALE;
+    vec3  tint = albedo * albedo;          // double-filtered transmission
+    float vis  = mix(FOLIAGE_SSS_SHADOW_MIN, 1.0, shad);
+    return tint * light_col *
+           ((back + FOLIAGE_SSS_AMBIENT) * vis / M_PI);
+}
+
 vec3 getDirectionByYawAndPitch(float yaw, float pitch) {
     vec3 direction;
     direction.x = cos(radians(-yaw)) * cos(radians(pitch));

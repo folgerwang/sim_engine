@@ -34,7 +34,12 @@ vec3 getPunctualRadianceSubsurface(vec3 n, vec3 v, vec3 l, float scale, float di
 {
     vec3 distortedHalfway = l + n * distortion;
     float backIntensity = max(0.0, dot(v, -distortedHalfway));
-    float reverseDiffuse = pow(clamp(0.0, 1.0, backIntensity), power) * scale;
+    // clamp(x, min, max) — the argument order was (0.0, 1.0, back),
+    // i.e. clamping the CONSTANT 0.0 into [1.0, back]: undefined when
+    // back < 1.0 (GLSL spec) and 1.0 otherwise, so the pow() lobe never
+    // varied with view angle at all.  Inherited from the Khronos
+    // glTF-Sample-Viewer this function was ported from.
+    float reverseDiffuse = pow(clamp(backIntensity, 0.0, 1.0), power) * scale;
     return (reverseDiffuse + color) * (1.0 - thickness);
 }
 

@@ -894,11 +894,20 @@ struct RtSkelHeader {
                                         // "Translucent" render-debug mode can highlight
                                         // these materials, and so future work that adds
                                         // a real translucent pipeline pass has the data.
+#define BINDLESS_MAT_FOLIAGE_SSS    8   // bit 3: thin-slab foliage subsurface
+                                        // scattering.  Set at cluster upload for
+                                        // leaf materials (name contains "leaf" /
+                                        // "foliage" — covers terrain_pcg's
+                                        // tree_<species>_leaf and tree_leafN).
+                                        // Forward cluster path adds the
+                                        // translucency term directly; the
+                                        // G-buffer path encodes the bit into
+                                        // normal_rough.w for deferred_resolve.
 
 // MeshCategory bit-pack — extract with
 //   uint cat = (flags & MASK) >> SHIFT;
 // Must match the MeshCategory enum in collision_mesh.h.  The shift +
-// mask layout leaves room for 5 more boolean flags in bits 3..7.
+// mask layout leaves room for 4 more boolean flags in bits 4..7.
 #define BINDLESS_MAT_CATEGORY_SHIFT 8
 #define BINDLESS_MAT_CATEGORY_MASK  0x0000FF00
 

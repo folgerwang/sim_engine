@@ -1282,11 +1282,24 @@ void main() {
         ? vec3(0.0)   // winner eval already includes its specular lobe
         : light_col * (0.05 * spec / M_PI);
 
+    // Thin-leaf subsurface scattering.  The G-buffer writer set
+    // normal_rough.w = 1.0 for materials flagged BINDLESS_MAT_FOLIAGE_SSS
+    // (leaf materials, tagged by name at cluster upload).  Identical
+    // term to the forward branch in cluster_bindless.frag so a tree
+    // shades the same before and after its clusters finalize.  Under
+    // ReSTIR the sun term is reservoir-driven, but the translucency
+    // stays sun-only — an approximation, and a stable one, since the
+    // sun dominates every outdoor pixel this flag ever touches.
+    vec3 sss = vec3(0.0);
+    if (nr.w > 0.5) {
+        sss = foliageTranslucency(N, V, L, albedo, light_col, shad);
+    }
+
     // RT AO partially dims the direct terms too (RT_AO_DIRECT_FRACTION)
     // for parity with the screen-space SSAO look, which multiplied the
     // final colour.  rt_ao is 1.0 whenever RT AO is inactive.
     vec3 color = ambient +
-                 (diffuse + specular) *
+                 (diffuse + specular + sss) *
                      mix(1.0, rt_ao, RT_AO_DIRECT_FRACTION) +
                  emissive;
 
