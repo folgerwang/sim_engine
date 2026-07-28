@@ -246,6 +246,27 @@ void ObjectSceneView::draw(
     const bool csm_mesh_shader =
         csm_use_mesh_shader && csm_layered && !csm_per_cascade;
 
+    // ── Publish the eye for plant LOD band selection ────────────────────
+    // Here rather than in drawDecals (which publishes the CLUTTER eye)
+    // because the tree LOD has to select in this pass and in every shadow
+    // cascade, and all of them have to select the SAME band for the same
+    // tile — a cascade that disagreed would cast the shadow of a tree the
+    // forward pass is not drawing.  Reading it once at the top of the one
+    // entry point every pass shares is what guarantees that.
+    //
+    // Always the main view camera, never a cascade's ortho eye: the
+    // cascades all render the player's surroundings, and selecting tree
+    // detail from a directional light's viewpoint would swap meshes for
+    // cards by sun angle.  m_camera_object_ is that camera in every pass
+    // (the VIEW_PARAMS_SET bind below uses it for all of them).
+    //
+    // Not cleared afterwards, unlike setViewerWorldPos — see that
+    // function's comment for the distinction: the clutter eye gates
+    // whether geometry EXISTS and a stale one loses tiles, while this one
+    // only picks between three drawings of the same tree.
+    ego::DrawableObject::setPlantLodEye(
+        m_camera_object_->getCameraViewInfo().position);
+
     renderer::DescriptorSetList desc_set_list = desc_sets;
     // For CSM layered pass there is no per-cascade camera descriptor — the GS
     // reads VP matrices directly from RuntimeLightsParams.  Use a nullptr slot

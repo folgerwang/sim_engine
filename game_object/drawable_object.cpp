@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>        // std::strtoll, for the plant-LOD node-name parse
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -10,6 +11,8 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
+#include <array>          // key type for the instance-transform memo
+#include <map>            // ordered map, so that key needs no hash
 #include <set>
 #include <filesystem>
 #include <mutex>
@@ -47,6 +50,15 @@ static glm::vec4 s_frustum_planes[6];
 // place to publish the camera position.
 static bool      s_viewer_pos_valid = false;
 static glm::vec3 s_viewer_pos_ws = glm::vec3(0.0f);
+
+// ── Eye position for plant LOD band selection ──────────────────────────
+// Separate from s_viewer_pos_ws and never cleared; see the doc-comment on
+// DrawableObject::setPlantLodEye for why the tree LOD cannot borrow the
+// decal pass's scoped eye.  Published by ObjectSceneView::draw before the
+// forward pass and before every shadow cascade, so all of them select the
+// same band for the same tile within a frame.
+static bool      s_plant_lod_eye_valid = false;
+static glm::vec3 s_plant_lod_eye_ws = glm::vec3(0.0f);
 
 namespace ego = engine::game_object;
 
@@ -2543,6 +2555,215 @@ static bool readFloatAccessor(
     return true;
 }
 
+// ── Plant LOD: parse the band/tile encoding out of the node names ───────
+// terrain_pcg.py writes one node per (tile, band, species) and puts both
+// the tile rectangle and the band range in the NAME:
+//
+//     tree_<species>_lodtile_<i>_<j>_<tile>_<near>_<far>
+//
+// five signed integers in metres after one marker, so the parse is a
+// single find() and a scan of five strtol calls, run once per node at
+// load.  Anything that does not match — every node of every other file
+// the engine loads — leaves lod_tile_m_ at 0 and draws unconditionally.
+//
+// Returns false rather than throwing on a malformed tail: a name that
+// merely CONTAINS the marker but does not parse is treated as an ordinary
+// node, which fails toward drawing geometry instead of hiding it.
+static bool parseLodTileName(
+    const std::string& name,
+    int64_t& ti, int64_t& tj,
+    float& tile_m, float& near_m, float& far_m) {
+
+    static const char kMark[] = "_lodtile_";
+    const size_t p = name.find(kMark);
+    if (p == std::string::npos) {
+        return false;
+    }
+    const char* s = name.c_str() + p + (sizeof(kMark) - 1);
+    long long v[5] = { 0, 0, 0, 0, 0 };
+    for (int i = 0; i < 5; ++i) {
+        char* end = nullptr;
+        v[i] = std::strtoll(s, &end, 10);
+        if (end == s) {
+            return false;                   // no digits where one is required
+        }
+        s = end;
+        if (i < 4) {
+            if (*s != '_') {
+                return false;
+            }
+            ++s;
+        }
+    }
+    if (*s != '\0') {
+        return false;                       // trailing junk: not our encoding
+    }
+    if (v[2] <= 0 || v[4] <= v[3] || v[3] < 0) {
+        return false;                       // degenerate tile or band
+    }
+    ti = static_cast<int64_t>(v[0]);
+    tj = static_cast<int64_t>(v[1]);
+    tile_m = static_cast<float>(v[2]);
+    near_m = static_cast<float>(v[3]);
+    far_m  = static_cast<float>(v[4]);
+    return true;
+}
+
+// Run once at load, right after setupNodes.  Fills the per-node tile
+// rectangle and band range, and sets has_plant_lod_ if ANY node carried
+// the encoding — that flag is what keeps every other drawable on exactly
+// the code path it had before this change.
+static void parsePlantLodBands(
+    std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::string& input_filename) {
+
+    uint32_t matched = 0;
+    float near_far_min = std::numeric_limits<float>::max();
+    float near_far_max = 0.0f;
+    for (auto& node : drawable_object->nodes_) {
+        int64_t ti = 0, tj = 0;
+        float tile_m = 0.0f, near_m = 0.0f, far_m = 0.0f;
+        if (!parseLodTileName(node.name_, ti, tj, tile_m, near_m, far_m)) {
+            continue;
+        }
+        node.lod_tile_m_ = tile_m;
+        node.lod_near_m_ = near_m;
+        node.lod_far_m_  = far_m;
+        // int64 index times tile size in double, then to float: the map is
+        // 32 km across so the product fits a float exactly at these sizes,
+        // but the multiply itself must not overflow a 32-bit int on a
+        // corrupt name, and int64 makes that unrepresentable rather than
+        // merely unlikely.
+        node.lod_lx0_ = static_cast<float>(
+            static_cast<double>(ti) * static_cast<double>(tile_m));
+        node.lod_lz0_ = static_cast<float>(
+            static_cast<double>(tj) * static_cast<double>(tile_m));
+        near_far_min = glm::min(near_far_min, near_m);
+        near_far_max = glm::max(near_far_max, far_m);
+        ++matched;
+    }
+    drawable_object->has_plant_lod_ = (matched > 0);
+    drawable_object->lod_far_max_ = (matched > 0) ? near_far_max : 0.0f;
+    if (matched > 0) {
+        drawable_object->lod_node_visible_.assign(
+            drawable_object->nodes_.size(), uint8_t(1));
+        // lod_world_from_ starts at all-zeroes, which no real transform
+        // equals, so the first selectPlantLodBands call is guaranteed to
+        // rebuild the world rectangles rather than trusting the default.
+        std::cout << "[lod] " << input_filename << ": " << matched
+                  << " of " << drawable_object->nodes_.size()
+                  << " nodes carry plant LOD bands, "
+                  << near_far_min << " to " << near_far_max << " m"
+                  << std::endl;
+    }
+}
+
+// Run once per frame per drawable (memoised on the eye and the instance
+// world, so the four shadow cascades ride on the forward pass's work AND
+// are guaranteed to agree with it).  For every LOD node: the horizontal
+// distance from the eye to the tile's rectangle, then "draw me if that
+// distance is inside my band".
+//
+// The bands partition [0, far_last) with no gaps and no overlap, so each
+// tile is selected by exactly one band — that is a property of the table
+// terrain_pcg.py writes, asserted on the Python side over thousands of
+// tiles and hundreds of camera positions, and it is why this function can
+// be a straight per-node range test with no cross-node bookkeeping.
+static void selectPlantLodBands(
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
+    const glm::mat4& instance_world) {
+
+    if (!drawable_object->has_plant_lod_) {
+        return;
+    }
+    const bool eye_valid = s_plant_lod_eye_valid;
+    const glm::vec3 eye = s_plant_lod_eye_ws;
+    if (drawable_object->lod_world_from_ == instance_world &&
+        drawable_object->lod_eye_valid_ == eye_valid &&
+        (!eye_valid || drawable_object->lod_eye_ == eye)) {
+        return;                             // same inputs, same answer
+    }
+
+    const bool rebuild_rects =
+        (drawable_object->lod_world_from_ != instance_world);
+    drawable_object->lod_world_from_ = instance_world;
+    drawable_object->lod_eye_ = eye;
+    drawable_object->lod_eye_valid_ = eye_valid;
+
+    auto& vis = drawable_object->lod_node_visible_;
+    if (vis.size() != drawable_object->nodes_.size()) {
+        vis.assign(drawable_object->nodes_.size(), uint8_t(1));
+    }
+
+    uint32_t drawn = 0;
+    for (size_t i = 0; i < drawable_object->nodes_.size(); ++i) {
+        auto& node = drawable_object->nodes_[i];
+        if (node.lod_tile_m_ <= 0.0f) {
+            vis[i] = 1;                     // not a LOD node: unchanged
+            continue;
+        }
+        if (rebuild_rects) {
+            // The rectangle through the node's full world transform.  All
+            // four corners, then the XZ extent of the result: for the
+            // identity and translation cases (which is what the tree GLB
+            // actually uses) this is exact, and for a rotated wrapper it
+            // is the rect's axis-aligned hull, which can only make the
+            // measured distance SMALLER — i.e. err toward more detail,
+            // never toward a hole.
+            const glm::mat4 m = instance_world * node.cached_matrix_;
+            const float x0 = node.lod_lx0_;
+            const float z0 = node.lod_lz0_;
+            const float x1 = x0 + node.lod_tile_m_;
+            const float z1 = z0 + node.lod_tile_m_;
+            const glm::vec3 c[4] = {
+                glm::vec3(m * glm::vec4(x0, 0.0f, z0, 1.0f)),
+                glm::vec3(m * glm::vec4(x1, 0.0f, z0, 1.0f)),
+                glm::vec3(m * glm::vec4(x0, 0.0f, z1, 1.0f)),
+                glm::vec3(m * glm::vec4(x1, 0.0f, z1, 1.0f)),
+            };
+            node.lod_wx0_ = glm::min(glm::min(c[0].x, c[1].x),
+                                     glm::min(c[2].x, c[3].x));
+            node.lod_wx1_ = glm::max(glm::max(c[0].x, c[1].x),
+                                     glm::max(c[2].x, c[3].x));
+            node.lod_wz0_ = glm::min(glm::min(c[0].z, c[1].z),
+                                     glm::min(c[2].z, c[3].z));
+            node.lod_wz1_ = glm::max(glm::max(c[0].z, c[1].z),
+                                     glm::max(c[2].z, c[3].z));
+        }
+
+        if (!eye_valid) {
+            // No eye has ever been published — the first frame or two
+            // after a load, before ObjectSceneView::draw has run once.
+            // Select the FARTHEST band: it still covers every tile
+            // exactly once (so nothing is missing and nothing doubles),
+            // and at four triangles a tree it cannot stall the frame the
+            // way selecting the near band for the whole map would.  The
+            // next frame has an eye and corrects itself.
+            vis[i] = (node.lod_far_m_ >= drawable_object->lod_far_max_)
+                     ? uint8_t(1) : uint8_t(0);
+            drawn += vis[i];
+            continue;
+        }
+
+        // Horizontal distance from the eye to the tile rectangle.  XZ
+        // only, and deliberately: a tile 300 m below the camera on a
+        // mountainside is 300 m of ALTITUDE away, and swapping its
+        // meshes for cards because of that reads as the forest below
+        // you dissolving when you climb.  Ground distance is what the
+        // eye judges tree detail by.
+        const float dx = glm::max(glm::max(node.lod_wx0_ - eye.x, 0.0f),
+                                  eye.x - node.lod_wx1_);
+        const float dz = glm::max(glm::max(node.lod_wz0_ - eye.z, 0.0f),
+                                  eye.z - node.lod_wz1_);
+        const float d = glm::sqrt(dx * dx + dz * dz);
+        const uint8_t v =
+            (d >= node.lod_near_m_ && d < node.lod_far_m_) ? 1 : 0;
+        vis[i] = v;
+        drawn += v;
+    }
+    drawable_object->lod_nodes_drawn_ = drawn;
+}
+
 // ── EXT_mesh_gpu_instancing: build the flat per-instance table ──────────
 // Walks every node that setupNode tagged with instance accessors and lays
 // its transforms end-to-end into DrawableData::baked_instances_, recording
@@ -2572,7 +2793,30 @@ static void bakeInstanceTransforms(
     drawable_object->baked_instances_.clear();
     drawable_object->baked_instances_.emplace_back();
 
-    size_t total = 0;
+    // ── One baked range per distinct accessor triple ──────────────────
+    // The tree GLB gives every LOD band of a tile its own node, and all
+    // three of those nodes point at the SAME TRANSLATION/ROTATION/SCALE
+    // accessors — a tree does not move, turn or change size when the
+    // camera crosses a band boundary, only the mesh drawn in its place
+    // changes.  The writer already stores those bytes once (see
+    // write_instanced_glb's _inst_acc memo).  This loop, though, walks
+    // NODES, so without this map it would faithfully decode the one
+    // stored copy three times and lay three byte-identical copies into
+    // baked_instances_ — which is the table that becomes a GPU buffer.
+    // The file would have shrunk 3x and VRAM would not have moved.  The
+    // two memos are a pair; either alone buys nothing.
+    //
+    // At 64 B per BakedInstanceXform this is the difference between
+    // 4.8 M trees costing ~307 MB and costing ~921 MB, on a card the
+    // user is already running at 18.7 of 24 GB.
+    //
+    // Keyed on the raw triple including the -1 "absent" sentinel, so two
+    // nodes that both omit rotation and share a translation accessor
+    // still collapse.  Nodes with genuinely distinct accessors miss and
+    // behave exactly as before.
+    std::map<std::array<int, 3>, std::pair<uint32_t, uint32_t>> range_memo;
+
+    size_t total = 0, shared = 0, saved = 0;
     for (uint32_t node_idx = 0;
          node_idx < drawable_object->nodes_.size(); ++node_idx) {
         auto& node = drawable_object->nodes_[node_idx];
@@ -2601,9 +2845,30 @@ static void bakeInstanceTransforms(
             continue;
         }
 
-        node.inst_offset_ =
-            static_cast<uint32_t>(drawable_object->baked_instances_.size());
-        node.inst_count_ = static_cast<uint32_t>(count);
+        // If another node already baked this exact triple, point at its
+        // range instead of appending a second copy.  `bake` false from
+        // here down means "reuse the rows, but still do everything that
+        // is per-NODE" — which the instance-expanded bbox below is: each
+        // band node owns a different mesh with a different local bbox
+        // (a full LOD0 tree and a flat far-field card are not the same
+        // box), so that union has to be recomputed even when the
+        // transforms behind it are shared.
+        const std::array<int, 3> key = {node.inst_translation_acc_,
+                                        node.inst_rotation_acc_,
+                                        node.inst_scale_acc_};
+        const auto memo_it = range_memo.find(key);
+        const bool bake = (memo_it == range_memo.end());
+        if (bake) {
+            node.inst_offset_ = static_cast<uint32_t>(
+                drawable_object->baked_instances_.size());
+            node.inst_count_ = static_cast<uint32_t>(count);
+            range_memo[key] = { node.inst_offset_, node.inst_count_ };
+        } else {
+            node.inst_offset_ = memo_it->second.first;
+            node.inst_count_ = memo_it->second.second;
+            ++shared;
+            saved += count;
+        }
 
         // ── Instance-expanded bounds ─────────────────────────────────
         // The mesh this node instances is modelled around the origin;
@@ -2661,13 +2926,15 @@ static void bakeInstanceTransforms(
                                     glm::mat3(sc.x, 0.0f, 0.0f,
                                               0.0f, sc.y, 0.0f,
                                               0.0f, 0.0f, sc.z);
-            ego::BakedInstanceXform x;
-            // Columns, matching base.vert's mat3x3(rot_0, rot_1, rot_2).
-            x.mat_rot_0 = glm::vec4(basis[0], 0.0f);
-            x.mat_rot_1 = glm::vec4(basis[1], 0.0f);
-            x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
-            x.mat_pos_scale = glm::vec4(tr, 1.0f);
-            drawable_object->baked_instances_.push_back(x);
+            if (bake) {
+                ego::BakedInstanceXform x;
+                // Columns, matching base.vert's mat3x3(rot_0,rot_1,rot_2).
+                x.mat_rot_0 = glm::vec4(basis[0], 0.0f);
+                x.mat_rot_1 = glm::vec4(basis[1], 0.0f);
+                x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
+                x.mat_pos_scale = glm::vec4(tr, 1.0f);
+                drawable_object->baked_instances_.push_back(x);
+            }
 
             if (mesh_bbox_valid) {
                 // All 8 corners, not just min/max: `basis` carries an
@@ -2691,7 +2958,9 @@ static void bakeInstanceTransforms(
                 inst_mesh->has_inst_bbox_ = true;
             }
         }
-        total += count;
+        if (bake) {
+            total += count;
+        }
 
         // Mirror the range onto the mesh so the indirect-draw fill (which
         // iterates meshes, not nodes) can find it.
@@ -2715,7 +2984,12 @@ static void bakeInstanceTransforms(
         std::cout << "[instancing] EXT_mesh_gpu_instancing: "
                   << drawable_object->mesh_instance_range_.size()
                   << " instanced mesh(es), " << total
-                  << " instances baked (+1 identity slot)" << std::endl;
+                  << " instances baked (+1 identity slot), " << shared
+                  << " node(s) reusing a shared range ("
+                  << (total * sizeof(ego::BakedInstanceXform)) / (1024 * 1024)
+                  << " MB resident, " << (saved * sizeof(
+                         ego::BakedInstanceXform)) / (1024 * 1024)
+                  << " MB not spent)" << std::endl;
     }
 }
 
@@ -3922,7 +4196,22 @@ static void drawNodes(
         const bool node_filtered =
             drawable_object->m_only_render_node_ >= 0 &&
             drawable_object->m_only_render_node_ != node_idx;
-        if (node.mesh_idx_ >= 0 && !node_filtered) {
+        // Plant LOD band gate.  selectPlantLodBands ran once at the top
+        // of DrawableObject::draw and marked, for every tile, the single
+        // band that owns it at this eye position; everything else is
+        // skipped here.  Applied in the depth-only and cascade passes
+        // too — the bands partition distance rather than dividing an
+        // effect from its absence, so a shadow pass that ignored the
+        // gate would draw all three copies of every tree at once, which
+        // is both the wrong silhouette and the whole cost this exists
+        // to remove.  Children are still recursed, exactly as the
+        // sub-object filter above does.
+        const bool lod_hidden =
+            drawable_object->has_plant_lod_ &&
+            node_idx < static_cast<int32_t>(
+                drawable_object->lod_node_visible_.size()) &&
+            drawable_object->lod_node_visible_[node_idx] == 0;
+        if (node.mesh_idx_ >= 0 && !node_filtered && !lod_hidden) {
             if (drawable_object->m_debug_force_red_ ||
                 drawable_object->m_debug_log_draws_) {
                 ++drawable_object->m_debug_draw_nodes_with_mesh_;
@@ -5931,10 +6220,22 @@ void DrawableObject::clearFrustumCull() {
 void DrawableObject::setViewerWorldPos(const glm::vec3& pos) {
     s_viewer_pos_ws = pos;
     s_viewer_pos_valid = true;
+    // Mirror into the plant-LOD eye.  The decal pass is not the primary
+    // publisher (ObjectSceneView::draw is, so the forward pass has a
+    // same-frame eye), but keeping it warm here means the LOD still
+    // tracks the camera if the forward publisher is ever removed —
+    // one frame late instead of frozen.
+    s_plant_lod_eye_ws = pos;
+    s_plant_lod_eye_valid = true;
 }
 
 void DrawableObject::clearViewerWorldPos() {
     s_viewer_pos_valid = false;
+}
+
+void DrawableObject::setPlantLodEye(const glm::vec3& pos) {
+    s_plant_lod_eye_ws = pos;
+    s_plant_lod_eye_valid = true;
 }
 
 void DrawableObject::initGameObjectBuffer(
@@ -6708,6 +7009,16 @@ void DrawableObject::draw(
         return;
     }
 
+    // ── Select the plant LOD band for every tile ────────────────────
+    // Inert (one predicate) for every drawable whose node names carry no
+    // _lodtile_ encoding, which is all of them but the tree GLB.  Called
+    // per PASS rather than per frame on purpose: there is no frame hook
+    // on this class, and the memo inside keyed on (instance world, eye)
+    // makes the second and subsequent passes of a frame free — while
+    // also guaranteeing the cascades cannot select differently from the
+    // forward pass, which would shadow trees that are not drawn.
+    selectPlantLodBands(object_, object_->m_current_instance_world_);
+
     // kDecal is tested BEFORE depth_only so a stray depth_only=true from
     // a caller cannot silently demote a decal draw into the shadow list;
     // the decal pass never wants a depth-only pipeline.
@@ -7024,6 +7335,10 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     setupSkins(device, model, drawable_object);
     captureRtSkinSource(model, drawable_object);
     setupNodes(model, drawable_object);
+    // Straight after setupNodes: the node names exist from here on, and
+    // the parse is pure CPU string work with no GPU dependency, so doing
+    // it on the async load thread keeps it off the render thread.
+    parsePlantLodBands(drawable_object, input_filename);
     setupModel(model, drawable_object);
     // Must be here, not at buffer-creation time: `model` is a stack local
     // and the instance accessors live in its buffers.

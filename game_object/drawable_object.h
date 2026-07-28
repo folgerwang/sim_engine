@@ -342,6 +342,39 @@ struct NodeInfo {
     uint32_t                    inst_offset_ = 0;
     uint32_t                    inst_count_ = 0;
 
+    // ── Plant LOD band (parsed once at load from name_) ───────────────
+    // terrain_pcg.py names every tree node
+    //     tree_<species>_lodtile_<i>_<j>_<tile>_<near>_<far>
+    // with the last five fields whole metres, and each (tile, band,
+    // species) is its own node.  parsePlantLodBands turns that into the
+    // tile's XZ RECTANGLE and the band's distance range; selectPlant-
+    // LodBands then draws, for each tile, the first band whose far_
+    // exceeds the distance from the eye to that rectangle.
+    //
+    // The rectangle comes from the NAME and not from the node's instance
+    // bounds on purpose.  A tile holds a different subset of species in
+    // each band, so its instance bounds differ per band, and two bands
+    // that measure different distances to the same ground disagree about
+    // which of them owns it — the tile is then drawn twice or not at all,
+    // and the hole moves with the camera.  Named rectangles are identical
+    // across the bands by construction, so the partition is exact.
+    //
+    // lod_tile_m_ == 0 means "this node is not part of a LOD chain" and
+    // the node draws unconditionally, which is every node in every other
+    // file the engine loads.
+    float                       lod_tile_m_ = 0.0f;
+    float                       lod_near_m_ = 0.0f;
+    float                       lod_far_m_ = 0.0f;
+    // The tile rectangle in WORLD space, cached by selectPlantLodBands
+    // for the drawable's current instance world (see DrawableData::
+    // lod_world_from_).  Recomputed only when that transform changes,
+    // so the per-frame work per node is two subtractions and a compare.
+    float                       lod_wx0_ = 0.0f, lod_wx1_ = 0.0f;
+    float                       lod_wz0_ = 0.0f, lod_wz1_ = 0.0f;
+    // Tile origin in the file's own space, kept so the world rectangle
+    // can be rebuilt if the wrapper moves.
+    float                       lod_lx0_ = 0.0f, lod_lz0_ = 0.0f;
+
     glm::vec3                   translation_{};
     glm::vec3                   scale_{1.0f};
     glm::quat                   rotation_{};
@@ -526,6 +559,40 @@ struct DrawableData {
     std::unordered_map<int32_t, std::pair<uint32_t, uint32_t>>
                                 mesh_instance_range_;
     bool                        has_baked_instances_ = false;
+
+    // ── Plant LOD band selection ─────────────────────────────────────
+    // NOT a staging slot, unlike m_clutter_fade_*_m_ above, and the
+    // difference is worth stating because the two look alike.  A fade
+    // distance is a per-WRAPPER property, so a shared DrawableData can
+    // only hold one wrapper's copy at a time.  A band selection is a pure
+    // function of (the node table, the instance world, the eye), and the
+    // memo below is keyed by both inputs that can change — so two
+    // wrappers of the same file at different positions still each get
+    // their own correct answer; they would merely recompute alternately
+    // rather than share.  (Today there is one tree wrapper, placed at
+    // identity, so they do share.)  A drawable is typically drawn five
+    // times a frame
+    // (forward + four cascades) and the memo is what makes the other
+    // four free — and, more importantly, what makes them agree: the
+    // bands partition distance, so a cascade selecting differently from
+    // the forward pass would shadow a tree that is not there.
+    //
+    // 1 = draw this node this frame.  Sized to nodes_ and left empty on
+    // every file that carries no _lodtile_ names, i.e. all but the tree
+    // GLB, which is also what has_plant_lod_ gates on.
+    std::vector<uint8_t>        lod_node_visible_;
+    bool                        has_plant_lod_ = false;
+    // Memo keys.  lod_eye_valid_ false means "no eye has been published
+    // yet"; see selectPlantLodBands for what is drawn then.
+    glm::mat4                   lod_world_from_ = glm::mat4(0.0f);
+    glm::vec3                   lod_eye_ = glm::vec3(0.0f);
+    bool                        lod_eye_valid_ = false;
+    // Largest far_ over all LOD nodes, i.e. which band is the outermost.
+    // Only read by the no-eye-yet fallback, which draws that band alone.
+    float                       lod_far_max_ = 0.0f;
+    // Diagnostics for the per-second print: nodes kept by the last
+    // selection, and how many tiles fell in each band.
+    uint32_t                    lod_nodes_drawn_ = 0;
 
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> update_instance_buffer_desc_set_;
@@ -1215,6 +1282,21 @@ public:
     // is inert (nothing is culled), which is the safe default.
     static void setViewerWorldPos(const glm::vec3& pos);
     static void clearViewerWorldPos();
+
+    // Eye position for plant LOD band selection.  A SECOND eye, and not
+    // the one above, for one reason: setViewerWorldPos is scoped to the
+    // decal pass and cleared straight after (deliberately — a stale eye
+    // silently culling geometry is nasty to debug), while the tree LOD
+    // has to select in the forward pass and in every shadow cascade.
+    // The distinction is that the clutter cull DROPS geometry, so being
+    // wrong there loses a tile; band selection only chooses between three
+    // drawings of the same tree, so being a metre stale changes nothing
+    // anyone can see.  Never cleared, for the same reason: a cascade that
+    // lost the eye mid-frame would disagree with the forward pass about
+    // which band owns a tile, and shadow a tree that is not drawn.
+    // Published by ObjectSceneView::draw (all passes) and mirrored from
+    // setViewerWorldPos so the decal path keeps it warm too.
+    static void setPlantLodEye(const glm::vec3& pos);
 
     static void initGameObjectBuffer(
         const std::shared_ptr<renderer::Device>& device);
