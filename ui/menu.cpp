@@ -6188,11 +6188,12 @@ void Menu::drawTerrainGenPopup() {
                      ImGuiWindowFlags_NoDocking |
                      ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextWrapped(
-            "Describe the terrain (the map covers a 4 km area at 0.5 m "
-            "per texel, so towns and rivers render at natural size).  "
-            "FLUX renders a satellite-view heightmap; a GPU erosion "
-            "model refines it and upscales to an 8192x8192 base map; "
-            "0.125 m ML detail streams in near the camera.");
+            "Describe the terrain as a REGION seen from orbit: the map "
+            "covers 32.8 km across at 4 m per texel, so ask for whole "
+            "valleys, ranges and towns, not a single street.  FLUX "
+            "renders a satellite-view heightmap; a GPU erosion model "
+            "refines it and upscales to an 8192x8192 base map; 1 m ML "
+            "detail tiles (2048 m / 2048 px) stream in near the camera.");
         // Soft-wrap to the box width (same callback the image-gen prompt
         // uses) so long prompts wrap instead of scrolling off the right edge.
         const float tp_box_w = ImGui::GetContentRegionAvail().x;
