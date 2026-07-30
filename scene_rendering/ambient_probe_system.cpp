@@ -1,4 +1,5 @@
 #include "ambient_probe_system.h"
+#include <cstring>   // std::memcpy
 #include "dynamic_cubemap.h"
 #include "scene_rendering/cluster_renderer.h"
 

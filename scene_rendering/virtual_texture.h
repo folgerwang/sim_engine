@@ -55,6 +55,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <queue>

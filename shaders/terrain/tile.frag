@@ -1,12 +1,12 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
-#include "..\global_definition.glsl.h"
-#include "..\weather\weather_common.glsl.h"
-#include "..\functions.glsl.h"
-#include "..\brdf.glsl.h"
-#include "..\punctual.glsl.h"
+#include "../global_definition.glsl.h"
+#include "../weather/weather_common.glsl.h"
+#include "../functions.glsl.h"
+#include "../brdf.glsl.h"
+#include "../punctual.glsl.h"
 
-#include "..\ibl.glsl.h"
+#include "../ibl.glsl.h"
 #include "tile_common.glsl.h"
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
@@ -149,7 +149,7 @@ float terrainDetailSurface(vec2 pos_xz_ws, float fade,
 // Same RVT pools/page-table/feedback as the cluster bindless path (one
 // shared VirtualTextureManager) — declaration order matters, see
 // vt_sample.glsl.h.  tile_params.vt_albedo_id gates the whole path.
-#include "..\vt_types.glsl.h"
+#include "../vt_types.glsl.h"
 
 layout(set = TILE_PARAMS_SET, binding = TERRAIN_VT_POOL_ALBEDO_INDEX)
     uniform sampler2D vt_pool_albedo;
@@ -172,7 +172,7 @@ layout(std430, set = TILE_PARAMS_SET, binding = TERRAIN_VT_FEEDBACK_INDEX)
     uint vt_feedback[];
 };
 
-#include "..\vt_sample.glsl.h"
+#include "../vt_sample.glsl.h"
 layout(set = TILE_PARAMS_SET, binding = SRC_MAP_MASK_INDEX) uniform sampler2D src_map_mask;
 layout(set = TILE_PARAMS_SET, binding = SRC_TEMP_TEX_INDEX) uniform sampler3D src_temp;
 layout(set = TILE_PARAMS_SET, binding = DETAIL_NOISE_TEXTURE_INDEX) uniform sampler3D src_detail_noise_tex;

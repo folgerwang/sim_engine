@@ -111,6 +111,12 @@ TerrainSceneView::TerrainSceneView(
                 "terrain/tile_water_frag.spv");
     }
 
+#ifndef __APPLE__
+    // Grass is amplified in a geometry shader (grass.geom; mesh-shader
+    // variant when USE_MESH_SHADER) — neither stage exists on Metal, and
+    // MoltenVK crashes inside vkCreateGraphicsPipelines when handed a
+    // geometry stage.  On macOS the pipeline stays null and the drawGrass
+    // call sites skip it: terrain renders without grass.
     if (m_tile_grass_pipeline_ == nullptr) {
         m_tile_grass_pipeline_ =
             ego::TileObject::createGrassPipeline(
@@ -119,6 +125,7 @@ TerrainSceneView::TerrainSceneView(
                 graphic_double_face_pipeline_info,
                 renderbuffer_formats[int(renderer::RenderPasses::kForward)]);
     }
+#endif
 
     // tile params set.
     m_tile_res_desc_sets_.resize(2);
@@ -283,7 +290,7 @@ void TerrainSceneView::draw(
                 delta_t,
                 cur_time);
 
-            if (m_b_render_grass_) {
+            if (m_b_render_grass_ && m_tile_grass_pipeline_) {
                 tile->drawGrass(
                     cmd_buf,
                     m_tile_grass_pipeline_layout_,
@@ -414,7 +421,7 @@ void TerrainSceneView::drawTilesInto(
             delta_t,
             cur_time);
 
-        if (m_b_render_grass_ && !tile->isOuter()) {
+        if (m_b_render_grass_ && m_tile_grass_pipeline_ && !tile->isOuter()) {
             tile->drawGrass(
                 cmd_buf,
                 m_tile_grass_pipeline_layout_,

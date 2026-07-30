@@ -30,6 +30,7 @@
 #include <iostream>
 #include <sstream>
 
+#ifdef _WIN32
 // Windows.h must come BEFORE winhttp.h.  application.cpp already pulls
 // in Windows.h transitively, but this TU is built on its own so we
 // include it explicitly here.  NOMINMAX suppresses the legacy `min`
@@ -41,15 +42,21 @@
 #define NOMINMAX
 #include "Windows.h"
 #include "winhttp.h"
+#else
+// Linux / macOS: same wire protocol over the shared POSIX transport.
+#include "helper/http_post.h"
+#endif
 
 #include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp,
                       // include path "${TP_DIR}/tinygltf" is on the
                       // engine target.
 
+#ifdef _WIN32
 // Tell the linker to pull in winhttp.lib without touching the CMake
 // link list manually.  Either works; the pragma is the lower-friction
 // path because it lives next to the only call site.
 #pragma comment(lib, "winhttp.lib")
+#endif
 
 namespace engine {
 namespace helper {
@@ -111,6 +118,7 @@ OllamaTarget parseHost(const std::string& raw) {
     return t;
 }
 
+#ifdef _WIN32
 // UTF-8 → UTF-16 helper for the WinHTTP API surface (which is wide-
 // char only).  WinHTTP API names like WinHttpOpen take LPCWSTR for
 // hostnames, paths, and the user-agent string.
@@ -126,6 +134,7 @@ std::wstring toW(const std::string& s) {
         static_cast<int>(s.size()), out.data(), n);
     return out;
 }
+#endif  // _WIN32
 
 // ── WinHTTP request ──────────────────────────────────────────────────
 // Single-shot synchronous plaintext-HTTP request to <host>:<port><path>.
@@ -144,6 +153,47 @@ std::wstring toW(const std::string& s) {
 // configured for browser traffic will typically refuse a connection
 // to localhost on a non-standard port.
 struct HttpResult { unsigned int status = 0; std::string body; };
+#ifndef _WIN32
+// POSIX (Linux / macOS) transport: same contract as the WinHTTP path
+// below — synchronous plaintext HTTP, no proxy, tight connect timeout,
+// 10-minute receive ceiling for CPU-bound token generation.  The method
+// stays a wide literal at the call sites (L"POST" / L"GET") so the two
+// platform paths share them; we narrow it here.
+HttpResult httpRequest(
+    const std::string& host,
+    unsigned short port,
+    const wchar_t*     method,
+    const std::string& path,
+    const std::string& body) {
+
+    std::string method_narrow;
+    for (const wchar_t* p = method; p && *p; ++p) {
+        method_narrow.push_back(static_cast<char>(*p));
+    }
+    std::cout << "[mat.cls.http] " << method_narrow << " http://" << host
+              << ":" << port << path << " body_bytes=" << body.size()
+              << std::endl;
+    g_classifier_bytes_sent.store(body.size(), std::memory_order_relaxed);
+
+    const SimpleHttpResult res = simpleHttpRequest(
+        host, port, method_narrow.c_str(), path, body,
+        /*connect_timeout_ms=*/5000,
+        /*recv_timeout_ms=*/600000,
+        &g_classifier_bytes_received);
+
+    if (res.status == 0) {
+        std::cout << "[mat.cls.http] request FAILED: " << res.err
+                  << std::endl;
+    } else {
+        std::cout << "[mat.cls.http] status=" << res.status << " ("
+                  << res.body.size() << " bytes)" << std::endl;
+    }
+    HttpResult r{};
+    r.status = res.status;
+    r.body   = res.body;
+    return r;
+}
+#else
 HttpResult httpRequest(
     const std::string& host,
     unsigned short port,
@@ -348,6 +398,7 @@ HttpResult httpRequest(
     mark("transport done, handles closed");
     return r;
 }
+#endif  // _WIN32
 
 // ── Prompt construction ───────────────────────────────────────────────
 // Build the JSON request body for /v1/messages.  We use Haiku because

@@ -12,7 +12,17 @@ layout(set = 0, binding = DST_TEX_INDEX, rg16f) uniform image2D dst_img;
 #define kConemapCacheBufferSize 4096
 
 shared vec2 s_depth[kConemapCacheBufferSize];
+// RW_METAL (defined by the build only when compiling for macOS/MoltenVK):
+// the running min/max accumulator moves out of shared memory into a
+// thread-0-private local.  Only thread 0 ever reads or writes it, and it
+// matters on Metal: s_depth alone is exactly 32768 bytes, Apple GPUs'
+// threadgroup-memory maximum.  The extra shared vec2 (8 bytes) made
+// pipeline creation fail on macOS with "Threadgroup memory size (32776)
+// exceeds the maximum (32768)".  Other platforms keep the original
+// shared accumulator.
+#ifndef RW_METAL
 shared vec2 s_minmax_height;
+#endif
 
 const uint g_dispatch_block_size =
     kConemapGenDispatchX * kConemapGenDispatchY;
@@ -31,10 +41,16 @@ void main()
     uvec2 group_idx = gl_WorkGroupID.xy;
     uint local_idx = gl_LocalInvocationIndex;
 
+#ifdef RW_METAL
+    // Thread-0-private accumulator (see note at the shared declarations).
+    vec2 minmax_height = vec2(1.0f, 0.0f);
+#else
+    #define minmax_height s_minmax_height
     if (local_idx == 0) {
         s_minmax_height = vec2(1.0f, 0.0f);
     }
     barrier();
+#endif
 
     uvec2 block_offset =
         group_idx *
@@ -73,11 +89,11 @@ void main()
                 barrier();
             }
             if (local_idx == 0) {
-			    s_minmax_height.x =
-                    min(s_minmax_height.x,
+			    minmax_height.x =
+                    min(minmax_height.x,
                         s_depth[offset].x);
-			    s_minmax_height.y =
-                    max(s_minmax_height.y,
+			    minmax_height.y =
+                    max(minmax_height.y,
                         s_depth[offset].y);
 		    }
         }
@@ -90,6 +106,6 @@ void main()
     	imageStore(
             dst_img,
             ivec2(gl_WorkGroupID),
-            vec4(s_minmax_height, 0, 0));
+            vec4(minmax_height, 0, 0));
     }
 }
