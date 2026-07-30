@@ -2278,6 +2278,12 @@ void VulkanDevice::getAccelerationStructureBuildSizes(
     VkAccelerationStructureBuildSizesInfoKHR as_build_size_info{};
     as_build_size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 
+    // Defensive: null on devices without the RT extensions (MoltenVK).
+    if (vkGetAccelerationStructureBuildSizesKHR == nullptr) {
+        size_info = {};
+        return;
+    }
+
     vkGetAccelerationStructureBuildSizesKHR(
         device_,
         helper::toVkAccelerationStructureBuildType(as_build_type),
@@ -2305,6 +2311,10 @@ AccelerationStructure VulkanDevice::createAccelerationStructure(
     as_create_info.offset = offset;
     as_create_info.size = size != 0 ? size : (buffer->getSize() - offset);
     as_create_info.type = helper::toVkAccelerationStructureType(as_type);
+    // Defensive: null on devices without the RT extensions (MoltenVK).
+    if (vkCreateAccelerationStructureKHR == nullptr) {
+        return AccelerationStructure{};
+    }
     VkAccelerationStructureKHR as_handle;
     vkCreateAccelerationStructureKHR(device_, &as_create_info, nullptr, &as_handle);
     return reinterpret_cast<AccelerationStructure>(as_handle);
@@ -2312,6 +2322,7 @@ AccelerationStructure VulkanDevice::createAccelerationStructure(
 
 void VulkanDevice::destroyAccelerationStructure(
     const AccelerationStructure& as) {
+    if (vkDestroyAccelerationStructureKHR == nullptr) return;
     auto vk_as = reinterpret_cast<VkAccelerationStructureKHR>(as);
     vkDestroyAccelerationStructureKHR(device_, vk_as, nullptr);
 }

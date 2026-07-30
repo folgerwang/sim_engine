@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -21,6 +22,9 @@
 #include "Windows.h"
 #include "winhttp.h"
 #pragma comment(lib, "winhttp.lib")
+#else
+#include "helper/http_post.h"   // shared POSIX transport (Linux / macOS)
+#endif
 
 #include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp
 
@@ -57,13 +61,32 @@ std::string getEnvStr(const char* name, const char* fallback) {
     return (v && v[0]) ? std::string(v) : std::string(fallback);
 }
 
+// Minimal HTTP round-trip (blocking — only ever called from the
+// worker threads below, never the render thread).
+struct HttpResult { unsigned int status = 0; std::string body; };
+#ifndef _WIN32
+HttpResult httpRequest(
+    const std::string& host, unsigned short port,
+    const wchar_t* method, const std::string& path,
+    const std::string& body) {
+    std::string method_narrow;
+    for (const wchar_t* p = method; p && *p; ++p) {
+        method_narrow.push_back(static_cast<char>(*p));
+    }
+    const SimpleHttpResult res = simpleHttpRequest(
+        host, port, method_narrow.c_str(), path, body,
+        /*connect_timeout_ms=*/5000,
+        /*recv_timeout_ms=*/120000);
+    HttpResult r{};
+    r.status = res.status;
+    r.body   = res.body;
+    return r;
+}
+#else
 std::wstring widen(const std::string& s) {
     return std::wstring(s.begin(), s.end());   // host names are ASCII
 }
 
-// Minimal WinHTTP round-trip (blocking — only ever called from the
-// worker threads below, never the render thread).
-struct HttpResult { unsigned int status = 0; std::string body; };
 HttpResult httpRequest(
     const std::string& host, unsigned short port,
     const wchar_t* method, const std::string& path,
@@ -125,6 +148,7 @@ HttpResult httpRequest(
     WinHttpCloseHandle(session);
     return r;
 }
+#endif  // _WIN32
 
 std::string systemPrompt() {
     // Default keeps the fine-tune in character; override with

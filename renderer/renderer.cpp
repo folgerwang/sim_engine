@@ -198,6 +198,10 @@ void Helper::initRayTracingProperties(
     return vk::helper::initRayTracingProperties(physical_device, device, rt_pipeline_properties, as_features);
 }
 
+bool Helper::isRayTracingSupported() {
+    return vk::helper::isRayTracingSupported();
+}
+
 void Helper::createSwapChain(
     GLFWwindow* window,
     const std::shared_ptr<Device>& device,

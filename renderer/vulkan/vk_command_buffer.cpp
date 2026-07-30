@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstring>   // std::memcpy
 
 #include "../renderer.h"
 #include "vk_device.h"

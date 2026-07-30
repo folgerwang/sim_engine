@@ -5191,6 +5191,11 @@ void ClusterRenderer::buildRtShadowBvh() {
 // alpha-test cutout casters and fast-path everything else.
 void ClusterRenderer::buildHwRtShadowAs() {
     hw_rt_shadow_ready_ = false;
+    // No KHR ray tracing on this device (MoltenVK/macOS): skip the BLAS/
+    // TLAS build entirely — the software BVH path above remains available.
+    if (!renderer::Helper::isRayTracingSupported()) {
+        return;
+    }
     if (total_clusters_all_meshes_ == 0 ||
         staging_indices_.empty() || staging_draw_infos_.empty()) {
         return;

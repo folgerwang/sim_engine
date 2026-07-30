@@ -26,6 +26,46 @@ static std::string s_src_shader_path;
 static std::string s_output_path;
 static std::string s_compiler_path;
 
+// Platform path separator for the runtime shader-compile paths below.
+// (Windows also accepts '/', but the historical behaviour is kept.)
+#ifdef _WIN32
+static constexpr const char* kPathSep = "\\";
+#else
+static constexpr const char* kPathSep = "/";
+#endif
+
+// Full path (or bare name) of the glslc executable to invoke at runtime.
+// Windows: the repo bundles glslc.exe in third_parties/vulkan_lib.
+// Linux / macOS: prefer an explicit compiler dir, then the Vulkan SDK,
+// then whatever `glslc` is on PATH (apt: glslc/shaderc, brew: shaderc).
+static std::string glslcCommand() {
+#ifdef _WIN32
+    return s_compiler_path + "\\glslc.exe";
+#else
+    if (!s_compiler_path.empty() &&
+        std::filesystem::exists(s_compiler_path + "/glslc")) {
+        return s_compiler_path + "/glslc";
+    }
+    if (const char* sdk = std::getenv("VULKAN_SDK")) {
+        const std::string p = std::string(sdk) + "/bin/glslc";
+        if (std::filesystem::exists(p)) return p;
+    }
+    return "glslc";
+#endif
+}
+
+// Platform-wide shader defines appended to every runtime glslc invocation.
+// RW_METAL marks shaders compiled for the macOS/MoltenVK target (Metal's
+// 32KB threadgroup-memory cap, etc.).  Keep in sync with
+// GLSLC_PLATFORM_FLAGS in cmake/CompileShaders.cmake.
+static const char* glslcPlatformFlags() {
+#ifdef __APPLE__
+    return " -DRW_METAL=1";
+#else
+    return "";
+#endif
+}
+
 void readFile(
     const std::string& file_name,
     std::vector<char>& buffer) {
@@ -489,9 +529,15 @@ std::pair<std::string, int> exec(const char* cmd) {
     std::array<char, 128> buffer;
     std::string result;
     int return_code = -1;
+#ifdef _WIN32
     auto pclose_wrapper = [&return_code](FILE* cmd) { return_code = _pclose(cmd); };
     { // scope is important, have to make sure the ptr goes out of scope first
         const std::unique_ptr<FILE, decltype(pclose_wrapper)> pipe(_popen(cmd, "rt"), pclose_wrapper);
+#else
+    auto pclose_wrapper = [&return_code](FILE* cmd) { return_code = pclose(cmd); };
+    { // scope is important, have to make sure the ptr goes out of scope first
+        const std::unique_ptr<FILE, decltype(pclose_wrapper)> pipe(popen(cmd, "r"), pclose_wrapper);
+#endif
         if (pipe) {
             while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
                 result += buffer.data();
@@ -502,10 +548,22 @@ std::pair<std::string, int> exec(const char* cmd) {
 }
 
 static void analyzeCommandLine(
-    const std::string& line,
+    const std::string& raw_line,
     std::string& input_name,
     std::string& output_name,
     std::string& params_str) {
+
+#ifdef _WIN32
+    const std::string& line = raw_line;
+#else
+    // Normalize Windows-style separators from shaders-compile.cfg so the
+    // paths work on POSIX filesystems.  ('/' also works on Windows, but the
+    // historical cfg format used '\' — accept both.)
+    std::string line = raw_line;
+    for (auto& c : line) {
+        if (c == '\\') c = '/';
+    }
+#endif
 
     auto o0 = line.rfind(' ');
     auto o1 = line.rfind('\t');
@@ -522,14 +580,14 @@ static void analyzeCommandLine(
         }
     }
 
-    output_name = "\\" + line.substr(o0 + 1, e0 - (o0 + 1));
+    output_name = kPathSep + line.substr(o0 + 1, e0 - (o0 + 1));
 
     auto i0 = line.find(' ');
     auto i1 = line.find('\t');
     if (i0 != std::string::npos && i1 != std::string::npos) {
         i0 = std::max(i0, i1);
     }
-    input_name = "\\" + line.substr(0, i0);
+    input_name = kPathSep + line.substr(0, i0);
 
     params_str = line.substr(i0, o0 - i0);
 }
@@ -544,7 +602,7 @@ std::string compileGlobalShaders() {
         }
         if (output_folder_exist) {
             std::fstream fs;
-            fs.open(s_src_shader_path + "\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
+            fs.open(s_src_shader_path + kPathSep + "shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
 
             std::string buffer;
             if (fs.is_open()) {
@@ -568,7 +626,7 @@ std::string compileGlobalShaders() {
                 stat(output_name.c_str(), &output_attrib);
 
                 if (true/*input_attrib.st_mtime > output_attrib.st_mtime*/) {
-                    auto cmd_str = s_compiler_path + "\\glslc.exe " + input_name + " " + params_str + " " + output_name;
+                    auto cmd_str = glslcCommand() + glslcPlatformFlags() + " " + input_name + " " + params_str + " " + output_name;
 
                     auto result = exec((cmd_str + " 2>&1").c_str());
 
@@ -624,10 +682,10 @@ std::string  initCompileGlobalShaders(
     s_compiler_path = compiler_path;
 
     std::string error_strings;
-    const auto shader_compiler_str = s_compiler_path + "\\glslc.exe ";
+    const auto shader_compiler_str = glslcCommand() + glslcPlatformFlags() + " ";
 
     std::fstream fs;
-    fs.open(s_src_shader_path + "\\shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
+    fs.open(s_src_shader_path + kPathSep + "shaders-compile.cfg", std::ios::in | std::ios::binary | std::ios::ate);
 
     std::string buffer;
     if (fs.is_open()) {

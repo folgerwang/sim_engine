@@ -438,9 +438,9 @@ void ConemapTest::draw(
     float y_value[25];
     static float s_theta = glm::pi<float>() / 3.0f;
     static float s_phi = glm::pi<float>() / 4.0f;
-    glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sinf(s_theta), std::cos(s_theta) / conemap_obj->getDepthScale()));
+    glm::vec2 ray_2d = glm::normalize(glm::vec2(std::sin(s_theta), std::cos(s_theta) / conemap_obj->getDepthScale()));
     
-    fillYVauleTablle(y_value, std::acosf(ray_2d.y), s_phi);
+    fillYVauleTablle(y_value, std::acos(ray_2d.y), s_phi);
 
     for (int i = 0; i < 25; i++) {
         params.coeffs[i] = y_value[i];

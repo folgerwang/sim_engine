@@ -2,6 +2,7 @@
 #include <set>
 #include <cstdlib>   // std::getenv (RW_NO_VSYNC present-mode override)
 #include <cstdio>
+#include <cstring>   // strcmp
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -1569,6 +1570,15 @@ std::vector<const char*> getRequiredExtensions() {
     std::vector<const char*> extensions(glfw_extensions, glfw_extensions + glfw_extensionCount);
     extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 
+#ifdef __APPLE__
+    // MoltenVK (Vulkan-over-Metal) is a "portability" implementation: since
+    // Vulkan loader 1.3.216 it is only enumerated when the instance opts in
+    // with VK_KHR_portability_enumeration + the ENUMERATE_PORTABILITY flag
+    // (see createInstance below).  Without these, vkEnumeratePhysicalDevices
+    // returns 0 devices on macOS.
+    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
+
     if (hasEnabledValidationLayers()) {
        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
@@ -1621,6 +1631,11 @@ std::shared_ptr<renderer::Instance> createInstance() {
     VkInstanceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
+#ifdef __APPLE__
+    // Pair of VK_KHR_portability_enumeration (pushed in
+    // getRequiredExtensions): allow the loader to report MoltenVK.
+    create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
 
 #if 0
     uint32_t glfw_extensionCount = 0;
@@ -1822,6 +1837,14 @@ bool checkDeviceExtensionSupport(
     }
 
     std::set<std::string> required_extensions(device_extensions.begin(), device_extensions.end());
+
+#ifdef __APPLE__
+    // MoltenVK exposes no geometry / mesh-shader / ray-tracing extensions.
+    // On macOS only the swapchain is a hard requirement for device
+    // selection; everything else in device_extensions is best-effort and
+    // filtered at vkCreateDevice time (see createLogicalDevice).
+    required_extensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+#endif
 
     for (const auto& extension : available_extensions) {
         required_extensions.erase(extension.extensionName);
@@ -2096,8 +2119,57 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
         create_info.enabledLayerCount = 0;
     }
 
-    create_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
-    create_info.ppEnabledExtensionNames = device_extensions.data();
+    // The extension list actually passed to vkCreateDevice.  On Windows /
+    // Linux this is device_extensions verbatim (unchanged behaviour).  On
+    // macOS (MoltenVK) the unsupported entries (ray tracing, mesh shader,
+    // conditional rendering, ...) are filtered against what the driver
+    // reports, and VK_KHR_portability_subset is added — the spec REQUIRES
+    // enabling it whenever the device advertises it.
+    std::vector<const char*> enabled_device_extensions(
+        device_extensions.begin(), device_extensions.end());
+#ifdef __APPLE__
+    bool has_rt_ext   = false;   // acceleration structure + RT pipeline
+    bool has_mesh_ext = false;   // VK_EXT_mesh_shader
+    {
+        const auto& vk_pd =
+            RENDER_TYPE_CAST(PhysicalDevice, physical_device);
+        uint32_t avail_count = 0;
+        vkEnumerateDeviceExtensionProperties(
+            vk_pd->get(), nullptr, &avail_count, nullptr);
+        std::vector<VkExtensionProperties> avail(avail_count);
+        vkEnumerateDeviceExtensionProperties(
+            vk_pd->get(), nullptr, &avail_count, avail.data());
+        std::set<std::string> avail_names;
+        for (const auto& e : avail) avail_names.insert(e.extensionName);
+
+        std::vector<const char*> filtered;
+        for (const char* name : enabled_device_extensions) {
+            if (avail_names.count(name)) {
+                filtered.push_back(name);
+            } else {
+                std::cout << "[vulkan] device extension not supported by "
+                             "MoltenVK — dropped: " << name << std::endl;
+            }
+        }
+        if (avail_names.count("VK_KHR_portability_subset")) {
+            filtered.push_back("VK_KHR_portability_subset");
+        }
+        enabled_device_extensions = std::move(filtered);
+
+        auto enabled = [&](const char* n) {
+            for (const char* e : enabled_device_extensions)
+                if (strcmp(e, n) == 0) return true;
+            return false;
+        };
+        has_rt_ext =
+            enabled(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+            enabled(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+            enabled(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        has_mesh_ext = enabled(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    }
+#endif
+    create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_device_extensions.size());
+    create_info.ppEnabledExtensionNames = enabled_device_extensions.data();
 
     VkPhysicalDeviceBufferDeviceAddressFeatures enabled_buffer_device_address_features{};
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR enabled_ray_tracing_pipeline_features{};
@@ -2131,6 +2203,21 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_mesh_shader_features.taskShader = VK_TRUE;
     enabled_mesh_shader_features.pNext = &enabled_acceleration_structure_features;
 
+#ifdef __APPLE__
+    // MoltenVK: only chain the feature structs whose extensions survived the
+    // filter above — enabling a feature of an un-enabled extension is a
+    // validation error and a device-creation failure on strict drivers.
+    // Chain order (full):  mesh → accel → rayquery → rtpipe → bda
+    void* apple_chain_head = nullptr;
+    if (has_rt_ext) {
+        apple_chain_head = &enabled_acceleration_structure_features;
+    }
+    if (has_mesh_ext) {
+        enabled_mesh_shader_features.pNext = apple_chain_head;  // may be null
+        apple_chain_head = &enabled_mesh_shader_features;
+    }
+#endif
+
     // NOTE: VkPhysicalDeviceFloat16Int8FeaturesKHR used to be in the pNext
     // chain, but VkPhysicalDeviceVulkan12Features subsumes shaderFloat16 +
     // shaderInt8 and the spec forbids both structs coexisting in the same
@@ -2150,7 +2237,11 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     // through a single execution thread per primitive group.  See
     // cluster_bindless_shadow.vert for the consumer side.
     enabled_vulkan11_features.multiview                           = VK_TRUE;
+#ifdef __APPLE__
+    enabled_vulkan11_features.pNext = apple_chain_head;   // filtered chain
+#else
     enabled_vulkan11_features.pNext = &enabled_mesh_shader_features;
+#endif
 
     // Vulkan 1.2: enable non-uniform indexing of sampler arrays.
     // Required for GL_EXT_nonuniform_qualifier in the cluster bindless fragment
@@ -2174,6 +2265,15 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     // chain).
     enabled_vulkan12_features.shaderFloat16                             = VK_TRUE;
     enabled_vulkan12_features.shaderInt8                                = VK_TRUE;
+#ifdef __APPLE__
+    // With the RT chain (and its standalone BufferDeviceAddressFeatures
+    // struct) filtered out, request bufferDeviceAddress through the core-1.2
+    // struct instead — MoltenVK supports it and non-RT users (bindless
+    // buffer refs) still need it.
+    if (!has_rt_ext) {
+        enabled_vulkan12_features.bufferDeviceAddress = VK_TRUE;
+    }
+#endif
     enabled_vulkan12_features.pNext = &enabled_vulkan11_features;
 
     enabled_vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -2181,6 +2281,67 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     enabled_vulkan13_features.synchronization2 = VK_TRUE;
     enabled_vulkan13_features.maintenance4 = VK_TRUE;
     enabled_vulkan13_features.pNext = &enabled_vulkan12_features;
+
+#ifdef __APPLE__
+    // MoltenVK: request only what the implementation actually supports.
+    // Metal has no geometry shaders, and some optional features vary by
+    // GPU generation — enabling an unsupported feature fails
+    // vkCreateDevice outright, so AND every request with the supported set.
+    {
+        const auto& vk_pd = RENDER_TYPE_CAST(PhysicalDevice, physical_device);
+
+        VkPhysicalDeviceVulkan11Features sup11{};
+        sup11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+        VkPhysicalDeviceVulkan12Features sup12{};
+        sup12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        sup12.pNext = &sup11;
+        VkPhysicalDeviceVulkan13Features sup13{};
+        sup13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        sup13.pNext = &sup12;
+        VkPhysicalDeviceFeatures2 sup2{};
+        sup2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        sup2.pNext = &sup13;
+        vkGetPhysicalDeviceFeatures2(vk_pd->get(), &sup2);
+
+        auto mask = [](VkBool32& want, VkBool32 have, const char* name) {
+            if (want && !have) {
+                std::cout << "[vulkan] feature not supported by MoltenVK — "
+                             "dropped: " << name << std::endl;
+                want = VK_FALSE;
+            }
+        };
+        mask(device_features.geometryShader,      sup2.features.geometryShader,      "geometryShader");
+        mask(device_features.shaderInt16,         sup2.features.shaderInt16,         "shaderInt16");
+        mask(device_features.multiDrawIndirect,   sup2.features.multiDrawIndirect,   "multiDrawIndirect");
+        mask(device_features.drawIndirectFirstInstance, sup2.features.drawIndirectFirstInstance, "drawIndirectFirstInstance");
+        mask(device_features.multiViewport,       sup2.features.multiViewport,       "multiViewport");
+        mask(device_features.depthClamp,          sup2.features.depthClamp,          "depthClamp");
+        mask(device_features.fragmentStoresAndAtomics, sup2.features.fragmentStoresAndAtomics, "fragmentStoresAndAtomics");
+        mask(device_features.independentBlend,    sup2.features.independentBlend,    "independentBlend");
+        mask(device_features.imageCubeArray,      sup2.features.imageCubeArray,      "imageCubeArray");
+        mask(device_features.samplerAnisotropy,   sup2.features.samplerAnisotropy,   "samplerAnisotropy");
+        mask(device_features.shaderSampledImageArrayDynamicIndexing,
+             sup2.features.shaderSampledImageArrayDynamicIndexing,
+             "shaderSampledImageArrayDynamicIndexing");
+
+        mask(enabled_vulkan11_features.storageBuffer16BitAccess,           sup11.storageBuffer16BitAccess,           "storageBuffer16BitAccess");
+        mask(enabled_vulkan11_features.uniformAndStorageBuffer16BitAccess, sup11.uniformAndStorageBuffer16BitAccess, "uniformAndStorageBuffer16BitAccess");
+        mask(enabled_vulkan11_features.multiview,                          sup11.multiview,                          "multiview");
+
+        mask(enabled_vulkan12_features.shaderSampledImageArrayNonUniformIndexing,
+             sup12.shaderSampledImageArrayNonUniformIndexing,
+             "shaderSampledImageArrayNonUniformIndexing");
+        mask(enabled_vulkan12_features.descriptorIndexing,   sup12.descriptorIndexing,   "descriptorIndexing");
+        mask(enabled_vulkan12_features.drawIndirectCount,    sup12.drawIndirectCount,    "drawIndirectCount");
+        mask(enabled_vulkan12_features.shaderFloat16,        sup12.shaderFloat16,        "shaderFloat16");
+        mask(enabled_vulkan12_features.shaderInt8,           sup12.shaderInt8,           "shaderInt8");
+        mask(enabled_vulkan12_features.bufferDeviceAddress,  sup12.bufferDeviceAddress,  "bufferDeviceAddress");
+
+        mask(enabled_vulkan13_features.dynamicRendering, sup13.dynamicRendering, "dynamicRendering");
+        mask(enabled_vulkan13_features.synchronization2, sup13.synchronization2, "synchronization2");
+        mask(enabled_vulkan13_features.maintenance4,     sup13.maintenance4,     "maintenance4");
+    }
+#endif
 
     // If a pNext(Chain) has been passed, we need to add it to the device creation info
     VkPhysicalDeviceFeatures2 physical_device_features2{};
@@ -2206,6 +2367,13 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
             vk_device,
             list.getGraphicAndPresentFamilyIndex()[0]);
     return vk_logic_device;
+}
+
+// Set by initRayTracingProperties; queried through isRayTracingSupported().
+static bool s_ray_tracing_supported = false;
+
+bool isRayTracingSupported() {
+    return s_ray_tracing_supported;
 }
 
 void initRayTracingProperties(
@@ -2234,6 +2402,22 @@ void initRayTracingProperties(
     vkCmdEndDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(vkGetDeviceProcAddr(vk_device, "vkCmdEndDebugUtilsLabelEXT"));
     vkSetDebugUtilsObjectNameEXT = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(vkGetDeviceProcAddr(vk_device, "vkSetDebugUtilsObjectNameEXT"));
     vkCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(vkGetDeviceProcAddr(vk_device, "vkCmdBeginRenderingKHR"));
+
+    // On implementations without the RT extensions (MoltenVK/macOS: they
+    // are filtered out at device creation) every pointer above is null.
+    // Record that once so RT consumers can skip their setup instead of
+    // calling through a null function pointer.
+    s_ray_tracing_supported =
+        vkCreateAccelerationStructureKHR        != nullptr &&
+        vkCmdBuildAccelerationStructuresKHR     != nullptr &&
+        vkGetAccelerationStructureBuildSizesKHR != nullptr &&
+        vkCreateRayTracingPipelinesKHR          != nullptr &&
+        vkCmdTraceRaysKHR                       != nullptr;
+    if (!s_ray_tracing_supported) {
+        std::cout << "[vulkan] ray tracing entry points unavailable — "
+                     "hardware RT disabled (software fallbacks in use)"
+                  << std::endl;
+    }
 
     // Get ray tracing pipeline properties, which will be used later on in the sample
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR  ray_tracing_pipeline_properties{};

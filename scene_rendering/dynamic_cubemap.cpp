@@ -1,4 +1,5 @@
 #include "dynamic_cubemap.h"
+#include <cstring>   // std::memcpy
 
 #include "renderer/renderer_helper.h"
 #include "renderer/vulkan/vk_renderer_helper.h"

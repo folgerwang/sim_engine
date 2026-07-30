@@ -423,6 +423,10 @@ public:
         PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
         PhysicalDeviceAccelerationStructureFeatures& as_features);
 
+    // False when the device lacks the KHR ray-tracing extensions (e.g.
+    // MoltenVK/macOS).  Valid after initRayTracingProperties has run.
+    static bool isRayTracingSupported();
+
     static void createSwapChain(
         GLFWwindow* window,
         const std::shared_ptr<Device>& device,

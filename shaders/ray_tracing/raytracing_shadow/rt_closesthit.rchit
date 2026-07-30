@@ -1,5 +1,5 @@
 #version 460
-#include "..\..\global_definition.glsl.h"
+#include "../../global_definition.glsl.h"
 
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_nonuniform_qualifier : enable

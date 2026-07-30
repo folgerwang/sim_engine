@@ -17,11 +17,21 @@
 
 #include "renderer_definition.h"
 
-template <class T>
-inline void hash_combine(uint64_t& seed, const T& v)
+// Seed type is templated (not hard-coded uint64_t) because the call sites mix
+// uint64_t and std::size_t seeds.  On MSVC those are the same type, but on
+// macOS/Linux size_t is `unsigned long` while uint64_t is `unsigned long
+// long` — distinct types, so a size_t seed can't bind to a uint64_t&.
+// Both are 64-bit on every platform this engine targets, so the mixing
+// constant and shifts behave identically either way.
+template <class S, class T>
+inline void hash_combine(S& seed, const T& v)
 {
+    static_assert(sizeof(S) == 8, "hash_combine expects a 64-bit seed");
     std::hash<T> hasher;
-    seed ^= static_cast<uint64_t>(hasher(v)) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    seed ^= static_cast<S>(static_cast<uint64_t>(hasher(v)) +
+                           0x9e3779b97f4a7c15ULL +
+                           (static_cast<uint64_t>(seed) << 6) +
+                           (static_cast<uint64_t>(seed) >> 2));
 }
 
 namespace engine {

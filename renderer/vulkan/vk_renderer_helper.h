@@ -1,6 +1,6 @@
 #pragma once
 #include <vulkan/vulkan.h>
-#include "..\renderer_structs.h"
+#include "../renderer_structs.h"
 
 struct GLFWwindow;
 
@@ -166,6 +166,13 @@ void initRayTracingProperties(
     const std::shared_ptr<renderer::Device>& device,
     PhysicalDeviceRayTracingPipelineProperties& rt_pipeline_properties,
     PhysicalDeviceAccelerationStructureFeatures& as_features);
+
+// True when the device exposes the KHR ray-tracing entry points
+// (acceleration structures + RT pipelines).  False on MoltenVK/macOS,
+// where the extensions are filtered at device creation — every RT
+// consumer must check this before touching the RT API (the function
+// pointers fetched by initRayTracingProperties are null otherwise).
+bool isRayTracingSupported();
 
 VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& available_formats);
 
