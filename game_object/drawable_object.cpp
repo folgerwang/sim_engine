@@ -768,16 +768,25 @@ static void setupMeshState(
             const auto& src_tex = model.textures[i_tex];
             const auto& src_img = model.images[i_tex];
             auto format = renderer::Format::R8G8B8A8_UNORM;
-            renderer::Helper::create2DTextureImage(
+            // Full mip chain, not just mip 0.  These are the embedded
+            // PNGs of runtime-generated GLBs (PCG house walls/roofs
+            // tile every 3 m) — with a single-level image the 16x
+            // anisotropic sampler under minification smears the tile
+            // along one screen axis and aliases along the other,
+            // which is the striped/stretched-wall artifact.  DDS
+            // assets ship baked chains and never showed it.
+            uint32_t tex_mips = 1;
+            renderer::Helper::create2DTextureImageWithMips(
                 device,
                 format,
                 src_img.width,
                 src_img.height,
-//                src_img.component,
                 src_img.image.data(),
                 dst_tex.image,
                 dst_tex.memory,
+                tex_mips,
                 std::source_location::current());
+            dst_tex.mip_levels = tex_mips;
 
             // Populate dst_tex.size — the glTF loader had been
             // leaving it at the default glm::uvec3(0).  Mirror what
@@ -799,7 +808,9 @@ static void setupMeshState(
                 renderer::ImageViewType::VIEW_2D,
                 format,
                 SET_FLAG_BIT(ImageAspect, COLOR_BIT),
-                std::source_location::current());
+                std::source_location::current(),
+                0,
+                tex_mips);
         }
     }
 

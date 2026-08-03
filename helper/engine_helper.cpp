@@ -182,15 +182,37 @@ void createTextureImage(
         // Materials that use DDS sources will skip VT registration.
     }
     else {
-        renderer::Helper::create2DTextureImage(
-            device,
-            format,
-            tex_width,
-            tex_height,
-            void_pixels,
-            texture.image,
-            texture.memory,
-            src_location);
+        if (format == engine::renderer::Format::R16_UNORM) {
+            // Height/data textures: single level, exact texels — a
+            // filtered mip chain would corrupt them.
+            renderer::Helper::create2DTextureImage(
+                device,
+                format,
+                tex_width,
+                tex_height,
+                void_pixels,
+                texture.image,
+                texture.memory,
+                src_location);
+            texture.mip_levels = 1;
+        } else {
+            // Colour textures decoded at runtime (PNG/JPG): full mip
+            // chain, for the same reason as the glTF-embedded path in
+            // drawable_object.cpp — a single-level tiling texture
+            // smears under anisotropic minification.
+            uint32_t tex_mips = 1;
+            renderer::Helper::create2DTextureImageWithMips(
+                device,
+                format,
+                tex_width,
+                tex_height,
+                void_pixels,
+                texture.image,
+                texture.memory,
+                tex_mips,
+                src_location);
+            texture.mip_levels = tex_mips;
+        }
 
         // Stash a CPU-side copy of the just-decoded RGBA8 pixels so
         // the Virtual Texture manager can build its bordered tile

@@ -474,6 +474,22 @@ public:
         std::shared_ptr<DeviceMemory>& texture_image_memory,
         const std::source_location& src_location);
 
+    // Full-mip-chain variant of the pixels overload above: allocates
+    // log2(max(w,h))+1 levels, uploads mip 0, and blit-generates the
+    // rest, leaving every level SHADER_READ_ONLY.  out_mip_count
+    // returns the chain length so the caller can create an image view
+    // that actually exposes it.  RGBA8-family formats only.
+    static void create2DTextureImageWithMips(
+        const std::shared_ptr<renderer::Device>& device,
+        Format format,
+        int tex_width,
+        int tex_height,
+        const void* pixels,
+        std::shared_ptr<Image>& texture_image,
+        std::shared_ptr<DeviceMemory>& texture_image_memory,
+        uint32_t& out_mip_count,
+        const std::source_location& src_location);
+
     static void create2DTextureImage(
         const std::shared_ptr<renderer::Device>& device,
         Format format,

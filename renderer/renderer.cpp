@@ -1,6 +1,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
+#include <cmath>
 #include <array>
 
 #include "renderer.h"
@@ -505,6 +506,136 @@ void Helper::create2DTextureImage(
         format,
         ImageLayout::TRANSFER_DST_OPTIMAL,
         ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    device->submitAndWaitTransientCommandBuffer();
+
+    device->destroyBuffer(staging_buffer);
+    device->freeMemory(staging_buffer_memory);
+}
+
+void Helper::create2DTextureImageWithMips(
+    const std::shared_ptr<renderer::Device>& device,
+    Format format,
+    int tex_width,
+    int tex_height,
+    const void* pixels,
+    std::shared_ptr<Image>& texture_image,
+    std::shared_ptr<DeviceMemory>& texture_image_memory,
+    uint32_t& out_mip_count,
+    const std::source_location& src_location) {
+
+    // Full-mip-chain variant of the pixels overload above.  That
+    // overload creates every runtime-decoded texture (glTF-embedded
+    // PNGs, stbi file loads) with a SINGLE mip level — fine for UI
+    // and LUTs, but any world-surface texture that tiles (the PCG
+    // house walls repeat every 3 m) is then sampled at mip 0 no
+    // matter how far away it is.  Under minification a 16x
+    // anisotropic sampler with only mip 0 averages its taps along
+    // ONE screen axis and aliases along the other, which is exactly
+    // the smeared / striped walls in the terrain screenshots; DDS
+    // assets never showed it because they ship baked mip chains.
+    //
+    // RGBA8-family only (4 bytes/texel, blit-filterable); callers
+    // with R16 height data or BC payloads keep using the other
+    // overloads.
+    const VkDeviceSize image_size =
+        static_cast<VkDeviceSize>(tex_width) *
+        static_cast<VkDeviceSize>(tex_height) * 4u;
+
+    std::shared_ptr<Buffer> staging_buffer;
+    std::shared_ptr<DeviceMemory> staging_buffer_memory;
+    device->createBuffer(
+        image_size,
+        SET_FLAG_BIT(BufferUsage, TRANSFER_SRC_BIT),
+        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+        0,
+        staging_buffer,
+        staging_buffer_memory,
+        src_location);
+
+    device->updateBufferMemory(
+        staging_buffer_memory,
+        image_size,
+        pixels);
+
+    const uint32_t mip_count = uint32_t(std::floor(std::log2(
+        std::max(std::max(tex_width, tex_height), 1)))) + 1u;
+    out_mip_count = mip_count;
+
+    // (uint32_t)-1 asks createTextureImage for the full chain.
+    vk::helper::createTextureImage(
+        device,
+        glm::vec3(tex_width, tex_height, 1),
+        (uint32_t)-1,
+        format,
+        ImageTiling::OPTIMAL,
+        SET_3_FLAG_BITS(ImageUsage, TRANSFER_DST_BIT, TRANSFER_SRC_BIT, SAMPLED_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        texture_image,
+        texture_image_memory,
+        src_location);
+
+    auto cmd_buf = device->setupTransientCommandBuffer();
+
+    const ImageResourceInfo res_undefined{
+        ImageLayout::UNDEFINED,
+        0,
+        SET_FLAG_BIT(PipelineStage, TOP_OF_PIPE_BIT) };
+    const ImageResourceInfo res_xfer_dst{
+        ImageLayout::TRANSFER_DST_OPTIMAL,
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    const ImageResourceInfo res_xfer_src{
+        ImageLayout::TRANSFER_SRC_OPTIMAL,
+        SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    const ImageResourceInfo res_shader_read{
+        ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, FRAGMENT_SHADER_BIT) };
+
+    // Mip 0: upload the source pixels.
+    cmd_buf->addImageBarrier(
+        texture_image, res_undefined, res_xfer_dst, 0, 1);
+    vk::helper::copyBufferToImage(
+        cmd_buf,
+        staging_buffer,
+        texture_image,
+        format,
+        glm::uvec3(tex_width, tex_height, 1),
+        0);
+
+    // Mips 1..n-1: blit-downsample each level from the previous one.
+    for (uint32_t i = 1; i < mip_count; ++i) {
+        cmd_buf->addImageBarrier(
+            texture_image, res_xfer_dst, res_xfer_src, i - 1, 1);
+        cmd_buf->addImageBarrier(
+            texture_image, res_undefined, res_xfer_dst, i, 1);
+
+        ImageBlitInfo blit{};
+        blit.src_subresource.mip_level = i - 1;
+        blit.src_offsets[1] = glm::ivec3(
+            std::max(tex_width >> (i - 1), 1),
+            std::max(tex_height >> (i - 1), 1), 1);
+        blit.dst_subresource.mip_level = i;
+        blit.dst_offsets[1] = glm::ivec3(
+            std::max(tex_width >> i, 1),
+            std::max(tex_height >> i, 1), 1);
+        cmd_buf->blitImage(
+            texture_image, ImageLayout::TRANSFER_SRC_OPTIMAL,
+            texture_image, ImageLayout::TRANSFER_DST_OPTIMAL,
+            { blit }, Filter::LINEAR);
+    }
+
+    // Final layouts: 0..n-2 are TRANSFER_SRC (blit sources), the
+    // last is TRANSFER_DST (never read from) — both to shader-read.
+    if (mip_count > 1) {
+        cmd_buf->addImageBarrier(
+            texture_image, res_xfer_src, res_shader_read, 0, mip_count - 1);
+    }
+    cmd_buf->addImageBarrier(
+        texture_image, res_xfer_dst, res_shader_read, mip_count - 1, 1);
+
     device->submitAndWaitTransientCommandBuffer();
 
     device->destroyBuffer(staging_buffer);
