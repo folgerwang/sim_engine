@@ -3801,6 +3801,11 @@ bool Menu::draw(
                          dev ? "" : "  (engine only)");
         }
 
+        // Effective shadow path (pushed by the app each frame): the
+        // permanent answer to "is it actually raytracing?".
+        const char* sbuf = effective_shadow_note_;
+        const bool  shadow_line = (sbuf != nullptr && sbuf[0] != '\0');
+
         // ── Tidy HUD panel: FPS on top, then (optional) VRAM text + bar ─────
         ImVec2 vp_pos, vp_size, vp_c;
         getViewportScreenRect(vp_pos, vp_size, vp_c);
@@ -3809,11 +3814,14 @@ bool Menu::draw(
         const float txt_h = ImGui::GetTextLineHeight();
         const ImVec2 fps_ts  = ImGui::CalcTextSize(fbuf);
         const ImVec2 vram_ts = vram_ok ? ImGui::CalcTextSize(vbuf) : ImVec2(0, 0);
-        const float cont_w = std::max({fps_ts.x, vram_ts.x,
+        const ImVec2 sh_ts = shadow_line ? ImGui::CalcTextSize(sbuf)
+                                         : ImVec2(0, 0);
+        const float cont_w = std::max({fps_ts.x, vram_ts.x, sh_ts.x,
                                        vram_ok ? 210.0f : 70.0f});
         const float panel_w = cont_w + inpad * 2.0f;
         float panel_h = inpad * 2.0f + txt_h;                 // FPS line
         if (vram_ok) panel_h += line_gap + txt_h + gap + bar_h;
+        if (shadow_line) panel_h += line_gap + txt_h;
         const float margin = 10.0f;
         const float right  = vp_pos.x + vp_size.x;
         const float ptop   = vp_pos.y +
@@ -3854,6 +3862,20 @@ bool Menu::draw(
                                   IM_COL32(80, 160, 245, 245), 2.0f);
             }
             dl->AddRect(b0, b1, IM_COL32(0, 0, 0, 140), 2.0f);
+        }
+
+        if (shadow_line) {
+            // Below the VRAM bar (or the FPS line when VRAM is absent).
+            const float sy = vram_ok
+                ? (fp.y + txt_h + line_gap + txt_h + gap + bar_h + line_gap)
+                : (fp.y + txt_h + line_gap);
+            const ImVec2 sp(p0.x + inpad, sy);
+            const ImU32 col = effective_shadow_warn_
+                ? IM_COL32(240, 185, 80, 245)     // fallback: orange
+                : IM_COL32(140, 225, 150, 245);   // as selected: green
+            dl->AddText(ImVec2(sp.x + 1.0f, sp.y + 1.0f),
+                        IM_COL32(0, 0, 0, 190), sbuf);
+            dl->AddText(sp, col, sbuf);
         }
     }
     // ------------------------------------------------------------------------
@@ -5666,6 +5688,22 @@ std::string Menu::ensureThumbnail(const std::string& src) {
     if (is_model) {
         ar::TriangleMesh mesh;
         if (!ar::loadMeshForThumbnail(src, mesh)) return "";
+        // World-scale GLBs (the PCG tree / clutter / ground layers span
+        // the whole 32 km map, bbox diagonal ~46 km) rasterise to a
+        // meaningless dot-cloud at 128 px and cost a full CPU orbit
+        // capture of every triangle in the file.  Anything bigger than a
+        // building-sized asset gets no orbit thumbnail; the content
+        // browser falls back to its generic model icon.
+        constexpr float kThumbMaxExtentM = 1000.0f;
+        const float thumb_ext = glm::length(mesh.bbox_max - mesh.bbox_min);
+        if (thumb_ext > kThumbMaxExtentM) {
+            fprintf(stderr,
+                    "[thumbnail] skip %s: extent %.0f m > %.0f m "
+                    "(world-scale asset)\n",
+                    srcP.filename().string().c_str(),
+                    thumb_ext, kThumbMaxExtentM);
+            return "";
+        }
         ar::SimpleRasterizer rast;
         auto caps = rast.captureOrbit(mesh, /*views*/1, kThumb,
                                       /*elevation*/15.0f, /*radius_mult*/1.5f);

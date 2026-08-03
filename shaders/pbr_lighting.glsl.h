@@ -909,11 +909,24 @@ vec3 getFinalColor(
                 clampedDot(in_material_info.clearcoatNormal, view_dir));
     }
 
+    // Thin-surface subsurface (foliage translucency).  The accumulated
+    // lobe (punctual + IBL, see getPunctualRadianceSubsurface) is
+    // untinted, so it is coloured here by the SQUARED diffuse albedo —
+    // light filtered through the leaf twice, the same convention as
+    // foliageTranslucency in functions.glsl.h — normalised by 1/PI to
+    // match that lobe's energy, and only PARTIALLY shadowed: a canopy in
+    // shadow still leaks skylight through its leaves (the 0.3 floor is
+    // FOLIAGE_SSS_SHADOW_MIN).  f_subsurface is vec3(0) for materials
+    // without FEATURE_MATERIAL_SUBSURFACE, so everything else is
+    // untouched.
+    vec3 sss_tint =
+        in_material_info.albedoColor * in_material_info.albedoColor;
     vec3 color =
         (in_color_info.f_emissive +
          in_color_info.f_diffuse * shadow +
          in_color_info.f_specular * shadow +
-         //in_color_info.f_subsurface +
+         in_color_info.f_subsurface * sss_tint *
+             (mix(0.3, 1.0, shadow) / M_PI) +
          (1.0 - in_material_info.reflectance) * in_color_info.f_sheen) * (1.0 - clearcoatFactor * clearcoatFresnel) +
         in_color_info.f_clearcoat * clearcoatFactor;
 

@@ -2,7 +2,7 @@
 #include <algorithm>
 #include "renderer/renderer.h"
 #include "game_object/camera.h"
-#include "game_object/terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "game_object/drawable_object.h"
 #include "game_object/patch.h"
 #include "game_object/sphere.h"

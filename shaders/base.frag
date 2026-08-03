@@ -86,10 +86,10 @@ const float CSM_NORMAL_BIAS_SCALE     = 0.05;
 // rationale.
 const float CSM_DEPTH_BIAS_BASE_WORLD  = 0.05;
 const float CSM_DEPTH_BIAS_SLOPE_WORLD = 0.20;
-const float CSM_LIGHT_SIZE_WORLD      = 0.20;
-const float CSM_BLOCKER_RADIUS_WORLD  = 0.40;
+const float CSM_LIGHT_SIZE_WORLD      = 0.10;   // halved: tighter penumbra, less visible dither
+const float CSM_BLOCKER_RADIUS_WORLD  = 0.20;   // halved with light size
 const float CSM_MIN_PCF_RADIUS_WORLD  = 0.02;
-const float CSM_MAX_PCF_RADIUS_WORLD  = 0.80;
+const float CSM_MAX_PCF_RADIUS_WORLD  = 0.40;   // halved with light size
 const int   CSM_BLOCKER_SAMPLES       = 16;
 const int   CSM_PCF_SAMPLES           = 16;
 
@@ -412,10 +412,33 @@ void main() {
                                         view_dist);
     }
 
-    // baseColor.a still carries the material's own alpha here (the
-    // road-fade skirt's texture ramp), so the two multiply rather than
-    // one overriding the other.
-    outColor = vec4(toneMap(material, color), baseColor.a * decal_alpha);
+    if ((material.material_features & FEATURE_MATERIAL_ALPHA_MASK) != 0u) {
+        // ── Foliage cards: NO blending — alpha-cutoff only ───────────
+        // The glTF authors these clutter/meadow cards as MASK now, so
+        // the decal permutation cuts instead of blending: texture alpha
+        // tests against the material cutoff, and the two decal fades
+        // (ground-contact gap + clutter distance, folded into
+        // decal_alpha above) become a screen-door dissolve — a
+        // per-pixel interleaved-gradient threshold — so distance fade
+        // survives without any partial transparency.  Surviving
+        // fragments write alpha 1.0: under the decal pipeline's blend
+        // state that is a full overwrite, i.e. effectively opaque, and
+        // overlapping foliage cards stop compositing into soup.
+        float ign = fract(52.9829189 *
+                          fract(dot(gl_FragCoord.xy,
+                                    vec2(0.06711056, 0.00583715))));
+        if (baseColor.a < material.alpha_cutoff || decal_alpha <= ign) {
+            discard;
+        }
+        outColor = vec4(toneMap(material, color), 1.0);
+    } else {
+        // Road skirt & true decals: alpha-blended as before.
+        // baseColor.a still carries the material's own alpha here (the
+        // road-fade skirt's texture ramp), so the two multiply rather
+        // than one overriding the other.
+        outColor = vec4(toneMap(material, color),
+                        baseColor.a * decal_alpha);
+    }
 #else
     // regular shading
     outColor = vec4(toneMap(material, color), baseColor.a);

@@ -261,6 +261,14 @@
 // the HW-RT technique implicitly raise the ReSTIR bit (and ReSTIR raise
 // RT_AO); keep every new flag unique against the WHOLE list.
 #define FEATURE_INPUT_RESTIR                    0x00000100
+// RT indirect diffuse (1-bounce GI): deferred_resolve traces one
+// cosine-hemisphere ray per pixel against the software cluster BVH and
+// replaces the flat sky-IBL ambient with the traced result (sky where
+// the sky is visible, sunlit-bounce colour where it is not), folded
+// into a per-pixel temporal accumulation buffer ping-ponged by
+// FEATURE_INPUT_RESTIR_PARITY.  Raised by the app whenever any RT
+// shadow technique is active and the software BVH exists.
+#define FEATURE_INPUT_RT_GI                     0x00000400
 // Reservoir ping-pong parity for the current frame: 0 → read half A / write
 // half B, 1 → the reverse.  Flipped by the app each frame.
 #define FEATURE_INPUT_RESTIR_PARITY             0x00000200

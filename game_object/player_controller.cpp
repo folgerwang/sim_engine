@@ -14,7 +14,7 @@
 #include "glm/gtc/matrix_transform.hpp"
 
 #include "drawable_object.h"
-#include "terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "helper/collision_mesh.h"
 
 namespace engine {

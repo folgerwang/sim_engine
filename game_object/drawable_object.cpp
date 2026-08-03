@@ -724,7 +724,18 @@ static void setupMeshState(
                                    return std::tolower(c);
                                });
                 if (lname.find("leaf") != std::string::npos ||
-                    lname.find("foliage") != std::string::npos) {
+                    lname.find("foliage") != std::string::npos ||
+                    // Ground-foliage layers from terrain_pcg: meadow and
+                    // flower cards ("clutter_grass*"/"clutter_flower*"),
+                    // tuft sprays and sward/forb atlases.  Thin cutout
+                    // vegetation, all of it — same translucency lobe.
+                    lname.find("clutter_grass") != std::string::npos ||
+                    lname.find("clutter_flower") != std::string::npos ||
+                    lname.find("spray") != std::string::npos ||
+                    lname.find("sward") != std::string::npos ||
+                    lname.find("forb") != std::string::npos ||
+                    lname.find("blossom") != std::string::npos ||
+                    lname.find("petal") != std::string::npos) {
                     ubo.material_features |= FEATURE_MATERIAL_SUBSURFACE;
                     // Same lobe the cluster paths use
                     // (foliageTranslucency in functions.glsl.h):
@@ -2609,6 +2620,39 @@ static bool parseLodTileName(
     return true;
 }
 
+// ── Proximity gate: parse "_pgate_<x_dm>_<z_dm>_<r_dm>_<mode>" ─────────
+// Same name-encoding discipline as the lodtile marker: four signed ints
+// (decimetres / mode) after one marker, nothing after the fourth.  Used
+// by the PCG house near-LOD: interiors gate ON within the house radius,
+// closed door leaves gate OFF as the player reaches the door (their
+// open twins gate ON), which is what makes doors read as "opening".
+static bool parsePgateName(
+    const std::string& name,
+    float& gx, float& gz, float& gr, int& mode) {
+    static const char kMark[] = "_pgate_";
+    const size_t p = name.find(kMark);
+    if (p == std::string::npos) return false;
+    const char* s = name.c_str() + p + (sizeof(kMark) - 1);
+    long long v[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 4; ++i) {
+        char* end = nullptr;
+        v[i] = std::strtoll(s, &end, 10);
+        if (end == s) return false;
+        s = end;
+        if (i < 3) {
+            if (*s != '_') return false;
+            ++s;
+        }
+    }
+    if (*s != '\0') return false;
+    if (v[2] <= 0 || (v[3] != 0 && v[3] != 1)) return false;
+    gx = float(v[0]) * 0.1f;
+    gz = float(v[1]) * 0.1f;
+    gr = float(v[2]) * 0.1f;
+    mode = int(v[3]);
+    return true;
+}
+
 // Run once at load, right after setupNodes.  Fills the per-node tile
 // rectangle and band range, and sets has_plant_lod_ if ANY node carried
 // the encoding — that flag is what keeps every other drawable on exactly
@@ -2621,6 +2665,19 @@ static void parsePlantLodBands(
     float near_far_min = std::numeric_limits<float>::max();
     float near_far_max = 0.0f;
     for (auto& node : drawable_object->nodes_) {
+        // Proximity gates ride the same load-time scan and the same
+        // per-frame visibility pass as the LOD bands.
+        {
+            float gx, gz, gr;
+            int gmode;
+            if (parsePgateName(node.name_, gx, gz, gr, gmode)) {
+                node.gate_x_ = gx;
+                node.gate_z_ = gz;
+                node.gate_r_ = gr;
+                node.gate_mode_ = gmode;
+                ++matched;   // arms has_plant_lod_ / the per-node pass
+            }
+        }
         int64_t ti = 0, tj = 0;
         float tile_m = 0.0f, near_m = 0.0f, far_m = 0.0f;
         if (!parseLodTileName(node.name_, ti, tj, tile_m, near_m, far_m)) {
@@ -2699,7 +2756,17 @@ static void selectPlantLodBands(
     for (size_t i = 0; i < drawable_object->nodes_.size(); ++i) {
         auto& node = drawable_object->nodes_[i];
         if (node.lod_tile_m_ <= 0.0f) {
-            vis[i] = 1;                     // not a LOD node: unchanged
+            uint8_t v = 1;                  // not a band node
+            if (node.gate_r_ > 0.0f && eye_valid) {
+                const float gdx = eye.x - node.gate_x_;
+                const float gdz = eye.z - node.gate_z_;
+                const bool inside =
+                    gdx * gdx + gdz * gdz <=
+                    node.gate_r_ * node.gate_r_;
+                if (node.gate_mode_ == 0 ? !inside : inside) v = 0;
+            }
+            vis[i] = v;
+            drawn += v;
             continue;
         }
         if (rebuild_rects) {
@@ -2756,8 +2823,16 @@ static void selectPlantLodBands(
         const float dz = glm::max(glm::max(node.lod_wz0_ - eye.z, 0.0f),
                                   eye.z - node.lod_wz1_);
         const float d = glm::sqrt(dx * dx + dz * dz);
-        const uint8_t v =
+        uint8_t v =
             (d >= node.lod_near_m_ && d < node.lod_far_m_) ? 1 : 0;
+        // Proximity gate applies on top of the band test.
+        if (v != 0 && node.gate_r_ > 0.0f) {
+            const float gdx = eye.x - node.gate_x_;
+            const float gdz = eye.z - node.gate_z_;
+            const bool inside =
+                gdx * gdx + gdz * gdz <= node.gate_r_ * node.gate_r_;
+            if (node.gate_mode_ == 0 ? !inside : inside) v = 0;
+        }
         vis[i] = v;
         drawn += v;
     }

@@ -15,6 +15,7 @@
 #endif
 #include "global_definition.glsl.h"
 #include "functions.glsl.h"
+#include "brdf.glsl.h"   // D_GGX / V_GGX / F_Schlick for the PBR resolve
 
 // ─── deferred_resolve.comp ────────────────────────────────────────────────
 // Phase 1 deferred lighting compute.
@@ -125,6 +126,17 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 8)
     RestirPointLight restir_lights[];
 };
 
+// ─── RT indirect diffuse (1-bounce GI) accumulation (binding 11) ─────
+// vec4 = (irradiance-estimate RGB, history length).  TWO screen-sized
+// halves ping-ponged by FEATURE_INPUT_RESTIR_PARITY, exactly like the
+// DI reservoirs above — temporal reuse in the ReSTIR spirit: each
+// frame's single-sample estimate is folded into the reprojected
+// surviving history instead of being resampled from scratch.
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 11)
+    buffer GiAccumBuf {
+    vec4 gi_accum[];
+};
+
 // ─── RT shadow/AO smoothing (three-dispatch flow) ─────────────────────
 // pass_mode 1 (GEN):   trace shadow+AO only, store raw (shad, ao) into
 //                      rt_raw_out, skip all shading.
@@ -226,16 +238,16 @@ const float CSM_DEPTH_BIAS_SLOPE_WORLD = 0.20;   // ~20 cm at grazing
 // proportional to caster→receiver distance.  Real sun is ~0.005 (= a
 // few cm at 10 m caster distance) but we exaggerate for visible
 // softness.  Tunable.
-const float CSM_LIGHT_SIZE_WORLD      = 0.20;
+const float CSM_LIGHT_SIZE_WORLD      = 0.10;   // halved: tighter penumbra, less visible dither
 // Blocker search disk radius in world units — wider catches more
 // distant blockers and produces smoother penumbras at the cost of
 // more incoherent texture fetches.
-const float CSM_BLOCKER_RADIUS_WORLD  = 0.40;
+const float CSM_BLOCKER_RADIUS_WORLD  = 0.20;   // halved with light size
 // Min/max PCF radius caps in world units.  Min keeps a small soft
 // fringe even on tight contact (anti-banding); max stops kernels from
 // blowing up to read outside the cascade on very tall casters.
 const float CSM_MIN_PCF_RADIUS_WORLD  = 0.02;
-const float CSM_MAX_PCF_RADIUS_WORLD  = 0.80;
+const float CSM_MAX_PCF_RADIUS_WORLD  = 0.40;   // halved with light size
 
 const int   CSM_BLOCKER_SAMPLES       = 16;
 const int   CSM_PCF_SAMPLES           = 16;
@@ -303,7 +315,7 @@ const int   RT_ALPHA_HIT_BUDGET = 8;
 // RT_SUN_TAN_RADIUS is tan(angular radius): the real sun is ~0.0047
 // (0.27°); the default is padded for a visibly soft edge.  Set the
 // sample counts to 1 for the old hard shadows.
-const float RT_SUN_TAN_RADIUS      = 0.01;
+const float RT_SUN_TAN_RADIUS      = 0.006;  // was 0.01 — tighter cone, less dither spread
 // Multi-ray, single-frame sampling (no temporal accumulation): the IGN
 // dither pattern is STATIC per pixel, so the result is a stable ordered
 // dither rather than animated noise.  Doubled from 4/2: more rays = more
@@ -520,6 +532,143 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
 // Soft sun shadow: average RT_SOFT_SAMPLES_SW cone-jittered rays.  The
 // IGN pair is decorrelated per sample by golden-ratio-ish offsets so a
 // 2-sample pixel doesn't reuse the same disk point.
+// ─── RT indirect diffuse: 1-bounce GI radiance along one ray ─────────
+// Closest-hit walk over the SAME cluster BVH the shadow rays traverse.
+// On a miss the ray sees sky: the cosine-convolved irradiance cube is
+// exactly the smooth estimate a 1-sample-per-pixel estimator wants.  On
+// a hit, the bounce radiance is the hit surface's (mip-filtered) albedo
+// lit by the sun — with a real occlusion ray from the hit point — plus
+// a small sky leak so back-faces don't return pure black.  Skinned
+// skeleton casters are skipped: a character's bounce contribution is
+// not worth the per-pixel chunk walk.
+const float RT_GI_MAX_DIST    = 120.0;  // bounce interval; sky beyond
+const float RT_GI_NORMAL_BIAS = 0.05;   // metres off the surface
+const float RT_GI_TEX_LOD     = 4.0;    // prefiltered albedo fetch
+const float RT_GI_SKY_LEAK    = 0.35;   // hit surface's own ambient
+const float RT_GI_HIST_MAX    = 24.0;   // temporal history clamp
+
+// Möller–Trumbore with the hit DISTANCE returned (rtRayTri drops it —
+// any-hit callers never need it, this closest-hit walk does).
+bool rtGiRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
+                out float o_u, out float o_v, out float o_t) {
+    vec3 e1 = v1 - v0;
+    vec3 e2 = v2 - v0;
+    vec3 pv = cross(rd, e2);
+    float det = dot(e1, pv);
+    if (abs(det) < 1e-8) return false;
+    float inv_det = 1.0 / det;
+    vec3 tv = ro - v0;
+    float u = dot(tv, pv) * inv_det;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 qv = cross(tv, e1);
+    float v = dot(rd, qv) * inv_det;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float t = dot(e2, qv) * inv_det;
+    if (t <= RT_SHADOW_BIAS || t >= t_max) return false;
+    o_u = u; o_v = v; o_t = t;
+    return true;
+}
+
+vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
+    vec3 inv_dir = 1.0 / rd;
+    float best_t   = RT_GI_MAX_DIST;
+    vec3  best_n   = vec3(0.0);
+    vec3  best_alb = vec3(0.0);
+    bool  hit = false;
+
+    uint stack[RT_BVH_STACK_SIZE];
+    int  sp = 0;
+    stack[sp++] = 0u;
+    while (sp > 0) {
+        RtBvhNode node = rt_bvh_nodes[stack[--sp]];
+        if (!rtRayAabb(ro, inv_dir, best_t,
+                       node.aabb_min, node.aabb_max)) continue;
+        if (node.prim_count == 0u) {
+            if (sp + 2 <= RT_BVH_STACK_SIZE) {
+                stack[sp++] = node.left_first;
+                stack[sp++] = node.left_first + 1u;
+            }
+            continue;
+        }
+        for (uint p = 0u; p < node.prim_count; ++p) {
+            uint cluster_idx = rt_bvh_leaf_clusters[node.left_first + p];
+            vec4 bs = rt_cull_infos[cluster_idx].bounds_sphere;
+            vec3 oc = bs.xyz - ro;
+            float t_ca = dot(oc, rd);
+            float d2 = dot(oc, oc) - t_ca * t_ca;
+            if (t_ca < -bs.w || t_ca - bs.w > best_t ||
+                d2 > bs.w * bs.w) continue;
+
+            ClusterDrawInfo draw = rt_draw_infos[cluster_idx];
+            BindlessMaterialParams m = rt_materials[draw.material_idx];
+            uint mflags = uint(m.flags);
+            if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+            bool masked = (mflags & BINDLESS_MAT_ALPHA_MASK) != 0u &&
+                          m.base_color_tex_idx >= 0;
+
+            uint tri_count = draw.index_count / 3u;
+            for (uint t = 0u; t < tri_count; ++t) {
+                uint i0 = rt_indices[draw.index_offset + t * 3u + 0u]
+                          + draw.vertex_offset;
+                uint i1 = rt_indices[draw.index_offset + t * 3u + 1u]
+                          + draw.vertex_offset;
+                uint i2 = rt_indices[draw.index_offset + t * 3u + 2u]
+                          + draw.vertex_offset;
+                vec4 p0 = rt_pos_uv[i0];
+                vec4 p1 = rt_pos_uv[i1];
+                vec4 p2 = rt_pos_uv[i2];
+                float hu, hv, ht;
+                if (!rtGiRayTri(ro, rd, best_t,
+                                p0.xyz, p1.xyz, p2.xyz, hu, hv, ht)) {
+                    continue;
+                }
+                vec4 texel = vec4(1.0);
+                if (m.base_color_tex_idx >= 0) {
+                    vec2 uv0 = unpackHalf2x16(floatBitsToUint(p0.w));
+                    vec2 uv1 = unpackHalf2x16(floatBitsToUint(p1.w));
+                    vec2 uv2 = unpackHalf2x16(floatBitsToUint(p2.w));
+                    vec2 huv = uv0 * (1.0 - hu - hv) + uv1 * hu + uv2 * hv;
+                    texel = textureLod(
+                        rt_base_color_textures[
+                            nonuniformEXT(m.base_color_tex_idx)],
+                        huv, RT_GI_TEX_LOD);
+                }
+                if (masked &&
+                    texel.a * m.base_color_factor.a < m.alpha_cutoff) {
+                    continue;   // transparent texel — ray passes through
+                }
+                best_t   = ht;
+                best_alb = texel.rgb * m.base_color_factor.rgb;
+                best_n   = normalize(cross(p1.xyz - p0.xyz,
+                                           p2.xyz - p0.xyz));
+                hit = true;
+            }
+        }
+    }
+
+    if (!hit) {
+        vec3 sky = texture(lambertian_env_sampler, rd).rgb;
+#ifndef USE_HDR
+        sky = sRGBToLinear(sky);
+#endif
+        return sky;
+    }
+
+    vec3 hp = ro + rd * best_t;
+    vec3 hn = (dot(best_n, rd) < 0.0) ? best_n : -best_n;
+    float ndl = max(dot(hn, sun_L), 0.0);
+    float vis = (ndl > 0.0)
+        ? rtShadowRayVisible(hp + hn * RT_GI_NORMAL_BIAS, sun_L,
+                             RT_SHADOW_MAX_DIST)
+        : 0.0;
+    vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
+#ifndef USE_HDR
+    sky_amb = sRGBToLinear(sky_amb);
+#endif
+    return best_alb * (sun_col * (ndl * vis / M_PI) +
+                       sky_amb * RT_GI_SKY_LEAK);
+}
+
 float rtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     vec3 L  = normalize(-runtime_lights.lights[0].direction);
     // Slope-scaled launch offset: at grazing sun angles a flat 3 cm
@@ -1268,19 +1417,94 @@ void main() {
 
     rt_ao = pow(clamp(rt_ao, 0.0, 1.0), RT_AO_POWER);
 
-    // Lambertian diffuse + Blinn-Phong specular — bit-identical to
-    // cluster_bindless.frag's forward path so visual parity holds.
-    // Under ReSTIR the direct term comes fully from the reservoir winner
-    // (sun-disk sample OR a point light); the legacy sun terms zero out.
-    vec3 ambient = getIBLRadianceLambertian(N, albedo) * (ao * rt_ao);
+    // ── PBR metal-rough shading (GGX) ────────────────────────────────
+    // Replaces the legacy Lambert + fixed-exponent Blinn-Phong.  The
+    // G-buffer's roughness (nr.z — real material roughness for terrain,
+    // per-material-class default for clusters) and metallic (em.a) now
+    // actually drive the BRDF, and the ambient term gains the GGX
+    // specular IBL that the forward PBR shaders (base.frag / tile.frag)
+    // always had.  Under ReSTIR the direct term still comes fully from
+    // the reservoir winner; ambient IBL applies either way.
+    float perceptual_rough = clamp(nr.z, 0.045, 1.0);
+    float alpha_rough      = perceptual_rough * perceptual_rough;
+    float metallic         = clamp(em.a, 0.0, 1.0);
+    vec3  f0               = mix(vec3(0.04), albedo, metallic);
+    vec3  c_diff           = albedo * (1.0 - metallic);
+
+    // Same mip count the forward IBL path assumes for the GGX env cube.
+    const float kIblMipCount = 10.0;
+
+    // ── Ambient diffuse: traced 1-bounce GI, or the flat sky IBL ─────
+    // The flat lambertian cube delivers FULL skylight to every pixel —
+    // under a canopy, inside a courtyard, at the bottom of a valley —
+    // which is a large part of the scene reading over-bright.  With
+    // RT GI active, one cosine ray per pixel replaces it: sky radiance
+    // only where sky is actually visible, sunlit bounce colour where
+    // it is not, temporally accumulated (reprojected by the velocity
+    // buffer, ReSTIR-style parity ping-pong) so 1 spp converges.
+    vec3 ambient_diffuse =
+        getIBLRadianceLambertian(N, c_diff) * (ao * rt_ao);
+    if ((camera_info.input_features & FEATURE_INPUT_RT_GI) != 0u) {
+        uint  gi_w    = uint(sz.x);
+        uint  gi_half = uint(sz.x) * uint(sz.y);
+        bool  gi_par  =
+            (camera_info.input_features & FEATURE_INPUT_RESTIR_PARITY) != 0u;
+        uint  gi_wofs = gi_par ? gi_half : 0u;
+        uint  gi_rofs = gi_par ? 0u : gi_half;
+        float gi_frame = float(
+            (camera_info.input_features & FEATURE_INPUT_FRAME_MASK)
+                >> FEATURE_INPUT_FRAME_SHIFT);
+        // Frame-rotated interleaved-gradient pair → cosine direction.
+        vec2 xi = vec2(
+            fract(csmIGN(vec2(px)) + gi_frame * 0.6180339887),
+            fract(csmIGN(vec2(px) + vec2(37.0, 17.0)) +
+                  gi_frame * 0.7548776662));
+        vec3 gi_dir = rtCosHemisphereDir(N_geom, xi);
+        vec3 gi_s = rtGiRadiance(
+            world_pos + N_geom * RT_GI_NORMAL_BIAS, gi_dir, L, light_col);
+
+        // Temporal accumulation with velocity reprojection.
+        vec3  gi_E  = gi_s;
+        float hist  = 1.0;
+        vec2  uv_prev = uv - texture(gbuf_velocity, uv).rg * 0.5;
+        if (all(greaterThanEqual(uv_prev, vec2(0.0))) &&
+            all(lessThan(uv_prev, vec2(1.0)))) {
+            ivec2 pp = clamp(ivec2(uv_prev * vec2(sz)),
+                             ivec2(0), sz - 1);
+            vec4 prev = gi_accum[gi_rofs + uint(pp.y) * gi_w + uint(pp.x)];
+            if (prev.w > 0.5) {
+                hist = min(prev.w + 1.0, RT_GI_HIST_MAX);
+                gi_E = mix(prev.rgb, gi_s, 1.0 / hist);
+            }
+        }
+        gi_accum[gi_wofs + uint(px.y) * gi_w + uint(px.x)] =
+            vec4(gi_E, hist);
+        // Cosine-sampled estimator: E[L(dir)] IS irradiance/PI, so the
+        // diffuse ambient is simply c_diff * estimate.  Micro-AO from
+        // the G-buffer still applies; rt_ao does NOT (the trace already
+        // measured the occlusion rt_ao approximates).
+        ambient_diffuse = c_diff * gi_E * ao;
+    }
+
+    vec3 ambient = ambient_diffuse +
+        getIBLRadianceGGX(N, V, perceptual_rough, f0, kIblMipCount) *
+            (ao * rt_ao);
+
     vec3 diffuse = restir_active
         ? restir_direct
-        : albedo * light_col * (NdotL * shad / M_PI);
-    vec3  H        = normalize(L + V);
-    float spec     = pow(max(dot(N, H), 0.0), 32.0) * shad;
-    vec3  specular = restir_active
-        ? vec3(0.0)   // winner eval already includes its specular lobe
-        : light_col * (0.05 * spec / M_PI);
+        : c_diff * light_col * (NdotL * shad / M_PI);
+
+    vec3 specular = vec3(0.0);
+    if (!restir_active && NdotL > 0.0) {
+        float NdotV = clampedDot(N, V);
+        vec3  H     = normalize(L + V);
+        float NdotH = clampedDot(N, H);
+        float VdotH = clampedDot(V, H);
+        vec3  F     = F_Schlick(f0, vec3(1.0), VdotH);
+        float Vis   = V_GGX(NdotL, NdotV, alpha_rough);
+        float D     = D_GGX(NdotH, alpha_rough);
+        specular    = light_col * (F * (Vis * D) * NdotL * shad);
+    }
 
     // Thin-leaf subsurface scattering.  The G-buffer writer set
     // normal_rough.w = 1.0 for materials flagged BINDLESS_MAT_FOLIAGE_SSS
@@ -1345,6 +1569,27 @@ void main() {
         // cluster_bindless.frag's matching branch + SSAO::render's
         // force_run gate when this mode is active.
         color = vec3(1.0);
+    }
+
+    // ── Soft highlight compression ───────────────────────────────────
+    // The PBR path lights with full sun + sky-IBL energy, and on bright
+    // albedo (snow, white plaster) the sum sits well above 1.0 — without
+    // compression the whole surface clips to flat white and the CSM/RT
+    // shadow term becomes invisible (a 0.85 shadowed pixel vs a 1.3
+    // clipped one both display ~white).  Piecewise curve: linear (i.e.
+    // untouched) below the knee, Reinhard-style rolloff above it with an
+    // asymptote at 1.0.  Applied on luminance so hue is preserved, and
+    // ONLY above the knee so mid-tones and dark pixels are bit-identical
+    // to the uncompressed output.  Debug views skip it (dbg_mode gate) so
+    // ROUGHNESS/SHADOW/etc. stay raw data.
+    if (dbg_mode == 0u) {
+        const float kKnee = 0.80;
+        float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        if (lum > kKnee) {
+            float t = lum - kKnee;
+            float lum_out = kKnee + (1.0 - kKnee) * t / (t + (1.0 - kKnee));
+            color *= lum_out / lum;
+        }
     }
 
     imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));

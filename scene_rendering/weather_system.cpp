@@ -2,7 +2,7 @@
 
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"
-#include "game_object/terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "weather_system.h"
 #include "shaders/weather/weather_common.glsl.h"
 

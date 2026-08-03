@@ -1,7 +1,7 @@
 #pragma once
 #include "renderer/renderer.h"
 #include "game_object/camera.h"
-#include "game_object/terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "game_object/drawable_object.h"
 #include "game_object/camera_object.h"
 #include "patch.h"

@@ -374,6 +374,16 @@ struct NodeInfo {
     // Tile origin in the file's own space, kept so the world rectangle
     // can be rebuilt if the wrapper moves.
     float                       lod_lx0_ = 0.0f, lod_lz0_ = 0.0f;
+    // ── Proximity gate (house interiors / door leaves) ────────────
+    // Parsed from a "_pgate_<x_dm>_<z_dm>_<r_dm>_<mode>" marker in the
+    // node name (decimetre ints).  mode 0: node draws ONLY when the eye
+    // is within r of (x, z) — house interiors, open door leaves.
+    // mode 1: node draws only when the eye is FARTHER than r — closed
+    // door leaves, which "open" (swap for the mode-0 leaf) as the
+    // player walks up.  gate_r_ == 0 means no gate.
+    float                       gate_x_ = 0.0f, gate_z_ = 0.0f;
+    float                       gate_r_ = 0.0f;
+    int                         gate_mode_ = 0;
 
     glm::vec3                   translation_{};
     glm::vec3                   scale_{1.0f};

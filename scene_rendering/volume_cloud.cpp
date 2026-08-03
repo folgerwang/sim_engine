@@ -2,7 +2,7 @@
 
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"
-#include "game_object/terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "shaders/global_definition.glsl.h"
 #include "volume_cloud.h"
 

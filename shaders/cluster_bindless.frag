@@ -234,10 +234,10 @@ const float CSM_NORMAL_BIAS_SCALE     = 0.05;
 // fine cascades, producing a visible intensity step at boundaries.
 const float CSM_DEPTH_BIAS_BASE_WORLD  = 0.05;
 const float CSM_DEPTH_BIAS_SLOPE_WORLD = 0.20;
-const float CSM_LIGHT_SIZE_WORLD      = 0.20;
-const float CSM_BLOCKER_RADIUS_WORLD  = 0.40;
+const float CSM_LIGHT_SIZE_WORLD      = 0.10;   // halved: tighter penumbra, less visible dither
+const float CSM_BLOCKER_RADIUS_WORLD  = 0.20;   // halved with light size
 const float CSM_MIN_PCF_RADIUS_WORLD  = 0.02;
-const float CSM_MAX_PCF_RADIUS_WORLD  = 0.80;
+const float CSM_MAX_PCF_RADIUS_WORLD  = 0.40;   // halved with light size
 const int   CSM_BLOCKER_SAMPLES       = 16;
 const int   CSM_PCF_SAMPLES           = 16;
 
@@ -672,8 +672,21 @@ void main() {
     // flags.w: BINDLESS_MAT_FOLIAGE_SSS → 1.0 so deferred_resolve adds
     // the thin-leaf translucency term for this pixel (RGBA8 target —
     // the bit survives quantisation exactly).
+    // Roughness default by material class rather than the old flat 0.5:
+    // every cluster material on the map is a dielectric (bark, leaves,
+    // plaster — none author metallic), and 0.5 under the resolve's GGX
+    // path reads as wet plastic.  Foliage sits rougher than hard
+    // surfaces.  TRUE per-material roughness needs a factor added to
+    // BindlessMaterialParams (48-byte layout change) or the mr VT plumbed
+    // through here — future work; these defaults are the dielectric
+    // ballpark the PCG's glTF roughnessFactor (0.9) already declares.
+    // Raised 0.80→0.92 / 0.90→0.95: at 0.80 plaster and stone walls
+    // still carried a broad sun sheen under the GGX resolve; matte
+    // masonry/bark sits ~0.9+ and these ARE those materials.
+    float gbuf_rough = ((mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0)
+                           ? 0.95 : 0.92;
     out_normal_rough   = vec4(
-        octEncodeDir(N), 0.5,
+        octEncodeDir(N), gbuf_rough,
         (mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0 ? 1.0 : 0.0);
     // Slot 2 was emissive.rgb + metallic.a, but cluster materials don't
     // author either yet — both default to 0 in the deferred resolve.

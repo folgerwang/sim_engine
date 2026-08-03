@@ -231,6 +231,9 @@ private:
     // falls back to unshadowed until the cluster AS is built, and CSM
     // remains selectable from Rendering > Shadow technique.
     ShadowTechnique shadow_technique_ = ShadowTechnique::kHwRt;
+    // Set per-frame by the app (setEffectiveShadowNote); shown in the HUD.
+    const char* effective_shadow_note_ = nullptr;
+    bool        effective_shadow_warn_ = false;
 
 public:
     // ─── CSM drawable-shadow draw mode ────────────────────────────────────
@@ -1859,6 +1862,18 @@ public:
     }
     inline bool isRestirOn() const {
         return shadow_technique_ == ShadowTechnique::kRestir;
+    }
+    // ─── Effective shadow path, for the HUD ──────────────────────────
+    // What the shadow technique ACTUALLY is this frame.  The selection
+    // above is menu state, but READINESS (BVH/TLAS built?) lives in the
+    // renderer, and only the app sees both — it pushes the resolved
+    // answer here every frame, and the profiler HUD prints it.  This
+    // exists because "is it really raytracing?" kept being asked and the
+    // only answer was buried in a one-shot console line.  `warn` tints
+    // the HUD line orange (fallback active) instead of green.
+    inline void setEffectiveShadowNote(const char* s, bool warn) {
+        effective_shadow_note_ = s;
+        effective_shadow_warn_ = warn;
     }
     // Edge-aware bilateral smoothing of the RT shadow/AO (Rendering >
     // Shadow > "Smooth RT shadow/AO").  Applies to the software/hardware

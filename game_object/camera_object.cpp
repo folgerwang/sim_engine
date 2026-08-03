@@ -6,7 +6,7 @@
 #include <algorithm>
 #include "camera_object.h"
 #include "glm/gtc/matrix_transform.hpp"
-#include "terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "helper/engine_helper.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"

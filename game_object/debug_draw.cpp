@@ -19,7 +19,7 @@
 #include "renderer/renderer.h"
 #include "renderer/renderer_helper.h"
 #include "helper/engine_helper.h"
-#include "terrain.h"
+#include "plugins/terrain_gen/terrain.h"
 #include "debug_draw.h"
 #include "shaders/global_definition.glsl.h"
 

@@ -19,9 +19,31 @@ layout(push_constant) uniform TileUniformBufferObject {
 
 layout(location = 0) in TileVsPsData in_data;
 
+#ifdef GBUFFER_OUTPUT
+// Deferred path: material attributes go into the cluster G-buffer layout
+// (same 4 RTs cluster_bindless.frag's GBUFFER_OUTPUT branch writes;
+// consumed by deferred_resolve.comp).  No lighting happens in this
+// shader in that mode.
+layout(location = 0) out vec4 out_albedo_ao;
+layout(location = 1) out vec4 out_normal_rough;
+layout(location = 2) out vec4 out_emissive_metal;
+layout(location = 3) out vec2 out_velocity;
+#else
 layout(location = 0) out vec4 outColor;
+#endif
 
 vec3  kSunDir = vec3(-0.624695f, 0.468521f, -0.624695f);
+
+// Octahedral encode — identical to cluster_bindless.frag's copy, paired
+// with octDecode in deferred_resolve.comp.
+vec2 octEncodeDir(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 oct = (n.z >= 0.0) ? n.xy
+                            : (1.0 - abs(n.yx)) * vec2(
+                                  n.x >= 0.0 ? 1.0 : -1.0,
+                                  n.y >= 0.0 ? 1.0 : -1.0);
+    return oct * 0.5 + 0.5;
+}
 
 layout(set = TILE_PARAMS_SET, binding = SRC_COLOR_TEX_INDEX) uniform sampler2D src_tex;
 layout(set = TILE_PARAMS_SET, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D src_depth;
@@ -318,8 +340,15 @@ vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
 
     // colour-driven base weights
     float w_grass = smoothstep(0.010f, 0.090f, green);
-    float w_snow  = smoothstep(0.60f, 0.80f, luma)
-                  * (1.0f - smoothstep(0.08f, 0.22f, sat));
+    // SNOW needs NEAR-WHITE, not merely pale.  The macro sample is a
+    // coarse mip average, and averaging green fields + tan paths + gray
+    // hedgerows lands at luma ~0.55-0.62, sat < 0.1 — the old
+    // (0.60..0.80, sat < 0.22) ramps classified that mix as snow and
+    // painted whole green-countryside maps white.  Real painted snow in
+    // these albedos sits at luma > 0.72 with sat < 0.10; start the ramp
+    // just under that (same detector the plant scatter uses).
+    float w_snow  = smoothstep(0.68f, 0.82f, luma)
+                  * (1.0f - smoothstep(0.06f, 0.16f, sat));
     // Bare ground: warm (r > b) OR simply low-saturation and not pale.
     // The low-saturation half of this used to fall through to ROCK, which
     // is why ordinary dirt, graded roads and dry grass got rock's hard
@@ -338,8 +367,14 @@ vec4 terrainMaterialWeights(vec3 macro, float slope01, float alt_m) {
     w_rock  += steep * 1.25f;
 
     // ── altitude: snow line only where it is already pale/cold ─────
-    float high = smoothstep(120.0f, 190.0f, alt_m);
-    w_snow += high * (1.0f - steep) * 0.5f * smoothstep(0.35f, 0.6f, luma);
+    // 120-190 m was absurdly low for a kTerrainHeightAmpMeters = 2000
+    // world — ordinary hills cleared it and the +0.5 bonus turned every
+    // pale upland white ("why is everywhere snow?").  Alpine assist now
+    // starts at 700 m and, per the comment above, actually REQUIRES the
+    // albedo to already read pale-cold (0.55..0.72 luma ramp) instead
+    // of granting it to anything brighter than mid-gray.
+    float high = smoothstep(700.0f, 1000.0f, alt_m);
+    w_snow += high * (1.0f - steep) * 0.5f * smoothstep(0.55f, 0.72f, luma);
 
     vec4 w = max(vec4(w_grass, w_rock, w_loose, w_snow), vec4(0.0f));
     return w / max(w.x + w.y + w.z + w.w, 1e-4f);
@@ -368,8 +403,11 @@ vec3 terrainSurfaceShade(vec4 w, float f, out float roughness) {
     tint *= mix(vec3(0.985f, 1.000f, 1.020f),
                 vec3(1.020f, 1.000f, 0.975f), 0.5f + 0.5f * f);
 
-    roughness = clamp(w.x * 0.93f + w.y * 0.76f
-                    + w.z * 0.95f + w.w * 0.58f, 0.05f, 1.0f);
+    // Raised across the board (grass .93→.97, rock .76→.88, loose
+    // .95→.98, snow .58→.72): natural ground is matte — the old rock
+    // and snow values gave hillsides and caps a plasticky sun sheen.
+    roughness = clamp(w.x * 0.97f + w.y * 0.88f
+                    + w.z * 0.98f + w.w * 0.72f, 0.05f, 1.0f);
     // damp hollows polish slightly, dry crests stay rough — correlated
     // with the same field, so the specular agrees with the colour
     roughness = clamp(roughness + f * 0.07f, 0.05f, 1.0f);
@@ -558,6 +596,11 @@ void main() {
         normal = normalize(mix(normal, vec3(0.0f, 1.0f, 0.0f), sfade));
     }
 
+    // Geometric normal: the pure heightfield surface before the authored
+    // normal maps / procedural micro-relief perturb it.  The deferred
+    // resolve uses this for shadow-ray biasing (see out_emissive_metal).
+    vec3 geom_normal = normal;
+
     vec3 view_vec = camera_info.position.xyz - in_data.vertex_position;
     float view_dist = length(view_vec);
     vec3 view = normalize(view_vec);
@@ -615,9 +658,31 @@ void main() {
     // it is real, but keeps the ground field's damp-hollow / dry-crest
     // modulation on top: that lives below the 4 m texel and below the 1 m
     // one too, so no map can carry it.
+    // Floor raised 0.05→0.50: whatever the authored ORM/detail maps
+    // say, walkable GROUND is never glossier than semi-matte — the low
+    // floor let pale detail tiles read as wet plastic in full sun.
     mat_rough = clamp(mix(mat_rough, surf_rough + g_field * 0.07f,
-                          surf_rough_w), 0.05f, 1.0f);
+                          surf_rough_w), 0.50f, 1.0f);
 
+#ifdef GBUFFER_OUTPUT
+    // Deferred path: write material attributes and stop.  Lighting (sun +
+    // CSM / raytraced shadows + RT-AO) runs once per pixel in
+    // deferred_resolve.comp — the exact same path cluster geometry takes,
+    // which is what keeps terrain lighting consistent with the rest of
+    // the scene.
+    //
+    // albedo_ao.a doubles as the resolve's "G-buffer written" sentinel
+    // (< 0.5 means forward pixel, leave its colour alone), so terrain AO
+    // is compressed into [0.5, 1.0] instead of risking a skipped pixel.
+    out_albedo_ao      = vec4(albedo, clamp(surf_ao, 0.5f, 1.0f));
+    out_normal_rough   = vec4(octEncodeDir(normal), mat_rough, 0.0f);
+    vec2 oct_geom      = octEncodeDir(geom_normal);
+    out_emissive_metal = vec4(oct_geom, 0.0f, 0.0f);
+    // Terrain is static: screen-space velocity is pure camera motion.
+    vec4 cur_clip  = camera_info.view_proj      * vec4(pos, 1.0f);
+    vec4 prev_clip = camera_info.prev_view_proj * vec4(pos, 1.0f);
+    out_velocity   = cur_clip.xy / cur_clip.w - prev_clip.xy / prev_clip.w;
+#else
     MaterialInfo material_info;
     material_info.baseColor = albedo;
 
@@ -676,4 +741,5 @@ void main() {
     float alpha = 1.0f;
     outColor = vec4(linearTosRGB(color), alpha);
 //    outColor.xyz *= in_data.test_color;
+#endif  // !GBUFFER_OUTPUT
 }

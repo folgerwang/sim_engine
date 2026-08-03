@@ -719,7 +719,18 @@ void ClusterRenderer::uploadMeshClusters(
                                            return std::tolower(c);
                                        });
                         if (lname.find("leaf") != std::string::npos ||
-                            lname.find("foliage") != std::string::npos) {
+                            lname.find("foliage") != std::string::npos ||
+                            // Keep in lockstep with the drawable-path
+                            // tagging in drawable_object.cpp so a mesh
+                            // shades identically before and after its
+                            // clusters finalize.
+                            lname.find("clutter_grass") != std::string::npos ||
+                            lname.find("clutter_flower") != std::string::npos ||
+                            lname.find("spray") != std::string::npos ||
+                            lname.find("sward") != std::string::npos ||
+                            lname.find("forb") != std::string::npos ||
+                            lname.find("blossom") != std::string::npos ||
+                            lname.find("petal") != std::string::npos) {
                             mp.flags |= BINDLESS_MAT_FOLIAGE_SSS;
                         }
                     }
