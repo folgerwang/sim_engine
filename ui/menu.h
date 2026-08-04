@@ -156,6 +156,19 @@ class Menu {
     int         terrain_gen_status_      = 0;  // 0 idle 1 run 2 done 3 fail
     std::string terrain_gen_out_;
     std::string terrain_gen_err_;
+    // ── STAGED pipeline (tools/terrain/terrain_stages.py) ─────────────
+    // The one-shot Generate button above runs the whole thing; these run
+    // it a step at a time, so retuning a road constant does not re-run
+    // the diffusion model.  Two independent runners because the two
+    // LIBRARY stages (house/plant samples) do not depend on any map and
+    // are expected to be built while a world chain is already running.
+    char        terrain_stage_map_[256]  = "assets/terrain/generated_map";
+    int         terrain_stage_status_    = 0;  // 0 idle 1 run 2 done 3 fail
+    std::string terrain_stage_name_;           // stage being run
+    std::string terrain_stage_prog_;           // "<manifest>.progress"
+    int         terrain_lib_status_      = 0;
+    std::string terrain_lib_name_;
+    std::string terrain_lib_prog_;
     // Texture-map pair the apply request carries: the generated heightmap
     // and (if --color) the matching albedo/satellite map.  Consumed by the
     // app's createTerrainFromMaps().

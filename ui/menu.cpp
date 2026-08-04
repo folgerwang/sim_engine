@@ -176,9 +176,17 @@ namespace {
         s.Colors[ImGuiCol_CheckMark]         = gold_bright;
         s.Colors[ImGuiCol_SliderGrab]        = gold_dim;
         s.Colors[ImGuiCol_SliderGrabActive]  = gold_bright;
-        s.Colors[ImGuiCol_Button]            = ImVec4(0.10f, 0.10f, 0.18f, 0.85f);
-        s.Colors[ImGuiCol_ButtonHovered]     = gold_dim;
-        s.Colors[ImGuiCol_ButtonActive]      = gold;
+        // BUTTONS ARE BLUE, and deliberately not the gold the rest of the
+        // accents use.  The idle fill used to be the panel background
+        // with a hairline border, so a row of buttons read as a row of
+        // labels — you had to hover to find out what was clickable.  A
+        // filled blue face separates "you may press this" from every
+        // other piece of chrome at a glance, and keeping gold for hover
+        // and press means the button still lights up in the theme's own
+        // accent when you reach for it.
+        s.Colors[ImGuiCol_Button]            = ImVec4(0.20f, 0.34f, 0.62f, 1.00f);
+        s.Colors[ImGuiCol_ButtonHovered]     = ImVec4(0.29f, 0.47f, 0.82f, 1.00f);
+        s.Colors[ImGuiCol_ButtonActive]      = ImVec4(0.38f, 0.60f, 1.00f, 1.00f);
         s.Colors[ImGuiCol_Header]            = ImVec4(0.10f, 0.10f, 0.18f, 0.85f);
         s.Colors[ImGuiCol_HeaderHovered]     = gold_dim;
         s.Colors[ImGuiCol_HeaderActive]      = gold;
@@ -6385,6 +6393,198 @@ void Menu::drawTerrainGenPopup() {
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
                                "Failed — see Editor Log.");
         }
+
+        // ── STAGED PIPELINE ───────────────────────────────────────────
+        // The button above runs everything from the diffusion model to
+        // the last blade of grass, which is the right shape for "make me
+        // a world" and the wrong one for iterating: retuning a road
+        // constant should not re-run FLUX, and rebuilding the house
+        // library should not re-run the roads.  These buttons drive
+        // tools/terrain/terrain_stages.py, which owns the dependency
+        // order and skips any stage whose inputs have not changed —
+        // clicking Place on an empty map still runs maps then roads
+        // first, in that order, without being asked to.
+        ImGui::Separator();
+        ImGui::TextUnformatted("Staged pipeline");
+        ImGui::TextDisabled("ML maps -> roads/bridges -> placement.  A stage "
+                            "whose inputs are unchanged is skipped.");
+        ImGui::SetNextItemWidth(tp_box_w - 140.0f);
+        ImGui::InputText("Map stem", terrain_stage_map_,
+                         sizeof(terrain_stage_map_));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Path without extension: the stage runner "
+                              "derives <stem>.png, _color.png, _seg.png, "
+                              "_roads.json and the manifest from it.");
+
+        // One launcher for both chains.  `world` picks which of the two
+        // runners (and which manifest) the run belongs to, so a library
+        // build and a world build can be in flight at the same time
+        // without overwriting each other's status.
+        auto launch_stage = [&](const char* stage, bool world) {
+            namespace fsl = std::filesystem;
+            const std::string stem(terrain_stage_map_);
+            const std::string prog =
+                world ? stem + "_stages.progress"
+                      : std::string("assets/terrain/lib/"
+                                    "library_stages.progress");
+            std::error_code lec;
+            fsl::remove(prog + ".err", lec);
+            fsl::remove(prog + ".done", lec);
+            std::string args =
+                std::string("\"tools/terrain/terrain_stages.py\" --stage ") +
+                stage;
+            if (world) args += " --map \"" + stem + "\"";
+            if (world && std::string(stage) == "maps") {
+                // The maps stage needs the same prompt the one-shot
+                // button uses; it goes through a FILE for the same
+                // reason it does there — a prompt with quotes in it
+                // does not survive cmd.exe.
+                const std::string p(terrain_prompt_buf_);
+                if (!p.empty()) {
+                    std::error_code ec2;
+                    fs::create_directories("content/terrain/.terrain_tmp",
+                                           ec2);
+                    const std::string pfile =
+                        (fs::path("content/terrain/.terrain_tmp") /
+                         "stage.prompt.txt").string();
+                    { std::ofstream pf(pfile, std::ios::binary); pf << p; }
+                    addTerrainPrompt(p, /*favorite*/ false);
+                    char hs[48];
+                    std::snprintf(hs, sizeof(hs), " --height-scale %.3f",
+                                  terrain_gen_height_scale_);
+                    args += " --prompt-file \"" + pfile + "\"" + hs;
+                }
+            }
+#ifdef _WIN32
+            const std::string cmd =
+                "cmd /c start \"terrain-stage\" /B python " + args;
+#else
+            const std::string cmd = "python3 " + args + " &";
+#endif
+            EditorLog::get().push(std::string("[terrain] stage '") + stage +
+                                  "' -> " + prog);
+            std::system(cmd.c_str());
+            if (world) {
+                terrain_stage_status_ = 1;
+                terrain_stage_name_   = stage;
+                terrain_stage_prog_   = prog;
+            } else {
+                terrain_lib_status_ = 1;
+                terrain_lib_name_   = stage;
+                terrain_lib_prog_   = prog;
+            }
+        };
+
+        // Shared poll + bar for either runner.  Missing progress file is
+        // "starting", ".err" is failure, ".done" is success — the
+        // progress file alone cannot distinguish "not started yet" from
+        // "finished", which is why the sentinels exist.
+        auto poll_stage = [&](int& status, const std::string& name,
+                              const std::string& prog) {
+            if (status != 1) return;
+            namespace fsl = std::filesystem;
+            if (fsl::exists(prog + ".err")) {
+                status = 3;
+                std::ifstream ef(prog + ".err", std::ios::binary);
+                std::string line, last;
+                while (std::getline(ef, line))
+                    if (!line.empty()) last = line;
+                EditorLog::get().push("[terrain] stage '" + name +
+                                      "' FAILED: " + last);
+                return;
+            }
+            if (fsl::exists(prog + ".done")) {
+                status = 2;
+                EditorLog::get().push("[terrain] stage '" + name + "' done");
+                return;
+            }
+            float       frac  = 0.01f;
+            std::string label = "starting python...";
+            {
+                std::ifstream pf(prog, std::ios::binary);
+                if (pf) {
+                    pf >> frac;
+                    std::getline(pf, label);
+                    if (!label.empty() && label[0] == ' ') label.erase(0, 1);
+                }
+            }
+            char overlay[224];
+            std::snprintf(overlay, sizeof(overlay), "%s: %s  %.0f%%",
+                          name.c_str(), label.c_str(), frac * 100.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                                  ImVec4(0.42f, 0.78f, 1.0f, 1.0f));
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
+            ImGui::PopStyleColor();
+        };
+
+        const float sb_w = 152.0f;
+        const bool  world_busy = (terrain_stage_status_ == 1);
+        if (world_busy) ImGui::BeginDisabled();
+        if (ImGui::Button("1. ML maps", ImVec2(sb_w, 0)))
+            launch_stage("maps", true);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("FLUX orthophoto -> heightmap, albedo, "
+                              "segmentation, terrain mesh.  Uses the prompt "
+                              "box above.");
+        ImGui::SameLine();
+        if (ImGui::Button("2. Roads & bridges", ImVec2(sb_w, 0)))
+            launch_stage("roads", true);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Road splines from the segmentation, limited "
+                              "to a drivable grade, with bridge meshes over "
+                              "the drops that would otherwise be a cliff.");
+        ImGui::SameLine();
+        if (ImGui::Button("3. Place houses & plants", ImVec2(sb_w + 44.0f, 0)))
+            launch_stage("place", true);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Places the libraries on the graded ground.  "
+                              "Runs maps and roads first if either is "
+                              "missing or out of date.");
+        if (world_busy) ImGui::EndDisabled();
+        poll_stage(terrain_stage_status_, terrain_stage_name_,
+                   terrain_stage_prog_);
+        if (terrain_stage_status_ == 2) {
+            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f),
+                               "Stage '%s' done.",
+                               terrain_stage_name_.c_str());
+        } else if (terrain_stage_status_ == 3) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                               "Stage '%s' failed — see Editor Log.",
+                               terrain_stage_name_.c_str());
+        }
+
+        // The two LIBRARIES depend on no map at all: they are built once
+        // and reused by every world, so they get their own row and their
+        // own runner rather than sitting in the ordered chain.
+        ImGui::TextDisabled("Sample libraries (world-independent)");
+        const bool lib_busy = (terrain_lib_status_ == 1);
+        if (lib_busy) ImGui::BeginDisabled();
+        if (ImGui::Button("House samples", ImVec2(sb_w, 0)))
+            launch_stage("houses", false);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Builds every house archetype (style x "
+                              "footprint x storeys x variant) into "
+                              "assets/terrain/lib/houses.glb.");
+        ImGui::SameLine();
+        if (ImGui::Button("Plant samples", ImVec2(sb_w, 0)))
+            launch_stage("plants", false);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Builds the plant sample sheet (every species "
+                              "at several sizes) into "
+                              "assets/terrain/lib/plants.glb.");
+        if (lib_busy) ImGui::EndDisabled();
+        poll_stage(terrain_lib_status_, terrain_lib_name_,
+                   terrain_lib_prog_);
+        if (terrain_lib_status_ == 2) {
+            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f),
+                               "Library '%s' done.",
+                               terrain_lib_name_.c_str());
+        } else if (terrain_lib_status_ == 3) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                               "Library '%s' failed — see Editor Log.",
+                               terrain_lib_name_.c_str());
+        }
+
         // The generated PNG lands in content/terrain/, so it also shows
         // up in the Content Browser for preview / reuse as a ref image.
     }
