@@ -161,7 +161,33 @@ void createTextureImage(
         }
 
         if (!void_pixels) {
-            throw std::runtime_error("failed to load texture image!");
+            // NAME THE FILE.  "failed to load texture image!" on its own
+            // says a texture failed but not which one, and the loader is
+            // called for engine assets, imported model textures and
+            // runtime-generated maps alike — so the message was a debug
+            // session, not a diagnosis.  stbi's own reason distinguishes
+            // "file not there" from "there but corrupt/truncated", which
+            // is exactly the fork that decides what to do about it.
+            const char* why = stbi_failure_reason();
+            std::string msg = "failed to load texture image '" +
+                              file_name + "'";
+            {
+                std::error_code fe_ec;
+                if (!std::filesystem::exists(file_name, fe_ec)) {
+                    msg += " — file does not exist";
+                } else {
+                    msg += " — exists (" +
+                           std::to_string(static_cast<unsigned long long>(
+                               std::filesystem::file_size(file_name,
+                                                          fe_ec))) +
+                           " B) but could not be decoded";
+                }
+            }
+            if (why && *why) {
+                msg += std::string("; stb_image: ") + why;
+            }
+            std::cout << "[texture] " << msg << std::endl;
+            throw std::runtime_error(msg);
         }
     }
 
@@ -182,37 +208,15 @@ void createTextureImage(
         // Materials that use DDS sources will skip VT registration.
     }
     else {
-        if (format == engine::renderer::Format::R16_UNORM) {
-            // Height/data textures: single level, exact texels — a
-            // filtered mip chain would corrupt them.
-            renderer::Helper::create2DTextureImage(
-                device,
-                format,
-                tex_width,
-                tex_height,
-                void_pixels,
-                texture.image,
-                texture.memory,
-                src_location);
-            texture.mip_levels = 1;
-        } else {
-            // Colour textures decoded at runtime (PNG/JPG): full mip
-            // chain, for the same reason as the glTF-embedded path in
-            // drawable_object.cpp — a single-level tiling texture
-            // smears under anisotropic minification.
-            uint32_t tex_mips = 1;
-            renderer::Helper::create2DTextureImageWithMips(
-                device,
-                format,
-                tex_width,
-                tex_height,
-                void_pixels,
-                texture.image,
-                texture.memory,
-                tex_mips,
-                src_location);
-            texture.mip_levels = tex_mips;
-        }
+        renderer::Helper::create2DTextureImage(
+            device,
+            format,
+            tex_width,
+            tex_height,
+            void_pixels,
+            texture.image,
+            texture.memory,
+            src_location);
 
         // Stash a CPU-side copy of the just-decoded RGBA8 pixels so
         // the Virtual Texture manager can build its bordered tile
