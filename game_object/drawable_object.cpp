@@ -3127,6 +3127,15 @@ static void bakeInstanceTransforms(
         }
         if (bake) {
             total += count;
+            // Physical-prop registry: hand the freshly created range to
+            // the binder.  Called only when the range is CREATED — the
+            // memoized shares alias these same slots, so binding them
+            // again would double-queue every later rewrite.  On the
+            // override path each band node creates its own range, and
+            // each gets bound, which is exactly what a move needs: all
+            // of a prop's band slots rewritten together.
+            ego::PcgInstanceRegistry::get().bindBakedRange(
+                drawable_object, node.name_, node.inst_offset_, t, count);
         }
 
         // Mirror the range onto the mesh so the indirect-draw fill (which
@@ -5600,6 +5609,307 @@ bool loadPcgWorldManifest(
     return !out_by_library.empty();
 }
 
+// ── PcgInstanceRegistry (see drawable_object.h for the design note) ────
+PcgInstanceRegistry& PcgInstanceRegistry::get() {
+    static PcgInstanceRegistry reg;
+    return reg;
+}
+
+namespace {
+inline uint64_t pcgMix64(uint64_t h) {
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
+} // namespace
+
+uint64_t PcgInstanceRegistry::posKey(uint32_t node, float x, float z) const {
+    // Decimetre cells.  The pipeline rounds positions to centimetres and
+    // the accessor stores float32 of the same value, so both spellings
+    // land in the same cell except within half a centimetre of a cell
+    // edge — which is why bindBakedRange probes the 3x3 neighbourhood.
+    const int64_t qx = (int64_t)std::llround((double)x * 10.0);
+    const int64_t qz = (int64_t)std::llround((double)z * 10.0);
+    return pcgMix64(((uint64_t)node << 1) + 0x9E3779B97F4A7C15ULL) ^
+           pcgMix64(((uint64_t)(qx + (1ll << 31)) << 32) ^
+                    (uint64_t)(uint32_t)(qz + (1ll << 31)));
+}
+
+bool PcgInstanceRegistry::load(const std::string& json_path) {
+    using nlohmann::json;
+    std::ifstream f(json_path, std::ios::binary);
+    if (!f) return false;
+    json doc;
+    try {
+        f >> doc;
+    } catch (...) {
+        return false;
+    }
+    if (!doc.contains("categories")) return false;
+    static const std::map<std::string, uint8_t> kCat = {
+        {"rocks", 0}, {"trees", 1}, {"bushes", 2},
+        {"houses", 3}, {"objects", 4}};
+
+    std::lock_guard<std::mutex> lk(mu_);
+    nodes_.clear(); recs_.clear();
+    by_id_.clear(); by_pos_.clear();
+    binds_.clear(); dirty_.clear();
+    const auto& cats = doc["categories"];
+    for (auto it = cats.begin(); it != cats.end(); ++it) {
+        const auto ci = kCat.find(it.key());
+        const uint8_t cat = (ci == kCat.end()) ? 255 : ci->second;
+        const auto& tab = it.value();
+        if (!tab.contains("nodes") || !tab.contains("ni") ||
+            !tab.contains("id") || !tab.contains("t") ||
+            !tab.contains("yaw") || !tab.contains("s") ||
+            !tab.contains("w")) {
+            continue;
+        }
+        const auto& names = tab["nodes"];
+        const auto& ni = tab["ni"];
+        const auto& id = tab["id"];
+        const auto& t = tab["t"];
+        const auto& yaw = tab["yaw"];
+        const auto& sc = tab["s"];
+        const auto& w = tab["w"];
+        const size_t n = ni.size();
+        if (id.size() != n || yaw.size() != n || sc.size() != n ||
+            w.size() != n || t.size() != n * 3) {
+            continue;
+        }
+        const uint32_t node_base = (uint32_t)nodes_.size();
+        for (const auto& nm : names) {
+            nodes_.push_back(nm.get<std::string>());
+        }
+        recs_.reserve(recs_.size() + n);
+        for (size_t i = 0; i < n; ++i) {
+            PcgInstanceRecord r;
+            r.id = id[i].get<uint64_t>();
+            r.node = node_base + (uint32_t)ni[i].get<size_t>();
+            r.category = cat;
+            r.state = 0;
+            r.weight_kg = w[i].get<float>();
+            r.t = glm::vec3(t[i * 3 + 0].get<float>(),
+                            t[i * 3 + 1].get<float>(),
+                            t[i * 3 + 2].get<float>());
+            r.yaw = yaw[i].get<float>();
+            r.scale = sc[i].get<float>();
+            const uint32_t idx = (uint32_t)recs_.size();
+            recs_.push_back(r);
+            by_id_.emplace(r.id, idx);
+            // first writer keeps the cell; a same-node same-decimetre
+            // twin stays findable by id, it just cannot be bound
+            by_pos_.emplace(posKey(r.node, r.t.x, r.t.z), idx);
+        }
+    }
+    std::cout << "[pcg-registry] " << recs_.size()
+              << " physical props loaded from " << json_path << std::endl;
+    return !recs_.empty();
+}
+
+void PcgInstanceRegistry::clear() {
+    std::lock_guard<std::mutex> lk(mu_);
+    nodes_.clear(); recs_.clear();
+    by_id_.clear(); by_pos_.clear();
+    binds_.clear(); dirty_.clear();
+}
+
+size_t PcgInstanceRegistry::size() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return recs_.size();
+}
+
+const PcgInstanceRecord* PcgInstanceRegistry::find(uint64_t id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = by_id_.find(id);
+    // stable storage: recs_ only mutates under load/clear, which also
+    // invalidate every id a caller could be holding
+    return it == by_id_.end() ? nullptr : &recs_[it->second];
+}
+
+std::vector<uint64_t> PcgInstanceRegistry::queryRadius(
+    const glm::vec3& p, float radius, int category) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<uint64_t> out;
+    const float r2 = radius * radius;
+    for (const auto& r : recs_) {
+        if (category >= 0 && r.category != (uint8_t)category) continue;
+        const float dx = r.t.x - p.x, dz = r.t.z - p.z;
+        if (dx * dx + dz * dz <= r2) out.push_back(r.id);
+    }
+    return out;
+}
+
+BakedInstanceXform PcgInstanceRegistry::xformOf(
+    const PcgInstanceRecord& r) const {
+    // Same convention the bake writes: columns of rotY(yaw) * scale,
+    // translation in mat_pos_scale.xyz.
+    const float c = std::cos(r.yaw) * r.scale;
+    const float s = std::sin(r.yaw) * r.scale;
+    BakedInstanceXform x;
+    x.mat_rot_0 = glm::vec4(c, 0.0f, -s, 0.0f);
+    x.mat_rot_1 = glm::vec4(0.0f, r.scale, 0.0f, 0.0f);
+    x.mat_rot_2 = glm::vec4(s, 0.0f, c, 0.0f);
+    x.mat_pos_scale = glm::vec4(r.t, 1.0f);
+    return x;
+}
+
+void PcgInstanceRegistry::queueRecord(uint32_t rec_idx,
+                                      const BakedInstanceXform& x) {
+    // caller holds mu_
+    const auto bit = binds_.find(rec_idx);
+    if (bit == binds_.end()) return;
+    for (const auto& b : bit->second) {
+        if (auto data = b.data.lock()) {
+            dirty_[data.get()].emplace_back(b.slot, x);
+        }
+    }
+}
+
+bool PcgInstanceRegistry::setState(uint64_t id, uint8_t state) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = by_id_.find(id);
+    if (it == by_id_.end() || state > 2) return false;
+    PcgInstanceRecord& r = recs_[it->second];
+    if (r.state == state) return true;
+    const bool was_destroyed = (r.state == 2);
+    r.state = state;
+    if (state == 2) {
+        BakedInstanceXform x = xformOf(r);
+        x.mat_rot_0 = x.mat_rot_1 = x.mat_rot_2 = glm::vec4(0.0f);
+        queueRecord(it->second, x);       // zero basis = invisible
+    } else if (was_destroyed) {
+        queueRecord(it->second, xformOf(r));
+    }
+    return true;
+}
+
+bool PcgInstanceRegistry::setTransform(uint64_t id, const glm::vec3& t,
+                                       float yaw, float scale) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = by_id_.find(id);
+    if (it == by_id_.end()) return false;
+    PcgInstanceRecord& r = recs_[it->second];
+    r.t = t; r.yaw = yaw; r.scale = scale;
+    if (r.state == 2) return true;        // stays hidden; transform kept
+    r.state = 1;                          // it moved: it is moving
+    queueRecord(it->second, xformOf(r));
+    return true;
+}
+
+void PcgInstanceRegistry::bindBakedRange(
+    const std::shared_ptr<DrawableData>& data,
+    const std::string& node_name,
+    uint32_t first_slot,
+    const std::vector<float>& translations,
+    size_t count) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (recs_.empty() || count == 0) return;
+    // longest registry key that prefixes this node's name — same rule
+    // the world-manifest overrides use (find_over above)
+    int best = -1;
+    size_t best_len = 0;
+    for (size_t k = 0; k < nodes_.size(); ++k) {
+        const std::string& key = nodes_[k];
+        if (node_name.size() > key.size() + 1 &&
+            node_name[key.size()] == '_' &&
+            node_name.compare(0, key.size(), key) == 0 &&
+            key.size() > best_len) {
+            best = (int)k;
+            best_len = key.size();
+        } else if (node_name == key && key.size() > best_len) {
+            best = (int)k;
+            best_len = key.size();
+        }
+    }
+    if (best < 0) return;                 // not a physical prop (clutter…)
+    size_t bound = 0;
+    for (size_t i = 0; i < count && (i + 1) * 3 <= translations.size();
+         ++i) {
+        const float x = translations[i * 3 + 0];
+        const float z = translations[i * 3 + 2];
+        // 3x3 decimetre probe: rounding differences between the JSON
+        // and the float32 accessor can straddle one cell edge
+        uint32_t rec = UINT32_MAX;
+        for (int dz = -1; dz <= 1 && rec == UINT32_MAX; ++dz) {
+            for (int dx = -1; dx <= 1 && rec == UINT32_MAX; ++dx) {
+                const auto pit = by_pos_.find(
+                    posKey((uint32_t)best, x + dx * 0.1f, z + dz * 0.1f));
+                if (pit != by_pos_.end() &&
+                    recs_[pit->second].node == (uint32_t)best) {
+                    rec = pit->second;
+                }
+            }
+        }
+        if (rec == UINT32_MAX) continue;
+        binds_[rec].push_back(Binding{data, first_slot + (uint32_t)i});
+        ++bound;
+        // a prop destroyed BEFORE this asset loaded (apply order, or a
+        // reload) must come up hidden, not resurrected
+        if (recs_[rec].state == 2) {
+            BakedInstanceXform hx = xformOf(recs_[rec]);
+            hx.mat_rot_0 = hx.mat_rot_1 = hx.mat_rot_2 = glm::vec4(0.0f);
+            dirty_[data.get()].emplace_back(first_slot + (uint32_t)i, hx);
+        }
+    }
+    (void)bound;
+}
+
+void PcgInstanceRegistry::flushDirty(
+    const std::shared_ptr<DrawableData>& data,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf) {
+    // Take a bounded batch under the lock; record commands outside it.
+    std::vector<std::pair<uint32_t, BakedInstanceXform>> batch;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = dirty_.find(data.get());
+        if (it == dirty_.end() || it->second.empty()) return;
+        auto& q = it->second;
+        constexpr size_t kMaxPerFrame = 512;   // 32 KB of vkCmdUpdateBuffer
+        if (q.size() <= kMaxPerFrame) {
+            batch.swap(q);
+            dirty_.erase(it);
+        } else {
+            batch.assign(q.begin(), q.begin() + kMaxPerFrame);
+            q.erase(q.begin(), q.begin() + kMaxPerFrame);
+        }
+    }
+    if (!data->instance_buffer_.buffer) return;
+    // WAR: the previous frame's vertex-input / mesh-shader reads must
+    // retire before the transfer writes land — mirrors the barriers the
+    // per-frame compute path uses on this same buffer.
+    cmd_buf->addBufferBarrier(
+        data->instance_buffer_.buffer,
+        { SET_2_FLAG_BITS(Access, VERTEX_ATTRIBUTE_READ_BIT,
+                          SHADER_READ_BIT),
+          SET_2_FLAG_BITS(PipelineStage, VERTEX_INPUT_BIT,
+                          MESH_SHADER_BIT_EXT) },
+        { SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+          SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) },
+        data->instance_buffer_.buffer->getSize());
+    const uint64_t buf_size = data->instance_buffer_.buffer->getSize();
+    for (const auto& [slot, x] : batch) {
+        const uint64_t ofs = (uint64_t)slot * sizeof(BakedInstanceXform);
+        if (ofs + sizeof(BakedInstanceXform) > buf_size) continue;
+        if (slot < data->baked_instances_.size()) {
+            data->baked_instances_[slot] = x;   // keep the CPU copy true
+        }
+        cmd_buf->updateBuffer(data->instance_buffer_.buffer, ofs,
+                              sizeof(BakedInstanceXform), &x);
+    }
+    // RAW: transfer writes visible to every consumer this frame.
+    cmd_buf->addBufferBarrier(
+        data->instance_buffer_.buffer,
+        { SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+          SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) },
+        { SET_2_FLAG_BITS(Access, VERTEX_ATTRIBUTE_READ_BIT,
+                          SHADER_READ_BIT),
+          SET_2_FLAG_BITS(PipelineStage, VERTEX_INPUT_BIT,
+                          MESH_SHADER_BIT_EXT) },
+        data->instance_buffer_.buffer->getSize());
+}
+
 // static member definition.
 uint32_t DrawableObject::max_alloc_game_objects_in_buffer = kNumDrawableInstance;
 int32_t  DrawableObject::forced_geo_lod_ = 0;   // 0 = full detail
@@ -7000,8 +7310,14 @@ void DrawableObject::updateInstanceBuffer(
     // with the shared game_objects_buffer_ transform, or (because static
     // placed imports set use_node_transform_only_) with a flat identity,
     // collapsing several thousand scattered trees onto the world origin.
-    // Nothing needs to run per frame here: the table is static.
+    // Nothing runs per frame here EXCEPT the physical-prop registry's
+    // dirty flush: a prop that gameplay moved or destroyed has its
+    // slots rewritten in place (64 B each, bounded per frame), which is
+    // a targeted transfer, not the compute stampede this opt-out
+    // exists to prevent.  A frame with no changes queues nothing and
+    // returns immediately, so the static table stays free.
     if (object_->has_baked_instances_) {
+        PcgInstanceRegistry::get().flushDirty(object_, cmd_buf);
         return;
     }
 

@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <mutex>          // PcgInstanceRegistry guards its tables
 #include <unordered_map>
 #include <utility>        // std::pair, for DrawableData::mesh_instance_range_
 #include "renderer/renderer.h"
@@ -1441,6 +1442,97 @@ bool loadPcgWorldManifest(
     const std::string& manifest_path,
     std::map<std::string, std::pair<std::string, PcgOverrideMap>>&
         out_by_library);
+
+// ── PCG PER-INSTANCE PHYSICAL REGISTRY ──────────────────────────────────
+// One record per PHYSICAL PROP the placement stage put on the level —
+// rocks, trees, bushes, houses, game objects — read from
+// <map>_pcg_instances.json (terrain_pcg._write_instance_registry).  Each
+// record carries the prop's stable 53-bit id, its weight in kg and its
+// placed transform; every prop starts STATIC, and the two runtime states
+// (moving, destroyed) exist so gameplay can push a rock downhill or
+// remove it without the pipeline knowing.
+//
+// HOW A RECORD REACHES THE GPU.  Placed props render as baked
+// EXT_mesh_gpu_instancing instances (DrawableData::baked_instances_, a
+// table uploaded once at load and then never rewritten — see
+// updateInstanceBuffer's baked opt-out).  At bake time the loader hands
+// every freshly created instance range to bindBakedRange, which matches
+// slots to records by NODE NAME PREFIX plus decimetre-quantised plan
+// position — position, not row order, because the same record appears
+// once per LOD band on the library path and per-tile-subsetted on the
+// baked-glb path, and order survives neither.  setTransform/setState
+// then queue the affected slots, and flushDirty rewrites them in place
+// through vkCmdUpdateBuffer (64 B per slot) from the per-frame update
+// pass, with the same barriers every other in-place rewrite uses.
+//
+// Thread contract: load/bind run on asset-load threads, set*/find on
+// gameplay, flushDirty on the render thread — one mutex covers all of
+// it; every call is short.
+struct PcgInstanceRecord {
+    uint64_t  id = 0;
+    uint32_t  node = 0;          // index into the loaded node-name table
+    uint8_t   category = 0;      // 0 rocks 1 trees 2 bushes 3 houses 4 objects
+    uint8_t   state = 0;         // 0 static 1 moving 2 destroyed
+    float     weight_kg = 0.0f;
+    glm::vec3 t{0.0f};
+    float     yaw = 0.0f;
+    float     scale = 1.0f;
+};
+
+class PcgInstanceRegistry {
+public:
+    static PcgInstanceRegistry& get();
+
+    // Parse <map>_pcg_instances.json; replaces the previous registry and
+    // drops every binding (call at terrain apply, BEFORE the placed
+    // glbs / libraries import).  Returns false on a parse failure.
+    bool load(const std::string& json_path);
+    void clear();
+    size_t size() const;
+
+    const PcgInstanceRecord* find(uint64_t id) const;   // nullptr if unknown
+    // ids within `radius` of `p` (plan distance), optionally one
+    // category only.  Linear scan — fine for occasional gameplay
+    // queries, wrong inside a per-frame loop over many callers.
+    std::vector<uint64_t> queryRadius(const glm::vec3& p, float radius,
+                                      int category = -1) const;
+
+    // Runtime state.  setTransform re-places the prop (marks it moving);
+    // setState(2) hides every bound GPU slot via a zero-scale rewrite,
+    // and setState(0|1) after a destroy restores the stored transform.
+    bool setState(uint64_t id, uint8_t state);
+    bool setTransform(uint64_t id, const glm::vec3& t, float yaw,
+                      float scale);
+
+    // Loader-side hooks — not for gameplay code.
+    void bindBakedRange(const std::shared_ptr<DrawableData>& data,
+                        const std::string& node_name,
+                        uint32_t first_slot,
+                        const std::vector<float>& translations,
+                        size_t count);
+    void flushDirty(const std::shared_ptr<DrawableData>& data,
+                    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf);
+
+private:
+    PcgInstanceRegistry() = default;
+    uint64_t posKey(uint32_t node, float x, float z) const;
+    BakedInstanceXform xformOf(const PcgInstanceRecord& r) const;
+    void queueRecord(uint32_t rec_idx, const BakedInstanceXform& x);
+
+    mutable std::mutex mu_;
+    std::vector<std::string> nodes_;
+    std::vector<PcgInstanceRecord> recs_;
+    std::unordered_map<uint64_t, uint32_t> by_id_;
+    std::unordered_map<uint64_t, uint32_t> by_pos_;   // posKey -> rec idx
+    struct Binding {
+        std::weak_ptr<DrawableData> data;
+        uint32_t slot;
+    };
+    std::unordered_map<uint32_t, std::vector<Binding>> binds_;
+    std::unordered_map<const DrawableData*,
+                       std::vector<std::pair<uint32_t, BakedInstanceXform>>>
+        dirty_;
+};
 
 } // namespace game_object
 } // namespace engine
