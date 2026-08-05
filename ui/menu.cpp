@@ -6572,6 +6572,14 @@ void Menu::drawTerrainGenPopup() {
             ImGui::SetTooltip("Builds the plant sample sheet (every species "
                               "at several sizes) into "
                               "assets/terrain/lib/plants.glb.");
+        ImGui::SameLine();
+        if (ImGui::Button("Game objects", ImVec2(sb_w, 0)))
+            launch_stage("objects", false);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Builds the game object sample sheet "
+                              "(tables, chairs, beds, drawings, closets, "
+                              "drawers - 10 variants each) into "
+                              "assets/terrain/lib/game_objects.glb.");
         if (lib_busy) ImGui::EndDisabled();
         poll_stage(terrain_lib_status_, terrain_lib_name_,
                    terrain_lib_prog_);

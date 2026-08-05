@@ -747,6 +747,31 @@ static void setupMeshState(
                     ubo.subsurface_thickness_factor = 0.0f;
                     ubo.subsurface_color_factor     = glm::vec3(0.06f);
                 }
+                // ── CLOTH: the sheen lobe ─────────────────────────
+                // Quilts, pillows and seat pads from the game-object
+                // library ship as "obj_fabricN" materials; under the
+                // plain metallic-roughness BRDF a matte-rough surface
+                // has no grazing response at all, so bedding read as
+                // painted plaster.  The renderer has carried a full
+                // Charlie-sheen cloth lobe (FEATURE_MATERIAL_SHEEN,
+                // BRDF_specularSheen) since the IBL pass grew its
+                // sheen map — nothing ever set the bit.  Same
+                // name-classification contract as the foliage branch
+                // above: the ASSET names its material as fabric, the
+                // loader gives it the fabric response.
+                if (lname.find("fabric") != std::string::npos ||
+                    lname.find("cloth")  != std::string::npos ||
+                    lname.find("quilt")  != std::string::npos ||
+                    lname.find("linen")  != std::string::npos ||
+                    lname.find("wool")   != std::string::npos) {
+                    ubo.material_features |= FEATURE_MATERIAL_SHEEN;
+                    // White-ish sheen tinted by the base texture at
+                    // lighting time; intensity/roughness tuned for
+                    // woven bedding — a soft rim, not satin gloss.
+                    ubo.sheen_color_factor     = glm::vec3(1.0f);
+                    ubo.sheen_intensity_factor = 0.55f;
+                    ubo.sheen_roughness        = 0.62f;
+                }
             }
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.specular_factor = glm::vec3(1.0f, 1.0f, 1.0f);
