@@ -1,4 +1,5 @@
 #include "model_inspect.h"
+#include "helper/mesh_tool.h"   // decimateMesh — bakes .rwgeo LOD levels
 
 #include <cctype>
 #include <cstdio>
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <functional>
 #include <iostream>
 #include <unordered_map>
@@ -1167,6 +1169,12 @@ constexpr char kRwGeoMagic4[8] = {'R','W','G','E','O','0','0','4'};
 // texlen+rel pairs after the albedo one — normal map, then
 // metallic-roughness map (either may be empty).
 constexpr char kRwGeoMagic5[8] = {'R','W','G','E','O','0','0','5'};
+// v6 = v5 + baked geometry LODs: flags bit5 (32u) → after the section
+// table, u32 lod_count then per level, per section, (u32 first_index,
+// u32 index_count).  The decimated levels' vertices and indices are
+// APPENDED to the main blobs (the FBX loader's HLOD layout), so the
+// header vc/ic counts cover them and older data blocks stay in place.
+constexpr char kRwGeoMagic6[8] = {'R','W','G','E','O','0','0','6'};
 constexpr char kRwHierMagic[8] = {'R','W','H','I','E','R','0','1'};
 constexpr char kRwAnimMagic[8] = {'R','W','A','N','I','M','0','1'};
 
@@ -1604,18 +1612,118 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
                       has_skin1 ? &weights1 : nullptr,
                       has_close1 ? &closeness1 : nullptr);
 
-    // v5: full PBR section refs (albedo + normal + metallic-roughness);
-    // flags bit1 marks the optional skin blobs.  Older files (v1-v4)
-    // remain readable.
-    f.write(kRwGeoMagic5, 8);
+    // ── Baked geometry LODs (v6) ─────────────────────────────────────
+    // Five progressively QEM-decimated levels (same c_target_lod_ratio
+    // cascade the FBX loader builds at load time), baked ONCE here so
+    // the renderer never re-decimates.  Decimated vertices/indices are
+    // appended to the main blobs; lod_ranges records per-level,
+    // per-section index ranges.  Skinned meshes skip this (decimation
+    // would have to carry joints/weights).
+    std::vector<std::vector<glm::uvec2>> lod_ranges;
+    if (!has_skin && !indices.empty() && !sections.empty()) {
+        // level 0 = the section table itself
+        std::vector<std::vector<glm::uvec2>> lvl(1);
+        lvl[0].reserve(sections.size());
+        for (const auto& sec : sections) {
+            lvl[0].push_back(glm::uvec2(sec.first_index,
+                                        sec.index_count));
+        }
+        std::ostringstream lod_log;
+        for (uint32_t l = 1; l <= c_num_lods; ++l) {
+            const auto& src_lvl = lvl.back();
+            // pack the previous level into a local mesh
+            Mesh combined;
+            std::vector<int32_t> combined_ids;
+            std::unordered_map<uint32_t, uint32_t> g2l;
+            size_t total_src_faces = 0;
+            for (size_t si = 0; si < src_lvl.size(); ++si) {
+                const uint32_t i0 = src_lvl[si].x;
+                const uint32_t nn = src_lvl[si].y;
+                total_src_faces += nn / 3;
+                for (uint32_t ii = i0; ii + 2 < i0 + nn; ii += 3) {
+                    Face lf;
+                    for (int k = 0; k < 3; ++k) {
+                        const uint32_t gi = indices[ii + k];
+                        auto [it, ins] = g2l.emplace(
+                            gi, (uint32_t)combined.vertex_data_ptr
+                                    ->size());
+                        if (ins) {
+                            VertexStruct v;
+                            v.position = positions[gi];
+                            v.normal = gi < normals.size()
+                                ? normals[gi]
+                                : glm::vec3(0.0f, 1.0f, 0.0f);
+                            v.uv = (has_uv && gi < uvs.size())
+                                ? uvs[gi] : glm::vec2(0.0f);
+                            combined.vertex_data_ptr->push_back(v);
+                        }
+                        lf.v_indices[k] = it->second;
+                    }
+                    combined.faces_ptr->push_back(lf);
+                    // the per-section walk IS the part id — valid for
+                    // appended LOD ranges too, unlike a face table
+                    combined_ids.push_back((int32_t)si);
+                }
+            }
+            if (total_src_faces < 8) {
+                // nothing sensible left to decimate: repeat the level
+                lvl.push_back(src_lvl);
+                continue;
+            }
+            const size_t target = std::max(
+                (size_t)((double)total_src_faces *
+                         (double)c_target_lod_ratio),
+                (size_t)1);
+            Mesh dec;
+            std::vector<int32_t> dec_ids;
+            decimateMesh(combined, combined_ids, dec, dec_ids, target,
+                         lod_log);
+            if (!dec.faces_ptr || dec.faces_ptr->empty()) {
+                lvl.push_back(src_lvl);
+                continue;
+            }
+            // append decimated vertices to the global arrays
+            const uint32_t base_v = (uint32_t)positions.size();
+            for (const auto& v : *dec.vertex_data_ptr) {
+                positions.push_back(v.position);
+                normals.push_back(v.normal);
+                if (has_uv) uvs.push_back(v.uv);
+            }
+            // bucket faces per section, emit in section order
+            std::vector<std::vector<int>> per_sec(sections.size());
+            for (int fi = 0; fi < (int)dec.faces_ptr->size(); ++fi) {
+                per_sec[dec_ids[fi]].push_back(fi);
+            }
+            std::vector<glm::uvec2> dst_lvl(sections.size());
+            for (size_t si = 0; si < sections.size(); ++si) {
+                dst_lvl[si].x = (uint32_t)indices.size();
+                dst_lvl[si].y = (uint32_t)(per_sec[si].size() * 3);
+                for (int fi : per_sec[si]) {
+                    const auto& fc = dec.faces_ptr->at(fi);
+                    indices.push_back(base_v + fc.v_indices[0]);
+                    indices.push_back(base_v + fc.v_indices[1]);
+                    indices.push_back(base_v + fc.v_indices[2]);
+                }
+                if (dst_lvl[si].y == 0) dst_lvl[si] = glm::uvec2(0, 0);
+            }
+            lvl.push_back(std::move(dst_lvl));
+        }
+        lod_ranges.assign(lvl.begin() + 1, lvl.end());
+    }
+    const bool has_lods = !lod_ranges.empty();
+
+    // v6: v5 + baked LODs (flags bit5); older files remain readable.
+    f.write(kRwGeoMagic6, 8);
     wrPod(f, (uint32_t)positions.size());
     wrPod(f, (uint32_t)indices.size());
     // bit3 (8u) = second skin set blobs (8-bone debug), bit4 (16u) =
-    // second closeness blob.  Readers older than the 8-bone path ignore
-    // unknown bits only if they're clear — engine and bake ship together.
+    // second closeness blob, bit5 (32u) = baked LOD table.  Readers
+    // older than a bit ignore it only if it's clear — engine and bake
+    // ship together.
     wrPod(f, (uint32_t)((has_uv ? 1u : 0u) | (has_skin ? 2u : 0u) |
                         (has_close ? 4u : 0u) | (has_skin1 ? 8u : 0u) |
-                        (has_close1 ? 16u : 0u)));
+                        (has_close1 ? 16u : 0u) |
+                        (has_lods ? 32u : 0u)));
     // v3: geometry is NODE-LOCAL; this matrix places it in source-world
     // space (standalone consumers apply it; hierarchical renderers compose
     // the rwhier chain instead).
@@ -1634,6 +1742,16 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
         f.write(s.nrm_rel.data(), (std::streamsize)s.nrm_rel.size());
         wrPod(f, (uint32_t)s.mr_rel.size());
         f.write(s.mr_rel.data(), (std::streamsize)s.mr_rel.size());
+    }
+    // LOD table (v6): per decimated level, per section, its index range.
+    if (has_lods) {
+        wrPod(f, (uint32_t)lod_ranges.size());
+        for (const auto& lvl2 : lod_ranges) {
+            for (const auto& r : lvl2) {
+                wrPod(f, r.x);
+                wrPod(f, r.y);
+            }
+        }
     }
     // Skin joint table (v4): per joint, the hierarchy.rwhier node index
     // it binds to + the inverse bind matrix.
@@ -1849,7 +1967,8 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     if (!f) return false;
     char magic[8];
     if (!f.read(magic, 8)) return false;
-    const bool v5 = std::memcmp(magic, kRwGeoMagic5, 8) == 0;
+    const bool v6 = std::memcmp(magic, kRwGeoMagic6, 8) == 0;
+    const bool v5 = std::memcmp(magic, kRwGeoMagic5, 8) == 0 || v6;
     const bool v4 = std::memcmp(magic, kRwGeoMagic4, 8) == 0 || v5;
     const bool v3 = std::memcmp(magic, kRwGeoMagic3, 8) == 0 || v4;
     const bool v2 = std::memcmp(magic, kRwGeoMagic2, 8) == 0;
@@ -1865,6 +1984,7 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     const bool has_close = v4 && (flags & 4u) != 0;   // baked closeness block
     const bool has_skin1  = v4 && (flags & 8u) != 0;  // 8-bone second set
     const bool has_close1 = v4 && (flags & 16u) != 0;
+    const bool has_lods   = v6 && (flags & 32u) != 0; // baked LOD table
 
     // v3+: node-local geometry + the node's world matrix (re-applied below
     // so standalone consumers keep seeing source-world coordinates).
@@ -1914,6 +2034,23 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
         s.first = 0;
         s.count = ic;
         secs.push_back(std::move(s));
+    }
+
+    // LOD table (v6): per decimated level, per section, an index range
+    // into the (already-appended) index blob read below.
+    if (has_lods) {
+        uint32_t lc = 0;
+        if (!rdPod(f, lc) || lc == 0 || lc > 16u) return false;
+        out.lod_ranges.resize(lc);
+        for (uint32_t l = 0; l < lc; ++l) {
+            out.lod_ranges[l].resize(secs.size());
+            for (size_t si = 0; si < secs.size(); ++si) {
+                glm::uvec2 r(0u);
+                if (!rdPod(f, r.x) || !rdPod(f, r.y)) return false;
+                if (r.x + r.y > ic) return false;
+                out.lod_ranges[l][si] = r;
+            }
+        }
     }
 
     // Skin joint table (v4, has_skin).

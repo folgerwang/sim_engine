@@ -37,6 +37,7 @@ extern "C" {
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_vulkan.h"
 #include "game_object/drawable_object.h"  // Details panel reads object transform
+#include "helper/mesh_tool.h"             // c_num_lods (Forced geometry LOD)
 #include "editor_log.h"                    // Output Log panel
 
 #include "renderer/renderer.h"
@@ -2662,6 +2663,25 @@ bool Menu::draw(
             bool hiz_cull = cluster_renderer_->getUseHiZOcclusionCull();
             if (ImGui::Checkbox("Hi-Z Occlusion Cull", &hiz_cull)) {
                 cluster_renderer_->getUseHiZOcclusionCull() = hiz_cull;
+            }
+            ImGui::Separator();
+            // Runtime geometry-LOD override: 0 = full detail (the
+            // default), 1..5 = the baked decimated levels carried by
+            // v6 .rwgeo data (and built at load for FBX assets).
+            // Assets without baked LODs clamp back to full detail.
+            {
+                int geo_lod =
+                    engine::game_object::DrawableObject::forced_geo_lod_;
+                if (ImGui::SliderInt("Forced geometry LOD", &geo_lod, 0,
+                                     (int)engine::helper::c_num_lods)) {
+                    engine::game_object::DrawableObject::
+                        forced_geo_lod_ = geo_lod;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "0 = full detail.  1-5 pick the baked LOD "
+                        "levels stored in .rwgeo data; assets without "
+                        "baked LODs keep rendering full detail.");
             }
             ImGui::Separator();
             const auto& vp = cluster_renderer_->getDebugVP();
@@ -6470,7 +6490,13 @@ void Menu::drawTerrainGenPopup() {
                 terrain_stage_prog_   = prog;
             } else {
                 terrain_lib_status_ = 1;
-                terrain_lib_name_   = stage;
+                // Display name: the STAGE KEY stays "objects" (paths,
+                // fingerprints, progress files all use it) but every
+                // status line and progress overlay reads this string,
+                // and the library is called "room decals" in the UI.
+                terrain_lib_name_   =
+                    (std::string(stage) == "objects") ? "room decals"
+                                                      : stage;
                 terrain_lib_prog_   = prog;
             }
         };
@@ -9226,6 +9252,15 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
             md.positions.empty() || md.indices.empty()) {
             continue;
         }
+        // v6 bakes: merge LOD 0 only (decimated levels are appended
+        // after the section spans).
+        if (!md.lod_ranges.empty()) {
+            uint32_t lod0_end = 0;
+            for (const auto& sec : md.sections)
+                lod0_end = std::max(lod0_end,
+                                    sec.first_index + sec.index_count);
+            if (lod0_end < md.indices.size()) md.indices.resize(lod0_end);
+        }
         // Raw-data skin detection: any baked object carrying a skin table /
         // per-vertex joints makes the whole group a skeleton mesh.
         if (!md.skin_joint_nodes.empty() || !md.joints.empty())
@@ -9565,6 +9600,15 @@ void Menu::buildRwGeoPreview(const std::string& rwgeo_path,
         EditorLog::get().push(
             "[preview] baked geometry unreadable: " + rwgeo_path);
         return;
+    }
+    // v6 bakes append decimated LOD indices after the full-detail
+    // sections — the preview shows LOD 0 only.
+    if (!data.lod_ranges.empty()) {
+        uint32_t lod0_end = 0;
+        for (const auto& sec : data.sections)
+            lod0_end = std::max(lod0_end,
+                                sec.first_index + sec.index_count);
+        if (lod0_end < data.indices.size()) data.indices.resize(lod0_end);
     }
     dbg_preview_skinned_ = !data.joints.empty();
     engine::helper::MeshPreviewPayload p;

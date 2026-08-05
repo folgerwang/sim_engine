@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstddef>   // offsetof (indirect-command LOD rewrite)
 #include <cstdlib>        // std::strtoll, for the plant-LOD node-name parse
 #include <iostream>
 #include <fstream>
@@ -4262,12 +4263,12 @@ static void drawMesh(
         }
         cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
-        // TODO: replace with distance-based LOD selection.
-        // cur_lod=1 was hardcoded which caused LOD 1 (30% faces) to always
-        // render regardless of camera distance, producing stretched polygons
-        // on close surfaces.  Use LOD 0 (original quality) until a proper
-        // distance-based selector is wired up.
-        uint32_t cur_lod = 0;
+        // Geometry LOD: 0 (full detail) unless the runtime override
+        // asks for a baked level; clamped to the slots this primitive
+        // actually carries so assets without LODs stay full-detail.
+        uint32_t cur_lod = (uint32_t)std::max(
+            0, std::min((int32_t)ego::DrawableObject::forced_geo_lod_,
+                        (int32_t)prim.index_desc_.size() - 1));
         const auto& index_buffer_view =
             drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
@@ -5601,6 +5602,7 @@ bool loadPcgWorldManifest(
 
 // static member definition.
 uint32_t DrawableObject::max_alloc_game_objects_in_buffer = kNumDrawableInstance;
+int32_t  DrawableObject::forced_geo_lod_ = 0;   // 0 = full detail
 
 // Engine-wide material classification counters — declared on
 // DrawableObject so VirtualTextureManager can pull them for the
@@ -7084,6 +7086,47 @@ void DrawableObject::updateIndirectDrawBuffer(
         return;
     }
 
+    // ── Runtime geometry-LOD override ────────────────────────────────
+    // The CPU fill at load wrote LOD-0 index counts into the indirect
+    // commands.  When the runtime override moves, rewrite each
+    // primitive's index_count in place (vkCmdUpdateBuffer) so it stays
+    // consistent with the record-time index-buffer offset, which is
+    // derived from the SAME clamped value in the draw path.  Runs for
+    // baked drawables too — this rewrite is the only writer their
+    // commands ever see after load, so counts remain final.
+    if (object_->applied_geo_lod_ != forced_geo_lod_) {
+        object_->applied_geo_lod_ = forced_geo_lod_;
+        cmd_buf->addBufferBarrier(
+            object_->indirect_draw_cmd_.buffer,
+            { SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+              SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) },
+            { SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+              SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) },
+            object_->indirect_draw_cmd_.buffer->getSize());
+        for (const auto& mesh : object_->meshes_) {
+            for (const auto& prim : mesh.primitives_) {
+                const uint32_t cur_lod = (uint32_t)std::max(
+                    0, std::min(forced_geo_lod_,
+                                (int32_t)prim.index_desc_.size() - 1));
+                const uint32_t cnt = (uint32_t)
+                    prim.index_desc_[cur_lod].index_count;
+                cmd_buf->updateBuffer(
+                    object_->indirect_draw_cmd_.buffer,
+                    prim.indirect_draw_cmd_ofs_ +
+                        offsetof(renderer::DrawIndexedIndirectCommand,
+                                 index_count),
+                    sizeof(uint32_t), &cnt);
+            }
+        }
+        cmd_buf->addBufferBarrier(
+            object_->indirect_draw_cmd_.buffer,
+            { SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+              SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) },
+            { SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+              SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) },
+            object_->indirect_draw_cmd_.buffer->getSize());
+    }
+
     // ── Baked GPU instancing opt-out ─────────────────────────────────
     // update_gltf_indirect_draw.comp stamps `instance_count =
     // kNumDrawableInstance` over EVERY primitive command unconditionally.
@@ -7624,7 +7667,6 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     // clear instance count = 0;
     indirect_draw_cmd_buffer[0] = 0;
     uint32_t prim_idx = 0;
-    uint32_t cur_lod = 0;
     int32_t mesh_idx = 0;
     for (const auto& mesh : drawable_object->meshes_) {
         // ── Baked GPU instancing ─────────────────────────────────────
@@ -7657,6 +7699,9 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
             }
         }
         for (const auto& prim : mesh.primitives_) {
+            // Load-time fill is LOD 0; the runtime override path in
+            // updateIndirectDrawBuffer rewrites counts when it moves.
+            const uint32_t cur_lod = 0;
             indirect_draw_buf[prim_idx].first_index = 0;
             indirect_draw_buf[prim_idx].first_instance = first_instance;
             indirect_draw_buf[prim_idx].index_count =
@@ -7859,10 +7904,19 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             ? md.normals[i] : glm::vec3(0.0f, 1.0f, 0.0f);
         v.uv = (i < md.uvs.size()) ? md.uvs[i] : glm::vec2(0.0f);
     }
+    // LOD0 span only: v6 bakes append the decimated levels' indices
+    // after the full-detail sections, and the CPU-side mesh (cluster
+    // sidecar, collision, selection) must see full detail exactly once.
+    uint32_t lod0_index_end = 0;
+    for (const auto& sec0 : md.sections) {
+        lod0_index_end = std::max(lod0_index_end,
+                                  sec0.first_index + sec0.index_count);
+    }
     const uint32_t index_count =
         static_cast<uint32_t>(md.indices.size());
-    cpu_mesh.faces_ptr->reserve(index_count / 3);
-    for (uint32_t i = 0; i + 2 < index_count; i += 3) {
+    const uint32_t cpu_index_end = std::min(index_count, lod0_index_end);
+    cpu_mesh.faces_ptr->reserve(cpu_index_end / 3);
+    for (uint32_t i = 0; i + 2 < cpu_index_end; i += 3) {
         cpu_mesh.faces_ptr->emplace_back(
             md.indices[i], md.indices[i + 1], md.indices[i + 2]);
     }
@@ -8211,15 +8265,31 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         primitive_info.attribute_descs_.push_back(attribute);
         dst_binding++;
 
-        // indices — no baked LODs: every LOD slot points at the same
-        // full-resolution section range.
+        // indices — v6 bakes carry per-section LOD ranges; slot 0 is
+        // the full-detail section range, slots 1..c_num_lods the baked
+        // decimated levels.  A level that lost the section entirely
+        // (0, 0) reuses the previous level's range, and files baked
+        // before v6 fall back to full detail in every slot.
+        const bool baked_lods =
+            !md.lod_ranges.empty() &&
+            md.lod_ranges[0].size() == num_sections;
         primitive_info.index_desc_.resize(helper::c_num_lods + 1);
+        uint32_t lod_first = sec.first_index;
+        uint32_t lod_count = sec.index_count;
         for (uint32_t i_lod = 0; i_lod < helper::c_num_lods + 1; i_lod++) {
+            if (baked_lods && i_lod > 0 &&
+                i_lod - 1 < md.lod_ranges.size()) {
+                const auto& r = md.lod_ranges[i_lod - 1][si];
+                if (r.y > 0) {
+                    lod_first = r.x;
+                    lod_count = r.y;
+                }
+            }
             primitive_info.index_desc_[i_lod].buffer_view = indice_view_idx;
             primitive_info.index_desc_[i_lod].offset =
-                sec.first_index * index_bytes_count;
+                lod_first * index_bytes_count;
             primitive_info.index_desc_[i_lod].index_type = index_type;
-            primitive_info.index_desc_[i_lod].index_count = sec.index_count;
+            primitive_info.index_desc_[i_lod].index_count = lod_count;
         }
 
         // Per-primitive bbox from the section's own vertices.

@@ -569,6 +569,10 @@ struct DrawableData {
     std::unordered_map<int32_t, std::pair<uint32_t, uint32_t>>
                                 mesh_instance_range_;
     bool                        has_baked_instances_ = false;
+    // Last geometry-LOD override the indirect commands were written
+    // for; updateIndirectDrawBuffer rewrites per-prim index counts
+    // when DrawableObject::forced_geo_lod_ moves away from this.
+    int32_t                     applied_geo_lod_ = 0;
 
     // ── Plant LOD band selection ─────────────────────────────────────
     // NOT a staging slot, unlike m_clutter_fade_*_m_ above, and the
@@ -765,6 +769,15 @@ class DrawableObject {
     static uint32_t max_alloc_game_objects_in_buffer;
 
 public:
+    // ── Runtime geometry-LOD override ─────────────────────────────────
+    // Which baked LOD level the CPU draw paths bind: 0 (default) = full
+    // detail; 1..c_num_lods = the progressively decimated levels baked
+    // into v6 .rwgeo files (and built at load for FBX).  Clamped per
+    // primitive to the slots it actually has, so assets without baked
+    // LODs simply keep rendering full detail.  Tweaked from the editor
+    // UI ("Forced geometry LOD").
+    static int32_t forced_geo_lod_;
+
     // ── Engine-wide material classification counters ──────────────────
     // Maintained by computeEffectiveOpaqueForMaterials whenever a new
     // mesh's materials are scanned.  Counts are CUMULATIVE — every load

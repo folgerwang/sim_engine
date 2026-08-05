@@ -76,6 +76,16 @@ struct ModelPreviewData {
     // complete data a native skinned renderer needs.
     std::vector<int32_t>        skin_joint_nodes;
     std::vector<glm::mat4>      skin_inverse_bind;
+
+    // ── Baked geometry LODs (v6 .rwgeo, non-skinned only) ─────────────
+    // lod_ranges[l][s] = (first_index, index_count) of section s at LOD
+    // level l+1 — five progressively decimated levels whose extra
+    // vertices and indices are already appended to positions/normals/
+    // uvs/indices at bake time.  LOD 0 is the section table itself.
+    // Empty for files baked before v6 (renderers fall back to full
+    // detail in every LOD slot).  A (0, 0) range means the level lost
+    // that section entirely; consumers reuse the previous level's range.
+    std::vector<std::vector<glm::uvec2>> lod_ranges;
 };
 
 // CPU-only preview load (Debug Display): fills world-space triangles +
