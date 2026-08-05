@@ -7058,11 +7058,46 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                       name.c_str());
                         rename_open_ = true;
                     }
-                    if (is_content && ImGui::MenuItem(multi
+                    // Clear empties a FOLDER but keeps the folder, so it
+                    // is offered on directory tiles only — the same action
+                    // the folder tree already carries, reachable from the
+                    // grid where the folder is actually being looked at.
+                    // Single selection only: the confirm modal counts and
+                    // reports ONE target, and a multi-folder clear that
+                    // silently emptied the rest is not a thing to offer
+                    // behind a dialog that names one.
+                    if (is_dir && !multi && ImGui::MenuItem("Clear")) {
+                        clear_target_ = item_path;
+                        clear_open_ = true;   // confirmation modal, below
+                    }
+                    if (is_dir && !multi && ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Delete every item inside this folder\n"
+                            "(the folder itself is kept)");
+                    // Delete is offered in BOTH browsers.  It was
+                    // Content-only, which left the File Browser — the one
+                    // panel that shows raw project files, and so the one
+                    // place a stray file is noticed — with no way to remove
+                    // anything it displayed.  Nothing below is content
+                    // specific: deleteOne() in the confirm dialog already
+                    // handles a plain file, a directory, and a model's
+                    // rwmeta / exploded / thumbnail sidecars alike, and the
+                    // grid re-reads the directory every frame, so a removed
+                    // tile disappears without a cache to invalidate.
+                    if (ImGui::MenuItem(multi
                             ? (std::string("Delete (") +
                                std::to_string(sel_n) + ")").c_str()
                             : "Delete")) {
                         delete_paths_.assign(sel_set.begin(), sel_set.end());
+                        // Tell the confirm dialog WHAT it is about to remove.
+                        // delete_is_dir_ was never set on this path, so the
+                        // "everything inside it will be removed" warning
+                        // showed whatever the previous delete left behind —
+                        // a file could be confirmed under a folder warning,
+                        // and a folder under a file one.
+                        std::error_code dd_ec;
+                        delete_is_dir_ = (sel_n == 1) &&
+                            fs::is_directory(sel_set[0], dd_ec);
                         delete_open_ = true;
                     }
                     ImGui::EndPopup();
