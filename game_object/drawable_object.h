@@ -1398,5 +1398,36 @@ public:
         const std::string& input_filename);
 };
 
+// ── PCG world-manifest instance overrides ───────────────────────────
+// The terrain apply reads <map>_pcg_world.json and, before importing a
+// sample LIBRARY glb (houses / plants / game_objects), registers the
+// manifest's per-node instance transforms here keyed by the library
+// file name.  The glTF loader consumes the entry in
+// bakeInstanceTransforms: nodes named in the map draw at the manifest
+// transforms instead of their sample-sheet slot, and nodes NOT named
+// are hidden — the library becomes the level's placed content, linked
+// by node name, with no re-baked geometry in between.
+struct PcgInstanceOverride {
+    std::vector<float> t;   // 3 floats per instance
+    std::vector<float> r;   // 4 floats per instance (xyzw quaternion)
+    std::vector<float> s;   // 3 floats per instance
+};
+// key: node name, matched exactly or as a "<key>_" prefix
+using PcgOverrideMap = std::map<std::string, PcgInstanceOverride>;
+void setPcgInstanceOverrides(const std::string& asset_file_name,
+                             PcgOverrideMap overrides);
+// consume (and erase) the registered map for one asset; empty if none
+PcgOverrideMap takePcgInstanceOverrides(
+    const std::string& asset_file_name);
+// Parse <map>_pcg_world.json (the placement stage's level manifest).
+// out: library key ("houses"/"plants"/"objects") -> (library glb path,
+// node-name -> instance transforms).  Returns false on any parse
+// failure; implemented beside the glTF loader so the vendored JSON
+// parser is reused rather than re-included elsewhere.
+bool loadPcgWorldManifest(
+    const std::string& manifest_path,
+    std::map<std::string, std::pair<std::string, PcgOverrideMap>>&
+        out_by_library);
+
 } // namespace game_object
 } // namespace engine

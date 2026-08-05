@@ -6517,24 +6517,31 @@ void Menu::drawTerrainGenPopup() {
             ImGui::PopStyleColor();
         };
 
-        const float sb_w = 152.0f;
+        // Each stage button sizes itself to ITS OWN label plus a
+        // small margin — long labels get long buttons, short ones
+        // stay compact, and no text is ever clipped.
+        auto stage_button = [](const char* label) {
+            const ImVec2 ts = ImGui::CalcTextSize(label);
+            return ImGui::Button(label,
+                                 ImVec2(ts.x + 26.0f, ts.y + 14.0f));
+        };
         const bool  world_busy = (terrain_stage_status_ == 1);
         if (world_busy) ImGui::BeginDisabled();
-        if (ImGui::Button("1. ML maps", ImVec2(sb_w, 0)))
+        if (stage_button("1. ML maps"))
             launch_stage("maps", true);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("FLUX orthophoto -> heightmap, albedo, "
                               "segmentation, terrain mesh.  Uses the prompt "
                               "box above.");
         ImGui::SameLine();
-        if (ImGui::Button("2. Roads & bridges", ImVec2(sb_w, 0)))
+        if (stage_button("2. Roads & bridges"))
             launch_stage("roads", true);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Road splines from the segmentation, limited "
                               "to a drivable grade, with bridge meshes over "
                               "the drops that would otherwise be a cliff.");
         ImGui::SameLine();
-        if (ImGui::Button("3. Place houses & plants", ImVec2(sb_w + 44.0f, 0)))
+        if (stage_button("3. Place houses & plants"))
             launch_stage("place", true);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Places the libraries on the graded ground.  "
@@ -6559,27 +6566,28 @@ void Menu::drawTerrainGenPopup() {
         ImGui::TextDisabled("Sample libraries (world-independent)");
         const bool lib_busy = (terrain_lib_status_ == 1);
         if (lib_busy) ImGui::BeginDisabled();
-        if (ImGui::Button("House samples", ImVec2(sb_w, 0)))
+        if (stage_button("House samples"))
             launch_stage("houses", false);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Builds every house archetype (style x "
                               "footprint x storeys x variant) into "
                               "assets/terrain/lib/houses.glb.");
         ImGui::SameLine();
-        if (ImGui::Button("Plant samples", ImVec2(sb_w, 0)))
+        if (stage_button("Plant samples"))
             launch_stage("plants", false);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Builds the plant sample sheet (every species "
                               "at several sizes) into "
                               "assets/terrain/lib/plants.glb.");
         ImGui::SameLine();
-        if (ImGui::Button("Game objects", ImVec2(sb_w, 0)))
+        if (stage_button("Room decals"))
             launch_stage("objects", false);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Builds the game object sample sheet "
-                              "(tables, chairs, beds, drawings, closets, "
-                              "drawers - 10 variants each) into "
-                              "assets/terrain/lib/game_objects.glb.");
+            ImGui::SetTooltip("Builds the room decal sample sheet "
+                              "(furniture, kitchenware, vases, curtains, "
+                              "windows, doors, lamps, ceiling lamps and "
+                              "switches - 20 variants each) into "
+                              "assets/terrain/lib/room_decals.glb.");
         if (lib_busy) ImGui::EndDisabled();
         poll_stage(terrain_lib_status_, terrain_lib_name_,
                    terrain_lib_prog_);

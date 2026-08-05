@@ -28,6 +28,8 @@
 
 // gltf
 #include "tiny_gltf.h"
+#include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp (world-manifest parse)
+#include <cmath>
 #include "helper/tiny_mtx2.h"
 
 // fbx
@@ -2886,7 +2888,38 @@ static void selectPlantLodBands(
 // in loadGltfModel, so this cannot be deferred to buffer-creation time.
 static void bakeInstanceTransforms(
     const tinygltf::Model& model,
-    std::shared_ptr<ego::DrawableData>& drawable_object) {
+    std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::string& input_filename = std::string()) {
+
+    // World-manifest overrides for this asset, if the terrain apply
+    // registered any (keyed by bare file name so relative/absolute
+    // spellings of the same library agree).
+    ego::PcgOverrideMap pcg_over;
+    if (!input_filename.empty()) {
+        pcg_over = ego::takePcgInstanceOverrides(
+            std::filesystem::path(input_filename).filename().string());
+    }
+    const bool has_over = !pcg_over.empty();
+    const auto find_over =
+        [&pcg_over](const std::string& node_name)
+        -> const ego::PcgInstanceOverride* {
+        auto it = pcg_over.find(node_name);
+        if (it != pcg_over.end()) return &it->second;
+        // longest "<key>_" prefix match (archetype / species keys
+        // cover every _lodtile_ band node of that sample)
+        const ego::PcgInstanceOverride* best = nullptr;
+        size_t best_len = 0;
+        for (const auto& kv : pcg_over) {
+            const std::string pref = kv.first + "_";
+            if (node_name.size() > pref.size() &&
+                node_name.compare(0, pref.size(), pref) == 0 &&
+                pref.size() > best_len) {
+                best = &kv.second;
+                best_len = pref.size();
+            }
+        }
+        return best;
+    };
 
     bool any = false;
     for (const auto& n : drawable_object->nodes_) {
@@ -2937,12 +2970,30 @@ static void bakeInstanceTransforms(
         }
 
         std::vector<float> t, r, s;
-        const bool has_t =
+        bool has_t =
             readFloatAccessor(model, node.inst_translation_acc_, 3, t);
-        const bool has_r =
+        bool has_r =
             readFloatAccessor(model, node.inst_rotation_acc_, 4, r);
-        const bool has_s =
+        bool has_s =
             readFloatAccessor(model, node.inst_scale_acc_, 3, s);
+        if (has_over) {
+            const ego::PcgInstanceOverride* ov = find_over(node.name_);
+            if (ov != nullptr) {
+                // manifest transforms REPLACE the sample-sheet slot
+                t = ov->t; r = ov->r; s = ov->s;
+                has_t = !t.empty();
+                has_r = !r.empty();
+                has_s = !s.empty();
+            } else {
+                // a sample the manifest never placed: hide it (one
+                // zero-scale instance keeps the node's plumbing alive
+                // without a visible triangle)
+                t.assign({0.f, -10000.f, 0.f});
+                r.assign({0.f, 0.f, 0.f, 1.f});
+                s.assign({0.f, 0.f, 0.f});
+                has_t = has_r = has_s = true;
+            }
+        }
 
         // Instance count is whichever attribute is present; the spec
         // requires all present attributes to agree, so take the max and
@@ -2956,6 +3007,8 @@ static void bakeInstanceTransforms(
             continue;
         }
 
+        // Overrides carry per-node data, so the accessor-triple memo
+        // below must not fold two overridden nodes together.
         // If another node already baked this exact triple, point at its
         // range instead of appending a second copy.  `bake` false from
         // here down means "reuse the rows, but still do everything that
@@ -2968,12 +3021,14 @@ static void bakeInstanceTransforms(
                                         node.inst_rotation_acc_,
                                         node.inst_scale_acc_};
         const auto memo_it = range_memo.find(key);
-        const bool bake = (memo_it == range_memo.end());
+        const bool bake = has_over || (memo_it == range_memo.end());
         if (bake) {
             node.inst_offset_ = static_cast<uint32_t>(
                 drawable_object->baked_instances_.size());
             node.inst_count_ = static_cast<uint32_t>(count);
-            range_memo[key] = { node.inst_offset_, node.inst_count_ };
+            if (!has_over) {
+                range_memo[key] = { node.inst_offset_, node.inst_count_ };
+            }
         } else {
             node.inst_offset_ = memo_it->second.first;
             node.inst_count_ = memo_it->second.second;
@@ -5462,6 +5517,88 @@ static std::shared_ptr<renderer::PipelineLayout> createInstanceBufferPipelineLay
 
 namespace game_object {
 
+// ── PCG world-manifest instance overrides (see drawable_object.h) ──────
+static std::mutex s_pcg_override_mutex;
+static std::map<std::string, PcgOverrideMap>& pcgOverrideRegistry() {
+    static std::map<std::string, PcgOverrideMap> reg;
+    return reg;
+}
+void setPcgInstanceOverrides(const std::string& asset_file_name,
+                             PcgOverrideMap overrides) {
+    std::lock_guard<std::mutex> lk(s_pcg_override_mutex);
+    pcgOverrideRegistry()[asset_file_name] = std::move(overrides);
+}
+PcgOverrideMap takePcgInstanceOverrides(
+    const std::string& asset_file_name) {
+    std::lock_guard<std::mutex> lk(s_pcg_override_mutex);
+    auto& reg = pcgOverrideRegistry();
+    auto it = reg.find(asset_file_name);
+    if (it == reg.end()) return {};
+    PcgOverrideMap out = std::move(it->second);
+    reg.erase(it);
+    return out;
+}
+bool loadPcgWorldManifest(
+    const std::string& manifest_path,
+    std::map<std::string, std::pair<std::string, PcgOverrideMap>>&
+        out_by_library) {
+    using nlohmann::json;
+    std::ifstream f(manifest_path, std::ios::binary);
+    if (!f) return false;
+    json doc;
+    try {
+        f >> doc;
+    } catch (...) {
+        return false;
+    }
+    if (!doc.contains("libraries") || !doc.contains("instances")) {
+        return false;
+    }
+    const auto& libs = doc["libraries"];
+    const auto& insts = doc["instances"];
+    for (auto it = insts.begin(); it != insts.end(); ++it) {
+        const std::string lib_key = it.key();
+        if (!libs.contains(lib_key)) continue;
+        const auto& cols = it.value();
+        if (!cols.contains("nodes") || !cols.contains("ni") ||
+            !cols.contains("t") || !cols.contains("yaw") ||
+            !cols.contains("s")) {
+            continue;
+        }
+        const auto& names = cols["nodes"];
+        const auto& ni = cols["ni"];
+        const auto& t = cols["t"];
+        const auto& yaw = cols["yaw"];
+        const auto& sc = cols["s"];
+        const size_t n = ni.size();
+        if (yaw.size() != n || t.size() != n * 3 || sc.size() != n * 3) {
+            continue;
+        }
+        PcgOverrideMap m;
+        for (size_t i = 0; i < n; ++i) {
+            const size_t nidx = ni[i].get<size_t>();
+            if (nidx >= names.size()) continue;
+            auto& ov = m[names[nidx].get<std::string>()];
+            ov.t.push_back(t[i * 3 + 0].get<float>());
+            ov.t.push_back(t[i * 3 + 1].get<float>());
+            ov.t.push_back(t[i * 3 + 2].get<float>());
+            const float half = yaw[i].get<float>() * 0.5f;
+            ov.r.push_back(0.0f);
+            ov.r.push_back(std::sin(half));
+            ov.r.push_back(0.0f);
+            ov.r.push_back(std::cos(half));
+            ov.s.push_back(sc[i * 3 + 0].get<float>());
+            ov.s.push_back(sc[i * 3 + 1].get<float>());
+            ov.s.push_back(sc[i * 3 + 2].get<float>());
+        }
+        if (!m.empty()) {
+            out_by_library[lib_key] = {libs[lib_key].get<std::string>(),
+                                       std::move(m)};
+        }
+    }
+    return !out_by_library.empty();
+}
+
 // static member definition.
 uint32_t DrawableObject::max_alloc_game_objects_in_buffer = kNumDrawableInstance;
 
@@ -7453,7 +7590,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     setupModel(model, drawable_object);
     // Must be here, not at buffer-creation time: `model` is a stack local
     // and the instance accessors live in its buffers.
-    bakeInstanceTransforms(model, drawable_object);
+    bakeInstanceTransforms(model, drawable_object, input_filename);
     for (auto& scene : drawable_object->scenes_) {
         for (auto& node : scene.nodes_) {
             calculateBbox(drawable_object, scene.nodes_[0], glm::mat4(1.0f), scene.bbox_min_, scene.bbox_max_);
