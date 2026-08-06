@@ -113,6 +113,59 @@ listModelTextureDependencies(const std::string& path);
 // them source-form instead.
 bool modelHasSkin(const std::string& path);
 
+// ── Instanced groups (.rwinst) ───────────────────────────────────────────
+// The native representation of an EXT_mesh_gpu_instancing file: the
+// MESHES bake to ordinary .rwgeo (one per renderable node, stored once,
+// LOD levels included) and the INSTANCES bake to one instances.rwinst
+// beside them — transform tables plus, per node, which table triple and
+// which mesh ordinal it uses.  Tables are stored deduplicated exactly as
+// the glTF stored shared accessors (every band node of a tile points at
+// the same transforms), so the runtime's shared-range memo keeps working
+// and VRAM is not paid three times.  Node names ride along because the
+// engine keys behaviour off them (_lodtile_ bands, _pgate_ gates,
+// world-manifest binding, the physical-prop registry).
+struct RwInstArray {
+    int                comp = 3;    // floats per element: 3 (T/S) or 4 (R)
+    std::vector<float> data;        // comp * element_count floats
+};
+struct RwInstNode {
+    std::string name;               // source node name, behaviours intact
+    int32_t     mesh_ordinal = -1;  // objects/NNN_*.rwgeo of this group
+    int32_t     t_idx = -1;         // indices into the array table;
+    int32_t     r_idx = -1;         // -1 = attribute absent (identity)
+    int32_t     s_idx = -1;
+};
+
+// Read the instancing data out of a glTF/GLB: every node with a mesh is
+// enumerated in the SAME order as listModelSubObjects / the bake (so
+// mesh_ordinal lines up with the NNN_ rwgeo files), and shared accessors
+// dedupe to shared table indices.  Returns false when the file carries
+// no EXT_mesh_gpu_instancing at all.
+bool readGpuInstancing(const std::string& path,
+                       std::vector<RwInstArray>& arrays,
+                       std::vector<RwInstNode>& nodes);
+
+// instances.rwinst io.  Format: "RWINST01", u32 array_count,
+// per array { u32 comp, u32 count, f32 data[comp*count] },
+// u32 node_count, per node { u32 name_len, name bytes, i32 mesh_ordinal,
+// i32 t_idx, i32 r_idx, i32 s_idx }.  Little-endian, no padding.
+bool writeRwInst(const std::string& path,
+                 const std::vector<RwInstArray>& arrays,
+                 const std::vector<RwInstNode>& nodes);
+bool loadRwInst(const std::string& path,
+                std::vector<RwInstArray>& arrays,
+                std::vector<RwInstNode>& nodes);
+
+// True when the model uses EXT_mesh_gpu_instancing (glTF only).  Such a
+// file stores each mesh ONCE plus per-instance transforms — the
+// generated tree/house/library GLBs are built this way — and the static
+// render-ready bake would either drop the instances or explode every
+// node into its own object, so the import keeps these as managed GLB
+// copies instead.  Deliberately a CHEAP HEADER SCAN (the extensionsUsed
+// list lives in the GLB's JSON chunk), never a full parse: the files
+// this question is asked about run to gigabytes.
+bool modelHasGpuInstancing(const std::string& path);
+
 // All external files the model needs to load from a copied location:
 // listModelTextureDependencies PLUS (for .gltf) the binary buffer files
 // (.bin).  Same {dst_relative, src_absolute} pair convention.

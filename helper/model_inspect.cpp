@@ -1065,6 +1065,231 @@ bool modelHasSkin(const std::string& path) {
     return false;
 }
 
+// ── Instanced groups: glTF -> tables, and instances.rwinst io ────────────
+namespace {
+
+// Decode one float accessor (VEC3/VEC4, float32, strided or tight) into
+// `out`.  Mirrors the runtime loader's reader; local copy because that
+// one lives (static) in drawable_object.cpp.
+bool rwiReadAccessor(const tinygltf::Model& model, int acc_idx,
+                     int expect_components, std::vector<float>& out) {
+    if (acc_idx < 0 || acc_idx >= (int)model.accessors.size()) return false;
+    const auto& acc = model.accessors[acc_idx];
+    if (acc.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) return false;
+    const int comp = tinygltf::GetNumComponentsInType(acc.type);
+    if (comp != expect_components) return false;
+    if (acc.bufferView < 0 ||
+        acc.bufferView >= (int)model.bufferViews.size()) return false;
+    const auto& view = model.bufferViews[acc.bufferView];
+    if (view.buffer < 0 || view.buffer >= (int)model.buffers.size())
+        return false;
+    const auto& buf = model.buffers[view.buffer];
+    const size_t elem_size = sizeof(float) * (size_t)comp;
+    const size_t stride = view.byteStride ? view.byteStride : elem_size;
+    const size_t base = view.byteOffset + acc.byteOffset;
+    if (base + (acc.count ? (acc.count - 1) * stride + elem_size : 0) >
+        buf.data.size()) return false;
+    out.resize(acc.count * (size_t)comp);
+    for (size_t i = 0; i < acc.count; ++i) {
+        std::memcpy(&out[i * comp], buf.data.data() + base + i * stride,
+                    elem_size);
+    }
+    return true;
+}
+
+int rwiAccessorOf(const tinygltf::Node& node, const char* attr) {
+    const auto ext = node.extensions.find("EXT_mesh_gpu_instancing");
+    if (ext == node.extensions.end() || !ext->second.IsObject()) return -1;
+    if (!ext->second.Has("attributes")) return -1;
+    const auto& attrs = ext->second.Get("attributes");
+    if (!attrs.IsObject() || !attrs.Has(attr)) return -1;
+    const auto& v = attrs.Get(attr);
+    return v.IsInt() ? v.Get<int>() : -1;
+}
+
+}  // namespace
+
+bool readGpuInstancing(const std::string& path,
+                       std::vector<RwInstArray>& arrays,
+                       std::vector<RwInstNode>& nodes) {
+    arrays.clear();
+    nodes.clear();
+    const std::string ext = lowerExt(path);
+    if (ext != ".gltf" && ext != ".glb") return false;
+    tinygltf::Model    model;
+    tinygltf::TinyGLTF loader;
+    std::string err, warn;
+    const bool ok = (ext == ".glb")
+        ? loader.LoadBinaryFromFile(&model, &err, &warn, path)
+        : loader.LoadASCIIFromFile(&model, &err, &warn, path);
+    if (!ok) return false;
+
+    // accessor index -> table index, so shared accessors stay shared
+    std::unordered_map<int, int> memo;
+    auto tableOf = [&](int acc_idx, int comp) -> int {
+        if (acc_idx < 0) return -1;
+        auto it = memo.find(acc_idx);
+        if (it != memo.end()) return it->second;
+        RwInstArray a;
+        a.comp = comp;
+        if (!rwiReadAccessor(model, acc_idx, comp, a.data)) {
+            memo.emplace(acc_idx, -1);
+            return -1;
+        }
+        const int idx = (int)arrays.size();
+        arrays.push_back(std::move(a));
+        memo.emplace(acc_idx, idx);
+        return idx;
+    };
+
+    bool any = false;
+    int ordinal = 0;
+    // model.nodes in index order, counting nodes WITH a mesh — the same
+    // enumeration listModelSubObjects and the bake use, so mesh_ordinal
+    // matches the NNN_ prefix of the baked .rwgeo files.
+    for (size_t ni = 0; ni < model.nodes.size(); ++ni) {
+        const auto& n = model.nodes[ni];
+        if (n.mesh < 0) continue;
+        const int my_ordinal = ordinal++;
+        const int t_acc = rwiAccessorOf(n, "TRANSLATION");
+        const int r_acc = rwiAccessorOf(n, "ROTATION");
+        const int s_acc = rwiAccessorOf(n, "SCALE");
+        if (t_acc < 0 && r_acc < 0 && s_acc < 0) continue;
+        RwInstNode out;
+        out.name = n.name;
+        out.mesh_ordinal = my_ordinal;
+        out.t_idx = tableOf(t_acc, 3);
+        out.r_idx = tableOf(r_acc, 4);
+        out.s_idx = tableOf(s_acc, 3);
+        if (out.t_idx < 0 && out.r_idx < 0 && out.s_idx < 0) continue;
+        nodes.push_back(std::move(out));
+        any = true;
+    }
+    return any;
+}
+
+bool writeRwInst(const std::string& path,
+                 const std::vector<RwInstArray>& arrays,
+                 const std::vector<RwInstNode>& nodes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write("RWINST01", 8);
+    auto w32 = [&f](uint32_t v) { f.write((const char*)&v, 4); };
+    auto wi32 = [&f](int32_t v) { f.write((const char*)&v, 4); };
+    w32((uint32_t)arrays.size());
+    for (const auto& a : arrays) {
+        w32((uint32_t)a.comp);
+        const uint32_t count =
+            a.comp > 0 ? (uint32_t)(a.data.size() / a.comp) : 0u;
+        w32(count);
+        f.write((const char*)a.data.data(),
+                (std::streamsize)((size_t)count * a.comp * sizeof(float)));
+    }
+    w32((uint32_t)nodes.size());
+    for (const auto& n : nodes) {
+        w32((uint32_t)n.name.size());
+        f.write(n.name.data(), (std::streamsize)n.name.size());
+        wi32(n.mesh_ordinal);
+        wi32(n.t_idx);
+        wi32(n.r_idx);
+        wi32(n.s_idx);
+    }
+    return (bool)f;
+}
+
+bool loadRwInst(const std::string& path,
+                std::vector<RwInstArray>& arrays,
+                std::vector<RwInstNode>& nodes) {
+    arrays.clear();
+    nodes.clear();
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[8] = {};
+    f.read(magic, 8);
+    if (!f || std::memcmp(magic, "RWINST01", 8) != 0) return false;
+    auto r32 = [&f]() { uint32_t v = 0; f.read((char*)&v, 4); return v; };
+    auto ri32 = [&f]() { int32_t v = 0; f.read((char*)&v, 4); return v; };
+    const uint32_t na = r32();
+    if (!f || na > 1u << 20) return false;
+    arrays.resize(na);
+    for (auto& a : arrays) {
+        a.comp = (int)r32();
+        const uint32_t count = r32();
+        if (!f || (a.comp != 3 && a.comp != 4) || count > 1u << 28)
+            return false;
+        a.data.resize((size_t)count * a.comp);
+        f.read((char*)a.data.data(),
+               (std::streamsize)(a.data.size() * sizeof(float)));
+        if (!f) return false;
+    }
+    const uint32_t nn = r32();
+    if (!f || nn > 1u << 22) return false;
+    nodes.resize(nn);
+    for (auto& n : nodes) {
+        const uint32_t len = r32();
+        if (!f || len > 4096) return false;
+        n.name.resize(len);
+        f.read(n.name.data(), len);
+        n.mesh_ordinal = ri32();
+        n.t_idx = ri32();
+        n.r_idx = ri32();
+        n.s_idx = ri32();
+        if (!f) return false;
+        auto ok = [&](int32_t i) {
+            return i < 0 || i < (int32_t)arrays.size();
+        };
+        if (!ok(n.t_idx) || !ok(n.r_idx) || !ok(n.s_idx)) return false;
+    }
+    return true;
+}
+
+bool modelHasGpuInstancing(const std::string& path) {
+    const std::string ext = lowerExt(path);
+    const char needle[] = "EXT_mesh_gpu_instancing";
+    const size_t nlen = sizeof(needle) - 1;
+    if (ext == ".glb") {
+        // GLB layout: 12-byte file header, then the JSON chunk (whose
+        // header the spec requires first).  Scan that chunk's bytes in
+        // 1 MB pieces with a needle-sized carry across boundaries — a
+        // multi-GB instanced library answers in the time it takes to
+        // read a few MB of JSON, with no glTF parse at all.
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        uint32_t hdr[3] = {0, 0, 0};
+        in.read(reinterpret_cast<char*>(hdr), 12);
+        if (!in || hdr[0] != 0x46546C67u) return false;      // "glTF"
+        uint32_t clen = 0, ctype = 0;
+        in.read(reinterpret_cast<char*>(&clen), 4);
+        in.read(reinterpret_cast<char*>(&ctype), 4);
+        if (!in || ctype != 0x4E4F534Au) return false;       // "JSON"
+        std::string carry;
+        std::vector<char> buf(1u << 20);
+        uint64_t left = clen;
+        while (left > 0) {
+            const size_t n = (left > buf.size())
+                                 ? buf.size() : (size_t)left;
+            in.read(buf.data(), (std::streamsize)n);
+            if (in.gcount() != (std::streamsize)n) break;
+            std::string chunk = carry;
+            chunk.append(buf.data(), n);
+            if (chunk.find(needle) != std::string::npos) return true;
+            const size_t keep = (chunk.size() < nlen - 1)
+                                    ? chunk.size() : nlen - 1;
+            carry.assign(chunk, chunk.size() - keep, keep);
+            left -= n;
+        }
+        return false;
+    }
+    if (ext == ".gltf") {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str().find(needle) != std::string::npos;
+    }
+    return false;   // FBX has no glTF instancing extension
+}
+
 std::vector<std::pair<std::string, std::string>>
 listModelFileDependencies(const std::string& path) {
     namespace fs = std::filesystem;

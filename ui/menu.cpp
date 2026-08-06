@@ -6426,8 +6426,8 @@ void Menu::drawTerrainGenPopup() {
         // first, in that order, without being asked to.
         ImGui::Separator();
         ImGui::TextUnformatted("Staged pipeline");
-        ImGui::TextDisabled("ML maps -> roads/bridges -> placement.  A stage "
-                            "whose inputs are unchanged is skipped.");
+        ImGui::TextDisabled("1 materials -> 2 ground mesh -> 3 instances.  "
+                            "A stage whose inputs are unchanged is skipped.");
         ImGui::SetNextItemWidth(tp_box_w - 140.0f);
         ImGui::InputText("Map stem", terrain_stage_map_,
                          sizeof(terrain_stage_map_));
@@ -6553,26 +6553,33 @@ void Menu::drawTerrainGenPopup() {
         };
         const bool  world_busy = (terrain_stage_status_ == 1);
         if (world_busy) ImGui::BeginDisabled();
-        if (stage_button("1. ML maps"))
+        if (stage_button("1. ML maps (materials)"))
             launch_stage("maps", true);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("FLUX orthophoto -> heightmap, albedo, "
-                              "segmentation, terrain mesh.  Uses the prompt "
-                              "box above.");
+            ImGui::SetTooltip("MATERIALS ONLY: FLUX orthophoto -> heightmap, "
+                              "albedo, segmentation, surface maps.  No "
+                              "geometry — the mesh stage builds that.  Uses "
+                              "the prompt box above.");
         ImGui::SameLine();
-        if (stage_button("2. Roads & bridges"))
-            launch_stage("roads", true);
+        if (stage_button("2. Terrain mesh"))
+            launch_stage("mesh", true);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Road splines from the segmentation, limited "
-                              "to a drivable grade, with bridge meshes over "
-                              "the drops that would otherwise be a cliff.");
+            ImGui::SetTooltip("The ACTUAL ground geometry: road splines "
+                              "graded to a drivable profile, bridges over "
+                              "the drops, river channels carved with real "
+                              "banks, house pads levelled, the heightmap "
+                              "readjusted to all of it, and the terrain + "
+                              "road meshes baked from the finished ground.  "
+                              "Every GLB auto-imports into content/.");
         ImGui::SameLine();
         if (stage_button("3. Place houses & plants"))
             launch_stage("place", true);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Places the libraries on the graded ground.  "
-                              "Runs maps and roads first if either is "
-                              "missing or out of date.");
+            ImGui::SetTooltip("INSTANCES ONLY: houses onto their "
+                              "pre-levelled pads, plants and clutter onto "
+                              "the finished ground.  Never touches the "
+                              "terrain.  Runs maps and mesh first if either "
+                              "is missing or out of date.");
         if (world_busy) ImGui::EndDisabled();
         poll_stage(terrain_stage_status_, terrain_stage_name_,
                    terrain_stage_prog_);

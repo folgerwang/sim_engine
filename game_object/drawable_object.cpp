@@ -6479,6 +6479,14 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                         err_out = "baked .rwchar load failed: " + file_name;
                         return false;
                     }
+                } else if (ext == ".rwinst") {
+                    // Native instanced group: one DrawableData from the
+                    // baked group (hierarchy + .rwgeo + instance tables).
+                    state->data = loadRwInstanced(device, file_name);
+                    if (!state->data) {
+                        err_out = "baked .rwinst load failed: " + file_name;
+                        return false;
+                    }
                 } else {
                     err_out = "unsupported mesh extension: " + ext;
                     return false;
@@ -9344,6 +9352,604 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
               << drawable_object->skins_.size() << " skin(s), "
               << drawable_object->animations_.size() << " clip(s))"
               << std::endl;
+    return drawable_object;
+}
+
+
+// ─── loadRwInstanced ───────────────────────────────────────────────────────
+// ONE static DrawableData from a baked INSTANCED GROUP (see the header
+// doc).  Mirrors loadRwCharacter's assembly minus everything skinned, and
+// finishes with the same three passes the glTF path runs: LOD-band /
+// gate parsing off the node names, the flat instance-table bake (sourced
+// from instances.rwinst instead of glTF accessors, table indices playing
+// the accessor-triple role in the shared-range memo), and the
+// world-manifest override / physical-prop-registry binding.
+std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::string& input_filename) {
+    namespace fs = std::filesystem;
+
+    const fs::path manifest(input_filename);
+    const fs::path group_dir = manifest.parent_path();
+    const std::string ref_name = group_dir.filename().string();
+    // The name every name-keyed system knows this asset by: the source
+    // glTF's file name (group folder name + .glb).  World-manifest
+    // overrides are registered under it, and the log lines use it.
+    const std::string canon_name = ref_name + ".glb";
+
+    std::vector<helper::RwInstArray> inst_arrays;
+    std::vector<helper::RwInstNode> inst_nodes;
+    if (!helper::loadRwInst(input_filename, inst_arrays, inst_nodes)) {
+        std::cout << "[rwinst] unreadable '" << input_filename << "'"
+                  << std::endl;
+        return nullptr;
+    }
+
+    // ── Hierarchy (names are behaviour — bands, gates, bindings) ─────
+    std::vector<helper::RwHierNode> hier;
+    if (!helper::loadRwHier((group_dir / "hierarchy.rwhier").string(),
+                            hier) || hier.empty()) {
+        std::cout << "[rwinst] missing/empty hierarchy for '" << ref_name
+                  << "'" << std::endl;
+        return nullptr;
+    }
+
+    // ── Baked objects: mesh_ordinal → objects/NNN_*.rwgeo ─────────────
+    std::vector<std::pair<int, std::string>> ordinal_geo;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(group_dir / "objects", ec)) {
+        if (e.path().extension() != ".rwgeo") continue;
+        {
+            std::error_code dec;
+            if (fs::exists(e.path().string() + ".disabled", dec)) {
+                std::cout << "[rwinst] sub-mesh disabled, skipping: "
+                          << e.path().filename().string() << std::endl;
+                continue;
+            }
+        }
+        int ord = -1;
+        if (std::sscanf(e.path().filename().string().c_str(), "%d_", &ord)
+                == 1 && ord >= 0)
+            ordinal_geo.emplace_back(ord, e.path().string());
+    }
+    if (ordinal_geo.empty()) {
+        std::cout << "[rwinst] no baked objects for '" << ref_name << "'"
+                  << std::endl;
+        return nullptr;
+    }
+    std::sort(ordinal_geo.begin(), ordinal_geo.end());
+
+    auto drawable_object = std::make_shared<ego::DrawableData>(device);
+    drawable_object->m_use_local_matrix_only_ = false;
+
+    auto decomposeTRS = [](const glm::mat4& m, glm::vec3& t, glm::quat& r,
+                           glm::vec3& s) {
+        t = glm::vec3(m[3]);
+        const glm::vec3 c0(m[0]), c1(m[1]), c2(m[2]);
+        s = glm::vec3(glm::length(c0), glm::length(c1), glm::length(c2));
+        const glm::mat3 rot(
+            s.x > 1e-8f ? glm::vec3(c0 / s.x) : glm::vec3(1, 0, 0),
+            s.y > 1e-8f ? glm::vec3(c1 / s.y) : glm::vec3(0, 1, 0),
+            s.z > 1e-8f ? glm::vec3(c2 / s.z) : glm::vec3(0, 0, 1));
+        r = glm::quat_cast(rot);
+    };
+
+    drawable_object->nodes_.resize(hier.size());
+    for (size_t i = 0; i < hier.size(); ++i) {
+        auto& n = drawable_object->nodes_[i];
+        n.name_ = hier[i].name;
+        n.parent_idx_ = hier[i].parent;
+        n.matrix_ = glm::mat4(1.0f);
+        decomposeTRS(hier[i].local, n.translation_, n.rotation_, n.scale_);
+    }
+    std::vector<int32_t> roots;
+    for (size_t i = 0; i < hier.size(); ++i) {
+        const int p = hier[i].parent;
+        if (p >= 0 && p < (int)hier.size())
+            drawable_object->nodes_[p].child_idx_.push_back((int32_t)i);
+        else
+            roots.push_back((int32_t)i);
+    }
+    drawable_object->scenes_.resize(1);
+    drawable_object->scenes_[0].nodes_ = roots;
+    drawable_object->default_scene_ = 0;
+
+    // ordinal → owning hierarchy node, and later ordinal → mesh index.
+    std::unordered_map<int, int> ordinal_node;
+    for (size_t i = 0; i < hier.size(); ++i)
+        if (hier[i].mesh_ordinal >= 0)
+            ordinal_node.emplace(hier[i].mesh_ordinal, (int)i);
+    std::unordered_map<int, int> ordinal_mesh;
+
+    std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
+
+    for (const auto& [ordinal, geo_path] : ordinal_geo) {
+        const auto own_it = ordinal_node.find(ordinal);
+        const int owner_node =
+            own_it != ordinal_node.end() ? own_it->second : -1;
+
+        helper::ModelPreviewData md;
+        std::vector<std::string> tex_paths;
+        if (!helper::loadRwGeo(geo_path, md, &tex_paths,
+                               /*decode_textures=*/false) ||
+            md.positions.empty() || md.indices.empty() ||
+            md.sections.empty())
+            continue;
+        helper::dedupModelVertices(md);
+
+        const uint32_t vtx_count   = (uint32_t)md.positions.size();
+        const uint32_t index_count = (uint32_t)md.indices.size();
+        const size_t num_sections  = md.sections.size();
+
+        // GPU buffers (vertex + index) — static path, no skin sets.
+        helper::Mesh cpu_mesh;
+        cpu_mesh.vertex_data_ptr->resize(vtx_count);
+        for (uint32_t i = 0; i < vtx_count; ++i) {
+            auto& v = cpu_mesh.vertex_data_ptr->at(i);
+            v.position = md.positions[i];
+            v.normal = i < md.normals.size() ? md.normals[i]
+                                             : glm::vec3(0, 1, 0);
+            v.uv = i < md.uvs.size() ? md.uvs[i] : glm::vec2(0);
+        }
+        // CPU faces: LOD0 span only (cluster/collision/selection must
+        // see full detail exactly once — the decimated levels' indices
+        // are appended after the sections).
+        uint32_t lod0_end = 0;
+        for (const auto& sec0 : md.sections)
+            lod0_end = std::max(lod0_end,
+                                sec0.first_index + sec0.index_count);
+        const uint32_t cpu_end = std::min(index_count, lod0_end);
+        cpu_mesh.faces_ptr->reserve(cpu_end / 3);
+        for (uint32_t i = 0; i + 2 < cpu_end; i += 3)
+            cpu_mesh.faces_ptr->emplace_back(
+                md.indices[i], md.indices[i + 1], md.indices[i + 2]);
+
+        const int vbuf = (int)drawable_object->buffers_.size();
+        drawable_object->buffers_.emplace_back();   // vertex
+        drawable_object->buffers_.emplace_back();   // index
+        renderer::Helper::createBuffer(
+            device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+            drawable_object->buffers_[vbuf].buffer,
+            drawable_object->buffers_[vbuf].memory,
+            std::source_location::current(),
+            vtx_count * sizeof(helper::VertexStruct),
+            cpu_mesh.vertex_data_ptr->data());
+
+        const bool use_16 = vtx_count < 65536;
+        const uint32_t ibytes = use_16 ? 2u : 4u;
+        const auto itype = use_16 ? renderer::IndexType::UINT16
+                                  : renderer::IndexType::UINT32;
+        if (use_16) {
+            std::vector<uint16_t> idx16(index_count);
+            for (uint32_t i = 0; i < index_count; ++i)
+                idx16[i] = (uint16_t)md.indices[i];
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[vbuf + 1].buffer,
+                drawable_object->buffers_[vbuf + 1].memory,
+                std::source_location::current(), idx16.size() * 2,
+                idx16.data());
+        } else {
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[vbuf + 1].buffer,
+                drawable_object->buffers_[vbuf + 1].memory,
+                std::source_location::current(), md.indices.size() * 4,
+                md.indices.data());
+        }
+
+        const int vbase = (int)drawable_object->buffer_views_.size();
+        drawable_object->buffer_views_.resize(vbase + 4);
+        const int pos_v = vbase + 0, nrm_v = vbase + 1, uv_v = vbase + 2,
+                  idx_v = vbase + 3;
+        {
+            auto& pv = drawable_object->buffer_views_[pos_v];
+            pv.buffer_idx = vbuf; pv.offset = 0;
+            pv.range = vtx_count * sizeof(helper::VertexStruct);
+            pv.stride = sizeof(helper::VertexStruct);
+            drawable_object->buffer_views_[nrm_v] = pv;
+            drawable_object->buffer_views_[nrm_v].offset = sizeof(glm::vec3);
+            drawable_object->buffer_views_[uv_v] = pv;
+            drawable_object->buffer_views_[uv_v].offset =
+                2 * sizeof(glm::vec3);
+            auto& iv = drawable_object->buffer_views_[idx_v];
+            iv.buffer_idx = vbuf + 1; iv.offset = 0;
+            iv.range = index_count * ibytes; iv.stride = ibytes;
+        }
+
+        // Textures (VT-only) with global indices — same cache policy as
+        // the character group loader.
+        const size_t tex_base = drawable_object->textures_.size();
+        drawable_object->textures_.resize(tex_base + md.textures.size());
+        for (size_t ti = 0; ti < md.textures.size() &&
+                            ti < tex_paths.size(); ++ti) {
+            auto& dst = drawable_object->textures_[tex_base + ti];
+            std::string key = fs::path(tex_paths[ti])
+                                  .lexically_normal().generic_string();
+            for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+            auto cit = tex_gpu_cache.find(key);
+            if (cit != tex_gpu_cache.end()) { dst = cit->second; continue; }
+            helper::RwTexBaked tb;
+            if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
+                tb.w <= 0 || tb.h <= 0)
+                continue;
+            dst.size = glm::uvec3((uint32_t)tb.w, (uint32_t)tb.h, 1u);
+            dst.linear = false;
+            dst.source_filename_ = tex_paths[ti];
+            dst.vt_bc7_tiles = tb.bc7_tiles;
+            if (!dst.vt_bc7_tiles && tb.preview_w == tb.w &&
+                tb.preview_h == tb.h && !tb.preview_rgba.empty())
+                dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
+                    tb.preview_rgba.begin(), tb.preview_rgba.end());
+            tex_gpu_cache.emplace(key, dst);
+        }
+
+        // Materials (one per section).
+        const size_t mat_base = drawable_object->materials_.size();
+        drawable_object->materials_.resize(mat_base + num_sections);
+        for (size_t si = 0; si < num_sections; ++si) {
+            const auto& sec = md.sections[si];
+            auto& mat = drawable_object->materials_[mat_base + si];
+            mat.name_ = ref_name + "_o" + std::to_string(ordinal) + "_s" +
+                        std::to_string(si);
+            if (sec.tex_index >= 0)
+                mat.base_color_idx_ = (int)tex_base + sec.tex_index;
+            if (sec.nrm_index >= 0)
+                mat.normal_idx_ = (int)tex_base + sec.nrm_index;
+            if (sec.mr_index >= 0)
+                mat.metallic_roughness_idx_ = (int)tex_base + sec.mr_index;
+            mat.alpha_cutoff_ = 0.1f;
+            mat.alpha_mask_ = true;
+            mat.alpha_mode_ = ego::AlphaMode::Mask;
+            device->createBuffer(
+                sizeof(glsl::PbrMaterialParams),
+                SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0, mat.uniform_buffer_.buffer, mat.uniform_buffer_.memory,
+                std::source_location::current());
+            glsl::PbrMaterialParams ubo{};
+            ubo.base_color_factor = sec.base_color;
+            ubo.specular_factor = glm::vec3(1.0f);
+            ubo.specular_color = glm::vec3(1.0f);
+            ubo.glossiness_factor = 1.0f;
+            ubo.metallic_roughness_specular_factor = 1.0f;
+            ubo.metallic_factor = sec.metallic;
+            ubo.roughness_factor = sec.roughness;
+            ubo.alpha_cutoff = 0.1f;
+            ubo.mip_count = 11;
+            ubo.normal_scale = 1.0f;
+            ubo.uv_set_flags = glm::vec4(0.0f);
+            ubo.exposure = 1.0f;
+            ubo.occlusion_strength = 1.0f;
+            ubo.tonemap_type = TONEMAP_DEFAULT;
+            ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+            ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+            device->updateBufferMemory(mat.uniform_buffer_.memory,
+                                       sizeof(ubo), &ubo);
+            captureMaterialDesc(
+                mat, ubo, drawable_object->textures_, ref_name);
+        }
+
+        // Mesh + primitives, LOD-aware index ranges (v6 rwgeo).
+        const int mesh_index = (int)drawable_object->meshes_.size();
+        drawable_object->meshes_.emplace_back();
+        auto& mesh = drawable_object->meshes_[mesh_index];
+        for (const auto& p : md.positions) {
+            mesh.bbox_min_ = glm::min(mesh.bbox_min_, p);
+            mesh.bbox_max_ = glm::max(mesh.bbox_max_, p);
+        }
+        mesh.vertex_position_ = std::make_shared<std::vector<glm::vec3>>(
+            md.positions.begin(), md.positions.end());
+        const bool baked_lods =
+            !md.lod_ranges.empty() &&
+            md.lod_ranges[0].size() == num_sections;
+        mesh.primitives_.resize(num_sections);
+        for (size_t si = 0; si < num_sections; ++si) {
+            const auto& sec = md.sections[si];
+            auto& prim = mesh.primitives_[si];
+            prim.tag_.restart_enable = false;
+            prim.material_idx_ = (int32_t)(mat_base + si);
+            prim.tag_.topology =
+                (uint32_t)renderer::PrimitiveTopology::TRIANGLE_LIST;
+            prim.tag_.has_texcoord_0 = true;
+            prim.tag_.has_normal = true;
+            // The generated glTF authors doubleSided on these materials
+            // (foliage cards, fence slats, interior walls seen from both
+            // sides); .rwgeo has no per-section flag yet, so parity says
+            // draw both faces rather than cull half the leaves away.
+            prim.tag_.double_sided = true;
+            prim.tag_.has_skin_set_0 = false;
+            prim.tag_.has_skin_set_1 = false;
+
+            uint32_t b = 0;
+            renderer::VertexInputBindingDescription bd = {};
+            renderer::VertexInputAttributeDescription ad = {};
+            bd.input_rate = renderer::VertexInputRate::VERTEX;
+            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            prim.binding_descs_.push_back(bd);
+            ad.buffer_view = pos_v; ad.binding = b; ad.offset = 0;
+            ad.buffer_offset = 0; ad.location = VINPUT_POSITION;
+            ad.format = renderer::Format::R32G32B32_SFLOAT;
+            prim.attribute_descs_.push_back(ad); ++b;
+            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            prim.binding_descs_.push_back(bd);
+            ad.buffer_view = nrm_v; ad.binding = b; ad.offset = 0;
+            ad.buffer_offset = sizeof(glm::vec3);
+            ad.location = VINPUT_NORMAL;
+            ad.format = renderer::Format::R32G32B32_SFLOAT;
+            prim.attribute_descs_.push_back(ad); ++b;
+            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            prim.binding_descs_.push_back(bd);
+            ad.buffer_view = uv_v; ad.binding = b; ad.offset = 0;
+            ad.buffer_offset = 2 * sizeof(glm::vec3);
+            ad.location = VINPUT_TEXCOORD0;
+            ad.format = renderer::Format::R32G32_SFLOAT;
+            prim.attribute_descs_.push_back(ad); ++b;
+
+            prim.index_desc_.resize(helper::c_num_lods + 1);
+            uint32_t lod_first = sec.first_index;
+            uint32_t lod_count = sec.index_count;
+            for (uint32_t l = 0; l < helper::c_num_lods + 1; ++l) {
+                if (baked_lods && l > 0 && l - 1 < md.lod_ranges.size()) {
+                    const auto& r = md.lod_ranges[l - 1][si];
+                    if (r.y > 0) {
+                        lod_first = r.x;
+                        lod_count = r.y;
+                    }
+                }
+                prim.index_desc_[l].buffer_view = idx_v;
+                prim.index_desc_[l].offset = lod_first * ibytes;
+                prim.index_desc_[l].index_type = itype;
+                prim.index_desc_[l].index_count = lod_count;
+            }
+            glm::vec3 pmin(std::numeric_limits<float>::max());
+            glm::vec3 pmax(std::numeric_limits<float>::lowest());
+            const uint32_t se =
+                std::min(sec.first_index + sec.index_count, index_count);
+            for (uint32_t ii = sec.first_index; ii < se; ++ii) {
+                const uint32_t vi = md.indices[ii];
+                if (vi < vtx_count) {
+                    pmin = glm::min(pmin, md.positions[vi]);
+                    pmax = glm::max(pmax, md.positions[vi]);
+                }
+            }
+            prim.bbox_min_ = pmin; prim.bbox_max_ = pmax;
+            prim.generateHash();
+        }
+
+        ordinal_mesh.emplace(ordinal, mesh_index);
+        if (owner_node >= 0)
+            drawable_object->nodes_[owner_node].mesh_idx_ = mesh_index;
+    }
+
+    if (drawable_object->meshes_.empty()) return nullptr;
+
+    // ── Instance tables → the flat baked table ───────────────────────
+    // The rwinst mirror of bakeInstanceTransforms: table indices play
+    // the accessor-triple role in the shared-range memo, the
+    // world-manifest overrides bind by node name under the group's
+    // canonical (source glTF) file name, and every freshly created
+    // range is handed to the physical-prop registry.
+    if (!inst_nodes.empty()) {
+        ego::PcgOverrideMap pcg_over =
+            ego::takePcgInstanceOverrides(canon_name);
+        const bool has_over = !pcg_over.empty();
+        const auto find_over =
+            [&pcg_over](const std::string& node_name)
+            -> const ego::PcgInstanceOverride* {
+            auto it = pcg_over.find(node_name);
+            if (it != pcg_over.end()) return &it->second;
+            const ego::PcgInstanceOverride* best = nullptr;
+            size_t best_len = 0;
+            for (const auto& kv : pcg_over) {
+                const std::string pref = kv.first + "_";
+                if (node_name.size() > pref.size() &&
+                    node_name.compare(0, pref.size(), pref) == 0 &&
+                    pref.size() > best_len) {
+                    best = &kv.second;
+                    best_len = pref.size();
+                }
+            }
+            return best;
+        };
+
+        drawable_object->baked_instances_.clear();
+        drawable_object->baked_instances_.emplace_back();   // identity 0
+
+        std::map<std::array<int, 3>, std::pair<uint32_t, uint32_t>>
+            range_memo;
+        size_t total = 0, shared_n = 0;
+        for (const auto& in : inst_nodes) {
+            const auto own_it = ordinal_node.find(in.mesh_ordinal);
+            if (own_it == ordinal_node.end()) continue;
+            auto& node = drawable_object->nodes_[own_it->second];
+
+            std::vector<float> t, r, s;
+            if (in.t_idx >= 0) t = inst_arrays[in.t_idx].data;
+            if (in.r_idx >= 0) r = inst_arrays[in.r_idx].data;
+            if (in.s_idx >= 0) s = inst_arrays[in.s_idx].data;
+            bool has_t = !t.empty(), has_r = !r.empty(),
+                 has_s = !s.empty();
+            if (has_over) {
+                const ego::PcgInstanceOverride* ov = find_over(node.name_);
+                if (ov != nullptr) {
+                    t = ov->t; r = ov->r; s = ov->s;
+                    has_t = !t.empty();
+                    has_r = !r.empty();
+                    has_s = !s.empty();
+                } else {
+                    t.assign({0.f, -10000.f, 0.f});
+                    r.assign({0.f, 0.f, 0.f, 1.f});
+                    s.assign({0.f, 0.f, 0.f});
+                    has_t = has_r = has_s = true;
+                }
+            }
+            size_t count = 0;
+            if (has_t) count = std::max(count, t.size() / 3);
+            if (has_r) count = std::max(count, r.size() / 4);
+            if (has_s) count = std::max(count, s.size() / 3);
+            if (count == 0) continue;
+
+            const std::array<int, 3> key = {in.t_idx, in.r_idx, in.s_idx};
+            const auto memo_it = range_memo.find(key);
+            const bool bake = has_over || (memo_it == range_memo.end());
+            if (bake) {
+                node.inst_offset_ = (uint32_t)
+                    drawable_object->baked_instances_.size();
+                node.inst_count_ = (uint32_t)count;
+                if (!has_over)
+                    range_memo[key] = { node.inst_offset_,
+                                        node.inst_count_ };
+            } else {
+                node.inst_offset_ = memo_it->second.first;
+                node.inst_count_ = memo_it->second.second;
+                ++shared_n;
+            }
+
+            const auto mesh_it = ordinal_mesh.find(in.mesh_ordinal);
+            ego::MeshInfo* inst_mesh =
+                mesh_it != ordinal_mesh.end()
+                    ? &drawable_object->meshes_[mesh_it->second]
+                    : nullptr;
+            const bool mesh_bbox_valid =
+                inst_mesh &&
+                inst_mesh->bbox_min_.x <= inst_mesh->bbox_max_.x &&
+                inst_mesh->bbox_min_.y <= inst_mesh->bbox_max_.y &&
+                inst_mesh->bbox_min_.z <= inst_mesh->bbox_max_.z;
+
+            for (size_t i = 0; i < count; ++i) {
+                const glm::vec3 tr =
+                    (has_t && (i + 1) * 3 <= t.size())
+                        ? glm::vec3(t[i * 3], t[i * 3 + 1], t[i * 3 + 2])
+                        : glm::vec3(0.0f);
+                const glm::quat rot =
+                    (has_r && (i + 1) * 4 <= r.size())
+                        ? glm::quat(r[i * 4 + 3], r[i * 4 + 0],
+                                    r[i * 4 + 1], r[i * 4 + 2])
+                        : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+                const glm::vec3 sc =
+                    (has_s && (i + 1) * 3 <= s.size())
+                        ? glm::vec3(s[i * 3], s[i * 3 + 1], s[i * 3 + 2])
+                        : glm::vec3(1.0f);
+                const glm::mat3 basis =
+                    glm::mat3_cast(glm::normalize(rot)) *
+                    glm::mat3(sc.x, 0.0f, 0.0f,
+                              0.0f, sc.y, 0.0f,
+                              0.0f, 0.0f, sc.z);
+                if (bake) {
+                    ego::BakedInstanceXform x;
+                    x.mat_rot_0 = glm::vec4(basis[0], 0.0f);
+                    x.mat_rot_1 = glm::vec4(basis[1], 0.0f);
+                    x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
+                    x.mat_pos_scale = glm::vec4(tr, 1.0f);
+                    drawable_object->baked_instances_.push_back(x);
+                }
+                if (mesh_bbox_valid) {
+                    const glm::vec3& bn = inst_mesh->bbox_min_;
+                    const glm::vec3& bx = inst_mesh->bbox_max_;
+                    for (int cx = 0; cx < 8; ++cx) {
+                        const glm::vec3 corner(
+                            (cx & 1) ? bx.x : bn.x,
+                            (cx & 2) ? bx.y : bn.y,
+                            (cx & 4) ? bx.z : bn.z);
+                        const glm::vec3 w = basis * corner + tr;
+                        inst_mesh->inst_bbox_min_ =
+                            glm::min(inst_mesh->inst_bbox_min_, w);
+                        inst_mesh->inst_bbox_max_ =
+                            glm::max(inst_mesh->inst_bbox_max_, w);
+                    }
+                    inst_mesh->has_inst_bbox_ = true;
+                }
+            }
+            if (bake) {
+                total += count;
+                ego::PcgInstanceRegistry::get().bindBakedRange(
+                    drawable_object, node.name_, node.inst_offset_, t,
+                    count);
+            }
+            if (node.mesh_idx_ >= 0) {
+                auto it = drawable_object->mesh_instance_range_.find(
+                    node.mesh_idx_);
+                if (it == drawable_object->mesh_instance_range_.end()) {
+                    drawable_object->mesh_instance_range_[node.mesh_idx_] =
+                        { node.inst_offset_, node.inst_count_ };
+                }
+            }
+        }
+        drawable_object->has_baked_instances_ =
+            drawable_object->baked_instances_.size() > 1;
+        if (drawable_object->has_baked_instances_) {
+            std::cout << "[rwinst] " << canon_name << ": "
+                      << drawable_object->mesh_instance_range_.size()
+                      << " instanced mesh(es), " << total
+                      << " instances from native tables, " << shared_n
+                      << " node(s) sharing ranges" << std::endl;
+        }
+    }
+
+    // Bands and gates off the node names — same pass as every loader.
+    parsePlantLodBands(drawable_object, canon_name);
+
+    // Scene bbox + world transforms.
+    for (auto& scene : drawable_object->scenes_) {
+        scene.bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
+        scene.bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
+        for (auto root : scene.nodes_)
+            calculateBbox(drawable_object, root, glm::mat4(1.0f),
+                          scene.bbox_min_, scene.bbox_max_);
+    }
+    drawable_object->update(device, 0, 0.0f,
+                            /*use_local_matrix_only=*/false);
+    setupRaytracing(drawable_object);
+
+    // Indirect draw buffer (same as the other native loaders).
+    uint32_t num_prims = 0;
+    for (auto& mesh : drawable_object->meshes_)
+        for (auto& prim : mesh.primitives_) {
+            prim.indirect_draw_cmd_ofs_ =
+                num_prims * sizeof(renderer::DrawIndexedIndirectCommand) +
+                INDIRECT_DRAW_BUF_OFS;
+            num_prims++;
+        }
+    std::vector<uint32_t> idc(
+        sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) *
+            num_prims + 1);
+    auto* cmds = reinterpret_cast<renderer::DrawIndexedIndirectCommand*>(
+        idc.data() + 1);
+    idc[0] = 0;
+    uint32_t pi = 0;
+    for (const auto& mesh : drawable_object->meshes_)
+        for (const auto& prim : mesh.primitives_) {
+            cmds[pi].first_index = 0;
+            cmds[pi].first_instance = 0;
+            cmds[pi].index_count =
+                (uint32_t)prim.index_desc_[0].index_count;
+            cmds[pi].instance_count = 0;
+            cmds[pi].vertex_offset = 0;
+            pi++;
+        }
+    renderer::Helper::createBuffer(
+        device,
+        SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT,
+                        STORAGE_BUFFER_BIT),
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+        drawable_object->indirect_draw_cmd_.buffer,
+        drawable_object->indirect_draw_cmd_.memory,
+        std::source_location::current(),
+        idc.size() * sizeof(uint32_t), idc.data());
+    drawable_object->num_prims_ = num_prims;
+
+    std::cout << "[rwinst] loaded '" << canon_name << "' ("
+              << drawable_object->nodes_.size() << " nodes, "
+              << drawable_object->meshes_.size() << " mesh(es), "
+              << (drawable_object->baked_instances_.empty()
+                      ? size_t(0)
+                      : drawable_object->baked_instances_.size() - 1)
+              << " baked instance(s))" << std::endl;
     return drawable_object;
 }
 

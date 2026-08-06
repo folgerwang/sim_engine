@@ -1410,6 +1410,20 @@ public:
     static std::shared_ptr<DrawableData> loadRwCharacter(
         const std::shared_ptr<renderer::Device>& device,
         const std::string& input_filename);
+
+    // Native INSTANCED GROUP loader (input: <group>/instances.rwinst).
+    // Builds ONE static DrawableData from a baked group — hierarchy from
+    // hierarchy.rwhier (node names intact, so _lodtile_ bands, _pgate_
+    // gates and world-manifest bindings all work), geometry from
+    // objects/NNN_*.rwgeo (v6 LOD levels honoured), textures from
+    // .rwtex, and the per-instance transform tables from
+    // instances.rwinst.  The native replacement for loading the
+    // generated glTF: content/ holds engine formats only.  An EMPTY
+    // rwinst (marker) loads the group as one non-instanced drawable —
+    // used for the merged generated files (clutter, decals, roads).
+    static std::shared_ptr<DrawableData> loadRwInstanced(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::string& input_filename);
 };
 
 // ── PCG world-manifest instance overrides ───────────────────────────
