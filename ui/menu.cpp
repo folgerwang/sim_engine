@@ -6166,7 +6166,20 @@ void Menu::refreshTerrainNames() {
     terrain_names_loaded_ = true;
     std::set<std::string> names;
     static const std::string kSuffix = "_stages.json";
+    // ONE FOLDER PER TERRAIN: assets/terrain/<name>/<name>_stages.json.
+    // The flat form (assets/terrain/<name>_stages.json) is the layout
+    // before that and is still listed, so a world built by the old
+    // pipeline stays selectable — python migrates it into its folder the
+    // moment a stage runs against it (terrain_stages.migrate_flat_terrain).
     for (auto& e : fs::directory_iterator("assets/terrain", ec)) {
+        if (e.is_directory(ec)) {
+            const std::string dn = e.path().filename().string();
+            if (dn == "lib") continue;
+            std::error_code sec;
+            if (fs::exists(e.path() / (dn + kSuffix), sec))
+                names.insert(dn);
+            continue;
+        }
         if (!e.is_regular_file(ec)) continue;
         const std::string fn = e.path().filename().string();
         if (fn.size() > kSuffix.size() &&
@@ -6424,19 +6437,98 @@ void Menu::drawTerrainGenPopup() {
                            0.05f, 1.0f,
                            "%.2f x 250");
 
+        // ── WHICH TERRAIN — ITS OWN SECTION, ABOVE EVERY BUILD ────────
+        // Every build on this panel writes into assets/terrain/<name>
+        // and content/terrain/<name>/, so a nameless world has nowhere
+        // to put its output.  The picker therefore comes FIRST: it is
+        // the question every button below depends on, and answering it
+        // is what un-gates them.  ONE flag (have_terrain) is read by the
+        // full generate, the three staged buttons and the libraries, so
+        // no path can start work the name picker has not authorised.
+        ImGui::Separator();
+        if (!terrain_names_loaded_) refreshTerrainNames();
+        ImGui::TextUnformatted("Terrain");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(tp_box_w * 0.34f);
+        if (ImGui::BeginCombo("##terrain_pick",
+                              terrain_name_[0] ? terrain_name_
+                                               : "(none selected)")) {
+            if (terrain_names_.empty())
+                ImGui::TextDisabled("(none built yet — name one)");
+            for (const auto& n : terrain_names_) {
+                const bool sel = (n == terrain_name_);
+                if (ImGui::Selectable(n.c_str(), sel)) {
+                    std::snprintf(terrain_name_, sizeof(terrain_name_),
+                                  "%s", n.c_str());
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Builds into assets/terrain/<name>.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.0f);
+        ImGui::InputTextWithHint("##terrain_new", "new name",
+                                 terrain_new_name_,
+                                 sizeof(terrain_new_name_));
+        ImGui::SameLine();
+        {
+            // A new name selects immediately; nothing is created on disk
+            // until a stage actually builds, so a mistyped name costs a
+            // retype rather than a stray folder.
+            const std::string fresh =
+                sanitizeTerrainName(terrain_new_name_);
+            ImGui::BeginDisabled(fresh.empty());
+            if (ImGui::Button("New")) {
+                std::snprintf(terrain_name_, sizeof(terrain_name_), "%s",
+                              fresh.c_str());
+                terrain_new_name_[0] = '\0';
+                terrain_names_loaded_ = false;   // re-scan; may already exist
+                EditorLog::get().push(
+                    "[terrain] selected new terrain '" + fresh +
+                    "' — nothing on disk until a stage builds it");
+            }
+            ImGui::EndDisabled();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Select the typed name.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Refresh##terrain_names"))
+            terrain_names_loaded_ = false;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-scan the terrains on disk.");
+        ImGui::Separator();
+
+        const bool have_terrain = (terrain_name_[0] != '\0');
+        // A build needs a PROMPT as much as it needs a name: the whole
+        // chain starts at the diffusion model, and the empty-prompt
+        // branch below used to swallow the click without a word, which
+        // reads as a dead button.  Gate it in the UI instead, so the
+        // reason is visible before the click rather than never.
+        const bool have_prompt = (terrain_prompt_buf_[0] != '\0');
         const bool busy = (terrain_gen_status_ == 1);
-        if (busy) ImGui::BeginDisabled();
-        if (ImGui::Button("Generate", ImVec2(120, 0))) {
+        const bool gen_blocked = (busy || !have_terrain || !have_prompt);
+        if (gen_blocked) ImGui::BeginDisabled();
+        // Sized to ITS OWN LABEL, exactly like the stage buttons below
+        // (same CalcTextSize + margin rule): a fixed pixel width clipped
+        // the text under this font ("Full Stage Ge"), and a full-width
+        // bar was wider than the words need.
+        if (ImGui::Button("Full Stage Generate",
+                          ImVec2(ImGui::CalcTextSize(
+                                     "Full Stage Generate").x + 26.0f,
+                                 0.0f))) {
             const std::string p(terrain_prompt_buf_);
             if (!p.empty()) {
                 addTerrainPrompt(p, /*favorite*/ false);   // recents history
                 std::error_code ec;
                 fs::create_directories("content/terrain/.terrain_tmp", ec);
-                // Same NAMED terrain the staged buttons build.  An
-                // empty name mints one so the button still works as
-                // "just make me a world"; the output goes to
-                // assets/terrain/<name>.png like every other stage, so
-                // the one-shot and the staged pipeline produce the same
+                // Same NAMED terrain the staged buttons build, in the
+                // same place: assets/terrain/<name>/<name>.png.  ONE
+                // FOLDER PER TERRAIN — every artifact of a world lands
+                // beside its heightmap instead of interleaving with
+                // every other world in one flat directory.  The one-shot
+                // and the staged pipeline therefore produce the same
                 // shape on disk instead of two different layouts.
                 std::string base = sanitizeTerrainName(terrain_name_);
                 if (base.empty()) {
@@ -6445,8 +6537,13 @@ void Menu::drawTerrainGenPopup() {
                     std::snprintf(terrain_name_, sizeof(terrain_name_),
                                   "%s", base.c_str());
                 }
-                terrain_gen_out_ =
-                    (fs::path("assets/terrain") / (base + ".png")).string();
+                {
+                    const fs::path tdir =
+                        fs::path("assets/terrain") / base;
+                    fs::create_directories(tdir, ec);
+                    terrain_gen_out_ =
+                        (tdir / (base + ".png")).string();
+                }
                 const std::string pfile =
                     (fs::path("content/terrain/.terrain_tmp") /
                      (base + ".prompt.txt")).string();
@@ -6478,10 +6575,25 @@ void Menu::drawTerrainGenPopup() {
                     "[terrain] launching generation -> " + terrain_gen_out_);
                 std::system(cmd.c_str());
                 terrain_gen_status_ = 1;
+            } else {
+                // Unreachable while the gate above holds — kept so that
+                // a future caller which loses the gate still SAYS why
+                // nothing happened rather than eating the click.
+                EditorLog::get().push(
+                    "[terrain] nothing to generate — the prompt box is "
+                    "empty");
             }
         }
-        if (busy) ImGui::EndDisabled();
+        if (gen_blocked) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(!have_terrain ? "Name a terrain above first."
+                              : !have_prompt
+                                  ? "Describe the terrain in the box at\n"
+                                    "the top first."
+                                  : "Run all stages in one pass.");
 
+        // Idle / done / failed: the short status sits beside the button.
+        // A run in flight gets the full-width progress bar on its own row.
         if (terrain_gen_status_ != 1) ImGui::SameLine();
         if (terrain_gen_status_ == 1) {
             // Progress: the script overwrites "<out>.progress" with
@@ -6533,63 +6645,7 @@ void Menu::drawTerrainGenPopup() {
         // first, in that order, without being asked to.
         ImGui::Separator();
         ImGui::TextUnformatted("Staged pipeline");
-        ImGui::TextDisabled("1 materials -> 2 ground mesh -> 3 instances.  "
-                            "A stage whose inputs are unchanged is skipped.");
-        // ── Which terrain ──────────────────────────────────────────────
-        // A world is picked by NAME from the ones on disk.  Every stage
-        // button below builds the selected name, replacing that stage's
-        // data for THAT world and leaving every other world alone.
-        if (!terrain_names_loaded_) refreshTerrainNames();
-        ImGui::SetNextItemWidth(tp_box_w * 0.45f);
-        if (ImGui::BeginCombo("##terrain_pick",
-                              terrain_name_[0] ? terrain_name_
-                                               : "(no terrain selected)")) {
-            if (terrain_names_.empty())
-                ImGui::TextDisabled("(none built yet — name one below)");
-            for (const auto& n : terrain_names_) {
-                const bool sel = (n == terrain_name_);
-                if (ImGui::Selectable(n.c_str(), sel)) {
-                    std::snprintf(terrain_name_, sizeof(terrain_name_),
-                                  "%s", n.c_str());
-                }
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Terrain to build.  The name resolves to\n"
-                "assets/terrain/<name> for the generated artifacts and\n"
-                "content/terrain/<name>/ for the managed copy.");
-        ImGui::SameLine();
-        ImGui::TextUnformatted("Terrain");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(160.0f);
-        ImGui::InputTextWithHint("##terrain_new", "new name",
-                                 terrain_new_name_,
-                                 sizeof(terrain_new_name_));
-        ImGui::SameLine();
-        {
-            // A new name selects immediately; nothing is created on disk
-            // until a stage actually builds, so a mistyped name costs a
-            // retype rather than a stray folder.
-            const std::string fresh =
-                sanitizeTerrainName(terrain_new_name_);
-            ImGui::BeginDisabled(fresh.empty());
-            if (ImGui::Button("New")) {
-                std::snprintf(terrain_name_, sizeof(terrain_name_), "%s",
-                              fresh.c_str());
-                terrain_new_name_[0] = '\0';
-                terrain_names_loaded_ = false;   // re-scan; may already exist
-                EditorLog::get().push(
-                    "[terrain] selected new terrain '" + fresh +
-                    "' — nothing on disk until a stage builds it");
-            }
-            ImGui::EndDisabled();
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Refresh##terrain_names"))
-            terrain_names_loaded_ = false;
+        ImGui::TextDisabled("Unchanged stages are skipped.");
 
         // One launcher for both chains.  `world` picks which of the two
         // runners (and which manifest) the run belongs to, so a library
@@ -6598,11 +6654,12 @@ void Menu::drawTerrainGenPopup() {
         auto launch_stage = [&](const char* stage, bool world) {
             namespace fsl = std::filesystem;
             // The NAME goes to python, which resolves it to
-            // assets/terrain/<name>; the progress sidecar has to be
-            // derived the same way here, because this is what the poll
-            // loop watches.
+            // assets/terrain/<name>/<name> (one folder per terrain); the
+            // progress sidecar has to be derived the same way here,
+            // because this is what the poll loop watches.
             const std::string name = sanitizeTerrainName(terrain_name_);
-            const std::string stem = "assets/terrain/" + name;
+            const std::string stem =
+                "assets/terrain/" + name + "/" + name;
             const std::string prog =
                 world ? stem + "_stages.progress"
                       : std::string("assets/terrain/lib/"
@@ -6626,7 +6683,16 @@ void Menu::drawTerrainGenPopup() {
                 // reason it does there — a prompt with quotes in it
                 // does not survive cmd.exe.
                 const std::string p(terrain_prompt_buf_);
-                if (!p.empty()) {
+                if (p.empty()) {
+                    // Launching anyway would spawn python only for it to
+                    // die on "maps stage needs params.prompt" — say so
+                    // here, where the user can act on it.
+                    EditorLog::get().push(
+                        "[terrain] stage 'maps' needs a prompt — describe "
+                        "the terrain in the box at the top of this panel");
+                    return;
+                }
+                {
                     std::error_code ec2;
                     fs::create_directories("content/terrain/.terrain_tmp",
                                            ec2);
@@ -6717,35 +6783,35 @@ void Menu::drawTerrainGenPopup() {
             return ImGui::Button(label,
                                  ImVec2(ts.x + 26.0f, ts.y + 14.0f));
         };
+        // ── No terrain, no stage rows ─────────────────────────────────
+        // Until a terrain is selected (or a new name pressed into New),
+        // the build buttons have nothing to act on — showing them just
+        // invites a click that can only produce an error line.  The name
+        // row above is the whole UI in that state.  (have_terrain is the
+        // panel-wide flag declared above the Generate button.)
+        if (!have_terrain) {
+            ImGui::TextDisabled("Name a terrain above to see its stages.");
+        }
         const bool  world_busy = (terrain_stage_status_ == 1);
+        if (have_terrain) {
         if (world_busy) ImGui::BeginDisabled();
         if (stage_button("1. ML maps (materials)"))
             launch_stage("maps", true);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("MATERIALS ONLY: FLUX orthophoto -> heightmap, "
-                              "albedo, segmentation, surface maps.  No "
-                              "geometry — the mesh stage builds that.  Uses "
-                              "the prompt box above.");
+            ImGui::SetTooltip("Heightmap, albedo, segmentation.\n"
+                              "Uses the prompt above.");
         ImGui::SameLine();
         if (stage_button("2. Terrain mesh"))
             launch_stage("mesh", true);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The ACTUAL ground geometry: road splines "
-                              "graded to a drivable profile, bridges over "
-                              "the drops, river channels carved with real "
-                              "banks, house pads levelled, the heightmap "
-                              "readjusted to all of it, and the terrain + "
-                              "road meshes baked from the finished ground.  "
-                              "Every GLB auto-imports into content/.");
+            ImGui::SetTooltip("Rivers, graded roads, bridges,\n"
+                              "house pads, ground mesh.");
         ImGui::SameLine();
         if (stage_button("3. Place houses & plants"))
             launch_stage("place", true);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("INSTANCES ONLY: houses onto their "
-                              "pre-levelled pads, plants and clutter onto "
-                              "the finished ground.  Never touches the "
-                              "terrain.  Runs maps and mesh first if either "
-                              "is missing or out of date.");
+            ImGui::SetTooltip("House / plant instances,\n"
+                              "then the design-match check.");
         if (world_busy) ImGui::EndDisabled();
         poll_stage(terrain_stage_status_, terrain_stage_name_,
                    terrain_stage_prog_);
@@ -6759,101 +6825,45 @@ void Menu::drawTerrainGenPopup() {
                                terrain_stage_name_.c_str());
         }
 
-        // ── Clear one stage's generated data ──────────────────────────
-        // The published data is split by the stage that made it
-        // (content/terrain/<stem>/{maps,mesh,place}/), so a clear can
-        // delete exactly one stage: the assets/ intermediates, that
-        // subfolder, and the manifest entry.  The next click on the
-        // stage's own button rebuilds it.
-        //
-        // Fire-and-forget on purpose: a delete finishes in milliseconds
-        // and writes no progress sentinels, so there is nothing for the
-        // poll loop to watch.  It deliberately does NOT set
-        // terrain_stage_status_ — that belongs to a running BUILD, and a
-        // clear that claimed it would show a progress bar for work that
-        // is already over.
-        auto launch_clear = [&](const char* stage) {
-            const std::string stem = sanitizeTerrainName(terrain_name_);
-            if (stem.empty()) {
-                EditorLog::get().push(
-                    "[terrain] no terrain selected — nothing to clear");
-                return;
-            }
-            std::string args =
-                std::string("\"tools/terrain/terrain_stages.py\" --clear ") +
-                stage + " --map \"" + stem + "\"";
-#ifdef _WIN32
-            const std::string cmd =
-                "cmd /c start \"terrain-clear\" /B python " + args;
-#else
-            const std::string cmd = "python3 " + args + " &";
-#endif
-            EditorLog::get().push(
-                std::string("[terrain] clearing stage '") + stage +
-                "' (and any stage built from it) for map '" + stem +
-                "' — see the console for what was removed");
-            std::system(cmd.c_str());
-            terrain_names_loaded_ = false;   // a clear can empty a world
-        };
-        // One Clear per stage, on its own row under the three build
-        // buttons: mixing them into that row made a destructive button
-        // sit one tile away from the button you actually want.
-        ImGui::TextDisabled("Clear a stage's data (it rebuilds next run; "
-                            "clearing also clears stages built from it)");
-        if (world_busy) ImGui::BeginDisabled();
-        {
-            struct ClearItem { const char* key; const char* label; };
-            static const ClearItem kClears[] = {
-                { "maps",  "Clear 1. maps"  },
-                { "mesh",  "Clear 2. mesh"  },
-                { "place", "Clear 3. place" },
-            };
-            for (int i = 0; i < IM_ARRAYSIZE(kClears); ++i) {
-                if (i) ImGui::SameLine();
-                ImGui::PushID(kClears[i].key);
-                if (stage_button(kClears[i].label))
-                    launch_clear(kClears[i].key);
-                ImGui::PopID();
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "Deletes the stage's assets/ intermediates, its\n"
-                    "content/terrain/<map>/<stage>/ folder (imported\n"
-                    "layer groups included) and its manifest entry.\n"
-                    "Clearing 'maps' re-runs the diffusion model.");
-        }
-        if (world_busy) ImGui::EndDisabled();
+        // (The per-stage Clear buttons are gone on purpose: the stage
+        // runner's staleness tracking already rebuilds whatever a click
+        // needs, so "clear then build" collapsed into just "build".  A
+        // clear remains available from the CLI — terrain_stages.py
+        // --clear <stage> — for the rare forensic wipe.)
+        }  // have_terrain — end of the world-stage rows
+
 
 
         // The two LIBRARIES depend on no map at all: they are built once
         // and reused by every world, so they get their own row and their
         // own runner rather than sitting in the ordered chain.
+        //
+        // They are nonetheless gated on a selected terrain, like every
+        // other build button here.  Not because a library needs the
+        // name — it does not — but because ONE rule that holds for the
+        // whole panel ("name a terrain, then build") is worth more than
+        // an exception a user has to learn: a lone enabled button under
+        // an otherwise empty panel reads as an oversight, and building a
+        // library is only ever a step toward placing it in a world.
         ImGui::TextDisabled("Sample libraries (world-independent)");
         const bool lib_busy = (terrain_lib_status_ == 1);
-        if (lib_busy) ImGui::BeginDisabled();
+        if (lib_busy || !have_terrain) ImGui::BeginDisabled();
         if (stage_button("House samples"))
             launch_stage("houses", false);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Builds every house archetype (style x "
-                              "footprint x storeys x variant) into "
-                              "assets/terrain/lib/houses.glb.");
+            ImGui::SetTooltip("Every house archetype -> lib/houses.glb.");
         ImGui::SameLine();
         if (stage_button("Plant samples"))
             launch_stage("plants", false);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Builds the plant sample sheet (every species "
-                              "at several sizes) into "
-                              "assets/terrain/lib/plants.glb.");
+            ImGui::SetTooltip("Every species -> lib/plants.glb.");
         ImGui::SameLine();
         if (stage_button("Room decals"))
             launch_stage("objects", false);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Builds the room decal sample sheet "
-                              "(furniture, kitchenware, vases, curtains, "
-                              "windows, doors, lamps, ceiling lamps and "
-                              "switches - 20 variants each) into "
-                              "assets/terrain/lib/room_decals.glb.");
-        if (lib_busy) ImGui::EndDisabled();
+            ImGui::SetTooltip("Furniture, lamps, doors -> "
+                              "lib/room_decals.glb.");
+        if (lib_busy || !have_terrain) ImGui::EndDisabled();
         poll_stage(terrain_lib_status_, terrain_lib_name_,
                    terrain_lib_prog_);
         if (terrain_lib_status_ == 2) {

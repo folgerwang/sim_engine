@@ -168,7 +168,16 @@ class Menu {
     // a run in ONE directory — the stage graph declares some outputs
     // relative to the stem and others pinned to assets/terrain, and those
     // only agree when the stem is rooted there.
-    char        terrain_name_[128]       = "generated_map";
+    // EMPTY until the user picks one from the combo or presses New.
+    // It used to default to "generated_map", and that quietly defeated
+    // the whole point of naming a world: the panel came up already
+    // "holding" a terrain nobody had chosen, every build button was
+    // live, and a click would generate — or overwrite — a world the
+    // user never named.  A default here is not a convenience, it is a
+    // guess about which world you meant.  No auto-select either, not
+    // even when exactly one exists: choosing is one click, and a wrong
+    // guess costs a rebuild.
+    char        terrain_name_[128]       = {};
     char        terrain_new_name_[128]   = {};   // "New" field
     // Names found on disk, for the picker.  Rebuilt on demand rather than
     // per frame: it is two directory scans, and the set only changes when
