@@ -12,6 +12,7 @@
 #include <queue>          // geodesic weight de-bleed (Dijkstra)
 #include <chrono>         // monotonic clock for the one-time viewport intro fade
 #include <functional>     // std::greater
+#include <set>
 #include <unordered_map>
 #include <cstring>        // std::memcpy (exact-position vertex weld)
 
@@ -5699,7 +5700,12 @@ std::string Menu::ensureThumbnail(const std::string& src) {
                            ext == ".bmp" || ext == ".tga");
     const bool is_dds   = (ext == ".dds");
     const bool is_model = (ext == ".gltf" || ext == ".glb" || ext == ".fbx");
-    if (!is_img && !is_dds && !is_model) return "";
+    // Baked engine texture.  readRwTex hands back RGBA8 for both formats:
+    // full-res for legacy format-0, the embedded <=256 px preview mip for
+    // format-1 (the BC7 VT tile cache) — either way more than a 128 px
+    // thumbnail needs, so it goes through the same box-downscale below.
+    const bool is_rwtex = (ext == ".rwtex");
+    if (!is_img && !is_dds && !is_model && !is_rwtex) return "";
 
     const fs::path thumbDir = srcP.parent_path() / ".thumbnails";
     const fs::path thumb     = thumbDir / (srcP.filename().string() + ".png");
@@ -5748,6 +5754,10 @@ std::string Menu::ensureThumbnail(const std::string& src) {
     std::vector<unsigned char> rgba;
     if (is_dds) {
         if (!decodeDdsToRgba(src, w, h, rgba)) return "";
+    } else if (is_rwtex) {
+        if (!engine::helper::readRwTex(src, w, h, rgba) ||
+            w <= 0 || h <= 0 || rgba.size() < (size_t)w * h * 4)
+            return "";
     } else {
         int comp = 0;
         unsigned char* px = stbi_load(src.c_str(), &w, &h, &comp, STBI_rgb_alpha);
@@ -6119,6 +6129,63 @@ void Menu::launchImageGen(const std::string& folder, const std::string& prompt,
     gen_status_ = 1;   // running
 }
 
+// ── Terrain names ──────────────────────────────────────────────────────────
+// A world is picked by NAME.  python resolves a bare name to
+// assets/terrain/<name> (terrain_stages.resolve_stem), so the name is the
+// only thing the editor has to carry — and the only thing it has to keep
+// safe, since both launchers interpolate it into a cmd.exe line.
+std::string Menu::sanitizeTerrainName(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (unsigned char c : raw) {
+        // Conservative allowlist.  Everything outside it is DROPPED
+        // rather than substituted: a name is also a folder name and a
+        // stem, and silently turning "my map & co" into "my_map___co"
+        // reads as a typo you did not make.  Path separators are
+        // excluded too, so a name can never escape assets/terrain/.
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+            out.push_back((char)c);
+    }
+    // Leading dots would make a hidden folder the Content Browser hides.
+    while (!out.empty() && out.front() == '.') out.erase(out.begin());
+    if (out.size() > 96) out.resize(96);
+    return out;
+}
+
+// Every terrain with data on disk.  Two sources, because a world can have
+// only one of them: a manifest but no published copy (every stage
+// cleared), or a published folder but no manifest (built by the one-shot
+// button, or adopted from an older pipeline).  Mirrors
+// terrain_stages.list_terrains — kept here rather than shelling out to
+// --list so the picker never blocks on a python start-up.
+void Menu::refreshTerrainNames() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    terrain_names_.clear();
+    terrain_names_loaded_ = true;
+    std::set<std::string> names;
+    static const std::string kSuffix = "_stages.json";
+    for (auto& e : fs::directory_iterator("assets/terrain", ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const std::string fn = e.path().filename().string();
+        if (fn.size() > kSuffix.size() &&
+            fn.compare(fn.size() - kSuffix.size(), kSuffix.size(),
+                       kSuffix) == 0) {
+            names.insert(fn.substr(0, fn.size() - kSuffix.size()));
+        }
+    }
+    for (auto& e : fs::directory_iterator("content/terrain", ec)) {
+        if (!e.is_directory(ec)) continue;
+        std::error_code mec;
+        if (fs::exists(e.path() / "terrain.rwmeta", mec))
+            names.insert(e.path().filename().string());
+    }
+    names.erase("lib");        // the shared sample libraries are not a world
+    names.erase("library");
+    terrain_names_.assign(names.begin(), names.end());
+}
+
 // ── Terrain prompt presets / history ────────────────────────────────────────
 // One line per prompt: 'F' or 'R', a tab, then the text with newlines
 // escaped as "\n".  Favorites first, then recents (capped).
@@ -6211,22 +6278,52 @@ void Menu::drawTerrainGenPopup() {
         if (fs::exists(terrain_gen_out_ + ".done", ec)) {
             fs::remove(terrain_gen_out_ + ".done", ec);
             terrain_gen_status_ = 2;
+            // PUBLISH before applying.  The one-shot does not go through
+            // the stage runner, so nothing would otherwise materialise
+            // content/terrain/<name>/ — its world would display but never
+            // appear as a draggable terrain folder.  Run it SYNCHRONOUSLY
+            // (no "start /B"): the generation just took minutes, a file
+            // copy is not what the user will notice, and applying the
+            // published heightmap keeps ONE marker per world instead of
+            // one for assets/ and another for content/.
+            const std::string gen_name =
+                fs::path(terrain_gen_out_).stem().string();
+            {
+#ifdef _WIN32
+                const std::string pcmd =
+                    "cmd /c python \"tools\\terrain\\terrain_stages.py\""
+                    " --publish --map \"" + gen_name + "\"";
+#else
+                const std::string pcmd =
+                    "python3 \"tools/terrain/terrain_stages.py\""
+                    " --publish --map \"" + gen_name + "\"";
+#endif
+                std::system(pcmd.c_str());
+                terrain_names_loaded_ = false;   // a new world exists now
+            }
             // Both texture maps are on disk — create the terrain from
             // them now: the app consumes this request, reloads the maps,
             // and regenerates the tile meshes.  No button, no restart.
-            terrain_apply_height_ = terrain_gen_out_;
+            // Prefer the published copy so the scene marker names the
+            // managed content, matching what a dragged terrain folder
+            // would produce.
+            const std::string pub_height =
+                (fs::path("content/terrain") / gen_name / "maps" /
+                 (gen_name + ".png")).string();
+            terrain_apply_height_ =
+                fs::exists(pub_height, ec) ? pub_height : terrain_gen_out_;
             terrain_apply_albedo_.clear();
             if (terrain_gen_color_) {
                 const std::string color_png =
-                    (fs::path(terrain_gen_out_).parent_path() /
-                     (fs::path(terrain_gen_out_).stem().string() +
+                    (fs::path(terrain_apply_height_).parent_path() /
+                     (fs::path(terrain_apply_height_).stem().string() +
                       "_color.png")).string();
                 if (fs::exists(color_png, ec))
                     terrain_apply_albedo_ = color_png;
             }
             terrain_apply_request_ = true;
             EditorLog::get().push(
-                "[terrain] heightmap ready: " + terrain_gen_out_ +
+                "[terrain] heightmap ready: " + terrain_apply_height_ +
                 (terrain_apply_albedo_.empty()
                      ? "" : "  (+ color map)") +
                 "  — creating terrain" +
@@ -6335,11 +6432,21 @@ void Menu::drawTerrainGenPopup() {
                 addTerrainPrompt(p, /*favorite*/ false);   // recents history
                 std::error_code ec;
                 fs::create_directories("content/terrain/.terrain_tmp", ec);
-                const std::string base =
-                    "terrain_" +
-                    std::to_string((long long)std::time(nullptr));
+                // Same NAMED terrain the staged buttons build.  An
+                // empty name mints one so the button still works as
+                // "just make me a world"; the output goes to
+                // assets/terrain/<name>.png like every other stage, so
+                // the one-shot and the staged pipeline produce the same
+                // shape on disk instead of two different layouts.
+                std::string base = sanitizeTerrainName(terrain_name_);
+                if (base.empty()) {
+                    base = "terrain_" +
+                           std::to_string((long long)std::time(nullptr));
+                    std::snprintf(terrain_name_, sizeof(terrain_name_),
+                                  "%s", base.c_str());
+                }
                 terrain_gen_out_ =
-                    (fs::path("content/terrain") / (base + ".png")).string();
+                    (fs::path("assets/terrain") / (base + ".png")).string();
                 const std::string pfile =
                     (fs::path("content/terrain/.terrain_tmp") /
                      (base + ".prompt.txt")).string();
@@ -6428,13 +6535,61 @@ void Menu::drawTerrainGenPopup() {
         ImGui::TextUnformatted("Staged pipeline");
         ImGui::TextDisabled("1 materials -> 2 ground mesh -> 3 instances.  "
                             "A stage whose inputs are unchanged is skipped.");
-        ImGui::SetNextItemWidth(tp_box_w - 140.0f);
-        ImGui::InputText("Map stem", terrain_stage_map_,
-                         sizeof(terrain_stage_map_));
+        // ── Which terrain ──────────────────────────────────────────────
+        // A world is picked by NAME from the ones on disk.  Every stage
+        // button below builds the selected name, replacing that stage's
+        // data for THAT world and leaving every other world alone.
+        if (!terrain_names_loaded_) refreshTerrainNames();
+        ImGui::SetNextItemWidth(tp_box_w * 0.45f);
+        if (ImGui::BeginCombo("##terrain_pick",
+                              terrain_name_[0] ? terrain_name_
+                                               : "(no terrain selected)")) {
+            if (terrain_names_.empty())
+                ImGui::TextDisabled("(none built yet — name one below)");
+            for (const auto& n : terrain_names_) {
+                const bool sel = (n == terrain_name_);
+                if (ImGui::Selectable(n.c_str(), sel)) {
+                    std::snprintf(terrain_name_, sizeof(terrain_name_),
+                                  "%s", n.c_str());
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Path without extension: the stage runner "
-                              "derives <stem>.png, _color.png, _seg.png, "
-                              "_roads.json and the manifest from it.");
+            ImGui::SetTooltip(
+                "Terrain to build.  The name resolves to\n"
+                "assets/terrain/<name> for the generated artifacts and\n"
+                "content/terrain/<name>/ for the managed copy.");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Terrain");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputTextWithHint("##terrain_new", "new name",
+                                 terrain_new_name_,
+                                 sizeof(terrain_new_name_));
+        ImGui::SameLine();
+        {
+            // A new name selects immediately; nothing is created on disk
+            // until a stage actually builds, so a mistyped name costs a
+            // retype rather than a stray folder.
+            const std::string fresh =
+                sanitizeTerrainName(terrain_new_name_);
+            ImGui::BeginDisabled(fresh.empty());
+            if (ImGui::Button("New")) {
+                std::snprintf(terrain_name_, sizeof(terrain_name_), "%s",
+                              fresh.c_str());
+                terrain_new_name_[0] = '\0';
+                terrain_names_loaded_ = false;   // re-scan; may already exist
+                EditorLog::get().push(
+                    "[terrain] selected new terrain '" + fresh +
+                    "' — nothing on disk until a stage builds it");
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Refresh##terrain_names"))
+            terrain_names_loaded_ = false;
 
         // One launcher for both chains.  `world` picks which of the two
         // runners (and which manifest) the run belongs to, so a library
@@ -6442,18 +6597,29 @@ void Menu::drawTerrainGenPopup() {
         // without overwriting each other's status.
         auto launch_stage = [&](const char* stage, bool world) {
             namespace fsl = std::filesystem;
-            const std::string stem(terrain_stage_map_);
+            // The NAME goes to python, which resolves it to
+            // assets/terrain/<name>; the progress sidecar has to be
+            // derived the same way here, because this is what the poll
+            // loop watches.
+            const std::string name = sanitizeTerrainName(terrain_name_);
+            const std::string stem = "assets/terrain/" + name;
             const std::string prog =
                 world ? stem + "_stages.progress"
                       : std::string("assets/terrain/lib/"
                                     "library_stages.progress");
+            if (world && name.empty()) {
+                EditorLog::get().push(
+                    "[terrain] no terrain selected — pick one, or type a "
+                    "name and press New");
+                return;
+            }
             std::error_code lec;
             fsl::remove(prog + ".err", lec);
             fsl::remove(prog + ".done", lec);
             std::string args =
                 std::string("\"tools/terrain/terrain_stages.py\" --stage ") +
                 stage;
-            if (world) args += " --map \"" + stem + "\"";
+            if (world) args += " --map \"" + name + "\"";
             if (world && std::string(stage) == "maps") {
                 // The maps stage needs the same prompt the one-shot
                 // button uses; it goes through a FILE for the same
@@ -6592,6 +6758,72 @@ void Menu::drawTerrainGenPopup() {
                                "Stage '%s' failed — see Editor Log.",
                                terrain_stage_name_.c_str());
         }
+
+        // ── Clear one stage's generated data ──────────────────────────
+        // The published data is split by the stage that made it
+        // (content/terrain/<stem>/{maps,mesh,place}/), so a clear can
+        // delete exactly one stage: the assets/ intermediates, that
+        // subfolder, and the manifest entry.  The next click on the
+        // stage's own button rebuilds it.
+        //
+        // Fire-and-forget on purpose: a delete finishes in milliseconds
+        // and writes no progress sentinels, so there is nothing for the
+        // poll loop to watch.  It deliberately does NOT set
+        // terrain_stage_status_ — that belongs to a running BUILD, and a
+        // clear that claimed it would show a progress bar for work that
+        // is already over.
+        auto launch_clear = [&](const char* stage) {
+            const std::string stem = sanitizeTerrainName(terrain_name_);
+            if (stem.empty()) {
+                EditorLog::get().push(
+                    "[terrain] no terrain selected — nothing to clear");
+                return;
+            }
+            std::string args =
+                std::string("\"tools/terrain/terrain_stages.py\" --clear ") +
+                stage + " --map \"" + stem + "\"";
+#ifdef _WIN32
+            const std::string cmd =
+                "cmd /c start \"terrain-clear\" /B python " + args;
+#else
+            const std::string cmd = "python3 " + args + " &";
+#endif
+            EditorLog::get().push(
+                std::string("[terrain] clearing stage '") + stage +
+                "' (and any stage built from it) for map '" + stem +
+                "' — see the console for what was removed");
+            std::system(cmd.c_str());
+            terrain_names_loaded_ = false;   // a clear can empty a world
+        };
+        // One Clear per stage, on its own row under the three build
+        // buttons: mixing them into that row made a destructive button
+        // sit one tile away from the button you actually want.
+        ImGui::TextDisabled("Clear a stage's data (it rebuilds next run; "
+                            "clearing also clears stages built from it)");
+        if (world_busy) ImGui::BeginDisabled();
+        {
+            struct ClearItem { const char* key; const char* label; };
+            static const ClearItem kClears[] = {
+                { "maps",  "Clear 1. maps"  },
+                { "mesh",  "Clear 2. mesh"  },
+                { "place", "Clear 3. place" },
+            };
+            for (int i = 0; i < IM_ARRAYSIZE(kClears); ++i) {
+                if (i) ImGui::SameLine();
+                ImGui::PushID(kClears[i].key);
+                if (stage_button(kClears[i].label))
+                    launch_clear(kClears[i].key);
+                ImGui::PopID();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Deletes the stage's assets/ intermediates, its\n"
+                    "content/terrain/<map>/<stage>/ folder (imported\n"
+                    "layer groups included) and its manifest entry.\n"
+                    "Clearing 'maps' re-runs the diffusion model.");
+        }
+        if (world_busy) ImGui::EndDisabled();
+
 
         // The two LIBRARIES depend on no map at all: they are built once
         // and reused by every world, so they get their own row and their
@@ -6873,6 +7105,19 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // Saved scene file (Scene → Save Scene).  Double-click opens
                 // it — the app no-ops if it is already the loaded scene.
                 const bool is_scene = (ext == ".scene");
+                // ── Baked group internals ──────────────────────────
+                // These are ordinary tiles inside a group folder, and
+                // each previews as itself: the instance TABLES place
+                // their meshes, the node tree lists its nodes, the clip
+                // file plays on the group's rig, the texture shows its
+                // pixels.  (None of them are placeable — "Add to Scene"
+                // takes the GROUP FOLDER, which routes through
+                // loadRwInstanced and keeps the bands/gates/manifest
+                // bindings that placing an internal file would lose.)
+                const bool is_inst   = (ext == ".rwinst");
+                const bool is_hier   = (ext == ".rwhier");
+                const bool is_rwanim = (ext == ".rwanim");
+                const bool is_rwtex  = (ext == ".rwtex");
                 // Import GROUP folder (holds import.rwmeta + .rwobj files):
                 // placeable as a whole — every object, original layout.
                 bool is_group_dir = false;
@@ -6881,10 +7126,22 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     is_group_dir =
                         fs::exists(e.path() / "import.rwmeta", gec);
                 }
+                // Generated TERRAIN folder (holds terrain.rwmeta): one
+                // whole world as a single asset — the heightmap, its
+                // colour/segmentation maps, and the imported PCG layer
+                // groups nested inside.  Every generation writes a new
+                // one, so several sit side by side; dropping one into
+                // the scene makes it the terrain.
+                bool is_terrain_dir = false;
+                if (is_content && is_dir) {
+                    std::error_code tec;
+                    is_terrain_dir =
+                        fs::exists(e.path() / "terrain.rwmeta", tec);
+                }
 
                 // Anything with a generatable thumbnail goes through getThumbnail;
                 // it returns 0 (→ type tile) for formats we can't render yet.
-                ImTextureID tex = (!is_dir && (is_img || is_model))
+                ImTextureID tex = (!is_dir && (is_img || is_model || is_rwtex))
                                   ? getThumbnail(e.path().string()) : 0;
 
                 ImGui::PushID((int)i);
@@ -6978,8 +7235,8 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // Images are draggable too — onto the Generate Image popup
                 // as a reference (FLUX.2 conditioning), not into the scene.
                 if (is_content &&
-                    (is_model || is_object || is_group_dir || is_img ||
-                     is_audio) &&
+                    (is_model || is_object || is_group_dir ||
+                     is_terrain_dir || is_img || is_audio) &&
                     ImGui::BeginDragDropSource()) {
                     const std::string pay = e.path().string();
                     ImGui::SetDragDropPayload("RW_CONTENT_ASSET",
@@ -7083,7 +7340,8 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     }
                     ImGui::Separator();
                     if (is_content &&
-                        (is_model || is_object || is_group_dir) &&
+                        (is_model || is_object || is_group_dir ||
+                         is_terrain_dir) &&
                         ImGui::MenuItem(multi
                             ? (std::string("Add to Scene (") +
                                std::to_string(sel_n) + ")").c_str()
@@ -7097,7 +7355,11 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                                 se == ".obj"  || se == ".fbx" ||
                                 se == ".rwobj" ||
                                 (fs::is_directory(sp, ec) &&
-                                 fs::exists(fs::path(sp) / "import.rwmeta", ec));
+                                 (fs::exists(fs::path(sp) / "import.rwmeta", ec) ||
+                                  // A terrain folder places as the scene's
+                                  // terrain, not as geometry — the app
+                                  // branches on the marker at the drop.
+                                  fs::exists(fs::path(sp) / "terrain.rwmeta", ec)));
                             if (placeable) place_asset_queue_.push_back(sp);
                         }
                     }
@@ -7191,11 +7453,27 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // single sub-object on click / double-click.  "Add to
                 // Scene" lives in the tile's right-click menu.
                 if (plain_click && is_dir) {
-                    if (is_group_dir && is_content) {
+                    if (is_terrain_dir && is_content) {
+                        // A terrain is not geometry you can orbit — the
+                        // readout is the preview.
+                        buildTerrainFolderPreview(e.path().string(), name);
+                    } else if (is_group_dir && is_content) {
                         // Group folder, Explorer-style: a single CLICK previews
                         // the assembled collection in the Debug Display; a
                         // DOUBLE-click (handled above) opens the folder.
-                        buildRwGroupPreview(e.path().string(), name);
+                        //
+                        // An INSTANCED group's layout lives in the tables,
+                        // not in the meshes — merging objects/*.rwgeo would
+                        // show one of each at the origin.  Route those
+                        // through the instance preview instead (which falls
+                        // back to the merge for an empty marker file).
+                        std::error_code iec;
+                        const fs::path ipath =
+                            e.path() / "instances.rwinst";
+                        if (fs::exists(ipath, iec))
+                            buildRwInstPreview(ipath.string(), name);
+                        else
+                            buildRwGroupPreview(e.path().string(), name);
                     } else {
                         cur_dir = e.path().string();   // plain folder: enter
                     }
@@ -7206,6 +7484,14 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                     buildRwObjPreview(e.path().string(), name);
                 } else if (plain_click && is_content && is_geo) {
                     buildRwGeoPreview(e.path().string(), name);
+                } else if (plain_click && is_content && is_inst) {
+                    buildRwInstPreview(e.path().string(), name);
+                } else if (plain_click && is_content && is_hier) {
+                    buildRwHierPreview(e.path().string(), name);
+                } else if (plain_click && is_content && is_rwanim) {
+                    buildRwAnimPreview(e.path().string(), name);
+                } else if (plain_click && is_content && is_rwtex) {
+                    buildRwTexPreview(e.path().string(), name);
                 } else if (plain_click && is_audio) {
                     // Toggle preview: clicking the playing clip stops it;
                     // clicking another clip switches to it.
@@ -9418,7 +9704,17 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
         if (engine::helper::loadRwAnim(
                 (fs::path(group_dir) / "animation.rwanim").string(), clips) &&
             !clips.empty()) {
-            chosen_clip = clips[0];
+            // Which clip is the .rwanim panel's picker (preview_anim_clip_).
+            // A different group means the index no longer refers to
+            // anything the user chose — start over at clip 0.
+            if (dbg_anim_clip_group_ != group_dir) {
+                dbg_anim_clip_group_ = group_dir;
+                preview_anim_clip_   = 0;
+            }
+            if (preview_anim_clip_ < 0 ||
+                preview_anim_clip_ >= (int)clips.size())
+                preview_anim_clip_ = 0;
+            chosen_clip = clips[preview_anim_clip_];
         } else {
             chosen_clip = makeProceduralWalk(hier);
         }
@@ -9647,6 +9943,621 @@ void Menu::buildRwGeoPreview(const std::string& rwgeo_path,
     preview_nav_ = PreviewNav::None;
 }
 
+// ── Native system-file previews ───────────────────────────────────────────
+// instances.rwinst / hierarchy.rwhier / animation.rwanim / *.rwtex are the
+// baked internals of an import group.  They show up as ordinary tiles, so
+// they get ordinary previews — each showing what the FILE actually carries
+// rather than falling through to a blank panel.
+
+void Menu::clearFormatReadouts() {
+    dbg_inst_path_.clear();
+    dbg_inst_stats_.clear();
+    dbg_inst_ready_ = false;
+    dbg_hier_nodes_.clear();
+    dbg_hier_stats_.clear();
+    dbg_anim_clip_names_.clear();
+    dbg_anim_stats_.clear();
+    dbg_anim_path_.clear();
+    dbg_tex_pending_.clear();
+    dbg_tex_stats_.clear();
+    dbg_tex_w_ = dbg_tex_h_ = 0;
+    dbg_terrain_stats_.clear();
+    // Deferred free: an in-flight frame may still sample this descriptor,
+    // so it rides the same retirement list the thumbnails use.
+    if (dbg_tex_info_) {
+        retired_thumbs_.push_back(dbg_tex_info_);
+        dbg_tex_info_.reset();
+    }
+    dbg_tex_id_ = ImTextureID(0);
+}
+
+// instances.rwinst — PLACE the instances.  An instanced group stores each
+// mesh once and scatters it by per-instance TRS (30 tree species, 30 000
+// copies), so merging objects/*.rwgeo the way buildRwGroupPreview does
+// shows the 30 species piled at the origin and none of the layout.  This
+// composes transform x mesh exactly the way loadRwInstanced does at
+// runtime: the .rwgeo positions come back in SOURCE-WORLD space (loadRwGeo
+// re-applies the node's baked matrix) and the instance transform is applied
+// on top of them.
+void Menu::buildRwInstPreview(const std::string& rwinst_path,
+                              const std::string& display_name) {
+    namespace fs = std::filesystem;
+    const std::string group_dir =
+        fs::path(rwinst_path).parent_path().string();
+    // The Expanded/Unique toggle is part of the key, so flipping it in the
+    // panel REBUILDS instead of short-circuiting on "already showing".
+    const std::string key = rwinst_path +
+        (preview_inst_expanded_ ? "#inst-placed" : "#inst-unique");
+    if (key == dbg_asset_key_) return;
+
+    std::vector<engine::helper::RwInstArray> arrays;
+    std::vector<engine::helper::RwInstNode>  inodes;
+    if (!engine::helper::loadRwInst(rwinst_path, arrays, inodes)) {
+        EditorLog::get().push(
+            "[preview] unreadable instance tables: " + rwinst_path);
+        return;
+    }
+    if (inodes.empty()) {
+        // A non-instanced "group mode" import writes an EMPTY rwinst as a
+        // routing MARKER (asset_import.cpp) — there is nothing to place,
+        // and the assembled group IS the preview.
+        buildRwGroupPreview(group_dir, display_name);
+        return;
+    }
+    dbg_preview_skinned_ = false;   // instanced groups are static props
+
+    // ── mesh_ordinal → objects/NNN_*.rwgeo ─────────────────────────────
+    // Same mapping loadRwInstanced uses: the leading digits of the file
+    // name ARE the ordinal.
+    std::error_code ec;
+    std::unordered_map<int, std::string> ordinal_geo;
+    for (auto& e : fs::directory_iterator(
+             fs::path(group_dir) / "objects", ec)) {
+        if (e.path().extension() != ".rwgeo") continue;
+        const std::string gp = e.path().string();
+        // Honour the Content Browser's per-tile Enabled toggle, exactly as
+        // the runtime loader does (in-memory set + persistent sidecar).
+        std::error_code dec;
+        if (content_disabled_.find(gp) != content_disabled_.end() ||
+            fs::exists(gp + ".disabled", dec))
+            continue;
+        const std::string fn = e.path().filename().string();
+        char* end = nullptr;
+        const long ord = std::strtol(fn.c_str(), &end, 10);
+        if (end == fn.c_str() || ord < 0) continue;
+        ordinal_geo.emplace((int)ord, gp);
+    }
+    if (ordinal_geo.empty()) {
+        EditorLog::get().push(
+            "[preview] instanced group has no baked objects: " + group_dir);
+        return;
+    }
+
+    // Vertex budget: a whole map's tree layer is tens of millions of
+    // vertices once placed.  Rather than truncate (half a forest, sharply
+    // cut off), the placement STRIDES — every n-th instance — so the
+    // preview keeps the full extent at lower density.
+    constexpr size_t kMaxInstVerts = 3'000'000;
+
+    engine::helper::MeshPreviewPayload p;
+    std::unordered_map<std::string, int> texmap;   // .rwtex path → payload idx
+
+    // One CPU load per unique mesh, reused by every instance of it.
+    struct GeoCache {
+        engine::helper::ModelPreviewData md;
+        std::vector<int>                 tex_remap;  // md.textures → p.textures
+        bool                             ok = false;
+    };
+    std::unordered_map<int, GeoCache> geo_cache;
+    auto fetch = [&](int ordinal) -> GeoCache* {
+        auto cit = geo_cache.find(ordinal);
+        if (cit != geo_cache.end())
+            return cit->second.ok ? &cit->second : nullptr;
+        GeoCache gc;
+        const auto git = ordinal_geo.find(ordinal);
+        if (git != ordinal_geo.end()) {
+            std::vector<std::string> tpaths;
+            if (engine::helper::loadRwGeo(git->second, gc.md, &tpaths) &&
+                !gc.md.positions.empty() && gc.md.indices.size() >= 3) {
+                // v6 bakes append decimated LOD indices after the section
+                // spans — the preview shows LOD 0 only.
+                if (!gc.md.lod_ranges.empty()) {
+                    uint32_t lod0_end = 0;
+                    for (const auto& s : gc.md.sections)
+                        lod0_end = std::max(lod0_end,
+                                            s.first_index + s.index_count);
+                    if (lod0_end < gc.md.indices.size())
+                        gc.md.indices.resize(lod0_end);
+                }
+                // Textures are shared across ordinals AND across every
+                // instance — one payload entry per distinct .rwtex.
+                gc.tex_remap.assign(gc.md.textures.size(), -1);
+                for (size_t t = 0; t < gc.md.textures.size() &&
+                                   t < tpaths.size(); ++t) {
+                    auto it = texmap.find(tpaths[t]);
+                    if (it != texmap.end()) {
+                        gc.tex_remap[t] = it->second;
+                        continue;
+                    }
+                    engine::helper::MeshPreviewTexture mt;
+                    mt.rgba = std::move(gc.md.textures[t].rgba);
+                    mt.w = gc.md.textures[t].w;
+                    mt.h = gc.md.textures[t].h;
+                    gc.tex_remap[t] = (int)p.textures.size();
+                    p.textures.push_back(std::move(mt));
+                    texmap.emplace(tpaths[t], gc.tex_remap[t]);
+                }
+                gc.ok = true;
+            }
+        }
+        auto ins = geo_cache.emplace(ordinal, std::move(gc));
+        return ins.first->second.ok ? &ins.first->second : nullptr;
+    };
+
+    // Append one transformed copy of a cached mesh.
+    auto append = [&](const GeoCache& gc, const glm::mat3& basis,
+                      const glm::vec3& translate) {
+        const auto& md = gc.md;
+        const uint32_t vbase = (uint32_t)p.positions.size();
+        const uint32_t ibase = (uint32_t)p.indices.size();
+        // Non-uniform instance scale needs the inverse transpose, or a
+        // squashed tree shades as though it were not squashed.
+        const glm::mat3 nrm_m = glm::transpose(glm::inverse(basis));
+        for (const auto& v : md.positions)
+            p.positions.push_back(basis * v + translate);
+        for (size_t i = 0; i < md.positions.size(); ++i) {
+            glm::vec3 n = i < md.normals.size() ? md.normals[i]
+                                                : glm::vec3(0, 1, 0);
+            n = nrm_m * n;
+            const float len = glm::length(n);
+            p.normals.push_back(len > 1e-8f ? n / len : glm::vec3(0, 1, 0));
+            // Keep the uv stream parallel to positions.
+            p.uvs.push_back(i < md.uvs.size() ? md.uvs[i] : glm::vec2(0.0f));
+        }
+        for (uint32_t ix : md.indices) p.indices.push_back(vbase + ix);
+        auto rm = [&gc](int idx) -> int {
+            return (idx >= 0 && idx < (int)gc.tex_remap.size())
+                       ? gc.tex_remap[idx] : -1;
+        };
+        for (const auto& s : md.sections) {
+            engine::helper::MeshPreviewSection ms;
+            ms.first_index = ibase + s.first_index;
+            ms.index_count = s.index_count;
+            ms.base_color  = s.base_color;
+            ms.metallic    = s.metallic;
+            ms.roughness   = s.roughness;
+            ms.tex_index   = rm(s.tex_index);
+            ms.nrm_index   = rm(s.nrm_index);
+            ms.mr_index    = rm(s.mr_index);
+            p.sections.push_back(ms);
+        }
+    };
+
+    // ── Pass 1: what is in here, and how big would placing it be? ──────
+    struct InstNodeInfo {
+        const engine::helper::RwInstNode* node = nullptr;
+        size_t count = 0;
+    };
+    std::vector<InstNodeInfo> live;
+    std::unordered_set<int>   used_set;
+    std::vector<int>          used_ordinals;   // sorted, unique
+    size_t total_instances = 0, placed_verts_est = 0;
+    for (const auto& in : inodes) {
+        size_t count = 0;
+        if (in.t_idx >= 0 && in.t_idx < (int)arrays.size())
+            count = std::max(count, arrays[in.t_idx].data.size() / 3);
+        if (in.r_idx >= 0 && in.r_idx < (int)arrays.size())
+            count = std::max(count, arrays[in.r_idx].data.size() / 4);
+        if (in.s_idx >= 0 && in.s_idx < (int)arrays.size())
+            count = std::max(count, arrays[in.s_idx].data.size() / 3);
+        if (count == 0) continue;
+        total_instances += count;
+        live.push_back({ &in, count });
+        if (used_set.insert(in.mesh_ordinal).second)
+            used_ordinals.push_back(in.mesh_ordinal);
+    }
+    std::sort(used_ordinals.begin(), used_ordinals.end());
+    // Loading the unique meshes is bounded by the SPECIES count (tens),
+    // not the instance count — cheap enough to do before deciding stride.
+    for (int ord : used_ordinals) {
+        const GeoCache* gc = fetch(ord);
+        if (!gc) continue;
+        for (const auto& li : live)
+            if (li.node->mesh_ordinal == ord)
+                placed_verts_est += li.count * gc->md.positions.size();
+    }
+
+    size_t stride = 1;
+    if (preview_inst_expanded_ && placed_verts_est > kMaxInstVerts) {
+        stride = (placed_verts_est + kMaxInstVerts - 1) / kMaxInstVerts;
+        if (stride < 1) stride = 1;
+    }
+
+    // ── Pass 2: build the payload ──────────────────────────────────────
+    size_t placed = 0;
+    if (preview_inst_expanded_) {
+        for (const auto& li : live) {
+            const GeoCache* gc = fetch(li.node->mesh_ordinal);
+            if (!gc) continue;
+            const std::vector<float>* t =
+                (li.node->t_idx >= 0 && li.node->t_idx < (int)arrays.size())
+                    ? &arrays[li.node->t_idx].data : nullptr;
+            const std::vector<float>* r =
+                (li.node->r_idx >= 0 && li.node->r_idx < (int)arrays.size())
+                    ? &arrays[li.node->r_idx].data : nullptr;
+            const std::vector<float>* s =
+                (li.node->s_idx >= 0 && li.node->s_idx < (int)arrays.size())
+                    ? &arrays[li.node->s_idx].data : nullptr;
+            for (size_t i = 0; i < li.count; i += stride) {
+                // Hard stop: the estimate is exact for well-formed tables,
+                // but a malformed one must not blow up the payload.
+                if (p.positions.size() >= kMaxInstVerts * 2) break;
+                const glm::vec3 tr =
+                    (t && (i + 1) * 3 <= t->size())
+                        ? glm::vec3((*t)[i * 3], (*t)[i * 3 + 1],
+                                    (*t)[i * 3 + 2])
+                        : glm::vec3(0.0f);
+                const glm::quat rot =
+                    (r && (i + 1) * 4 <= r->size())
+                        ? glm::quat((*r)[i * 4 + 3], (*r)[i * 4 + 0],
+                                    (*r)[i * 4 + 1], (*r)[i * 4 + 2])
+                        : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+                const glm::vec3 sc =
+                    (s && (i + 1) * 3 <= s->size())
+                        ? glm::vec3((*s)[i * 3], (*s)[i * 3 + 1],
+                                    (*s)[i * 3 + 2])
+                        : glm::vec3(1.0f);
+                const glm::mat3 basis =
+                    glm::mat3_cast(glm::normalize(rot)) *
+                    glm::mat3(sc.x, 0.0f, 0.0f,
+                              0.0f, sc.y, 0.0f,
+                              0.0f, 0.0f, sc.z);
+                append(*gc, basis, tr);
+                ++placed;
+            }
+        }
+    } else {
+        // Unique-meshes-only: a SAMPLE SHEET, not a pile.  The instanced
+        // nodes almost always sit at the origin (all the placement is in
+        // the tables), so laying the species out in a row by their own
+        // width is the only way this view says anything.
+        float cursor_x = 0.0f;
+        for (int ord : used_ordinals) {
+            const GeoCache* gc = fetch(ord);
+            if (!gc) continue;
+            glm::vec3 bmn(1e30f), bmx(-1e30f);
+            for (const auto& v : gc->md.positions) {
+                bmn = glm::min(bmn, v);
+                bmx = glm::max(bmx, v);
+            }
+            const float wdt = std::max(0.01f, bmx.x - bmn.x);
+            // Shift onto the cursor and drop each sample to a common floor.
+            const glm::vec3 offset(cursor_x - bmn.x, -bmn.y, -0.5f * (bmn.z + bmx.z));
+            append(*gc, glm::mat3(1.0f), offset);
+            cursor_x += wdt * 1.25f;
+            ++placed;
+        }
+    }
+
+    if (p.positions.empty() || p.indices.size() < 3) {
+        EditorLog::get().push(
+            "[preview] instanced group has no readable geometry: " +
+            group_dir);
+        return;
+    }
+
+    stagePreviewPayload(std::move(p));
+    finishAssetPreview(key, display_name + (preview_inst_expanded_
+                                                ? " (instances)"
+                                                : " (unique meshes)"));
+    preview_nav_ = PreviewNav::None;
+
+    // Readouts last: finishAssetPreview clears them.
+    char buf[320];
+    if (preview_inst_expanded_) {
+        const std::string thinned =
+            stride > 1 ? ("  (1 in " + std::to_string(stride) +
+                          ", thinned to the vertex budget)")
+                       : std::string();
+        std::snprintf(buf, sizeof(buf),
+            "%zu instanced node(s) · %zu table(s) · %zu instance(s) over "
+            "%zu unique mesh(es)\nplaced %zu%s",
+            live.size(), arrays.size(), total_instances,
+            used_ordinals.size(), placed, thinned.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf),
+            "%zu instanced node(s) · %zu table(s) · %zu instance(s) over "
+            "%zu unique mesh(es)\nshowing the %zu unique mesh(es) only, "
+            "laid out side by side",
+            live.size(), arrays.size(), total_instances,
+            used_ordinals.size(), placed);
+    }
+    dbg_inst_stats_ = buf;
+    dbg_inst_path_  = rwinst_path;
+    dbg_inst_ready_ = true;
+}
+
+// hierarchy.rwhier — the group's assembled geometry PLUS the node tree.
+// The tree is the point of the file (transform-only nodes, parent links,
+// which node owns which baked object), so it gets a readout of its own.
+void Menu::buildRwHierPreview(const std::string& rwhier_path,
+                              const std::string& display_name) {
+    namespace fs = std::filesystem;
+    const std::string group_dir =
+        fs::path(rwhier_path).parent_path().string();
+    std::vector<engine::helper::RwHierNode> hier;
+    if (!engine::helper::loadRwHier(rwhier_path, hier) || hier.empty()) {
+        EditorLog::get().push(
+            "[preview] unreadable node hierarchy: " + rwhier_path);
+        return;
+    }
+
+    // Geometry side: whatever the group assembles to.  An instanced group
+    // goes through the instance path so the hierarchy readout sits next to
+    // the layout the nodes actually describe.  dbg_asset_key_ is cleared
+    // first so an already-showing group rebuilds rather than leaving the
+    // tree attached to a stale image.
+    dbg_asset_key_.clear();
+    std::error_code iec;
+    const fs::path ipath = fs::path(group_dir) / "instances.rwinst";
+    if (fs::exists(ipath, iec))
+        buildRwInstPreview(ipath.string(), display_name);
+    else
+        buildRwGroupPreview(group_dir, display_name);
+
+    // Readouts last (the builders above clear them).  These are populated
+    // even when the geometry side bailed out — an unreadable bake does not
+    // make the node tree less worth reading.
+    size_t roots = 0, meshed = 0;
+    for (const auto& n : hier) {
+        if (n.parent < 0 || n.parent >= (int)hier.size()) ++roots;
+        if (n.mesh_ordinal >= 0) ++meshed;
+    }
+    // Depth by walking parents, guarded against a malformed cyclic link.
+    size_t depth = 0;
+    for (size_t i = 0; i < hier.size(); ++i) {
+        size_t d = 0;
+        int walk = hier[i].parent;
+        while (walk >= 0 && walk < (int)hier.size() && d <= hier.size()) {
+            ++d;
+            walk = hier[walk].parent;
+        }
+        depth = std::max(depth, d);
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "%zu node(s) · %zu root(s) · %zu with a baked mesh · depth %zu",
+        hier.size(), roots, meshed, depth);
+    dbg_hier_stats_ = buf;
+    dbg_hier_nodes_ = std::move(hier);
+    dbg_asset_key_  = rwhier_path + "#hier";
+}
+
+// animation.rwanim — the group's rig, plus a picker for WHICH clip plays.
+// buildRwGroupPreview does the skinned assembly and reads the pick out of
+// preview_anim_clip_.
+void Menu::buildRwAnimPreview(const std::string& rwanim_path,
+                              const std::string& display_name) {
+    namespace fs = std::filesystem;
+    const std::string group_dir =
+        fs::path(rwanim_path).parent_path().string();
+    std::vector<engine::helper::RwAnimClip> clips;
+    if (!engine::helper::loadRwAnim(rwanim_path, clips) || clips.empty()) {
+        EditorLog::get().push(
+            "[preview] no clips in: " + rwanim_path);
+        return;
+    }
+    if (dbg_anim_clip_group_ != group_dir) {
+        dbg_anim_clip_group_ = group_dir;
+        preview_anim_clip_   = 0;
+    }
+    if (preview_anim_clip_ < 0 || preview_anim_clip_ >= (int)clips.size())
+        preview_anim_clip_ = 0;
+
+    dbg_asset_key_.clear();   // force the rebuild with the chosen clip
+    buildRwGroupPreview(group_dir, display_name);
+
+    // Readouts last (buildRwGroupPreview clears them).
+    dbg_anim_clip_names_.clear();
+    dbg_anim_clip_names_.reserve(clips.size());
+    for (size_t i = 0; i < clips.size(); ++i) {
+        dbg_anim_clip_names_.push_back(
+            clips[i].name.empty() ? ("clip " + std::to_string(i))
+                                  : clips[i].name);
+    }
+    const auto& sel = clips[preview_anim_clip_];
+    size_t keys = 0;
+    for (const auto& ch : sel.channels) keys += ch.times.size();
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "%zu clip(s) baked · selected: %.2fs, %zu channel(s), %zu key(s)",
+        clips.size(), sel.duration, sel.channels.size(), keys);
+    dbg_anim_stats_ = buf;
+    dbg_anim_path_  = rwanim_path;
+    dbg_asset_key_  = rwanim_path + "#anim" +
+                      std::to_string(preview_anim_clip_);
+}
+
+// .rwtex — the decoded pixels, shown in place of the mesh render.  Both
+// formats come back as RGBA8: format 0 is full-res, format 1 (the BC7 VT
+// tile cache) carries an embedded <=256 px preview mip.
+void Menu::buildRwTexPreview(const std::string& rwtex_path,
+                             const std::string& display_name) {
+    namespace fs = std::filesystem;
+    const std::string key = rwtex_path + "#tex";
+    if (key == dbg_asset_key_) return;
+
+    engine::helper::RwTexBaked tb;
+    if (!engine::helper::readRwTexBaked(rwtex_path, tb) ||
+        tb.preview_w <= 0 || tb.preview_h <= 0 ||
+        tb.preview_rgba.size() <
+            (size_t)tb.preview_w * tb.preview_h * 4) {
+        EditorLog::get().push(
+            "[preview] unreadable baked texture: " + rwtex_path);
+        return;
+    }
+
+    // The decoded pixels go out through a PNG sidecar so the upload can
+    // reuse createTextureImage (which loads from a PATH).  Same
+    // .thumbnails folder the grid tiles use, distinct suffix so the 128 px
+    // tile thumbnail is not clobbered.
+    std::error_code ec;
+    const fs::path srcP(rwtex_path);
+    const fs::path dir = srcP.parent_path() / ".thumbnails";
+    fs::create_directories(dir, ec);
+    const fs::path png = dir / (srcP.filename().string() + ".view.png");
+    if (!stbi_write_png(png.string().c_str(), tb.preview_w, tb.preview_h, 4,
+                        tb.preview_rgba.data(), tb.preview_w * 4)) {
+        EditorLog::get().push(
+            "[preview] could not stage texture pixels: " + rwtex_path);
+        return;
+    }
+
+    // A texture preview REPLACES the mesh image — otherwise the panel
+    // shows the last previewed object under the texture's caption.
+    retireDebugPreview();
+    finishAssetPreview(key, display_name);   // clears the readouts
+
+    dbg_tex_pending_ = png.string();         // uploaded on an idle frame
+    dbg_tex_w_ = tb.preview_w;
+    dbg_tex_h_ = tb.preview_h;
+    const std::string mip =
+        (tb.preview_w != tb.w || tb.preview_h != tb.h)
+            ? ("  ·  showing the " + std::to_string(tb.preview_w) + " x " +
+               std::to_string(tb.preview_h) + " preview mip")
+            : std::string();
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "%d x %d source%s%s%s", tb.w, tb.h, mip.c_str(),
+        tb.bc7_tiles ? "  ·  BC7 VT tile cache" : "  ·  RGBA8",
+        tb.alpha.empty() ? "" : "  ·  full-res alpha plane (cutout)");
+    dbg_tex_stats_ = buf;
+}
+
+// A generated TERRAIN folder — content/terrain/<stem>/, marked by
+// terrain.rwmeta.  Every generation publishes a new one, so this is what
+// the Content Browser shows when you click between worlds.
+//
+// The readout is TEXT on purpose.  The obvious preview would be the
+// colour map, but these are 8192x8192: uploading one into the panel
+// costs ~256 MB of VRAM to show a picture that says less than the layer
+// list does.  What you actually want to know before dropping a terrain
+// into the scene is which layers exist and which of them are imported.
+void Menu::buildTerrainFolderPreview(const std::string& terrain_dir,
+                                     const std::string& display_name) {
+    namespace fs = std::filesystem;
+    const std::string key = terrain_dir + "#terrain";
+    if (key == dbg_asset_key_) return;
+
+    std::string stem, height, color, generated;
+    std::vector<std::string> layers, stages;
+    {
+        std::ifstream meta((fs::path(terrain_dir) / "terrain.rwmeta")
+                               .string());
+        if (!meta) {
+            EditorLog::get().push(
+                "[preview] not a terrain folder: " + terrain_dir);
+            return;
+        }
+        std::string line;
+        while (std::getline(meta, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("stem=", 0) == 0)            stem = line.substr(5);
+            else if (line.rfind("height=", 0) == 0)     height = line.substr(7);
+            else if (line.rfind("color=", 0) == 0)      color = line.substr(6);
+            else if (line.rfind("generated=", 0) == 0)  generated = line.substr(10);
+            else if (line.rfind("stage=", 0) == 0)      stages.push_back(line.substr(6));
+            else if (line.rfind("layer=", 0) == 0)      layers.push_back(line.substr(6));
+        }
+    }
+    // Pre-marker folders (hand-arranged) still read: the stem is the
+    // folder name and the heightmap is named after it.  A marker written
+    // before the data was split by stage names the heightmap at the top
+    // level; both forms resolve, because height= is always relative to
+    // the folder.
+    if (stem.empty()) stem = fs::path(terrain_dir).filename().string();
+    if (height.empty()) {
+        std::error_code hec;
+        height = fs::exists(fs::path(terrain_dir) / "maps" / (stem + ".png"),
+                            hec)
+                     ? ("maps/" + stem + ".png")
+                     : (stem + ".png");
+    }
+    // Stages the world has data for.  An older marker lists none, so
+    // fall back to probing the folders.
+    if (stages.empty()) {
+        std::error_code sec;
+        for (const char* st : { "maps", "mesh", "place" }) {
+            if (fs::is_directory(fs::path(terrain_dir) / st, sec))
+                stages.push_back(st);
+        }
+    }
+
+    std::error_code ec;
+    const bool have_height =
+        fs::exists(fs::path(terrain_dir) / height, ec);
+    const bool have_color =
+        !color.empty() && fs::exists(fs::path(terrain_dir) / color, ec);
+
+    // A layer is IMPORTED when its group folder sits beside the maps —
+    // the name without ".glb".  That folder is what the engine's
+    // content-wide index resolves the raw assets/ glb to, so "imported"
+    // here means exactly "the engine will use the managed copy".
+    size_t imported = 0;
+    std::string missing;
+    for (const auto& l : layers) {
+        std::string base = l;
+        const auto dot = base.find_last_of('.');
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        if (fs::is_directory(fs::path(terrain_dir) / base, ec)) {
+            ++imported;
+        } else if (missing.size() < 120) {
+            if (!missing.empty()) missing += ", ";
+            missing += base;
+        }
+    }
+
+    // No mesh to show — retire the preview so the panel is not showing
+    // the last object under a terrain's caption.
+    retireDebugPreview();
+    finishAssetPreview(key, display_name);   // clears the readouts
+
+    // The generation stages this world has data for.  Each is its own
+    // subfolder, so a missing one means that stage was cleared (or never
+    // ran) and will rebuild on the next pipeline run.
+    std::string stage_line;
+    for (const char* st : { "maps", "mesh", "place" }) {
+        const bool have =
+            std::find(stages.begin(), stages.end(), st) != stages.end();
+        if (!stage_line.empty()) stage_line += "  ";
+        stage_line += std::string(have ? "[x] " : "[ ] ") + st;
+    }
+
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+        "stem %s%s%s\nstages: %s\nheightmap: %s%s\ncolour map: %s\n"
+        "%zu PCG layer(s), %zu imported into this folder%s%s",
+        stem.c_str(),
+        generated.empty() ? "" : "   generated ",
+        generated.c_str(),
+        stage_line.c_str(),
+        height.c_str(), have_height ? "" : "   MISSING",
+        have_color ? color.c_str() : "(none)",
+        layers.size(), imported,
+        missing.empty() ? "" : "\nnot imported: ",
+        missing.c_str());
+    dbg_terrain_stats_ = buf;
+    if (!have_height) {
+        // The single failure that makes a terrain silently not display:
+        // the frame scan checks the heightmap exists and, if it does not,
+        // does nothing at all — no log, no terrain.
+        EditorLog::get().push(
+            "[terrain] '" + display_name + "' has no heightmap at " +
+            height + " — dropping it into the scene will not display "
+            "anything");
+    }
+}
+
 void Menu::buildRwObjPreview(const std::string& rwobj_path,
                              const std::string& fallback_name) {
     std::string src, name, geo;
@@ -9782,6 +10693,10 @@ void Menu::finishAssetPreview(const std::string& key,
                               const std::string& caption) {
     dbg_asset_key_    = key;
     dbg_disp_caption_ = caption;
+    // Any new preview starts with a clean panel; the specialised
+    // .rwinst/.rwhier/.rwanim/.rwtex builders re-populate their own
+    // readout AFTER staging.
+    clearFormatReadouts();
 
     // Invalidate the scene-selection key so clicking any scene object next
     // rebuilds from the selection — but record the CURRENT selection as
@@ -9829,6 +10744,9 @@ void Menu::drawDebugDisplayPanel() {
         if (sel_changed) {
             updateDebugDisplay(obj, node);
             dbg_disp_caption_.clear();
+            // A scene selection is not a content file — drop the
+            // file-format readouts (and the .rwtex image) with it.
+            clearFormatReadouts();
             if (obj && editor_selected_ >= 0 &&
                 editor_selected_ < (int)editor_objects_.size()) {
                 const auto& eo = editor_objects_[editor_selected_];
@@ -9854,22 +10772,73 @@ void Menu::drawDebugDisplayPanel() {
             ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "%s",
                                dbg_skin_status_.c_str());
 
+        // ── Deferred .rwtex upload ─────────────────────────────────────
+        // Uploading is main-thread GPU work (command buffer + queue submit
+        // + device allocation) and MUST NOT run while the async mesh
+        // loader is doing the same on its worker — the identical hazard
+        // getThumbnail documents.  The path waits here until the loader
+        // has drained; the panel shows "Decoding..." meanwhile.
+        if (!dbg_tex_pending_.empty() &&
+            !(mesh_load_task_manager_ &&
+              mesh_load_task_manager_->inFlightCount() > 0)) {
+            const std::string png = dbg_tex_pending_;
+            dbg_tex_pending_.clear();
+            try {
+                auto info = std::make_shared<renderer::TextureInfo>();
+                engine::helper::createTextureImage(
+                    device_, png, renderer::Format::R8G8B8A8_UNORM, true,
+                    *info, std::source_location::current());
+                if (info->view) {
+                    dbg_tex_info_ = info;
+                    dbg_tex_id_ = renderer::Helper::addImTextureID(
+                        sampler_, info->view);
+                }
+            } catch (...) {
+                dbg_tex_info_.reset();
+                dbg_tex_id_ = ImTextureID(0);
+                EditorLog::get().push(
+                    "[preview] texture upload failed: " + png);
+            }
+        }
+
         // The image lives in helper::MeshPreview's persistent GPU target —
         // rendered by the app (real pipeline, three spot lights) whenever a
         // staged mesh is consumed, sampled here every frame.
         const ImTextureID prev_id =
             engine::helper::MeshPreview::imguiId();
+        // A .rwtex preview is a flat image, not a mesh render — it takes
+        // the panel over while it is up.
+        const bool show_tex = (dbg_tex_id_ != ImTextureID(0));
         const bool show_image =
+            !show_tex &&
             preview_active_ &&
             engine::helper::MeshPreview::hasImage() &&
             prev_id != 0;
 
-        if (!dbg_disp_caption_.empty() && show_image) {
+        if (!dbg_disp_caption_.empty() && (show_image || show_tex)) {
             ImGui::TextDisabled("%s", dbg_disp_caption_.c_str());
             ImGui::Separator();
         }
 
-        if (show_image) {
+        if (show_tex) {
+            // Fit to the panel, preserving aspect; never upscaled past 1:1
+            // (a 256 px preview mip blown up to a 900 px panel is mush).
+            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            const float iw = (float)std::max(1, dbg_tex_w_);
+            const float ih = (float)std::max(1, dbg_tex_h_);
+            const float reserve =
+                ImGui::GetTextLineHeightWithSpacing() * 2.0f + 6.0f;
+            const float max_h = std::max(32.0f, avail.y - reserve);
+            float s = std::min(avail.x / iw, max_h / ih);
+            if (s > 1.0f) s = 1.0f;
+            if (s <= 0.0f) s = 1.0f;
+            const float pad_x = (avail.x - iw * s) * 0.5f;
+            if (pad_x > 0.0f)
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad_x);
+            ImGui::Image(dbg_tex_id_, ImVec2(iw * s, ih * s));
+        } else if (!dbg_tex_pending_.empty()) {
+            ImGui::TextDisabled("Decoding texture...");
+        } else if (show_image) {
             // Animated skeleton preview: re-pose + re-stage each frame.
             tickPreviewAnimation();
             // Fit the preview into the panel, preserving aspect, centred.
@@ -10121,6 +11090,145 @@ void Menu::drawDebugDisplayPanel() {
             ImGui::TextDisabled(
                 "(click an object in the scene / Outliner, or double-click\n"
                 " a tile in the Content Browser, to preview it here)");
+        }
+
+        // ── Per-format readouts ────────────────────────────────────────
+        // Outside the image branch on purpose: a file can parse fine and
+        // still render nothing (an unreadable bake beside a perfectly good
+        // node tree), and the readout is the useful half in that case.
+
+        // instances.rwinst — counts, plus the Expanded/Unique toggle.
+        if (dbg_inst_ready_) {
+            ImGui::Separator();
+            if (ImGui::Button(preview_inst_expanded_
+                                  ? "Instances: placed"
+                                  : "Instances: unique meshes")) {
+                preview_inst_expanded_ = !preview_inst_expanded_;
+                // The toggle is baked into the preview key, so this
+                // rebuilds rather than short-circuiting.
+                const std::string path = dbg_inst_path_;
+                buildRwInstPreview(
+                    path, std::filesystem::path(path)
+                              .parent_path().filename().string());
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "placed: every instance from the tables (thinned to a\n"
+                    "vertex budget on huge groups)\n"
+                    "unique meshes: the stored meshes only, side by side —\n"
+                    "the cheap view for multi-million-instance groups");
+            ImGui::TextWrapped("%s", dbg_inst_stats_.c_str());
+        }
+
+        // animation.rwanim — which clip plays.
+        if (!dbg_anim_clip_names_.empty()) {
+            ImGui::Separator();
+            const int n = (int)dbg_anim_clip_names_.size();
+            int sel = preview_anim_clip_;
+            if (sel < 0 || sel >= n) sel = 0;
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##rwanim_clip",
+                                  dbg_anim_clip_names_[sel].c_str())) {
+                for (int i = 0; i < n; ++i) {
+                    const bool is_sel = (i == sel);
+                    if (ImGui::Selectable(dbg_anim_clip_names_[i].c_str(),
+                                          is_sel) && !is_sel) {
+                        preview_anim_clip_ = i;
+                        const std::string path = dbg_anim_path_;
+                        buildRwAnimPreview(
+                            path,
+                            std::filesystem::path(path)
+                                .parent_path().filename().string());
+                    }
+                    if (is_sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextWrapped("%s", dbg_anim_stats_.c_str());
+            if (!preview_anim_ready_) {
+                // The clips are readable, but nothing in the group is
+                // skinned — so there is no rig for them to drive.  Say so
+                // rather than leaving a dead Play control implied.
+                ImGui::TextColored(
+                    ImVec4(1.0f, 0.80f, 0.45f, 1.0f),
+                    "group has no skinned mesh — clip cannot be played");
+            }
+        }
+
+        // hierarchy.rwhier — the node tree.
+        if (!dbg_hier_nodes_.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", dbg_hier_stats_.c_str());
+            if (ImGui::CollapsingHeader("Node tree##rwhier")) {
+                // Children by parent, built once per draw — the arrays are
+                // node-count sized, not vertex-count sized.
+                const auto& H = dbg_hier_nodes_;
+                std::vector<std::vector<int>> kids(H.size());
+                std::vector<int> roots;
+                for (size_t i = 0; i < H.size(); ++i) {
+                    const int par = H[i].parent;
+                    if (par >= 0 && par < (int)H.size())
+                        kids[par].push_back((int)i);
+                    else
+                        roots.push_back((int)i);
+                }
+                ImGui::BeginChild("##rwhier_tree", ImVec2(0.0f, 220.0f),
+                                  true);
+                // Explicit stack, not recursion: a deep or (malformed)
+                // cyclic tree must not blow the UI thread's stack.
+                std::vector<std::pair<int, int>> stack;   // node, depth
+                for (auto it = roots.rbegin(); it != roots.rend(); ++it)
+                    stack.emplace_back(*it, 0);
+                std::vector<char> seen(H.size(), 0);
+                while (!stack.empty()) {
+                    const auto [ni, depth] = stack.back();
+                    stack.pop_back();
+                    if (ni < 0 || ni >= (int)H.size() || seen[ni]) continue;
+                    seen[ni] = 1;
+                    const auto& nd = H[ni];
+                    ImGui::Indent(depth * 12.0f);
+                    if (nd.mesh_ordinal >= 0) {
+                        // Nodes that own a baked object are the ones you
+                        // can actually see — call them out.
+                        ImGui::TextColored(
+                            ImVec4(0.70f, 0.85f, 1.0f, 1.0f),
+                            "%s   [mesh %d]",
+                            nd.name.empty() ? "(unnamed)" : nd.name.c_str(),
+                            nd.mesh_ordinal);
+                    } else {
+                        ImGui::TextDisabled(
+                            "%s", nd.name.empty() ? "(unnamed)"
+                                                  : nd.name.c_str());
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        const glm::vec3 t(nd.local[3]);
+                        ImGui::SetTooltip(
+                            "node %d   parent %d\nlocal translation "
+                            "%.3f, %.3f, %.3f",
+                            ni, nd.parent, t.x, t.y, t.z);
+                    }
+                    ImGui::Unindent(depth * 12.0f);
+                    for (auto it = kids[ni].rbegin();
+                         it != kids[ni].rend(); ++it)
+                        stack.emplace_back(*it, depth + 1);
+                }
+                ImGui::EndChild();
+            }
+        }
+
+        // .rwtex — source dimensions / storage format.
+        if (!dbg_tex_stats_.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", dbg_tex_stats_.c_str());
+        }
+
+        // Terrain folder — what dropping this into the scene would load.
+        if (!dbg_terrain_stats_.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", dbg_terrain_stats_.c_str());
+            ImGui::TextDisabled(
+                "drag this folder into the viewport to make it the "
+                "scene's terrain");
         }
     }
     ImGui::End();

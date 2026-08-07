@@ -34,6 +34,53 @@ std::string portablePath(const std::string& p) {
     return s;
 }
 
+// ── Import progress sidecar ──────────────────────────────────────────────
+// The headless import is ONE blocking call across a C ABI
+// (rw_import_assets), so a bake that runs for an hour reports nothing until
+// it returns and every watcher concludes it has hung.  That is not a corner
+// case: an 800 MB instanced GLB bakes to ~46 000 objects, each with five
+// QEM-decimated LOD levels, and the whole thing is a single call.
+//
+// Rather than widen the ABI with a callback pointer — a version bump and a
+// rebuild for every host — the bake drops a sidecar the caller can poll:
+//
+//   <group_dir>/.import.progress    "<done> <total> <name>"
+//
+// Same shape as the terrain pipeline's own .progress files, so the stage
+// runner reads it with the parsing it already has.  Its ABSENCE means "not
+// running", which is why the destructor removes it.
+class ImportProgress {
+public:
+    ImportProgress(std::filesystem::path dir, std::string name)
+        : path_(dir / ".import.progress"), name_(std::move(name)) {}
+    ~ImportProgress() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    ImportProgress(const ImportProgress&) = delete;
+    ImportProgress& operator=(const ImportProgress&) = delete;
+
+    void operator()(size_t done, size_t total) {
+        // Throttled: at 46 000 objects an unthrottled rewrite would cost
+        // more than the work it reports on.  The LAST object always
+        // writes, so a poller cannot miss the finished count by landing
+        // inside the throttle window.
+        const auto now = std::chrono::steady_clock::now();
+        if (done < total &&
+            now - last_ < std::chrono::milliseconds(250)) return;
+        last_ = now;
+        std::error_code ec;
+        std::filesystem::create_directories(path_.parent_path(), ec);
+        std::ofstream f(path_, std::ios::trunc);
+        if (f) f << done << ' ' << total << ' ' << name_ << '\n';
+    }
+
+private:
+    std::filesystem::path                 path_;
+    std::string                           name_;
+    std::chrono::steady_clock::time_point last_{};
+};
+
 // Replace this group's rows in content/asset_index.tsv (stable IDs make
 // re-imports idempotent), append the fresh ones.  Columns:
 //   id <TAB> type <TAB> name <TAB> path
@@ -188,8 +235,13 @@ bool importOneAssetToContent(const std::string& chosen,
     }
     const fs::path group_dir = fs::path(import_dir) / src.stem();
     std::vector<BakedObject> baked;
+    // Publish per-object progress for whoever is watching (the stage
+    // runner polls the sidecar while its blocking DLL call runs).  The
+    // file is removed when this goes out of scope, success or not.
+    ImportProgress prog(group_dir, src.filename().string());
     const bool ok =
-        bakeModelToRenderReady(chosen, group_dir.string(), baked, {});
+        bakeModelToRenderReady(chosen, group_dir.string(), baked,
+                               [&prog](size_t d, size_t t) { prog(d, t); });
     if (!ok) {
         std::cerr << "[import] bake FAILED for '" << chosen << "'"
                   << std::endl;

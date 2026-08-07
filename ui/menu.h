@@ -162,7 +162,25 @@ class Menu {
     // the diffusion model.  Two independent runners because the two
     // LIBRARY stages (house/plant samples) do not depend on any map and
     // are expected to be built while a world chain is already running.
-    char        terrain_stage_map_[256]  = "assets/terrain/generated_map";
+    // A world is identified by a NAME, not by a path the user types.  The
+    // name resolves to assets/terrain/<name> on the python side
+    // (terrain_stages.resolve_stem), which is what keeps every artifact of
+    // a run in ONE directory — the stage graph declares some outputs
+    // relative to the stem and others pinned to assets/terrain, and those
+    // only agree when the stem is rooted there.
+    char        terrain_name_[128]       = "generated_map";
+    char        terrain_new_name_[128]   = {};   // "New" field
+    // Names found on disk, for the picker.  Rebuilt on demand rather than
+    // per frame: it is two directory scans, and the set only changes when
+    // a build, a clear or the New button says so.
+    std::vector<std::string> terrain_names_;
+    bool        terrain_names_loaded_    = false;
+    // Strip a typed name to something safe to use as a folder name AND to
+    // interpolate into the python command line — the launchers go through
+    // cmd.exe, where a stray quote or ampersand in a name would be an
+    // injection rather than a typo.
+    static std::string sanitizeTerrainName(const std::string& raw);
+    void        refreshTerrainNames();
     int         terrain_stage_status_    = 0;  // 0 idle 1 run 2 done 3 fail
     std::string terrain_stage_name_;           // stage being run
     std::string terrain_stage_prog_;           // "<manifest>.progress"
@@ -841,6 +859,42 @@ public:
     // the assembled collection instead of nothing.
     void buildRwGroupPreview(const std::string& group_dir,
                              const std::string& display_name);
+    // ── Native system-file previews ────────────────────────────────────
+    // The baked group internals are ordinary Content Browser tiles, so
+    // they get first-class previews too.
+    //
+    // instances.rwinst — the transform TABLES.  An instanced group stores
+    // each mesh ONCE and scatters it by per-instance TRS, so merging the
+    // objects/*.rwgeo (what buildRwGroupPreview does) shows 30 species
+    // meshes piled at the origin instead of a forest.  This places the
+    // instances.  preview_inst_expanded_ toggles between the placed
+    // assembly and the cheap unique-meshes-only view.
+    void buildRwInstPreview(const std::string& rwinst_path,
+                            const std::string& display_name);
+    // hierarchy.rwhier — the group's assembled geometry PLUS the parsed
+    // node tree, shown as an indented readout under the image.
+    void buildRwHierPreview(const std::string& rwhier_path,
+                            const std::string& display_name);
+    // animation.rwanim — the group's rig with a clip picker; the chosen
+    // clip drives the same CPU-skinned preview a character group uses.
+    void buildRwAnimPreview(const std::string& rwanim_path,
+                            const std::string& display_name);
+    // .rwtex — decoded pixels shown directly (no mesh pass at all).
+    void buildRwTexPreview(const std::string& rwtex_path,
+                           const std::string& display_name);
+    // A generated TERRAIN folder (content/terrain/<stem>/terrain.rwmeta):
+    // a whole world as one asset — heightmap, colour/segmentation maps and
+    // the imported PCG layer groups.  Deliberately a TEXT readout and not
+    // an image: these heightmaps are 8192^2, and uploading one into the
+    // preview target to look at a thumbnail is a quarter-gigabyte of VRAM
+    // for no information the readout doesn't give.
+    void buildTerrainFolderPreview(const std::string& terrain_dir,
+                                   const std::string& display_name);
+    // Drop every per-format readout (instance stats, node tree, clip
+    // list, texture image).  Called from finishAssetPreview, so ANY new
+    // preview starts clean and each specialised builder re-populates
+    // only its own after staging.
+    void clearFormatReadouts();
     // Body of the Rendering ▸ Render Debug submenu (debug visualisation
     // modes, pipeline toggle, viewers, glass mode) — extracted so the
     // large block can live under the Rendering menu.
@@ -871,6 +925,47 @@ public:
     std::string  dbg_disp_caption_;         // shown above the image
     std::string  dbg_skin_status_;          // "Auto-Rig Skin Layer" button status
     std::string  dbg_asset_key_;            // "path#sub" of asset preview
+
+    // ── .rwinst: placed-instance preview ───────────────────────────────
+    // dbg_inst_path_ is the tables file the current preview came from, so
+    // the panel's Expanded/Unique toggle can rebuild from it in place.
+    std::string  dbg_inst_path_;
+    std::string  dbg_inst_stats_;           // counts line under the image
+    bool         dbg_inst_ready_    = false;
+    // Expanded = every instance placed (capped by the vertex budget);
+    // otherwise the unique meshes only, which is what a multi-million-
+    // instance group wants.
+    bool         preview_inst_expanded_ = true;
+
+    // ── .rwhier: node-tree readout ─────────────────────────────────────
+    std::vector<engine::helper::RwHierNode> dbg_hier_nodes_;
+    std::string  dbg_hier_stats_;
+
+    // ── .rwanim: clip picker ───────────────────────────────────────────
+    // Populated when a .rwanim tile is previewed; the combo rebuilds the
+    // group preview with the chosen clip.  preview_anim_clip_ is read by
+    // buildRwGroupPreview whenever a group has baked clips.
+    std::vector<std::string> dbg_anim_clip_names_;
+    std::string  dbg_anim_stats_;
+    std::string  dbg_anim_path_;            // rebuild target for the combo
+    int          preview_anim_clip_  = 0;
+    // Group the clip index belongs to — previewing a DIFFERENT group
+    // resets the pick to clip 0 instead of inheriting an index that meant
+    // something else.
+    std::string  dbg_anim_clip_group_;
+
+    // ── .rwtex: decoded image shown in place of the mesh preview ───────
+    // Uploaded on an IDLE frame only (main-thread GPU work races the async
+    // mesh loader — same hazard getThumbnail documents), so the path is
+    // parked in dbg_tex_pending_ until the loader has drained.
+    std::shared_ptr<renderer::TextureInfo> dbg_tex_info_;
+    ImTextureID  dbg_tex_id_ = ImTextureID(0);
+    int          dbg_tex_w_ = 0, dbg_tex_h_ = 0;
+    std::string  dbg_tex_stats_;
+    std::string  dbg_tex_pending_;          // decoded PNG awaiting upload
+
+    // ── Terrain folder readout ─────────────────────────────────────────
+    std::string  dbg_terrain_stats_;
     // ── Arrow-key navigation between sibling objects ───────────────────
     // While the Debug Display shows a content preview, Left/Right (or
     // Up/Down) steps to the previous/next item: sibling .rwobj files in
