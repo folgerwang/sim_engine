@@ -2911,6 +2911,29 @@ static void selectPlantLodBands(
         const float d = glm::sqrt(dx * dx + dz * dz);
         uint8_t v =
             (d >= node.lod_near_m_ && d < node.lod_far_m_) ? 1 : 0;
+        // ── Far-band visibility census ─────────────────────────────
+        // The house envelope band (near_m > 0) baked 20k nodes and
+        // 311 _far meshes yet the horizon shows nothing — every layer
+        // of the bake checks out, so the truth has to come from HERE:
+        // how many far-band nodes pass this exact test each frame.
+        // One line every ~10 s; delete once the pop-in is solved.
+        {
+            static uint64_t s_calls = 0;
+            static uint32_t s_far_pass = 0, s_far_total = 0;
+            if (node.lod_near_m_ > 0.0f) {
+                ++s_far_total;
+                s_far_pass += v;
+            }
+            if ((++s_calls & 0xFFFFF) == 0 && s_far_total) {
+                std::cout << "[lod] far-band census: " << s_far_pass
+                          << " of " << s_far_total
+                          << " far-band node tests passed since last "
+                             "census (eye "
+                          << (eye_valid ? "valid" : "INVALID") << ")"
+                          << std::endl;
+                s_far_pass = s_far_total = 0;
+            }
+        }
         // Proximity gate applies on top of the LOD test.
         if (v != 0 && node.gate_r_ > 0.0f) {
             const float gdx = eye.x - node.gate_x_;
@@ -9067,6 +9090,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
 
     // Per-character VT texture cache (canonical .rwtex path → TextureInfo).
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
+    // Which texture slots carry a real cutout alpha (baked alpha plane,
+    // or legacy full-res preview with any translucent texel).  Drives
+    // alpha_mask_ below: blanket-masking EVERY placed material sent 100%
+    // of shadow casters down the CSM alpha-cutoff path (measured:
+    // 107473/107473) when only foliage needs it.
+    std::unordered_map<std::string, uint8_t> tex_cutout_cache;
+    std::vector<uint8_t> tex_cutout;
 
     for (const auto& oref : ordinal_geo) {
         const int ordinal = oref.ordinal;
@@ -9319,6 +9349,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             std::string key = fs::path(tex_paths[ti])
                                   .lexically_normal().generic_string();
             for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+            tex_cutout.resize(drawable_object->textures_.size(), 0);
             auto cit = tex_gpu_cache.find(key);
             if (cit != tex_gpu_cache.end()) {
                 dst = cit->second;
@@ -9326,6 +9357,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 // GPU handles; later copies borrow them so
                 // DrawableData::destroy frees each image exactly once.
                 dst.borrowed_ = true;
+                tex_cutout[tex_base + ti] = tex_cutout_cache[key];
                 continue;
             }
             helper::RwTexBaked tb;
@@ -9360,8 +9392,21 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 dst = chit->second;
                 dst.borrowed_ = true;
                 tex_gpu_cache.emplace(key, dst);  // path alias
+                tex_cutout[tex_base + ti] = tex_cutout_cache[ckey];
+                tex_cutout_cache[key] = tex_cutout_cache[ckey];
                 continue;
             }
+            uint8_t cutout = tb.alpha.empty() ? 0 : 1;
+            if (!cutout && tb.preview_w == tb.w && tb.preview_h == tb.h) {
+                // legacy fmt-0: alpha lives in the full-res preview
+                const auto& pv = tb.preview_rgba;
+                for (size_t ai = 3; ai < pv.size(); ai += 4) {
+                    if (pv[ai] < 250) { cutout = 1; break; }
+                }
+            }
+            tex_cutout[tex_base + ti] = cutout;
+            tex_cutout_cache[key] = cutout;
+            tex_cutout_cache[ckey] = cutout;
             dst.size = glm::uvec3((uint32_t)tb.w, (uint32_t)tb.h, 1u);
             dst.linear = false;
             dst.source_filename_ = tex_paths[ti];
@@ -9438,9 +9483,20 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 mat.normal_idx_ = (int)tex_base + sec.nrm_index;
             if (sec.mr_index >= 0)
                 mat.metallic_roughness_idx_ = (int)tex_base + sec.mr_index;
-            mat.alpha_cutoff_ = 0.1f;
-            mat.alpha_mask_ = true;
-            mat.alpha_mode_ = ego::AlphaMode::Mask;
+            // Mask ONLY where the albedo actually has cutout alpha
+            // (foliage cards, lattice).  Blanket Mask on every placed
+            // material forced the whole world down the CSM alpha-
+            // cutoff caster path — 107473/107473 casters sampling
+            // their albedo in the shadow pass for opaque walls.
+            const bool mat_cutout =
+                sec.tex_index >= 0 &&
+                size_t(tex_base) + size_t(sec.tex_index) <
+                    tex_cutout.size() &&
+                tex_cutout[tex_base + sec.tex_index] != 0;
+            mat.alpha_cutoff_ = mat_cutout ? 0.1f : 0.0f;
+            mat.alpha_mask_ = mat_cutout;
+            mat.alpha_mode_ = mat_cutout ? ego::AlphaMode::Mask
+                                         : ego::AlphaMode::Opaque;
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
                 SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
@@ -9456,7 +9512,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             ubo.metallic_roughness_specular_factor = 1.0f;
             ubo.metallic_factor = sec.metallic;
             ubo.roughness_factor = sec.roughness;
-            ubo.alpha_cutoff = 0.1f;
+            ubo.alpha_cutoff = mat_cutout ? 0.1f : 0.0f;
             ubo.mip_count = 11;
             ubo.normal_scale = 1.0f;
             ubo.uv_set_flags = glm::vec4(0.0f);
@@ -9805,6 +9861,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     std::unordered_map<std::string, int> geo_mesh;
 
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
+    // Which texture slots carry a real cutout alpha (baked alpha plane,
+    // or legacy full-res preview with any translucent texel).  Drives
+    // alpha_mask_ below: blanket-masking EVERY placed material sent 100%
+    // of shadow casters down the CSM alpha-cutoff path (measured:
+    // 107473/107473) when only foliage needs it.
+    std::unordered_map<std::string, uint8_t> tex_cutout_cache;
+    std::vector<uint8_t> tex_cutout;
 
     for (const auto& oref : ordinal_geo) {
         const int ordinal = oref.ordinal;
@@ -9930,6 +9993,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             std::string key = fs::path(tex_paths[ti])
                                   .lexically_normal().generic_string();
             for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+            tex_cutout.resize(drawable_object->textures_.size(), 0);
             auto cit = tex_gpu_cache.find(key);
             if (cit != tex_gpu_cache.end()) {
                 dst = cit->second;
@@ -9937,6 +10001,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 // GPU handles; later copies borrow them so
                 // DrawableData::destroy frees each image exactly once.
                 dst.borrowed_ = true;
+                tex_cutout[tex_base + ti] = tex_cutout_cache[key];
                 continue;
             }
             helper::RwTexBaked tb;
@@ -9971,8 +10036,21 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 dst = chit->second;
                 dst.borrowed_ = true;
                 tex_gpu_cache.emplace(key, dst);  // path alias
+                tex_cutout[tex_base + ti] = tex_cutout_cache[ckey];
+                tex_cutout_cache[key] = tex_cutout_cache[ckey];
                 continue;
             }
+            uint8_t cutout = tb.alpha.empty() ? 0 : 1;
+            if (!cutout && tb.preview_w == tb.w && tb.preview_h == tb.h) {
+                // legacy fmt-0: alpha lives in the full-res preview
+                const auto& pv = tb.preview_rgba;
+                for (size_t ai = 3; ai < pv.size(); ai += 4) {
+                    if (pv[ai] < 250) { cutout = 1; break; }
+                }
+            }
+            tex_cutout[tex_base + ti] = cutout;
+            tex_cutout_cache[key] = cutout;
+            tex_cutout_cache[ckey] = cutout;
             dst.size = glm::uvec3((uint32_t)tb.w, (uint32_t)tb.h, 1u);
             dst.linear = false;
             dst.source_filename_ = tex_paths[ti];
@@ -10049,9 +10127,20 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 mat.normal_idx_ = (int)tex_base + sec.nrm_index;
             if (sec.mr_index >= 0)
                 mat.metallic_roughness_idx_ = (int)tex_base + sec.mr_index;
-            mat.alpha_cutoff_ = 0.1f;
-            mat.alpha_mask_ = true;
-            mat.alpha_mode_ = ego::AlphaMode::Mask;
+            // Mask ONLY where the albedo actually has cutout alpha
+            // (foliage cards, lattice).  Blanket Mask on every placed
+            // material forced the whole world down the CSM alpha-
+            // cutoff caster path — 107473/107473 casters sampling
+            // their albedo in the shadow pass for opaque walls.
+            const bool mat_cutout =
+                sec.tex_index >= 0 &&
+                size_t(tex_base) + size_t(sec.tex_index) <
+                    tex_cutout.size() &&
+                tex_cutout[tex_base + sec.tex_index] != 0;
+            mat.alpha_cutoff_ = mat_cutout ? 0.1f : 0.0f;
+            mat.alpha_mask_ = mat_cutout;
+            mat.alpha_mode_ = mat_cutout ? ego::AlphaMode::Mask
+                                         : ego::AlphaMode::Opaque;
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
                 SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
@@ -10067,7 +10156,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             ubo.metallic_roughness_specular_factor = 1.0f;
             ubo.metallic_factor = sec.metallic;
             ubo.roughness_factor = sec.roughness;
-            ubo.alpha_cutoff = 0.1f;
+            ubo.alpha_cutoff = mat_cutout ? 0.1f : 0.0f;
             ubo.mip_count = 11;
             ubo.normal_scale = 1.0f;
             ubo.uv_set_flags = glm::vec4(0.0f);
