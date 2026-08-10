@@ -477,6 +477,32 @@ namespace {
 namespace engine {
 namespace ui {
 
+// ── PREVIEW CACHE STAMP ────────────────────────────────────────────────
+// Every preview short-circuits on "same key, already showing".  The key
+// used to be the PATH alone, which is wrong the moment the file behind
+// that path is rebuilt: re-import a group and the Debug Display keeps
+// drawing the preview it built from the previous bake, for ever, because
+// the path did not change.  That is invisible and indistinguishable from
+// "the pipeline did nothing" — which is exactly how it was read.
+//
+// Folding the file's size and write time into the key makes a rebuild
+// look like a different asset, which is what it is.
+static std::string previewStamp(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto t = fs::last_write_time(path, ec);
+    if (ec) return std::string();
+    const auto sz = fs::file_size(path, ec);
+    return "@" + std::to_string(
+               (long long)t.time_since_epoch().count()) +
+           "/" + std::to_string(ec ? 0ull : (unsigned long long)sz);
+}
+
+// Defined further down with the preview code, in this same namespace —
+// the Content Browser (some 6500 lines up from it) needs it first, to
+// keep meshes above LOD 0 out of the asset grid.
+static bool isFarLodFile(const std::string& path);
+
 Menu::Menu(
     GLFWwindow* window,
     const std::shared_ptr<renderer::Device>& device,
@@ -6376,9 +6402,15 @@ void Menu::drawTerrainGenPopup() {
         GenWrapUD tp_ud;
         tp_ud.wrap_w = tp_box_w - ImGui::GetStyle().FramePadding.x * 2.0f
                                 - ImGui::GetStyle().ScrollbarSize - 4.0f;
+        // Eight text lines instead of a fixed 64 px (~2.5 lines): real
+        // prompts are paragraph-sized, and editing one through a
+        // three-line slot meant scrolling blind.
         ImGui::InputTextMultiline("##terrain_prompt", terrain_prompt_buf_,
                                   sizeof(terrain_prompt_buf_),
-                                  ImVec2(tp_box_w, 64.0f),
+                                  ImVec2(tp_box_w,
+                                         ImGui::GetTextLineHeight() * 8.0f +
+                                         ImGui::GetStyle().FramePadding.y *
+                                             2.0f),
                                   ImGuiInputTextFlags_CallbackAlways,
                                   &GenPromptWrapCallback, &tp_ud);
         // ── Prompt presets / history ─────────────────────────────────
@@ -6398,12 +6430,38 @@ void Menu::drawTerrainGenPopup() {
                 label += one_line.substr(0, 72);
                 if (one_line.size() > 72) label += "...";
                 ImGui::PushID((int)i);
+                // Row = the selectable (loads the prompt) plus a right-
+                // aligned delete button.  Overlap is allowed so the "x"
+                // wins the click where the two share pixels.
+                ImGui::SetNextItemAllowOverlap();
                 if (ImGui::Selectable(label.c_str())) {
                     std::snprintf(terrain_prompt_buf_,
                                   sizeof(terrain_prompt_buf_),
                                   "%s", txt.c_str());
                 }
+                // The row shows one 72-char line of what may be a long
+                // multi-line prompt — hovering shows the full text.
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+                    ImGui::TextUnformatted(txt.c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine(ImGui::GetWindowWidth() - 30.0f);
+                bool erased = false;
+                if (ImGui::SmallButton("x")) {
+                    terrain_prompts_.erase(
+                        terrain_prompts_.begin() + (ptrdiff_t)i);
+                    saveTerrainPrompts();
+                    erased = true;
+                }
+                if (!erased && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("delete this prompt from history");
                 ImGui::PopID();
+                if (erased)
+                    break;      // indices shifted; the combo redraws
+                                // next frame with the entry gone
             }
             if (terrain_prompts_.empty())
                 ImGui::TextDisabled("(empty — Generate or Save to add)");
@@ -6514,12 +6572,25 @@ void Menu::drawTerrainGenPopup() {
         // (same CalcTextSize + margin rule): a fixed pixel width clipped
         // the text under this font ("Full Stage Ge"), and a full-width
         // bar was wider than the words need.
+        // ── FULL STAGE = THE WHOLE PIPELINE ──────────────────────────
+        // This used to shell straight to terrain_from_text.py, which
+        // makes the heightmap and nothing else -- no roads, no houses,
+        // no plants -- and then reported "Done: terrain created", which
+        // is true and reads as if the world were finished.
+        //
+        // The button now runs the PLACE stage through the staged runner.
+        // place depends on ("maps", "mesh", "houses", "plants",
+        // "objects"), so plan() walks that graph and builds every one
+        // that is missing or stale, in order, skipping what is already
+        // current.  One button, whole world.
+        bool full_stage_click = false;
         if (ImGui::Button("Full Stage Generate",
                           ImVec2(ImGui::CalcTextSize(
                                      "Full Stage Generate").x + 26.0f,
                                  0.0f))) {
             const std::string p(terrain_prompt_buf_);
             if (!p.empty()) {
+                full_stage_click = true;
                 addTerrainPrompt(p, /*favorite*/ false);   // recents history
                 std::error_code ec;
                 fs::create_directories("content/terrain/.terrain_tmp", ec);
@@ -6549,32 +6620,16 @@ void Menu::drawTerrainGenPopup() {
                      (base + ".prompt.txt")).string();
                 { std::ofstream pf(pfile, std::ios::binary); pf << p; }
                 terrain_gen_err_.clear();
-                char hs_arg[48];
-                std::snprintf(hs_arg, sizeof(hs_arg),
-                              " --height-scale %.3f",
-                              terrain_gen_height_scale_);
-#ifdef _WIN32
-                const std::string cmd =
-                    "cmd /c start \"terrain\" /B python "
-                    "\"tools\\terrain\\terrain_from_text.py\""
-                    " --prompt-file \"" + pfile + "\""
-                    " --out \"" + terrain_gen_out_ + "\"" + hs_arg +
-                    (terrain_gen_install_ ? " --install" : "") +
-                    (terrain_gen_color_   ? " --color"   : "") +
-                    (terrain_gen_layout_  ? " --layout"  : "");
-#else
-                const std::string cmd =
-                    "python3 \"tools/terrain/terrain_from_text.py\""
-                    " --prompt-file \"" + pfile + "\""
-                    " --out \"" + terrain_gen_out_ + "\"" + hs_arg +
-                    (terrain_gen_install_ ? " --install" : "") +
-                    (terrain_gen_color_   ? " --color"   : "") +
-                    (terrain_gen_layout_  ? " --layout"  : "") + " &";
-#endif
-                EditorLog::get().push(
-                    "[terrain] launching generation -> " + terrain_gen_out_);
-                std::system(cmd.c_str());
-                terrain_gen_status_ = 1;
+                // Clear the one-shot generator's status: its "Done —
+                // terrain created." is what used to sit next to a
+                // pipeline that was still building roads and houses.
+                // The staged progress bar below is the truth now.
+                terrain_gen_status_ = 0;
+                // The heightmap is the staged runner's MAPS stage now,
+                // so nothing is spawned here — full_stage_click below
+                // runs launch_stage("place"), which builds the whole
+                // graph including this map.
+                (void)pfile;
             } else {
                 // Unreachable while the gate above holds — kept so that
                 // a future caller which loses the gate still SAYS why
@@ -6677,13 +6732,21 @@ void Menu::drawTerrainGenPopup() {
                 std::string("\"tools/terrain/terrain_stages.py\" --stage ") +
                 stage;
             if (world) args += " --map \"" + name + "\"";
-            if (world && std::string(stage) == "maps") {
+            // The prompt rides along for PLACE too, because place's
+            // dependency graph includes maps: a world whose map has not
+            // been generated yet needs the text, and one whose map is
+            // current simply never reads it.
+            if (world && (std::string(stage) == "maps" ||
+                          std::string(stage) == "place")) {
                 // The maps stage needs the same prompt the one-shot
                 // button uses; it goes through a FILE for the same
                 // reason it does there — a prompt with quotes in it
                 // does not survive cmd.exe.
                 const std::string p(terrain_prompt_buf_);
-                if (p.empty()) {
+                // Only the maps stage REQUIRES it.  Asking place to
+                // build a world whose map already exists is legitimate
+                // with an empty box.
+                if (p.empty() && std::string(stage) == "maps") {
                     // Launching anyway would spawn python only for it to
                     // die on "maps stage needs params.prompt" — say so
                     // here, where the user can act on it.
@@ -6692,7 +6755,7 @@ void Menu::drawTerrainGenPopup() {
                         "the terrain in the box at the top of this panel");
                     return;
                 }
-                {
+                if (!p.empty()) {
                     std::error_code ec2;
                     fs::create_directories("content/terrain/.terrain_tmp",
                                            ec2);
@@ -6732,6 +6795,16 @@ void Menu::drawTerrainGenPopup() {
                 terrain_lib_prog_   = prog;
             }
         };
+
+        // The Full Stage click above is performed HERE because
+        // launch_stage is declared below the button.  Running "place"
+        // pulls maps, mesh, houses, plants and objects in with it.
+        if (full_stage_click) {
+            EditorLog::get().push(
+                "[terrain] Full Stage: building maps -> mesh -> houses/"
+                "plants/objects -> place");
+            launch_stage("place", true);
+        }
 
         // Shared poll + bar for either runner.  Missing progress file is
         // "starting", ".err" is failure, ".done" is success — the
@@ -7055,10 +7128,26 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             }
             std::vector<fs::directory_entry> items;   // dirs first, then files
             std::vector<fs::directory_entry> dirs, files;
+            size_t far_lod_hidden = 0;
             for (auto& e : fs::directory_iterator(cur_dir, ec)) {
                 // Hide dot-entries (.thumbnails, .flux_tmp, .git, …).
                 const std::string fn = e.path().filename().string();
                 if (!fn.empty() && fn[0] == '.') continue;
+                // ── Only LOD 0 is a browsable asset ────────────────
+                // The plant library authors its LODs as separate meshes,
+                // so every species baked three .rwgeo files and the grid
+                // listed all three.  Two of them are meshes that only
+                // make sense from 200 m away — an impostor card is a
+                // cross of two quads — so arrow-keying through the grid
+                // kept landing on one and previewing it at arm's length.
+                // The browser lists LOD 0.  The rest stay on
+                // disk, load with the group, and still draw in the world
+                // at their range; they are just not things to click.
+                if (e.path().extension() == ".rwgeo" &&
+                    isFarLodFile(e.path().string())) {
+                    ++far_lod_hidden;
+                    continue;
+                }
                 // Sidecar metadata / the asset index stay invisible in the
                 // asset view.
                 if (is_content &&
@@ -7076,6 +7165,18 @@ void Menu::drawBrowserBody(const std::string& tree_root,
             std::sort(files.begin(), files.end(), byname);
             items.insert(items.end(), dirs.begin(), dirs.end());
             items.insert(items.end(), files.begin(), files.end());
+            // Said once per folder, not once per frame.
+            if (far_lod_hidden > 0) {
+                static std::string lod_note_dir;
+                if (lod_note_dir != cur_dir) {
+                    lod_note_dir = cur_dir;
+                    EditorLog::get().push(
+                        "[browser] LOD 0 only — " +
+                        std::to_string(far_lod_hidden) +
+                        " mesh(es) at LOD 1+ not listed here (they load with "
+                        "the group and draw at range)");
+                }
+            }
 
             const float cell  = 80.0f;
             const float avail = ImGui::GetContentRegionAvail().x;
@@ -7122,7 +7223,7 @@ void Menu::drawBrowserBody(const std::string& tree_root,
                 // file plays on the group's rig, the texture shows its
                 // pixels.  (None of them are placeable — "Add to Scene"
                 // takes the GROUP FOLDER, which routes through
-                // loadRwInstanced and keeps the bands/gates/manifest
+                // loadRwInstanced and keeps the LODs/gates/manifest
                 // bindings that placing an internal file would lose.)
                 const bool is_inst   = (ext == ".rwinst");
                 const bool is_hier   = (ext == ".rwhier");
@@ -9146,7 +9247,8 @@ void Menu::installDebugPreview(plugins::auto_rig::TriangleMesh& mesh) {
 // base-colour texture and the PBR factors; the GPU pass does the shading.
 void Menu::buildAssetPreview(const std::string& path, int sub_index,
                              const std::string& caption) {
-    const std::string key = path + "#" + std::to_string(sub_index);
+    const std::string key = path + "#" + std::to_string(sub_index) +
+        previewStamp(path);
     if (key == dbg_asset_key_) return;   // already showing
 
     engine::helper::ModelPreviewData data;
@@ -9497,9 +9599,76 @@ static engine::helper::RwAnimClip makeProceduralWalk(
     return clip;
 }
 
+// ── Is this baked object a NON-ZERO LOD? ───────────────────────────────
+// The plant/rock/ground libraries author their LOD levels as separate
+// meshes (see the note in buildRwGroupPreview), and terrain_pcg puts the
+// LOD's DISTANCE RANGE in the node name, which the bake carries into the
+// file name.  TWO spellings have to be read here:
+//
+//   CURRENT — model_inspect's canonical_geo_name, one file per distinct
+//   mesh, tile indices dropped because they describe a scatter bucket
+//   and not the geometry:
+//     000_tree_spruce_lodband_0_80.rwgeo        LOD 0, 0-80 m
+//     NNN_tree_spruce_lodband_80_200.rwgeo      LOD 1
+//     NNN_tree_spruce_lodband_200_2600.rwgeo    LOD 2, impostor card
+//
+//   LEGACY — one file per tile node, the full five-int tail that
+//   drawable_object.cpp's parseLodTileName still reads at load time.
+//   Content baked before the dedup keeps this spelling until it is
+//   re-imported, so the preview must not stop recognising it:
+//     000_tree_spruce_lodtile_-8_-7_512_0_80.rwgeo
+//
+// Either way the test is the same: a LOD whose NEAR edge is past the
+// camera is a distance replacement for geometry already in this view, so
+// the preview keeps near == 0 only.
+//
+// Anything without a marker previews unchanged — that is every object of
+// every ordinary imported model.
+static bool isFarLodFile(const std::string& path) {
+    namespace fs = std::filesystem;
+    const std::string stem = fs::path(path).stem().string();
+
+    // Reads n underscore-separated integers ending the stem at s.
+    // Returns the NEAR edge, or -1 when the tail is not this encoding —
+    // which fails toward previewing geometry rather than hiding it.
+    const auto near_of = [](const char* s, int n) -> long long {
+        long long v[5] = { 0, 0, 0, 0, 0 };
+        if (n > 5) return -1;
+        for (int i = 0; i < n; ++i) {
+            char* end = nullptr;
+            v[i] = std::strtoll(s, &end, 10);
+            if (end == s) return -1;        // no digits where one is due
+            s = end;
+            if (i < n - 1) {
+                if (*s != '_') return -1;
+                ++s;
+            }
+        }
+        if (*s != '\0') return -1;          // trailing junk: not ours
+        return v[n - 2];                    // near is second from last
+    };
+
+    static const char kBand[] = "_lodband_";
+    size_t p = stem.find(kBand);
+    if (p != std::string::npos) {
+        const long long near_m =
+            near_of(stem.c_str() + p + (sizeof(kBand) - 1), 2);
+        if (near_m >= 0) return near_m > 0;
+    }
+    static const char kTile[] = "_lodtile_";
+    p = stem.find(kTile);
+    if (p != std::string::npos) {
+        const long long near_m =
+            near_of(stem.c_str() + p + (sizeof(kTile) - 1), 5);
+        if (near_m >= 0) return near_m > 0;
+    }
+    return false;
+}
+
 void Menu::buildRwGroupPreview(const std::string& group_dir,
                                const std::string& display_name) {
-    const std::string key = group_dir + "#group";
+    const std::string key = group_dir + "#group" +
+        previewStamp(group_dir + "/objects/objects.rwmap");
     if (key == dbg_asset_key_) return;   // already showing
     // Detected from the baked raw data below: a character import is a group
     // whose objects/*.rwgeo carry skin blobs (joints/skin table).  We do NOT
@@ -9539,8 +9708,27 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
     std::unordered_map<int, glm::mat4> invbind_map;   // skeleton node → inv bind
     bool all_skinned = true;
     int  first_skinned_ordinal = -1;   // owner mesh node (bind-space cancel)
+    size_t lod_skipped = 0;
     for (const auto& geo : geos) {
         if (p.positions.size() >= kMaxGroupVerts) { ++skipped; continue; }
+        // ── ONLY LOD 0 ────────────────────────────────────────────────
+        // Two different LOD mechanisms meet here.  A v6 .rwgeo carries
+        // its decimated levels INSIDE the file, and the trim below drops
+        // them.  The PCG plant/rock/ground libraries predate that: their
+        // levels are AUTHORED, materially different meshes — the far one
+        // is a flat impostor card with its own baked texture — so each
+        // LOD baked to its own .rwgeo, named after the mesh that made
+        // it (objects/NNN_<name>_lodband_<near>_<far>.rwgeo, see
+        // model_inspect's canonical_geo_name).  Merging every file in
+        // the folder therefore drew all three LODs stacked at the same
+        // origin, and what you saw was the impostor card standing inside
+        // the tree it replaces.
+        //
+        // isFarLodFile reads the LOD's distance range out of the
+        // name.  LOD 0 (near == 0) is the only one a preview
+        // should show; anything past it is a distance replacement for
+        // geometry already in this view.
+        if (isFarLodFile(geo)) { ++lod_skipped; continue; }
         // Skip objects disabled in the Content Browser — they're left out of
         // the assembled Debug Display preview.  Check the persistent
         // sidecar too (the in-memory set is only seeded while browsing).
@@ -9694,6 +9882,12 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
         EditorLog::get().push(
             "[preview] group preview capped — " +
             std::to_string(skipped) + " object(s) omitted");
+    }
+    if (lod_skipped > 0) {
+        EditorLog::get().push(
+            "[preview] LOD 0 only — " + std::to_string(lod_skipped) +
+            " object(s) at LOD 1+ hidden (impostor cards / coarse "
+            "levels; they still draw in the world at range)");
     }
     // ── Animated preview setup (fully-skinned group + skeleton + clip) ──
     bool want_anim = dbg_preview_skinned_ && all_skinned &&
@@ -9906,7 +10100,7 @@ void Menu::buildRwGroupPreview(const std::string& group_dir,
 // bake-only character imports' skeleton meshes show in the Debug Display.
 void Menu::buildRwGeoPreview(const std::string& rwgeo_path,
                              const std::string& display_name) {
-    const std::string key = rwgeo_path + "#geo";
+    const std::string key = rwgeo_path + "#geo" + previewStamp(rwgeo_path);
     if (key == dbg_asset_key_) return;   // already showing
     engine::helper::ModelPreviewData data;
     if (!engine::helper::loadRwGeo(rwgeo_path, data)) {
@@ -9997,7 +10191,10 @@ void Menu::buildRwInstPreview(const std::string& rwinst_path,
     // The Expanded/Unique toggle is part of the key, so flipping it in the
     // panel REBUILDS instead of short-circuiting on "already showing".
     const std::string key = rwinst_path +
-        (preview_inst_expanded_ ? "#inst-placed" : "#inst-unique");
+        (preview_inst_expanded_ ? "#inst-placed" : "#inst-unique") +
+        previewStamp(rwinst_path) +
+        previewStamp(fs::path(rwinst_path).parent_path().string() +
+                     "/objects/objects.rwmap");
     if (key == dbg_asset_key_) return;
 
     std::vector<engine::helper::RwInstArray> arrays;
@@ -10016,26 +10213,65 @@ void Menu::buildRwInstPreview(const std::string& rwinst_path,
     }
     dbg_preview_skinned_ = false;   // instanced groups are static props
 
-    // ── mesh_ordinal → objects/NNN_*.rwgeo ─────────────────────────────
-    // Same mapping loadRwInstanced uses: the leading digits of the file
-    // name ARE the ordinal.
+    // ── mesh_ordinal → baked geometry ──────────────────────────────────
+    // Through objects.rwmap, the same table loadRwInstanced reads.  The
+    // filename prefix is NOT the ordinal any more: the bake writes one
+    // file per distinct mesh, so several ordinals share a file and the
+    // prefix only counts files.  Reading it as an ordinal is how this
+    // preview came to draw an impostor card where a LOD 0 tree
+    // belonged — ordinal 330 resolved to "330_..._lodband_200_2600".
+    // No map = content baked before that, where the prefix IS the
+    // ordinal; the scan below stays for it.
     std::error_code ec;
     std::unordered_map<int, std::string> ordinal_geo;
-    for (auto& e : fs::directory_iterator(
-             fs::path(group_dir) / "objects", ec)) {
-        if (e.path().extension() != ".rwgeo") continue;
-        const std::string gp = e.path().string();
-        // Honour the Content Browser's per-tile Enabled toggle, exactly as
-        // the runtime loader does (in-memory set + persistent sidecar).
+    // Content Browser's per-tile Enabled toggle, exactly as the runtime
+    // loader does it (in-memory set + persistent sidecar).
+    const auto enabled = [&](const std::string& gp) {
         std::error_code dec;
-        if (content_disabled_.find(gp) != content_disabled_.end() ||
-            fs::exists(gp + ".disabled", dec))
-            continue;
-        const std::string fn = e.path().filename().string();
-        char* end = nullptr;
-        const long ord = std::strtol(fn.c_str(), &end, 10);
-        if (end == fn.c_str() || ord < 0) continue;
-        ordinal_geo.emplace((int)ord, gp);
+        return content_disabled_.find(gp) == content_disabled_.end() &&
+               !fs::exists(gp + ".disabled", dec);
+    };
+    // ── LOD 0 ONLY ────────────────────────────────────────────────────
+    // A plant's LODs sit at the SAME instance positions, so drawing
+    // every ordinal stacks the near mesh, the mid mesh and the impostor
+    // card in one spot — and the card, being flat and unlit, is what you
+    // end up looking at.  The Debug Display is an inspection view with
+    // no camera distance to speak of, so it draws the highest-detail
+    // level and nothing else.
+    //
+    // LODs are levels of one file now, so "level 0" is the test; the
+    // filename check stays for groups baked while they were still
+    // separate per-LOD files.
+    size_t lod_skipped = 0;
+    std::vector<engine::helper::RwObjRef> mapped;
+    if (engine::helper::loadRwObjMap(group_dir, mapped) && !mapped.empty()) {
+        for (const auto& r : mapped) {
+            if (!enabled(r.path)) continue;
+            if (r.level > 0 || isFarLodFile(r.path)) {
+                ++lod_skipped;
+                continue;
+            }
+            ordinal_geo.emplace(r.ordinal, r.path);
+        }
+    } else {
+        for (auto& e : fs::directory_iterator(
+                 fs::path(group_dir) / "objects", ec)) {
+            if (e.path().extension() != ".rwgeo") continue;
+            const std::string gp = e.path().string();
+            if (!enabled(gp)) continue;
+            if (isFarLodFile(gp)) { ++lod_skipped; continue; }
+            const std::string fn = e.path().filename().string();
+            char* end = nullptr;
+            const long ord = std::strtol(fn.c_str(), &end, 10);
+            if (end == fn.c_str() || ord < 0) continue;
+            ordinal_geo.emplace((int)ord, gp);
+        }
+    }
+    if (lod_skipped > 0) {
+        EditorLog::get().push(
+            "[preview] LOD 0 only — " + std::to_string(lod_skipped) +
+            " mesh(es) at LOD 1+ hidden (they still draw in the world at "
+            "range)");
     }
     if (ordinal_geo.empty()) {
         EditorLog::get().push(
@@ -10394,7 +10630,7 @@ void Menu::buildRwAnimPreview(const std::string& rwanim_path,
 void Menu::buildRwTexPreview(const std::string& rwtex_path,
                              const std::string& display_name) {
     namespace fs = std::filesystem;
-    const std::string key = rwtex_path + "#tex";
+    const std::string key = rwtex_path + "#tex" + previewStamp(rwtex_path);
     if (key == dbg_asset_key_) return;
 
     engine::helper::RwTexBaked tb;
@@ -10581,7 +10817,8 @@ void Menu::buildRwObjPreview(const std::string& rwobj_path,
     dbg_preview_skinned_ = false;   // .rwobj objects are static props
 
     if (!geo.empty()) {
-        const std::string key = rwobj_path + "#geo";
+        const std::string key = rwobj_path + "#geo" +
+            previewStamp(rwobj_path);
         if (key == dbg_asset_key_) return;   // already showing
         engine::helper::ModelPreviewData data;
         if (engine::helper::loadRwGeo(geo, data)) {

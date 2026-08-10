@@ -54,14 +54,61 @@ static glm::vec4 s_frustum_planes[6];
 static bool      s_viewer_pos_valid = false;
 static glm::vec3 s_viewer_pos_ws = glm::vec3(0.0f);
 
-// ── Eye position for plant LOD band selection ──────────────────────────
+// ── Eye position for plant LOD LOD selection ──────────────────────────
 // Separate from s_viewer_pos_ws and never cleared; see the doc-comment on
 // DrawableObject::setPlantLodEye for why the tree LOD cannot borrow the
 // decal pass's scoped eye.  Published by ObjectSceneView::draw before the
 // forward pass and before every shadow cascade, so all of them select the
-// same band for the same tile within a frame.
+// same LOD for the same tile within a frame.
 static bool      s_plant_lod_eye_valid = false;
 static glm::vec3 s_plant_lod_eye_ws = glm::vec3(0.0f);
+
+// Box-downscale a baked .rwtex RGBA8 preview for the forward-path
+// stopgap image (see the "Forward-path preview image" blocks below).
+// Full 256² previews are ~262 KB each and a PCG world binds ~4 000
+// unique .rwtex — ~1 GB of VRAM for images that only matter during the
+// pre-merge / forward window.  128² keeps foliage-card alpha cutouts
+// legible and cuts that cost 4×.  Returns false when the source is
+// already within max_dim (caller uploads it as-is, no copy).
+static bool downscalePreviewPixels(
+    const std::vector<unsigned char>& src, int sw, int sh, int max_dim,
+    std::vector<unsigned char>& out, int& ow, int& oh) {
+    if (sw <= 0 || sh <= 0 || (sw <= max_dim && sh <= max_dim))
+        return false;
+    if (src.size() < (size_t)sw * (size_t)sh * 4u) return false;
+    const float scale = (float)max_dim / (float)std::max(sw, sh);
+    const int dw = std::max(1, (int)(sw * scale));
+    const int dh = std::max(1, (int)(sh * scale));
+    out.resize((size_t)dw * dh * 4);
+    for (int y = 0; y < dh; ++y) {
+        const int sy0 = (int)((int64_t)y * sh / dh);
+        const int sy1 =
+            std::max(sy0 + 1, (int)((int64_t)(y + 1) * sh / dh));
+        for (int x = 0; x < dw; ++x) {
+            const int sx0 = (int)((int64_t)x * sw / dw);
+            const int sx1 =
+                std::max(sx0 + 1, (int)((int64_t)(x + 1) * sw / dw));
+            uint32_t acc[4] = {0, 0, 0, 0};
+            uint32_t n = 0;
+            for (int sy = sy0; sy < sy1; ++sy)
+                for (int sx = sx0; sx < sx1; ++sx) {
+                    const unsigned char* p =
+                        &src[((size_t)sy * sw + sx) * 4];
+                    acc[0] += p[0]; acc[1] += p[1];
+                    acc[2] += p[2]; acc[3] += p[3];
+                    ++n;
+                }
+            unsigned char* q = &out[((size_t)y * dw + x) * 4];
+            q[0] = (unsigned char)(acc[0] / n);
+            q[1] = (unsigned char)(acc[1] / n);
+            q[2] = (unsigned char)(acc[2] / n);
+            q[3] = (unsigned char)(acc[3] / n);
+        }
+    }
+    ow = dw;
+    oh = dh;
+    return true;
+}
 
 namespace ego = engine::game_object;
 
@@ -2605,9 +2652,9 @@ static bool readFloatAccessor(
     return true;
 }
 
-// ── Plant LOD: parse the band/tile encoding out of the node names ───────
-// terrain_pcg.py writes one node per (tile, band, species) and puts both
-// the tile rectangle and the band range in the NAME:
+// ── Plant LOD: parse the LOD/tile encoding out of the node names ───────
+// terrain_pcg.py writes one node per (tile, LOD, species) and puts both
+// the tile rectangle and the LOD range in the NAME:
 //
 //     tree_<species>_lodtile_<i>_<j>_<tile>_<near>_<far>
 //
@@ -2649,7 +2696,7 @@ static bool parseLodTileName(
         return false;                       // trailing junk: not our encoding
     }
     if (v[2] <= 0 || v[4] <= v[3] || v[3] < 0) {
-        return false;                       // degenerate tile or band
+        return false;                       // degenerate tile or LOD
     }
     ti = static_cast<int64_t>(v[0]);
     tj = static_cast<int64_t>(v[1]);
@@ -2693,7 +2740,7 @@ static bool parsePgateName(
 }
 
 // Run once at load, right after setupNodes.  Fills the per-node tile
-// rectangle and band range, and sets has_plant_lod_ if ANY node carried
+// rectangle and LOD range, and sets has_plant_lod_ if ANY node carried
 // the encoding — that flag is what keeps every other drawable on exactly
 // the code path it had before this change.
 static void parsePlantLodBands(
@@ -2705,7 +2752,7 @@ static void parsePlantLodBands(
     float near_far_max = 0.0f;
     for (auto& node : drawable_object->nodes_) {
         // Proximity gates ride the same load-time scan and the same
-        // per-frame visibility pass as the LOD bands.
+        // per-frame visibility pass as the LOD LODs.
         {
             float gx, gz, gr;
             int gmode;
@@ -2748,7 +2795,7 @@ static void parsePlantLodBands(
         // rebuild the world rectangles rather than trusting the default.
         std::cout << "[lod] " << input_filename << ": " << matched
                   << " of " << drawable_object->nodes_.size()
-                  << " nodes carry plant LOD bands, "
+                  << " nodes carry plant LODs, "
                   << near_far_min << " to " << near_far_max << " m"
                   << std::endl;
     }
@@ -2758,10 +2805,10 @@ static void parsePlantLodBands(
 // world, so the four shadow cascades ride on the forward pass's work AND
 // are guaranteed to agree with it).  For every LOD node: the horizontal
 // distance from the eye to the tile's rectangle, then "draw me if that
-// distance is inside my band".
+// distance is inside my LOD".
 //
-// The bands partition [0, far_last) with no gaps and no overlap, so each
-// tile is selected by exactly one band — that is a property of the table
+// The LODs partition [0, far_last) with no gaps and no overlap, so each
+// tile is selected by exactly one LOD — that is a property of the table
 // terrain_pcg.py writes, asserted on the Python side over thousands of
 // tiles and hundreds of camera positions, and it is why this function can
 // be a straight per-node range test with no cross-node bookkeeping.
@@ -2795,7 +2842,7 @@ static void selectPlantLodBands(
     for (size_t i = 0; i < drawable_object->nodes_.size(); ++i) {
         auto& node = drawable_object->nodes_[i];
         if (node.lod_tile_m_ <= 0.0f) {
-            uint8_t v = 1;                  // not a band node
+            uint8_t v = 1;                  // not a LOD node
             if (node.gate_r_ > 0.0f && eye_valid) {
                 const float gdx = eye.x - node.gate_x_;
                 const float gdz = eye.z - node.gate_z_;
@@ -2840,10 +2887,10 @@ static void selectPlantLodBands(
         if (!eye_valid) {
             // No eye has ever been published — the first frame or two
             // after a load, before ObjectSceneView::draw has run once.
-            // Select the FARTHEST band: it still covers every tile
+            // Select the FARTHEST LOD: it still covers every tile
             // exactly once (so nothing is missing and nothing doubles),
             // and at four triangles a tree it cannot stall the frame the
-            // way selecting the near band for the whole map would.  The
+            // way selecting the near LOD for the whole map would.  The
             // next frame has an eye and corrects itself.
             vis[i] = (node.lod_far_m_ >= drawable_object->lod_far_max_)
                      ? uint8_t(1) : uint8_t(0);
@@ -2864,7 +2911,7 @@ static void selectPlantLodBands(
         const float d = glm::sqrt(dx * dx + dz * dz);
         uint8_t v =
             (d >= node.lod_near_m_ && d < node.lod_far_m_) ? 1 : 0;
-        // Proximity gate applies on top of the band test.
+        // Proximity gate applies on top of the LOD test.
         if (v != 0 && node.gate_r_ > 0.0f) {
             const float gdx = eye.x - node.gate_x_;
             const float gdz = eye.z - node.gate_z_;
@@ -2907,7 +2954,7 @@ static void bakeInstanceTransforms(
         auto it = pcg_over.find(node_name);
         if (it != pcg_over.end()) return &it->second;
         // longest "<key>_" prefix match (archetype / species keys
-        // cover every _lodtile_ band node of that sample)
+        // cover every _lodtile_ node of that sample)
         const ego::PcgInstanceOverride* best = nullptr;
         size_t best_len = 0;
         for (const auto& kv : pcg_over) {
@@ -2939,10 +2986,10 @@ static void bakeInstanceTransforms(
     drawable_object->baked_instances_.emplace_back();
 
     // ── One baked range per distinct accessor triple ──────────────────
-    // The tree GLB gives every LOD band of a tile its own node, and all
+    // The tree GLB gives every LOD LOD of a tile its own node, and all
     // three of those nodes point at the SAME TRANSLATION/ROTATION/SCALE
     // accessors — a tree does not move, turn or change size when the
-    // camera crosses a band boundary, only the mesh drawn in its place
+    // camera crosses a LOD boundary, only the mesh drawn in its place
     // changes.  The writer already stores those bytes once (see
     // write_instanced_glb's _inst_acc memo).  This loop, though, walks
     // NODES, so without this map it would faithfully decode the one
@@ -3014,7 +3061,7 @@ static void bakeInstanceTransforms(
         // range instead of appending a second copy.  `bake` false from
         // here down means "reuse the rows, but still do everything that
         // is per-NODE" — which the instance-expanded bbox below is: each
-        // band node owns a different mesh with a different local bbox
+        // LOD node owns a different mesh with a different local bbox
         // (a full LOD0 tree and a flat far-field card are not the same
         // box), so that union has to be recomputed even when the
         // transforms behind it are shared.
@@ -3131,27 +3178,27 @@ static void bakeInstanceTransforms(
             // the binder.  Called only when the range is CREATED — the
             // memoized shares alias these same slots, so binding them
             // again would double-queue every later rewrite.  On the
-            // override path each band node creates its own range, and
+            // override path each LOD node creates its own range, and
             // each gets bound, which is exactly what a move needs: all
-            // of a prop's band slots rewritten together.
+            // of a prop's LOD slots rewritten together.
             ego::PcgInstanceRegistry::get().bindBakedRange(
                 drawable_object, node.name_, node.inst_offset_, t, count);
         }
 
-        // Mirror the range onto the mesh so the indirect-draw fill (which
-        // iterates meshes, not nodes) can find it.
-        if (node.mesh_idx_ >= 0) {
-            auto it =
-                drawable_object->mesh_instance_range_.find(node.mesh_idx_);
-            if (it != drawable_object->mesh_instance_range_.end()) {
-                std::cout << "[instancing] mesh " << node.mesh_idx_
-                          << " is referenced by more than one instanced node;"
-                             " only the first range is drawn" << std::endl;
-            } else {
-                drawable_object->mesh_instance_range_[node.mesh_idx_] =
-                    { node.inst_offset_, node.inst_count_ };
-            }
-        }
+        // INFORMATIONAL ONLY, and deliberately no longer a constraint.
+        // The indirect-draw init below gives an instanced drawable one
+        // command block per NODE, so any number of nodes may share a
+        // mesh and each still draws its own slice of the baked table.
+        // This map used to be the fill's only route to a range, which is
+        // why a shared mesh had to warn that every node after the first
+        // would silently vanish — and why the exporter emitted a private
+        // mesh entry per node to avoid ever tripping it.  Kept because
+        // the summary below reports how many distinct meshes the
+        // instancing touches; first writer wins and nothing reads it.
+        if (node.mesh_idx_ >= 0)
+            drawable_object->mesh_instance_range_.emplace(
+                node.mesh_idx_,
+                std::make_pair(node.inst_offset_, node.inst_count_));
     }
 
     drawable_object->has_baked_instances_ =
@@ -3935,7 +3982,15 @@ static void drawMesh(
     //   the active list and the GS-style dispatch is used for every
     //   primitive.  fallback param ignored.
     bool mesh_shader_csm_mode = false,
-    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines = nullptr) {
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines = nullptr,
+    // ── The CALLING NODE'S command block ────────────────────────────
+    // >= 0: this drawable keeps one command per (node, primitive), so
+    // the offset comes from the node and the primitives below are read
+    // in order.  -1: the drawable still carries the command on the
+    // primitive, which is every non-instanced file.  See
+    // NodeInfo::indirect_cmd_ofs_ for why the command belongs to the
+    // node.
+    int32_t node_cmd_ofs = -1) {
 
     // ── Debug reach: drawMesh entered ───────────────────────────────
     // Only one drawable in the scene has this flag (the player today),
@@ -4339,9 +4394,17 @@ static void drawMesh(
         }
 
         //cmd_buf->drawIndexed(static_cast<uint32_t>(prim.index_desc_.index_count));
+        // The slot is the primitive's INDEX IN THE MESH, not a running
+        // counter: this loop walks a depth-sorted copy of the primitive
+        // list and skips primitives with no pipeline, so a counter would
+        // drift off the commands the fill wrote.
         cmd_buf->drawIndexedIndirect(
             drawable_object->indirect_draw_cmd_,
-            prim.indirect_draw_cmd_ofs_);
+            node_cmd_ofs >= 0
+                ? (node_cmd_ofs +
+                   (int32_t)((size_t)(prim_ptr - mesh_info.primitives_.data()) *
+                             sizeof(renderer::DrawIndexedIndirectCommand)))
+                : prim.indirect_draw_cmd_ofs_);
     }
 }
 
@@ -4372,11 +4435,11 @@ static void drawNodes(
         const bool node_filtered =
             drawable_object->m_only_render_node_ >= 0 &&
             drawable_object->m_only_render_node_ != node_idx;
-        // Plant LOD band gate.  selectPlantLodBands ran once at the top
+        // Plant LOD LOD gate.  selectPlantLodBands ran once at the top
         // of DrawableObject::draw and marked, for every tile, the single
-        // band that owns it at this eye position; everything else is
+        // LOD that owns it at this eye position; everything else is
         // skipped here.  Applied in the depth-only and cascade passes
-        // too — the bands partition distance rather than dividing an
+        // too — the LODs partition distance rather than dividing an
         // effect from its absence, so a shadow pass that ignored the
         // gate would draw all three copies of every tree at once, which
         // is both the wrong silhouette and the whole cost this exists
@@ -4447,7 +4510,8 @@ static void drawNodes(
                 depth_only,
                 last_hash,
                 mesh_shader_csm_mode,
-                mesh_shader_fallback_pipelines);
+                mesh_shader_fallback_pipelines,
+                node.indirect_cmd_ofs_);
 
             num_draw_meshes++;
         }
@@ -6522,11 +6586,26 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
             if (!data) {
                 // Phase 2 failed; MeshLoadTaskManager already logged
                 // the error. Leave obj->object_ null so isReady()
-                // stays false — the caller can notice via the task
-                // status if they held on to the MeshLoadTask handle.
+                // stays false — but mark every wrapper attached to
+                // this load as FAILED so waiters (the placed→cluster
+                // merge in syncPlacedObjectsToClusters) can skip it
+                // instead of blocking forever on a load that will
+                // never finish.
                 // Drop the in-flight entry so a later retry can submit
                 // a fresh load instead of attaching to a dead slot.
-                s_in_flight_loads_.erase(file_name);
+                auto fit = s_in_flight_loads_.find(file_name);
+                if (fit != s_in_flight_loads_.end()) {
+                    for (auto& sibling : fit->second) {
+                        if (sibling) {
+                            sibling->load_failed_.store(
+                                true, std::memory_order_release);
+                        }
+                    }
+                    s_in_flight_loads_.erase(fit);
+                } else if (obj) {
+                    obj->load_failed_.store(
+                        true, std::memory_order_release);
+                }
                 return;
             }
 
@@ -7427,19 +7506,45 @@ void DrawableObject::updateIndirectDrawBuffer(
             { SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
               SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) },
             object_->indirect_draw_cmd_.buffer->getSize());
-        for (const auto& mesh : object_->meshes_) {
-            for (const auto& prim : mesh.primitives_) {
-                const uint32_t cur_lod = (uint32_t)std::max(
-                    0, std::min(forced_geo_lod_,
-                                (int32_t)prim.index_desc_.size() - 1));
-                const uint32_t cnt = (uint32_t)
-                    prim.index_desc_[cur_lod].index_count;
-                cmd_buf->updateBuffer(
-                    object_->indirect_draw_cmd_.buffer,
-                    prim.indirect_draw_cmd_ofs_ +
-                        offsetof(renderer::DrawIndexedIndirectCommand,
-                                 index_count),
-                    sizeof(uint32_t), &cnt);
+        // Rewrite through whichever command layout this drawable uses.
+        // A drawable with per-NODE command blocks (see
+        // NodeInfo::indirect_cmd_ofs_) may draw one mesh from several
+        // nodes, so walking meshes would leave every node past the first
+        // holding a stale count.
+        bool node_cmds = false;
+        for (const auto& n : object_->nodes_)
+            if (n.indirect_cmd_ofs_ >= 0) { node_cmds = true; break; }
+        const auto write_prim = [&](const ego::PrimitiveInfo& prim,
+                                    int32_t ofs) {
+            const uint32_t cur_lod = (uint32_t)std::max(
+                0, std::min(forced_geo_lod_,
+                            (int32_t)prim.index_desc_.size() - 1));
+            const uint32_t cnt = (uint32_t)
+                prim.index_desc_[cur_lod].index_count;
+            cmd_buf->updateBuffer(
+                object_->indirect_draw_cmd_.buffer,
+                ofs + offsetof(renderer::DrawIndexedIndirectCommand,
+                               index_count),
+                sizeof(uint32_t), &cnt);
+        };
+        if (node_cmds) {
+            for (const auto& node : object_->nodes_) {
+                if (node.indirect_cmd_ofs_ < 0 || node.mesh_idx_ < 0 ||
+                    node.mesh_idx_ >= (int32_t)object_->meshes_.size())
+                    continue;
+                const auto& mesh = object_->meshes_[node.mesh_idx_];
+                int32_t ofs = node.indirect_cmd_ofs_;
+                for (const auto& prim : mesh.primitives_) {
+                    write_prim(prim, ofs);
+                    ofs += (int32_t)
+                        sizeof(renderer::DrawIndexedIndirectCommand);
+                }
+            }
+        } else {
+            for (const auto& mesh : object_->meshes_) {
+                for (const auto& prim : mesh.primitives_) {
+                    write_prim(prim, prim.indirect_draw_cmd_ofs_);
+                }
             }
         }
         cmd_buf->addBufferBarrier(
@@ -7624,7 +7729,7 @@ void DrawableObject::draw(
         return;
     }
 
-    // ── Select the plant LOD band for every tile ────────────────────
+    // ── Select the plant LOD LOD for every tile ────────────────────
     // Inert (one predicate) for every drawable whose node names carry no
     // _lodtile_ encoding, which is all of them but the tree GLB.  Called
     // per PASS rather than per frame on purpose: there is no frame hook
@@ -7975,6 +8080,28 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     setupRaytracing(drawable_object);
 
     // init indirect draw buffer.
+    //
+    // TWO LAYOUTS, chosen by whether this drawable has baked instances.
+    //
+    // A plain glTF drawable keeps ONE COMMAND PER PRIMITIVE -- unchanged,
+    // and still what every non-instanced path reads.
+    //
+    // An INSTANCED one switches to ONE COMMAND BLOCK PER NODE, matching
+    // what the native .rwinst loader already does (see the note on
+    // NodeInfo::indirect_cmd_ofs_).  first_instance/instance_count are a
+    // property of the NODE's slice of the baked transform table, so a
+    // command living on the primitive can only ever express ONE node's
+    // slice -- which is exactly what forced the exporter to give every
+    // instanced node a private mesh entry, and why a placement GLB
+    // carried 173 MB of duplicated mesh JSON for trees and 217 MB for
+    // objects.  With the command on the node, a mesh is geometry and
+    // nothing else, and any number of nodes may draw it with their own
+    // ranges.
+    //
+    // Per-primitive offsets are assigned in BOTH layouts: other code
+    // reads them, and under the node layout they are simply not the
+    // offsets this drawable draws through.
+    const bool node_cmd_layout = drawable_object->has_baked_instances_;
     uint32_t num_prims = 0;
     for (auto& mesh : drawable_object->meshes_) {
         for (auto& prim : mesh.primitives_) {
@@ -7983,58 +8110,84 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
             num_prims++;
         }
     }
+    if (node_cmd_layout) {
+        // A node's commands are contiguous, one per primitive of its
+        // mesh, in primitive order -- drawMesh indexes them by the
+        // primitive's position within the mesh.
+        num_prims = 0;
+        for (auto& node : drawable_object->nodes_) {
+            if (node.mesh_idx_ < 0 ||
+                node.mesh_idx_ >= (int32_t)drawable_object->meshes_.size()) {
+                node.indirect_cmd_ofs_ = -1;
+                continue;
+            }
+            node.indirect_cmd_ofs_ = (int32_t)(
+                num_prims * sizeof(renderer::DrawIndexedIndirectCommand) +
+                INDIRECT_DRAW_BUF_OFS);
+            num_prims += (uint32_t)
+                drawable_object->meshes_[node.mesh_idx_].primitives_.size();
+        }
+    }
 
     std::vector<uint32_t> indirect_draw_cmd_buffer(
-        sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) * num_prims + 1);
+        sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) * std::max(num_prims, 1u) + 1);
     auto indirect_draw_buf = reinterpret_cast<renderer::DrawIndexedIndirectCommand*>(indirect_draw_cmd_buffer.data() + 1);
 
     // clear instance count = 0;
     indirect_draw_cmd_buffer[0] = 0;
     uint32_t prim_idx = 0;
-    int32_t mesh_idx = 0;
-    for (const auto& mesh : drawable_object->meshes_) {
-        // ── Baked GPU instancing ─────────────────────────────────────
-        // For a normal drawable instance_count stays 0 here and update_-
-        // gltf_indirect_draw.comp stamps kNumDrawableInstance over it
-        // every frame.  A baked drawable skips that compute pass (see
-        // updateIndirectDrawBuffer), so THIS fill is the only thing that
-        // ever writes the command — the counts must be final.
-        //
-        // first_instance is what makes per-node ranges work at all: it
-        // offsets Vulkan's instance-rate vertex-attribute fetch, so each
-        // species reads its own slice of the baked table.  base.vert
-        // needs no change for this — it consumes the instance transform
-        // purely as vertex attributes (locations 10/12/13/14) and never
-        // reads gl_InstanceIndex, so the offset is applied by the fixed-
-        // function fetch before the shader ever sees it.
-        uint32_t first_instance = 0;
-        uint32_t instance_count = 0;
-        if (drawable_object->has_baked_instances_) {
-            const auto it =
-                drawable_object->mesh_instance_range_.find(mesh_idx);
-            if (it != drawable_object->mesh_instance_range_.end()) {
-                first_instance = it->second.first;
-                instance_count = it->second.second;
-            } else {
-                // Non-instanced node in an instanced file: one copy at
-                // the reserved identity slot 0.
-                first_instance = 0;
-                instance_count = 1;
+    // ── Baked GPU instancing ─────────────────────────────────────────
+    // For a normal drawable instance_count stays 0 here and update_-
+    // gltf_indirect_draw.comp stamps kNumDrawableInstance over it every
+    // frame.  A baked drawable skips that compute pass (see
+    // updateIndirectDrawBuffer), so THIS fill is the only thing that
+    // ever writes the command — the counts must be final.
+    //
+    // first_instance is what makes per-node ranges work at all: it
+    // offsets Vulkan's instance-rate vertex-attribute fetch, so each
+    // species reads its own slice of the baked table.  base.vert needs
+    // no change for this — it consumes the instance transform purely as
+    // vertex attributes (locations 10/12/13/14) and never reads
+    // gl_InstanceIndex, so the offset is applied by the fixed-function
+    // fetch before the shader ever sees it.
+    if (node_cmd_layout) {
+        for (const auto& node : drawable_object->nodes_) {
+            if (node.indirect_cmd_ofs_ < 0) continue;
+            const auto& mesh = drawable_object->meshes_[node.mesh_idx_];
+            // A node with no slice of the table draws one copy at the
+            // reserved identity slot 0 — a plain node in an instanced
+            // file, exactly as before.
+            const uint32_t first_instance =
+                node.inst_count_ ? node.inst_offset_ : 0u;
+            const uint32_t instance_count =
+                node.inst_count_ ? node.inst_count_ : 1u;
+            for (const auto& prim : mesh.primitives_) {
+                // Load-time fill is LOD 0; the runtime override path in
+                // updateIndirectDrawBuffer rewrites counts when it moves.
+                indirect_draw_buf[prim_idx].first_index = 0;
+                indirect_draw_buf[prim_idx].first_instance = first_instance;
+                indirect_draw_buf[prim_idx].index_count =
+                    static_cast<uint32_t>(prim.index_desc_[0].index_count);
+                indirect_draw_buf[prim_idx].instance_count = instance_count;
+                indirect_draw_buf[prim_idx].vertex_offset = 0;
+                prim_idx++;
             }
         }
-        for (const auto& prim : mesh.primitives_) {
-            // Load-time fill is LOD 0; the runtime override path in
-            // updateIndirectDrawBuffer rewrites counts when it moves.
-            const uint32_t cur_lod = 0;
-            indirect_draw_buf[prim_idx].first_index = 0;
-            indirect_draw_buf[prim_idx].first_instance = first_instance;
-            indirect_draw_buf[prim_idx].index_count =
-                static_cast<uint32_t>(prim.index_desc_[cur_lod].index_count);
-            indirect_draw_buf[prim_idx].instance_count = instance_count;
-            indirect_draw_buf[prim_idx].vertex_offset = 0;
-            prim_idx++;
+    } else {
+        // Non-instanced: one command per primitive, counts left at 0 for
+        // the compute pass to stamp.
+        for (const auto& mesh : drawable_object->meshes_) {
+            for (const auto& prim : mesh.primitives_) {
+                const uint32_t cur_lod = 0;
+                indirect_draw_buf[prim_idx].first_index = 0;
+                indirect_draw_buf[prim_idx].first_instance = 0;
+                indirect_draw_buf[prim_idx].index_count =
+                    static_cast<uint32_t>(prim.index_desc_[cur_lod].index_count);
+                indirect_draw_buf[prim_idx].instance_count = 0;
+                indirect_draw_buf[prim_idx].vertex_offset = 0;
+                prim_idx++;
+            }
         }
-        mesh_idx++;
     }
 
     renderer::Helper::createBuffer(
@@ -8419,6 +8572,32 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         ubo.occlusion_strength = 1.0f;
         ubo.tonemap_type      = TONEMAP_DEFAULT;
         ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+        // ── TELL THE SHADER ITS MAPS EXIST ───────────────────────────
+        // Binding a texture at the descriptor level is not enough:
+        // getBaseColor only samples albedo_tex when
+        // FEATURE_HAS_BASE_COLOR_MAP is set, and without it baseColor is
+        // the FACTOR alone -- opaque, untextured.  For a foliage card
+        // that is fatal twice over: the leaves lose their picture, and
+        // their alpha comes back 1.0 so the mask below can never cut
+        // anything out and every leaf renders as a solid quad.  The
+        // glTF loader has always set these; the native loaders did not.
+        ubo.material_features |=
+            (dst_material.base_color_idx_ >= 0
+                 ? FEATURE_HAS_BASE_COLOR_MAP : 0u) |
+            (dst_material.normal_idx_ >= 0 ? FEATURE_HAS_NORMAL_MAP : 0u) |
+            (dst_material.metallic_roughness_idx_ >= 0
+                 ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP |
+                    FEATURE_HAS_METALLIC_CHANNEL)
+                 : 0u);
+        // World-space texturing, asked for by the asset (see kSecTriplanar).
+        // A rock has no seam-free uv set, so its maps are sampled by
+        // position; triplanar_tile_m carries the metres-per-repeat the
+        // generator authored.
+        if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
+            sec.triplanar_tile_m > 0.0f) {
+            ubo.material_features |= FEATURE_MATERIAL_TRIPLANAR;
+            ubo.triplanar_tile_m = sec.triplanar_tile_m;
+        }
         // NO FEATURE_HAS_BASE_COLOR_MAP: baked textures are VT-only
         // (cpu_pixels, no full-res GPU image) — the forward pass renders
         // the flat section colour; the cluster pass samples the VT pool.
@@ -8747,6 +8926,71 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
     return drawable_object;
 }
 
+// ─── mesh ordinal → baked geometry file ────────────────────────────────
+// hierarchy.rwhier gives every mesh-bearing node a mesh_ordinal, and the
+// bake records which .rwgeo that ordinal ended up in.  The mapping used
+// to be implicit in the file name's "%d_" prefix, which only worked
+// while the bake wrote exactly one file per node.  It no longer does:
+// model_inspect keys the write on the GEOMETRY, so nodes that share a
+// mesh — every tile of one plant species and LOD — share a file, and
+// the ordinal cannot be read off the name any more.  The bake therefore
+// writes objects/objects.rwmap.
+//
+// No map = content baked before that change, where the prefix IS the
+// ordinal; scan the directory the old way.  Either way a sibling
+// ".disabled" marker removes the sub-mesh, and the result is sorted by
+// ordinal because both callers walk it in that order.
+static std::vector<helper::RwObjRef> readOrdinalGeo(
+    const std::filesystem::path& group_dir, const char* tag) {
+    namespace fs = std::filesystem;
+    std::vector<helper::RwObjRef> out;
+    std::error_code ec;
+
+    const auto usable = [&](const fs::path& p) {
+        std::error_code dec;
+        if (!fs::exists(p, dec)) {
+            std::cout << tag << " missing baked geometry: "
+                      << p.filename().string() << std::endl;
+            return false;
+        }
+        if (fs::exists(p.string() + ".disabled", dec)) {
+            std::cout << tag << " sub-mesh disabled, skipping: "
+                      << p.filename().string() << std::endl;
+            return false;
+        }
+        return true;
+    };
+
+    std::vector<helper::RwObjRef> mapped;
+    if (helper::loadRwObjMap(group_dir.string(), mapped) && !mapped.empty()) {
+        for (const auto& r : mapped)
+            if (usable(r.path)) out.push_back(r);
+        if (!out.empty()) return out;   // already sorted by ordinal
+        out.clear();       // every entry disabled: fall through to the scan
+    }
+
+    for (auto& e : fs::directory_iterator(group_dir / "objects", ec)) {
+        if (e.path().extension() != ".rwgeo") continue;
+        {
+            std::error_code dec;
+            if (fs::exists(e.path().string() + ".disabled", dec)) {
+                std::cout << tag << " sub-mesh disabled, skipping: "
+                          << e.path().filename().string() << std::endl;
+                continue;
+            }
+        }
+        int ord = -1;
+        if (std::sscanf(e.path().filename().string().c_str(), "%d_", &ord)
+                == 1 && ord >= 0)
+            out.push_back({ ord, e.path().string(), 0 });
+    }
+    std::sort(out.begin(), out.end(),
+              [](const helper::RwObjRef& a, const helper::RwObjRef& b) {
+                  return a.ordinal < b.ordinal;
+              });
+    return out;
+}
+
 // ─── loadRwCharacter ───────────────────────────────────────────────────────
 // Builds ONE skinned DrawableData from a baked character group (see the
 // header doc).  Mirrors loadRwObjModel for geometry/material/texture and the
@@ -8772,34 +9016,17 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
         return nullptr;
     }
 
-    // ── Baked objects: mesh_ordinal → objects/NNN_*.rwgeo ─────────────
-    std::vector<std::pair<int, std::string>> ordinal_geo;
-    std::error_code ec;
-    for (auto& e : fs::directory_iterator(group_dir / "objects", ec)) {
-        if (e.path().extension() != ".rwgeo") continue;
-        // Content-Browser "Enabled" toggle: a sibling .disabled marker
-        // removes the sub-mesh from the loaded character entirely —
-        // it never reaches the forward pass, CSM, or either RT shadow
-        // path (the RT skin capture runs in the same load loop).
-        {
-            std::error_code dec;
-            if (fs::exists(e.path().string() + ".disabled", dec)) {
-                std::cout << "[rwchar] sub-mesh disabled, skipping: "
-                          << e.path().filename().string() << std::endl;
-                continue;
-            }
-        }
-        int ord = -1;
-        if (std::sscanf(e.path().filename().string().c_str(), "%d_", &ord)
-                == 1 && ord >= 0)
-            ordinal_geo.emplace_back(ord, e.path().string());
-    }
+    // ── Baked objects: mesh_ordinal → geometry file ───────────────────
+    // Content-Browser "Enabled" toggle honoured inside readOrdinalGeo: a
+    // sibling .disabled marker removes the sub-mesh from the loaded
+    // character entirely — it never reaches the forward pass, CSM, or
+    // either RT shadow path (the RT skin capture runs in this loop).
+    const auto ordinal_geo = readOrdinalGeo(group_dir, "[rwchar]");
     if (ordinal_geo.empty()) {
         std::cout << "[rwchar] no baked objects for '" << ref_name << "'"
                   << std::endl;
         return nullptr;
     }
-    std::sort(ordinal_geo.begin(), ordinal_geo.end());
 
     auto drawable_object = std::make_shared<ego::DrawableData>(device);
     drawable_object->m_use_local_matrix_only_ = false;
@@ -8841,7 +9068,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
     // Per-character VT texture cache (canonical .rwtex path → TextureInfo).
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
 
-    for (const auto& [ordinal, geo_path] : ordinal_geo) {
+    for (const auto& oref : ordinal_geo) {
+        const int ordinal = oref.ordinal;
+        const std::string& geo_path = oref.path;
+        const int geo_level = oref.level;
+        (void)geo_level;
         int owner_node = -1;
         for (size_t i = 0; i < hier.size(); ++i)
             if (hier[i].mesh_ordinal == ordinal) { owner_node = (int)i; break; }
@@ -9089,11 +9320,48 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                                   .lexically_normal().generic_string();
             for (auto& c : key) c = (char)std::tolower((unsigned char)c);
             auto cit = tex_gpu_cache.find(key);
-            if (cit != tex_gpu_cache.end()) { dst = cit->second; continue; }
+            if (cit != tex_gpu_cache.end()) {
+                dst = cit->second;
+                // The FIRST textures_ entry for this .rwtex owns the
+                // GPU handles; later copies borrow them so
+                // DrawableData::destroy frees each image exactly once.
+                dst.borrowed_ = true;
+                continue;
+            }
             helper::RwTexBaked tb;
             if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
                 tb.w <= 0 || tb.h <= 0)
                 continue;
+            // ── Content dedup ───────────────────────────────────────
+            // PCG bakes write one .rwtex per SOURCE SLOT, so a tree
+            // group carries thousands of byte-identical files (a
+            // measured sample: 800 files → 31 unique payloads).  Key
+            // the GPU cache by payload hash as well as by path: the
+            // first file with a given payload owns the GPU handles,
+            // every later one — same path or not — borrows them.
+            uint64_t ch = 1469598103934665603ull;   // FNV-1a 64
+            auto fnv = [&ch](const void* p, size_t n) {
+                const unsigned char* b = (const unsigned char*)p;
+                for (size_t i = 0; i < n; ++i) {
+                    ch ^= b[i];
+                    ch *= 1099511628211ull;
+                }
+            };
+            const int32_t dims[4] = {tb.w, tb.h, tb.preview_w,
+                                     tb.preview_h};
+            fnv(dims, sizeof(dims));
+            fnv(tb.preview_rgba.data(), tb.preview_rgba.size());
+            fnv(tb.alpha.data(), tb.alpha.size());
+            if (tb.bc7_tiles)
+                fnv(tb.bc7_tiles->data(), tb.bc7_tiles->size());
+            const std::string ckey = "c:" + std::to_string(ch);
+            auto chit = tex_gpu_cache.find(ckey);
+            if (chit != tex_gpu_cache.end()) {
+                dst = chit->second;
+                dst.borrowed_ = true;
+                tex_gpu_cache.emplace(key, dst);  // path alias
+                continue;
+            }
             dst.size = glm::uvec3((uint32_t)tb.w, (uint32_t)tb.h, 1u);
             dst.linear = false;
             dst.source_filename_ = tex_paths[ti];
@@ -9102,7 +9370,58 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 tb.preview_h == tb.h && !tb.preview_rgba.empty())
                 dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
                     tb.preview_rgba.begin(), tb.preview_rgba.end());
+            // ── Forward-path preview image ──────────────────────────
+            // These textures are VT-only (full detail streams through
+            // the cluster pipeline's Runtime Virtual Texture), so no
+            // full-res GPU image exists here.  The material block below
+            // sets FEATURE_HAS_BASE_COLOR_MAP (needed so foliage-card
+            // alpha masks work), which makes the forward shader SAMPLE
+            // the albedo binding — and with a null view the descriptor
+            // writer bound the global BLACK fallback: placed objects on
+            // the forward path (pre-cluster-merge window, transform
+            // edits, and skinned characters always) rendered pure
+            // black.  Upload the baked ≤256 px preview as a real image
+            // so the forward path shows low-res albedo/normal/MR
+            // instead.  Cost: one small RGBA8 image per UNIQUE .rwtex
+            // (path-cached above).
+            if (!tb.preview_rgba.empty() && tb.preview_w > 0 &&
+                tb.preview_h > 0 &&
+                tb.preview_rgba.size() >=
+                    size_t(tb.preview_w) * size_t(tb.preview_h) * 4u) {
+                // VRAM: cap the stopgap image at 128² (box filter) —
+                // ~4 000 unique .rwtex at 256² was ~1 GB.
+                std::vector<unsigned char> ds_pixels;
+                int ds_w = 0, ds_h = 0;
+                const bool scaled = downscalePreviewPixels(
+                    tb.preview_rgba, tb.preview_w, tb.preview_h,
+                    128, ds_pixels, ds_w, ds_h);
+                // Full mip chain (blit-generated): without it the
+                // 16x anisotropic sampler minifies mip 0 only and
+                // distant foliage shimmers/aliases.  The shared
+                // texture_sampler_ already has maxLod=1024.
+                uint32_t preview_mips = 1;
+                renderer::Helper::create2DTextureImageWithMips(
+                    device,
+                    renderer::Format::R8G8B8A8_UNORM,
+                    scaled ? ds_w : tb.preview_w,
+                    scaled ? ds_h : tb.preview_h,
+                    scaled ? ds_pixels.data() : tb.preview_rgba.data(),
+                    dst.image,
+                    dst.memory,
+                    preview_mips,
+                    std::source_location::current());
+                dst.view = device->createImageView(
+                    dst.image,
+                    renderer::ImageViewType::VIEW_2D,
+                    renderer::Format::R8G8B8A8_UNORM,
+                    SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                    std::source_location::current(),
+                    /*base_mip=*/0,
+                    /*mip_count=*/preview_mips);
+                dst.mip_levels = preview_mips;
+            }
             tex_gpu_cache.emplace(key, dst);
+            tex_gpu_cache.emplace(ckey, dst);
         }
 
         // Materials (one per section), global texture indices.
@@ -9145,6 +9464,31 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             ubo.occlusion_strength = 1.0f;
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+            // ── TELL THE SHADER ITS MAPS EXIST ───────────────────────────
+            // Binding a texture at the descriptor level is not enough:
+            // getBaseColor only samples albedo_tex when
+            // FEATURE_HAS_BASE_COLOR_MAP is set, and without it baseColor is
+            // the FACTOR alone -- opaque, untextured.  For a foliage card
+            // that is fatal twice over: the leaves lose their picture, and
+            // their alpha comes back 1.0 so the mask below can never cut
+            // anything out and every leaf renders as a solid quad.  The
+            // glTF loader has always set these; the native loaders did not.
+            ubo.material_features |=
+                (mat.base_color_idx_ >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0u) |
+                (mat.normal_idx_ >= 0 ? FEATURE_HAS_NORMAL_MAP : 0u) |
+                (mat.metallic_roughness_idx_ >= 0
+                     ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP |
+                        FEATURE_HAS_METALLIC_CHANNEL)
+                     : 0u);
+            // World-space texturing, asked for by the asset (see kSecTriplanar).
+            // A rock has no seam-free uv set, so its maps are sampled by
+            // position; triplanar_tile_m carries the metres-per-repeat the
+            // generator authored.
+            if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
+                sec.triplanar_tile_m > 0.0f) {
+                ubo.material_features |= FEATURE_MATERIAL_TRIPLANAR;
+                ubo.triplanar_tile_m = sec.triplanar_tile_m;
+            }
             ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
@@ -9359,7 +9703,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
 // ─── loadRwInstanced ───────────────────────────────────────────────────────
 // ONE static DrawableData from a baked INSTANCED GROUP (see the header
 // doc).  Mirrors loadRwCharacter's assembly minus everything skinned, and
-// finishes with the same three passes the glTF path runs: LOD-band /
+// finishes with the same three passes the glTF path runs: LOD-LOD /
 // gate parsing off the node names, the flat instance-table bake (sourced
 // from instances.rwinst instead of glTF accessors, table indices playing
 // the accessor-triple role in the shared-range memo), and the
@@ -9385,7 +9729,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         return nullptr;
     }
 
-    // ── Hierarchy (names are behaviour — bands, gates, bindings) ─────
+    // ── Hierarchy (names are behaviour — LODs, gates, bindings) ─────
     std::vector<helper::RwHierNode> hier;
     if (!helper::loadRwHier((group_dir / "hierarchy.rwhier").string(),
                             hier) || hier.empty()) {
@@ -9394,30 +9738,18 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         return nullptr;
     }
 
-    // ── Baked objects: mesh_ordinal → objects/NNN_*.rwgeo ─────────────
-    std::vector<std::pair<int, std::string>> ordinal_geo;
-    std::error_code ec;
-    for (auto& e : fs::directory_iterator(group_dir / "objects", ec)) {
-        if (e.path().extension() != ".rwgeo") continue;
-        {
-            std::error_code dec;
-            if (fs::exists(e.path().string() + ".disabled", dec)) {
-                std::cout << "[rwinst] sub-mesh disabled, skipping: "
-                          << e.path().filename().string() << std::endl;
-                continue;
-            }
-        }
-        int ord = -1;
-        if (std::sscanf(e.path().filename().string().c_str(), "%d_", &ord)
-                == 1 && ord >= 0)
-            ordinal_geo.emplace_back(ord, e.path().string());
-    }
+    // ── Baked objects: mesh_ordinal → geometry file ───────────────────
+    // ONE MESH PER ORDINAL still, even where two ordinals name the same
+    // file: bakeInstanceTransforms mirrors a node's instance range onto
+    // its MESH index, so two nodes sharing a mesh would collide and only
+    // the first range would draw.  Dedup saves disk, not mesh entries —
+    // the file is simply read twice.
+    const auto ordinal_geo = readOrdinalGeo(group_dir, "[rwinst]");
     if (ordinal_geo.empty()) {
         std::cout << "[rwinst] no baked objects for '" << ref_name << "'"
                   << std::endl;
         return nullptr;
     }
-    std::sort(ordinal_geo.begin(), ordinal_geo.end());
 
     auto drawable_object = std::make_shared<ego::DrawableData>(device);
     drawable_object->m_use_local_matrix_only_ = false;
@@ -9460,13 +9792,41 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         if (hier[i].mesh_ordinal >= 0)
             ordinal_node.emplace(hier[i].mesh_ordinal, (int)i);
     std::unordered_map<int, int> ordinal_mesh;
+    // ── ONE MESH PER DISTINCT GEOMETRY ────────────────────────────────
+    // Keyed on "<file>|<level>": that pair IS the geometry, and
+    // objects.rwmap resolves every ordinal to one.  Ordinals that share
+    // it share the mesh, its buffers and its materials -- so a species
+    // is uploaded once however many tiles draw it.  On a full world's
+    // tree group that is 803 uploads instead of 817 486.
+    //
+    // Safe only because the draw command now belongs to the NODE: while
+    // it lived on the primitive, a shared mesh could carry just one
+    // node's instance range and every other node drawing it was lost.
+    std::unordered_map<std::string, int> geo_mesh;
 
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
 
-    for (const auto& [ordinal, geo_path] : ordinal_geo) {
+    for (const auto& oref : ordinal_geo) {
+        const int ordinal = oref.ordinal;
+        const std::string& geo_path = oref.path;
+        const int geo_level = oref.level;
+        (void)geo_level;
         const auto own_it = ordinal_node.find(ordinal);
         const int owner_node =
             own_it != ordinal_node.end() ? own_it->second : -1;
+
+        const std::string geo_key =
+            geo_path + "|" + std::to_string(geo_level);
+        {
+            const auto git = geo_mesh.find(geo_key);
+            if (git != geo_mesh.end()) {
+                ordinal_mesh.emplace(ordinal, git->second);
+                if (owner_node >= 0)
+                    drawable_object->nodes_[owner_node].mesh_idx_ =
+                        git->second;
+                continue;                  // geometry already resident
+            }
+        }
 
         helper::ModelPreviewData md;
         std::vector<std::string> tex_paths;
@@ -9571,11 +9931,48 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                                   .lexically_normal().generic_string();
             for (auto& c : key) c = (char)std::tolower((unsigned char)c);
             auto cit = tex_gpu_cache.find(key);
-            if (cit != tex_gpu_cache.end()) { dst = cit->second; continue; }
+            if (cit != tex_gpu_cache.end()) {
+                dst = cit->second;
+                // The FIRST textures_ entry for this .rwtex owns the
+                // GPU handles; later copies borrow them so
+                // DrawableData::destroy frees each image exactly once.
+                dst.borrowed_ = true;
+                continue;
+            }
             helper::RwTexBaked tb;
             if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
                 tb.w <= 0 || tb.h <= 0)
                 continue;
+            // ── Content dedup ───────────────────────────────────────
+            // PCG bakes write one .rwtex per SOURCE SLOT, so a tree
+            // group carries thousands of byte-identical files (a
+            // measured sample: 800 files → 31 unique payloads).  Key
+            // the GPU cache by payload hash as well as by path: the
+            // first file with a given payload owns the GPU handles,
+            // every later one — same path or not — borrows them.
+            uint64_t ch = 1469598103934665603ull;   // FNV-1a 64
+            auto fnv = [&ch](const void* p, size_t n) {
+                const unsigned char* b = (const unsigned char*)p;
+                for (size_t i = 0; i < n; ++i) {
+                    ch ^= b[i];
+                    ch *= 1099511628211ull;
+                }
+            };
+            const int32_t dims[4] = {tb.w, tb.h, tb.preview_w,
+                                     tb.preview_h};
+            fnv(dims, sizeof(dims));
+            fnv(tb.preview_rgba.data(), tb.preview_rgba.size());
+            fnv(tb.alpha.data(), tb.alpha.size());
+            if (tb.bc7_tiles)
+                fnv(tb.bc7_tiles->data(), tb.bc7_tiles->size());
+            const std::string ckey = "c:" + std::to_string(ch);
+            auto chit = tex_gpu_cache.find(ckey);
+            if (chit != tex_gpu_cache.end()) {
+                dst = chit->second;
+                dst.borrowed_ = true;
+                tex_gpu_cache.emplace(key, dst);  // path alias
+                continue;
+            }
             dst.size = glm::uvec3((uint32_t)tb.w, (uint32_t)tb.h, 1u);
             dst.linear = false;
             dst.source_filename_ = tex_paths[ti];
@@ -9584,7 +9981,58 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 tb.preview_h == tb.h && !tb.preview_rgba.empty())
                 dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
                     tb.preview_rgba.begin(), tb.preview_rgba.end());
+            // ── Forward-path preview image ──────────────────────────
+            // These textures are VT-only (full detail streams through
+            // the cluster pipeline's Runtime Virtual Texture), so no
+            // full-res GPU image exists here.  The material block below
+            // sets FEATURE_HAS_BASE_COLOR_MAP (needed so foliage-card
+            // alpha masks work), which makes the forward shader SAMPLE
+            // the albedo binding — and with a null view the descriptor
+            // writer bound the global BLACK fallback: placed objects on
+            // the forward path (pre-cluster-merge window, transform
+            // edits, and skinned characters always) rendered pure
+            // black.  Upload the baked ≤256 px preview as a real image
+            // so the forward path shows low-res albedo/normal/MR
+            // instead.  Cost: one small RGBA8 image per UNIQUE .rwtex
+            // (path-cached above).
+            if (!tb.preview_rgba.empty() && tb.preview_w > 0 &&
+                tb.preview_h > 0 &&
+                tb.preview_rgba.size() >=
+                    size_t(tb.preview_w) * size_t(tb.preview_h) * 4u) {
+                // VRAM: cap the stopgap image at 128² (box filter) —
+                // ~4 000 unique .rwtex at 256² was ~1 GB.
+                std::vector<unsigned char> ds_pixels;
+                int ds_w = 0, ds_h = 0;
+                const bool scaled = downscalePreviewPixels(
+                    tb.preview_rgba, tb.preview_w, tb.preview_h,
+                    128, ds_pixels, ds_w, ds_h);
+                // Full mip chain (blit-generated): without it the
+                // 16x anisotropic sampler minifies mip 0 only and
+                // distant foliage shimmers/aliases.  The shared
+                // texture_sampler_ already has maxLod=1024.
+                uint32_t preview_mips = 1;
+                renderer::Helper::create2DTextureImageWithMips(
+                    device,
+                    renderer::Format::R8G8B8A8_UNORM,
+                    scaled ? ds_w : tb.preview_w,
+                    scaled ? ds_h : tb.preview_h,
+                    scaled ? ds_pixels.data() : tb.preview_rgba.data(),
+                    dst.image,
+                    dst.memory,
+                    preview_mips,
+                    std::source_location::current());
+                dst.view = device->createImageView(
+                    dst.image,
+                    renderer::ImageViewType::VIEW_2D,
+                    renderer::Format::R8G8B8A8_UNORM,
+                    SET_FLAG_BIT(ImageAspect, COLOR_BIT),
+                    std::source_location::current(),
+                    /*base_mip=*/0,
+                    /*mip_count=*/preview_mips);
+                dst.mip_levels = preview_mips;
+            }
             tex_gpu_cache.emplace(key, dst);
+            tex_gpu_cache.emplace(ckey, dst);
         }
 
         // Materials (one per section).
@@ -9627,6 +10075,31 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             ubo.occlusion_strength = 1.0f;
             ubo.tonemap_type = TONEMAP_DEFAULT;
             ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+            // ── TELL THE SHADER ITS MAPS EXIST ───────────────────────────
+            // Binding a texture at the descriptor level is not enough:
+            // getBaseColor only samples albedo_tex when
+            // FEATURE_HAS_BASE_COLOR_MAP is set, and without it baseColor is
+            // the FACTOR alone -- opaque, untextured.  For a foliage card
+            // that is fatal twice over: the leaves lose their picture, and
+            // their alpha comes back 1.0 so the mask below can never cut
+            // anything out and every leaf renders as a solid quad.  The
+            // glTF loader has always set these; the native loaders did not.
+            ubo.material_features |=
+                (mat.base_color_idx_ >= 0 ? FEATURE_HAS_BASE_COLOR_MAP : 0u) |
+                (mat.normal_idx_ >= 0 ? FEATURE_HAS_NORMAL_MAP : 0u) |
+                (mat.metallic_roughness_idx_ >= 0
+                     ? (FEATURE_HAS_METALLIC_ROUGHNESS_MAP |
+                        FEATURE_HAS_METALLIC_CHANNEL)
+                     : 0u);
+            // World-space texturing, asked for by the asset (see kSecTriplanar).
+            // A rock has no seam-free uv set, so its maps are sampled by
+            // position; triplanar_tile_m carries the metres-per-repeat the
+            // generator authored.
+            if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
+                sec.triplanar_tile_m > 0.0f) {
+                ubo.material_features |= FEATURE_MATERIAL_TRIPLANAR;
+                ubo.triplanar_tile_m = sec.triplanar_tile_m;
+            }
             ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
@@ -9647,10 +10120,44 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         const bool baked_lods =
             !md.lod_ranges.empty() &&
             md.lod_ranges[0].size() == num_sections;
-        mesh.primitives_.resize(num_sections);
-        for (size_t si = 0; si < num_sections; ++si) {
-            const auto& sec = md.sections[si];
-            auto& prim = mesh.primitives_[si];
+        // ── THIS NODE'S LEVEL ──────────────────────────────────────────
+        // A plant keeps its authored distance LODs as LEVELS of one
+        // file, and objects.rwmap says which level this node is.  Level
+        // 0 is the section table; level n is lod_ranges[n-1].  The union
+        // section table means a level uses only some sections — the near
+        // mesh's bark and leaf, or the far card's impostor atlas — and
+        // leaves the rest at zero length, so a zero-length section here
+        // means THIS LEVEL DOES NOT DRAW IT, not "reuse the last range".
+        const auto level_range = [&](size_t si) -> glm::uvec2 {
+            if (geo_level <= 0 || !baked_lods)
+                return glm::uvec2(md.sections[si].first_index,
+                                  md.sections[si].index_count);
+            const size_t l = (size_t)geo_level - 1;
+            if (l >= md.lod_ranges.size())
+                return glm::uvec2(md.sections[si].first_index,
+                                  md.sections[si].index_count);
+            return md.lod_ranges[l][si];
+        };
+        // Sections this level actually draws, in section order.  A level
+        // that uses none of them would make an empty mesh, so fall back
+        // to the section table rather than load nothing.
+        std::vector<size_t> active;
+        for (size_t si = 0; si < num_sections; ++si)
+            if (level_range(si).y >= 3) active.push_back(si);
+        const bool use_level = !active.empty();
+        if (!use_level)
+            for (size_t si = 0; si < num_sections; ++si)
+                if (md.sections[si].index_count >= 3) active.push_back(si);
+        mesh.primitives_.resize(active.size());
+        for (size_t ai = 0; ai < active.size(); ++ai) {
+            const size_t si = active[ai];
+            auto sec = md.sections[si];         // copy: retargeted below
+            if (use_level) {
+                const glm::uvec2 lr = level_range(si);
+                sec.first_index = lr.x;
+                sec.index_count = lr.y;
+            }
+            auto& prim = mesh.primitives_[ai];
             prim.tag_.restart_enable = false;
             prim.material_idx_ = (int32_t)(mat_base + si);
             prim.tag_.topology =
@@ -9722,6 +10229,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         }
 
         ordinal_mesh.emplace(ordinal, mesh_index);
+        geo_mesh.emplace(geo_key, mesh_index);
         if (owner_node >= 0)
             drawable_object->nodes_[owner_node].mesh_idx_ = mesh_index;
     }
@@ -9871,27 +10379,27 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                     drawable_object, node.name_, node.inst_offset_, t,
                     count);
             }
-            if (node.mesh_idx_ >= 0) {
-                auto it = drawable_object->mesh_instance_range_.find(
-                    node.mesh_idx_);
-                if (it == drawable_object->mesh_instance_range_.end()) {
-                    drawable_object->mesh_instance_range_[node.mesh_idx_] =
-                        { node.inst_offset_, node.inst_count_ };
-                }
-            }
+            // No mirror onto the mesh.  The range is the NODE's and the
+            // command block is the node's too, so nothing downstream has
+            // to look it up by mesh -- which is what used to make a
+            // shared mesh ambiguous and force one mesh per node.
         }
         drawable_object->has_baked_instances_ =
             drawable_object->baked_instances_.size() > 1;
         if (drawable_object->has_baked_instances_) {
+            size_t inst_nodes = 0;
+            for (const auto& n : drawable_object->nodes_)
+                if (n.mesh_idx_ >= 0 && n.inst_count_ > 0) ++inst_nodes;
             std::cout << "[rwinst] " << canon_name << ": "
-                      << drawable_object->mesh_instance_range_.size()
-                      << " instanced mesh(es), " << total
+                      << inst_nodes << " instanced node(s) over "
+                      << drawable_object->meshes_.size()
+                      << " mesh(es), " << total
                       << " instances from native tables, " << shared_n
                       << " node(s) sharing ranges" << std::endl;
         }
     }
 
-    // Bands and gates off the node names — same pass as every loader.
+    // LODs and gates off the node names — same pass as every loader.
     parsePlantLodBands(drawable_object, canon_name);
 
     // Scene bbox + world transforms.
@@ -9906,32 +10414,68 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                             /*use_local_matrix_only=*/false);
     setupRaytracing(drawable_object);
 
-    // Indirect draw buffer (same as the other native loaders).
+    // ── ONE COMMAND BLOCK PER NODE ────────────────────────────────
+    // Not per primitive.  first_instance/instance_count describe the
+    // NODE's slice of the baked transform table, so a command that
+    // lives on the primitive can only ever express one node's slice --
+    // which is what forced one mesh per instanced node and, with it,
+    // one GPU copy of the same geometry per node.  With the command on
+    // the node, a mesh is geometry and nothing else, and any number of
+    // nodes may draw it with their own ranges.
+    //
+    // Commands for a node are contiguous, one per primitive of its
+    // mesh, in primitive order -- drawMesh indexes them by the
+    // primitive's position in the mesh.
     uint32_t num_prims = 0;
-    for (auto& mesh : drawable_object->meshes_)
-        for (auto& prim : mesh.primitives_) {
-            prim.indirect_draw_cmd_ofs_ =
-                num_prims * sizeof(renderer::DrawIndexedIndirectCommand) +
-                INDIRECT_DRAW_BUF_OFS;
-            num_prims++;
+    for (auto& node : drawable_object->nodes_) {
+        if (node.mesh_idx_ < 0 ||
+            node.mesh_idx_ >= (int32_t)drawable_object->meshes_.size()) {
+            node.indirect_cmd_ofs_ = -1;
+            continue;
         }
+        node.indirect_cmd_ofs_ =
+            (int32_t)(num_prims * sizeof(renderer::DrawIndexedIndirectCommand)
+                      + INDIRECT_DRAW_BUF_OFS);
+        num_prims += (uint32_t)
+            drawable_object->meshes_[node.mesh_idx_].primitives_.size();
+    }
+    // The per-primitive offsets stay valid for anything that still
+    // reads them (they are never used to draw this drawable now).
+    {
+        uint32_t p_ofs = 0;
+        for (auto& mesh : drawable_object->meshes_)
+            for (auto& prim : mesh.primitives_) {
+                prim.indirect_draw_cmd_ofs_ =
+                    p_ofs * sizeof(renderer::DrawIndexedIndirectCommand) +
+                    INDIRECT_DRAW_BUF_OFS;
+                p_ofs++;
+            }
+    }
     std::vector<uint32_t> idc(
         sizeof(renderer::DrawIndexedIndirectCommand) / sizeof(uint32_t) *
-            num_prims + 1);
+            std::max(num_prims, 1u) + 1);
     auto* cmds = reinterpret_cast<renderer::DrawIndexedIndirectCommand*>(
         idc.data() + 1);
     idc[0] = 0;
     uint32_t pi = 0;
-    for (const auto& mesh : drawable_object->meshes_)
+    for (const auto& node : drawable_object->nodes_) {
+        if (node.indirect_cmd_ofs_ < 0) continue;
+        const auto& mesh = drawable_object->meshes_[node.mesh_idx_];
+        // A node with no instance slice draws once at the reserved
+        // identity slot 0, exactly as a plain node always did.
+        const uint32_t first_inst = node.inst_count_ ? node.inst_offset_ : 0u;
+        const uint32_t inst_count = node.inst_count_ ? node.inst_count_ : 1u;
         for (const auto& prim : mesh.primitives_) {
             cmds[pi].first_index = 0;
-            cmds[pi].first_instance = 0;
+            cmds[pi].first_instance = first_inst;
             cmds[pi].index_count =
                 (uint32_t)prim.index_desc_[0].index_count;
-            cmds[pi].instance_count = 0;
+            cmds[pi].instance_count =
+                drawable_object->has_baked_instances_ ? inst_count : 0u;
             cmds[pi].vertex_offset = 0;
             pi++;
         }
+    }
     renderer::Helper::createBuffer(
         device,
         SET_2_FLAG_BITS(BufferUsage, INDIRECT_BUFFER_BIT,

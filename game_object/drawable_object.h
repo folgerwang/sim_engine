@@ -342,6 +342,21 @@ struct NodeInfo {
     // instanced" and the drawable's single identity slot 0 is used.
     uint32_t                    inst_offset_ = 0;
     uint32_t                    inst_count_ = 0;
+    // ── THIS NODE'S INDIRECT COMMANDS ────────────────────────────────
+    // Byte offset of the first of this node's draw commands, one per
+    // primitive of its mesh, contiguous.  -1 = this drawable still uses
+    // the per-primitive commands in PrimitiveInfo.
+    //
+    // A command has to belong to the NODE, not the primitive, or two
+    // nodes cannot share a mesh: first_instance/instance_count are a
+    // property of the node's slice of the baked transform table, and a
+    // command living on the primitive can only hold one node's slice.
+    // That is what forced one mesh per instanced node, and therefore one
+    // GPU upload of the same geometry per node -- 817 486 tree nodes
+    // over 803 distinct meshes on a full world.  With the command here,
+    // the mesh is just geometry and every node that draws it supplies
+    // its own instance range.
+    int32_t                     indirect_cmd_ofs_ = -1;
 
     // ── Plant LOD band (parsed once at load from name_) ───────────────
     // terrain_pcg.py names every tree node
@@ -561,12 +576,13 @@ struct DrawableData {
     // (some nodes instanced, some not) still renders its plain nodes at
     // first_instance=0, count=1 — i.e. exactly as before.
     std::vector<BakedInstanceXform> baked_instances_;
-    // mesh index -> (first_instance, instance_count) for the indirect
-    // draw fill, which walks meshes/primitives rather than nodes.  Empty
-    // when nothing is instanced.  A mesh referenced by two instanced
-    // nodes would be ambiguous here; the writer emits one mesh per
-    // instanced node, and bakeInstanceTransforms warns if that is ever
-    // violated rather than silently picking one.
+    // mesh index -> (first_instance, instance_count), first writer wins.
+    // Empty when nothing is instanced.  REPORTING ONLY: the indirect
+    // draw fill used to walk meshes and read this, which made a mesh
+    // shared by two instanced nodes ambiguous and forced the writer to
+    // emit one mesh entry per instanced node.  An instanced drawable now
+    // gets one command block per NODE (NodeInfo::indirect_cmd_ofs_), so
+    // sharing is expected and this map only feeds the load summary.
     std::unordered_map<int32_t, std::pair<uint32_t, uint32_t>>
                                 mesh_instance_range_;
     bool                        has_baked_instances_ = false;
@@ -687,6 +703,13 @@ class DrawableObject {
     };
     std::shared_ptr<DrawableData>   object_;
     glm::mat4                   location_;
+
+    // Set (main thread, phase 3) when this wrapper's async load FAILED
+    // permanently — phase 2 produced no DrawableData (unreadable /
+    // corrupt source file).  object_ stays null so isReady() is false
+    // forever; loadFailed() lets waiters distinguish "still streaming"
+    // from "never coming".  See DrawableObject::createAsync.
+    std::atomic<bool>           load_failed_{false};
 
     // See setUseNodeTransformOnly() in the public section for what this
     // flag does and why the player controller has to set it.
@@ -921,6 +944,15 @@ public:
     // with the ready_ flag.
     bool isReady() const {
         return object_ && object_->ready_.load(std::memory_order_acquire);
+    }
+
+    // True when the async load for this wrapper failed permanently
+    // (isReady() will never become true).  Systems that wait for
+    // "every placed object ready" — e.g. the placed→cluster merge in
+    // syncPlacedObjectsToClusters — must treat a failed wrapper as
+    // skippable instead of stalling forever behind it.
+    bool loadFailed() const {
+        return load_failed_.load(std::memory_order_acquire);
     }
 
     // RT-shadow skeleton forwarders (see DrawableData) — only valid when

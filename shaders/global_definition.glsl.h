@@ -213,6 +213,24 @@
 #define FEATURE_HAS_OCCLUSION_MAP               0x00100000
 #define FEATURE_HAS_METALLIC_CHANNEL            0x00200000
 
+// TRIPLANAR (world-space) TEXTURING.  Sample the material's maps three
+// times by WORLD POSITION -- along X, Y and Z -- and blend by the square
+// of the surface normal, instead of using the mesh's uv set.
+//
+// This exists because a rock has no seam-free uv set and cannot have
+// one.  Any single chart on a closed surface must carry either a
+// singularity (the cylindrical mapping this replaced put one at the
+// summit, where the texture fanned out in a star) or cuts between
+// charts, where the texture jumps.  That is topology, not a bug in the
+// unwrap, and no unwrapper gets around it.  Triplanar sidesteps the
+// question by not having a uv set at all: the texture is a function of
+// world position, so it is continuous everywhere on any shape.
+//
+// Costs two extra samples per map on the pixels that opt in, and gives
+// up per-mesh uv control -- which is exactly what a tiling noise wants
+// and exactly what a hand-authored asset does not, hence per material.
+#define FEATURE_MATERIAL_TRIPLANAR              0x00400000
+
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
 #define FEATURE_INPUT_SHADOW_DISABLED           0x00000002
 // Debug-only: when set, cluster_bindless.frag discards every fragment
@@ -1279,7 +1297,10 @@ struct PbrMaterialParams {
     uvec4           uv_set_flags;
 
     uint            material_features;
-    uint            pad_2;
+    // Metres of world space per texture repeat when
+    // FEATURE_MATERIAL_TRIPLANAR is set; ignored otherwise.  Reuses the
+    // pad word, so the struct layout is byte-for-byte what it was.
+    float           triplanar_tile_m;
     float           normal_scale;
     float           occlusion_strength;
 

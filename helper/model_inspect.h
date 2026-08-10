@@ -46,7 +46,14 @@ struct PreviewSection {
     int       tex_index   = -1;  // albedo, into ModelPreviewData::textures
     int       nrm_index   = -1;  // normal map (-1 = none)
     int       mr_index    = -1;  // metallic-roughness map (glTF G=rough B=metal)
+    // v7 material flags.  Bit 0 = sample this section's maps TRIPLANAR
+    // (by world position, blended by the normal) instead of by uv --
+    // the only seam-free option on a closed surface like a rock.
+    uint32_t  flags       = 0;
+    float     triplanar_tile_m = 0.0f;   // metres per repeat when bit 0
 };
+// PreviewSection::flags bits, and the same values GeoSectionOut writes.
+static const uint32_t kSecTriplanar = 0x1u;
 struct ModelPreviewData {
     std::vector<glm::vec3>      positions;
     std::vector<glm::vec3>      normals;   // recomputed when absent
@@ -119,10 +126,10 @@ bool modelHasSkin(const std::string& path);
 // LOD levels included) and the INSTANCES bake to one instances.rwinst
 // beside them — transform tables plus, per node, which table triple and
 // which mesh ordinal it uses.  Tables are stored deduplicated exactly as
-// the glTF stored shared accessors (every band node of a tile points at
+// the glTF stored shared accessors (every LOD node of a tile points at
 // the same transforms), so the runtime's shared-range memo keeps working
 // and VRAM is not paid three times.  Node names ride along because the
-// engine keys behaviour off them (_lodtile_ bands, _pgate_ gates,
+// engine keys behaviour off them (_lodtile_ LODs, _pgate_ gates,
 // world-manifest binding, the physical-prop registry).
 struct RwInstArray {
     int                comp = 3;    // floats per element: 3 (T/S) or 4 (R)
@@ -244,6 +251,27 @@ bool bakeModelToRenderReady(
 bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
                std::vector<std::string>* out_texture_paths = nullptr,
                bool decode_textures = true);
+
+// objects/objects.rwmap — MESH ORDINAL → baked geometry file AND LEVEL.
+//
+// The bake writes one .rwgeo per OBJECT: nodes sharing a mesh share a
+// file, and an object authored at several distance LODs keeps them as
+// LEVELS of one file (level 0 is the section table, 1.. are the
+// lod_ranges).  So the ordinal names a file and a level, and neither
+// can be read off the "%d_" filename prefix any more.  Every consumer
+// that walks a baked group by ordinal goes through here.
+struct RwObjRef {
+    int         ordinal = 0;
+    std::string path;        // absolute
+    int         level = 0;   // 0 = section table, n = lod_ranges[n-1]
+};
+
+// Returns false when the group has no map: that is content baked before
+// any of this, where the prefix IS the ordinal, and the caller keeps its
+// own directory-scan fallback.  Entries whose file is missing are
+// dropped, so a true return still needs an empty() check.
+bool loadRwObjMap(const std::string& group_dir,
+                  std::vector<RwObjRef>& out);
 
 // Raw .rwtex read (RGBA8).  For format-0 (legacy RGBA8) files this is
 // the full-resolution image; for format-1 (BC7 VT tile cache) files it

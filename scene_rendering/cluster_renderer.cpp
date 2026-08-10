@@ -1035,7 +1035,19 @@ int ClusterRenderer::preRegisterVtMaterials(
         if (vid != kInvalidVtId && nrm_img) {
             vt_normal_id_cache_[nrm_img.get()] = vid;
         }
-        ++registered;
+        // Cost model for the caller's per-frame budget: a bake-time
+        // BC7 blob registration is a memcpy + one pinned-page upload
+        // (cheap — several per frame are fine), while a runtime CPU
+        // BC7 encode of a full texture can take tens of ms (keep the
+        // old one-heavy-encode-per-frame pacing for those).  A PCG
+        // world's tree group alone has thousands of blob-backed
+        // textures; at a flat 1/frame the cluster merge sat behind
+        // minutes of warm-up.
+        if (has_blob) {
+            ++registered;
+        } else {
+            registered = max_new;   // heavy encode — consume the budget
+        }
     }
     return registered;
 }

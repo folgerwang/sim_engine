@@ -1,6 +1,7 @@
 #include "model_inspect.h"
 #include "helper/mesh_tool.h"   // decimateMesh — bakes .rwgeo LOD levels
 
+#include <algorithm>      // std::sort — geometry-key attribute ordering
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -1210,7 +1211,13 @@ bool loadRwInst(const std::string& path,
     auto r32 = [&f]() { uint32_t v = 0; f.read((char*)&v, 4); return v; };
     auto ri32 = [&f]() { int32_t v = 0; f.read((char*)&v, 4); return v; };
     const uint32_t na = r32();
-    if (!f || na > 1u << 20) return false;
+    // Sanity cap only — a full PCG object group legitimately bakes one
+    // small TRS array per node and was observed at 2.4 M arrays, which
+    // the previous 1 M cap rejected as "unreadable" (permanently
+    // blocking the placed→cluster merge).  Real corruption is still
+    // caught by the per-array comp/count checks and stream-state
+    // checks below.
+    if (!f || na > 1u << 26) return false;
     arrays.resize(na);
     for (auto& a : arrays) {
         a.comp = (int)r32();
@@ -1223,7 +1230,7 @@ bool loadRwInst(const std::string& path,
         if (!f) return false;
     }
     const uint32_t nn = r32();
-    if (!f || nn > 1u << 22) return false;
+    if (!f || nn > 1u << 24) return false;
     nodes.resize(nn);
     for (auto& n : nodes) {
         const uint32_t len = r32();
@@ -1400,6 +1407,11 @@ constexpr char kRwGeoMagic5[8] = {'R','W','G','E','O','0','0','5'};
 // APPENDED to the main blobs (the FBX loader's HLOD layout), so the
 // header vc/ic counts cover them and older data blocks stay in place.
 constexpr char kRwGeoMagic6[8] = {'R','W','G','E','O','0','0','6'};
+// v7 adds a per-section FLAGS word and a triplanar tile size.  A rock is
+// textured by world position rather than by its uv set (see
+// FEATURE_MATERIAL_TRIPLANAR), and that decision belongs to the material,
+// so it has to survive the bake.  Everything else is v6.
+constexpr char kRwGeoMagic7[8] = {'R','W','G','E','O','0','0','7'};
 constexpr char kRwHierMagic[8] = {'R','W','H','I','E','R','0','1'};
 constexpr char kRwAnimMagic[8] = {'R','W','A','N','I','M','0','1'};
 
@@ -1649,6 +1661,8 @@ namespace {
 struct GeoSectionOut {
     uint32_t    first_index = 0;
     uint32_t    index_count = 0;
+    uint32_t    flags       = 0;    // kSecTriplanar
+    float       triplanar_tile_m = 0.0f;
     glm::vec4   base_color  = glm::vec4(1.0f);
     float       metallic    = 0.0f;
     float       roughness   = 0.6f;
@@ -1784,9 +1798,30 @@ void dedupSoupVertices(std::vector<glm::vec3>& positions,
     if (has_close1) *closeness1 = std::move(dcls1);
 }
 
+// ── AUTHORED LOD LEVELS ────────────────────────────────────────────────
+//
+// Normally writeRwGeo MAKES the v6 levels by decimating.  That works for
+// a solid mesh and not at all for the plant library, whose levels are
+// authored: the far level is a two-quad card with its own baked
+// impostor atlas, which no simplifier will ever reach from a tree.
+//
+// So a caller may hand the levels over instead.  `authored` holds one
+// entry per EXTRA level (level 0 is the section table itself, exactly as
+// the format already defines it), each an index range per section.  A
+// level that does not use a section passes (0, 0) — that is how one file
+// carries a bark/leaf near mesh and an atlas-textured card in the same
+// section table, which is what lets every LOD of a plant live in ONE
+// .rwgeo instead of one file per LOD.  Zero-length ranges are already
+// part of the format: writeRwGeo emits them for sections a decimated
+// level dropped entirely.
+//
+// Decimation is skipped when levels are supplied — the caller's levels
+// ARE the chain, and re-decimating them would append a second, unrelated
+// one.
 bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
                 const std::vector<GeoSectionOut>& sections,
-                const glm::mat4& node_to_world) {
+                const glm::mat4& node_to_world,
+                const std::vector<std::vector<glm::uvec2>>* authored) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
     bool any_tex = false;
@@ -1845,7 +1880,21 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     // per-section index ranges.  Skinned meshes skip this (decimation
     // would have to carry joints/weights).
     std::vector<std::vector<glm::uvec2>> lod_ranges;
-    if (!has_skin && !indices.empty() && !sections.empty()) {
+    if (authored != nullptr) {
+        // Caller-supplied chain: validated, not generated.  A range that
+        // runs past the index blob would make the loader read another
+        // level's triangles, so drop the whole chain rather than write a
+        // file that decodes into the wrong mesh.
+        bool ok = !authored->empty();
+        for (const auto& lvl2 : *authored) {
+            if (lvl2.size() != sections.size()) { ok = false; break; }
+            for (const auto& r : lvl2) {
+                if ((size_t)r.x + r.y > indices.size()) { ok = false; break; }
+            }
+            if (!ok) break;
+        }
+        if (ok) lod_ranges = *authored;
+    } else if (!has_skin && !indices.empty() && !sections.empty()) {
         // level 0 = the section table itself
         std::vector<std::vector<glm::uvec2>> lvl(1);
         lvl[0].reserve(sections.size());
@@ -1938,7 +1987,7 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
     const bool has_lods = !lod_ranges.empty();
 
     // v6: v5 + baked LODs (flags bit5); older files remain readable.
-    f.write(kRwGeoMagic6, 8);
+    f.write(kRwGeoMagic7, 8);
     wrPod(f, (uint32_t)positions.size());
     wrPod(f, (uint32_t)indices.size());
     // bit3 (8u) = second skin set blobs (8-bone debug), bit4 (16u) =
@@ -1967,6 +2016,9 @@ bool writeRwGeo(const std::string& path, const ModelPreviewData& d,
         f.write(s.nrm_rel.data(), (std::streamsize)s.nrm_rel.size());
         wrPod(f, (uint32_t)s.mr_rel.size());
         f.write(s.mr_rel.data(), (std::streamsize)s.mr_rel.size());
+        // v7: material flags + the triplanar tile size they imply.
+        wrPod(f, s.flags);
+        wrPod(f, s.triplanar_tile_m);
     }
     // LOD table (v6): per decimated level, per section, its index range.
     if (has_lods) {
@@ -2182,6 +2234,47 @@ bool loadRwAnim(const std::string& path, std::vector<RwAnimClip>& out) {
     return true;
 }
 
+bool loadRwObjMap(const std::string& group_dir,
+                  std::vector<RwObjRef>& out) {
+    namespace fs = std::filesystem;
+    out.clear();
+    const fs::path map_path =
+        fs::path(group_dir) / "objects" / "objects.rwmap";
+    std::error_code ec;
+    if (!fs::exists(map_path, ec)) return false;
+    std::ifstream mf(map_path);
+    if (!mf) return false;
+    std::string line;
+    bool header = false;
+    while (std::getline(mf, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("rwobjmap=", 0) == 0) { header = true; continue; }
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        const int ord = std::atoi(line.substr(0, eq).c_str());
+        std::string rel = line.substr(eq + 1);
+        // "<rel>" or "<rel>|<level>" — the bar is not a legal path
+        // character here because the bake writes sanitised names.
+        int level = 0;
+        const size_t bar = rel.rfind('|');
+        if (bar != std::string::npos) {
+            level = std::atoi(rel.c_str() + bar + 1);
+            rel.resize(bar);
+        }
+        if (ord < 0 || level < 0 || rel.empty()) continue;
+        const fs::path p = fs::path(group_dir) / rel;
+        std::error_code fec;
+        if (!fs::exists(p, fec)) continue;      // dropped: caller sees a gap
+        out.push_back({ ord, p.string(), level });
+    }
+    if (!header) { out.clear(); return false; } // malformed: not our format
+    std::sort(out.begin(), out.end(),
+              [](const RwObjRef& a, const RwObjRef& b) {
+                  return a.ordinal < b.ordinal;
+              });
+    return true;
+}
+
 bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
                std::vector<std::string>* out_texture_paths,
                bool decode_textures) {
@@ -2192,7 +2285,8 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     if (!f) return false;
     char magic[8];
     if (!f.read(magic, 8)) return false;
-    const bool v6 = std::memcmp(magic, kRwGeoMagic6, 8) == 0;
+    const bool v7 = std::memcmp(magic, kRwGeoMagic7, 8) == 0;
+    const bool v6 = std::memcmp(magic, kRwGeoMagic6, 8) == 0 || v7;
     const bool v5 = std::memcmp(magic, kRwGeoMagic5, 8) == 0 || v6;
     const bool v4 = std::memcmp(magic, kRwGeoMagic4, 8) == 0 || v5;
     const bool v3 = std::memcmp(magic, kRwGeoMagic3, 8) == 0 || v4;
@@ -2219,6 +2313,8 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
     // Section table (v2) / single legacy material header (v1).
     struct SecIn {
         uint32_t first = 0, count = 0;
+        uint32_t flags = 0;
+        float    triplanar_tile_m = 0.0f;
         glm::vec4 color = glm::vec4(1.0f);
         float metallic = 0.0f, roughness = 0.6f;
         std::string tex_rel;
@@ -2246,6 +2342,10 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
                 if (!rdPod(f, mlen)) return false;
                 s.mr_rel.resize(mlen);
                 if (mlen && !f.read(s.mr_rel.data(), mlen)) return false;
+            }
+            if (v7) {
+                if (!rdPod(f, s.flags)) return false;
+                if (!rdPod(f, s.triplanar_tile_m)) return false;
             }
         }
     } else {
@@ -2407,6 +2507,8 @@ bool loadRwGeo(const std::string& rwgeo_path, ModelPreviewData& out,
         sec.tex_index   = resolve_tex(s.tex_rel);
         sec.nrm_index   = resolve_tex(s.nrm_rel);
         sec.mr_index    = resolve_tex(s.mr_rel);
+        sec.flags       = s.flags;
+        sec.triplanar_tile_m = s.triplanar_tile_m;
         out.sections.push_back(sec);
     }
     if (out.textures.empty()) out.uvs.clear();
@@ -2425,11 +2527,145 @@ bool bakeModelToRenderReady(
     fs::create_directories(fs::path(group_dir) / "objects", ec);
     fs::create_directories(fs::path(group_dir) / "textures", ec);
 
-    auto geo_rel_for = [&](size_t k, const std::string& name) {
+    // ── Clear the previous bake's geometry ──────────────────────────────
+    // A group directory is written from ONE source model, so every
+    // .rwgeo in it belongs to the bake about to run.  Leaving the old
+    // ones behind used to be harmless because the same node produced
+    // the same file name; now that the names come from the mesh and a
+    // deduped bake writes fewer files, the leftovers would sit in the
+    // folder for ever — the Content Browser lists the directory, and
+    // both native loaders read every file in it, so a stale file is not
+    // cosmetic: it loads.
+    {
+        std::error_code dec;
+        for (auto& e :
+             fs::directory_iterator(fs::path(group_dir) / "objects", dec)) {
+            const std::string fn = e.path().filename().string();
+            if (e.path().extension() == ".rwgeo" || fn == "objects.rwmap")
+                fs::remove(e.path(), dec);
+        }
+    }
+
+    // ── ONE .rwgeo PER DISTINCT GEOMETRY, NOT PER NODE ─────────────────
+    //
+    // The bake used to name every file after the NODE that produced it,
+    // which put an internal encoding in the asset browser and wrote the
+    // same mesh once per node.  The PCG plant library is the extreme
+    // case: terrain_pcg builds ONE mesh per (species, LOD) and repeats
+    // it over the tile grid, giving each tile node its own glTF mesh
+    // index but the SAME primitives — same accessors, same bytes (see
+    // the "ONE MESH ENTRY PER NODE, SHARING THE SAME ACCESSORS" note in
+    // write_glb, which does that to dodge the loader's one-instance-
+    // range-per-mesh rule).  Baked per node, 870 objects came to 237 MB
+    // of which only 130 MB was distinct, and the browser showed
+    // 000_tree_spruce_lodtile_-8_-7_512_0_80.rwgeo — a tile bucket
+    // wearing a filename.
+    //
+    // So: key the write on the GEOMETRY and let every node that shares
+    // it point at the same file.  out_objects still gets one entry per
+    // node, with its own name and world-space bounds, so the .rwobj
+    // sidecars and the placement data are unchanged; only the number of
+    // .rwgeo files on disk goes down.
+    //
+    // ── AND ONE FILE PER OBJECT, WITH ITS LODs INSIDE ──────────────────
+    //
+    // Dedup alone still left a plant as THREE files, because its levels
+    // are authored rather than decimated and each was its own node:
+    // <prefix>_lodtile_<i>_<j>_<tile>_<near>_<far>, one per distance
+    // LOD.  An object should be one file.
+    //
+    // So the LODs are merged into levels of a single .rwgeo.  The
+    // format already carries per-level index ranges; what it does not
+    // carry is a material per level, and the far level needs one (it is
+    // a two-quad card with its own impostor atlas, sharing nothing with
+    // the near mesh).  The way through is a UNION section table — bark,
+    // leaf, atlas, all three in one table — where each level fills only
+    // the sections it uses and passes (0, 0) for the rest.  That is
+    // already legal: the decimator emits zero ranges for sections a
+    // level drops.
+    //
+    // Nothing about distance selection changes.  The engine still picks
+    // per NODE, by the tile rectangle in the node name; the node just
+    // resolves to a LEVEL of a file now instead of a file, which
+    // objects.rwmap records as "<rel>|<level>".
+    //
+    // The file is named after the object with the whole tail gone —
+    // tree_araucaria.rwgeo — because neither the tile nor the LOD is a
+    // property of the object.  Names without the marker are untouched,
+    // which is every node of every ordinary imported model.
+    std::unordered_map<std::string, int> geo_names;   // name → uses
+    size_t geo_written = 0;
+
+    // Splits "<prefix>_lodtile_<i>_<j>_<tile>_<near>_<far>".  Returns
+    // false — leaving prefix as the whole name — for anything else.
+    struct LodTail { std::string prefix; long long near = 0, far = 0; };
+    auto split_lod_tail = [](const std::string& name, LodTail& out) -> bool {
+        out.prefix = name;
+        static const char kMark[] = "_lodtile_";
+        const size_t p = name.find(kMark);
+        if (p == std::string::npos) return false;
+        const char* s = name.c_str() + p + (sizeof(kMark) - 1);
+        long long v[5] = { 0, 0, 0, 0, 0 };
+        for (int i = 0; i < 5; ++i) {
+            char* end = nullptr;
+            v[i] = std::strtoll(s, &end, 10);
+            if (end == s) return false;     // malformed: not our tail
+            s = end;
+            if (i < 4) {
+                if (*s != '_') return false;
+                ++s;
+            }
+        }
+        if (*s != '\0') return false;       // trailing junk
+        if (v[2] <= 0 || v[4] <= v[3] || v[3] < 0) return false;
+        out.prefix = name.substr(0, p);
+        out.near = v[3];
+        out.far  = v[4];
+        return true;
+    };
+
+    // Allocates the next file name.  The %03u prefix counts FILES
+    // WRITTEN — nothing reads it, it only keeps the folder in bake
+    // order.  Two distinct objects that reduce to the same name get
+    // _2, _3, ... so a collision can never silently overwrite one.
+    auto geo_rel_new = [&](const std::string& base_name) {
+        const std::string base = sanitizeFileName(base_name);
+        const int use = ++geo_names[base];
+        const std::string uniq =
+            (use == 1) ? base : base + "_" + std::to_string(use);
         char pre[16];
-        std::snprintf(pre, sizeof(pre), "%03u_", (unsigned)k);
-        return std::string("objects/") + pre + sanitizeFileName(name) +
-               ".rwgeo";
+        std::snprintf(pre, sizeof(pre), "%03u_", (unsigned)geo_written++);
+        return std::string("objects/") + pre + uniq + ".rwgeo";
+    };
+
+    // ── objects.rwmap: MESH ORDINAL → FILE and LEVEL ───────────────────
+    //
+    // The prefix used to BE the mesh ordinal, and both native loaders
+    // relied on that: loadRwInstanced and the character path each scan
+    // objects/ and sscanf "%d_" off the front to match a file to
+    // hierarchy.rwhier's mesh_ordinal.  That worked only while the map
+    // was 1:1.  It is now many-to-one twice over — nodes sharing a mesh
+    // share a file, and a plant's three LOD nodes share a file at
+    // different LEVELS — so the mapping is written down explicitly:
+    //
+    //     <ordinal>=<rel>            level 0 (the section table)
+    //     <ordinal>=<rel>|<level>    level 1 and up
+    //
+    // Absent file = legacy content baked before any of this, where the
+    // prefix IS the ordinal; the loaders keep that fallback.
+    struct OrdRef { int ord; std::string rel; int level; };
+    std::vector<OrdRef> ordinal_rel;
+
+    auto write_obj_map = [&]() {
+        std::ofstream mf(fs::path(group_dir) / "objects" / "objects.rwmap",
+                         std::ios::trunc);
+        if (!mf) return;
+        mf << "rwobjmap=1\n";
+        for (const auto& r : ordinal_rel) {
+            mf << r.ord << '=' << r.rel;
+            if (r.level > 0) mf << '|' << r.level;
+            mf << '\n';
+        }
     };
 
     if (ext == ".gltf" || ext == ".glb") {
@@ -2501,6 +2737,54 @@ bool bakeModelToRenderReady(
 
         size_t total = 0;
         for (const auto& n : model.nodes) if (n.mesh >= 0) ++total;
+
+        // ── Pre-pass: which LODs does each object have? ───────────────
+        // A level index only means something relative to the whole set,
+        // so the LODs are collected before any geometry is built and
+        // sorted by near edge: 0-80 becomes level 0, 80-200 level 1,
+        // 200-2600 level 2.  An object with no LOD tail has one level.
+        std::unordered_map<std::string, std::vector<long long>> obj_lods;
+        for (int i = 0; i < (int)model.nodes.size(); ++i) {
+            if (model.nodes[i].mesh < 0) continue;
+            std::string nm = model.nodes[i].name;
+            if (nm.empty()) nm = "node " + std::to_string(i);
+            LodTail bt;
+            if (!split_lod_tail(nm, bt)) continue;
+            auto& v = obj_lods[bt.prefix];
+            if (std::find(v.begin(), v.end(), bt.near) == v.end())
+                v.push_back(bt.near);
+        }
+        for (auto& [_, v] : obj_lods) std::sort(v.begin(), v.end());
+
+        // ── One accumulator per object ────────────────────────────────
+        // Geometry for every level is concatenated into one blob; the
+        // section table is the union of the levels' materials, matched
+        // by material identity so bark shared by the near and mid mesh
+        // stays ONE section carrying two ranges.
+        struct MergedGeo {
+            ModelPreviewData d;
+            std::vector<GeoSectionOut>           usec;   // union sections
+            std::vector<std::string>             ukey;   // material identity
+            std::vector<std::vector<glm::uvec2>> lvl;    // [level][section]
+            std::vector<std::string>             lvl_key;// geometry key/level
+            std::string rel;
+            glm::mat4   node_world = glm::mat4(1.0f);
+            bool        has_world = false;
+            int         levels = 1;
+        };
+        std::unordered_map<std::string, MergedGeo> merged;
+        std::vector<std::string> merged_order;
+
+        auto mat_key = [](const GeoSectionOut& s) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "%.6g,%.6g,%.6g,%.6g|%.6g|%.6g|",
+                          (double)s.base_color.x, (double)s.base_color.y,
+                          (double)s.base_color.z, (double)s.base_color.w,
+                          (double)s.metallic, (double)s.roughness);
+            return std::string(b) + s.tex_rel + '|' + s.nrm_rel + '|' +
+                   s.mr_rel;
+        };
+
         int k = 0;
         for (int i = 0; i < (int)model.nodes.size(); ++i) {
             if (model.nodes[i].mesh < 0) continue;
@@ -2570,6 +2854,29 @@ bool bakeModelToRenderReady(
                                     s.metallic, s.roughness);
                 s.tex_rel = bake_gltf_texture(
                     gltfAlbedoTextureIndex(model, prim.material));
+                // ── Triplanar, declared by the material's NAME ────────
+                // "<name>_triplanar_<tile_dm>" -- the same name-encoding
+                // discipline the node names already use for LOD tiles
+                // and proximity gates: the asset states its own
+                // behaviour and the engine only has to read.  A rock
+                // asks for it because a closed surface has no seam-free
+                // uv set to give it.
+                if (prim.material >= 0 &&
+                    prim.material < (int)model.materials.size()) {
+                    const std::string& mn = model.materials[prim.material].name;
+                    static const char kTri[] = "_triplanar_";
+                    const size_t tp = mn.find(kTri);
+                    if (tp != std::string::npos) {
+                        char* end = nullptr;
+                        const long dm = std::strtol(
+                            mn.c_str() + tp + (sizeof(kTri) - 1), &end, 10);
+                        if (end != mn.c_str() + tp + (sizeof(kTri) - 1) &&
+                            dm > 0) {
+                            s.flags |= kSecTriplanar;
+                            s.triplanar_tile_m = (float)dm * 0.1f;
+                        }
+                    }
+                }
                 // Full PBR refs: normal + metallic-roughness maps.
                 if (prim.material >= 0 &&
                     prim.material < (int)model.materials.size()) {
@@ -2597,16 +2904,160 @@ bool bakeModelToRenderReady(
                 bmn = glm::min(bmn, wp);
                 bmx = glm::max(bmx, wp);
             }
-            const std::string geo_rel = geo_rel_for((size_t)k, name);
-            if (writeRwGeo((fs::path(group_dir) / geo_rel).string(),
-                           d, secs, node_world[i])) {
-                out_objects.push_back({ name, geo_rel, bmn, bmx });
-            } else {
-                out_objects.push_back({ name, std::string(), bmn, bmx });
+            // ── The geometry key ────────────────────────────────────────
+            // What actually lands in the file: the primitives' ACCESSORS
+            // (appendGltfPrim bakes with an identity matrix, so the
+            // vertices are node-local and depend on nothing else), the
+            // skin, and the node's world matrix — which writeRwGeo puts
+            // in the header, so two nodes sharing accessors but standing
+            // in different places must still get separate files.
+            //
+            // The glTF mesh INDEX is deliberately not in the key: the
+            // plant library gives every tile node a private mesh index
+            // over shared accessors, so keying on it would dedupe
+            // nothing at all.
+            std::string gkey = "s" + std::to_string(skin_idx) + "|";
+            {
+                char b[48];
+                const float* mw = &node_world[i][0][0];
+                for (int c = 0; c < 16; ++c) {
+                    std::snprintf(b, sizeof(b), "%.9g,", (double)mw[c]);
+                    gkey += b;
+                }
+                for (const auto& prim : mesh.primitives) {
+                    gkey += "|p" + std::to_string(prim.material) + ':' +
+                            std::to_string(prim.indices) + ':' +
+                            std::to_string(prim.mode);
+                    std::vector<std::string> at;
+                    at.reserve(prim.attributes.size());
+                    for (const auto& a : prim.attributes)
+                        at.push_back(a.first + '=' +
+                                     std::to_string(a.second));
+                    std::sort(at.begin(), at.end());   // map order is not
+                    for (const auto& a : at)           // load-bearing
+                        gkey += ',' + a;
+                }
             }
+            // ── Which object is this, and which level of it? ────────────
+            LodTail bt;
+            const bool has_lod_tail = split_lod_tail(name, bt);
+            int level = 0, n_levels = 1;
+            if (has_lod_tail) {
+                const auto bit = obj_lods.find(bt.prefix);
+                if (bit != obj_lods.end() && !bit->second.empty()) {
+                    n_levels = (int)bit->second.size();
+                    const auto lp = std::find(bit->second.begin(),
+                                              bit->second.end(), bt.near);
+                    level = (int)(lp - bit->second.begin());
+                }
+            }
+            // Unbanded objects still key on the geometry, so nodes that
+            // share a mesh share a file exactly as before.  Banded ones
+            // key on the object, which is what collapses the LODs.
+            const std::string okey = has_lod_tail ? ("B" + bt.prefix)
+                                            : ("G" + gkey);
+            MergedGeo& mg = merged[okey];
+            if (mg.rel.empty()) {
+                merged_order.push_back(okey);
+                mg.rel = geo_rel_new(has_lod_tail ? bt.prefix : name);
+                mg.levels = n_levels;
+                mg.lvl.assign((size_t)n_levels, {});
+                mg.lvl_key.assign((size_t)n_levels, std::string());
+                mg.node_world = node_world[i];
+                mg.has_world = true;
+            }
+            if (level >= (int)mg.lvl.size()) { ++k; continue; }
+
+            if (mg.lvl_key[level].empty()) {
+                // First node to supply this level: append its geometry
+                // and file its ranges into the union table.
+                if (mg.d.positions.empty()) {
+                    mg.d.uvs.clear();
+                }
+                const uint32_t vbase = (uint32_t)mg.d.positions.size();
+                mg.d.positions.insert(mg.d.positions.end(),
+                                      d.positions.begin(), d.positions.end());
+                mg.d.normals.insert(mg.d.normals.end(),
+                                    d.normals.begin(), d.normals.end());
+                // uv stream stays parallel to positions, zero-filled for
+                // a level that carries none, or the writer drops uvs for
+                // the whole file and every textured level goes grey.
+                for (size_t v = 0; v < d.positions.size(); ++v) {
+                    mg.d.uvs.push_back(v < d.uvs.size() ? d.uvs[v]
+                                                        : glm::vec2(0.0f));
+                }
+                mg.lvl[level].assign(mg.usec.size(), glm::uvec2(0));
+                for (const auto& s : secs) {
+                    const std::string mk = mat_key(s);
+                    size_t slot = 0;
+                    while (slot < mg.ukey.size() && mg.ukey[slot] != mk)
+                        ++slot;
+                    if (slot == mg.ukey.size()) {       // new material
+                        mg.ukey.push_back(mk);
+                        GeoSectionOut us = s;
+                        us.first_index = 0;
+                        us.index_count = 0;
+                        mg.usec.push_back(us);
+                        for (auto& lv : mg.lvl) lv.push_back(glm::uvec2(0));
+                    }
+                    const uint32_t first = (uint32_t)mg.d.indices.size();
+                    for (uint32_t n = 0; n < s.index_count; ++n) {
+                        const uint32_t ix = s.first_index + n;
+                        if (ix < d.indices.size())
+                            mg.d.indices.push_back(vbase + d.indices[ix]);
+                    }
+                    const uint32_t cnt =
+                        (uint32_t)mg.d.indices.size() - first;
+                    mg.lvl[level][slot] = glm::uvec2(first, cnt);
+                    if (level == 0) {
+                        mg.usec[slot].first_index = first;
+                        mg.usec[slot].index_count = cnt;
+                    }
+                }
+                mg.lvl_key[level] = gkey;
+            }
+            out_objects.push_back({ name, mg.rel, bmn, bmx });
+            ordinal_rel.push_back({ k, mg.rel, level });
             ++k;
             if (progress) progress((size_t)k, total);
         }
+
+        // ── Write one file per object ─────────────────────────────────
+        std::unordered_map<std::string, std::string> failed;
+        size_t levelled = 0;
+        for (const auto& okey : merged_order) {
+            MergedGeo& mg = merged[okey];
+            if (mg.d.positions.empty() || mg.d.indices.size() < 3 ||
+                mg.usec.empty())
+                continue;
+            // Levels 1.. are the authored chain; level 0 IS the section
+            // table, so it is not repeated here.
+            std::vector<std::vector<glm::uvec2>> authored(
+                mg.lvl.begin() + (mg.lvl.empty() ? 0 : 1), mg.lvl.end());
+            const bool multi = !authored.empty();
+            if (multi) ++levelled;
+            if (!writeRwGeo((fs::path(group_dir) / mg.rel).string(),
+                            mg.d, mg.usec, mg.node_world,
+                            multi ? &authored : nullptr)) {
+                failed.emplace(mg.rel, okey);
+            }
+        }
+        if (!failed.empty()) {
+            for (auto& r : ordinal_rel)
+                if (failed.count(r.rel)) r.rel.clear();
+            for (auto& o : out_objects)
+                if (failed.count(o.rwgeo_rel)) o.rwgeo_rel.clear();
+            ordinal_rel.erase(
+                std::remove_if(ordinal_rel.begin(), ordinal_rel.end(),
+                               [](const OrdRef& r) { return r.rel.empty(); }),
+                ordinal_rel.end());
+        }
+        write_obj_map();
+        std::cout << "[bake] " << ordinal_rel.size() << " mesh node(s) -> "
+                  << geo_written << " .rwgeo file(s)";
+        if (levelled > 0)
+            std::cout << " (" << levelled << " carrying authored LOD levels)";
+        std::cout << std::endl;
 
         // ── Hierarchy: every node (incl. transform-only), local TRS ─────
         {
@@ -2860,16 +3311,25 @@ bool bakeModelToRenderReady(
                 bmn = glm::min(bmn, wp);
                 bmx = glm::max(bmx, wp);
             }
-            const std::string geo_rel = geo_rel_for((size_t)k, name);
+            // FBX: no accessor identity to key on, so every node keeps
+            // its own file exactly as before — only the allocator is
+            // shared, and for names without the _lodtile_ tail it makes
+            // the same name the old geo_rel_for did.
+            const std::string geo_rel = geo_rel_new(name);
             if (writeRwGeo((fs::path(group_dir) / geo_rel).string(),
-                           d, secs, node_world)) {
+                           d, secs, node_world, nullptr)) {
                 out_objects.push_back({ name, geo_rel, bmn, bmx });
+                ordinal_rel.push_back({ k, geo_rel, 0 });
             } else {
                 out_objects.push_back({ name, std::string(), bmn, bmx });
             }
             ++k;
             if (progress) progress((size_t)k, total);
         }
+        // Written here too even though the FBX path does not dedup: a
+        // node whose geometry failed to write has no file, so the
+        // prefix-is-the-ordinal assumption is not safe here either.
+        write_obj_map();
 
         // ── Hierarchy: every node (incl. transform-only), local TRS ─────
         {

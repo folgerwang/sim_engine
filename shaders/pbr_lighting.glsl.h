@@ -107,6 +107,44 @@ vec2 getOcclusionUV(
 #endif
 }
 
+// ── Triplanar (world-space) sampling ───────────────────────────────────
+// See FEATURE_MATERIAL_TRIPLANAR in global_definition.glsl.h for why a
+// rock gets textured this way and a hand-authored asset does not.
+//
+// The blend weights are the normal's components, floored at a threshold
+// and renormalised, so a face pointing squarely down one axis uses that
+// projection alone and only genuinely diagonal faces pay for the blend.
+vec3 triplanarWeights(in vec3 n) {
+    vec3 w = abs(n);
+    w = max(w - 0.28, vec3(0.0));
+    return w / max(w.x + w.y + w.z, 1e-5);
+}
+
+vec4 triplanarSample(
+    in sampler2D tex, in vec3 world_pos, in vec3 n, in float tile_m) {
+    float inv = 1.0 / max(tile_m, 1e-3);
+    vec3  w   = triplanarWeights(n);
+    vec4  c   = vec4(0.0);
+    if (w.x > 0.0) c += texture(tex, world_pos.zy * inv) * w.x;
+    if (w.y > 0.0) c += texture(tex, world_pos.xz * inv) * w.y;
+    if (w.z > 0.0) c += texture(tex, world_pos.xy * inv) * w.z;
+    return c;
+}
+
+bool materialIsTriplanar(in PbrMaterialParams in_mat) {
+    return (in_mat.material_features & FEATURE_MATERIAL_TRIPLANAR) != 0;
+}
+
+// The normal used to drive the blend.  Geometric, never the mapped one:
+// the weights must not depend on the map they are being used to fetch.
+vec3 triplanarNormal(in ObjectVsPsData in_data) {
+#ifdef HAS_NORMALS
+    return normalize(in_data.vertex_normal);
+#else
+    return vec3(0.0, 1.0, 0.0);
+#endif
+}
+
 // Get normal, tangent and bitangent vectors.
 NormalInfo getNormalInfo(
     in ObjectVsPsData in_data,
@@ -123,7 +161,13 @@ NormalInfo getNormalInfo(
 
     vec3 n, t, b, ng;
 
-    bool has_normal_map = (in_mat.material_features & FEATURE_HAS_NORMAL_MAP) != 0;
+    // A tangent-space normal map is defined RELATIVE TO THE UV SET, and
+    // the TBN above is built from uv derivatives.  A triplanar material
+    // has no uv set worth differentiating, so the map is skipped and the
+    // geometric normal stands — which is what removes the lighting seam
+    // as well as the albedo one.  Rock relief lives in the mesh here.
+    bool has_normal_map = (in_mat.material_features & FEATURE_HAS_NORMAL_MAP) != 0
+                          && !materialIsTriplanar(in_mat);
 
     // Compute geometrical TBN:
 #ifdef HAS_NORMALS
@@ -205,7 +249,13 @@ vec4 getBaseColor(
     if (enable_metallic_roughness) {
         baseColor = in_mat.base_color_factor;
         if (has_base_color_map) {
-            baseColor *= sRGBToLinear(texture(albedo_tex, getBaseColorUV(in_data, in_mat)));
+            if (materialIsTriplanar(in_mat)) {
+                baseColor *= sRGBToLinear(triplanarSample(
+                    albedo_tex, in_data.vertex_position,
+                    triplanarNormal(in_data), in_mat.triplanar_tile_m));
+            } else {
+                baseColor *= sRGBToLinear(texture(albedo_tex, getBaseColorUV(in_data, in_mat)));
+            }
         }
     }
 #endif
@@ -261,7 +311,10 @@ void getMetallicRoughnessInfo(
     if (has_metallic_roughness_map) {
         // Roughness is stored in the 'g' channel, metallic is stored in the 'b' channel.
         // This layout intentionally reserves the 'r' channel for (optional) occlusion map data
-        vec4 mrSample = texture(metallic_roughness_tex, getMetallicRoughnessUV(in_data, in_mat));
+        vec4 mrSample = materialIsTriplanar(in_mat)
+            ? triplanarSample(metallic_roughness_tex, in_data.vertex_position,
+                              triplanarNormal(in_data), in_mat.triplanar_tile_m)
+            : texture(metallic_roughness_tex, getMetallicRoughnessUV(in_data, in_mat));
         info.perceptualRoughness = mrSample.g;
         if (has_metallic_channel) {
             info.metallic = mrSample.b;
