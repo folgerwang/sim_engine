@@ -441,10 +441,12 @@
 #define kWorldMapSize                           32768.0f                  // meters (32 km; matches tools/terrain WORLD_SIZE_M)
 #define kCloudMapSize                           65536.0f
 
-// Terrain detail streaming: the world is split into 16x16 detail tiles of
-// 2048 m; each is generated on demand at 2048^2 (1 m/texel) by
-// tools/terrain/terrain_detail_worker.py and streamed into a texture-array
-// cache around the camera (see TerrainDetailStream).
+// Terrain detail streaming: the world is split into 32x32 detail tiles of
+// 1024 m; each is ML-generated on demand at 1025^2 (1 m/texel) by
+// tools/terrain/terrain_detail_worker.py — a Real-ESRGAN x4 upscale of
+// the tile's 256^2 window of the global 8k map (8192 px / 32 = 256 px
+// per tile) — and streamed into a texture-array cache around the camera
+// (see TerrainDetailStream).
 // Extent of the GENERATED TERRAIN MAP (heightmap/albedo).  EQUAL to
 // kWorldMapSize: the generated terrain covers the whole world, 8192 px
 // over 32768 m = 4 m/texel native macro, with the streamed 1 m detail
@@ -482,20 +484,36 @@
 // as far as the terrain is legible, not just the near field.
 #define kTerrainMatDetailNear                   600.0f
 #define kTerrainMatDetailFar                    2600.0f
-#define kDetailTileMeters                       (kTerrainMapMeters / 16.0f)  // 2048 m
-#define kDetailTilesPerSide                     16
-// 2049: texel centers on integer world meters, so the shared border
-// row/column of adjacent tiles holds bit-identical heights (exact seams).
-#define kDetailTileRes                          2049
-#define kDetailCacheSlots                       9         // 3x3 ring around camera
+#define kDetailTileMeters                       (kTerrainMapMeters / 32.0f)  // 1024 m
+#define kDetailTilesPerSide                     32
+// 1025: texel centers on integer world meters, so the shared border
+// row/column of adjacent tiles holds bit-identical heights (exact
+// seams).  256 source px x the Real-ESRGAN x4 = 1024 spans, +1 for the
+// shared border row.
+#define kDetailTileRes                          1025
+// 7x7 ring around the camera: tiles ACTIVATE (stream their full 1 m
+// data into a slot) within ~3 km — the ring's half-extent is 3.5 tiles
+// = 3584 m, so every tile whose nearest edge is inside 3 km is
+// resident.  Outside the ring the terrain falls back to the always-
+// resident lowest LOD: the 8k base map (4 m/texel), which never
+// leaves memory.  Tiles in the 3-4 km band are PREFETCHED — their
+// generation is requested ahead of arrival so the PNG is on disk
+// before the slot is needed (see kDetailPrefetchRadius).
+// VRAM: 49 slots x (~2.1 MB heights + ~8.4 MB colour+surface) ~= 515 MB.
+#define kDetailCacheSlots                       49
+// Prefetch ring half-width in tiles: request tile GENERATION (worker
+// starts producing the PNGs) when the camera enters ~4 km, without
+// occupying a cache slot until the tile is inside the resident ring.
+#define kDetailPrefetchRadius                   4
 // Camera-distance band over which rendered height blends detail -> base,
 // so the edge of the loaded detail region never shows a hard step.
 // Scaled with kDetailTileMeters, and the constraint that fixes the
-// ceiling: the fade END must stay inside the loaded 3x3 tile ring,
-// whose half-extent is 1.5 tiles = 3072 m.  2560 m leaves a 512 m
-// margin for the camera being off-centre within its own tile.
-#define kDetailFadeStartMeters                  1536.0f
-#define kDetailFadeEndMeters                    2560.0f
+// ceiling: the fade END must stay inside the loaded 7x7 tile ring,
+// whose half-extent is 3.5 tiles = 3584 m.  3072 m (the 3 km
+// activation range) leaves a 512 m (half-tile) margin for the camera
+// being off-centre within its own tile.
+#define kDetailFadeStartMeters                  2048.0f
+#define kDetailFadeEndMeters                    3072.0f
 
 #define kDetailNoiseTextureSize                 256
 #define kRoughNoiseTextureSize                  32

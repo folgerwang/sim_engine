@@ -5,7 +5,7 @@
 // (TerrainDetailStream provides the two bindings below).
 //
 // The world is split into kDetailTilesPerSide^2 detail tiles of
-// kDetailTileMeters; a 3x3 ring around the camera is resident in
+// kDetailTileMeters; a 5x5 ring around the camera is resident in
 // detail_height_tiles (R16 array, kDetailTileRes^2 per layer, texel
 // centers on integer world meters).  detail_slot_map maps world tile
 // index -> array layer (-1 = not resident).
@@ -49,7 +49,7 @@ float terrainDetailHeight(vec2 pos_xz_ws, float base_h, float fade) {
         return base_h;
     int slot = detail_slot_map[t.y * kDetailTilesPerSide + t.x];
     if (slot < 0) return base_h;
-    // Texel k center at tile-origin + k * cell (res 2049 texels span the
+    // Texel k center at tile-origin + k * cell (res 1025 texels span the
     // tile; cell = kDetailTileMeters / (kDetailTileRes - 1)).
     vec2 texels = (rel - vec2(t)) * float(kDetailTileRes - 1);
     vec2 uv = (texels + 0.5f) / float(kDetailTileRes);
