@@ -129,9 +129,39 @@ const char* VkResultToString(
     case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
     case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
     case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
-        // ... add other VkResult values as needed
-    default: return "UNKNOWN_ERROR";
+    // Vulkan 1.1 core.  VK_ERROR_OUT_OF_POOL_MEMORY missing from this
+    // table is what made a NORMAL, fully-handled descriptor-pool growth
+    // log itself as "[DESCPOOL] UNKNOWN_ERROR ... spawned overflow pool"
+    // -- createDescriptorSets only spawns an overflow for this code and
+    // FRAGMENTED_POOL, so the one result it prints most often was the one
+    // result it could not name.
+    case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
+    case VK_ERROR_INVALID_EXTERNAL_HANDLE:
+        return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+    // Vulkan 1.2 core.
+    case VK_ERROR_FRAGMENTATION: return "VK_ERROR_FRAGMENTATION";
+    case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS:
+        return "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS";
+    case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+    // Swapchain / surface -- the codes the present loop actually acts on.
+    case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+    case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+    case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
+        return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+    case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR:
+        return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
+    case VK_ERROR_VALIDATION_FAILED_EXT:
+        return "VK_ERROR_VALIDATION_FAILED_EXT";
+    default: break;
     }
+    // Still unmapped: print the NUMBER rather than a bare "UNKNOWN_ERROR".
+    // A code is greppable against vulkan_core.h; a word is not -- which is
+    // the whole reason the case above went unnoticed.  thread_local so two
+    // threads logging at once cannot scribble on each other's buffer.
+    static thread_local char unmapped[32];
+    std::snprintf(unmapped, sizeof(unmapped), "VkResult(%d)", (int)result);
+    return unmapped;
 }
 
 VulkanDevice::VulkanDevice(
@@ -894,12 +924,16 @@ DescriptorSetList VulkanDevice::createDescriptorSets(
                 src_location);
         vk_descriptor_pool->pushOverflow(overflow);
 
-        std::cerr
-            << "[DESCPOOL] " << VkResultToString(result)
-            << " allocating " << buffer_count
-            << " set(s); spawned overflow pool #"
+        // NOT an error path: this is the pool growing on demand, which is
+        // the design (see the retry comment above).  Word it that way --
+        // the previous phrasing led with a VkResult and read like a
+        // failure, so a routine grow looked like a bug worth chasing.
+        std::cout
+            << "[DESCPOOL] pool full (" << VkResultToString(result)
+            << ") allocating " << buffer_count
+            << " set(s) -- grew to overflow pool #"
             << vk_descriptor_pool->overflowPools().size()
-            << " (called from " << src_location.file_name()
+            << ", allocation retried (from " << src_location.file_name()
             << ":" << src_location.line() << ")"
             << std::endl;
         // Loop and retry against the freshly created overflow pool.

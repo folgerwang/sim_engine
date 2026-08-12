@@ -90,6 +90,7 @@ const float CSM_LIGHT_SIZE_WORLD      = 0.10;   // halved: tighter penumbra, les
 const float CSM_BLOCKER_RADIUS_WORLD  = 0.20;   // halved with light size
 const float CSM_MIN_PCF_RADIUS_WORLD  = 0.02;
 const float CSM_MAX_PCF_RADIUS_WORLD  = 0.40;   // halved with light size
+const float CSM_RANGE_FADE_START      = 0.85;  // fade shadows out over the last 15% of CSM range
 const int   CSM_BLOCKER_SAMPLES       = 16;
 const int   CSM_PCF_SAMPLES           = 16;
 
@@ -105,11 +106,60 @@ float csmIGN(vec2 pixel) {
                  fract(dot(pixel, vec2(0.06711056, 0.00583715))));
 }
 
+// ── CSM coverage helpers (out-of-range handling) ─────────────────────
+// Fetch one shadow-map texel, treating anything outside the cascade's
+// [0,1] UV box as "nothing between this point and the light".
+//
+// The shadow sampler is CLAMP_TO_EDGE and the CSM silhouette prepass
+// clears the map to 0.0 outside each cascade's camera-frustum
+// silhouette, so an out-of-bounds read returns 0.0 = "an occluder sits
+// right at the light" — the blocker search then finds a fake blocker
+// and the receiver resolves fully black.  Two places hit that path:
+// border taps of the LAST cascade (no cascade left to be promoted
+// into), and every receiver past the CSM's max range, whose projection
+// lands far outside the last cascade's box.  The latter is what turns
+// the whole far field (last split → camera far plane) black behind a
+// hard, camera-dependent boundary.  With no data out there, "lit" is
+// the only honest answer.
+float csmSampleMap(vec2 tap_uv, int cascade) {
+    if (any(lessThan(tap_uv, vec2(0.0))) ||
+        any(greaterThan(tap_uv, vec2(1.0))))
+        return 1.0;
+    return texture(direct_shadow_sampler, vec3(tap_uv, float(cascade))).r;
+}
+
+// View-space distance at which the CSM runs out of data — the last
+// cascade's far split (cascade_splits is packed vec4[2]).
+float csmMaxRange() {
+    return runtime_lights.cascade_splits[(CSM_CASCADE_COUNT - 1) >> 2]
+                                        [(CSM_CASCADE_COUNT - 1) & 3];
+}
+
+// 0 well inside the covered range → 1 at/past the last split.  Fading
+// the shadow term to fully lit across the tail of the last cascade
+// keeps the edge of shadow coverage from reading as a visible ring.
+float csmRangeFade(float view_depth) {
+    float max_range  = csmMaxRange();
+    float fade_begin = max_range * CSM_RANGE_FADE_START;
+    return clamp((view_depth - fade_begin) /
+                 max(max_range - fade_begin, 1e-4), 0.0, 1.0);
+}
+
 float calculateShadowFactor(
     vec3 position_world, vec3 normal_world, vec2 screen_pixel) {
     // Cascade selection by view-space depth.
     vec4 position_view = camera_info.view * vec4(position_world, 1.0);
     float view_depth = -position_view.z;
+
+    // ── Out-of-max-range guard ──────────────────────────────────────
+    // Past the last split no cascade covers this receiver: the depth
+    // selection below falls through to the last cascade, the projection
+    // lands outside its UV/depth box, and the clamped border reads make
+    // the entire far field resolve as occluded.  Fade the shadow term
+    // out over the tail of the last cascade and bail out completely
+    // once we are past it.
+    float range_fade = csmRangeFade(view_depth);
+    if (range_fade >= 1.0) return 1.0;
 
     int cascade_idx = CSM_CASCADE_COUNT - 1;
     for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
@@ -146,7 +196,17 @@ float calculateShadowFactor(
         w2uv = 0.5 *
             length(runtime_lights.light_view_proj[cascade_idx][0].xyz);
 
-        if (cascade_idx >= CSM_CASCADE_COUNT - 1) break;   // last — take it
+        if (cascade_idx >= CSM_CASCADE_COUNT - 1) {
+            // Last cascade — nothing left to promote into.  If the
+            // receiver projects outside its map or its depth slab there
+            // is no shadow data for it, so return lit instead of
+            // sampling clamped border texels.
+            if (any(lessThan(shadow_uv, vec2(0.0))) ||
+                any(greaterThan(shadow_uv, vec2(1.0))) ||
+                current_depth < 0.0 || current_depth > 1.0)
+                return 1.0;
+            break;
+        }
 
         float kernel_uv =
             max(CSM_BLOCKER_RADIUS_WORLD, CSM_MAX_PCF_RADIUS_WORLD) * w2uv
@@ -177,8 +237,7 @@ float calculateShadowFactor(
     for (int i = 0; i < CSM_BLOCKER_SAMPLES; ++i) {
         vec2 off = csmVogelDisk(i, CSM_BLOCKER_SAMPLES, phi)
                        * blocker_radius_uv;
-        float d = texture(direct_shadow_sampler,
-                          vec3(shadow_uv + off, float(cascade_idx))).r;
+        float d = csmSampleMap(shadow_uv + off, cascade_idx);
         if (d < current_depth - depth_bias) {
             blocker_sum += d;
             ++blocker_count;
@@ -198,14 +257,12 @@ float calculateShadowFactor(
     float sum = 0.0;
     for (int i = 0; i < CSM_PCF_SAMPLES; ++i) {
         vec2 off = csmVogelDisk(i, CSM_PCF_SAMPLES, phi) * pcf_radius;
-        float closest_depth =
-            texture(direct_shadow_sampler,
-                    vec3(shadow_uv + off, float(cascade_idx))).r;
+        float closest_depth = csmSampleMap(shadow_uv + off, cascade_idx);
         sum += (closest_depth < 1.0 &&
                 current_depth > closest_depth + depth_bias)
                ? 0.0 : 1.0;
     }
-    return sum * (1.0 / float(CSM_PCF_SAMPLES));
+    return mix(sum * (1.0 / float(CSM_PCF_SAMPLES)), 1.0, range_fade);
 }
 
 void main() {

@@ -2165,7 +2165,39 @@ bool loadRwHier(const std::string& path, std::vector<RwHierNode>& out) {
     if (!f.read(magic, 8) || std::memcmp(magic, kRwHierMagic, 8) != 0)
         return false;
     uint32_t count = 0;
-    if (!rdPod(f, count) || count == 0 || count > 1'000'000u) return false;
+    if (!rdPod(f, count) || count == 0) return false;
+    // -- Node-count sanity, derived from the FILE, not a magic number ----
+    // A fixed 1,000,000 cap used to live here, and it was not really a
+    // corruption check: a full PCG object group bakes one hierarchy node
+    // per placed instance, and a world's object layer legitimately runs
+    // past it (1,409,821 nodes / 153 MB in the case that surfaced this).
+    // The cap rejected that perfectly good file, loadRwHier returned
+    // false, and the whole layer died as "baked .rwinst load failed" --
+    // with the group's own .rwinst parsing fine.  loadRwInst above hit
+    // the identical wall for its array count and had to raise its cap
+    // for the same reason; this is the other half of that fix.
+    //
+    // The bound that actually means something is the file itself.  Every
+    // node writes at least parent(4) + mesh_ordinal(4) + local(64) +
+    // name_len(4) = 76 bytes before its name, so a count larger than
+    // (size - header) / 76 cannot possibly be backed by data.  That
+    // rejects a corrupt header BEFORE the resize below turns it into a
+    // multi-GB speculative allocation, and it never rejects a file that
+    // is genuinely big enough -- which a fixed constant cannot promise.
+    {
+        constexpr uint64_t kHeaderBytes  = 8 + 4;         // magic + count
+        constexpr uint64_t kMinNodeBytes = 4 + 4 + 64 + 4;  // + name bytes
+        std::error_code fec;
+        const auto fsz = std::filesystem::file_size(path, fec);
+        // Unstattable stream (unlikely): fall back to a generous absolute
+        // ceiling rather than refusing to load at all.
+        const uint64_t max_nodes =
+            fec ? (1ull << 26)
+                : ((uint64_t)fsz > kHeaderBytes
+                       ? ((uint64_t)fsz - kHeaderBytes) / kMinNodeBytes
+                       : 0ull);
+        if (max_nodes == 0 || (uint64_t)count > max_nodes) return false;
+    }
     out.resize(count);
     for (auto& n : out) {
         uint32_t name_len = 0;
