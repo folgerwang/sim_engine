@@ -1,4 +1,5 @@
 #pragma once
+#include "scene_rendering/volume_cloud.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -329,6 +330,14 @@ private:
     float view_ext_factor_ = 0.10f;
     float view_ext_exponent_ = 1.0f;
     float cloud_ambient_intensity_ = 1.0f;
+    // Ground fog controls (see getGroundFogParams).
+    bool  ground_fog_on_         = false;
+    float fog_density_           = 0.030f;
+    float fog_height_falloff_    = 0.060f;
+    float fog_base_y_            = 0.0f;
+    float fog_g_                 = 0.55f;
+    float fog_sun_intensity_     = 1.2f;
+    float fog_ambient_intensity_ = 0.35f;
     float cloud_phase_intensity_ = 0.5f;
     float cloud_moist_to_pressure_ratio_ = 0.05f;
     float global_flow_dir_ = 85.0f;
@@ -2056,6 +2065,19 @@ public:
 
     inline const float getViewExtExponent() const {
         return view_ext_exponent_;
+    }
+
+    // Ground fog (volumetric, raymarched with the clouds).
+    inline engine::scene_rendering::GroundFogParams
+        getGroundFogParams() const {
+        engine::scene_rendering::GroundFogParams p;
+        p.density           = ground_fog_on_ ? fog_density_ : 0.0f;
+        p.height_falloff    = fog_height_falloff_;
+        p.base_y            = fog_base_y_;
+        p.g                 = fog_g_;
+        p.sun_intensity     = fog_sun_intensity_;
+        p.ambient_intensity = fog_ambient_intensity_;
+        return p;
     }
 
     inline const float getCloudAmbientIntensity() const {

@@ -17,6 +17,8 @@
 #include <set>
 #include <filesystem>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 #include "helper/engine_helper.h"
 #include "helper/bvh.h"
@@ -9860,6 +9862,71 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     // node's instance range and every other node drawing it was lost.
     std::unordered_map<std::string, int> geo_mesh;
 
+    // ── Parallel geometry pre-load ────────────────────────────────────
+    // The per-ordinal loop below used to loadRwGeo + dedup INLINE, one
+    // file at a time.  On instanced groups that is invisible (a tree
+    // library is ~800 unique files), but a NON-instanced group bakes one
+    // .rwgeo per node -- the whole-map clutter group carries 47 812 of
+    // them -- and a serial walk of that many small files held phase 2
+    // for minutes.  Everything downstream waited: the placed set never
+    // read all-ready, the cluster merge never ran, and the RT BVH/TLAS
+    // it builds never existed, so "RT selected" fell back to CSM for
+    // the whole session.
+    //
+    // The file parse and the vertex dedup are pure per-file work, so
+    // they fan out onto a small pool here; the serial loop below then
+    // consumes parsed results by key.  Everything device- or
+    // shared-state-touching (buffers, materials, texture caches) stays
+    // on this thread, exactly as before.
+    struct PreGeo {
+        helper::ModelPreviewData md;
+        std::vector<std::string> tex_paths;
+        bool ok = false;
+    };
+    // pre_geo holds ONE CHUNK of parsed files at a time (see the chunked
+    // loop below) so a 47k-file group never sits fully parsed in RAM.
+    std::unordered_map<std::string, PreGeo> pre_geo;
+    const auto preload_range = [&](size_t begin, size_t end) {
+        pre_geo.clear();
+        std::vector<std::pair<std::string, std::string>> jobs;  // key, path
+        for (size_t oi = begin; oi < end; ++oi) {
+            const auto& oref2 = ordinal_geo[oi];
+            const std::string key =
+                oref2.path + "|" + std::to_string(oref2.level);
+            if (pre_geo.emplace(key, PreGeo{}).second) {
+                jobs.emplace_back(key, oref2.path);
+            }
+        }
+        unsigned hw_threads = std::thread::hardware_concurrency();
+        unsigned nt = std::min<unsigned>(
+            std::max(2u, hw_threads > 2 ? hw_threads - 2 : 2u), 16u);
+        nt = std::min<unsigned>(
+            nt, (unsigned)std::max<size_t>(jobs.size(), 1));
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            for (;;) {
+                const size_t j = next.fetch_add(1);
+                if (j >= jobs.size()) break;
+                PreGeo& pg = pre_geo[jobs[j].first];
+                pg.ok = helper::loadRwGeo(jobs[j].second, pg.md,
+                                          &pg.tex_paths,
+                                          /*decode_textures=*/false) &&
+                        !pg.md.positions.empty() &&
+                        !pg.md.indices.empty() &&
+                        !pg.md.sections.empty();
+                if (pg.ok) helper::dedupModelVertices(pg.md);
+            }
+        };
+        if (jobs.size() > 8 && nt > 1) {
+            std::vector<std::thread> pool;
+            pool.reserve(nt);
+            for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
+            for (auto& t : pool) t.join();
+        } else {
+            worker();
+        }
+    };
+
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
     // Which texture slots carry a real cutout alpha (baked alpha plane,
     // or legacy full-res preview with any translucent texel).  Drives
@@ -9869,7 +9936,14 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     std::unordered_map<std::string, uint8_t> tex_cutout_cache;
     std::vector<uint8_t> tex_cutout;
 
-    for (const auto& oref : ordinal_geo) {
+    const size_t kGeoChunk = 4096;   // ~bounded parsed-file RAM per chunk
+    for (size_t chunk_begin = 0; chunk_begin < ordinal_geo.size();
+         chunk_begin += kGeoChunk) {
+        const size_t chunk_end =
+            std::min(ordinal_geo.size(), chunk_begin + kGeoChunk);
+        preload_range(chunk_begin, chunk_end);
+        for (size_t oref_i = chunk_begin; oref_i < chunk_end; ++oref_i) {
+        const auto& oref = ordinal_geo[oref_i];
         const int ordinal = oref.ordinal;
         const std::string& geo_path = oref.path;
         const int geo_level = oref.level;
@@ -9891,14 +9965,12 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             }
         }
 
-        helper::ModelPreviewData md;
-        std::vector<std::string> tex_paths;
-        if (!helper::loadRwGeo(geo_path, md, &tex_paths,
-                               /*decode_textures=*/false) ||
-            md.positions.empty() || md.indices.empty() ||
-            md.sections.empty())
-            continue;
-        helper::dedupModelVertices(md);
+        auto pre_it = pre_geo.find(geo_key);
+        if (pre_it == pre_geo.end() || !pre_it->second.ok) continue;
+        helper::ModelPreviewData md = std::move(pre_it->second.md);
+        std::vector<std::string> tex_paths =
+            std::move(pre_it->second.tex_paths);
+        pre_it->second.ok = false;   // consumed (moved-from)
 
         const uint32_t vtx_count   = (uint32_t)md.positions.size();
         const uint32_t index_count = (uint32_t)md.indices.size();
@@ -10321,6 +10393,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         geo_mesh.emplace(geo_key, mesh_index);
         if (owner_node >= 0)
             drawable_object->nodes_[owner_node].mesh_idx_ = mesh_index;
+    }
     }
 
     if (drawable_object->meshes_.empty()) return nullptr;

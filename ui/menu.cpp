@@ -2907,6 +2907,26 @@ bool Menu::draw(
 
             ImGui::Separator();
 
+            // ── Ground fog (volumetric, CSM-shadowed shafts) ─────────
+            ImGui::Checkbox("Ground Fog", &ground_fog_on_);
+            if (ground_fog_on_) {
+                ImGui::SliderFloat("Fog Density", &fog_density_,
+                                   0.0f, 0.15f, "%.3f");
+                ImGui::SliderFloat("Fog Height Falloff",
+                                   &fog_height_falloff_, 0.0f, 0.5f,
+                                   "%.3f");
+                ImGui::SliderFloat("Fog Base Height", &fog_base_y_,
+                                   -50.0f, 300.0f);
+                ImGui::SliderFloat("Fog Anisotropy", &fog_g_,
+                                   0.0f, 0.95f);
+                ImGui::SliderFloat("Fog Sun Intensity",
+                                   &fog_sun_intensity_, 0.0f, 4.0f);
+                ImGui::SliderFloat("Fog Ambient",
+                                   &fog_ambient_intensity_, 0.0f, 2.0f);
+            }
+
+            ImGui::Separator();
+
             ImGui::SliderFloat("water flow strength", &water_flow_strength_, 0.0f, 10.0f);
             ImGui::SliderFloat("air flow strength", &air_flow_strength_, 0.0f, 100.0f);
 

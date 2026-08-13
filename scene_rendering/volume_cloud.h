@@ -5,6 +5,17 @@
 namespace engine {
 namespace scene_rendering {
 
+// Ground-fog knobs, filled from the weather menu each frame and pushed
+// into the volume-cloud march (VolumeMoistrueParams.fog_*).
+struct GroundFogParams {
+    float density = 0.0f;          // 0 = fog off
+    float height_falloff = 0.06f;
+    float base_y = 0.0f;
+    float g = 0.55f;
+    float sun_intensity = 1.2f;
+    float ambient_intensity = 0.35f;
+};
+
 class VolumeCloud {
     renderer::TextureInfo fog_cloud_tex_;
     renderer::TextureInfo blurred_fog_cloud_tex_;
@@ -35,6 +46,8 @@ public:
         const std::shared_ptr<renderer::ImageView>& scattering_lut_tex,
         const std::shared_ptr<renderer::ImageView>& detail_noise_tex,
         const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
+        const std::shared_ptr<renderer::ImageView>& csm_shadow_tex,
+        const std::shared_ptr<renderer::BufferInfo>& runtime_lights_buffer,
         const glm::uvec2& display_size);
 
     void recreate(
@@ -51,6 +64,8 @@ public:
         const std::shared_ptr<renderer::ImageView>& scattering_lut_tex,
         const std::shared_ptr<renderer::ImageView>& detail_noise_tex,
         const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
+        const std::shared_ptr<renderer::ImageView>& csm_shadow_tex,
+        const std::shared_ptr<renderer::BufferInfo>& runtime_lights_buffer,
         const glm::uvec2& display_size);
 
     void renderVolumeCloud(
@@ -68,6 +83,7 @@ public:
         const float& noise_thresold,
         const float& noise_scrolling_speed,
         const glm::vec2& noise_scale,
+        const GroundFogParams& ground_fog,
         const glm::uvec2& display_size,
         int dbuf_idx,
         float current_time);

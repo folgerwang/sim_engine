@@ -57,6 +57,14 @@ public:
         return m_view_camera_->getCameraInfo().position;
     }
 
+    // Authoritative double-precision camera position — pairs with the
+    // terrain tiles' double centre offsets.  Use this for streaming /
+    // placement math; the float getter above remains for GPU-adjacent
+    // callers.
+    glm::dvec3 getCameraPositionD() const {
+        return m_view_camera_->getPositionD();
+    }
+
     virtual void updateCamera(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const uint32_t& dbuf_idx,

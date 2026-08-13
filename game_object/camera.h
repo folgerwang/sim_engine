@@ -21,6 +21,16 @@ class ViewCamera {
     std::shared_ptr<renderer::BufferInfo> m_view_camera_buffer_;
 
     glsl::ViewCameraInfo m_camera_info_;
+    // ── Double-precision camera position — the AUTHORITATIVE copy ────
+    // The terrain tiles anchor on double-precision centre offsets; a
+    // camera whose position lives only in the GPU struct's float vec3
+    // quantises to ~0.25 mm steps 4 km from the origin and to ~2 mm at
+    // 32 km — visible as micro-jitter against the double-anchored
+    // terrain, and it compounds because WASD flight ACCUMULATES in that
+    // float.  Every mutation below goes through this dvec3 first;
+    // m_camera_info_.position is the narrowed snapshot the GPU sees,
+    // and the view matrix is built in double then narrowed ONCE.
+    glm::dvec3 m_position_d_ = glm::dvec3(0.0);
     bool m_is_ortho_ = false;
     // Last frame's aspect ratio.  Used by updateViewCameraInfo to detect a
     // window-resize projection discontinuity and zero the velocity attachment
@@ -106,6 +116,11 @@ public:
 
     const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;
+    }
+
+    // Authoritative double-precision position (see m_position_d_).
+    const glm::dvec3& getPositionD() const {
+        return m_position_d_;
     }
 
     // Hard-set the mouse-look state.  Used by the editor's "view through

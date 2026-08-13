@@ -27,6 +27,39 @@ layout(set = 0, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampler3D src_rough
 layout(set = 0, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D src_depth;
 layout(set = 0, binding = DST_FOG_CLOUD_INDEX, rgba16f) uniform writeonly image2D dst_fog_cloud;
 
+// ── Ground fog: CSM shadow taps for light shafts ────────────────────
+layout(set = 0, binding = VOLFOG_CSM_SHADOW_INDEX) uniform sampler2DArray src_csm_shadow;
+layout(std140, set = 0, binding = VOLFOG_LIGHTS_BUF_INDEX) uniform VolFogLightsUniformBufferObject {
+    RuntimeLightsParams runtime_lights;
+};
+
+// One shadow tap per march sample: cascade by view depth, single
+// compare, generous WORLD-space bias (self-shadow acne cannot exist in
+// air, and a fat bias keeps the shafts stable across cascade seams).
+// Outside the CSM's box there is no data — return LIT, exactly like the
+// surface shadow paths do (see deferred_resolve.comp's guards).
+float volFogSunVisibility(vec3 world_pos) {
+    float view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
+    int cascade = CSM_CASCADE_COUNT - 1;
+    for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
+        if (view_depth < runtime_lights.cascade_splits[i >> 2][i & 3]) {
+            cascade = i;
+            break;
+        }
+    }
+    vec4 lclip = runtime_lights.light_view_proj[cascade] *
+                 vec4(world_pos, 1.0);
+    vec3 lndc = lclip.xyz / lclip.w;
+    vec2 uv = lndc.xy * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) ||
+        any(greaterThan(uv, vec2(1.0))) ||
+        lndc.z < 0.0 || lndc.z > 1.0)
+        return 1.0;
+    float z_scale = length(runtime_lights.light_view_proj[cascade][2].xyz);
+    float map = texture(src_csm_shadow, vec3(uv, float(cascade))).r;
+    return (map < 1.0 && lndc.z > map + 0.35 * z_scale) ? 0.0 : 1.0;
+}
+
 layout(local_size_x = 8, local_size_y = 8) in;
 void main()
 {
@@ -97,6 +130,33 @@ void main()
         float cur_alpha = exp2(-pow(extinct, params.view_ext_exponent));
         fg_color = mix(cloud_lighting, fg_color, cur_alpha);
         final_alpha *= cur_alpha;
+
+        // ── CSM-shadowed ground fog, same sample ────────────────────
+        // Exponential height medium: densest at fog_base_y, thinning
+        // with altitude.  Sun in-scatter is gated by BOTH the CSM tap
+        // (tree/house shafts) and the cloud-shadow volume already
+        // fetched for this sample, so fog under a cloud goes grey the
+        // way the ground under it does.  Marched far-to-near inside the
+        // cloud loop, so fog correctly sits in FRONT of cloud samples
+        // behind it and vice versa.
+        if (params.fog_density > 0.0f) {
+            float fog_sigma = params.fog_density *
+                exp(-max(sample_pos.y - params.fog_base_y, 0.0f) *
+                    params.fog_height_falloff);
+            float fog_ext = thickness * fog_sigma;
+            if (fog_ext > 1e-5f) {
+                float sun_vis =
+                    volFogSunVisibility(sample_pos) * cloud_shadow;
+                float fog_phase =
+                    henyeyGreensteinPhaseFunc(params.fog_g, cos_theta);
+                vec3 fog_light =
+                    vec3(params.fog_sun_intensity) * fog_phase * sun_vis +
+                    vec3(params.fog_ambient_intensity);
+                float fog_alpha = exp(-fog_ext);
+                fg_color = mix(fog_light, fg_color, fog_alpha);
+                final_alpha *= fog_alpha;
+            }
+        }
 
         last_dist = cur_dist;
     }

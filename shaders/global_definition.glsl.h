@@ -164,6 +164,11 @@
 #define PERM_GRAD_TEXTURE_INDEX             (TILE_BASE_PARAMS_INDEX + 31) // 38
 #define PERM_GRAD_4D_TEXTURE_INDEX          (TILE_BASE_PARAMS_INDEX + 32) // 39
 #define GRAD_4D_TEXTURE_INDEX               (TILE_BASE_PARAMS_INDEX + 33) // 40
+// Ground-fog additions to the volume-cloud pass: the CSM shadow array
+// (for light shafts through the fog) and the runtime-lights UBO (for
+// the cascade matrices the shadow taps need).
+#define VOLFOG_CSM_SHADOW_INDEX             (TILE_BASE_PARAMS_INDEX + 34) // 41
+#define VOLFOG_LIGHTS_BUF_INDEX             (TILE_BASE_PARAMS_INDEX + 35) // 42
 
 // Noise Texture.
 #define DST_PERLIN_NOISE_TEX_INDEX          0
@@ -1067,6 +1072,16 @@ struct VolumeMoistrueParams {
     float           ambient_intensity;
     float           phase_intensity;
     float           pressure_to_moist_ratio;
+    // ── Ground fog (raymarched in the same pass as the clouds) ───────
+    // density <= 0 disables the fog term entirely.  Pushes the struct
+    // to 144 B — over the 128 B Vulkan-guaranteed push-constant floor,
+    // fine on every desktop driver (256 B min on NV/AMD/Intel).
+    float           fog_density;
+    float           fog_height_falloff;
+    float           fog_base_y;
+    float           fog_g;
+    float           fog_sun_intensity;
+    float           fog_ambient_intensity;
 };
 
 struct BlurImageParams {

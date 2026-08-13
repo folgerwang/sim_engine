@@ -119,6 +119,7 @@ ViewCamera::ViewCamera(
     m_is_ortho_(is_ortho){
 
     m_camera_info_.position = view_camera_params.init_camera_pos;
+    m_position_d_ = glm::dvec3(view_camera_params.init_camera_pos);
     m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
     m_camera_info_.yaw = view_camera_params.yaw;
     m_camera_info_.pitch = view_camera_params.pitch;
@@ -160,6 +161,7 @@ void ViewCamera::initViewCameraBuffer(
     const std::shared_ptr<renderer::Device>& device,
     const glsl::ViewCameraParams& view_camera_params) {
     m_camera_info_.position = view_camera_params.init_camera_pos;
+    m_position_d_ = glm::dvec3(view_camera_params.init_camera_pos);
     m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
     m_camera_info_.yaw = view_camera_params.yaw;
     m_camera_info_.pitch = view_camera_params.pitch;
@@ -332,8 +334,10 @@ void ViewCamera::updateViewCameraInfo(
     }
 
     if (m_is_ortho_) {
-        if (input_camera_pos) 
+        if (input_camera_pos) {
             m_camera_info_.position = glm::ivec3(*input_camera_pos);
+            m_position_d_ = glm::dvec3(glm::ivec3(*input_camera_pos));
+        }
 
         float frustum_size = 100.0f;
         float cast_dist = 25.0f;
@@ -378,6 +382,7 @@ void ViewCamera::updateViewCameraInfo(
     else {
         if (m_camera_info_.status == 0 || view_camera_params.frame_count == 0) {
             m_camera_info_.position = view_camera_params.init_camera_pos;
+            m_position_d_ = glm::dvec3(view_camera_params.init_camera_pos);
             m_camera_info_.mouse_pos = view_camera_params.mouse_pos;
             m_camera_info_.yaw = view_camera_params.yaw;
             m_camera_info_.pitch = view_camera_params.pitch;
@@ -403,23 +408,30 @@ void ViewCamera::updateViewCameraInfo(
         m_camera_info_.up_vector =
             normalize(cross(camera_right, m_camera_info_.facing_dir));
 
-        auto camera_speed =
-            view_camera_params.camera_speed * view_camera_params.delta_t / 0.033f;
+        // WASD flight integrates in DOUBLE.  This accumulation is where
+        // float precision actually dies: far from the origin the add of
+        // a small per-frame step to a large coordinate quantises, so
+        // speed decays with distance and the motion stutters against the
+        // double-anchored terrain tiles.
+        const double camera_speed = double(
+            view_camera_params.camera_speed * view_camera_params.delta_t
+            / 0.033f);
 
-        auto move_forward_vec =
-            camera_speed * m_camera_info_.facing_dir;
+        const glm::dvec3 move_forward_vec =
+            camera_speed * glm::dvec3(m_camera_info_.facing_dir);
 
-        auto move_right_vec =
-            camera_speed * camera_right;
+        const glm::dvec3 move_right_vec =
+            camera_speed * glm::dvec3(camera_right);
 
         if (view_camera_params.key == GLFW_KEY_W)
-            m_camera_info_.position += move_forward_vec;
+            m_position_d_ += move_forward_vec;
         if (view_camera_params.key == GLFW_KEY_S)
-            m_camera_info_.position -= move_forward_vec;
+            m_position_d_ -= move_forward_vec;
         if (view_camera_params.key == GLFW_KEY_A)
-            m_camera_info_.position -= move_right_vec;
+            m_position_d_ -= move_right_vec;
         if (view_camera_params.key == GLFW_KEY_D)
-            m_camera_info_.position += move_right_vec;
+            m_position_d_ += move_right_vec;
+        m_camera_info_.position = glm::vec3(m_position_d_);
 
         // ── Third-person follow-target override ──────────────────────
         // When the caller supplies an input_camera_pos (via the
@@ -434,6 +446,7 @@ void ViewCamera::updateViewCameraInfo(
         // override wins on the same frame the keys were pressed.
         if (input_camera_pos) {
             m_camera_info_.position = *input_camera_pos;
+            m_position_d_ = glm::dvec3(*input_camera_pos);
         }
         // Optional facing override (third-person follow camera).  Lets the
         // caller aim the view independently of the mouse-derived yaw/pitch —
@@ -447,28 +460,39 @@ void ViewCamera::updateViewCameraInfo(
             m_camera_info_.facing_dir = normalize(*input_facing_dir);
         }
 
-        auto eye_pos = m_camera_info_.position;
-        auto target_pos = eye_pos + m_camera_info_.facing_dir;
-        auto up_dir = m_camera_info_.up_vector;
+        // ── View/projection in DOUBLE, narrowed once ─────────────────
+        // lookAt's translation row is dot(basis, eye): at float it
+        // re-quantises the eye position a second time and the products
+        // lose more bits; view_proj and its inverse compound that.
+        // Building the chain in double and casting each matrix once
+        // keeps the narrow at the very end, which is the whole point of
+        // carrying a double position.
+        const glm::dvec3 eye_d    = m_position_d_;
+        const glm::dvec3 target_d =
+            eye_d + glm::dvec3(m_camera_info_.facing_dir);
+        const glm::dvec3 up_d     = glm::dvec3(m_camera_info_.up_vector);
+        m_camera_info_.position = glm::vec3(eye_d);
 
-        m_camera_info_.position = eye_pos;
+        const glm::dmat4 view_d = glm::lookAt(eye_d, target_d, up_d);
+        glm::dmat4 proj_d = glm::perspective(
+            double(view_camera_params.fov),
+            double(view_camera_params.aspect),
+            double(view_camera_params.z_near),
+            double(view_camera_params.z_far));
+        proj_d[1][1] *= -1.0;
+        const glm::dmat4 view_proj_d = proj_d * view_d;
 
-        m_camera_info_.view =
-            lookAt(eye_pos, target_pos, up_dir);
-        m_camera_info_.proj =
-            perspective(
-                view_camera_params.fov,
-                view_camera_params.aspect,
-                view_camera_params.z_near,
-                view_camera_params.z_far);
-        m_camera_info_.proj[1].y *= -1.0f;
-        m_camera_info_.view_proj = m_camera_info_.proj * m_camera_info_.view;
-        m_camera_info_.inv_view_proj = inverse(m_camera_info_.view_proj);
-        m_camera_info_.inv_view = inverse(m_camera_info_.view);
-        m_camera_info_.inv_proj = inverse(m_camera_info_.proj);
+        m_camera_info_.view          = glm::mat4(view_d);
+        m_camera_info_.proj          = glm::mat4(proj_d);
+        m_camera_info_.view_proj     = glm::mat4(view_proj_d);
+        m_camera_info_.inv_view_proj = glm::mat4(glm::inverse(view_proj_d));
+        m_camera_info_.inv_view      = glm::mat4(glm::inverse(view_d));
+        m_camera_info_.inv_proj      = glm::mat4(glm::inverse(proj_d));
 
-        mat4 view_relative = lookAt(vec3(0), target_pos - eye_pos, up_dir);
-        m_camera_info_.inv_view_proj_relative = inverse(m_camera_info_.proj * view_relative);
+        const glm::dmat4 view_relative_d = glm::lookAt(
+            glm::dvec3(0.0), target_d - eye_d, up_d);
+        m_camera_info_.inv_view_proj_relative =
+            glm::mat4(glm::inverse(proj_d * view_relative_d));
         m_camera_info_.depth_params = vec4(
             m_camera_info_.proj[2].z,
             m_camera_info_.proj[3].z,

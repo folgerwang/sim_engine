@@ -61,9 +61,11 @@ er::WriteDescriptorList addCloudFogTextures(
     const std::shared_ptr<er::ImageView>& volume_moist_tex,
     const std::shared_ptr<er::ImageView>& volume_temp_tex,
     const std::shared_ptr<er::ImageView>& cloud_lighting_tex,
-    const std::shared_ptr<er::ImageView>& scattering_lut_tex) {
+    const std::shared_ptr<er::ImageView>& scattering_lut_tex,
+    const std::shared_ptr<er::ImageView>& csm_shadow_tex,
+    const std::shared_ptr<er::BufferInfo>& runtime_lights_buffer) {
     er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(14);
+    descriptor_writes.reserve(16);
 
     // envmap texture.
     er::Helper::addOneTexture(
@@ -195,6 +197,28 @@ er::WriteDescriptorList addCloudFogTextures(
         er::Helper::getGrad4DTexture().view,
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
+    // ── Ground fog: CSM shadow array + runtime-lights UBO ────────────
+    // Same layout convention as the PBR global set's DIRECT_SHADOW
+    // binding (application.cpp) — the depth array is sampled, not
+    // compared, and sits in DEPTH_STENCIL_READ_ONLY between shadow
+    // passes.
+    er::Helper::addOneTexture(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        VOLFOG_CSM_SHADOW_INDEX,
+        texture_sampler,
+        csm_shadow_tex,
+        er::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+
+    er::Helper::addOneBuffer(
+        descriptor_writes,
+        description_set,
+        er::DescriptorType::UNIFORM_BUFFER,
+        VOLFOG_LIGHTS_BUF_INDEX,
+        runtime_lights_buffer->buffer,
+        runtime_lights_buffer->buffer->getSize());
+
     return descriptor_writes;
 }
 
@@ -248,6 +272,8 @@ VolumeCloud::VolumeCloud(
     const std::shared_ptr<renderer::ImageView>& scattering_lut_tex,
     const std::shared_ptr<renderer::ImageView>& detail_noise_tex,
     const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
+    const std::shared_ptr<renderer::ImageView>& csm_shadow_tex,
+    const std::shared_ptr<renderer::BufferInfo>& runtime_lights_buffer,
     const glm::uvec2& display_size) {
 
     blur_image_desc_set_layout_ =
@@ -322,7 +348,15 @@ VolumeCloud::VolumeCloud(
               renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
                 GRAD_4D_TEXTURE_INDEX,
                 SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) | SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-                er::DescriptorType::COMBINED_IMAGE_SAMPLER)});
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER),
+              renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                VOLFOG_CSM_SHADOW_INDEX,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER),
+              renderer::helper::getBufferDescriptionSetLayoutBinding(
+                VOLFOG_LIGHTS_BUF_INDEX,
+                SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::UNIFORM_BUFFER)});
 
     recreate(
         device,
@@ -338,6 +372,8 @@ VolumeCloud::VolumeCloud(
         scattering_lut_tex,
         detail_noise_tex,
         rough_noise_tex,
+        csm_shadow_tex,
+        runtime_lights_buffer,
         display_size);
 }
 
@@ -355,6 +391,8 @@ void VolumeCloud::recreate(
     const std::shared_ptr<renderer::ImageView>& scattering_lut_tex,
     const std::shared_ptr<renderer::ImageView>& detail_noise_tex,
     const std::shared_ptr<renderer::ImageView>& rough_noise_tex,
+    const std::shared_ptr<renderer::ImageView>& csm_shadow_tex,
+    const std::shared_ptr<renderer::BufferInfo>& runtime_lights_buffer,
     const glm::uvec2& display_size) {
 
     fog_cloud_tex_.destroy(device);
@@ -471,7 +509,9 @@ void VolumeCloud::recreate(
             moisture_texes[dbuf_idx],
             temp_texes[dbuf_idx],
             cloud_lighting_tex,
-            scattering_lut_tex);
+            scattering_lut_tex,
+            csm_shadow_tex,
+            runtime_lights_buffer);
         device->updateDescriptorSets(render_cloud_fog_texture_descs);
     }
 
@@ -504,6 +544,7 @@ void VolumeCloud::renderVolumeCloud(
     const float& noise_thresold,
     const float& noise_scrolling_speed,
     const glm::vec2& noise_scale,
+    const GroundFogParams& ground_fog,
     const glm::uvec2& display_size,
     int dbuf_idx,
     float current_time) {
@@ -536,6 +577,12 @@ void VolumeCloud::renderVolumeCloud(
         params.noise_thresold = noise_thresold;
         params.noise_speed_scale = noise_scrolling_speed;
         params.noise_scale = noise_scale;
+        params.fog_density = ground_fog.density;
+        params.fog_height_falloff = ground_fog.height_falloff;
+        params.fog_base_y = ground_fog.base_y;
+        params.fog_g = ground_fog.g;
+        params.fog_sun_intensity = ground_fog.sun_intensity;
+        params.fog_ambient_intensity = ground_fog.ambient_intensity;
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
