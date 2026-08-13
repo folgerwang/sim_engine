@@ -2908,6 +2908,16 @@ bool bakeModelToRenderReady(
                             s.triplanar_tile_m = (float)dm * 0.1f;
                         }
                     }
+                    // ── Snow cover, same discipline ───────────────
+                    // "<name>_snowcover" on a tree's wood or leaf
+                    // material: the plant scatter appends it when the
+                    // site it planted stands on snow, so the same
+                    // species is green in the valley and white on the
+                    // ridge without a second copy of the mesh.  No
+                    // format bump — s.flags is already a v7 field.
+                    if (mn.find("_snowcover") != std::string::npos) {
+                        s.flags |= kSecSnowCover;
+                    }
                 }
                 // Full PBR refs: normal + metallic-roughness maps.
                 if (prim.material >= 0 &&

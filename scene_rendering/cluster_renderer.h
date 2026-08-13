@@ -522,6 +522,7 @@ private:
 
     // Global stats for debug UI.
     uint32_t total_clusters_all_meshes_ = 0;
+    uint32_t rt_instance_count_ = 0;   // RT-only instanced casters staged
     uint32_t total_visible_all_meshes_ = 0;
 
     // Polygon (triangle) counts for debug UI.
@@ -1114,6 +1115,16 @@ public:
     const glm::vec4& getDebugFirstLocal() const { return debug_first_local_bounds_; }
     const glm::vec4& getDebugFirstModelDiag() const { return debug_first_model_diag_; }
     uint32_t getTotalClusters() const { return total_clusters_all_meshes_; }
+
+    // ── RT-only instanced caster bookkeeping ──────────────────────────
+    // How many EXT_mesh_gpu_instancing placements the application staged
+    // as RT-only shadow casters in the last merge (they are uploaded as
+    // ordinary cluster meshes and then hidden from the raster cull — see
+    // the rt_inst_* block in application.h).  Reporting only; it makes
+    // the "[shadow] RT gate" line able to distinguish "no geometry at
+    // all" from "geometry present, RT still not arming".
+    void setRtInstanceCount(uint32_t n) { rt_instance_count_ = n; }
+    uint32_t getRtInstanceCount() const { return rt_instance_count_; }
     uint32_t getTotalVisible() const { return total_visible_all_meshes_; }
     uint64_t getTotalTriangles() const { return total_triangles_all_meshes_; }
     uint64_t getVisibleTriangles() const { return visible_triangles_; }

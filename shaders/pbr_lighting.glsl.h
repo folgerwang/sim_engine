@@ -258,6 +258,25 @@ vec4 getBaseColor(
             }
         }
     }
+    // ── Snow cover ───────────────────────────────────────────────────
+    // RGB ONLY.  baseColor.a is the foliage cutout the alpha-mask test
+    // reads, and washing it toward 1 would turn every leaf spray back
+    // into the solid quad its texture exists to cut away.
+    //
+    // Weighted by the surface normal rather than applied flat: snow
+    // settles on what faces the sky.  Needle sprays angled downward keep
+    // most of the species' own colour, which is what stops a snowy
+    // conifer reading as a white cardboard cutout.
+    if ((in_mat.material_features & FEATURE_MATERIAL_SNOW_COVER) != 0) {
+        const vec3 kSnowAlbedo = vec3(0.86, 0.88, 0.92);   // linear
+#ifdef HAS_NORMALS
+        float up = clamp(normalize(in_data.vertex_normal).y, 0.0, 1.0);
+#else
+        float up = 1.0;
+#endif
+        baseColor.rgb = mix(baseColor.rgb, kSnowAlbedo,
+                            mix(0.45, 0.95, up));
+    }
 #endif
     return baseColor * getVertexColor(in_data);
 }

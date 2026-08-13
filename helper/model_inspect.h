@@ -54,6 +54,10 @@ struct PreviewSection {
 };
 // PreviewSection::flags bits, and the same values GeoSectionOut writes.
 static const uint32_t kSecTriplanar = 0x1u;
+// This section's material should be tinted toward snow by the shader
+// (FEATURE_MATERIAL_SNOW_COVER).  Declared by the material NAME marker
+// "_snowcover", same name-encoding discipline as _triplanar_ above.
+static const uint32_t kSecSnowCover = 0x2u;
 struct ModelPreviewData {
     std::vector<glm::vec3>      positions;
     std::vector<glm::vec3>      normals;   // recomputed when absent

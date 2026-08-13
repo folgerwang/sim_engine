@@ -8618,6 +8618,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // A rock has no seam-free uv set, so its maps are sampled by
         // position; triplanar_tile_m carries the metres-per-repeat the
         // generator authored.
+        // Snow cover: see FEATURE_MATERIAL_SNOW_COVER — a shader tint
+        // asked for by the material name, not a second mesh.
+        if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_SNOW_COVER;
+        }
         if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
             sec.triplanar_tile_m > 0.0f) {
             ubo.material_features |= FEATURE_MATERIAL_TRIPLANAR;
@@ -9542,6 +9547,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             // A rock has no seam-free uv set, so its maps are sampled by
             // position; triplanar_tile_m carries the metres-per-repeat the
             // generator authored.
+            // Snow cover: the scatter marked this section's material
+            // "_snowcover" because the site stands on snow.  Pure shader
+            // tint (see FEATURE_MATERIAL_SNOW_COVER) — no second mesh,
+            // no second atlas.
+            if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
+                ubo.material_features |= FEATURE_MATERIAL_SNOW_COVER;
+            }
             if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
                 sec.triplanar_tile_m > 0.0f) {
                 ubo.material_features |= FEATURE_MATERIAL_TRIPLANAR;
@@ -10256,6 +10268,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             // A rock has no seam-free uv set, so its maps are sampled by
             // position; triplanar_tile_m carries the metres-per-repeat the
             // generator authored.
+            // Snow cover: the scatter marked this section's material
+            // "_snowcover" because the site stands on snow.  Pure shader
+            // tint (see FEATURE_MATERIAL_SNOW_COVER) — no second mesh,
+            // no second atlas.
+            if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
+                ubo.material_features |= FEATURE_MATERIAL_SNOW_COVER;
+            }
             if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
                 sec.triplanar_tile_m > 0.0f) {
                 ubo.material_features |= FEATURE_MATERIAL_TRIPLANAR;
@@ -10387,6 +10406,65 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             }
             prim.bbox_min_ = pmin; prim.bbox_max_ = pmax;
             prim.generateHash();
+        }
+
+        // ── Cluster sidecar (Nanite-lite GPU culling + RT shadows) ────
+        // loadRwObjModel and the FBX/glTF paths have always built this;
+        // the .rwinst loader never did.  The consequence was invisible
+        // but total: syncPlacedObjectsToClusters skips every mesh whose
+        // cluster_mesh_ is empty, so a scene made entirely of .rwinst
+        // placements staged ZERO clusters, finalizeUploads ran with
+        // total_clusters_all_meshes_ == 0, and buildRtShadowBvh() /
+        // buildHwRtShadowAs() both returned at their first guard —
+        // rt_shadow_ready_ never went true and the frame fell back to
+        // CSM forever.
+        //
+        // Build from the index ranges THIS mesh actually draws, not
+        // from cpu_mesh: cpu_mesh is LOD0 only, while a level>0 node
+        // draws md.lod_ranges[level-1] (the decimated levels are
+        // appended after the section table).  Walking `active` in
+        // primitive order also gives cluster_prim_map_ for free — the
+        // per-face primitive ordinal is recorded as the faces are
+        // emitted, so a cluster's material is its first face's
+        // primitive, exactly like the .rwobj path resolves it from
+        // contiguous section face ranges.
+        {
+            helper::Mesh cluster_src;
+            cluster_src.vertex_data_ptr = cpu_mesh.vertex_data_ptr;
+            std::vector<uint32_t> face_prim;   // face -> primitive ordinal
+            for (size_t ai = 0; ai < active.size(); ++ai) {
+                const size_t si = active[ai];
+                const glm::uvec2 r =
+                    use_level ? level_range(si)
+                              : glm::uvec2(md.sections[si].first_index,
+                                           md.sections[si].index_count);
+                const uint32_t r_end =
+                    std::min(r.x + r.y, index_count);
+                for (uint32_t ii = r.x; ii + 2 < r_end; ii += 3) {
+                    const uint32_t i0 = md.indices[ii];
+                    const uint32_t i1 = md.indices[ii + 1];
+                    const uint32_t i2 = md.indices[ii + 2];
+                    if (i0 >= vtx_count || i1 >= vtx_count ||
+                        i2 >= vtx_count)
+                        continue;
+                    cluster_src.faces_ptr->emplace_back(i0, i1, i2);
+                    face_prim.push_back(static_cast<uint32_t>(ai));
+                }
+            }
+            if (!cluster_src.faces_ptr->empty()) {
+                helper::buildClusterMesh(cluster_src, mesh.cluster_mesh_);
+                mesh.cluster_prim_map_.clear();
+                mesh.cluster_prim_map_.reserve(
+                    mesh.cluster_mesh_.clusters.size());
+                for (const auto& cl : mesh.cluster_mesh_.clusters) {
+                    uint32_t prim_idx = 0;
+                    if (!cl.face_indices.empty() &&
+                        cl.face_indices[0] < face_prim.size()) {
+                        prim_idx = face_prim[cl.face_indices[0]];
+                    }
+                    mesh.cluster_prim_map_.push_back(prim_idx);
+                }
+            }
         }
 
         ordinal_mesh.emplace(ordinal, mesh_index);

@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
+#include <iostream>
 #include <limits>
 #include <source_location>
 #include <cstring>
@@ -29,6 +31,36 @@ namespace er  = engine::renderer;
 
 namespace engine {
 namespace scene_rendering {
+
+// ─── Log routing ───────────────────────────────────────────────────────────
+// main.cpp redirects std::cout's streambuf into logs/engine_stdout_*.log
+// and mirrors std::cerr into the editor Output Log — but it does NOT touch
+// the C stdio streams.  Every std::printf in this file therefore went to
+// the console window and was discarded, which is why "[CLUSTER_RENDERER]
+// Finalized", "No clusters to upload" and the RT acceleration-structure
+// build reports have never appeared in a single captured log — the exact
+// lines needed to answer "why is RT not ready?".  These two shims keep the
+// printf-style call sites but route them through the streams that ARE
+// captured.
+static void clog_printf(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    std::cout << buf << std::flush;
+}
+
+static void clog_eprintf(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    std::cerr << buf << std::flush;
+}
 
 // ─── Push-constant struct layout sanity checks ────────────────────────
 // The same ClusterCullPushConstants struct is consumed by both C++ (via
@@ -438,7 +470,7 @@ ClusterRenderer::ClusterRenderer(
         std::source_location::current());
 
 #if CLUSTER_RENDERER_VERBOSE
-    std::printf("[CLUSTER_RENDERER] Initialized GPU cluster culling pipeline.\n");
+    clog_printf("[CLUSTER_RENDERER] Initialized GPU cluster culling pipeline.\n");
 #endif
 }
 
@@ -478,7 +510,7 @@ void ClusterRenderer::uploadMeshClusters(
     if (uploaded_mesh_count_ < 3 && num_clusters > 0) {
         const auto& c0 = cluster_mesh.clusters[0];
 #if CLUSTER_RENDERER_VERBOSE
-        fprintf(stderr,
+        clog_eprintf(
             "[CLUSTER_UPLOAD #%u] mesh_idx=%u clusters=%u "
             "LOCAL center=(%.3f,%.3f,%.3f) r=%.3f "
             "modelDiag=(%.3f,%.3f,%.3f,%.3f)\n",
@@ -487,7 +519,7 @@ void ClusterRenderer::uploadMeshClusters(
             c0.bounds_center.z, c0.bounds_radius,
             model_transform[0][0], model_transform[1][1],
             model_transform[2][2], model_transform[3][3]);
-        fprintf(stderr,
+        clog_eprintf(
             "  modelCol3=(%.3f,%.3f,%.3f,%.3f) "
             "LOCAL aabb_min=(%.3f,%.3f,%.3f) aabb_max=(%.3f,%.3f,%.3f)\n",
             model_transform[3][0], model_transform[3][1],
@@ -821,7 +853,7 @@ void ClusterRenderer::uploadMeshClusters(
 
         // Print first few world-space results for diagnosis.
         if (uploaded_mesh_count_ == 0 && c < 3) {
-            std::printf("  WS cluster[%u] center=(%.3f,%.3f,%.3f) r=%.3f "
+            clog_printf("  WS cluster[%u] center=(%.3f,%.3f,%.3f) r=%.3f "
                         "aabb=(%.3f..%.3f, %.3f..%.3f, %.3f..%.3f)\n",
                         c,
                         cull_info.bounds_sphere.x, cull_info.bounds_sphere.y,
@@ -1107,7 +1139,7 @@ void ClusterRenderer::finalizeUploads() {
     // Log VT registration outcome so we know the pool got populated.
     // Counts unique source images registered (cache size).  If this is
     // zero, vt_manager_ wasn't wired or no materials had textures.
-    std::printf("[RVT] registered %zu albedo textures, %zu normal textures with VT pool.\n",
+    clog_printf("[RVT] registered %zu albedo textures, %zu normal textures with VT pool.\n",
                 vt_albedo_id_cache_.size(),
                 vt_normal_id_cache_.size());
 
@@ -1125,7 +1157,7 @@ void ClusterRenderer::finalizeUploads() {
             cluster_to_mesh_.clear();
             mesh_visible_.clear();
         }
-        std::printf("[CLUSTER_RENDERER] No clusters to upload.\n");
+        clog_printf("[CLUSTER_RENDERER] No clusters to upload.\n");
         return;
     }
 
@@ -1149,7 +1181,7 @@ void ClusterRenderer::finalizeUploads() {
             auto* gpu_data = reinterpret_cast<const glsl::ClusterCullInfo*>(mapped);
             const uint32_t n_check = std::min(5u, total_clusters_all_meshes_);
             for (uint32_t i = 0; i < n_check; ++i) {
-                std::printf(
+                clog_printf(
                     "  GPU[%u] center=(%.2f,%.2f,%.2f) r=%.2f\n",
                     i,
                     gpu_data[i].bounds_sphere.x,
@@ -1172,7 +1204,7 @@ void ClusterRenderer::finalizeUploads() {
             device_,
             staging_material_params_.size() * sizeof(glsl::BindlessMaterialParams),
             staging_material_params_.data());
-        std::printf("[CLUSTER_RENDERER] Uploaded %zu material(s) to GPU.\n",
+        clog_printf("[CLUSTER_RENDERER] Uploaded %zu material(s) to GPU.\n",
                     staging_material_params_.size());
     } else {
         // Fallback: single white material entry so the shader always has data.
@@ -1394,7 +1426,7 @@ void ClusterRenderer::finalizeUploads() {
                         vmax.x, vmax.y, vmax.z);
 
             std::fclose(dbg);
-            std::printf("[CLUSTER_RENDERER] Debug dump written to "
+            clog_printf("[CLUSTER_RENDERER] Debug dump written to "
                         "cluster_debug_dump.txt\n");
         }
     }
@@ -1512,7 +1544,7 @@ void ClusterRenderer::finalizeUploads() {
         buildRtShadowBvh();
     }
 
-    std::printf(
+    clog_printf(
         "[CLUSTER_RENDERER] Finalized: %u clusters from %u meshes, "
         "merged VB: %u verts (%zu KB), IB: %u indices (%zu KB).\n",
         total_clusters_all_meshes_, uploaded_mesh_count_,
@@ -1524,7 +1556,7 @@ void ClusterRenderer::finalizeUploads() {
     // Store first cluster for display in ImGui.
     if (!staging_cull_infos_.empty()) {
         debug_first_cluster_bounds_ = staging_cull_infos_[0].bounds_sphere;
-        fprintf(stderr,
+        clog_eprintf(
             "[CLUSTER_FINALIZE] staging[0] bounds_sphere=(%.3f,%.3f,%.3f) r=%.3f\n",
             staging_cull_infos_[0].bounds_sphere.x,
             staging_cull_infos_[0].bounds_sphere.y,
@@ -1547,7 +1579,7 @@ void ClusterRenderer::finalizeUploads() {
 
         for (uint32_t i = 0; i < std::min(5u, (uint32_t)debug_sample_clusters_.size()); ++i) {
             const auto& c = debug_sample_clusters_[i];
-            std::printf(
+            clog_printf(
                 "  [%u] center=(%.2f,%.2f,%.2f) r=%.2f\n",
                 i,
                 c.bounds_sphere.x, c.bounds_sphere.y, c.bounds_sphere.z,
@@ -1576,7 +1608,7 @@ void ClusterRenderer::finalizeUploads() {
     // Initialize all meshes as visible until the first readback.
     mesh_visible_.assign(mesh_cluster_ranges_.size(), true);
 
-    std::printf("[CLUSTER_RENDERER] Built cluster→mesh LUT: %u meshes, "
+    clog_printf("[CLUSTER_RENDERER] Built cluster→mesh LUT: %u meshes, "
                 "%llu total triangles.\n",
                 static_cast<uint32_t>(mesh_cluster_ranges_.size()),
                 static_cast<unsigned long long>(total_triangles_all_meshes_));
@@ -1628,7 +1660,7 @@ void ClusterRenderer::markBaseUploads() {
     base_normal_tex_count_ = staging_normal_tex_views_.size();
     base_mesh_count_     = uploaded_mesh_count_;
     base_marked_         = true;
-    std::printf("[CLUSTER_RENDERER] Base uploads marked: %u meshes, "
+    clog_printf("[CLUSTER_RENDERER] Base uploads marked: %u meshes, "
                 "%zu clusters, %zu verts.\n",
                 base_mesh_count_, base_cluster_count_, base_vertex_count_);
 }
@@ -1806,7 +1838,7 @@ void ClusterRenderer::setVtEnabled(bool enabled) {
             off_copy.data());
     }
     vt_enabled_ = enabled;
-    std::printf("[CLUSTER_RENDERER] VT %s — material_params re-uploaded "
+    clog_printf("[CLUSTER_RENDERER] VT %s — material_params re-uploaded "
                 "(%zu materials, %zu KB)\n",
                 enabled ? "ENABLED" : "DISABLED",
                 material_params_backup_.size(), bytes / 1024u);
@@ -1831,7 +1863,7 @@ void ClusterRenderer::applyMaterialCategories(
     const helper::MaterialClassifier& cls) {
     if (material_params_backup_.empty() ||
         !material_params_buffer_.memory) {
-        std::printf(
+        clog_printf(
             "[CLUSTER_RENDERER] applyMaterialCategories: no params to "
             "patch (backup_empty=%d memory_null=%d)\n",
             static_cast<int>(material_params_backup_.empty()),
@@ -1847,7 +1879,7 @@ void ClusterRenderer::applyMaterialCategories(
         material_params_backup_.size(), staging_material_names_.size());
     if (pair_count != material_params_backup_.size() ||
         pair_count != staging_material_names_.size()) {
-        std::printf(
+        clog_printf(
             "[CLUSTER_RENDERER] applyMaterialCategories: name list "
             "length mismatch (params=%zu names=%zu), patching first %zu\n",
             material_params_backup_.size(),
@@ -1889,7 +1921,7 @@ void ClusterRenderer::applyMaterialCategories(
 
     categories_applied_ = true;
 
-    std::printf(
+    clog_printf(
         "[CLUSTER_RENDERER] applyMaterialCategories: patched %d / %d "
         "entries (%d classified non-Unknown). "
         "Unknown=%d Floor=%d Wall=%d Door=%d Object=%d Glass=%d "
@@ -2663,7 +2695,7 @@ void ClusterRenderer::initBindlessPipeline(
     const renderer::PipelineRenderbufferFormats& framebuffer_format) {
 
     if (!gpu_ready_ || total_merged_vertices_ == 0) {
-        std::printf("[CLUSTER_RENDERER] Skipping bindless pipeline init — "
+        clog_printf("[CLUSTER_RENDERER] Skipping bindless pipeline init — "
                     "no merged geometry.\n");
         return;
     }
@@ -3252,7 +3284,7 @@ void ClusterRenderer::initBindlessPipeline(
                     4u + l, default_sampler_, dummy_texture_.view,
                     er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
             }
-            std::printf("[CLUSTER_RENDERER] WARNING: vt_manager_ not set "
+            clog_printf("[CLUSTER_RENDERER] WARNING: vt_manager_ not set "
                         "during writeBindlessDescriptors. VT bindings 8/9 "
                         "left UNWRITTEN — call setVtManager() before "
                         "initBindlessPipeline().\n");
@@ -3268,7 +3300,7 @@ void ClusterRenderer::initBindlessPipeline(
     // The views are shared_ptrs into DrawableData textures that stay
     // alive anyway; the extra cost is just the vector itself.
 
-    std::printf("[CLUSTER_RENDERER] Bindless graphics pipeline created. "
+    clog_printf("[CLUSTER_RENDERER] Bindless graphics pipeline created. "
                 "Bindless set at index %u.\n", bindless_set_index);
 }
 
@@ -4830,7 +4862,7 @@ void ClusterRenderer::buildRtShadowBvh() {
     rt_shadow_ready_ = true;
     const double ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
-    std::printf(
+    clog_printf(
         "[CLUSTER_RENDERER] RT shadow BVH: %u clusters -> %u nodes, "
         "%zu leaf refs (%.1f ms build, %.1f MB)\n",
         n, rt_bvh_node_count_, leaf_indices.size(), ms,
@@ -5134,7 +5166,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
     rt_skel_have_gpu_state_ = false;
     const double hw_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
-    std::printf(
+    clog_printf(
         "[CLUSTER_RENDERER] HW RT shadow AS: %u opaque + %u masked tris "
         "(%.1f ms build, BLAS %.1f MB)\n",
         opaque_tris, masked_tris, hw_ms,
@@ -5401,7 +5433,7 @@ void ClusterRenderer::updateRtSkeletons(
     {
         static int s_frame = 0;
         if ((s_frame++ % 300) == 0) {
-            std::printf(
+            clog_printf(
                 "[RT_SKEL] update: %zu/%zu skeleton(s), %u tris, hw_as=%d\n",
                 headers.size(), skeletons.size(),
                 (uint32_t)(all_idx.size() / 3u),
@@ -5692,7 +5724,7 @@ void ClusterRenderer::destroy() {
 
 bool ClusterRenderer::verifyIndirectCommands(uint32_t max_commands_to_check) const {
     if (!draw_count_buffer_.memory || !indirect_draw_buffer_.memory) {
-        std::fprintf(stderr, "[VERIFY] Failed to map draw_count_buffer_.\n");
+        clog_eprintf( "[VERIFY] Failed to map draw_count_buffer_.\n");
         return false;
     }
 
@@ -5702,24 +5734,24 @@ bool ClusterRenderer::verifyIndirectCommands(uint32_t max_commands_to_check) con
         const void* ptr = device_->mapMemory(
             draw_count_buffer_.memory, sizeof(uint32_t), 0);
         if (!ptr) {
-            std::fprintf(stderr, "[VERIFY] Failed to map draw_count_buffer_.\n");
+            clog_eprintf( "[VERIFY] Failed to map draw_count_buffer_.\n");
             return false;
         }
         std::memcpy(&draw_count, ptr, sizeof(uint32_t));
         device_->unmapMemory(draw_count_buffer_.memory);
     }
-    std::fprintf(stderr,
+    clog_eprintf(
         "[VERIFY] draw_count=%u  total_clusters=%u  "
         "total_merged_verts=%u  total_merged_indices=%u\n",
         draw_count, total_clusters_all_meshes_,
         total_merged_vertices_, total_merged_indices_);
 
     if (draw_count == 0) {
-        std::fprintf(stderr, "[VERIFY] draw_count is 0 — no clusters visible.\n");
+        clog_eprintf( "[VERIFY] draw_count is 0 — no clusters visible.\n");
         return true;
     }
     if (draw_count > total_clusters_all_meshes_) {
-        std::fprintf(stderr,
+        clog_eprintf(
             "[VERIFY] CORRUPTED: draw_count=%u > total_clusters=%u\n",
             draw_count, total_clusters_all_meshes_);
         return false;
@@ -5733,7 +5765,7 @@ bool ClusterRenderer::verifyIndirectCommands(uint32_t max_commands_to_check) con
     const void* indirect_ptr = device_->mapMemory(
         indirect_draw_buffer_.memory, map_size, 0);
     if (!indirect_ptr) {
-        std::fprintf(stderr, "[VERIFY] Failed to map indirect or index buffer.\n");
+        clog_eprintf( "[VERIFY] Failed to map indirect or index buffer.\n");
         return false;
     }
 
@@ -5746,7 +5778,7 @@ bool ClusterRenderer::verifyIndirectCommands(uint32_t max_commands_to_check) con
                    (cmd.vertex_offset < 0 ||
                     static_cast<uint32_t>(cmd.vertex_offset) >= total_merged_vertices_);
         if (bad) {
-            std::fprintf(stderr,
+            clog_eprintf(
                 "[VERIFY] cmd[%u]: indexCount=%u firstIndex=%u "
                 "vertexOffset=%d firstInstance=%u — OUT OF RANGE\n",
                 i, cmd.index_count, cmd.first_index,

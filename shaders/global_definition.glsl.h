@@ -235,6 +235,21 @@
 // up per-mesh uv control -- which is exactly what a tiling noise wants
 // and exactly what a hand-authored asset does not, hence per material.
 #define FEATURE_MATERIAL_TRIPLANAR              0x00400000
+// ── SNOW COVER ────────────────────────────────────────────────────────
+// The asset is standing on snow and should LOOK it: getBaseColor lerps
+// the sampled albedo toward snow, weighted by how upward-facing the
+// surface is, so tops load up and undersides keep the species' own
+// colour.  Set per SECTION at bake time from the material name marker
+// "_snowcover" (see kSecSnowCover in model_inspect.h) — the scatter
+// decides which trees stand on snow and names their materials
+// accordingly, so one species can be green in the valley and white on
+// the ridge without a second mesh.
+//
+// It is a SHADER tint, not a baked texture, for the reason every other
+// marker here is: the geometry and the atlas are shared by both, and
+// duplicating a 30-species tree library to change its colour would cost
+// the library again in VRAM and in bake time.
+#define FEATURE_MATERIAL_SNOW_COVER             0x00800000
 
 #define FEATURE_INPUT_HAS_TANGENT               0x00000001
 #define FEATURE_INPUT_SHADOW_DISABLED           0x00000002
