@@ -202,6 +202,20 @@ layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 2)
     readonly buffer HwRtMaskedTriMats {
     uint hw_rt_masked_tri_mat[];
 };
+//   3  opaque geometry's index buffer (GLOBAL vertex ids, like binding 1)
+//   4  per-opaque-triangle material id (into rt_materials[])
+// Needed by the CLOSEST-HIT GI ray (hwRtGiRadiance): unlike the any-hit
+// shadow query, a committed GI hit on the opaque geometry must recover
+// its triangle (normal) + material (albedo) — the shadow-only bindings
+// above cover masked candidates only.
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 3)
+    readonly buffer HwRtOpaqueIndices {
+    uint hw_rt_opaque_indices[];
+};
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 4)
+    readonly buffer HwRtOpaqueTriMats {
+    uint hw_rt_opaque_tri_mat[];
+};
 #endif
 
 // Octahedral decode — companion of the encode in cluster_bindless.frag
@@ -1088,6 +1102,131 @@ float hwRtAoFactor(vec3 world_pos, vec3 world_normal,
     }
     return open / float(RT_AO_SAMPLES_HW);
 }
+
+// ─── Hardware 1-bounce GI ray (closest hit vs the cluster TLAS) ──────
+// Same estimator as rtGiRadiance, but the closest-hit walk runs in the
+// RT cores instead of the software cluster BVH.  This matters far more
+// for GI than for shadows: the shadow query is any-hit (first opaque
+// hit ends it), while a closest-hit ray must consider EVERYTHING along
+// its 120 m interval — on the unordered software BVH that walk was the
+// entire "Deferred Resolve Compute" cost in dense scenes (hundreds of
+// ms/frame), dwarfing the actual ray-query shadows it ran next to.
+// Alpha-masked candidates get the same texel test as the shadow query;
+// opaque hits commit in hardware.  The committed hit's geometry index
+// picks the right index/material stream (geom 0 = opaque, 1 = masked),
+// and both index buffers hold GLOBAL vertex ids into rt_pos_uv[].
+vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq, hw_rt_tlas,
+        gl_RayFlagsNoneEXT, 0xFFu,
+        ro, RT_SHADOW_BIAS, rd, RT_GI_MAX_DIST);
+
+    while (rayQueryProceedEXT(rq)) {
+        // Only non-opaque (masked) triangle candidates reach here.
+        if (rayQueryGetIntersectionTypeEXT(rq, false) ==
+            gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const int prim =
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            const uint mat_id = hw_rt_masked_tri_mat[prim];
+            BindlessMaterialParams m = rt_materials[mat_id];
+
+            uint i0 = hw_rt_masked_indices[3 * prim + 0];
+            uint i1 = hw_rt_masked_indices[3 * prim + 1];
+            uint i2 = hw_rt_masked_indices[3 * prim + 2];
+            vec2 uv0 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i0].w));
+            vec2 uv1 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i1].w));
+            vec2 uv2 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i2].w));
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+            vec2 huv = uv0 * (1.0 - bary.x - bary.y)
+                     + uv1 * bary.x + uv2 * bary.y;
+
+            float a = (m.base_color_tex_idx >= 0)
+                ? textureLod(rt_base_color_textures[
+                      nonuniformEXT(m.base_color_tex_idx)], huv,
+                      RT_GI_TEX_LOD).a
+                      * m.base_color_factor.a
+                : m.base_color_factor.a;
+            if (a >= m.alpha_cutoff) {
+                rayQueryConfirmIntersectionEXT(rq);   // solid texel
+            }
+        }
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) ==
+        gl_RayQueryCommittedIntersectionNoneEXT) {
+        // Miss: the cosine ray sees sky — the lambertian cube is the
+        // smooth 1-spp estimate (identical to the software path).
+        vec3 sky = texture(lambertian_env_sampler, rd).rgb;
+#ifndef USE_HDR
+        sky = sRGBToLinear(sky);
+#endif
+        return sky;
+    }
+
+    const float ht = rayQueryGetIntersectionTEXT(rq, true);
+    const vec3  hp = ro + rd * ht;
+
+    // Skeleton-instance hit (custom index 1).  The software path skips
+    // characters entirely (they're not in its BVH); here the hardware
+    // walk finds them anyway, so shade a neutral matte bounce instead of
+    // reading cluster streams the skeleton BLAS has no entries in.
+    if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) != 0) {
+        vec3 sky_amb = texture(lambertian_env_sampler, -rd).rgb;
+#ifndef USE_HDR
+        sky_amb = sRGBToLinear(sky_amb);
+#endif
+        return vec3(0.35) * sky_amb * RT_GI_SKY_LEAK;
+    }
+
+    const int  geom = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+    const int  prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    const bool masked = (geom != 0);
+
+    uint i0 = masked ? hw_rt_masked_indices[3 * prim + 0]
+                     : hw_rt_opaque_indices[3 * prim + 0];
+    uint i1 = masked ? hw_rt_masked_indices[3 * prim + 1]
+                     : hw_rt_opaque_indices[3 * prim + 1];
+    uint i2 = masked ? hw_rt_masked_indices[3 * prim + 2]
+                     : hw_rt_opaque_indices[3 * prim + 2];
+    const uint mat_id = masked ? hw_rt_masked_tri_mat[prim]
+                               : hw_rt_opaque_tri_mat[prim];
+    BindlessMaterialParams m = rt_materials[mat_id];
+
+    vec4 p0 = rt_pos_uv[i0];
+    vec4 p1 = rt_pos_uv[i1];
+    vec4 p2 = rt_pos_uv[i2];
+
+    vec4 texel = vec4(1.0);
+    if (m.base_color_tex_idx >= 0) {
+        vec2 uv0 = unpackHalf2x16(floatBitsToUint(p0.w));
+        vec2 uv1 = unpackHalf2x16(floatBitsToUint(p1.w));
+        vec2 uv2 = unpackHalf2x16(floatBitsToUint(p2.w));
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        vec2 huv = uv0 * (1.0 - bary.x - bary.y)
+                 + uv1 * bary.x + uv2 * bary.y;
+        texel = textureLod(
+            rt_base_color_textures[nonuniformEXT(m.base_color_tex_idx)],
+            huv, RT_GI_TEX_LOD);
+    }
+    vec3 best_alb = texel.rgb * m.base_color_factor.rgb;
+    vec3 best_n   = normalize(cross(p1.xyz - p0.xyz, p2.xyz - p0.xyz));
+
+    // Bounce radiance: hit albedo lit by the sun (real occlusion ray —
+    // hardware this time) + a small sky leak (see rtGiRadiance).
+    vec3  hn  = (dot(best_n, rd) < 0.0) ? best_n : -best_n;
+    float ndl = max(dot(hn, sun_L), 0.0);
+    float vis = (ndl > 0.0)
+        ? hwRtShadowRayVisible(hp + hn * RT_GI_NORMAL_BIAS, sun_L,
+                               RT_SHADOW_MAX_DIST)
+        : 0.0;
+    vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
+#ifndef USE_HDR
+    sky_amb = sRGBToLinear(sky_amb);
+#endif
+    return best_alb * (sun_col * (ndl * vis / M_PI) +
+                       sky_amb * RT_GI_SKY_LEAK);
+}
 #endif
 
 float ssrtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
@@ -1519,8 +1658,23 @@ void main() {
             fract(csmIGN(vec2(px) + vec2(37.0, 17.0)) +
                   gi_frame * 0.7548776662));
         vec3 gi_dir = rtCosHemisphereDir(N_geom, xi);
-        vec3 gi_s = rtGiRadiance(
-            world_pos + N_geom * RT_GI_NORMAL_BIAS, gi_dir, L, light_col);
+        // Hardware TLAS closest-hit when this variant has it and the
+        // AS is armed — the software-BVH closest-hit walk is orders of
+        // magnitude slower and was serialising the whole resolve.
+        vec3 gi_s;
+#ifdef HW_RT_SHADOW
+        if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW)
+            != 0u) {
+            gi_s = hwRtGiRadiance(
+                world_pos + N_geom * RT_GI_NORMAL_BIAS, gi_dir,
+                L, light_col);
+        } else
+#endif
+        {
+            gi_s = rtGiRadiance(
+                world_pos + N_geom * RT_GI_NORMAL_BIAS, gi_dir,
+                L, light_col);
+        }
 
         // Temporal accumulation with velocity reprojection.
         vec3  gi_E  = gi_s;

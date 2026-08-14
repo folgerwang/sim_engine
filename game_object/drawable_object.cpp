@@ -4197,25 +4197,40 @@ static void drawMesh(
     // hashing / pipeline batching still benefits from cache locality.
     // Per-mesh sorting (typically <50 primitives) is enough for
     // correctness; cross-mesh alpha sorting is the WBOIT resolve's job.
-    std::vector<const ego::PrimitiveInfo*> sorted_prims;
-    sorted_prims.reserve(mesh_info.primitives_.size());
-    for (const auto& p : mesh_info.primitives_) sorted_prims.push_back(&p);
-    std::stable_sort(
-        sorted_prims.begin(), sorted_prims.end(),
-        [&](const ego::PrimitiveInfo* a, const ego::PrimitiveInfo* b) {
-            auto bucket = [&](const ego::PrimitiveInfo* pp) -> int {
-                if (pp->material_idx_ < 0) return 0;
-                switch (drawable_object->materials_[pp->material_idx_].alpha_mode_) {
-                    case ego::AlphaMode::Opaque: return 0;
-                    case ego::AlphaMode::Mask:   return 1;
-                    case ego::AlphaMode::Blend:  return 2;
-                }
-                return 0;
-            };
-            return bucket(a) < bucket(b);
-        });
+    // Single-primitive fast path (the overwhelmingly common case for
+    // placed-instance meshes): nothing to sort, and skipping the vector
+    // saves a heap allocation per mesh per pass — at tens of thousands
+    // of drawn meshes per frame those allocations were measurable CPU
+    // time.  The multi-primitive path keeps the alpha-mode sort.
+    const ego::PrimitiveInfo* single_prim = nullptr;
+    std::vector<const ego::PrimitiveInfo*> sorted_vec;
+    if (mesh_info.primitives_.size() == 1) {
+        single_prim = &mesh_info.primitives_[0];
+    } else {
+        sorted_vec.reserve(mesh_info.primitives_.size());
+        for (const auto& p : mesh_info.primitives_) sorted_vec.push_back(&p);
+        std::stable_sort(
+            sorted_vec.begin(), sorted_vec.end(),
+            [&](const ego::PrimitiveInfo* a, const ego::PrimitiveInfo* b) {
+                auto bucket = [&](const ego::PrimitiveInfo* pp) -> int {
+                    if (pp->material_idx_ < 0) return 0;
+                    switch (drawable_object->materials_[pp->material_idx_].alpha_mode_) {
+                        case ego::AlphaMode::Opaque: return 0;
+                        case ego::AlphaMode::Mask:   return 1;
+                        case ego::AlphaMode::Blend:  return 2;
+                    }
+                    return 0;
+                };
+                return bucket(a) < bucket(b);
+            });
+    }
+    const ego::PrimitiveInfo* const* prims_begin =
+        single_prim ? &single_prim : sorted_vec.data();
+    const size_t prims_count =
+        single_prim ? 1 : sorted_vec.size();
 
-    for (const auto* prim_ptr : sorted_prims) {
+    for (size_t prim_i = 0; prim_i < prims_count; ++prim_i) {
+        const auto* prim_ptr = prims_begin[prim_i];
         const auto& prim = *prim_ptr;
         const auto& attrib_list = prim.attribute_descs_;
         if (drawable_object->m_debug_force_red_ ||
@@ -4433,8 +4448,27 @@ static void drawMesh(
     }
 }
 
+// Draw the mesh attached to ONE node (no recursion).  Shared by the
+// recursive drawNodes walk (sub-object-filter path) and the flat
+// mesh_node_flat_ iteration in DrawableObject::draw (the common path) —
+// see DrawableData::mesh_node_flat_ for why the flat lane exists.
+static void drawNodeMesh(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::shared_ptr<renderer::PipelineLayout>& drawable_pipeline_layout,
+    const renderer::DescriptorSetList& desc_set_list,
+    int32_t node_idx,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipelines,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    bool depth_only,
+    size_t& last_hash,
+    uint32_t csm_cascade_idx,
+    bool mesh_shader_csm_mode,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines);
+
 static void drawNodes(
-    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<ego::DrawableData>& drawable_object,
     const std::shared_ptr<renderer::PipelineLayout>& drawable_pipeline_layout,
     const renderer::DescriptorSetList& desc_set_list,
@@ -4452,6 +4486,45 @@ static void drawNodes(
             drawable_object->m_debug_log_draws_) {
             ++drawable_object->m_debug_draw_nodes_visited_;
         }
+        drawNodeMesh(cmd_buf, drawable_object, drawable_pipeline_layout,
+                     desc_set_list, node_idx, pipelines, viewports,
+                     scissors, depth_only, last_hash, csm_cascade_idx,
+                     mesh_shader_csm_mode, mesh_shader_fallback_pipelines);
+
+        const auto& node = drawable_object->nodes_[node_idx];
+        for (auto& child_idx : node.child_idx_) {
+            drawNodes(cmd_buf,
+                drawable_object,
+                drawable_pipeline_layout,
+                desc_set_list,
+                child_idx,
+                pipelines,
+                viewports,
+                scissors,
+                depth_only,
+                last_hash,
+                csm_cascade_idx,
+                mesh_shader_csm_mode,
+                mesh_shader_fallback_pipelines);
+        }
+    }
+}
+
+static void drawNodeMesh(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<ego::DrawableData>& drawable_object,
+    const std::shared_ptr<renderer::PipelineLayout>& drawable_pipeline_layout,
+    const renderer::DescriptorSetList& desc_set_list,
+    int32_t node_idx,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>& pipelines,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    bool depth_only,
+    size_t& last_hash,
+    uint32_t csm_cascade_idx,
+    bool mesh_shader_csm_mode,
+    std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines) {
+    {
         const auto& node = drawable_object->nodes_[node_idx];
         // Per-wrapper sub-object filter (staged by DrawableObject::draw):
         // when active, only the matching node's mesh is drawn.  Children
@@ -4539,22 +4612,6 @@ static void drawNodes(
                 node.indirect_cmd_ofs_);
 
             num_draw_meshes++;
-        }
-
-        for (auto& child_idx : node.child_idx_) {
-            drawNodes(cmd_buf,
-                drawable_object,
-                drawable_pipeline_layout,
-                desc_set_list,
-                child_idx,
-                pipelines,
-                viewports,
-                scissors,
-                depth_only,
-                last_hash,
-                csm_cascade_idx,
-                mesh_shader_csm_mode,
-                mesh_shader_fallback_pipelines);
         }
     }
 }
@@ -7821,8 +7878,38 @@ void DrawableObject::draw(
                 mesh_shader_fallback);
         }
     } else {
-        for (auto node_idx : object_->scenes_[root_node].nodes_) {
-            drawNodes(
+        // ── Flat mesh-node lane (common path) ────────────────────────
+        // Build once: DFS over the default scene's roots in recursion
+        // order, keeping ONLY nodes that carry a mesh.  See the member
+        // comment on DrawableData::mesh_node_flat_ — the recursive walk
+        // visited every empty grouping node of procedurally generated
+        // layouts (~1.5M nodes/pass scene-wide for a few hundred mesh
+        // nodes) and dominated CPU command recording.
+        if (!object_->mesh_node_flat_built_) {
+            object_->mesh_node_flat_.clear();
+            std::vector<int32_t> dfs;
+            const auto& roots = object_->scenes_[root_node].nodes_;
+            for (auto it = roots.rbegin(); it != roots.rend(); ++it) {
+                dfs.push_back(*it);
+            }
+            while (!dfs.empty()) {
+                const int32_t ni = dfs.back();
+                dfs.pop_back();
+                if (ni < 0 ||
+                    ni >= (int32_t)object_->nodes_.size()) continue;
+                const auto& node = object_->nodes_[ni];
+                if (node.mesh_idx_ >= 0) {
+                    object_->mesh_node_flat_.push_back(ni);
+                }
+                for (auto cit = node.child_idx_.rbegin();
+                     cit != node.child_idx_.rend(); ++cit) {
+                    dfs.push_back(*cit);
+                }
+            }
+            object_->mesh_node_flat_built_ = true;
+        }
+        for (const int32_t node_idx : object_->mesh_node_flat_) {
+            drawNodeMesh(
                 cmd_buf,
                 object_,
                 drawable_pipeline_layout_,

@@ -625,6 +625,23 @@ struct DrawableData {
     // selection, and how many tiles fell in each band.
     uint32_t                    lod_nodes_drawn_ = 0;
 
+    // ── Flattened mesh-node list (draw-path fast lane) ────────────────
+    // DFS-ordered indices of every node with mesh_idx_ >= 0, over all
+    // roots of the default scene.  Built lazily on first draw (node
+    // topology is immutable once ready_) and iterated INSTEAD of the
+    // recursive whole-tree walk: procedurally generated files carry
+    // hundreds of thousands of empty grouping nodes around a few hundred
+    // mesh nodes (587k nodes / 180 meshes was measured for one placed
+    // house layout), and the recursive visit of every one of them —
+    // ~1.5M nodes per pass across the scene — was the dominant CPU cost
+    // of command recording (~35 ms/frame in the forward pass alone).
+    // Node transforms are pre-baked into node.cached_matrix_, so the
+    // draw never needed the parent chain — only the mesh nodes.
+    // The per-wrapper sub-object filter path (m_only_render_node_) keeps
+    // the old targeted recursion and never touches this list.
+    std::vector<int32_t>        mesh_node_flat_;
+    bool                        mesh_node_flat_built_ = false;
+
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> update_instance_buffer_desc_set_;
 

@@ -4903,7 +4903,12 @@ void ClusterRenderer::buildHwRtShadowAs() {
     std::vector<uint32_t> opaque_idx;
     std::vector<uint32_t> masked_idx;
     std::vector<uint32_t> masked_tri_mat;
+    // Per-OPAQUE-triangle material id: the closest-hit GI ray shades the
+    // committed hit (albedo + sun bounce), so unlike the shadow-only
+    // query it needs materials for the opaque geometry too.
+    std::vector<uint32_t> opaque_tri_mat;
     opaque_idx.reserve(staging_indices_.size());
+    opaque_tri_mat.reserve(staging_indices_.size() / 3u);
     for (uint32_t ci = 0; ci < total_clusters_all_meshes_; ++ci) {
         const glsl::ClusterDrawInfo& draw = staging_draw_infos_[ci];
         if (draw.material_idx >= staging_material_params_.size()) continue;
@@ -4923,19 +4928,23 @@ void ClusterRenderer::buildHwRtShadowAs() {
             dst.push_back(
                 staging_indices_[draw.index_offset + k] + draw.vertex_offset);
         }
-        if (masked) {
+        {
             const uint32_t tri_n = draw.index_count / 3u;
+            std::vector<uint32_t>& mat_dst =
+                masked ? masked_tri_mat : opaque_tri_mat;
             for (uint32_t t = 0; t < tri_n; ++t) {
-                masked_tri_mat.push_back(draw.material_idx);
+                mat_dst.push_back(draw.material_idx);
             }
         }
     }
     const uint32_t opaque_tris = (uint32_t)opaque_idx.size() / 3u;
     const uint32_t masked_tris = (uint32_t)masked_idx.size() / 3u;
     if (opaque_tris + masked_tris == 0) return;
-    // Keep the SSBO bindings legal when there are no masked casters.
+    // Keep the SSBO bindings legal when either partition is empty.
     if (masked_idx.empty())     masked_idx.assign(3, 0u);
     if (masked_tri_mat.empty()) masked_tri_mat.assign(1, 0u);
+    if (opaque_idx.empty())     opaque_idx.assign(3, 0u);
+    if (opaque_tri_mat.empty()) opaque_tri_mat.assign(1, 0u);
 
     hw_rt_opaque_index_buffer_ = createDeviceSSBO(
         device_, opaque_idx.size() * sizeof(uint32_t), opaque_idx.data(),
@@ -4946,6 +4955,9 @@ void ClusterRenderer::buildHwRtShadowAs() {
     hw_rt_masked_tri_mat_buffer_ = createDeviceSSBO(
         device_, masked_tri_mat.size() * sizeof(uint32_t),
         masked_tri_mat.data());
+    hw_rt_opaque_tri_mat_buffer_ = createDeviceSSBO(
+        device_, opaque_tri_mat.size() * sizeof(uint32_t),
+        opaque_tri_mat.data());
 
     // ── 2. BLAS: geometry 0 = opaque, geometry 1 = alpha-masked ──────
     const auto vertex_addr = rt_pos_uv_buffer_.buffer->getDeviceAddress();
@@ -5129,16 +5141,18 @@ void ClusterRenderer::buildHwRtShadowAs() {
     // initDeferredResolve (the app builds the HW resolve pipeline layout
     // before the first finalize).
     if (!hw_rt_desc_set_layout_) {
-        std::vector<er::DescriptorSetLayoutBinding> b(3);
+        std::vector<er::DescriptorSetLayoutBinding> b(5);
         b[0] = er::helper::getBufferDescriptionSetLayoutBinding(
             0, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::ACCELERATION_STRUCTURE_KHR);
-        b[1] = er::helper::getBufferDescriptionSetLayoutBinding(
-            1, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            er::DescriptorType::STORAGE_BUFFER);
-        b[2] = er::helper::getBufferDescriptionSetLayoutBinding(
-            2, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            er::DescriptorType::STORAGE_BUFFER);
+        // 1/2 = masked indices + per-masked-tri material (shadow alpha
+        // test); 3/4 = opaque indices + per-opaque-tri material (GI
+        // closest-hit shading).
+        for (int i = 1; i < 5; ++i) {
+            b[i] = er::helper::getBufferDescriptionSetLayoutBinding(
+                i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_BUFFER);
+        }
         hw_rt_desc_set_layout_ = device_->createDescriptorSetLayout(b);
     }
     if (!hw_rt_desc_set_) {
@@ -5146,7 +5160,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
             descriptor_pool_, hw_rt_desc_set_layout_, 1)[0];
     }
     er::WriteDescriptorList hw_writes;
-    hw_writes.reserve(3);
+    hw_writes.reserve(5);
     er::Helper::addOneAccelerationStructure(hw_writes, hw_rt_desc_set_,
         er::DescriptorType::ACCELERATION_STRUCTURE_KHR, 0,
         { hw_rt_tlas_handle_ });
@@ -5158,6 +5172,14 @@ void ClusterRenderer::buildHwRtShadowAs() {
         er::DescriptorType::STORAGE_BUFFER, 2,
         hw_rt_masked_tri_mat_buffer_.buffer,
         static_cast<uint32_t>(masked_tri_mat.size() * sizeof(uint32_t)));
+    er::Helper::addOneBuffer(hw_writes, hw_rt_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 3,
+        hw_rt_opaque_index_buffer_.buffer,
+        static_cast<uint32_t>(opaque_idx.size() * sizeof(uint32_t)));
+    er::Helper::addOneBuffer(hw_writes, hw_rt_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, 4,
+        hw_rt_opaque_tri_mat_buffer_.buffer,
+        static_cast<uint32_t>(opaque_tri_mat.size() * sizeof(uint32_t)));
     device_->updateDescriptorSets(hw_writes);
 
     hw_rt_shadow_ready_ = true;

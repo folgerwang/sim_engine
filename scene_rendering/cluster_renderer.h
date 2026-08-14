@@ -394,13 +394,16 @@ private:
     // baked in) so both geometries share rt_pos_uv_buffer_ as the vertex
     // source and the shader can fetch UVs with the same indices.
     // hw_rt_desc_set_ (COMPUTE): 0 TLAS, 1 masked index buffer (uint[]),
-    // 2 per-masked-triangle material id (uint[]).  The application binds
-    // it at set RUNTIME_LIGHTS_PARAMS_SET + 2 of the deferred-resolve
+    // 2 per-masked-triangle material id (uint[]), 3 opaque index buffer
+    // (uint[]), 4 per-opaque-triangle material id (uint[]) — 3/4 feed
+    // the closest-hit GI ray's hit shading.  The application binds it
+    // at set RUNTIME_LIGHTS_PARAMS_SET + 2 of the deferred-resolve
     // HW-RT pipeline; its layout MUST stay identically defined in
     // application.cpp::initDeferredResolve.
     renderer::BufferInfo hw_rt_opaque_index_buffer_;
     renderer::BufferInfo hw_rt_masked_index_buffer_;
     renderer::BufferInfo hw_rt_masked_tri_mat_buffer_;
+    renderer::BufferInfo hw_rt_opaque_tri_mat_buffer_;
     renderer::BufferInfo hw_rt_blas_buffer_;
     renderer::BufferInfo hw_rt_blas_scratch_buffer_;
     renderer::BufferInfo hw_rt_tlas_buffer_;
