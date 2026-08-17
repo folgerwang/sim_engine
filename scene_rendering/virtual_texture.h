@@ -295,8 +295,13 @@ public:
     //     time GPU blit from this image into a temporary RGBA8
     //     image (Vulkan's blit decompresses BC formats), reads it
     //     back, and uses those bytes as the source.
-    //   * normal_image / mr_ao_image / emissive_image: GPU images
-    //     (kept alive for streaming-time blits).
+    //   * normal_image / mr_ao_image: GPU images consumed DURING this
+    //     call (one-time readback → CPU BC5/BC7 tile caches); NOT
+    //     stashed, so the caller may destroy both as soon as this
+    //     returns — that's what lets the 8K ORM source stop being
+    //     permanently resident.
+    //   * emissive_image: GPU image, kept alive for streaming-time
+    //     blits (the only remaining blit-fed layer).
     //   * width / height: source albedo dimensions in texels.
     //   * albedo_bc7_tiles: OPTIONAL pre-encoded per-tile BC7 cache
     //     blob, produced at import-bake time by
@@ -725,11 +730,11 @@ private:
     std::unordered_map<uint32_t, uint32_t> tile_to_slot_; // key → slot
 
     // Per-VT pre-encoded cache.  Built once at registerMaterial,
-    // consumed by the streamer's per-tile uploads.  Albedo holds the
-    // BC7 mip chain for all pool slots (kBc7BytesPerEntry per entry,
-    // entries laid out same order as the page-table window).  Source
-    // images for the other layers are kept alive on the GPU and
-    // blitted into pool slots on demand.
+    // consumed by the streamer's per-tile uploads.  ALBEDO / NORMAL /
+    // MR_AO hold BC tile chains for all pool slots (kBc7BytesPerEntry
+    // per entry, entries laid out same order as the page-table
+    // window).  Only the EMISSIVE source image is kept alive on the
+    // GPU and blitted into pool slots on demand.
     struct VtCacheEntry {
         uint32_t width   = 0;
         uint32_t height  = 0;
@@ -739,11 +744,11 @@ private:
         uint32_t page_table_offset = 0;
         // ALBEDO is BC7-encoded (via bc7enc) into bc7_albedo at
         // registerMaterial time; uploadTileAllLayers feeds it to the
-        // BC7_SRGB pool slot via copyBufferToImage.  The other three
-        // layers stay on the GPU and are blitted from their kept-
-        // alive source images (no readback / encode).  albedo_src
-        // is kept around for diagnostic format swaps but is unused
-        // by the live BC7 path.
+        // BC7_SRGB pool slot via copyBufferToImage.  Only EMISSIVE
+        // still stays on the GPU and is blitted from its kept-alive
+        // source image (no readback / encode).  albedo_src is kept
+        // around for diagnostic format swaps but is unused by the
+        // live BC7 path.
         std::vector<uint8_t> bc7_albedo;
         // Per-VT BC5 cache for the NORMAL layer.  Same per-tile entry
         // size as bc7_albedo (kBc7BytesPerEntry = 6480 B) — BC5 and
@@ -752,6 +757,14 @@ private:
         // arithmetic in uploadTileAllLayers.  Built at registerMaterial
         // time from the normal source's RGBA8 readback (only RG used).
         std::vector<uint8_t> bc5_normal;
+        // Per-VT BC7 cache for the METAL_ROUGH_AO layer.  Same
+        // 6480 B/entry layout as bc5_normal / bc7_albedo.  BC7_UNORM
+        // (linear ORM triple — no sRGB), built at registerMaterial
+        // time from the ORM source's RGBA8 readback via
+        // encodeBC7Mode6.  Replaces the old GPU-blit-from-resident-
+        // source path so the ORM source image can be destroyed by
+        // the caller after registerMaterial returns.
+        std::vector<uint8_t> bc7_mr_ao;
         std::shared_ptr<renderer::Image> albedo_src;
         std::shared_ptr<renderer::Image> normal_src;
         std::shared_ptr<renderer::Image> mr_ao_src;

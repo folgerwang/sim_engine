@@ -90,9 +90,13 @@ struct ShadowEmitPair {
 };
 taskPayloadSharedEXT ShadowEmitPair payload[MAX_SURVIVORS];
 
-// BindlessVertex stride in floats (sizeof(BindlessVertex) / 4).
-// position(3) + normal(3) + uv(2) + tangent(4) = 12 floats = 48 bytes.
-#define BINDLESS_VERTEX_FLOAT_STRIDE 12u
+// BindlessVertex stride in 32-bit words (sizeof(BindlessVertex) / 4).
+// Packed layout: position(3 floats) + packed_normal(1 uint) +
+// packed_tangent(1 uint) + packed_uv(1 uint) = 6 words = 24 bytes.
+// Only the position words are read here (depth-only pass), so the
+// float[] SSBO view stays valid — the packed uint words are simply
+// skipped by the stride.
+#define BINDLESS_VERTEX_FLOAT_STRIDE 6u
 
 vec3 fetchVertexPosition(uint vertex_idx) {
     uint base = vertex_idx * BINDLESS_VERTEX_FLOAT_STRIDE;

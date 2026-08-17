@@ -519,7 +519,9 @@
 // leaves memory.  Tiles in the 3-4 km band are PREFETCHED — their
 // generation is requested ahead of arrival so the PNG is on disk
 // before the slot is needed (see kDetailPrefetchRadius).
-// VRAM: 49 slots x (~2.1 MB heights + ~8.4 MB colour+surface) ~= 515 MB.
+// VRAM: 49 slots x (~2.1 MB heights + ~2.1 MB BC7 colour+surface)
+// ~= 206 MB (colour/surface arrays are BC7-compressed at upload —
+// see terrain_detail_stream.cpp).
 #define kDetailCacheSlots                       49
 // Prefetch ring half-width in tiles: request tile GENERATION (worker
 // starts producing the PNGs) when the camera enters ~4 km, without
@@ -535,7 +537,10 @@
 #define kDetailFadeStartMeters                  2048.0f
 #define kDetailFadeEndMeters                    3072.0f
 
-#define kDetailNoiseTextureSize                 256
+// 128 (was 256): the cloud march samples this volume with normalized
+// wrap-sampled coords, so halving the resolution trades only noise
+// spatial frequency, and cuts the 3D texture 64 MB -> 8 MB.
+#define kDetailNoiseTextureSize                 128
 #define kRoughNoiseTextureSize                  32
 
 #define kNodeLeft                               0x00      // -x
@@ -1450,12 +1455,33 @@ struct PbrLightsColorInfo {
     vec3 f_transmission;
 };
 
+// Per-instance world transform, 48 B (was 64: the fourth vec4 and the
+// three .w pads were never read, which at 17 M baked instances wasted
+// ~260 MiB of VRAM).  .xyz of each vec4 is a COLUMN of the
+// rotation*scale basis (scale premultiplied); the translation is
+// spread across the three .w lanes:
+//     position_ws = mat3(mat_rot_0.xyz, mat_rot_1.xyz, mat_rot_2.xyz)
+//                 * position_ls
+//                 + vec3(mat_rot_0.w, mat_rot_1.w, mat_rot_2.w)
+// Must stay byte-identical to ego::BakedInstanceXform
+// (game_object/drawable_object.h) — the baked table is memcpy'd in.
 struct InstanceDataInfo {
     vec4            mat_rot_0;
     vec4            mat_rot_1;
     vec4            mat_rot_2;
-    vec4            mat_pos_scale;
 };
+
+#ifndef __cplusplus
+// Unpack helpers for the 48 B layout above — use these instead of
+// open-coding the lanes so every consumer stays in sync with the pack
+// sites (bakeInstanceTransforms / update_instance_buffer.comp).
+mat3 instanceBasis(InstanceDataInfo inst) {
+    return mat3(inst.mat_rot_0.xyz, inst.mat_rot_1.xyz, inst.mat_rot_2.xyz);
+}
+vec3 instanceTranslation(InstanceDataInfo inst) {
+    return vec3(inst.mat_rot_0.w, inst.mat_rot_1.w, inst.mat_rot_2.w);
+}
+#endif
 
 struct GrassInstanceDataInfo {
     vec4            mat_rot_0;
@@ -1643,5 +1669,51 @@ uint partBy2(uint x) {
 // Interleave the bits of x and y to produce the Morton code / Z-order index
 uint zOrder(uint x, uint y) {
     return (partBy2(x) | (partBy2(y) << 1));
+}
+
+// ── Packed BindlessVertex attribute decode ───────────────────────────
+// The cluster merged VB stores 24 B vertices (see BindlessVertex in
+// cluster_renderer.h):
+//   vec3 position | uint packed_normal | uint packed_tangent | uint packed_uv
+// packed_normal / packed_tangent are octahedral-encoded unit vectors in
+// 2×snorm16 (packSnorm2x16 of the oct map); packed_tangent additionally
+// folds the bitangent handedness sign into bit 16 (the LSB of the Y
+// snorm lane: set = +1, clear = -1 — costs that lane one snorm step,
+// invisible for a tangent frame).  packed_uv is packHalf2x16(uv).
+// MUST stay in exact sync with the CPU encoders in cluster_renderer.cpp
+// (octEncode / packOctSnorm2x16 / packOctTangentWithSign).
+// "bv" prefix avoids collisions with the per-shader oct helpers that
+// already exist (e.g. octDecode in deferred_resolve.comp, which decodes
+// the G-buffer's UNORM-mapped octahedral normals — a different encoding).
+
+vec2 bvSignNotZero(vec2 v) {
+    return vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+}
+
+// Standard snorm octahedral decode → unit vector.
+vec3 bvOctDecode(vec2 e) {
+    vec3 v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    if (v.z < 0.0) {
+        v.xy = (1.0 - abs(v.yx)) * bvSignNotZero(v.xy);
+    }
+    return normalize(v);
+}
+
+vec3 bvDecodeNormal(uint packed_normal) {
+    return bvOctDecode(unpackSnorm2x16(packed_normal));
+}
+
+// Returns the tangent frame as vec4(T.xyz, bitangent_sign) — the exact
+// value the old vec4 tangent attribute carried, so consumers keep
+// computing B = cross(N, T.xyz) * T.w unchanged.  The sign bit rides in
+// bit 16; unpackSnorm2x16 sees it as the Y lane's LSB, a ≤ 1/32767
+// perturbation we deliberately ignore.
+vec4 bvDecodeTangent(uint packed_tangent) {
+    float sign_w = ((packed_tangent & 0x10000u) != 0u) ? 1.0 : -1.0;
+    return vec4(bvOctDecode(unpackSnorm2x16(packed_tangent)), sign_w);
+}
+
+vec2 bvDecodeUv(uint packed_uv) {
+    return unpackHalf2x16(packed_uv);
 }
 #endif

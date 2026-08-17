@@ -56,21 +56,17 @@ layout(std430, set = DRAWABLE_MESH_SHADOW_SET, binding = 0) readonly buffer VBBu
 layout(std430, set = DRAWABLE_MESH_SHADOW_SET, binding = 1) readonly buffer IBBuffer {
     uint ib_indices[];
 };
-// InstanceDataInfo layout (matches the IA inputs IINPUT_MAT_ROT_0..2 +
-// IINPUT_MAT_POS_SCALE).  std430-compatible float array view to avoid
-// strict alignment concerns across drivers.  16 floats per instance:
-//   [0..2]   = mat_rot_0   (vec3 row 0)
-//   [3]      = pad
-//   [4..6]   = mat_rot_1   (vec3 row 1)
-//   [7]      = pad
-//   [8..10]  = mat_rot_2   (vec3 row 2)
-//   [11]     = pad
-//   [12..15] = mat_pos_scale (vec4 — xyz=translation, w=uniform scale)
-//
-// (The C++ struct may pack more tightly, but std430 vec3 attributes
-// align to 16 bytes; the renderer's binding setup uses single-attr
-// vec3 bindings which place each at a 16-byte stride.  If the actual
-// layout differs at runtime we'll adjust this view.)
+// InstanceDataInfo layout (matches the IA inputs IINPUT_MAT_ROT_0..2).
+// std430-compatible float array view to avoid strict alignment
+// concerns across drivers.  12 floats per instance (48 B layout — the
+// old fourth vec4 and its dead lanes are gone; the translation now
+// rides the .w lane of each basis column):
+//   [0..2]   = mat_rot_0.xyz (basis column 0)
+//   [3]      = mat_rot_0.w   (translation.x)
+//   [4..6]   = mat_rot_1.xyz (basis column 1)
+//   [7]      = mat_rot_1.w   (translation.y)
+//   [8..10]  = mat_rot_2.xyz (basis column 2)
+//   [11]     = mat_rot_2.w   (translation.z)
 layout(std430, set = DRAWABLE_MESH_SHADOW_SET, binding = 2) readonly buffer InstanceBuffer {
     float instance_floats[];
 };
@@ -96,7 +92,7 @@ layout(push_constant) uniform MeshShadowPC {
     uint vb_stride_floats;          // 76
     uint vb_position_offset_floats; // 80
     uint ib_first_index;            // 84
-    uint instance_stride_floats;    // 88 — typically 16 (see comment above)
+    uint instance_stride_floats;    // 88 — typically 12 (see comment above)
     uint pad0;                      // 92
     uint pad1;                      // 96  -- total 96 bytes, well under 128
 } pc;
@@ -110,7 +106,9 @@ vec3 fetchPosition(uint vertex_idx) {
 }
 
 // Read instance 0's TRS.  pc.instance_stride_floats lets the caller
-// override the default 16-float stride if needed.
+// override the default 12-float stride if needed.  Basis columns keep
+// their old float offsets (0/4/8); only the translation moved — from
+// its own vec4 at [12..14] into the .w lanes at [3]/[7]/[11].
 void readInstance(out mat3 rot_mat, out vec3 translation) {
     uint base = 0u;  // instance 0
     rot_mat = mat3(
@@ -124,9 +122,9 @@ void readInstance(out mat3 rot_mat, out vec3 translation) {
              instance_floats[base +  9u],
              instance_floats[base + 10u]));
     translation = vec3(
-        instance_floats[base + 12u],
-        instance_floats[base + 13u],
-        instance_floats[base + 14u]);
+        instance_floats[base +  3u],
+        instance_floats[base +  7u],
+        instance_floats[base + 11u]);
 }
 
 void main() {

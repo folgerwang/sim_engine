@@ -51,10 +51,13 @@ layout(location = VINPUT_JOINTS_1) in uvec4 in_joints_1;
 layout(location = VINPUT_WEIGHTS_1) in vec4 in_weights_1;
 #endif
 
-layout(location = IINPUT_MAT_ROT_0) in vec3 in_loc_rot_mat_0;
-layout(location = IINPUT_MAT_ROT_1) in vec3 in_loc_rot_mat_1;
-layout(location = IINPUT_MAT_ROT_2) in vec3 in_loc_rot_mat_2;
-layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
+// 48 B instance layout: three vec4 columns of the rotation*scale basis
+// with the world translation spread across the .w lanes (see
+// BakedInstanceXform in drawable_object.h).  The old separate
+// IINPUT_MAT_POS_SCALE attribute (location 14) no longer exists.
+layout(location = IINPUT_MAT_ROT_0) in vec4 in_loc_rot_mat_0;
+layout(location = IINPUT_MAT_ROT_1) in vec4 in_loc_rot_mat_1;
+layout(location = IINPUT_MAT_ROT_2) in vec4 in_loc_rot_mat_2;
 
 layout(location = 0) out ObjectVsPsData out_data;
 
@@ -81,13 +84,15 @@ void main() {
     vec3 position_ls = (matrix_ls * vec4(in_position, 1.0f)).xyz;
 
     mat3 local_world_rot_mat =
-        mat3x3(in_loc_rot_mat_0,
-               in_loc_rot_mat_1,
-               in_loc_rot_mat_2);
+        mat3x3(in_loc_rot_mat_0.xyz,
+               in_loc_rot_mat_1.xyz,
+               in_loc_rot_mat_2.xyz);
     vec3 position_ws =
         local_world_rot_mat *
         position_ls +
-        in_loc_pos_scale.xyz;
+        vec3(in_loc_rot_mat_0.w,
+             in_loc_rot_mat_1.w,
+             in_loc_rot_mat_2.w);
 #ifdef CSM_PER_CASCADE
     // Per-cascade VP picked by model_params.cascade_idx (written by
     // drawMesh before each cascade pass).  The host has already uploaded

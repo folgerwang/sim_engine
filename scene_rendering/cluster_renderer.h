@@ -172,22 +172,47 @@ private:
     renderer::TextureInfo                 dummy_texture_;
 
     // ── Merged VB/IB staging for bindless rendering ──
-    // Vertices are transformed to world space during upload.
-    //   tangent.xyz = world-space tangent (already orthogonalised against normal)
-    //   tangent.w   = bitangent sign so the fragment shader can derive
-    //                 B = cross(N, tangent.xyz) * tangent.w
+    // Vertices are transformed to world space during upload.  The
+    // (decoded) tangent is the classic vec4:
+    //   xyz = world-space tangent (already orthogonalised against normal)
+    //   w   = bitangent sign so the fragment shader can derive
+    //         B = cross(N, tangent.xyz) * tangent.w
     // The tangent is computed at upload time from the source mesh's
     // per-triangle position+UV gradients (Lengyel-style accumulation,
     // normalised + Gram-Schmidt against the vertex normal).  Carrying it as
     // an interpolated vertex attribute lets cluster_bindless.frag apply
     // normal mapping without the per-fragment dFdx/dFdy reconstruction
     // that previously produced fine-grained sparkle on shaded surfaces.
+    //
+    // PACKED LAYOUT (24 B, was 48 B — halves the 2.1M-vertex merged VB):
+    //   position       — full-precision vec3 (12 B); raster + BLAS need
+    //                    exact positions, never quantised.
+    //   packed_normal  — octahedral-encoded unit normal in 2×snorm16
+    //                    (glm::packSnorm2x16 of the oct map; ~0.01°
+    //                    worst-case error, far below shading noise).
+    //   packed_tangent — octahedral-encoded unit tangent in 2×snorm16,
+    //                    with the bitangent handedness sign folded into
+    //                    bit 16 (the LSB of the Y snorm lane): set = +1,
+    //                    clear = -1.  Costs the Y lane one snorm LSB
+    //                    (≤ 1/32767) — irrelevant for a tangent frame.
+    //   packed_uv      — glm::packHalf2x16(uv).  Half precision matches
+    //                    what the RT path already ships in
+    //                    rt_pos_uv_buffer_ for its alpha-cutoff test.
+    // Decoders live in global_definition.glsl.h (bvDecodeNormal /
+    // bvDecodeTangent / bvDecodeUv) so every consuming shader shares one
+    // implementation.  Keep the C++ pack helpers in cluster_renderer.cpp
+    // (packOctSnorm2x16 etc.) in exact sync with those decoders.
     struct BindlessVertex {
         glm::vec3 position;
-        glm::vec3 normal;
-        glm::vec2 uv;
-        glm::vec4 tangent;
+        uint32_t  packed_normal;
+        uint32_t  packed_tangent;
+        uint32_t  packed_uv;
     };
+    // Vertex-input offsets + the mesh shader's uint stride (24 B = 6
+    // words) are derived from this layout — guard it.
+    static_assert(sizeof(BindlessVertex) == 24,
+                  "BindlessVertex must stay 24 B — shaders decode this "
+                  "exact packed layout");
     std::vector<BindlessVertex> staging_vertices_;
     std::vector<uint32_t>       staging_indices_;
 
@@ -224,6 +249,13 @@ private:
     // (alpha blend on, depth-write off).
     renderer::BufferInfo trans_indirect_draw_buffer_;
     renderer::BufferInfo trans_draw_count_buffer_;
+    // Capacity of trans_indirect_draw_buffer_ in indirect commands.
+    // Right-sized at finalize from the actual translucent cluster count
+    // (2× headroom) instead of the old "100%-glass scene" worst case —
+    // cluster_cull.comp drops emits past this bound (capacity guard via
+    // the camera_pos_pad.w push-constant pad word), and the translucent
+    // draws clamp maxDrawCount to it.
+    uint32_t trans_indirect_capacity_ = 0;
 
     // ── Per-cascade shadow indirect buffers (Option B) ──────────────────
     // CSM_CASCADE_COUNT separate indirect/count buffer pairs — one per
@@ -242,6 +274,15 @@ private:
         shadow_indirect_draw_buffers_;
     std::array<renderer::BufferInfo, CSM_CASCADE_COUNT>
         shadow_draw_count_buffers_;
+    // Per-cascade capacity (in indirect commands) of the buffers above.
+    // Near cascades retain a small fraction of clusters (cascade 0 ~5%
+    // per the measurement quoted above), so worst-case sizing every
+    // cascade at total_clusters wasted tens of MiB.  finalizeUploads
+    // sizes cascade 0 at C/4, cascades 1-2 at C/2, and the glancing far
+    // cascades 3-5 at C; cluster_cull.comp skips emits past the bound
+    // (capacity plumbed through the hiz_size_mips_pad.w pad word).  An
+    // overflow only drops shadow draws for that cascade for one frame.
+    std::array<uint32_t, CSM_CASCADE_COUNT> shadow_indirect_capacities_{};
 
     // Scratch translucent indirect/count for the shadow cull dispatches.
     // cluster_cull.comp unconditionally routes translucent clusters into
@@ -249,9 +290,14 @@ private:
     // shadow cull would clobber the main path's trans_indirect_draw_buffer_
     // and drawTranslucentForward would read stale or wrong data.  One
     // shared scratch suffices for all cascades because we never read it
-    // back — successive per-cascade writes just overwrite.
+    // back — successive per-cascade writes just overwrite.  Because it is
+    // write-only scratch, it is sized at a small fixed command count
+    // (kShadowCullTransScratchCapacity in cluster_renderer.cpp) instead
+    // of the old total_clusters worst case; the cull shader's capacity
+    // guard silently drops writes past the bound.
     renderer::BufferInfo shadow_cull_trans_indirect_buffer_;
     renderer::BufferInfo shadow_cull_trans_count_buffer_;
+    uint32_t shadow_cull_trans_capacity_ = 0;
 
     // Scratch visible-cluster-indices buffer for the shadow cull dispatches.
     // cluster_cull.comp writes visible_cluster_indices[slot] = cluster_idx
@@ -373,8 +419,10 @@ private:
     //                           — SoA repack of the merged VB: ONE 16 B
     //                           fetch per vertex in the triangle loop
     //                           instead of 3 floats scattered over the
-    //                           48 B interleaved stride; the UV rides
-    //                           along for the alpha-cutoff hit test.
+    //                           interleaved BindlessVertex stride; the UV
+    //                           rides along for the alpha-cutoff hit test
+    //                           (same half2x16 encoding BindlessVertex
+    //                           now stores, so the repack is a bit copy).
     // rt_shadow_desc_set_ (COMPUTE visibility) bindings:
     //   0 cull infos  1 draw infos  2 packed pos+uv  3 merged IB
     //   4 material params  5 BVH nodes  6 BVH leaf cluster indices
@@ -384,15 +432,21 @@ private:
     // The application binds it at set RUNTIME_LIGHTS_PARAMS_SET + 1 of
     // the deferred-resolve pipeline (its own identically-defined layout
     // keeps the pipeline creatable before the first finalize).
-    // ALL trace-visible buffers are DEVICE_LOCAL copies — the shared
-    // cluster buffers are HOST_VISIBLE for the CPU-cull/debug paths, and
-    // a per-pixel traversal reading over PCIe is a 10-100× slowdown.
+    // Trace-visible buffers must be DEVICE_LOCAL — a per-pixel traversal
+    // reading host memory over PCIe is a 10-100× slowdown.  The merged
+    // index buffer is now DEVICE_LOCAL itself (no CPU readback exists),
+    // so binding 3 points straight at merged_index_buffer_ — the old
+    // rt_indices_buffer_ duplicate (~25 MiB for the Bistro-scale scene)
+    // is gone.  cull/draw infos and material params KEEP their
+    // device-local duplicates because the primaries have genuine host
+    // access: cull_info (setMeshClustersHidden pokes + CPU-cull-mode
+    // reads), draw_info (CPU-cull-mode per-frame reads), material params
+    // (setVtEnabled / applyMaterialCategories host re-uploads).
     renderer::BufferInfo rt_bvh_nodes_buffer_;
     renderer::BufferInfo rt_bvh_leaves_buffer_;
     renderer::BufferInfo rt_pos_uv_buffer_;
     renderer::BufferInfo rt_cull_infos_buffer_;
     renderer::BufferInfo rt_draw_infos_buffer_;
-    renderer::BufferInfo rt_indices_buffer_;
     renderer::BufferInfo rt_materials_buffer_;
     uint32_t             rt_bvh_node_count_ = 0;
     bool                 rt_shadow_ready_   = false;
@@ -428,8 +482,14 @@ private:
     renderer::BufferInfo hw_rt_masked_tri_mat_buffer_;
     renderer::BufferInfo hw_rt_opaque_tri_mat_buffer_;
     renderer::BufferInfo hw_rt_blas_buffer_;
+    // BLAS build scratch — freed immediately after the synchronous
+    // (submit-and-wait) build in buildHwRtShadowAs; scratch memory is
+    // only needed while the build executes.  Empty outside that window.
     renderer::BufferInfo hw_rt_blas_scratch_buffer_;
     renderer::BufferInfo hw_rt_tlas_buffer_;
+    // TLAS scratch is NOT one-shot: updateRtSkeletons reuses it every
+    // frame for the static+skeleton TLAS rebuild, so it must stay
+    // allocated.  It is tiny (2-instance TLAS).
     renderer::BufferInfo hw_rt_tlas_scratch_buffer_;
     renderer::BufferInfo hw_rt_instance_buffer_;
     renderer::AccelerationStructure hw_rt_blas_handle_{};

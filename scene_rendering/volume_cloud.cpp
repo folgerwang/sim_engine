@@ -398,10 +398,22 @@ void VolumeCloud::recreate(
     fog_cloud_tex_.destroy(device);
     blurred_fog_cloud_tex_.destroy(device);
 
+    // ── Half-resolution march targets ────────────────────────────────
+    // The volumetric march is the most expensive pass in the frame and
+    // clouds/fog are low-frequency, so the march and the X-blur run at
+    // ceil(display/2).  The final blur_image_y_merge pass still runs at
+    // FULL resolution (it writes every HDR pixel) and reads this target
+    // through a LINEAR sampler with normalized UVs, which gives the
+    // bilinear upsample for free.  Cuts both RGBA16F targets to 1/4
+    // VRAM (56.3 -> 14.1 MiB at 1440p) and ~quarters the march cost.
+    // Keep RGBA16F: RGB carries in-scattered light, A carries the
+    // accumulated transmittance the merge pass composites with.
+    const glm::uvec2 fog_tex_size = (display_size + 1u) / 2u;
+
     renderer::Helper::create2DTextureImage(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
-        display_size,
+        fog_tex_size,
         1,
         fog_cloud_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
@@ -412,7 +424,7 @@ void VolumeCloud::recreate(
     renderer::Helper::create2DTextureImage(
         device,
         renderer::Format::R16G16B16A16_SFLOAT,
-        display_size,
+        fog_tex_size,
         1,
         blurred_fog_cloud_tex_,
         SET_FLAG_BIT(ImageUsage, SAMPLED_BIT) |
@@ -548,6 +560,12 @@ void VolumeCloud::renderVolumeCloud(
     const glm::uvec2& display_size,
     int dbuf_idx,
     float current_time) {
+    // The march and the X-blur run at the fog target's OWN resolution
+    // (half display, see recreate) — derive extents from the actual
+    // texture so dispatch counts can never drift from the allocation.
+    // Only the final Y-blur+merge below runs at display resolution.
+    const glm::uvec2 fog_tex_size = glm::uvec2(fog_cloud_tex_.size);
+
     // render moisture volume.
     {
         renderer::helper::transitMapTextureToStoreImage(
@@ -560,8 +578,12 @@ void VolumeCloud::renderVolumeCloud(
         glsl::VolumeMoistrueParams params = {};
         params.world_min = glm::vec2(-kCloudMapSize / 2.0f);
         params.inv_world_range = 1.0f / (glm::vec2(kCloudMapSize / 2.0f) - params.world_min);
-        params.size = display_size;
-        params.inv_screen_size = 1.0f / glm::vec2(display_size);
+        // The shader builds its ray UV as (pixel + 0.5) * inv_screen_size,
+        // so feeding the half-res target size keeps UVs spanning the full
+        // 0..1 screen; the full-res depth buffer is sampled with those
+        // same normalized UVs, so no shader change is needed.
+        params.size = fog_tex_size;
+        params.inv_screen_size = 1.0f / glm::vec2(fog_tex_size);
         params.time = current_time;
         params.g = skydome->getG();
         params.inv_rayleigh_scale_height = 1.0f / skydome->getRayleighScaleHeight();
@@ -597,8 +619,8 @@ void VolumeCloud::renderVolumeCloud(
               frame_desc_set });
 
         cmd_buf->dispatch(
-            (display_size.x + 7) / 8,
-            (display_size.y + 7) / 8,
+            (fog_tex_size.x + 7) / 8,
+            (fog_tex_size.y + 7) / 8,
             1);
 
         renderer::helper::transitMapTextureFromStoreImage(
@@ -615,8 +637,11 @@ void VolumeCloud::renderVolumeCloud(
             renderer::PipelineBindPoint::COMPUTE,
             blur_image_x_pipeline_);
         glsl::BlurImageParams params = {};
-        params.size = display_size;
-        params.inv_size = 1.0f / glm::vec2(display_size);
+        // X-blur is half-res -> half-res (fog_cloud -> blurred), so
+        // both the push-constant size and the dispatch follow the fog
+        // target, not the display.
+        params.size = fog_tex_size;
+        params.inv_size = 1.0f / glm::vec2(fog_tex_size);
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -631,8 +656,8 @@ void VolumeCloud::renderVolumeCloud(
               frame_desc_set });
 
         cmd_buf->dispatch(
-            (display_size.x + 63) / 64,
-            display_size.y,
+            (fog_tex_size.x + 63) / 64,
+            fog_tex_size.y,
             1);
 
         renderer::helper::transitMapTextureFromStoreImage(
@@ -649,6 +674,12 @@ void VolumeCloud::renderVolumeCloud(
             renderer::PipelineBindPoint::COMPUTE,
             blur_image_y_merge_pipeline_);
         glsl::BlurImageParams params = {};
+        // Y-blur + merge WRITES the full-res HDR buffer, so it stays at
+        // display resolution.  Its src (blurred_fog_cloud) is half-res:
+        // sampled with normalized UVs through the LINEAR sampler bound
+        // in recreate, this is exactly a bilinear upsample — and the
+        // X/Y blur has already low-passed the signal, so no extra
+        // filtering is needed.
         params.size = display_size;
         params.inv_size = 1.0f / glm::vec2(display_size);
 

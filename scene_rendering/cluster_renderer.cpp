@@ -201,6 +201,45 @@ std::vector<glm::vec4> computeMeshTangents(
     return out;
 }
 
+// ─── BindlessVertex attribute packing ─────────────────────────────────────
+// CPU-side encoders for the 24 B packed BindlessVertex layout.  MUST stay
+// in exact sync with the GLSL decoders in global_definition.glsl.h
+// (bvDecodeNormal / bvDecodeTangent / bvDecodeUv).
+
+// Octahedral map of a unit vector onto the [-1,1]² square.  Standard
+// oct encode: project onto the L1 sphere, fold the lower hemisphere.
+inline glm::vec2 octEncode(glm::vec3 n) {
+    const float l1 = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
+    if (l1 < 1e-8f) {
+        // Degenerate input (zero normal) — encode +Z so the decode is a
+        // valid unit vector rather than NaN.
+        return glm::vec2(0.0f, 0.0f);
+    }
+    n /= l1;
+    if (n.z < 0.0f) {
+        const float sx = (n.x >= 0.0f) ? 1.0f : -1.0f;
+        const float sy = (n.y >= 0.0f) ? 1.0f : -1.0f;
+        return glm::vec2((1.0f - std::abs(n.y)) * sx,
+                         (1.0f - std::abs(n.x)) * sy);
+    }
+    return glm::vec2(n.x, n.y);
+}
+
+// Oct-encode a unit vector into 2×snorm16 (x lane = bits 0..15, y lane
+// = bits 16..31) — bit-compatible with GLSL unpackSnorm2x16.
+inline uint32_t packOctSnorm2x16(const glm::vec3& v) {
+    return glm::packSnorm2x16(octEncode(v));
+}
+
+// Tangent variant: fold the bitangent handedness sign into bit 16 — the
+// LSB of the Y snorm lane (set = +1, clear = -1).  Costs that lane one
+// snorm step (≤ 1/32767) of precision, invisible for a tangent frame,
+// and keeps the whole tangent in 4 bytes.
+inline uint32_t packOctTangentWithSign(const glm::vec3& t, float sign_w) {
+    const uint32_t packed = glm::packSnorm2x16(octEncode(t));
+    return (packed & ~0x10000u) | ((sign_w >= 0.0f) ? 0x10000u : 0u);
+}
+
 }  // anonymous namespace
 
 // ─── Descriptor set layout for the cull compute pass ───────────────
@@ -251,11 +290,19 @@ void writeCullDescriptors(
     const renderer::BufferInfo& cull_info_buffer,
     const renderer::BufferInfo& draw_info_buffer,
     const renderer::BufferInfo& indirect_draw_buffer,
+    // Capacity of indirect_draw_buffer in DrawIndexedIndirect commands.
+    // The main cull set passes total_clusters (worst-case buffer); the
+    // per-cascade shadow sets pass their right-sized cascade capacity so
+    // the descriptor range never exceeds the smaller buffer.
+    uint32_t                    indirect_capacity,
     const renderer::BufferInfo& draw_count_buffer,
     const renderer::BufferInfo& visible_buffer,
     const renderer::BufferInfo& material_params_buffer,
     uint32_t                    total_materials,
     const renderer::BufferInfo& trans_indirect_draw_buffer,
+    // Same, for the translucent bucket (right-sized at finalize / small
+    // fixed scratch for the shadow sets).
+    uint32_t                    trans_indirect_capacity,
     const renderer::BufferInfo& trans_draw_count_buffer,
     const renderer::BufferInfo& visibility_bit_buffer,
     const renderer::BufferInfo& indirect_draw_buffer_phase_a,
@@ -279,7 +326,7 @@ void writeCullDescriptors(
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 2,
         indirect_draw_buffer.buffer,
-        static_cast<uint32_t>(total_clusters * 5u * sizeof(uint32_t)));
+        static_cast<uint32_t>(indirect_capacity * 5u * sizeof(uint32_t)));
 
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 3,
@@ -304,7 +351,8 @@ void writeCullDescriptors(
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 6,
         trans_indirect_draw_buffer.buffer,
-        static_cast<uint32_t>(total_clusters * 5u * sizeof(uint32_t)));
+        static_cast<uint32_t>(
+            trans_indirect_capacity * 5u * sizeof(uint32_t)));
 
     er::Helper::addOneBuffer(writes, desc_set,
         er::DescriptorType::STORAGE_BUFFER, 7,
@@ -956,25 +1004,31 @@ void ClusterRenderer::uploadMeshClusters(
                 BindlessVertex bv;
                 bv.position = glm::vec3(
                     model_transform * glm::vec4(sv.position, 1.0f));
-                bv.normal = glm::normalize(normal_mat3 * sv.normal);
-                bv.uv = sv.uv;
+                // Normal is oct-encoded into 2×snorm16 (24 B packed
+                // vertex — see the BindlessVertex doc in the header).
+                bv.packed_normal = packOctSnorm2x16(
+                    glm::normalize(normal_mat3 * sv.normal));
+                glm::vec2 uv = sv.uv;
                 // Apply the same UV flip that base.vert applies via model_params.flip_uv_coord.
                 // FBX files always set m_flip_v_=true (V-axis is inverted vs OpenGL/Vulkan).
-                if (drawable_data.m_flip_u_) bv.uv.x = 1.0f - bv.uv.x;
-                if (drawable_data.m_flip_v_) bv.uv.y = 1.0f - bv.uv.y;
+                if (drawable_data.m_flip_u_) uv.x = 1.0f - uv.x;
+                if (drawable_data.m_flip_v_) uv.y = 1.0f - uv.y;
+                bv.packed_uv = glm::packHalf2x16(uv);
                 // World-space tangent + bitangent sign.  src_tangents[vi].xyz is
                 // the orthogonalised object-space tangent from
                 // computeMeshTangents(); we transform direction-only with
                 // tangent_mat3.  Renormalise after the transform because
                 // non-uniform scale would otherwise leave |T| != 1.  The .w
-                // bitangent sign is preserved unchanged.
+                // bitangent sign is folded into bit 16 of the packed word.
                 if (vi < src_tangents.size()) {
                     glm::vec3 ws_T =
                         glm::normalize(tangent_mat3 * glm::vec3(src_tangents[vi]));
-                    bv.tangent = glm::vec4(ws_T, src_tangents[vi].w);
+                    bv.packed_tangent =
+                        packOctTangentWithSign(ws_T, src_tangents[vi].w);
                 } else {
                     // Defensive fallback for out-of-range indices.
-                    bv.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+                    bv.packed_tangent = packOctTangentWithSign(
+                        glm::vec3(1.0f, 0.0f, 0.0f), 1.0f);
                 }
                 staging_vertices_.push_back(bv);
             }
@@ -1279,12 +1333,33 @@ void ClusterRenderer::finalizeUploads() {
         total_clusters_all_meshes_ * sizeof(uint32_t),
         nullptr);
 
-    // Translucent bucket — same worst-case sizing as opaque so a 100%-glass
-    // scene wouldn't overflow.  In practice these allocations are dwarfed
-    // by the merged VB/IB so the doubled indirect-buffer cost is fine.
+    // Translucent bucket — right-sized from the ACTUAL translucent
+    // cluster count instead of the old "100%-glass scene" worst case
+    // (which cost another C×20 B ≈ 8.5 MiB at Bistro scale for a bucket
+    // that holds a few thousand entries).  The predicate mirrors
+    // cluster_cull.comp's is_translucent exactly (TRANSLUCENT flag OR
+    // base-colour alpha < 0.9); the translucency inputs are fixed after
+    // finalize (setVtEnabled / applyMaterialCategories never touch
+    // them), so 2× headroom + the shader-side capacity guard is safe —
+    // an overflow just drops excess glass draws for one frame.
+    {
+        uint32_t trans_clusters = 0;
+        for (const auto& di : staging_draw_infos_) {
+            if (di.material_idx >= staging_material_params_.size()) continue;
+            const auto& m = staging_material_params_[di.material_idx];
+            const bool is_translucent =
+                (static_cast<uint32_t>(m.flags) & BINDLESS_MAT_TRANSLUCENT)
+                    != 0u ||
+                m.base_color_factor.a < 0.9f;
+            if (is_translucent) ++trans_clusters;
+        }
+        trans_indirect_capacity_ = std::min(
+            total_clusters_all_meshes_,
+            std::max(1024u, trans_clusters * 2u));
+    }
     trans_indirect_draw_buffer_ = createIndirectSSBO(
         device_,
-        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+        trans_indirect_capacity_ * 5 * sizeof(uint32_t));
     trans_draw_count_buffer_ = createCounterBuffer(device_);
 
     // ── Shadow cull scratch buffers ──────────────────────────────────
@@ -1292,10 +1367,15 @@ void ClusterRenderer::finalizeUploads() {
     // translucent-bucket writes so they don't clobber the main path's
     // trans_indirect_draw_buffer_ before drawTranslucentForward reads
     // it.  drawClusterShadow never reads these — they're write-only
-    // scratch.  Worst-case sized like the regular translucent buffer.
+    // scratch — so a small fixed capacity suffices; the cull shader's
+    // capacity guard discards writes past it (the data was never
+    // consumed anyway).  Was worst-case sized at C×20 B ≈ 8.5 MiB.
+    constexpr uint32_t kShadowCullTransScratchCapacity = 4096u;
+    shadow_cull_trans_capacity_ = std::min(
+        total_clusters_all_meshes_, kShadowCullTransScratchCapacity);
     shadow_cull_trans_indirect_buffer_ = createIndirectSSBO(
         device_,
-        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+        shadow_cull_trans_capacity_ * 5 * sizeof(uint32_t));
     shadow_cull_trans_count_buffer_ = createCounterBuffer(device_);
 
     // Scratch visible-buffer for the shadow cull dispatches — see the
@@ -1314,9 +1394,15 @@ void ClusterRenderer::finalizeUploads() {
     // each cascade's pair via vkCmdDrawIndexedIndirectCount inside its
     // own dynamic-rendering pass on the cascade's depth layer.
     //
-    // Each indirect buffer is worst-case sized for "all clusters land
-    // in this cascade"; in practice each cascade retains ~5-90% of
-    // clusters depending on which slab of the camera frustum it covers.
+    // Sizing: cascade 0 covers the smallest camera-frustum slab and
+    // retains only ~5% of clusters (see the header doc), cascades 1-2
+    // a middling share, while the glancing far cascades legitimately
+    // keep most — so size 0 → C/4, 1-2 → C/2, 3-5 → C instead of the
+    // old uniform worst case (saves ~C×20 B × 1.75 ≈ 15 MiB at Bistro
+    // scale).  cluster_cull.comp's capacity guard (capacity pushed via
+    // the hiz_size_mips_pad.w pad word) skips emits past a cascade's
+    // bound, so an unusually dense frame just drops some shadow draws
+    // for that cascade for one frame instead of corrupting memory.
     //
     // The count buffers are seeded with total_clusters_all_meshes_ as a
     // first-frame fallback — if cullShadow hasn't run yet (e.g. before
@@ -1332,9 +1418,14 @@ void ClusterRenderer::finalizeUploads() {
     // shadow path in shadow_object_scene_view_->draw is handling the
     // load anyway.
     for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
+        const uint32_t cascade_capacity =
+            (k == 0) ? std::max(1u, total_clusters_all_meshes_ / 4u)
+          : (k <= 2) ? std::max(1u, total_clusters_all_meshes_ / 2u)
+                     : total_clusters_all_meshes_;
+        shadow_indirect_capacities_[k] = cascade_capacity;
         shadow_indirect_draw_buffers_[k] = createIndirectSSBO(
             device_,
-            total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+            cascade_capacity * 5 * sizeof(uint32_t));
         shadow_draw_count_buffers_[k] = createCounterBuffer(device_);
     }
 
@@ -1380,10 +1471,14 @@ void ClusterRenderer::finalizeUploads() {
         device_, cull_desc_set_,
         total_clusters_all_meshes_,
         cull_info_buffer_, draw_info_buffer_,
-        indirect_draw_buffer_, draw_count_buffer_,
+        indirect_draw_buffer_,
+        total_clusters_all_meshes_,   // opaque buffer stays worst-case
+        draw_count_buffer_,
         visible_buffer_,
         material_params_buffer_, mat_count,
-        trans_indirect_draw_buffer_, trans_draw_count_buffer_,
+        trans_indirect_draw_buffer_,
+        trans_indirect_capacity_,
+        trans_draw_count_buffer_,
         visibility_bit_buffer_,
         indirect_draw_buffer_phase_a_,
         draw_count_buffer_phase_a_,
@@ -1411,10 +1506,12 @@ void ClusterRenderer::finalizeUploads() {
             total_clusters_all_meshes_,
             cull_info_buffer_, draw_info_buffer_,
             shadow_indirect_draw_buffers_[k],
+            shadow_indirect_capacities_[k],
             shadow_draw_count_buffers_[k],
             shadow_cull_visible_buffer_,  // scratch, not visible_buffer_
             material_params_buffer_, mat_count,
             shadow_cull_trans_indirect_buffer_,
+            shadow_cull_trans_capacity_,
             shadow_cull_trans_count_buffer_,
             visibility_bit_buffer_,
             indirect_draw_buffer_phase_a_,
@@ -1453,10 +1550,13 @@ void ClusterRenderer::finalizeUploads() {
                     uint32_t vi = staging_indices_[j];
                     if (vi < n_verts) {
                         const auto& v = staging_vertices_[vi];
+                        // Normal is oct-packed now — dump the raw word;
+                        // decoding it here isn't worth the extra code for
+                        // a validation dump.
                         std::fprintf(dbg, "  idx[%u]=%u pos=(%.4f,%.4f,%.4f) "
-                                    "n=(%.3f,%.3f,%.3f)\n",
+                                    "n_oct=0x%08x\n",
                                     j, vi, v.position.x, v.position.y, v.position.z,
-                                    v.normal.x, v.normal.y, v.normal.z);
+                                    v.packed_normal);
                     } else {
                         std::fprintf(dbg, "  idx[%u]=%u OUT_OF_RANGE!\n", j, vi);
                     }
@@ -1485,8 +1585,12 @@ void ClusterRenderer::finalizeUploads() {
     total_merged_indices_  = static_cast<uint32_t>(staging_indices_.size());
 
     if (total_merged_vertices_ > 0) {
-        // HOST_VISIBLE for debugging — bypass staging transfer to rule out
-        // GPU upload corruption.
+        // DEVICE_LOCAL with automatic staged upload (Helper::createBuffer
+        // stages when the memory property is exactly DEVICE_LOCAL_BIT).
+        // This buffer was HOST_VISIBLE only as a debugging measure to rule
+        // out upload corruption; no CPU path ever maps it after finalize,
+        // and host-visible placement forced the RT paths to keep separate
+        // device-local geometry copies.
         // STORAGE_BUFFER_BIT lets the cluster mesh-shader CSM path read
         // the merged VB as an SSBO (cluster_bindless_shadow.mesh).  The
         // forward / G-buffer paths still bind it through VERTEX_BUFFER_BIT
@@ -1495,7 +1599,7 @@ void ClusterRenderer::finalizeUploads() {
             device_,
             SET_3_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT,
                             STORAGE_BUFFER_BIT, TRANSFER_DST_BIT),
-            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0,
             merged_vertex_buffer_.buffer,
             merged_vertex_buffer_.memory,
@@ -1505,13 +1609,19 @@ void ClusterRenderer::finalizeUploads() {
     }
 
     if (total_merged_indices_ > 0) {
+        // DEVICE_LOCAL (staged upload, same as the merged VB above): the
+        // indices are never mapped by the CPU after finalize, and making
+        // them device-local lets the software-RT trace read THIS buffer
+        // directly — the rt_indices_buffer_ duplicate (~25 MiB) that
+        // existed only because this one was host-visible is removed.
         // STORAGE_BUFFER_BIT for the mesh-shader shadow path (reads indices
-        // as a plain uint[] SSBO and computes its own primitive emission).
+        // as a plain uint[] SSBO and computes its own primitive emission)
+        // and for the RT trace in deferred_resolve.comp.
         er::Helper::createBuffer(
             device_,
             SET_3_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT,
                             STORAGE_BUFFER_BIT, TRANSFER_DST_BIT),
-            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0,
             merged_index_buffer_.buffer,
             merged_index_buffer_.memory,
@@ -2287,7 +2397,12 @@ void ClusterRenderer::cull(
 
         glsl::ClusterCullPushConstants push{};
         push.view_proj = view_proj;
-        push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
+        // camera_pos_pad.w carries the TRANSLUCENT indirect capacity
+        // (in commands) — the trans bucket is right-sized now, and the
+        // shader must skip emits past the end.  Exactly representable
+        // as float for any plausible cluster count (< 2^24).
+        push.camera_pos_pad = glm::vec4(
+            camera_pos, float(trans_indirect_capacity_));
         push.total_clusters = total_clusters_all_meshes_;
         push.total_bvh_nodes = 0;
         push.lod_error_threshold = 1.0f;
@@ -2304,9 +2419,12 @@ void ClusterRenderer::cull(
         push.vis_read_word_ofs  = 0u;
         push.vis_write_word_ofs = 0u;
         push.last_view_proj = last_view_proj;
+        // hiz_size_mips_pad.w carries the OPAQUE indirect capacity —
+        // the main buffer stays worst-case sized so this is simply the
+        // cluster count (the guard never trips on this path).
         push.hiz_size_mips_pad = glm::vec4(
             float(hiz_size_.x), float(hiz_size_.y),
-            float(hiz_mip_count_), 0.0f);
+            float(hiz_mip_count_), float(total_clusters_all_meshes_));
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -2436,7 +2554,11 @@ void ClusterRenderer::cullShadow(
     for (uint32_t k = 0; k < CSM_CASCADE_COUNT; ++k) {
         glsl::ClusterCullPushConstants push{};
         push.view_proj           = cascade_vps[k];
-        push.camera_pos_pad      = glm::vec4(synth_cam, 0.0f);
+        // camera_pos_pad.w = capacity of the shared translucent SCRATCH
+        // (small fixed size — shadow draws never read it, overflow is
+        // silently dropped by the shader guard).
+        push.camera_pos_pad      = glm::vec4(
+            synth_cam, float(shadow_cull_trans_capacity_));
         push.total_clusters      = total_clusters_all_meshes_;
         push.total_bvh_nodes     = 0;
         push.lod_error_threshold = 1.0f;
@@ -2446,7 +2568,11 @@ void ClusterRenderer::cullShadow(
         push.vis_read_word_ofs   = 0;     // phase 0: bits untouched
         push.vis_write_word_ofs  = 0;
         push.last_view_proj      = glm::mat4(1.0f);
-        push.hiz_size_mips_pad   = glm::vec4(0.0f);
+        // hiz_size_mips_pad.w = this cascade's right-sized indirect
+        // capacity; the shader skips emits past it (dropped shadow
+        // draws for one frame — acceptable vs an OOB write).
+        push.hiz_size_mips_pad   = glm::vec4(
+            0.0f, 0.0f, 0.0f, float(shadow_indirect_capacities_[k]));
 
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -2541,7 +2667,11 @@ void ClusterRenderer::cullPhaseA(
 
     glsl::ClusterCullPushConstants push{};
     push.view_proj = view_proj;
-    push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
+    // camera_pos_pad.w / hiz_size_mips_pad.w = translucent / opaque
+    // indirect capacities for the shader's overflow guard.  Phase A's
+    // buffer is worst-case sized, so the opaque guard never trips here.
+    push.camera_pos_pad = glm::vec4(
+        camera_pos, float(trans_indirect_capacity_));
     push.total_clusters = total_clusters_all_meshes_;
     push.use_bvh = 0;
     push.use_hiz_cull = 0u;     // Phase A skips Hi-Z; the shader also
@@ -2550,7 +2680,8 @@ void ClusterRenderer::cullPhaseA(
     push.vis_read_word_ofs  = vis_parity_ ? vis_word_count_ : 0u;
     push.vis_write_word_ofs = vis_parity_ ? 0u : vis_word_count_;
     push.last_view_proj = glm::mat4(1.0f);
-    push.hiz_size_mips_pad = glm::vec4(0.0f);
+    push.hiz_size_mips_pad = glm::vec4(
+        0.0f, 0.0f, 0.0f, float(total_clusters_all_meshes_));
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -2617,7 +2748,10 @@ void ClusterRenderer::cullPhaseB(
 
     glsl::ClusterCullPushConstants push{};
     push.view_proj = view_proj;
-    push.camera_pos_pad = glm::vec4(camera_pos, 0.0f);
+    // camera_pos_pad.w = translucent indirect capacity (right-sized
+    // buffer) for the shader's overflow guard.
+    push.camera_pos_pad = glm::vec4(
+        camera_pos, float(trans_indirect_capacity_));
     push.total_clusters = total_clusters_all_meshes_;
     push.use_bvh = debug_distance_cull_ ? 3u : 0u;
     // Hi-Z occlusion test is gated on the menu toggle so the default
@@ -2636,9 +2770,11 @@ void ClusterRenderer::cullPhaseB(
     // the Hi-Z pyramid was built from THIS frame's Phase A depth (not
     // last frame's).  So pass view_proj for both.
     push.last_view_proj = view_proj;
+    // .w = opaque indirect capacity (worst-case buffer on this path, so
+    // the guard is a no-op — plumbed for uniformity with cullShadow).
     push.hiz_size_mips_pad = glm::vec4(
         float(hiz_size_.x), float(hiz_size_.y),
-        float(hiz_mip_count_), 0.0f);
+        float(hiz_mip_count_), float(total_clusters_all_meshes_));
 
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -2878,29 +3014,32 @@ void ClusterRenderer::initBindlessPipeline(
     binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
 
     std::vector<er::VertexInputAttributeDescription> attrib_descs(4);
-    // location 0: vec3 position
+    // location 0: vec3 position (full precision — raster + BLAS input).
     attrib_descs[0].binding  = 0;
     attrib_descs[0].location = 0;
     attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
     attrib_descs[0].offset   = offsetof(BindlessVertex, position);
-    // location 1: vec3 normal
+    // location 1: uint packed normal — octahedral 2×snorm16, decoded in
+    // cluster_bindless.vert via bvDecodeNormal (global_definition.glsl.h).
     attrib_descs[1].binding  = 0;
     attrib_descs[1].location = 1;
-    attrib_descs[1].format   = er::Format::R32G32B32_SFLOAT;
-    attrib_descs[1].offset   = offsetof(BindlessVertex, normal);
-    // location 2: vec2 uv
+    attrib_descs[1].format   = er::Format::R32_UINT;
+    attrib_descs[1].offset   = offsetof(BindlessVertex, packed_normal);
+    // location 2: uint packed uv — packHalf2x16, decoded via bvDecodeUv.
     attrib_descs[2].binding  = 0;
     attrib_descs[2].location = 2;
-    attrib_descs[2].format   = er::Format::R32G32_SFLOAT;
-    attrib_descs[2].offset   = offsetof(BindlessVertex, uv);
-    // location 3: vec4 tangent (xyz = world-space tangent, w = bitangent sign).
-    // Used by cluster_bindless.frag to apply normal mapping without the per-
-    // fragment dFdx/dFdy reconstruction that produced sparkle on shaded
-    // surfaces.  See BindlessVertex doc + computeMeshTangents() for details.
+    attrib_descs[2].format   = er::Format::R32_UINT;
+    attrib_descs[2].offset   = offsetof(BindlessVertex, packed_uv);
+    // location 3: uint packed tangent — octahedral 2×snorm16 with the
+    // bitangent handedness sign folded into bit 16; decoded via
+    // bvDecodeTangent.  Used by cluster_bindless.frag to apply normal
+    // mapping without the per-fragment dFdx/dFdy reconstruction that
+    // produced sparkle on shaded surfaces.  See BindlessVertex doc +
+    // computeMeshTangents() for details.
     attrib_descs[3].binding  = 0;
     attrib_descs[3].location = 3;
-    attrib_descs[3].format   = er::Format::R32G32B32A32_SFLOAT;
-    attrib_descs[3].offset   = offsetof(BindlessVertex, tangent);
+    attrib_descs[3].format   = er::Format::R32_UINT;
+    attrib_descs[3].offset   = offsetof(BindlessVertex, packed_tangent);
 
     // ── Graphics pipeline ──
     er::PipelineInputAssemblyStateCreateInfo input_assembly;
@@ -3574,22 +3713,24 @@ void ClusterRenderer::initBindlessGBufferPipeline(
     // VertexInputAttributeDescription has no list-init operator= — assign
     // each field explicitly, mirroring initBindlessPipeline above.
     std::vector<er::VertexInputAttributeDescription> attrib_descs(4);
+    // Packed 24 B BindlessVertex — locations 1..3 are uint words the
+    // vertex shader decodes (see initBindlessPipeline for the layout).
     attrib_descs[0].binding  = 0;
     attrib_descs[0].location = 0;
     attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
     attrib_descs[0].offset   = offsetof(BindlessVertex, position);
     attrib_descs[1].binding  = 0;
     attrib_descs[1].location = 1;
-    attrib_descs[1].format   = er::Format::R32G32B32_SFLOAT;
-    attrib_descs[1].offset   = offsetof(BindlessVertex, normal);
+    attrib_descs[1].format   = er::Format::R32_UINT;
+    attrib_descs[1].offset   = offsetof(BindlessVertex, packed_normal);
     attrib_descs[2].binding  = 0;
     attrib_descs[2].location = 2;
-    attrib_descs[2].format   = er::Format::R32G32_SFLOAT;
-    attrib_descs[2].offset   = offsetof(BindlessVertex, uv);
+    attrib_descs[2].format   = er::Format::R32_UINT;
+    attrib_descs[2].offset   = offsetof(BindlessVertex, packed_uv);
     attrib_descs[3].binding  = 0;
     attrib_descs[3].location = 3;
-    attrib_descs[3].format   = er::Format::R32G32B32A32_SFLOAT;
-    attrib_descs[3].offset   = offsetof(BindlessVertex, tangent);
+    attrib_descs[3].format   = er::Format::R32_UINT;
+    attrib_descs[3].offset   = offsetof(BindlessVertex, packed_tangent);
 
     er::PipelineInputAssemblyStateCreateInfo input_assembly;
     input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
@@ -4317,10 +4458,15 @@ uint32_t ClusterRenderer::drawTranslucentForward(
     cmd_buf->bindIndexBuffer(
         merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
 
+    // maxDrawCount MUST be clamped to the right-sized buffer capacity:
+    // the cull shader's counter can exceed it on overflow (atomicAdd is
+    // unconditional; only the WRITES are guarded), and the min(count,
+    // maxDrawCount) rule is what keeps the GPU from reading commands
+    // past the end of the smaller buffer.
     cmd_buf->drawIndexedIndirectCount(
         trans_indirect_draw_buffer_, 0,
         trans_draw_count_buffer_, 0,
-        total_clusters_all_meshes_);
+        std::min(total_clusters_all_meshes_, trans_indirect_capacity_));
 
     return total_visible_all_meshes_;
 }
@@ -4414,10 +4560,12 @@ uint32_t ClusterRenderer::drawTranslucentOit(
 
     cmd_buf->beginDynamicRendering(oit_ri);
     bind_geometry_state(bindless_translucent_oit_pipeline_);
+    // Clamp maxDrawCount to the right-sized translucent buffer — see
+    // the matching comment in drawTranslucentForward.
     cmd_buf->drawIndexedIndirectCount(
         trans_indirect_draw_buffer_, 0,
         trans_draw_count_buffer_, 0,
-        total_clusters_all_meshes_);
+        std::min(total_clusters_all_meshes_, trans_indirect_capacity_));
     cmd_buf->endDynamicRendering();
 
     // ── Transition accum + reveal: COLOR_ATTACHMENT → SHADER_READ ────
@@ -4603,10 +4751,14 @@ void ClusterRenderer::recreate(
             device_, cull_desc_set_,
             total_clusters_all_meshes_,
             cull_info_buffer_, draw_info_buffer_,
-            indirect_draw_buffer_, draw_count_buffer_,
+            indirect_draw_buffer_,
+            total_clusters_all_meshes_,   // opaque buffer stays worst-case
+            draw_count_buffer_,
             visible_buffer_,
             material_params_buffer_, mat_count,
-            trans_indirect_draw_buffer_, trans_draw_count_buffer_,
+            trans_indirect_draw_buffer_,
+            trans_indirect_capacity_,
+            trans_draw_count_buffer_,
             visibility_bit_buffer_,
             indirect_draw_buffer_phase_a_,
             draw_count_buffer_phase_a_,
@@ -4625,11 +4777,13 @@ void ClusterRenderer::recreate(
 // inside finalizeUploads, which is already a load-time hitch) and uploaded
 // as SSBOs for deferred_resolve.comp's per-pixel traversal.
 //
-// DEVICE_LOCAL is non-negotiable for every buffer the trace touches: the
-// shared cluster buffers (cull/draw infos, merged VB/IB, materials) are
-// HOST_VISIBLE for the CPU-cull/debug paths, and a per-pixel traversal
-// reading host memory over PCIe is a 10-100× slowdown.  So the RT set
-// gets its own device-local copies, built here from the staging arrays.
+// DEVICE_LOCAL is non-negotiable for every buffer the trace touches: a
+// per-pixel traversal reading host memory over PCIe is a 10-100× slowdown.
+// The merged VB/IB are DEVICE_LOCAL themselves now (finalizeUploads), so
+// the trace shares them directly (pos+uv SoA repack aside); only the
+// buffers whose primaries must stay HOST_VISIBLE for genuine CPU access
+// (cull infos, draw infos, materials — see the comment at their copies
+// below) still get device-local duplicates built from the staging arrays.
 
 // DEVICE_LOCAL variant of createSSBO — Helper::createBuffer stages the
 // upload automatically when the memory property is exactly DEVICE_LOCAL.
@@ -4754,18 +4908,22 @@ void ClusterRenderer::buildRtShadowBvh() {
 
     // ── Packed position + UV SoA (binding 2) ─────────────────────────
     // The trace's inner loop is memory-bound on vertex fetches: the
-    // interleaved BindlessVertex is 48 B with position at offset 0, so
-    // reading 3 positions touches 3 cache lines' worth of stride.
-    // Repack to vec4 { pos.xyz, packHalf2x16(uv) } — one coalesced 16 B
-    // load per vertex, and the UV comes along free for the alpha-cutoff
-    // texture test on masked casters.
+    // interleaved BindlessVertex (24 B packed, position at offset 0)
+    // still scatters the 3 position fetches across the stride.  Repack
+    // to vec4 { pos.xyz, packHalf2x16(uv) } — one coalesced 16 B load
+    // per vertex, the UV comes along free for the alpha-cutoff texture
+    // test on masked casters, AND this buffer doubles as the hardware-RT
+    // BLAS vertex source (vec4 stride, R32G32B32 positions) — do NOT
+    // compress it.
     {
         std::vector<glm::vec4> pos_uv(staging_vertices_.size());
         for (size_t i = 0; i < staging_vertices_.size(); ++i) {
             const BindlessVertex& v = staging_vertices_[i];
-            const uint32_t packed_uv = glm::packHalf2x16(v.uv);
+            // BindlessVertex already stores the UV as packHalf2x16 — the
+            // exact encoding this SoA carries — so the repack is a bit
+            // copy of the packed word.
             pos_uv[i] = glm::vec4(v.position,
-                                  glm::uintBitsToFloat(packed_uv));
+                                  glm::uintBitsToFloat(v.packed_uv));
         }
         // as_input: also the vertex source of the hardware-RT BLAS
         // (positions at offset 0, stride 16 B, format R32G32B32_SFLOAT).
@@ -4775,12 +4933,16 @@ void ClusterRenderer::buildRtShadowBvh() {
     }
 
     // ── Device-local copies of the shared cluster buffers ────────────
-    // cull_info_buffer_ / draw_info_buffer_ / merged_index_buffer_ /
-    // material_params_buffer_ are all HOST_VISIBLE (CPU-cull + debug
-    // paths map them).  The trace reads cull+draw infos per leaf cluster
-    // and indices per TRIANGLE — over PCIe that dominates the whole
-    // dispatch.  VRAM cost is a one-time duplicate of data we already
-    // keep staged on the CPU.
+    // cull_info_buffer_ / draw_info_buffer_ / material_params_buffer_
+    // are HOST_VISIBLE because the CPU genuinely touches them at runtime
+    // (setMeshClustersHidden pokes cull infos, the CPU-cull debug mode
+    // maps cull+draw infos per frame, setVtEnabled / applyMaterial-
+    // Categories re-upload material params from the host).  The trace
+    // reads cull+draw infos per leaf cluster — over PCIe that dominates
+    // the whole dispatch — so those keep device-local duplicates.  The
+    // merged INDEX buffer has no CPU access after finalize and is now
+    // DEVICE_LOCAL itself (see finalizeUploads), so the trace binds it
+    // directly instead of a ~25 MiB rt_indices duplicate.
     rt_cull_infos_buffer_ = createDeviceSSBO(
         device_,
         staging_cull_infos_.size() * sizeof(glsl::ClusterCullInfo),
@@ -4789,10 +4951,6 @@ void ClusterRenderer::buildRtShadowBvh() {
         device_,
         staging_draw_infos_.size() * sizeof(glsl::ClusterDrawInfo),
         staging_draw_infos_.data());
-    rt_indices_buffer_ = createDeviceSSBO(
-        device_,
-        staging_indices_.size() * sizeof(uint32_t),
-        staging_indices_.data());
     {
         std::vector<glsl::BindlessMaterialParams> mat_fallback;
         const glsl::BindlessMaterialParams* mat_data =
@@ -4861,9 +5019,12 @@ void ClusterRenderer::buildRtShadowBvh() {
         rt_pos_uv_buffer_.buffer,
         static_cast<uint32_t>(
             total_merged_vertices_ * sizeof(glm::vec4)));
+    // Binding 3: the merged index buffer itself — DEVICE_LOCAL since the
+    // finalizeUploads conversion, so no duplicate copy is needed for the
+    // per-pixel trace.
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 3,
-        rt_indices_buffer_.buffer,
+        merged_index_buffer_.buffer,
         static_cast<uint32_t>(total_merged_indices_ * sizeof(uint32_t)));
     const uint32_t rt_mat_count = std::max(
         static_cast<uint32_t>(staging_material_params_.size()), 1u);
@@ -5102,6 +5263,12 @@ void ClusterRenderer::buildHwRtShadowAs() {
         cmd_buf->buildAccelerationStructures({blas_info}, blas_ranges);
         device_->submitAndWaitTransientCommandBuffer();
     }
+    // Scratch is only needed WHILE the build executes, and the submit-
+    // and-wait above guarantees the build is complete — free it now
+    // instead of keeping ~tens of MiB of dead VRAM alive for the
+    // renderer's lifetime.  (The TLAS scratch below is different: the
+    // per-frame skeleton TLAS rebuild in updateRtSkeletons reuses it.)
+    hw_rt_blas_scratch_buffer_.destroy(device_);
     const auto blas_addr =
         device_->getAccelerationStructureDeviceAddress(hw_rt_blas_handle_);
 
@@ -5174,6 +5341,11 @@ void ClusterRenderer::buildHwRtShadowAs() {
     hw_rt_tlas_handle_ = device_->createAccelerationStructure(
         hw_rt_tlas_buffer_.buffer,
         er::AccelerationStructureType::TOP_LEVEL_KHR);
+    // NOTE: unlike the BLAS scratch (freed right after its build), the
+    // TLAS scratch must OUTLIVE this function — updateRtSkeletons reuses
+    // it every frame for the static+skeleton TLAS rebuild (same 2-
+    // instance geometry, so the size computed here always suffices).
+    // It is a few KiB, not worth per-frame reallocation.
     device_->createBuffer(
         tlas_sizes.build_scratch_size,
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |

@@ -510,9 +510,14 @@ static void calculateBbox(
                 for (uint32_t i = 0; i < node.inst_count_; ++i) {
                     const auto& x =
                         drawable_object->baked_instances_[node.inst_offset_ + i];
+                    // 48 B layout: basis columns in .xyz, translation
+                    // spread across the .w lanes (see BakedInstanceXform).
                     const glm::mat4 inst_mat(
-                        x.mat_rot_0, x.mat_rot_1, x.mat_rot_2,
-                        glm::vec4(glm::vec3(x.mat_pos_scale), 1.0f));
+                        glm::vec4(glm::vec3(x.mat_rot_0), 0.0f),
+                        glm::vec4(glm::vec3(x.mat_rot_1), 0.0f),
+                        glm::vec4(glm::vec3(x.mat_rot_2), 0.0f),
+                        glm::vec4(x.mat_rot_0.w, x.mat_rot_1.w,
+                                  x.mat_rot_2.w, 1.0f));
                     glm::vec3 bbox_min, bbox_max;
                     transformBbox(
                         inst_mat * cur_matrix,
@@ -3275,8 +3280,8 @@ static void bakeInstanceTransforms(
     // The file would have shrunk 3x and VRAM would not have moved.  The
     // two memos are a pair; either alone buys nothing.
     //
-    // At 64 B per BakedInstanceXform this is the difference between
-    // 4.8 M trees costing ~307 MB and costing ~921 MB, on a card the
+    // At 48 B per BakedInstanceXform this is the difference between
+    // 4.8 M trees costing ~230 MB and costing ~691 MB, on a card the
     // user is already running at 18.7 of 24 GB.
     //
     // Keyed on the raw triple including the -1 "absent" sentinel, so two
@@ -3419,11 +3424,12 @@ static void bakeInstanceTransforms(
                                               0.0f, 0.0f, sc.z);
             if (bake) {
                 ego::BakedInstanceXform x;
-                // Columns, matching base.vert's mat3x3(rot_0,rot_1,rot_2).
-                x.mat_rot_0 = glm::vec4(basis[0], 0.0f);
-                x.mat_rot_1 = glm::vec4(basis[1], 0.0f);
-                x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
-                x.mat_pos_scale = glm::vec4(tr, 1.0f);
+                // Columns in .xyz, matching base.vert's
+                // mat3x3(rot_0.xyz, rot_1.xyz, rot_2.xyz); translation
+                // rides the .w lanes (48 B layout, see the struct).
+                x.mat_rot_0 = glm::vec4(basis[0], tr.x);
+                x.mat_rot_1 = glm::vec4(basis[1], tr.y);
+                x.mat_rot_2 = glm::vec4(basis[2], tr.z);
                 drawable_object->baked_instances_.push_back(x);
             }
 
@@ -3520,6 +3526,11 @@ static void createInstanceBuffer(
     static_assert(
         sizeof(ego::BakedInstanceXform) == sizeof(glsl::InstanceDataInfo),
         "BakedInstanceXform must stay byte-identical to the GLSL struct");
+    // The whole point of the mat3x4 repack: 4 vec4s → 3.  If this fires
+    // someone re-grew the struct and the ~260 MiB VRAM saving is gone.
+    static_assert(
+        sizeof(ego::BakedInstanceXform) == 48,
+        "BakedInstanceXform must stay 48 B (3 vec4s, translation in .w)");
 
     const auto usage =
         SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT);
@@ -5371,10 +5382,14 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     desc.stride = sizeof(glsl::InstanceDataInfo);
     binding_descs.push_back(desc);
 
+    // 48 B InstanceDataInfo: THREE vec4 attributes now (the old vec3
+    // IINPUT_MAT_ROT_* + vec4 IINPUT_MAT_POS_SCALE quartet is gone).
+    // Each vec4 carries a basis column in .xyz and one translation
+    // component in .w — base.vert unpacks accordingly.
     renderer::VertexInputAttributeDescription attr;
     attr.binding = VINPUT_INSTANCE_BINDING_POINT;
     attr.buffer_offset = 0;
-    attr.format = renderer::Format::R32G32B32_SFLOAT;
+    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
     attr.buffer_view = 0;
     attr.location = IINPUT_MAT_ROT_0;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_0);
@@ -5384,10 +5399,6 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     attribute_descs.push_back(attr);
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
-    attribute_descs.push_back(attr);
-    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
-    attr.location = IINPUT_MAT_POS_SCALE;
-    attr.offset = offsetof(glsl::InstanceDataInfo, mat_pos_scale);
     attribute_descs.push_back(attr);
 
     renderer::RasterizationStateOverride rasterization_state_override;
@@ -5486,10 +5497,13 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     desc.stride = sizeof(glsl::InstanceDataInfo);
     binding_descs.push_back(desc);
 
+    // 48 B InstanceDataInfo: three vec4 attributes (basis column in
+    // .xyz, translation component in .w) — mirrors the forward
+    // pipeline's setup above; the shadow VS unpacks the same way.
     renderer::VertexInputAttributeDescription attr;
     attr.binding = VINPUT_INSTANCE_BINDING_POINT;
     attr.buffer_offset = 0;
-    attr.format = renderer::Format::R32G32B32_SFLOAT;
+    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
     attr.buffer_view = 0;
     attr.location = IINPUT_MAT_ROT_0;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_0);
@@ -5499,10 +5513,6 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     attribute_descs.push_back(attr);
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
-    attribute_descs.push_back(attr);
-    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
-    attr.location = IINPUT_MAT_POS_SCALE;
-    attr.offset = offsetof(glsl::InstanceDataInfo, mat_pos_scale);
     attribute_descs.push_back(attr);
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_depth_clamp_enable = true;
@@ -6331,15 +6341,14 @@ std::vector<uint64_t> PcgInstanceRegistry::queryRadius(
 
 BakedInstanceXform PcgInstanceRegistry::xformOf(
     const PcgInstanceRecord& r) const {
-    // Same convention the bake writes: columns of rotY(yaw) * scale,
-    // translation in mat_pos_scale.xyz.
+    // Same convention the bake writes: columns of rotY(yaw) * scale in
+    // .xyz, translation spread across the .w lanes (48 B layout).
     const float c = std::cos(r.yaw) * r.scale;
     const float s = std::sin(r.yaw) * r.scale;
     BakedInstanceXform x;
-    x.mat_rot_0 = glm::vec4(c, 0.0f, -s, 0.0f);
-    x.mat_rot_1 = glm::vec4(0.0f, r.scale, 0.0f, 0.0f);
-    x.mat_rot_2 = glm::vec4(s, 0.0f, c, 0.0f);
-    x.mat_pos_scale = glm::vec4(r.t, 1.0f);
+    x.mat_rot_0 = glm::vec4(c, 0.0f, -s, r.t.x);
+    x.mat_rot_1 = glm::vec4(0.0f, r.scale, 0.0f, r.t.y);
+    x.mat_rot_2 = glm::vec4(s, 0.0f, c, r.t.z);
     return x;
 }
 
@@ -6365,7 +6374,12 @@ bool PcgInstanceRegistry::setState(uint64_t id, uint8_t state) {
     r.state = state;
     if (state == 2) {
         BakedInstanceXform x = xformOf(r);
-        x.mat_rot_0 = x.mat_rot_1 = x.mat_rot_2 = glm::vec4(0.0f);
+        // Zero only the basis (.xyz); the .w lanes keep the translation
+        // so CPU readers of the mirrored baked_instances_ copy (the RT
+        // candidate scan) still see where the hidden prop stands.
+        x.mat_rot_0.x = x.mat_rot_0.y = x.mat_rot_0.z = 0.0f;
+        x.mat_rot_1.x = x.mat_rot_1.y = x.mat_rot_1.z = 0.0f;
+        x.mat_rot_2.x = x.mat_rot_2.y = x.mat_rot_2.z = 0.0f;
         queueRecord(it->second, x);       // zero basis = invisible
     } else if (was_destroyed) {
         queueRecord(it->second, xformOf(r));
@@ -6437,7 +6451,11 @@ void PcgInstanceRegistry::bindBakedRange(
         // reload) must come up hidden, not resurrected
         if (recs_[rec].state == 2) {
             BakedInstanceXform hx = xformOf(recs_[rec]);
-            hx.mat_rot_0 = hx.mat_rot_1 = hx.mat_rot_2 = glm::vec4(0.0f);
+            // Zero basis only; .w lanes keep the translation (see
+            // setState above for why).
+            hx.mat_rot_0.x = hx.mat_rot_0.y = hx.mat_rot_0.z = 0.0f;
+            hx.mat_rot_1.x = hx.mat_rot_1.y = hx.mat_rot_1.z = 0.0f;
+            hx.mat_rot_2.x = hx.mat_rot_2.y = hx.mat_rot_2.z = 0.0f;
             dirty_[data.get()].emplace_back(first_slot + (uint32_t)i, hx);
         }
     }
@@ -11256,10 +11274,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                               0.0f, 0.0f, sc.z);
                 if (bake) {
                     ego::BakedInstanceXform x;
-                    x.mat_rot_0 = glm::vec4(basis[0], 0.0f);
-                    x.mat_rot_1 = glm::vec4(basis[1], 0.0f);
-                    x.mat_rot_2 = glm::vec4(basis[2], 0.0f);
-                    x.mat_pos_scale = glm::vec4(tr, 1.0f);
+                    // Basis columns in .xyz, translation in the .w
+                    // lanes (48 B layout, see the struct comment).
+                    x.mat_rot_0 = glm::vec4(basis[0], tr.x);
+                    x.mat_rot_1 = glm::vec4(basis[1], tr.y);
+                    x.mat_rot_2 = glm::vec4(basis[2], tr.z);
                     drawable_object->baked_instances_.push_back(x);
                 }
                 if (mesh_bbox_valid) {

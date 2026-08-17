@@ -51,10 +51,13 @@ layout(location = VINPUT_JOINTS_1) in uvec4 in_joints_1;
 layout(location = VINPUT_WEIGHTS_1) in vec4 in_weights_1;
 #endif
 
-layout(location = IINPUT_MAT_ROT_0) in vec3 in_loc_rot_mat_0;
-layout(location = IINPUT_MAT_ROT_1) in vec3 in_loc_rot_mat_1;
-layout(location = IINPUT_MAT_ROT_2) in vec3 in_loc_rot_mat_2;
-layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
+// 48 B InstanceDataInfo: three vec4s, .xyz = basis COLUMN,
+// .w = one translation component (the old IINPUT_MAT_POS_SCALE
+// attribute is gone).  Must match the attribute setup in
+// drawable_object.cpp (createDrawableGraphicsPipeline).
+layout(location = IINPUT_MAT_ROT_0) in vec4 in_loc_rot_mat_0;
+layout(location = IINPUT_MAT_ROT_1) in vec4 in_loc_rot_mat_1;
+layout(location = IINPUT_MAT_ROT_2) in vec4 in_loc_rot_mat_2;
 
 layout(location = 0) out ObjectVsPsData out_data;
 
@@ -171,13 +174,17 @@ void main() {
     vec3 position_ls = (matrix_ls * vec4(in_position, 1.0f)).xyz;
 
     mat3 local_world_rot_mat =
-        mat3x3(in_loc_rot_mat_0,
-               in_loc_rot_mat_1,
-               in_loc_rot_mat_2);
+        mat3x3(in_loc_rot_mat_0.xyz,
+               in_loc_rot_mat_1.xyz,
+               in_loc_rot_mat_2.xyz);
+    // Translation rides the .w lanes of the three basis columns
+    // (48 B InstanceDataInfo layout).
     vec3 position_ws =
         local_world_rot_mat *
         position_ls +
-        in_loc_pos_scale.xyz;
+        vec3(in_loc_rot_mat_0.w,
+             in_loc_rot_mat_1.w,
+             in_loc_rot_mat_2.w);
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
 

@@ -81,11 +81,11 @@ static void boxDownsampleRgba8(
 
 static er::Format layerFormat(VtLayer layer) {
     // ALBEDO is BC7_SRGB_BLOCK (4× VRAM win over RGBA8) — encoded
-    // CPU-side via Rich Geldreich's bc7enc.  The other three layers
-    // stay RGBA8_UNORM since they're blitted directly from source
-    // images on the GPU (no CPU encoding).  See encodeAndCacheVt for
-    // the ALBEDO encode pipeline and uploadTileAllLayers for the
-    // BC7-staging vs blit upload split.
+    // CPU-side via Rich Geldreich's bc7enc.  Only EMISSIVE stays
+    // RGBA8_UNORM, blitted directly from its stashed source image on
+    // the GPU (no CPU encoding).  See encodeAndCacheVt for the
+    // ALBEDO/NORMAL/MR_AO encode pipelines and uploadTileAllLayers
+    // for the BC-staging vs blit upload split.
     switch (layer) {
         case VtLayer::ALBEDO:         return er::Format::BC7_SRGB_BLOCK;
         // NORMAL is BC5_UNORM — 2-channel block-compressed format
@@ -97,7 +97,16 @@ static er::Format layerFormat(VtLayer layer) {
         // tile via encodeBC5UNorm; same per-entry byte layout as
         // BC7 so the existing kBc7BytesMip0/Mip1 constants apply.
         case VtLayer::NORMAL:         return er::Format::BC5_UNORM_BLOCK;
-        case VtLayer::METAL_ROUGH_AO: return er::Format::R8G8B8A8_UNORM;
+        // METAL_ROUGH_AO is BC7_UNORM — NOT the _SRGB variant: the
+        // ORM triple (occlusion/roughness/metallic) is linear data,
+        // and a sample-time sRGB decode would skew the scalar values.
+        // CPU-encoded per tile via encodeBC7Mode6 into cache.bc7_mr_ao
+        // (same 6480 B/entry layout as the other BC caches), which
+        // replaces the old blit path from a permanently resident
+        // RGBA8 source image — 4× pool saving (~168 MB → ~42 MB) and
+        // the caller may destroy the ORM source right after
+        // registerMaterial returns.
+        case VtLayer::METAL_ROUGH_AO: return er::Format::BC7_UNORM_BLOCK;
         case VtLayer::EMISSIVE:       return er::Format::R8G8B8A8_UNORM;
         default:                      return er::Format::R8G8B8A8_UNORM;
     }
@@ -228,15 +237,16 @@ VirtualTextureManager::VirtualTextureManager(
     // ~100 µs on most desktop drivers, so for 32 uploads/frame this
     // alone saves ~3 ms of CPU time per tick.
     {
-        // Two BC layers (ALBEDO BC7 + NORMAL BC5) both consume one
-        // kBc7BytesPerEntry-sized region per upload, so each frame
-        // needs 2 × N regions.  We allocate kVtCompactSlots (= FIF)
-        // copies of that to make CPU writes safe while the GPU is
-        // still reading from the previous frame's slice.
+        // Three BC layers (ALBEDO BC7 + NORMAL BC5 + MR_AO BC7) each
+        // consume one kBc7BytesPerEntry-sized region per upload, so
+        // each frame needs 3 × N regions.  We allocate kVtCompactSlots
+        // (= FIF) copies of that to make CPU writes safe while the GPU
+        // is still reading from the previous frame's slice.
         //
         // Layout per frame slot (frame_index % FIF):
-        //   slot N → bytes [frame_base + N*2 + 0] = ALBEDO
-        //          → bytes [frame_base + N*2 + 1] = NORMAL
+        //   slot N → bytes [frame_base + N*3 + 0] = ALBEDO
+        //          → bytes [frame_base + N*3 + 1] = NORMAL
+        //          → bytes [frame_base + N*3 + 2] = MR_AO
         // where frame_base = (frame_index % FIF) * kPerFrameBytes.
         //
         // Without this multi-buffering the previous design relied on
@@ -246,7 +256,7 @@ VirtualTextureManager::VirtualTextureManager(
         // command buffer; with FIF separate slices, no synchronization
         // beyond the frame fence is needed.
         const uint64_t kPerFrameBytes =
-            uint64_t(kStreamerUploadsPerFrame) * 2u * kBc7BytesPerEntry;
+            uint64_t(kStreamerUploadsPerFrame) * 3u * kBc7BytesPerEntry;
         const uint64_t upload_bytes = kPerFrameBytes * kVtCompactSlots;
         er::Helper::createBuffer(
             device_,
@@ -747,8 +757,10 @@ void VirtualTextureManager::tick(
         // computes the absolute byte offset by adding the frame slice
         // base (stashed in m_active_staging_base_off_ for the duration
         // of the call).
+        // 3 subslots per upload (ALBEDO/NORMAL/MR_AO) — must match the
+        // constructor's kPerFrameBytes and uploadTileAllLayers' offsets.
         const uint64_t kPerFrameStagingBytes =
-            uint64_t(kStreamerUploadsPerFrame) * 2u * kBc7BytesPerEntry;
+            uint64_t(kStreamerUploadsPerFrame) * 3u * kBc7BytesPerEntry;
         const uint64_t frame_staging_base =
             uint64_t(frame_index % kVtCompactSlots) * kPerFrameStagingBytes;
         active_staging_base_off_ = frame_staging_base;
@@ -759,7 +771,8 @@ void VirtualTextureManager::tick(
             decodeTileKey(key, vt, mip, px, py);
             if (vt >= vt_cache_.size() || vt_cache_[vt].mip_count == 0) continue;
             const VtCacheEntry& cache = vt_cache_[vt];
-            trans_src_once(cache.mr_ao_src);
+            // mr_ao_src is always null now (MR_AO streams from the CPU
+            // BC7 cache) — only EMISSIVE still needs a blit source.
             trans_src_once(cache.emissive_src);
 
             uint32_t s = allocSlot();
@@ -790,7 +803,8 @@ void VirtualTextureManager::tick(
             // Reverse barrier — find the shared_ptr by walking caches
             // (cheap; ≤ N source images).
             for (auto& c : vt_cache_) {
-                if (c.mr_ao_src.get()    == p) cmd_buf->addImageBarrier(c.mr_ao_src,    to_xfer_src, from_read, 0, 1, 0, 1);
+                // mr_ao_src is always null now — EMISSIVE is the only
+                // remaining blit source that needs the reverse barrier.
                 if (c.emissive_src.get() == p) cmd_buf->addImageBarrier(c.emissive_src, to_xfer_src, from_read, 0, 1, 0, 1);
             }
         }
@@ -1429,8 +1443,9 @@ void VirtualTextureManager::uploadLayerByBlitToSlots(
 // memory, parallel-encode every (mip, page) at full + half res into
 // vt_cache_[vt_index].bc7_albedo.  Total cache size per VT:
 // total_pages × kBc7BytesPerEntry  (≈ 7 MB for a 2048² source).
-// Source images for non-ALBEDO layers are kept by shared_ptr — the
-// streamer issues vkCmdBlitImage from those on demand.
+// Only the EMISSIVE source image is kept by shared_ptr — the
+// streamer issues vkCmdBlitImage from it on demand.  NORMAL / MR_AO
+// are consumed here into CPU BC caches like ALBEDO.
 // Decompress any GPU image to CPU RGBA8 via a blit-through-RGBA8
 // detour.  vkCmdBlitImage decompresses BC formats during the blit
 // (driver-side), so the destination RGBA8 image holds true colour
@@ -1710,8 +1725,13 @@ void VirtualTextureManager::encodeAndCacheVt(
     cache.mip_count = mip_count;
     cache.page_table_offset = page_table_offset;
     cache.albedo_src   = nullptr;       // not used in CPU-pixels path
-    cache.normal_src   = normal_image;
-    cache.mr_ao_src    = mr_ao_image;
+    // NORMAL + MR_AO are served entirely from the CPU-side BC caches
+    // built below (bc5_normal / bc7_mr_ao) — no blit path remains for
+    // either, so we don't stash their sources and the caller may
+    // destroy both images as soon as registerMaterial returns.
+    // emissive_src is the only remaining stashed blit source.
+    cache.normal_src   = nullptr;
+    cache.mr_ao_src    = nullptr;
     cache.emissive_src = emissive_image;
 
     // Fallback path: if the caller didn't have CPU-side pixels (the
@@ -1935,14 +1955,96 @@ void VirtualTextureManager::encodeAndCacheVt(
                 });
         }
     }
+
+    // ── METAL_ROUGH_AO pipeline: identical structure to NORMAL above
+    //    but encoded as BC7_UNORM via encodeBC7Mode6.  The ORM triple
+    //    is linear data, so the readback uses the UNORM temp (no sRGB
+    //    round-trip) and the pool format is BC7_UNORM, not _SRGB.
+    //    Replaces the old permanently-resident-source blit path; the
+    //    caller may destroy mr_ao_image once registerMaterial returns.
+    if (mr_ao_image) {
+        std::vector<uint8_t> orm_pixels =
+            readbackImageToRgba8(mr_ao_image, width, height,
+                                 /*dst_is_srgb*/ false);
+        if (!orm_pixels.empty()) {
+            cache.bc7_mr_ao.assign(uint64_t(total_pages) * kBc7BytesPerEntry, 0);
+
+            // CPU mip pyramid for the ORM source.
+            std::vector<std::vector<uint8_t>> om_pixels(mip_count);
+            std::vector<uint32_t> om_w(mip_count), om_h(mip_count);
+            om_pixels[0] = std::move(orm_pixels);
+            om_w[0] = width; om_h[0] = height;
+            for (uint32_t k = 1; k < mip_count; ++k) {
+                om_w[k] = std::max(1u, om_w[k - 1] >> 1);
+                om_h[k] = std::max(1u, om_h[k - 1] >> 1);
+                om_pixels[k].resize(uint64_t(om_w[k]) * om_h[k] * 4u);
+                boxDownsampleRgba8(om_pixels[k - 1].data(),
+                                   om_w[k - 1], om_h[k - 1],
+                                   om_pixels[k].data());
+            }
+
+            // Same parallel per-tile encode loop as NORMAL but
+            // calling encodeBC7Mode6 on the gathered RGBA.
+            encode_pool_->parallelFor(total_pages,
+                [&](size_t entry_idx) {
+                    uint32_t local = uint32_t(entry_idx);
+                    uint32_t k = 0;
+                    while (k < mip_count) {
+                        uint32_t mp = vtMipPagesAt(pages_x, k) * vtMipPagesAt(pages_y, k);
+                        if (local < mp) break;
+                        local -= mp;
+                        ++k;
+                    }
+                    if (k >= mip_count) return;
+                    const uint32_t mpx = vtMipPagesAt(pages_x, k);
+                    const uint32_t px  = local % mpx;
+                    const uint32_t py  = local / mpx;
+                    const uint32_t mw  = om_w[k];
+                    const uint32_t mh  = om_h[k];
+                    const uint8_t* mip_data = om_pixels[k].data();
+
+                    std::vector<uint8_t> tile_rgba(kVtTileSize * kVtTileSize * 4u);
+                    const int32_t origin_x = int32_t(px * kVtPageSize) - int32_t(kVtTileBorder);
+                    const int32_t origin_y = int32_t(py * kVtPageSize) - int32_t(kVtTileBorder);
+                    for (uint32_t ty = 0; ty < kVtTileSize; ++ty) {
+                        int32_t sy_signed = origin_y + int32_t(ty);
+                        uint32_t sy = uint32_t(std::clamp(sy_signed,
+                                                          0, int32_t(mh) - 1));
+                        for (uint32_t tx = 0; tx < kVtTileSize; ++tx) {
+                            int32_t sx_signed = origin_x + int32_t(tx);
+                            uint32_t sx = uint32_t(std::clamp(sx_signed,
+                                                              0, int32_t(mw) - 1));
+                            const uint8_t* s = mip_data + (size_t(sy) * mw + sx) * 4u;
+                            uint8_t* d = tile_rgba.data() + (size_t(ty) * kVtTileSize + tx) * 4u;
+                            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+                        }
+                    }
+
+                    uint8_t* dst0 = cache.bc7_mr_ao.data()
+                                  + uint64_t(entry_idx) * kBc7BytesPerEntry;
+                    encodeBC7Mode6(tile_rgba.data(),
+                                   kVtTileSize, kVtTileSize, dst0);
+
+                    std::vector<uint8_t> tile_rgba_half(
+                        (kVtTileSize/2) * (kVtTileSize/2) * 4u);
+                    boxDownsampleRgba8(tile_rgba.data(),
+                                       kVtTileSize, kVtTileSize,
+                                       tile_rgba_half.data());
+                    encodeBC7Mode6(tile_rgba_half.data(),
+                                   kVtTileSize/2, kVtTileSize/2,
+                                   dst0 + kBc7BytesMip0);
+                });
+        }
+    }
 }
 
 // ── Upload one tile (mip, page_x, page_y) of a VT to a pool slot ─────
-// Issues into the supplied command buffer.  ALBEDO comes from the
-// per-VT BC7 cache via copyBufferToImage; non-ALBEDO blits from the
-// stashed source GPU image.  Caller surrounds with TRANSFER_DST
-// barrier on each pool image.  Created staging buffers are pushed to
-// the keepalive vectors and released after submit completes.
+// Issues into the supplied command buffer.  ALBEDO / NORMAL / MR_AO
+// come from their per-VT BC caches via copyBufferToImage; only
+// EMISSIVE still blits from its stashed source GPU image.  Caller
+// surrounds with TRANSFER_DST barrier on each pool image.  Created
+// staging buffers are pushed to the keepalive vectors and released
+// after submit completes.
 void VirtualTextureManager::uploadTileAllLayers(
     const std::shared_ptr<er::CommandBuffer>& cmd_buf,
     uint32_t slot, uint32_t vt_index,
@@ -1970,12 +2072,13 @@ void VirtualTextureManager::uploadTileAllLayers(
         upload_staging_mapped_ &&
         staging_slot < kStreamerUploadsPerFrame) {
         // Per-slot staging layout: ALBEDO uses subslot 0, NORMAL uses
-        // subslot 1.  Both subslots are kBc7BytesPerEntry-sized.
-        // The frame's FIF slice base (active_staging_base_off_) is
-        // added on so back-to-back frames don't overlap.
+        // subslot 1, MR_AO uses subslot 2.  All subslots are
+        // kBc7BytesPerEntry-sized.  The frame's FIF slice base
+        // (active_staging_base_off_) is added on so back-to-back
+        // frames don't overlap.
         const uint64_t base_off =
             active_staging_base_off_ +
-            uint64_t(staging_slot) * 2u * kBc7BytesPerEntry;
+            uint64_t(staging_slot) * 3u * kBc7BytesPerEntry;
         std::memcpy(
             upload_staging_mapped_ + base_off,
             cache.bc7_albedo.data() + uint64_t(entry_idx_in_cache) * kBc7BytesPerEntry,
@@ -2016,7 +2119,7 @@ void VirtualTextureManager::uploadTileAllLayers(
         // FIF base + per-slot subslot 1 (NORMAL).
         const uint64_t base_off =
             active_staging_base_off_ +
-            (uint64_t(staging_slot) * 2u + 1u) * kBc7BytesPerEntry;
+            (uint64_t(staging_slot) * 3u + 1u) * kBc7BytesPerEntry;
         std::memcpy(
             upload_staging_mapped_ + base_off,
             cache.bc5_normal.data() + uint64_t(entry_idx_in_cache) * kBc7BytesPerEntry,
@@ -2046,7 +2149,50 @@ void VirtualTextureManager::uploadTileAllLayers(
             regions, er::ImageLayout::TRANSFER_DST_OPTIMAL);
     }
 
-    // ── Non-ALBEDO/Non-NORMAL: blit (page_size + 2*border) << mip
+    // ── METAL_ROUGH_AO: BC7 from cache → persistent staging buffer
+    //    subslot 2 → pool slot.  Same per-tile structure as NORMAL
+    //    above; the MR_AO pool was switched from R8G8B8A8_UNORM
+    //    (blit-fed) to BC7_UNORM (CPU-encoded) for a 4× memory
+    //    saving.  The 72/36 texel offsets are multiples of 4 so the
+    //    copy stays BC-block-aligned, same as the other BC pools.
+    if (!cache.bc7_mr_ao.empty() &&
+        entry_idx_in_cache < cache.bc7_mr_ao.size() / kBc7BytesPerEntry &&
+        upload_staging_mapped_ &&
+        staging_slot < kStreamerUploadsPerFrame) {
+        // FIF base + per-slot subslot 2 (MR_AO).
+        const uint64_t base_off =
+            active_staging_base_off_ +
+            (uint64_t(staging_slot) * 3u + 2u) * kBc7BytesPerEntry;
+        std::memcpy(
+            upload_staging_mapped_ + base_off,
+            cache.bc7_mr_ao.data() + uint64_t(entry_idx_in_cache) * kBc7BytesPerEntry,
+            kBc7BytesPerEntry);
+
+        std::vector<er::BufferImageCopyInfo> regions(2);
+        regions[0].buffer_offset = base_off;
+        regions[0].buffer_row_length   = kVtTileSize;
+        regions[0].buffer_image_height = kVtTileSize;
+        regions[0].image_subresource.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
+        regions[0].image_subresource.mip_level   = 0;
+        regions[0].image_subresource.layer_count = 1;
+        regions[0].image_offset = glm::ivec3(int32_t(phys_page_x*kVtTileSize),
+                                              int32_t(phys_page_y*kVtTileSize), 0);
+        regions[0].image_extent = glm::uvec3(kVtTileSize, kVtTileSize, 1);
+        regions[1] = regions[0];
+        regions[1].buffer_offset = base_off + kBc7BytesMip0;
+        regions[1].buffer_row_length   = kVtTileSize / 2;
+        regions[1].buffer_image_height = kVtTileSize / 2;
+        regions[1].image_subresource.mip_level = 1;
+        regions[1].image_offset = glm::ivec3(int32_t(phys_page_x*(kVtTileSize/2)),
+                                              int32_t(phys_page_y*(kVtTileSize/2)), 0);
+        regions[1].image_extent = glm::uvec3(kVtTileSize/2, kVtTileSize/2, 1);
+        cmd_buf->copyBufferToImage(
+            upload_staging_buffer_,
+            layer_pools_[uint32_t(VtLayer::METAL_ROUGH_AO)].texture.image,
+            regions, er::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    // ── EMISSIVE (only remaining blit layer): blit (page_size + 2*border) << mip
     // from source into a kVtTileSize×kVtTileSize pool slot.  Source
     // region is
     // CENTRED on the page's content with a kVtTileBorder<<mip border
@@ -2089,8 +2235,8 @@ void VirtualTextureManager::uploadTileAllLayers(
                            er::ImageLayout::TRANSFER_DST_OPTIMAL,
                            regs, er::Filter::LINEAR);
     };
-    blitOne(VtLayer::METAL_ROUGH_AO, cache.mr_ao_src);
-    blitOne(VtLayer::EMISSIVE,       cache.emissive_src);
+    // MR_AO no longer blits — it streams from cache.bc7_mr_ao above.
+    blitOne(VtLayer::EMISSIVE, cache.emissive_src);
 }
 
 // ── Public: register a material (Phase B: metadata-only + pin) ───────
@@ -2157,7 +2303,9 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
         meta_mapped_[vt_index] = meta;
     }
 
-    // ── Build CPU BC7 cache + stash source images ─────────────────
+    // ── Build CPU BC caches (albedo/normal/mr_ao) + stash emissive ──
+    // normal_image / mr_ao_image are fully consumed here (readback +
+    // encode); the caller may destroy both once this function returns.
     encodeAndCacheVt(vt_index, albedo_pixels, albedo_image,
                      normal_image, mr_ao_image, emissive_image,
                      width, height,
@@ -2193,12 +2341,10 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
             cmd->addImageBarrier(layer_pools_[l].texture.image,
                 from_read, to_xfer_dst, 0, kVtPoolMipLevels, 0, 1);
         }
-        // ALBEDO + NORMAL upload via copyBufferToImage from per-VT
-        // BC7/BC5 caches — no source-image transition required for
-        // either.  Only MR_AO + EMISSIVE still go through the GPU
-        // blit path and need TRANSFER_SRC_OPTIMAL.
-        if (mr_ao_image)    cmd->addImageBarrier(mr_ao_image,
-            from_read, to_xfer_src, 0, 1, 0, 1);
+        // ALBEDO + NORMAL + MR_AO upload via copyBufferToImage from
+        // per-VT BC caches — no source-image transition required for
+        // any of them.  Only EMISSIVE still goes through the GPU
+        // blit path and needs TRANSFER_SRC_OPTIMAL.
         if (emissive_image) cmd->addImageBarrier(emissive_image,
             from_read, to_xfer_src, 0, 1, 0, 1);
 
@@ -2229,8 +2375,6 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
             cmd->addImageBarrier(layer_pools_[l].texture.image,
                 to_xfer_dst, from_read, 0, kVtPoolMipLevels, 0, 1);
         }
-        if (mr_ao_image)    cmd->addImageBarrier(mr_ao_image,
-            to_xfer_src, from_read, 0, 1, 0, 1);
         if (emissive_image) cmd->addImageBarrier(emissive_image,
             to_xfer_src, from_read, 0, 1, 0, 1);
         device_->submitAndWaitTransientCommandBuffer();

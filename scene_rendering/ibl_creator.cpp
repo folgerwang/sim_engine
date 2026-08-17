@@ -1,3 +1,4 @@
+#include <iostream>
 #include <vector>
 
 #include "renderer/renderer.h"
@@ -8,58 +9,20 @@
 
 namespace {
 namespace er = engine::renderer;
-er::ShaderModuleList getIblShaderModules(
-    const std::shared_ptr<er::Device>& device)
-{
-    er::ShaderModuleList shader_modules(5);
-    shader_modules[0] =
-        er::helper::loadShaderModule(
-            device,
-            "full_screen_vert.spv",
-            er::ShaderStageFlagBits::VERTEX_BIT,
-            std::source_location::current());
-    shader_modules[1] =
-        er::helper::loadShaderModule(
-            device,
-            "panorama_to_cubemap_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT,
-            std::source_location::current());
-    shader_modules[2] =
-        er::helper::loadShaderModule(
-            device,
-            "ibl_labertian_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT,
-            std::source_location::current());
-    shader_modules[3] =
-        er::helper::loadShaderModule(
-            device,
-            "ibl_ggx_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT,
-            std::source_location::current());
-    shader_modules[4] =
-        er::helper::loadShaderModule(
-            device,
-            "ibl_charlie_frag.spv",
-            er::ShaderStageFlagBits::FRAGMENT_BIT,
-            std::source_location::current());
 
-    return shader_modules;
-}
+// VRAM cleanup (2026-08): the helpers that served the legacy full-res
+// graphics IBL path (getIblShaderModules, createCubemapPipelineLayout,
+// addIblTextures, addIblComputeTextures, createCubemapComputePipelineLayout)
+// were removed together with the pipelines/textures they set up.  The
+// public methods that used them are kept as logged no-op stubs — see the
+// "STUBBED" banner in ibl_creator.h.
 
-std::shared_ptr<er::PipelineLayout> createCubemapPipelineLayout(
-    const std::shared_ptr<er::Device>& device,
-    const std::shared_ptr<er::DescriptorSetLayout>& ibl_desc_set_layout) {
-    er::PushConstantRange push_const_range{};
-    push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT);
-    push_const_range.offset = 0;
-    push_const_range.size = sizeof(glsl::IblParams);
-
-    return device->createPipelineLayout(
-        { ibl_desc_set_layout },
-        { push_const_range },
-        std::source_location::current());
-}
-
+// Writes the PANORAMA_TEX_INDEX binding of envmap_tex_desc_set_.  The
+// panorama HDR itself was removed as dead VRAM (drawEnvmapFromPanoramaImage
+// is now a stub); the set is kept — it has a public accessor
+// (getEnvmapTexDescSet) that unstaged UI/tooling code may still call —
+// and is filled with a valid placeholder view so binding it is never
+// undefined behavior.
 er::WriteDescriptorList addPanoramaTextures(
     const std::shared_ptr<er::DescriptorSet>& description_set,
     const std::shared_ptr<er::Sampler>& texture_sampler,
@@ -80,82 +43,28 @@ er::WriteDescriptorList addPanoramaTextures(
     return descriptor_writes;
 }
 
-er::WriteDescriptorList addIblTextures(
-    const std::shared_ptr<er::DescriptorSet>& description_set,
-    const std::shared_ptr<er::Sampler>& texture_sampler,
-    const er::TextureInfo& rt_envmap_tex)
-{
-    er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(1);
-
-    er::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        er::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        ENVMAP_TEX_INDEX,
-        texture_sampler,
-        rt_envmap_tex.view,
-        er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-    return descriptor_writes;
+// Warning for calls into the stubbed legacy IBL methods.  std::cerr is
+// mirrored into the editor Output Log (see the logging note in
+// cluster_renderer.cpp).  Each stub wraps this in its own
+// function-local once-guard so a per-frame caller can't flood the log,
+// while distinct stubbed methods each still get one line.
+void warnStubbedIblCall(const char* method_name) {
+    std::cerr << "[IblCreator] " << method_name
+              << "() is a no-op stub - the legacy full-res IBL path "
+                 "was removed (VRAM cleanup); use the *MapMini "
+                 "compute path instead."
+              << std::endl;
 }
 
-er::WriteDescriptorList addIblComputeTextures(
-    const std::shared_ptr<er::DescriptorSet>& description_set,
-    const std::shared_ptr<er::Sampler>& texture_sampler,
-    const er::TextureInfo& src_tex,
-    const er::TextureInfo& dst_tex)
-{
-    er::WriteDescriptorList descriptor_writes;
-    descriptor_writes.reserve(2);
-
-    // ibl_smooth.comp binds both src_img and dst_img as `imageCube`
-    // (STORAGE_IMAGE).  Vulkan ignores VkDescriptorImageInfo::sampler for
-    // STORAGE_IMAGE descriptors, so pass nullptr here to match the
-    // convention used elsewhere in the codebase
-    // (e.g. application.cpp:505/850, conemap_test.cpp:248).  The
-    // texture_sampler parameter is retained on the function signature in
-    // case a future caller wants to repurpose this helper for a
-    // SAMPLED_IMAGE/COMBINED_IMAGE_SAMPLER variant.
-    (void)texture_sampler;
-    er::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        er::DescriptorType::STORAGE_IMAGE,
-        SRC_TEX_INDEX,
-        nullptr,
-        src_tex.view,
-        er::ImageLayout::GENERAL);
-
-    er::Helper::addOneTexture(
-        descriptor_writes,
-        description_set,
-        er::DescriptorType::STORAGE_IMAGE,
-        DST_TEX_INDEX,
-        nullptr,
-        dst_tex.view,
-        er::ImageLayout::GENERAL);
-
-    return descriptor_writes;
-}
-
-std::shared_ptr<er::PipelineLayout> createCubemapComputePipelineLayout(
-    const std::shared_ptr<er::Device>& device,
-    const std::shared_ptr<er::DescriptorSetLayout>& ibl_comp_desc_set_layout)
-{
-    er::PushConstantRange push_const_range{};
-    push_const_range.stage_flags = SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
-    push_const_range.offset = 0;
-    push_const_range.size = sizeof(glsl::IblComputeParams);
-
-    er::DescriptorSetLayoutList desc_set_layouts(1);
-    desc_set_layouts[0] = ibl_comp_desc_set_layout;
-
-    return device->createPipelineLayout(
-        desc_set_layouts,
-        { push_const_range },
-        std::source_location::current());
-}
+// Expands to a per-method once-guarded warnStubbedIblCall.
+#define IBL_WARN_STUBBED_ONCE(method_name)          \
+    do {                                            \
+        static bool s_warned_once = false;          \
+        if (!s_warned_once) {                       \
+            s_warned_once = true;                   \
+            warnStubbedIblCall(method_name);        \
+        }                                           \
+    } while (0)
 
 // Pipeline layout for the mini-buffer IBL convolution compute shaders.
 // Push constant carries IblMiniParams (roughness, mip metadata, dither
@@ -243,16 +152,21 @@ IblCreator::IblCreator(
         cube_render_pass,
         cube_size);
 
-    auto format = er::Format::R8G8B8A8_UNORM;
-    helper::createTextureImage(
-        device,
-        "assets/environments/doge2.hdr",
-        format,
-        false,
-        panorama_tex_,
-        std::source_location::current());
+    // NOTE (VRAM cleanup, 2026-08): the panorama HDR load
+    // ("assets/environments/doge2.hdr"), the ibl compute (blur)
+    // descriptor set layout, the blur compute pipeline and the four
+    // graphics pipelines (envmap / lambertian / ggx / charlie) that
+    // used to be created here were removed — nothing in src/ calls the
+    // methods that consumed them (drawEnvmapFromPanoramaImage,
+    // createIbl*Map, blurIblMaps; all stubbed).  The runtime IBL path
+    // is exclusively the *MapMini compute pipelines set up below.
+    // The parameter stays on the signature so call sites (application.cpp)
+    // don't churn.
+    (void)cube_graphic_pipeline_info;
 
-    // ibl texture descriptor set layout.
+    // ibl texture descriptor set layout.  Kept: getIblDescSetLayout()
+    // and getEnvmapTexDescSet() are public and may be referenced by
+    // UI/tooling code outside this tree.
     {
         std::vector<er::DescriptorSetLayoutBinding> bindings(1);
         bindings[0] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(PANORAMA_TEX_INDEX);
@@ -262,47 +176,10 @@ IblCreator::IblCreator(
             device->createDescriptorSetLayout(bindings);
     }
 
-    // ibl compute texture descriptor set layout.
-    {
-        std::vector<er::DescriptorSetLayoutBinding> bindings(2);
-        bindings[0] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(SRC_TEX_INDEX,
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            er::DescriptorType::STORAGE_IMAGE);
-        bindings[1] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(DST_TEX_INDEX,
-            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-            er::DescriptorType::STORAGE_IMAGE);
-
-        ibl_comp_desc_set_layout_ =
-            device->createDescriptorSetLayout(bindings);
-    }
-
     createDescriptorSets(
         device,
         descriptor_pool,
         texture_sampler);
-
-    ibl_comp_pipeline_layout_ =
-        createCubemapComputePipelineLayout(
-            device,
-            ibl_comp_desc_set_layout_);
-
-    blur_comp_pipeline_ =
-        er::helper::createComputePipeline(
-            device,
-            ibl_comp_pipeline_layout_,
-            "ibl_smooth_comp.spv",
-            std::source_location::current());
-
-    ibl_pipeline_layout_ =
-        createCubemapPipelineLayout(
-            device,
-            ibl_desc_set_layout_);
-
-    createIblGraphicsPipelines(
-        device,
-        cube_render_pass,
-        cube_graphic_pipeline_info,
-        cube_size);
 
     // ── Mini-buffer IBL convolution: descriptor set layout, pipeline
     // layout, and the three per-filter compute pipelines.  Per-mip
@@ -445,49 +322,50 @@ void IblCreator::createCubeTextures(
         tmp_ibl_diffuse_tex_,
         std::source_location::current());
 
-    renderer::Helper::createCubemapTexture(
-        device,
-        cube_render_pass,
-        cube_size,
-        cube_size,
-        num_mips,
-        renderer::Format::R16G16B16A16_SFLOAT,
-        dump_copies,
-        tmp_ibl_specular_tex_,
-        std::source_location::current());
+    // NOTE (VRAM cleanup, 2026-08): tmp_ibl_specular_tex_ and
+    // tmp_ibl_sheen_tex_ (16 MiB each) were removed.  They only ever
+    // served as blur sources for blurIblMaps(), which has no caller —
+    // consumers bind rt_ibl_specular_tex_ / rt_ibl_sheen_tex_ directly
+    // (see addToGlobalTextures).
 
-    renderer::Helper::createCubemapTexture(
-        device,
-        cube_render_pass,
-        cube_size,
-        cube_size,
-        num_mips,
-        renderer::Format::R16G16B16A16_SFLOAT,
-        dump_copies,
-        tmp_ibl_sheen_tex_,
-        std::source_location::current());
-
-    // Diffuse accumulator at 4× linear / 16× area of the consumer-facing
-    // diffuse cube.  The mini-buffer Lambertian convolution writes mip 0
-    // each frame at the larger size; we then run box-filter mipgen to
-    // populate mips 1 and 2 — mip 2 is a proper 4×4-averaged 1× cube,
-    // and we blit that to tmp_ibl_diffuse_tex_ for consumers.
+    // Diffuse EMA accumulator at 2× linear / 4× area of the consumer-
+    // facing diffuse cube.  The mini-buffer Lambertian convolution writes
+    // mip 0 each frame at the larger size; we then run box-filter mipgen
+    // to populate mip 1 — a proper 2×2-averaged 1× cube — and copy that
+    // to tmp_ibl_diffuse_tex_ for consumers.
     //
-    // Why 3 mips and not just LINEAR-blit 4×→1× directly:
+    // Why 2× and not the previous 4× (VRAM cleanup, 2026-08):
+    //   4× / 16×-area cost ~252 MiB of RGBA16F for what is a band-limited
+    //   (~SH order 2) signal.  Nothing in the dither dispatch *requires*
+    //   super-sampling — the 32×32 sparse-update path only needs
+    //   face_size >= 32 — but the box downsample is the main spatial
+    //   variance suppressor for the 16-sample Monte-Carlo estimates
+    //   (this codebase has a history of visible diffuse speckle, see
+    //   kIblTemporalAlpha).  2× keeps a true 2×2 box average (4
+    //   independently-dithered EMA texels per consumer texel, ~4×
+    //   variance reduction) at ~60 MiB — a 192 MiB saving.  If speckle
+    //   ever shows up at 2×, prefer lowering kIblTemporalAlpha before
+    //   re-growing this allocation.
+    //
+    // Why a mip chain and not a direct LINEAR blit to tmp_:
     //   Vulkan's LINEAR blit filter uses a 2×2 footprint regardless of
-    //   the downsample ratio, so a 4:1 LINEAR blit misses 12 out of every
-    //   16 source pixels per output cell — the 4 it does read are biased
-    //   toward whatever dither phase the cycle happens to land on, which
-    //   shows up as systematic darkening of the consumer-facing cube.
-    //   Two sequential 2:1 LINEAR blits via mipgen each cover their full
-    //   2×2 source neighbourhood and chain into a true 4×4 box average,
-    //   so every accumulator texel contributes to the consumer cube.
+    //   the downsample ratio; a single 2:1 blit (or mipgen step) covers
+    //   its full 2×2 source neighbourhood, so every accumulator texel
+    //   contributes to the consumer cube — no dither-phase bias.
+    //
+    // Format must stay R16G16B16A16_SFLOAT: the mini compute shader uses
+    // alpha == 0 as its "untouched texel" sentinel to pick
+    // effective_alpha = 1.0 on a texel's literal first touch (see the
+    // IblMiniParams::is_first_touch comment in global_definition.glsl.h),
+    // so an alpha-less format (e.g. B10G11R11_UFLOAT) would break EMA
+    // seeding — and the SPIR-V's declared storage-image format couldn't
+    // be changed from here anyway.
     renderer::Helper::createCubemapTexture(
         device,
         cube_render_pass,
-        cube_size * 4,
-        cube_size * 4,
-        3,                      // mips 0 (4×), 1 (2×), 2 (1×)
+        cube_size * 2,
+        cube_size * 2,
+        2,                      // mips 0 (2×), 1 (1×)
         renderer::Format::R16G16B16A16_SFLOAT,
         dump_copies,
         rt_ibl_diffuse_tex_,
@@ -516,57 +394,20 @@ void IblCreator::createCubeTextures(
         std::source_location::current());
 }
 
+// STUBBED (VRAM cleanup, 2026-08): the envmap / lambertian / ggx /
+// charlie graphics pipelines only served drawEnvmapFromPanoramaImage and
+// createIbl*Map, none of which have callers in src/.  Kept as a logged
+// no-op in case out-of-tree UI/tooling code still calls it.
 void IblCreator::createIblGraphicsPipelines(
     const std::shared_ptr<renderer::Device>& device,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const renderer::GraphicPipelineInfo& cube_graphic_pipeline_info,
     const uint32_t& cube_size) {
-    er::PipelineInputAssemblyStateCreateInfo input_assembly;
-    input_assembly.topology = er::PrimitiveTopology::TRIANGLE_LIST;
-    input_assembly.restart_enable = false;
-    {
-        auto ibl_shader_modules = getIblShaderModules(device);
-
-        envmap_pipeline_ = device->createPipeline(
-            cube_render_pass,
-            ibl_pipeline_layout_,
-            {}, {},
-            input_assembly,
-            cube_graphic_pipeline_info,
-            { ibl_shader_modules[0], ibl_shader_modules[1] },
-            glm::uvec2(cube_size, cube_size),
-            std::source_location::current());
-
-        lambertian_pipeline_ = device->createPipeline(
-            cube_render_pass,
-            ibl_pipeline_layout_,
-            {}, {},
-            input_assembly,
-            cube_graphic_pipeline_info,
-            { ibl_shader_modules[0], ibl_shader_modules[2] },
-            glm::uvec2(cube_size, cube_size),
-            std::source_location::current());
-
-        ggx_pipeline_ = device->createPipeline(
-            cube_render_pass,
-            ibl_pipeline_layout_,
-            {}, {},
-            input_assembly,
-            cube_graphic_pipeline_info,
-            { ibl_shader_modules[0], ibl_shader_modules[3] },
-            glm::uvec2(cube_size, cube_size),
-            std::source_location::current());
-
-        charlie_pipeline_ = device->createPipeline(
-            cube_render_pass,
-            ibl_pipeline_layout_,
-            {}, {},
-            input_assembly,
-            cube_graphic_pipeline_info,
-            { ibl_shader_modules[0], ibl_shader_modules[4] },
-            glm::uvec2(cube_size, cube_size),
-            std::source_location::current());
-    }
+    (void)device;
+    (void)cube_render_pass;
+    (void)cube_graphic_pipeline_info;
+    (void)cube_size;
+    IBL_WARN_STUBBED_ONCE("createIblGraphicsPipelines");
 }
 
 void IblCreator::createDescriptorSets(
@@ -582,109 +423,37 @@ void IblCreator::createDescriptorSets(
                 device->createDescriptorSets(
                     descriptor_pool, ibl_desc_set_layout_, 1)[0];
 
-        // create a global ibl texture descriptor set.
+        // VRAM cleanup (2026-08): panorama_tex_ was removed (its only
+        // reader, drawEnvmapFromPanoramaImage, is a stub).  Write the
+        // runtime envmap cube as a placeholder so the set stays fully
+        // written — getEnvmapTexDescSet() is public and out-of-tree code
+        // binding an unwritten COMBINED_IMAGE_SAMPLER would be undefined
+        // behavior.
         auto ibl_texture_descs = addPanoramaTextures(
             envmap_tex_desc_set_,
-            texture_sampler,
-            panorama_tex_);
-        device->updateDescriptorSets(ibl_texture_descs);
-    }
-
-    // ibl
-    {
-        // only one descriptor layout.
-        // persistent pool: allocate once, reuse across resize
-        if (!ibl_tex_desc_set_)
-            ibl_tex_desc_set_ = device->createDescriptorSets(
-                descriptor_pool, ibl_desc_set_layout_, 1)[0];
-
-        // create a global ibl texture descriptor set.
-        auto ibl_texture_descs = addIblTextures(
-            ibl_tex_desc_set_,
             texture_sampler,
             rt_envmap_tex_);
         device->updateDescriptorSets(ibl_texture_descs);
     }
 
-    // ibl diffuse blur compute.
-    //
-    // Layout decision:
-    //   src = rt_ibl_diffuse_tex_   (the EMA accumulator the mini-buffer
-    //                                Lambertian convolution reads/writes
-    //                                each frame — its full history)
-    //   dst = tmp_ibl_diffuse_tex_  (the consumer-facing blurred output
-    //                                bound at LAMBERTIAN_ENV_TEX_INDEX
-    //                                — see addToGlobalTextures())
-    //
-    // The blur is therefore a *read-only side-channel* on the EMA: it
-    // never writes back into rt_, so successive frames' Monte-Carlo
-    // averages don't compound the spatial blur into themselves.  The
-    // earlier "blur made the buffer darker every frame" symptom was
-    // exactly that feedback loop: the previous descriptor binding had
-    // src=tmp_, dst=rt_, so each frame the EMA picked up the blurred
-    // result as its starting point and the sequence converged toward a
-    // doubly-low-pass-filtered, increasingly desaturated steady state.
-    // Swapping src/dst breaks that loop entirely.
-    {
-        // persistent pool: allocate once, reuse across resize
-        if (!ibl_diffuse_tex_desc_set_)
-            ibl_diffuse_tex_desc_set_ = device->createDescriptorSets(
-                descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
-
-        auto ibl_texture_descs = addIblComputeTextures(
-            ibl_diffuse_tex_desc_set_,
-            texture_sampler,
-            rt_ibl_diffuse_tex_,    // src = EMA history
-            tmp_ibl_diffuse_tex_);  // dst = blurred consumer-facing
-        device->updateDescriptorSets(ibl_texture_descs);
-    }
-
-    // ibl specular compute
-    {
-        // only one descriptor layout.
-        // persistent pool: allocate once, reuse across resize
-        if (!ibl_specular_tex_desc_set_)
-            ibl_specular_tex_desc_set_ = device->createDescriptorSets(
-                descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
-
-        // create a global ibl texture descriptor set.
-        auto ibl_texture_descs = addIblComputeTextures(
-            ibl_specular_tex_desc_set_,
-            texture_sampler,
-            tmp_ibl_specular_tex_,
-            rt_ibl_specular_tex_);
-        device->updateDescriptorSets(ibl_texture_descs);
-    }
-
-    // ibl sheen compute
-    {
-        // only one descriptor layout.
-        // persistent pool: allocate once, reuse across resize
-        if (!ibl_sheen_tex_desc_set_)
-            ibl_sheen_tex_desc_set_ = device->createDescriptorSets(
-                descriptor_pool, ibl_comp_desc_set_layout_, 1)[0];
-
-        // create a global ibl texture descriptor set.
-        auto ibl_texture_descs = addIblComputeTextures(
-            ibl_sheen_tex_desc_set_,
-            texture_sampler,
-            tmp_ibl_sheen_tex_,
-            rt_ibl_sheen_tex_);
-        device->updateDescriptorSets(ibl_texture_descs);
-    }
+    // VRAM cleanup (2026-08): the ibl_tex_desc_set_ (full-res graphics
+    // convolution input) and the diffuse/specular/sheen blur-compute
+    // descriptor sets were removed together with the stubbed
+    // createIbl*Map / blurIblMaps paths and the tmp specular/sheen blur
+    // cubes they bound.  The mini-buffer path's per-(filter, mip) sets
+    // are built in bindIblMiniTargets().
 }
 
 void IblCreator::addToGlobalTextures(
     renderer::WriteDescriptorList& descriptor_writes,
     const std::shared_ptr<renderer::DescriptorSet>& description_set,
     const std::shared_ptr<renderer::Sampler>& texture_sampler) {
-    // LAMBERTIAN_ENV_TEX_INDEX → tmp_ibl_diffuse_tex_ (post-blur output).
-    // The on-disk-loaded fallback that some assets use still binds rt_
-    // directly (not blurred), but for the live, runtime-convolved cube
-    // the consumer reads the blurred side-channel that blurIblMaps()
-    // produces each frame from the EMA accumulator in rt_.  See the
-    // src/dst comment in createDescriptorSets() for why the blur output
-    // doesn't feed back into the accumulator.
+    // LAMBERTIAN_ENV_TEX_INDEX → tmp_ibl_diffuse_tex_ (the 1× cube that
+    // updateIblDiffuseMapMini fills each frame via box-filter mipgen +
+    // copy from the 2× EMA accumulator in rt_ibl_diffuse_tex_).  tmp_ is
+    // a pure side-channel: nothing ever writes it back into rt_, so
+    // successive frames' Monte-Carlo averages don't compound the spatial
+    // downsample into themselves.
     er::Helper::addOneTexture(
         descriptor_writes,
         description_set,
@@ -711,213 +480,66 @@ void IblCreator::addToGlobalTextures(
         er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 }
 
-// generate envmap cubemap from panorama hdr image.
+// STUBBED (VRAM cleanup, 2026-08): panorama_tex_ and envmap_pipeline_
+// were removed — the runtime envmap is generated by
+// Skydome::updateCubeSkyBoxMini instead.  Logged no-op for out-of-tree
+// callers.
 void IblCreator::drawEnvmapFromPanoramaImage(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const std::vector<er::ClearValue>& clear_values,
     const uint32_t& cube_size) {
-
-    cmd_buf->addImageBarrier(
-        rt_envmap_tex_.image,
-        er::Helper::getImageAsSource(),
-        er::Helper::getImageAsColorAttachment(),
-        0, 1, 0, 6);
-
-    cmd_buf->bindPipeline(
-        er::PipelineBindPoint::GRAPHICS,
-        envmap_pipeline_);
-
-    std::vector<er::ClearValue> envmap_clear_values(6, clear_values[0]);
-    cmd_buf->beginRenderPass(
-        cube_render_pass,
-        rt_envmap_tex_.framebuffers[0],
-        glm::uvec2(cube_size, cube_size),
-        envmap_clear_values);
-
-    glsl::IblParams ibl_params = {};
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-        ibl_pipeline_layout_,
-        &ibl_params,
-        sizeof(ibl_params));
-
-    cmd_buf->bindDescriptorSets(
-        er::PipelineBindPoint::GRAPHICS,
-        ibl_pipeline_layout_,
-        { envmap_tex_desc_set_ });
-
-    cmd_buf->draw(3);
-
-    cmd_buf->endRenderPass();
-
-    uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
-
-    er::Helper::generateMipmapLevels(
-        cmd_buf,
-        rt_envmap_tex_.image,
-        num_mips,
-        cube_size,
-        cube_size,
-        er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    (void)cmd_buf;
+    (void)cube_render_pass;
+    (void)clear_values;
+    (void)cube_size;
+    IBL_WARN_STUBBED_ONCE("drawEnvmapFromPanoramaImage");
 }
 
-// generate ibl diffuse texture.
+// STUBBED (VRAM cleanup, 2026-08): the full-res graphics convolution
+// path was removed — updateIblDiffuseMapMini self-bootstraps via its
+// first-touch block fill, so this bootstrap is no longer needed.
+// Logged no-op for out-of-tree callers.
 void IblCreator::createIblDiffuseMap(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const std::vector<er::ClearValue>& clear_values,
     const uint32_t& cube_size)
 {
-    cmd_buf->bindPipeline(
-        er::PipelineBindPoint::GRAPHICS,
-        lambertian_pipeline_);
-
-    cmd_buf->addImageBarrier(
-        rt_ibl_diffuse_tex_.image,
-        er::Helper::getImageAsSource(),
-        er::Helper::getImageAsColorAttachment(),
-        0, 1, 0, 6);
-
-    std::vector<er::ClearValue> envmap_clear_values(6, clear_values[0]);
-    cmd_buf->beginRenderPass(cube_render_pass,
-        rt_ibl_diffuse_tex_.framebuffers[0],
-        glm::uvec2(cube_size, cube_size),
-        envmap_clear_values);
-
-    glsl::IblParams ibl_params = {};
-    ibl_params.roughness = 1.0f;
-    ibl_params.currentMipLevel = 0;
-    ibl_params.width = cube_size;
-    ibl_params.lodBias = 0;
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-        ibl_pipeline_layout_,
-        &ibl_params,
-        sizeof(ibl_params));
-
-    cmd_buf->bindDescriptorSets(
-        er::PipelineBindPoint::GRAPHICS,
-        ibl_pipeline_layout_,
-        { ibl_tex_desc_set_ });
-
-    cmd_buf->draw(3);
-    cmd_buf->endRenderPass();
-
-    cmd_buf->addImageBarrier(
-        rt_ibl_diffuse_tex_.image,
-        er::Helper::getImageAsColorAttachment(),
-        er::Helper::getImageAsShaderSampler(),
-        0, 1, 0, 6);
+    (void)cmd_buf;
+    (void)cube_render_pass;
+    (void)clear_values;
+    (void)cube_size;
+    IBL_WARN_STUBBED_ONCE("createIblDiffuseMap");
 }
 
-// generate ibl specular texture.
+// STUBBED (VRAM cleanup, 2026-08): see createIblDiffuseMap — replaced
+// by updateIblSpecularMapMini's first-touch block fill.
 void IblCreator::createIblSpecularMap(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const std::vector<er::ClearValue>& clear_values,
     const uint32_t& cube_size)
 {
-    uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
-    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, ggx_pipeline_);
-
-    for (int i_mip = num_mips - 1; i_mip >= 0; i_mip--) {
-        cmd_buf->addImageBarrier(
-            rt_ibl_specular_tex_.image,
-            er::Helper::getImageAsSource(),
-            er::Helper::getImageAsColorAttachment(),
-            i_mip, 1, 0, 6);
-
-        uint32_t width = std::max(static_cast<uint32_t>(cube_size) >> i_mip, 1u);
-        uint32_t height = std::max(static_cast<uint32_t>(cube_size) >> i_mip, 1u);
-
-        std::vector<er::ClearValue> envmap_clear_values(6, clear_values[0]);
-        cmd_buf->beginRenderPass(
-            cube_render_pass,
-            rt_ibl_specular_tex_.framebuffers[i_mip],
-            glm::uvec2(width, height),
-            envmap_clear_values);
-
-        glsl::IblParams ibl_params = {};
-        ibl_params.roughness = static_cast<float>(i_mip) / static_cast<float>(num_mips - 1);
-        ibl_params.currentMipLevel = i_mip;
-        ibl_params.width = cube_size;
-        ibl_params.lodBias = 0;
-        cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-            ibl_pipeline_layout_,
-            &ibl_params,
-            sizeof(ibl_params));
-
-        cmd_buf->bindDescriptorSets(
-            er::PipelineBindPoint::GRAPHICS,
-            ibl_pipeline_layout_,
-            { ibl_tex_desc_set_ });
-
-        cmd_buf->draw(3);
-
-        cmd_buf->endRenderPass();
-    }
-
-    cmd_buf->addImageBarrier(
-        rt_ibl_specular_tex_.image,
-        er::Helper::getImageAsColorAttachment(),
-        er::Helper::getImageAsShaderSampler(),
-        0, num_mips, 0, 6);
+    (void)cmd_buf;
+    (void)cube_render_pass;
+    (void)clear_values;
+    (void)cube_size;
+    IBL_WARN_STUBBED_ONCE("createIblSpecularMap");
 }
 
-// generate ibl sheen texture.
+// STUBBED (VRAM cleanup, 2026-08): see createIblDiffuseMap — replaced
+// by updateIblSheenMapMini's first-touch block fill.
 void IblCreator::createIblSheenMap(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
     const std::vector<er::ClearValue>& clear_values,
     const uint32_t& cube_size) {
-    uint32_t num_mips = static_cast<uint32_t>(std::log2(cube_size) + 1);
-    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, charlie_pipeline_);
-
-    for (int i_mip = num_mips - 1; i_mip >= 0; i_mip--) {
-        uint32_t width = std::max(static_cast<uint32_t>(cube_size) >> i_mip, 1u);
-        uint32_t height = std::max(static_cast<uint32_t>(cube_size) >> i_mip, 1u);
-
-        cmd_buf->addImageBarrier(
-            rt_ibl_sheen_tex_.image,
-            er::Helper::getImageAsSource(),
-            er::Helper::getImageAsColorAttachment(),
-            i_mip, 1, 0, 6);
-
-        std::vector<er::ClearValue> envmap_clear_values(6, clear_values[0]);
-        cmd_buf->beginRenderPass(
-            cube_render_pass,
-            rt_ibl_sheen_tex_.framebuffers[i_mip],
-            glm::uvec2(width, height),
-            envmap_clear_values);
-
-        glsl::IblParams ibl_params = {};
-        ibl_params.roughness = static_cast<float>(i_mip) / static_cast<float>(num_mips - 1);
-        ibl_params.currentMipLevel = i_mip;
-        ibl_params.width = cube_size;
-        ibl_params.lodBias = 0;
-        cmd_buf->pushConstants(
-            SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
-            ibl_pipeline_layout_,
-            &ibl_params,
-            sizeof(ibl_params));
-
-        cmd_buf->bindDescriptorSets(
-            er::PipelineBindPoint::GRAPHICS,
-            ibl_pipeline_layout_,
-            { ibl_tex_desc_set_ });
-
-        cmd_buf->draw(3);
-
-        cmd_buf->endRenderPass();
-    }
-
-    cmd_buf->addImageBarrier(
-        rt_ibl_sheen_tex_.image,
-        er::Helper::getImageAsColorAttachment(),
-        er::Helper::getImageAsShaderSampler(),
-        0, num_mips, 0, 6);
+    (void)cmd_buf;
+    (void)cube_render_pass;
+    (void)clear_values;
+    (void)cube_size;
+    IBL_WARN_STUBBED_ONCE("createIblSheenMap");
 }
 
 namespace {
@@ -1067,19 +689,17 @@ void IblCreator::updateIblDiffuseMapMini(
 
     const glm::ivec2 dither = iblDitherOffsetForFrame(mini_frame_index_);
 
-    // The diffuse accumulator (rt_ibl_diffuse_tex_) is allocated at 4×
-    // the consumer-facing size (16× area) with a 3-mip chain.  Each
-    // frame:
-    //   1. Convolve mip 0 at the larger size (more dither coverage per
-    //      cycle).
-    //   2. Box-filter mipgen mips 1 and 2 — two sequential 2:1 LINEAR
-    //      blits, equivalent to a true 4×4 box filter on mip 0.  This
-    //      replaces a single 4:1 LINEAR blit, which only reads a 2×2
-    //      footprint per output pixel and so misses 12/16 of the source
-    //      data — the cause of the systematic darkening we saw with
-    //      direct rt_(4×) → tmp_(1×) blits.
-    //   3. Copy mip 2 (now exactly cube_size sized) → tmp_ for consumers.
-    const uint32_t accum_size = cube_size * 4;
+    // The diffuse accumulator (rt_ibl_diffuse_tex_) is allocated at 2×
+    // the consumer-facing size (4× area) with a 2-mip chain — see the
+    // sizing rationale in createCubeTextures (shrunk from 4× to save
+    // ~192 MiB of VRAM).  Each frame:
+    //   1. Convolve mip 0 at the larger size (spatial super-sampling of
+    //      the Monte-Carlo estimates).
+    //   2. Box-filter mipgen mip 1 — one 2:1 LINEAR blit that covers its
+    //      full 2×2 source neighbourhood, i.e. a true 2×2 box average of
+    //      4 independently-dithered EMA texels per output texel.
+    //   3. Copy mip 1 (now exactly cube_size sized) → tmp_ for consumers.
+    const uint32_t accum_size = cube_size * 2;
 
     dispatchIblMiniMip(
         cmd_buf,
@@ -1092,22 +712,22 @@ void IblCreator::updateIblDiffuseMapMini(
         dither,
         mini_frame_index_);
     // dispatchIblMiniMip leaves rt_ mip 0 in SHADER_READ_ONLY_OPTIMAL.
-    // Mips 1 and 2 are still in UNDEFINED on first frame (just allocated)
-    // and SHADER_READ_ONLY_OPTIMAL on subsequent frames (left there by
-    // the previous frame's mipgen tail).  generateMipmapLevels handles
-    // both cases — it uses cur_image_layout for the source mip and
+    // Mip 1 is still in UNDEFINED on first frame (just allocated) and
+    // SHADER_READ_ONLY_OPTIMAL on subsequent frames (left there by the
+    // previous frame's mipgen tail).  generateMipmapLevels handles both
+    // cases — it uses cur_image_layout for the source mip and
     // transitions destination mips internally.
 
-    // Step 2: box-filter mipgen across mips 0 → 1 → 2.
+    // Step 2: box-filter mipgen across mips 0 → 1.
     renderer::Helper::generateMipmapLevels(
         cmd_buf,
         rt_ibl_diffuse_tex_.image,
-        /*mip_count*/ 3,
+        /*mip_count*/ 2,
         accum_size, accum_size,
         renderer::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     // After mipgen, every mip of rt_ is in SHADER_READ_ONLY_OPTIMAL.
 
-    // Step 3: copy mip 2 (1× size) → tmp_ mip 0 for consumers.
+    // Step 3: copy mip 1 (1× size) → tmp_ mip 0 for consumers.
     er::ImageResourceInfo as_xfer_src = {
         er::ImageLayout::TRANSFER_SRC_OPTIMAL,
         SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
@@ -1117,13 +737,13 @@ void IblCreator::updateIblDiffuseMapMini(
         SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
         SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
 
-    // Only mip 2 of rt_ needs to flip to TRANSFER_SRC (mips 0/1 stay
+    // Only mip 1 of rt_ needs to flip to TRANSFER_SRC (mip 0 stays
     // in SHADER_READ_ONLY).
     cmd_buf->addImageBarrier(
         rt_ibl_diffuse_tex_.image,
         er::Helper::getImageAsShaderSampler(),
         as_xfer_src,
-        /*baseMip*/ 2, /*mipCount*/ 1, 0, 6);
+        /*baseMip*/ 1, /*mipCount*/ 1, 0, 6);
     cmd_buf->addImageBarrier(
         tmp_ibl_diffuse_tex_.image,
         er::Helper::getImageAsSource(),
@@ -1132,7 +752,7 @@ void IblCreator::updateIblDiffuseMapMini(
 
     er::ImageCopyInfo copy_region{};
     copy_region.src_subresource.aspect_mask      = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
-    copy_region.src_subresource.mip_level        = 2;
+    copy_region.src_subresource.mip_level        = 1;
     copy_region.src_subresource.base_array_layer = 0;
     copy_region.src_subresource.layer_count      = 6;
     copy_region.src_offset = glm::ivec3(0, 0, 0);
@@ -1147,7 +767,7 @@ void IblCreator::updateIblDiffuseMapMini(
         { copy_region });
 
     // tmp_ → SHADER_READ_ONLY for consumers (cluster bindless ambient,
-    // base.frag IBL ambient, glass OIT).  rt_ mip 2 → SHADER_READ_ONLY
+    // base.frag IBL ambient, glass OIT).  rt_ mip 1 → SHADER_READ_ONLY
     // for next-frame state symmetry.
     cmd_buf->addImageBarrier(
         tmp_ibl_diffuse_tex_.image,
@@ -1158,7 +778,7 @@ void IblCreator::updateIblDiffuseMapMini(
         rt_ibl_diffuse_tex_.image,
         as_xfer_src,
         er::Helper::getImageAsShaderSampler(),
-        /*baseMip*/ 2, /*mipCount*/ 1, 0, 6);
+        /*baseMip*/ 1, /*mipCount*/ 1, 0, 6);
 }
 
 void IblCreator::updateIblSpecularMapMini(
@@ -1247,84 +867,18 @@ void IblCreator::updateIblSheenMapMini(
     ++mini_frame_index_;
 }
 
+// STUBBED (VRAM cleanup, 2026-08): the Gaussian blur side-channel was
+// superseded by the box-filter mipgen + copy inside
+// updateIblDiffuseMapMini, and this method had no caller anywhere in
+// src/.  Its blur pipeline, compute descriptor sets and the
+// tmp specular/sheen blur-source cubes (16 MiB each) were removed.
+// Logged no-op for out-of-tree callers.
 void IblCreator::blurIblMaps(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const uint32_t& cube_size) {
-
-    // ── Shallow Gaussian on the diffuse cubemap ────────────────────────
-    // Reads the EMA accumulator (rt_ibl_diffuse_tex_) and writes the
-    // consumer-facing blurred cubemap (tmp_ibl_diffuse_tex_, bound at
-    // LAMBERTIAN_ENV_TEX_INDEX in addToGlobalTextures).  The blur is a
-    // pure side-channel: it never writes back into rt_, so successive
-    // frames' EMA accumulations don't pick up the spatial blur as their
-    // own starting point — see ibl_diffuse_tex_desc_set_ wiring in
-    // createDescriptorSets() for the rationale.
-    //
-    // Specular is intentionally NOT blurred: at the call site's
-    // num_mips=1 the GGX importance sampler degenerates to envmap(N),
-    // which already matches its consumer's expectation, and adding a
-    // blur to the specular side-channel would require either a second
-    // mipgen pass or a parallel blurred-specular allocation.
-
-    er::ImageResourceInfo rt_for_compute_read = {
-        er::ImageLayout::GENERAL,
-        SET_FLAG_BIT(Access, SHADER_READ_BIT),
-        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
-
-    // 1. rt_diffuse: SHADER_READ_ONLY → GENERAL (storage-image read).
-    //    The mini-buffer convolution left it in SHADER_READ_ONLY at end.
-    cmd_buf->addImageBarrier(
-        rt_ibl_diffuse_tex_.image,
-        er::Helper::getImageAsShaderSampler(),
-        rt_for_compute_read,
-        0, 1, 0, 6);
-    // 2. tmp_diffuse: any layout → GENERAL (storage-image write).
-    //    On first frame this comes from UNDEFINED; subsequently from
-    //    SHADER_READ_ONLY left by the previous frame's tail barrier.
-    //    Using getImageAsSource() (which encodes UNDEFINED) is safe in
-    //    both cases — we overwrite every texel anyway.
-    cmd_buf->addImageBarrier(
-        tmp_ibl_diffuse_tex_.image,
-        er::Helper::getImageAsSource(),
-        er::Helper::getImageAsStore(),
-        0, 1, 0, 6);
-
-    // 3. Bind, push constants, dispatch.
-    glsl::IblComputeParams ibl_comp_params = {};
-    ibl_comp_params.size = glm::ivec4(cube_size, cube_size, 0, 0);
-
-    cmd_buf->bindPipeline(
-        er::PipelineBindPoint::COMPUTE,
-        blur_comp_pipeline_);
-    cmd_buf->pushConstants(
-        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
-        ibl_comp_pipeline_layout_,
-        &ibl_comp_params,
-        sizeof(ibl_comp_params));
-    cmd_buf->bindDescriptorSets(
-        er::PipelineBindPoint::COMPUTE,
-        ibl_comp_pipeline_layout_,
-        { ibl_diffuse_tex_desc_set_ });
-    cmd_buf->dispatch(
-        (cube_size + 7) / 8, (cube_size + 7) / 8, 6);
-
-    // 4. tmp_diffuse → SHADER_READ_ONLY for consumers (cluster bindless
-    //    ambient, base.frag IBL ambient, glass OIT).
-    cmd_buf->addImageBarrier(
-        tmp_ibl_diffuse_tex_.image,
-        er::Helper::getImageAsStore(),
-        er::Helper::getImageAsShaderSampler(),
-        0, 1, 0, 6);
-    // 5. rt_diffuse → SHADER_READ_ONLY so the next frame's mini-buffer
-    //    EMA path (which transitions GENERAL→GENERAL via getImageAsLoad
-    //    Store before its dispatch) starts from a known well-defined
-    //    layout, AND so the IBL Debug viewer's SAMPLED descriptors over
-    //    rt_'s per-mip face views remain valid for ImGui::Image reads.
-    cmd_buf->addImageBarrier(
-        rt_ibl_diffuse_tex_.image,
-        rt_for_compute_read,
-        er::Helper::getImageAsShaderSampler(),
-        0, 1, 0, 6);
+    (void)cmd_buf;
+    (void)cube_size;
+    IBL_WARN_STUBBED_ONCE("blurIblMaps");
 }
 
 void IblCreator::recreate(
@@ -1352,17 +906,10 @@ void IblCreator::recreate(
 void IblCreator::destroy(
     const std::shared_ptr<renderer::Device>& device)
 {
-    device->destroyPipeline(blur_comp_pipeline_);
-    device->destroyPipelineLayout(ibl_comp_pipeline_layout_);
-
-    device->destroyPipeline(envmap_pipeline_);
-    device->destroyPipeline(lambertian_pipeline_);
-    device->destroyPipeline(ggx_pipeline_);
-    device->destroyPipeline(charlie_pipeline_);
-    device->destroyPipelineLayout(ibl_pipeline_layout_);
-
+    // VRAM cleanup (2026-08): the blur / full-res graphics pipelines,
+    // their pipeline layouts and the compute descriptor set layout no
+    // longer exist — nothing to destroy for them.
     device->destroyDescriptorSetLayout(ibl_desc_set_layout_);
-    device->destroyDescriptorSetLayout(ibl_comp_desc_set_layout_);
 
     // Mini-buffer IBL convolution.
     device->destroyPipeline(lambertian_mini_pipeline_);
@@ -1378,10 +925,7 @@ void IblCreator::destroy(
     rt_ibl_sheen_per_mip_cube_views_.clear();
 
     rt_envmap_tex_.destroy(device);
-    panorama_tex_.destroy(device);
     tmp_ibl_diffuse_tex_.destroy(device);
-    tmp_ibl_specular_tex_.destroy(device);
-    tmp_ibl_sheen_tex_.destroy(device);
     rt_ibl_diffuse_tex_.destroy(device);
     rt_ibl_specular_tex_.destroy(device);
     rt_ibl_sheen_tex_.destroy(device);

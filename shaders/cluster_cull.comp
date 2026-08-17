@@ -243,6 +243,25 @@ void main() {
     // that took a different branch (or returned earlier) don't
     // contribute, so each branch's wave-local count is exactly the
     // number of slots that branch needs.
+    //
+    // ── Overflow guards ─────────────────────────────────────────────
+    // The indirect buffers are no longer all worst-case sized: the
+    // per-cascade shadow buffers and the translucent buckets are
+    // right-sized, so a lane whose allocated slot lands past the
+    // buffer's capacity must simply SKIP the write (one dropped draw
+    // for one frame — acceptable; an OOB write is not).  Capacities
+    // ride in the two push-constant pad words (both exactly float-
+    // representable for any plausible cluster count):
+    //   hiz_size_mips_pad.w → opaque / shadow indirect capacity
+    //   camera_pos_pad.w    → translucent indirect capacity
+    // 0 means "no limit" so stale callers that leave the pads zeroed
+    // keep the pre-guard behaviour.  Note the counter atomicAdd itself
+    // is NOT guarded — only the writes — so the count value can exceed
+    // capacity; consumers clamp via maxDrawCount (and the CPU-side
+    // draws pass the capacity there).
+    uint opaque_capacity = uint(params.hiz_size_mips_pad.w);
+    uint trans_capacity  = uint(params.camera_pos_pad.w);
+
     if (params.cull_phase == 1u) {
         if (!skip_hiz_contribution) {
             uvec4 ballot     = subgroupBallot(true);
@@ -253,12 +272,14 @@ void main() {
             }
             base_slot = subgroupBroadcastFirst(base_slot);
             uint slot = base_slot + subgroupBallotExclusiveBitCount(ballot);
-            uint base = slot * 5u;
-            indirect_draws_phase_a[base + 0] = draw.index_count;
-            indirect_draws_phase_a[base + 1] = 1u;
-            indirect_draws_phase_a[base + 2] = draw.index_offset;
-            indirect_draws_phase_a[base + 3] = draw.vertex_offset;
-            indirect_draws_phase_a[base + 4] = cluster_idx;
+            if (opaque_capacity == 0u || slot < opaque_capacity) {
+                uint base = slot * 5u;
+                indirect_draws_phase_a[base + 0] = draw.index_count;
+                indirect_draws_phase_a[base + 1] = 1u;
+                indirect_draws_phase_a[base + 2] = draw.index_offset;
+                indirect_draws_phase_a[base + 3] = draw.vertex_offset;
+                indirect_draws_phase_a[base + 4] = cluster_idx;
+            }
         }
         return;
     }
@@ -272,12 +293,14 @@ void main() {
         }
         base_slot = subgroupBroadcastFirst(base_slot);
         uint slot = base_slot + subgroupBallotExclusiveBitCount(ballot);
-        uint base = slot * 5u;
-        trans_indirect_draws[base + 0] = draw.index_count;
-        trans_indirect_draws[base + 1] = 1u;
-        trans_indirect_draws[base + 2] = draw.index_offset;
-        trans_indirect_draws[base + 3] = draw.vertex_offset;
-        trans_indirect_draws[base + 4] = cluster_idx;
+        if (trans_capacity == 0u || slot < trans_capacity) {
+            uint base = slot * 5u;
+            trans_indirect_draws[base + 0] = draw.index_count;
+            trans_indirect_draws[base + 1] = 1u;
+            trans_indirect_draws[base + 2] = draw.index_offset;
+            trans_indirect_draws[base + 3] = draw.vertex_offset;
+            trans_indirect_draws[base + 4] = cluster_idx;
+        }
     } else {
         if (params.cull_phase == 2u) {
             // Record EVERY opaque survivor in THIS frame's set (write
@@ -315,12 +338,20 @@ void main() {
         }
         base_slot = subgroupBroadcastFirst(base_slot);
         uint slot = base_slot + subgroupBallotExclusiveBitCount(ballot);
-        uint base = slot * 5u;
-        indirect_draws[base + 0] = draw.index_count;
-        indirect_draws[base + 1] = 1u;
-        indirect_draws[base + 2] = draw.index_offset;
-        indirect_draws[base + 3] = draw.vertex_offset;
-        indirect_draws[base + 4] = cluster_idx;
-        visible_cluster_indices[slot] = cluster_idx;
+        // Capacity guard — matters for the per-cascade shadow dispatches
+        // whose binding-2 buffer is right-sized (cascade 0 = C/4, 1-2 =
+        // C/2).  The main-camera dispatches pass capacity == C, where at
+        // most one emit per cluster makes this guard unreachable.
+        // visible_cluster_indices is always sized for C entries, so
+        // slot < capacity <= C keeps that write in bounds too.
+        if (opaque_capacity == 0u || slot < opaque_capacity) {
+            uint base = slot * 5u;
+            indirect_draws[base + 0] = draw.index_count;
+            indirect_draws[base + 1] = 1u;
+            indirect_draws[base + 2] = draw.index_offset;
+            indirect_draws[base + 3] = draw.vertex_offset;
+            indirect_draws[base + 4] = cluster_idx;
+            visible_cluster_indices[slot] = cluster_idx;
+        }
     }
 }

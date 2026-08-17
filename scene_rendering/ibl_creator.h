@@ -5,31 +5,30 @@ namespace engine {
 namespace scene_rendering {
 
 class IblCreator {
-    renderer::TextureInfo panorama_tex_;
+    // VRAM cleanup (2026-08): the following members were removed as
+    // provably dead in this tree — no code path referenced them outside
+    // their own (uncalled) setup/draw functions:
+    //   panorama_tex_          (only read by drawEnvmapFromPanoramaImage,
+    //                           now a stub — the runtime envmap comes from
+    //                           Skydome::updateCubeSkyBoxMini)
+    //   tmp_ibl_specular_tex_ / tmp_ibl_sheen_tex_  (16 MiB each; only
+    //                           bound as blur sources for blurIblMaps,
+    //                           now a stub — consumers sample the rt_
+    //                           cubes directly, see addToGlobalTextures)
+    //   ibl_tex_desc_set_ / ibl_diffuse/specular/sheen_tex_desc_set_,
+    //   ibl_comp_desc_set_layout_, ibl_pipeline_layout_,
+    //   ibl_comp_pipeline_layout_, envmap/lambertian/ggx/charlie/
+    //   blur_comp pipelines    (setup exclusively for the stubbed
+    //                           full-res graphics + blur paths)
     renderer::TextureInfo rt_envmap_tex_;
     renderer::TextureInfo tmp_ibl_diffuse_tex_;
-    renderer::TextureInfo tmp_ibl_specular_tex_;
-    renderer::TextureInfo tmp_ibl_sheen_tex_;
     renderer::TextureInfo rt_ibl_diffuse_tex_;
     renderer::TextureInfo rt_ibl_specular_tex_;
     renderer::TextureInfo rt_ibl_sheen_tex_;
 
     std::shared_ptr<renderer::DescriptorSet> envmap_tex_desc_set_;
-    std::shared_ptr<renderer::DescriptorSet> ibl_tex_desc_set_;
-    std::shared_ptr<renderer::DescriptorSet> ibl_diffuse_tex_desc_set_;
-    std::shared_ptr<renderer::DescriptorSet> ibl_specular_tex_desc_set_;
-    std::shared_ptr<renderer::DescriptorSet> ibl_sheen_tex_desc_set_;
 
     std::shared_ptr<renderer::DescriptorSetLayout> ibl_desc_set_layout_;
-    std::shared_ptr<renderer::DescriptorSetLayout> ibl_comp_desc_set_layout_;
-    std::shared_ptr<renderer::PipelineLayout> ibl_pipeline_layout_;
-    std::shared_ptr<renderer::PipelineLayout> ibl_comp_pipeline_layout_;
-
-    std::shared_ptr<renderer::Pipeline> envmap_pipeline_;
-    std::shared_ptr<renderer::Pipeline> lambertian_pipeline_;
-    std::shared_ptr<renderer::Pipeline> ggx_pipeline_;
-    std::shared_ptr<renderer::Pipeline> charlie_pipeline_;
-    std::shared_ptr<renderer::Pipeline> blur_comp_pipeline_;
 
     // ── Dithered "mini-buffer" IBL convolution state ─────────────────────
     // Same idea as Skydome::updateCubeSkyBoxMini: per frame, only 1/64 of
@@ -85,13 +84,14 @@ public:
     // Menu's "IBL Debug" window to show face-by-face previews via
     // ImGui::Image.  TextureInfo::surface_views[mip][face] gives
     // sampleable 2D views for each cube face per mip - ideal for ImGui.
-    // Returns the *blurred, consumer-facing* diffuse cube — the same
-    // image bound at LAMBERTIAN_ENV_TEX_INDEX that cluster_bindless.frag,
-    // base.frag and the glass OIT shading block actually sample for
-    // diffuse irradiance.  Used by the IBL Debug viewer so the
-    // thumbnails reflect what the shaders see, not the noisier EMA
-    // accumulator that lives behind the blur.  For the unblurred
-    // accumulator (debugging the convolution path itself) use
+    // Returns the *consumer-facing* diffuse cube — the same image bound
+    // at LAMBERTIAN_ENV_TEX_INDEX that cluster_bindless.frag, base.frag
+    // and the glass OIT shading block actually sample for diffuse
+    // irradiance (produced each frame by box-filter mipgen + copy from
+    // the EMA accumulator, see updateIblDiffuseMapMini).  Used by the
+    // IBL Debug viewer so the thumbnails reflect what the shaders see,
+    // not the noisier EMA accumulator.  For the raw accumulator
+    // (debugging the convolution path itself) use
     // getIblDiffuseAccumulator() below.
     inline const renderer::TextureInfo& getIblDiffuseTexture()      const { return tmp_ibl_diffuse_tex_; }
     inline const renderer::TextureInfo& getIblDiffuseAccumulator()  const { return rt_ibl_diffuse_tex_; }
@@ -133,16 +133,26 @@ public:
         const std::shared_ptr<renderer::DescriptorSet>& description_set,
         const std::shared_ptr<renderer::Sampler>& texture_sampler);
 
+    void createDescriptorSets(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
+        const std::shared_ptr<renderer::Sampler>& texture_sampler);
+
+    // ── Legacy full-res IBL bootstrap path — STUBBED ──────────────────
+    // The methods below (createIblGraphicsPipelines,
+    // drawEnvmapFromPanoramaImage, createIbl{Diffuse,Specular,Sheen}Map,
+    // blurIblMaps) have no callers anywhere in src/; the runtime uses
+    // the *MapMini compute path exclusively.  Their pipelines, descriptor
+    // sets and backing textures (panorama_tex_, tmp_ibl_specular_tex_,
+    // tmp_ibl_sheen_tex_) were removed to reclaim VRAM.  The methods are
+    // kept as logged no-ops (not deleted) in case UI / tooling code that
+    // is not part of this tree still references them — calling one logs
+    // a one-time warning and does nothing.
     void createIblGraphicsPipelines(
         const std::shared_ptr<renderer::Device>& device,
         const std::shared_ptr<renderer::RenderPass>& cube_render_pass,
         const renderer::GraphicPipelineInfo& cube_graphic_pipeline_info,
         const uint32_t& cube_size);
-
-    void createDescriptorSets(
-        const std::shared_ptr<renderer::Device>& device,
-        const std::shared_ptr<renderer::DescriptorPool>& descriptor_pool,
-        const std::shared_ptr<renderer::Sampler>& texture_sampler);
 
     void drawEnvmapFromPanoramaImage(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

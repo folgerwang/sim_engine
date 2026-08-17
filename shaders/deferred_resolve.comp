@@ -92,7 +92,7 @@ layout(std430, set = RT_SHADOW_DATA_SET, binding = 1) readonly buffer RtDrawInfo
 // Packed position + UV: vec4 = { position.xyz, packHalf2x16(uv) }.
 // Built CPU-side in buildRtShadowBvh() from the merged vertex staging
 // data.  ONE coalesced 16 B fetch per vertex instead of three floats
-// scattered across the 48 B interleaved BindlessVertex stride (the
+// scattered across the 24 B interleaved BindlessVertex stride (packed oct/half layout) (the
 // dominant bandwidth cost of the triangle loop), and the UV rides along
 // for free so alpha-cutoff casters can be texture-tested at the hit.
 layout(std430, set = RT_SHADOW_DATA_SET, binding = 2) readonly buffer RtPosUv {

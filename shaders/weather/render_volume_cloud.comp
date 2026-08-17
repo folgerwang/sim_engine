@@ -63,6 +63,10 @@ float volFogSunVisibility(vec3 world_pos) {
 layout(local_size_x = 8, local_size_y = 8) in;
 void main()
 {
+    // This pass runs at dst_fog_cloud's own resolution (HALF display —
+    // see VolumeCloud::recreate): params.inv_screen_size is 1/target
+    // size, so in_uv spans the full screen and the full-res depth
+    // buffer below is sampled with the same normalized UVs.
     ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
     vec2 in_uv = (pixel_coords + 0.5) * params.inv_screen_size;
     vec2 ss_xy = in_uv * 2.0f - 1.0f;

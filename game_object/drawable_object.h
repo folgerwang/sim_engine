@@ -300,24 +300,30 @@ struct MeshInfo {
 // DataInfo (see shaders/global_definition.glsl.h) so a vector of these
 // can be memcpy'd straight into instance_buffer_.
 //
+// 48 B, not 64: the old fourth vec4 (mat_pos_scale) and the three .w
+// pads were dead weight — every consumer read only the .xyz of the
+// basis columns and the .xyz of the translation, so at 17 M baked
+// instances the four unused lanes alone cost ~260 MiB of VRAM.  The
+// translation now rides in the .w lane of each basis column instead:
+//     mat_rot_0 = (basis[0], T.x)
+//     mat_rot_1 = (basis[1], T.y)
+//     mat_rot_2 = (basis[2], T.z)
+//
 // Column convention is base.vert's, NOT a glm::mat4's rows:
-//     position_ws = mat3(mat_rot_0, mat_rot_1, mat_rot_2) * position_ls
-//                 + mat_pos_scale.xyz
-// GLSL's mat3x3(a,b,c) builds from COLUMNS, so mat_rot_i is column i of
-// the rotation*scale basis and mat_pos_scale.xyz is the translation.
-// That matches glm's column-major mat4 exactly: mat_rot_i == M[i] for
+//     position_ws = mat3(mat_rot_0.xyz, mat_rot_1.xyz, mat_rot_2.xyz)
+//                 * position_ls
+//                 + vec3(mat_rot_0.w, mat_rot_1.w, mat_rot_2.w)
+// GLSL's mat3x3(a,b,c) builds from COLUMNS, so mat_rot_i.xyz is column
+// i of the rotation*scale basis (scale premultiplied at bake time) and
+// the three .w lanes together are the translation.  That matches glm's
+// column-major mat4 exactly: mat_rot_i.xyz == vec3(M[i]) for
 // M = translate(T) * mat4_cast(R) * scale(S).  Get this wrong and every
 // instance renders transposed — sheared and mirrored, not obviously
 // "rotated", which is a miserable thing to debug.
-//
-// mat_pos_scale.w is 1.0 and unused; the name is inherited from the
-// per-frame compute path (update_instance_buffer.comp) which packs the
-// same four vec4s.
 struct BakedInstanceXform {
     glm::vec4                   mat_rot_0{1.0f, 0.0f, 0.0f, 0.0f};
     glm::vec4                   mat_rot_1{0.0f, 1.0f, 0.0f, 0.0f};
     glm::vec4                   mat_rot_2{0.0f, 0.0f, 1.0f, 0.0f};
-    glm::vec4                   mat_pos_scale{0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 struct NodeInfo {

@@ -55,17 +55,21 @@ void main()
   if (params.force_identity != 0u) {
     // Explicit transform pushed from the CPU (editor placement TRS for
     // hand-placed skinned characters; identity for the controller-
-    // driven player).  Same column convention as the path below.
-    insts[inst_idx].mat_rot_0     = params.forced_mat_0;
-    insts[inst_idx].mat_rot_1     = params.forced_mat_1;
-    insts[inst_idx].mat_rot_2     = params.forced_mat_2;
-    insts[inst_idx].mat_pos_scale = vec4(params.forced_pos.xyz, 1.0);
+    // driven player).  Same column convention as the path below —
+    // 48 B InstanceDataInfo: basis columns in .xyz, translation spread
+    // across the .w lanes (the push constant still ships a separate
+    // forced_pos; only the buffer layout shrank).
+    insts[inst_idx].mat_rot_0 = vec4(params.forced_mat_0.xyz, params.forced_pos.x);
+    insts[inst_idx].mat_rot_1 = vec4(params.forced_mat_1.xyz, params.forced_pos.y);
+    insts[inst_idx].mat_rot_2 = vec4(params.forced_mat_2.xyz, params.forced_pos.z);
     return;
   }
 
   UnpackedGameObjectInfo info = unpackGameObjectInfo(items[inst_idx]);
-  insts[inst_idx].mat_rot_0 = vec4(cross(info.up_vector, info.facing_dir) * info.scale, 0.0f);
-  insts[inst_idx].mat_rot_1 = vec4(info.up_vector * info.scale, 0.0f);
-  insts[inst_idx].mat_rot_2 = vec4(info.facing_dir * info.scale, 0.0f);
-  insts[inst_idx].mat_pos_scale = vec4(info.position, 1.0f);
+  // Basis columns in .xyz (scale premultiplied), translation in .w —
+  // must mirror BakedInstanceXform / instanceBasis()+instanceTranslation()
+  // in global_definition.glsl.h.
+  insts[inst_idx].mat_rot_0 = vec4(cross(info.up_vector, info.facing_dir) * info.scale, info.position.x);
+  insts[inst_idx].mat_rot_1 = vec4(info.up_vector * info.scale, info.position.y);
+  insts[inst_idx].mat_rot_2 = vec4(info.facing_dir * info.scale, info.position.z);
 }

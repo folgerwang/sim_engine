@@ -18,15 +18,19 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     ViewCameraInfo camera_info;
 };
 
-// Vertex attributes from the merged vertex buffer (BindlessVertex layout).
-layout(location = 0) in vec3 in_position;   // world-space position
-layout(location = 1) in vec3 in_normal;      // world-space normal
-layout(location = 2) in vec2 in_uv;          // texture UV
-// in_tangent.xyz = world-space tangent (orthogonalised against in_normal,
+// Vertex attributes from the merged vertex buffer (packed 24 B
+// BindlessVertex layout — see cluster_renderer.h).  Normal / tangent /
+// UV arrive as raw uint words (R32_UINT attributes) and are decoded
+// here with the shared bvDecode* helpers from global_definition.glsl.h,
+// so the fragment shader's inputs are unchanged.
+layout(location = 0) in vec3 in_position;         // world-space position
+layout(location = 1) in uint in_packed_normal;    // oct 2×snorm16
+layout(location = 2) in uint in_packed_uv;        // packHalf2x16(uv)
+// Oct 2×snorm16 world-space tangent (orthogonalised against the normal,
 // computed at upload by computeMeshTangents in cluster_renderer.cpp);
-// in_tangent.w   = bitangent handedness sign so the fragment shader can
-//                  recover B = cross(N, T) * w without storing B explicitly.
-layout(location = 3) in vec4 in_tangent;
+// bit 16 carries the bitangent handedness sign so the fragment shader
+// can recover B = cross(N, T) * w without storing B explicitly.
+layout(location = 3) in uint in_packed_tangent;
 
 // Outputs to fragment shader.
 layout(location = 0) out vec3 v_world_pos;
@@ -47,10 +51,13 @@ layout(location = 6) out vec4 v_prev_clip;
 
 void main() {
     v_world_pos   = in_position;
-    v_normal      = in_normal;
-    v_uv          = in_uv;
+    // Decode the packed attributes once per vertex — the interpolators
+    // carry the same vec3/vec2/vec4 values they always did, so the
+    // fragment shader needs no change.
+    v_normal      = bvDecodeNormal(in_packed_normal);
+    v_uv          = bvDecodeUv(in_packed_uv);
     v_cluster_idx = gl_InstanceIndex;
-    v_tangent     = in_tangent;
+    v_tangent     = bvDecodeTangent(in_packed_tangent);
 
     vec4 world = vec4(in_position, 1.0);
     v_cur_clip  = camera_info.view_proj      * world;
