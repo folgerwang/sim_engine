@@ -806,14 +806,34 @@ void ClusterRenderer::uploadMeshClusters(
     // has no CPU-side geometry (e.g. it was already freed after the
     // original draw path's GPU upload) — the per-cluster code below already
     // bails out in that case, so we just leave src_tangents empty.
-    std::vector<glm::vec4> src_tangents;
+    // Cached per SOURCE mesh: the RT instanced-caster rebuild uploads the
+    // same species mesh hundreds of times per 96 m walk (one call per
+    // instance), and recomputing whole-mesh tangents each time was the
+    // largest slice of that walk hitch.  Tangents are object-space and
+    // depend only on the source geometry, never on model_transform, so
+    // one entry serves every instance.  The weak_ptr guards against a
+    // freed Mesh being reallocated at the same address.
+    std::shared_ptr<const std::vector<glm::vec4>> src_tangents_ptr;
     if (cluster_mesh.source->vertex_data_ptr &&
         cluster_mesh.source->faces_ptr &&
         !cluster_mesh.source->vertex_data_ptr->empty()) {
-        src_tangents = computeMeshTangents(
-            *cluster_mesh.source->vertex_data_ptr,
-            *cluster_mesh.source->faces_ptr);
+        const void* key = cluster_mesh.source.get();
+        auto it = tangent_cache_.find(key);
+        if (it != tangent_cache_.end() &&
+            it->second.source.lock() == cluster_mesh.source) {
+            src_tangents_ptr = it->second.tangents;
+        } else {
+            auto computed = std::make_shared<std::vector<glm::vec4>>(
+                computeMeshTangents(
+                    *cluster_mesh.source->vertex_data_ptr,
+                    *cluster_mesh.source->faces_ptr));
+            tangent_cache_[key] = { cluster_mesh.source, computed };
+            src_tangents_ptr = std::move(computed);
+        }
     }
+    static const std::vector<glm::vec4> kNoTangents;
+    const std::vector<glm::vec4>& src_tangents =
+        src_tangents_ptr ? *src_tangents_ptr : kNoTangents;
     // Direction-vector transform for tangents.  Tangents lie IN the surface
     // plane and transform like position differences (mat3 of model_transform),
     // NOT like normals (inverse-transpose).  For rigid / uniform-scale
@@ -901,18 +921,36 @@ void ClusterRenderer::uploadMeshClusters(
 
         // Pass 1: scan all faces in this cluster, collect unique vertices,
         // transform to world space, and push into staging VB.
-        std::unordered_map<uint32_t, uint32_t> vert_remap;
-        vert_remap.reserve(cl.vertex_indices.size());
+        //
+        // The remap used to be a per-cluster unordered_map — ~3.6 M hash
+        // inserts/finds per walk rebuild.  It is now an epoch-stamped
+        // scratch array (index == source vertex id): clearing is a single
+        // counter bump, lookup is one load.  The scratch grows to the
+        // largest source mesh seen and is reused across every cluster and
+        // every uploadMeshClusters call.
+        if (remap_scratch_idx_.size() < src_vert_count) {
+            remap_scratch_idx_.resize(src_vert_count, 0u);
+            remap_scratch_epoch_.resize(src_vert_count, 0u);
+        }
+        ++remap_epoch_;
+        if (remap_epoch_ == 0u) {   // wrapped: stamps are ambiguous, reset
+            std::fill(remap_scratch_epoch_.begin(),
+                      remap_scratch_epoch_.end(), 0u);
+            remap_epoch_ = 1u;
+        }
+        uint32_t remap_count = 0;
 
         for (uint32_t fi : cl.face_indices) {
             if (fi >= src_face_count) continue;
             const auto& face = src_faces[fi];
             for (int k = 0; k < 3; ++k) {
                 uint32_t vi = face.v_indices[k];
-                if (vi >= src_vert_count || vert_remap.count(vi)) continue;
-                uint32_t new_idx = merged_vertex_base +
-                    static_cast<uint32_t>(vert_remap.size());
-                vert_remap[vi] = new_idx;
+                if (vi >= src_vert_count ||
+                    remap_scratch_epoch_[vi] == remap_epoch_) continue;
+                uint32_t new_idx = merged_vertex_base + remap_count;
+                ++remap_count;
+                remap_scratch_epoch_[vi] = remap_epoch_;
+                remap_scratch_idx_[vi]   = new_idx;
 
                 const auto& sv = src_verts[vi];
                 BindlessVertex bv;
@@ -946,14 +984,17 @@ void ClusterRenderer::uploadMeshClusters(
         for (uint32_t fi : cl.face_indices) {
             if (fi >= src_face_count) continue;
             const auto& face = src_faces[fi];
-            auto it0 = vert_remap.find(face.v_indices[0]);
-            auto it1 = vert_remap.find(face.v_indices[1]);
-            auto it2 = vert_remap.find(face.v_indices[2]);
-            if (it0 == vert_remap.end() || it1 == vert_remap.end() ||
-                it2 == vert_remap.end()) continue;
-            staging_indices_.push_back(it0->second);
-            staging_indices_.push_back(it1->second);
-            staging_indices_.push_back(it2->second);
+            const uint32_t v0 = face.v_indices[0];
+            const uint32_t v1 = face.v_indices[1];
+            const uint32_t v2 = face.v_indices[2];
+            if (v0 >= src_vert_count || v1 >= src_vert_count ||
+                v2 >= src_vert_count) continue;
+            if (remap_scratch_epoch_[v0] != remap_epoch_ ||
+                remap_scratch_epoch_[v1] != remap_epoch_ ||
+                remap_scratch_epoch_[v2] != remap_epoch_) continue;
+            staging_indices_.push_back(remap_scratch_idx_[v0]);
+            staging_indices_.push_back(remap_scratch_idx_[v1]);
+            staging_indices_.push_back(remap_scratch_idx_[v2]);
         }
 
         glsl::ClusterDrawInfo draw_info;
@@ -1131,10 +1172,18 @@ void ClusterRenderer::finalizeUploads() {
     // frees the old allocation) and no in-flight frame may still
     // reference it.  This is an editor-time hitch (object placement /
     // transform commit), not a per-frame cost.
+    // Phase timing for the periodic rebuild hitch — the BVH and BLAS/TLAS
+    // builds already print theirs; these are the two that did not, and
+    // they are the ones that decide whether this work can move to the
+    // loader thread.  waitIdle is a FULL GPU drain and the buffer phase
+    // is ~10 staged device-local uploads, each currently paying its own
+    // submit-and-wait round trip.
+    const auto _t_fin_begin = std::chrono::steady_clock::now();
     const bool refinalize = (cull_info_buffer_.buffer != nullptr);
     if (refinalize) {
         device_->waitIdle();
     }
+    const auto _t_after_wait = std::chrono::steady_clock::now();
 
     // Log VT registration outcome so we know the pool got populated.
     // Counts unique source images registered (cache size).  If this is
@@ -1541,6 +1590,17 @@ void ClusterRenderer::finalizeUploads() {
         // Software-RT shadow acceleration structure + descriptor set —
         // rebuilt alongside the mesh-data set so the resolve shader's
         // world-space shadow rays always trace CURRENT geometry.
+        const auto _t_before_bvh = std::chrono::steady_clock::now();
+        {
+            const double wait_ms = std::chrono::duration<double, std::milli>(
+                _t_after_wait - _t_fin_begin).count();
+            const double buf_ms = std::chrono::duration<double, std::milli>(
+                _t_before_bvh - _t_after_wait).count();
+            clog_printf(
+                "[CLUSTER_RENDERER] finalize phases: waitIdle %.1f ms, "
+                "buffers+uploads %.1f ms (BVH/AS timings follow)\n",
+                wait_ms, buf_ms);
+        }
         buildRtShadowBvh();
     }
 
@@ -5426,12 +5486,18 @@ void ClusterRenderer::updateRtSkeletons(
                           (uint32_t)all_idx.size(), sizeof(uint32_t), true);
         if (rewrote) writeRtSkeletonDescriptors();
 
+        // deferrable: these four are the per-frame RT-skeleton set, read
+        // by the previous frame's still-in-flight resolve.  Queued during
+        // recording and applied just before submit — see
+        // Device::beginDeferredBufferWrites.  Safe because the capacity
+        // grow (ensure() above) already ran, so the memory these name is
+        // the memory the flush will map.
         device_->updateBufferMemory(rt_skel_pos_buffer_.memory,
-            all_pos.size() * sizeof(glm::vec4), all_pos.data());
+            all_pos.size() * sizeof(glm::vec4), all_pos.data(), 0, true);
         device_->updateBufferMemory(rt_skel_index_buffer_.memory,
-            all_idx.size() * sizeof(uint32_t), all_idx.data());
+            all_idx.size() * sizeof(uint32_t), all_idx.data(), 0, true);
         device_->updateBufferMemory(rt_skel_chunk_buffer_.memory,
-            all_chunks.size() * sizeof(glm::vec4), all_chunks.data());
+            all_chunks.size() * sizeof(glm::vec4), all_chunks.data(), 0, true);
     }
     {
         // Header buffer: count + entries (count 0 disables the loop).
@@ -5444,7 +5510,7 @@ void ClusterRenderer::updateRtSkeletons(
                         headers.size() * sizeof(glsl::RtSkelHeader));
         }
         device_->updateBufferMemory(rt_skel_header_buffer_.memory,
-                                    hdr.size(), hdr.data());
+                                    hdr.size(), hdr.data(), 0, true);
     }
     // GPU state is now consistent with rt_skel_cache_ — identical poses
     // next frame skip the whole update (see the change detection above).
@@ -5636,8 +5702,11 @@ void ClusterRenderer::updateRtSkeletons(
                 device_->getAccelerationStructureDeviceAddress(
                     hw_rt_skel_blas_handle_);
         }
+        // deferrable: the TLAS instance array for THIS frame's rebuild,
+        // which is recorded into the frame command buffer (not a transient
+        // submit), so the flush before submit lands in time.
         device_->updateBufferMemory(hw_rt_frame_instance_buffer_.memory,
-                                    sizeof(insts), insts);
+                                    sizeof(insts), insts, 0, true);
 
         auto tlas_geom =
             std::make_shared<er::AccelerationStructureGeometry>();

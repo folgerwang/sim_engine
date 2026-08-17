@@ -25,6 +25,8 @@ vec4 sRGBToLinear(vec4 srgbIn)
     return vec4(sRGBToLinear(srgbIn.xyz), srgbIn.w);
 }
 
+#include "tonemap.glsl.h"
+
 struct NormalInfo {
     vec3 ng;   // Geometric normal
     vec3 n;    // Pertubed normal

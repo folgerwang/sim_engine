@@ -672,7 +672,30 @@ struct ModelParams {
     // against them; change one, change the other.
     float clutter_fade_start_m;
     float clutter_fade_end_m;
-    vec2 model_params_pad0;
+    // ── Plant/clutter LOD cross-fade weight ──────────────────────────
+    // Claims the first half of the old pad, so the struct's size and
+    // alignment are unchanged and every other shader is unaffected.
+    //
+    // ZERO = draw normally, and that polarity is deliberate: several
+    // call sites build a zero-initialised ModelParams and fill only the
+    // fields they care about (object_file.cpp, and any future one), so
+    // "no dissolve" MUST be the all-zero state.  Encoding it the other
+    // way round — 1.0 meaning draw — silently discarded every fragment
+    // of anything that did not know about this field.
+    //
+    // Non-zero means the tile is inside a LOD-band TRANSITION and
+    // base.frag dissolves it with a screen-door threshold, so a band
+    // change plays out per-pixel over several metres instead of swapping
+    // a whole 128 m tile in one frame (the tile-shaped LOD pop).  The
+    // SIGN says which side of the transition this band is on, and the
+    // two sides use exactly complementary tests so every pixel is
+    // covered by precisely one of them:
+    //     w > 0  fading OUT → keep where   w  >  ign
+    //     w < 0  fading IN  → keep where  |w| > 1 - ign
+    // Written by DrawableObject::drawNodeMesh from
+    // DrawableData::lod_node_fade_.
+    float lod_fade;
+    float model_params_pad0;
 };
 
 struct PrtLightParams {
@@ -867,6 +890,15 @@ struct DebugDrawParams {
 
 struct BaseShapeDrawParams {
     mat4            transform;
+};
+
+// Push constants for the citizen (box-people) draw — one per body part.
+// transform carries the part's full world matrix; color.rgb the role
+// tint (nurse white, police navy, ...), color.a an emissive-ish lift so
+// citizens stay readable at dusk.
+struct CitizenDrawParams {
+    mat4            transform;
+    vec4            color;
 };
 
 // Push constants for the "Nanite-lite" per-cluster flat-color debug draw.

@@ -7,6 +7,7 @@ const int iSteps = 32;
 const int jSteps = 8;
 
 #include "global_definition.glsl.h"
+#include "tonemap.glsl.h"   // sceneTonemap
 #include "sun.glsl.h"
 #include "sunlight_scattering.glsl.h"
 
@@ -81,5 +82,9 @@ void main() {
     return;
 #endif
 
-    outColor = vec4(color/*textureLod(skybox_tex, view_dir, 0).xyz*/, 1.0);
+    // The atmosphere integral above is HDR linear radiance (sun intensity
+    // 22).  This used to be written RAW to the LDR target — no tonemap, no
+    // sRGB — so most of the sky clipped to flat white.  Same shared curve
+    // as every other final-colour writer.
+    outColor = vec4(sceneTonemap(color/*textureLod(skybox_tex, view_dir, 0).xyz*/), 1.0);
 }

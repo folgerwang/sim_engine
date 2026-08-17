@@ -1795,15 +1795,16 @@ void main() {
     // ONLY above the knee so mid-tones and dark pixels are bit-identical
     // to the uncompressed output.  Debug views skip it (dbg_mode gate) so
     // ROUGHNESS/SHADOW/etc. stay raw data.
+    // Scene tonemap (sceneTonemap in functions.glsl.h): exposure + ACES
+    // filmic, shared with every forward writer.  Replaces the old
+    // luminance-knee compressor — the knee only rolled off above 0.8 and
+    // still left the frame reading blown-out; ACES at kSceneExposure
+    // keeps mid-tones in place and gives highlights a proper filmic
+    // shoulder.  Debug views (dbg_mode != 0) stay raw linearTosRGB so
+    // ROUGHNESS/SHADOW/etc. remain readable data, not display imagery.
     if (dbg_mode == 0u) {
-        const float kKnee = 0.80;
-        float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
-        if (lum > kKnee) {
-            float t = lum - kKnee;
-            float lum_out = kKnee + (1.0 - kKnee) * t / (t + (1.0 - kKnee));
-            color *= lum_out / lum;
-        }
+        imageStore(hdr_out, px, vec4(sceneTonemap(color), 1.0));
+    } else {
+        imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));
     }
-
-    imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));
 }

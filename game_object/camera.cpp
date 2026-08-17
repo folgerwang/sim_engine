@@ -510,18 +510,36 @@ void ViewCamera::updateViewCameraInfo(
     }
     m_last_vp_aspect_ = view_camera_params.aspect;
 
+    // deferrable — AND THIS ONE MATTERS MOST OF ALL.  The view camera UBO
+    // carries view_proj / prev_view_proj / position / input_features and
+    // is read by essentially every shader in the engine: the CSM shadow
+    // pass, the deferred resolve's ray-traced shadow and GI, the terrain
+    // and cluster fragment paths.  It is SINGLE-buffered, so overwriting
+    // it while the previous frame is still in flight hands two different
+    // cameras to one frame's passes — which reads as shadows and
+    // lighting flickering frame to frame.  That is exactly why the old
+    // "wait for frame N-1" sat ahead of command recording; now that the
+    // wait sits after recording, the write has to be queued instead.
+    // (Outside the armed window — init, editor paths — this writes
+    // immediately, unchanged.)
     m_device_->updateBufferMemory(
         m_view_camera_buffer_->memory,
         sizeof(m_camera_info_),
-        &m_camera_info_);
+        &m_camera_info_,
+        /*offset*/ 0,
+        /*deferrable*/ true);
 }
 
 void ViewCamera::setInputFeatureFlags(uint32_t flags) {
     m_camera_info_.input_features = flags;
+    // Same buffer, same hazard — and this one is called from the middle
+    // of drawScene, so it is the write that actually raced.
     m_device_->updateBufferMemory(
         m_view_camera_buffer_->memory,
         sizeof(m_camera_info_),
-        &m_camera_info_);
+        &m_camera_info_,
+        /*offset*/ 0,
+        /*deferrable*/ true);
 }
 
 void ViewCamera::readGpuCameraInfo(

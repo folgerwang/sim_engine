@@ -1,0 +1,27 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+#include "tonemap.glsl.h"
+
+layout(push_constant) uniform CitizenDrawUniformBufferObject {
+    CitizenDrawParams params;
+};
+
+layout(location = 0) in vec3 in_normal_ws;
+layout(location = 1) in vec3 in_position_ws;
+
+layout(location = 0) out vec4 outColor;
+
+// Simple wrapped-lambert + ambient: citizens are gameplay markers first
+// and PBR objects second, so a stable readable shade beats a full BRDF.
+// Finished through the shared scene tonemap so they sit in the same
+// exposure as the world around them.
+const vec3 kSunDir = normalize(vec3(-0.62, 0.62, -0.48));
+
+void main() {
+    vec3 n = normalize(in_normal_ws);
+    float nl = dot(n, kSunDir) * 0.5 + 0.5;          // wrapped
+    vec3 lit = params.color.rgb * (0.35 + 0.85 * nl);
+    lit += params.color.rgb * params.color.a;         // readability lift
+    outColor = vec4(sceneTonemap(lit), 1.0);
+}

@@ -265,7 +265,31 @@ float calculateShadowFactor(
     return mix(sum * (1.0 / float(CSM_PCF_SAMPLES)), 1.0, range_fade);
 }
 
+// ── LOD band cross-fade dissolve ─────────────────────────────────────
+// See ModelParams::lod_fade.  A tile inside a band transition is drawn
+// by BOTH neighbouring bands; this screen-door test decides, per pixel,
+// which one keeps it.  The two sides get exactly complementary
+// comparisons against the same interleaved-gradient value, so the union
+// of what they keep is every pixel and the intersection is (almost)
+// none — no holes opening up mid-transition and no double-drawn
+// silhouettes.  Costs one compare on ordinary geometry (lod_fade 1.0).
+bool lodFadeDiscards(float w) {
+    // 0 = no dissolve.  This is BOTH the common case and the value every
+    // zero-initialised ModelParams carries, so it must mean "draw".
+    if (w == 0.0) return false;
+    if (w >= 0.999) return false;          // steady
+    if (w <= -0.999) return false;         // fully faded in
+    float ign = fract(52.9829189 *
+                      fract(dot(gl_FragCoord.xy,
+                                vec2(0.06711056, 0.00583715))));
+    return (w >= 0.0) ? (w <= ign) : (-w <= 1.0 - ign);
+}
+
 void main() {
+    // Band transition: dissolve before any shading work is done.
+    if (lodFadeDiscards(model_params.lod_fade)) {
+        discard;
+    }
     bool is_front_face = gl_FrontFacing;
 #ifndef NO_MTL
     vec4 baseColor = getBaseColor(ps_in_data, material);

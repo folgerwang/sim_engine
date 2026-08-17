@@ -123,11 +123,45 @@ namespace ego = engine::game_object;
 // the loader recorded one (real path → dedups across assets); otherwise by
 // "<asset_key>#<index>" (embedded textures → dedups across instances of
 // the same asset, never falsely across different assets).
+// ── Shading-input census ─────────────────────────────────────────────
+// Every material built by every loader passes through here, which makes
+// it the one place that can answer "what roughness and metallic did the
+// engine ACTUALLY end up with" — as opposed to what the generator wrote.
+// A blown-out white specular is always one of three numbers (metallic
+// near 1, roughness near 0, or an MR map that never got bound so the
+// factors stand alone), and guessing between them costs a build cycle
+// each time.  Printed once per drawable next to the material totals.
+namespace {
+struct MatCensus {
+    int   n = 0, n_mr_map = 0, n_metal_chan = 0;
+    int   n_metallic_hi = 0, n_rough_lo = 0;
+    float rough_min = 1e9f, rough_max = -1e9f, rough_sum = 0.0f;
+    float metal_min = 1e9f, metal_max = -1e9f, metal_sum = 0.0f;
+    void add(const glsl::PbrMaterialParams& u) {
+        ++n;
+        if ((u.material_features & FEATURE_HAS_METALLIC_ROUGHNESS_MAP) != 0)
+            ++n_mr_map;
+        if ((u.material_features & FEATURE_HAS_METALLIC_CHANNEL) != 0)
+            ++n_metal_chan;
+        if (u.metallic_factor > 0.5f) ++n_metallic_hi;
+        if (u.roughness_factor < 0.2f) ++n_rough_lo;
+        rough_min = std::min(rough_min, u.roughness_factor);
+        rough_max = std::max(rough_max, u.roughness_factor);
+        rough_sum += u.roughness_factor;
+        metal_min = std::min(metal_min, u.metallic_factor);
+        metal_max = std::max(metal_max, u.metallic_factor);
+        metal_sum += u.metallic_factor;
+    }
+};
+MatCensus& matCensus() { static MatCensus c; return c; }
+}  // namespace
+
 static void captureMaterialDesc(
     ego::MaterialInfo& m,
     const glsl::PbrMaterialParams& ubo,
     const std::vector<engine::renderer::TextureInfo>& textures,
     const std::string& asset_key) {
+    matCensus().add(ubo);
     auto tex_key = [&](int32_t idx) -> std::string {
         if (idx < 0) return std::string();
         if (idx < (int32_t)textures.size() &&
@@ -2745,6 +2779,89 @@ static bool parsePgateName(
 // rectangle and LOD range, and sets has_plant_lod_ if ANY node carried
 // the encoding — that flag is what keeps every other drawable on exactly
 // the code path it had before this change.
+// ── Runtime plant LOD band tables (see drawable_object.h) ────────────
+namespace {
+std::map<std::string, std::vector<float>>& plantLodTables() {
+    static std::map<std::string, std::vector<float>> s_tables;
+    return s_tables;
+}
+uint32_t& plantLodGenMutable() {
+    static uint32_t s_gen = 0;
+    return s_gen;
+}
+float& interiorGateMutable() {
+    static float s_r = 0.0f;      // 0 = leave the authored radii alone
+    return s_r;
+}
+const std::vector<float> s_no_edges;
+
+// The node name's leading token: "tree_oak_lodtile_..." -> "tree".
+std::string lodCategoryOf(const std::string& node_name) {
+    const size_t u = node_name.find('_');
+    return (u == std::string::npos) ? node_name : node_name.substr(0, u);
+}
+}  // namespace
+
+// Rewrite every LOD node's near/far from its OWN category's table, by
+// rung, and raise the proximity gates to the interior floor.  Walks
+// every node, so the caller gates it on the generation counter — the
+// tree file has 690k of them.
+static void applyPlantLodBands(
+    const std::shared_ptr<ego::DrawableData>& d) {
+    const float gate_floor = game_object::interiorGateRadiusM();
+    float far_max = 0.0f;
+    for (auto& node : d->nodes_) {
+        // Interior props / door leaves: SET the radius, not just raise a
+        // floor — "visible within 50 m" has to shrink an over-large
+        // authored gate as well as grow a small one, or a big house keeps
+        // showing its furniture from further out than asked.  Both modes
+        // take the same value, or the open/closed door pair stops
+        // partitioning and there is a ring where both leaves draw.
+        if (node.gate_r_ > 0.0f && gate_floor > 0.0f) {
+            node.gate_r_ = gate_floor;
+        }
+        const int b = node.lod_band_idx_;
+        const int c = node.lod_cat_idx_;
+        if (b < 0 || c < 0 ||
+            static_cast<size_t>(c) >= d->lod_band_authored_.size()) {
+            continue;
+        }
+        const auto& authored = d->lod_band_authored_[c];
+        const auto& edges =
+            game_object::plantLodBands(
+                static_cast<size_t>(c) < d->lod_cat_names_.size()
+                              ? d->lod_cat_names_[c]
+                              : std::string());
+        const bool last_rung =
+            (static_cast<size_t>(b) + 1 >= authored.size());
+        if (!edges.empty() &&
+            static_cast<size_t>(b) + 1 < edges.size()) {
+            node.lod_near_m_ = (b == 0) ? 0.0f : edges[b];
+            // The OUTERMOST rung of this chain always runs to the
+            // table's final edge, whatever its index.  Without this a
+            // 5-rung chain driven by a 6-rung table would stop at the
+            // fifth edge and its far field would vanish — the impostor
+            // rung is the one that has to reach the far plane, and which
+            // index that is is a property of the bake.
+            node.lod_far_m_ = last_rung ? edges.back() : edges[b + 1];
+        } else if (static_cast<size_t>(b) < authored.size()) {
+            // No override for this category, or a table too short to
+            // cover this rung: the generator's own metres, so nothing
+            // ever blanks for want of a number.
+            node.lod_near_m_ = authored[b].x;
+            node.lod_far_m_  = authored[b].y;
+        }
+        far_max = glm::max(far_max, node.lod_far_m_);
+    }
+    if (far_max > 0.0f) d->lod_far_max_ = far_max;
+    d->lod_band_gen_ = game_object::plantLodBandGeneration();
+    // Force the per-frame pass to redo its band choice: the rectangles
+    // are unchanged but every distance test just moved.  This only
+    // invalidates the MEMO key — the real eye validity is a separate
+    // global that selectPlantLodBands reads fresh.
+    d->lod_eye_valid_ = false;
+}
+
 static void parsePlantLodBands(
     std::shared_ptr<ego::DrawableData>& drawable_object,
     const std::string& input_filename) {
@@ -2789,7 +2906,61 @@ static void parsePlantLodBands(
     }
     drawable_object->has_plant_lod_ = (matched > 0);
     drawable_object->lod_far_max_ = (matched > 0) ? near_far_max : 0.0f;
+
+    // ── RUNG ORDINALS, PER CHAIN ─────────────────────────────────────
+    // The name gives metres; the runtime knob needs an INDEX.  Group the
+    // authored (near, far) pairs by CATEGORY first — one file carries
+    // several independent chains (tree + bush + rock all live in the
+    // trees glb) — then order each category's pairs by near, which is
+    // its chain order because the pairs partition by construction.
+    {
+        std::map<std::string, std::set<std::pair<float, float>>> by_cat;
+        for (const auto& node : drawable_object->nodes_) {
+            if (node.lod_tile_m_ <= 0.0f) continue;
+            by_cat[lodCategoryOf(node.name_)].emplace(node.lod_near_m_,
+                                                      node.lod_far_m_);
+        }
+        std::map<std::string, int> cat_idx;
+        drawable_object->lod_cat_names_.clear();
+        drawable_object->lod_band_authored_.clear();
+        for (const auto& kv : by_cat) {
+            cat_idx[kv.first] =
+                static_cast<int>(drawable_object->lod_cat_names_.size());
+            drawable_object->lod_cat_names_.push_back(kv.first);
+            std::vector<glm::vec2> rungs;
+            rungs.reserve(kv.second.size());
+            for (const auto& nf : kv.second)
+                rungs.emplace_back(nf.first, nf.second);
+            drawable_object->lod_band_authored_.push_back(std::move(rungs));
+        }
+        for (auto& node : drawable_object->nodes_) {
+            if (node.lod_tile_m_ <= 0.0f) continue;
+            const auto ci = cat_idx.find(lodCategoryOf(node.name_));
+            if (ci == cat_idx.end()) continue;
+            node.lod_cat_idx_ = ci->second;
+            const auto& rungs =
+                drawable_object->lod_band_authored_[ci->second];
+            node.lod_band_idx_ = -1;
+            for (size_t r = 0; r < rungs.size(); ++r) {
+                if (rungs[r].x == node.lod_near_m_ &&
+                    rungs[r].y == node.lod_far_m_) {
+                    node.lod_band_idx_ = static_cast<int>(r);
+                    break;
+                }
+            }
+        }
+        for (size_t c = 0; c < drawable_object->lod_cat_names_.size(); ++c) {
+            std::cout << "[lod] " << input_filename << ": chain '"
+                      << drawable_object->lod_cat_names_[c] << "' —";
+            for (const auto& b : drawable_object->lod_band_authored_[c])
+                std::cout << " [" << b.x << "," << b.y << ")";
+            std::cout << std::endl;
+        }
+    }
     if (matched > 0) {
+        // Adopt whatever the runtime table currently says (no-op when it
+        // is empty, which is the authored default).
+        applyPlantLodBands(drawable_object);
         drawable_object->lod_node_visible_.assign(
             drawable_object->nodes_.size(), uint8_t(1));
         // lod_world_from_ starts at all-zeroes, which no real transform
@@ -2817,6 +2988,13 @@ static void parsePlantLodBands(
 static void selectPlantLodBands(
     const std::shared_ptr<ego::DrawableData>& drawable_object,
     const glm::mat4& instance_world) {
+    // Live retune: setPlantLodBands() bumped the generation, so rewrite
+    // this drawable's node distances before choosing a band.  Costs a
+    // walk over the node list ONCE per change, not per frame.
+    if (drawable_object->lod_band_gen_ !=
+        game_object::plantLodBandGeneration()) {
+        applyPlantLodBands(drawable_object);
+    }
 
     if (!drawable_object->has_plant_lod_) {
         return;
@@ -2839,6 +3017,14 @@ static void selectPlantLodBands(
     if (vis.size() != drawable_object->nodes_.size()) {
         vis.assign(drawable_object->nodes_.size(), uint8_t(1));
     }
+    auto& fade = drawable_object->lod_node_fade_;
+    if (fade.size() != drawable_object->nodes_.size()) {
+        fade.assign(drawable_object->nodes_.size(), 1.0f);
+    }
+    auto& owner = drawable_object->lod_node_owner_;
+    if (owner.size() != drawable_object->nodes_.size()) {
+        owner.assign(drawable_object->nodes_.size(), uint8_t(1));
+    }
 
     uint32_t drawn = 0;
     for (size_t i = 0; i < drawable_object->nodes_.size(); ++i) {
@@ -2854,6 +3040,8 @@ static void selectPlantLodBands(
                 if (node.gate_mode_ == 0 ? !inside : inside) v = 0;
             }
             vis[i] = v;
+            fade[i] = 1.0f;
+            owner[i] = v;
             drawn += v;
             continue;
         }
@@ -2896,6 +3084,8 @@ static void selectPlantLodBands(
             // next frame has an eye and corrects itself.
             vis[i] = (node.lod_far_m_ >= drawable_object->lod_far_max_)
                      ? uint8_t(1) : uint8_t(0);
+            fade[i] = 1.0f;
+            owner[i] = vis[i];
             drawn += vis[i];
             continue;
         }
@@ -2911,8 +3101,69 @@ static void selectPlantLodBands(
         const float dz = glm::max(glm::max(node.lod_wz0_ - eye.z, 0.0f),
                                   eye.z - node.lod_wz1_);
         const float d = glm::sqrt(dx * dx + dz * dz);
-        uint8_t v =
-            (d >= node.lod_near_m_ && d < node.lod_far_m_) ? 1 : 0;
+
+        // ── Band selection with a CROSS-FADE transition ──────────────
+        // The old test was a hard `d in [near, far)`: the instant the
+        // eye crossed a boundary an entire 128 m tile swapped one mesh
+        // set for another, and because the bands differ a lot in
+        // character (full trees vs cards, dense grass vs none) the swap
+        // read as a square patch of the world changing in one frame —
+        // the tile-shaped LOD pop.  Now each boundary gets a transition
+        // zone of half-width kLodFadeM in which BOTH neighbouring bands
+        // are drawn, dissolving into each other with complementary
+        // screen-door thresholds (see DrawableData::lod_node_fade_), so
+        // the swap happens per-pixel over several metres of travel
+        // instead of per-tile in one frame.
+        //
+        // The zone is a fraction of the band's own width, clamped: an
+        // absolute width would swamp a narrow near band and barely
+        // register on a 400 m far band.
+        const float band_w = glm::max(node.lod_far_m_ - node.lod_near_m_,
+                                      1.0f);
+        const float kLodFadeM =
+            glm::clamp(band_w * 0.12f, 2.0f, 24.0f);
+
+        // Fade IN across the near edge, OUT across the far edge.  The
+        // outermost band has no neighbour beyond it, so it holds solid
+        // to its far edge rather than dissolving into nothing; likewise
+        // the innermost band (near == 0) has no inner neighbour.
+        const bool has_inner = node.lod_near_m_ > 0.01f;
+        const bool has_outer =
+            node.lod_far_m_ < drawable_object->lod_far_max_ - 0.01f;
+
+        float w_out = 1.0f;      // 1 inside, ramps to 0 past the far edge
+        if (has_outer) {
+            w_out = glm::clamp(
+                (node.lod_far_m_ + kLodFadeM - d) / (2.0f * kLodFadeM),
+                0.0f, 1.0f);
+        } else {
+            w_out = (d < node.lod_far_m_) ? 1.0f : 0.0f;
+        }
+        float w_in = 1.0f;       // 1 inside, ramps to 0 before the near edge
+        if (has_inner) {
+            w_in = glm::clamp(
+                (d - (node.lod_near_m_ - kLodFadeM)) / (2.0f * kLodFadeM),
+                0.0f, 1.0f);
+        } else {
+            w_in = (d >= node.lod_near_m_ - 1e-3f) ? 1.0f : 0.0f;
+        }
+
+        // Signed weight: which edge this tile is dissolving across
+        // decides which half of the complementary dither it uses.  A
+        // tile straddling both (a very narrow band) takes the tighter
+        // one; being in only one transition at a time is the norm.
+        float w;
+        if (w_in < w_out) {
+            w = -w_in;           // fading IN across its near edge
+        } else {
+            w = w_out;           // fading OUT (or steady at 1.0)
+        }
+        uint8_t v = (glm::abs(w) > 0.0f) ? 1 : 0;
+        fade[i] = v ? w : 0.0f;
+        // Stable single-owner test for the depth passes (see
+        // lod_node_owner_): the pre-cross-fade rule, unchanged.
+        owner[i] = (d >= node.lod_near_m_ && d < node.lod_far_m_)
+                   ? uint8_t(1) : uint8_t(0);
         // ── Far-band visibility census ─────────────────────────────
         // The house envelope band (near_m > 0) baked 20k nodes and
         // 311 _far meshes yet the horizon shows nothing — every layer
@@ -2945,6 +3196,7 @@ static void selectPlantLodBands(
             if (node.gate_mode_ == 0 ? !inside : inside) v = 0;
         }
         vis[i] = v;
+        if (v == 0) { fade[i] = 0.0f; owner[i] = 0; }
         drawn += v;
     }
     drawable_object->lod_nodes_drawn_ = drawn;
@@ -3962,6 +4214,19 @@ static void computeEffectiveOpaqueForMaterials(
         stats_mask_with_cutout, stats_mask_solid, stats_mask_unscanned,
         stats_alpha_companions_built,
         double(alpha_companion_bytes) / (1024.0 * 1024.0));
+    {
+        const auto& c = matCensus();
+        if (c.n > 0) {
+            std::printf(
+                "[drawable] shading inputs: n=%d  roughness min/avg/max "
+                "%.3f/%.3f/%.3f (%d below 0.2)  metallic min/avg/max "
+                "%.3f/%.3f/%.3f (%d above 0.5)  mr-map=%d  "
+                "metal-channel=%d\n",
+                c.n, c.rough_min, c.rough_sum / float(c.n), c.rough_max,
+                c.n_rough_lo, c.metal_min, c.metal_sum / float(c.n),
+                c.metal_max, c.n_metallic_hi, c.n_mr_map, c.n_metal_chan);
+        }
+    }
 
     // Engine-wide cumulative counters for the per-frame shadow log.
     // "Alpha-cutoff" = Mask materials that take the with-frag path
@@ -4020,8 +4285,9 @@ static void drawMesh(
     // ── Debug reach: drawMesh entered ───────────────────────────────
     // Only one drawable in the scene has this flag (the player today),
     // so the branch is essentially never taken for other geometry.
-    if (drawable_object->m_debug_force_red_ ||
-        drawable_object->m_debug_log_draws_) {
+    if (!depth_only &&
+        (drawable_object->m_debug_force_red_ ||
+         drawable_object->m_debug_log_draws_)) {
         ++drawable_object->m_debug_draw_mesh_entered_;
     }
 
@@ -4030,8 +4296,18 @@ static void drawMesh(
     // using model_params.model_mat, then test against the frustum planes
     // set by application.cpp. Shadow / depth-only passes are NOT culled
     // so off-screen geometry still casts correct shadows.
+    // Cull gate: skip ONLY for SKINNED drawables — the bypass below
+    // explains why their bind-pose bbox can't be trusted.  It used to
+    // key on m_use_node_transform_only_, but that flag is ALSO set on
+    // every STATIC placed import (the identity-instance fix in
+    // application.cpp's ECS gather), which silently disabled frustum
+    // culling for the entire placed world: ~15k plant-tile meshes and
+    // every house recorded every frame regardless of the camera
+    // (frustumcull=0 across all [placed.draw] rows).  A static mesh's
+    // bbox through its live model_mat is exactly what this test wants,
+    // node-only mode or not.
     if (!depth_only && s_frustum_cull_active &&
-        !drawable_object->m_use_node_transform_only_) {
+        drawable_object->skins_.empty()) {
         // ── Skinned-character bypass ────────────────────────────────
         // m_use_node_transform_only_ marks drawables whose world
         // pose is driven by PlayerController (or equivalent) and
@@ -4076,8 +4352,9 @@ static void drawMesh(
             if (dist < -world_radius) { outside = true; break; }
         }
         if (outside) {
-            if (drawable_object->m_debug_force_red_ ||
-                drawable_object->m_debug_log_draws_) {
+            if (!depth_only &&
+                (drawable_object->m_debug_force_red_ ||
+                 drawable_object->m_debug_log_draws_)) {
                 ++drawable_object->m_debug_draw_mesh_culled_frustum_;
             }
             return;
@@ -4152,8 +4429,9 @@ static void drawMesh(
     // whether debug GPU buffers happen to exist.
     if (engine::helper::clusterIndirectActive() &&
         mesh_info.cluster_global_mesh_idx_ >= 0) {
-        if (drawable_object->m_debug_force_red_ ||
-            drawable_object->m_debug_log_draws_) {
+        if (!depth_only &&
+            (drawable_object->m_debug_force_red_ ||
+             drawable_object->m_debug_log_draws_)) {
             ++drawable_object->m_debug_draw_mesh_taken_by_cluster_;
         }
         return;
@@ -4163,8 +4441,9 @@ static void drawMesh(
         engine::helper::clusterRenderingEnabled() &&
         mesh_info.cluster_debug_gpu_.ready() &&
         ego::ClusterDebugDraw::ready()) {
-        if (drawable_object->m_debug_force_red_ ||
-            drawable_object->m_debug_log_draws_) {
+        if (!depth_only &&
+            (drawable_object->m_debug_force_red_ ||
+             drawable_object->m_debug_log_draws_)) {
             ++drawable_object->m_debug_draw_mesh_cluster_debug_path_;
         }
         // Cluster-debug pipeline layout only declares PBR_GLOBAL_PARAMS_SET
@@ -4233,8 +4512,9 @@ static void drawMesh(
         const auto* prim_ptr = prims_begin[prim_i];
         const auto& prim = *prim_ptr;
         const auto& attrib_list = prim.attribute_descs_;
-        if (drawable_object->m_debug_force_red_ ||
-            drawable_object->m_debug_log_draws_) {
+        if (!depth_only &&
+            (drawable_object->m_debug_force_red_ ||
+             drawable_object->m_debug_log_draws_)) {
             ++drawable_object->m_debug_draw_prims_iterated_;
         }
 
@@ -4318,8 +4598,9 @@ static void drawMesh(
 
             // Task shader amplifies (1,1,1) → CSM_CASCADE_COUNT mesh WGs.
             cmd_buf->drawMeshTasks(1u, 1u, 1u);
-            if (drawable_object->m_debug_force_red_ ||
-                drawable_object->m_debug_log_draws_) {
+            if (!depth_only &&
+                (drawable_object->m_debug_force_red_ ||
+                 drawable_object->m_debug_log_draws_)) {
                 ++drawable_object->m_debug_draw_prim_mesh_shader_;
             }
             continue;
@@ -4334,6 +4615,14 @@ static void drawMesh(
         if (mesh_shader_csm_mode && mesh_shader_fallback_pipelines) {
             dispatch_pipelines = mesh_shader_fallback_pipelines;
         }
+        // Snapshot the "command-buffer state is not mine" flag BEFORE the
+        // pipeline block below, which sets last_hash = cur_hash.  Reading
+        // it after that point is always false, so the bind cache would
+        // never be invalidated between drawables — it would then skip
+        // binds while the previously cached primitive's buffers were
+        // still bound, and the draw would read indices against the wrong
+        // vertex buffer.  That is a GPU page fault: VK_ERROR_DEVICE_LOST.
+        const bool state_dirty = (last_hash == 0);
         if (cur_hash != last_hash) {
             auto pipe_it = dispatch_pipelines->find(cur_hash);
             if (pipe_it == dispatch_pipelines->end() || !pipe_it->second) {
@@ -4358,14 +4647,48 @@ static void drawMesh(
             last_hash = cur_hash;
         }
 
-        std::vector<std::shared_ptr<renderer::Buffer>> buffers(attrib_list.size());
-        std::vector<uint64_t> offsets(attrib_list.size());
-        for (int i_attrib = 0; i_attrib < attrib_list.size(); i_attrib++) {
-            const auto& buffer_view = drawable_object->buffer_views_[attrib_list[i_attrib].buffer_view];
-            buffers[i_attrib] = drawable_object->buffers_[buffer_view.buffer_idx].buffer;
-            offsets[i_attrib] = attrib_list[i_attrib].buffer_offset;
+        // ── REDUNDANT-BIND ELIMINATION ──────────────────────────────
+        // The dominant forward-pass cost is not the draws, it is the
+        // STATE around them: vertex buffers, index buffer and two
+        // descriptor-set binds per primitive, ~5 Vulkan calls for every
+        // draw.  And for the plant/clutter layers almost all of it is
+        // redundant — the bake emits ONE mesh per (species, LOD band)
+        // and then one node per 128 m tile pointing at it, so thousands
+        // of consecutive draws re-bind byte-identical state and differ
+        // only in their push constants and indirect offset.
+        //
+        // The primitive POINTER is an exact key for all of it: same
+        // PrimitiveInfo (at the same geometry LOD) ⇒ same vertex
+        // buffers, same index buffer, same material descriptor set.  So
+        // cache what is currently bound and skip the call when it has
+        // not changed.  Vulkan keeps vertex/index/descriptor bindings
+        // across a pipeline change as long as the layout is compatible,
+        // and every primitive here binds through the SAME
+        // drawable_pipeline_layout, so a pipeline switch does not
+        // invalidate them.
+        //
+        // Invalidation rides the EXISTING `last_hash == 0` contract:
+        // that is already the engine's "command-buffer state is not
+        // mine any more" signal — set at the top of every
+        // DrawableObject::draw and by the two paths that bind a
+        // different layout (mesh-shader CSM and ClusterDebugDraw).
+        // thread_local so a future multi-threaded record path is safe.
+        static thread_local const ego::PrimitiveInfo* s_bound_prim = nullptr;
+        static thread_local uint32_t s_bound_lod = 0xFFFFFFFFu;
+        static thread_local const void* s_bound_desc_list = nullptr;
+        static thread_local const void* s_bound_skin = nullptr;
+        // Invalidate on the snapshot above, and additionally whenever the
+        // DRAWABLE changes: the cache is a static that outlives any one
+        // draw() call, and belt-and-braces here is far cheaper than
+        // debugging a device loss.
+        static thread_local const void* s_bound_drawable = nullptr;
+        if (state_dirty || s_bound_drawable != (const void*)drawable_object.get()) {
+            s_bound_prim = nullptr;
+            s_bound_lod = 0xFFFFFFFFu;
+            s_bound_desc_list = nullptr;
+            s_bound_skin = nullptr;
+            s_bound_drawable = (const void*)drawable_object.get();
         }
-        cmd_buf->bindVertexBuffers(0, buffers, offsets);
 
         // Geometry LOD: 0 (full detail) unless the runtime override
         // asks for a baked level; clamped to the slots this primitive
@@ -4373,27 +4696,62 @@ static void drawMesh(
         uint32_t cur_lod = (uint32_t)std::max(
             0, std::min((int32_t)ego::DrawableObject::forced_geo_lod_,
                         (int32_t)prim.index_desc_.size() - 1));
-        const auto& index_buffer_view =
-            drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
 
-        cmd_buf->bindIndexBuffer(
-            drawable_object->buffers_[index_buffer_view.buffer_idx].buffer,
-            prim.index_desc_[cur_lod].offset + index_buffer_view.offset,
-            prim.index_desc_[cur_lod].index_type);
+        const bool same_geometry =
+            (s_bound_prim == prim_ptr) && (s_bound_lod == cur_lod);
 
-        renderer::DescriptorSetList desc_sets = desc_set_list;
-        if (prim.material_idx_ >= 0) {
-            const auto& material =
-                drawable_object->materials_[prim.material_idx_];
-            desc_sets[PBR_MATERIAL_PARAMS_SET] = material.desc_set_;
+        if (!same_geometry) {
+            // HOT PATH: persistent scratch instead of two fresh heap
+            // vectors per primitive — with tens of thousands of recorded
+            // primitives per frame those allocations were a measurable
+            // slice of the forward-pass record time.
+            static thread_local std::vector<std::shared_ptr<renderer::Buffer>> buffers;
+            static thread_local std::vector<uint64_t> offsets;
+            buffers.resize(attrib_list.size());
+            offsets.resize(attrib_list.size());
+            for (int i_attrib = 0; i_attrib < attrib_list.size(); i_attrib++) {
+                const auto& buffer_view = drawable_object->buffer_views_[attrib_list[i_attrib].buffer_view];
+                buffers[i_attrib] = drawable_object->buffers_[buffer_view.buffer_idx].buffer;
+                offsets[i_attrib] = attrib_list[i_attrib].buffer_offset;
+            }
+            cmd_buf->bindVertexBuffers(0, buffers, offsets);
+
+            const auto& index_buffer_view =
+                drawable_object->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
+            cmd_buf->bindIndexBuffer(
+                drawable_object->buffers_[index_buffer_view.buffer_idx].buffer,
+                prim.index_desc_[cur_lod].offset + index_buffer_view.offset,
+                prim.index_desc_[cur_lod].index_type);
         }
 
-        cmd_buf->bindDescriptorSets(
-            renderer::PipelineBindPoint::GRAPHICS,
-            drawable_pipeline_layout,
-            desc_sets);
+        // Material / global descriptor sets.  Keyed on the primitive too
+        // (the material set is a pure function of prim.material_idx_)
+        // plus the identity of the incoming set list, which changes
+        // between passes but never within one.
+        if (!same_geometry || s_bound_desc_list != (const void*)&desc_set_list) {
+            // Same persistent-scratch treatment for the per-prim
+            // descriptor list (a vector of shared_ptrs — copying it fresh
+            // per prim was a heap alloc + ~7 atomic refcounts each time).
+            static thread_local renderer::DescriptorSetList desc_sets;
+            desc_sets = desc_set_list;
+            if (prim.material_idx_ >= 0) {
+                const auto& material =
+                    drawable_object->materials_[prim.material_idx_];
+                desc_sets[PBR_MATERIAL_PARAMS_SET] = material.desc_set_;
+            }
 
-        if (skin_info) {
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::GRAPHICS,
+                drawable_pipeline_layout,
+                desc_sets);
+            s_bound_desc_list = (const void*)&desc_set_list;
+        }
+
+        s_bound_prim = prim_ptr;
+        s_bound_lod = cur_lod;
+
+        if (skin_info && s_bound_skin != (const void*)skin_info) {
+            s_bound_skin = (const void*)skin_info;
             cmd_buf->bindDescriptorSets(
                 renderer::PipelineBindPoint::GRAPHICS,
                 drawable_pipeline_layout,
@@ -4428,8 +4786,9 @@ static void drawMesh(
         // forward draw is firing N indirect draws for the player or
         // being entirely skipped upstream (frustum cull, isReady,
         // pipeline binding, etc.).
-        if (drawable_object->m_debug_force_red_ ||
-            drawable_object->m_debug_log_draws_) {
+        if (!depth_only &&
+            (drawable_object->m_debug_force_red_ ||
+             drawable_object->m_debug_log_draws_)) {
             ++drawable_object->m_debug_draw_call_count_;
         }
 
@@ -4482,8 +4841,9 @@ static void drawNodes(
     bool mesh_shader_csm_mode,
     std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>>* mesh_shader_fallback_pipelines) {
     if (node_idx >= 0) {
-        if (drawable_object->m_debug_force_red_ ||
-            drawable_object->m_debug_log_draws_) {
+        if (!depth_only &&
+            (drawable_object->m_debug_force_red_ ||
+             drawable_object->m_debug_log_draws_)) {
             ++drawable_object->m_debug_draw_nodes_visited_;
         }
         drawNodeMesh(cmd_buf, drawable_object, drawable_pipeline_layout,
@@ -4543,14 +4903,42 @@ static void drawNodeMesh(
         // is both the wrong silhouette and the whole cost this exists
         // to remove.  Children are still recursed, exactly as the
         // sub-object filter above does.
-        const bool lod_hidden =
+        // Cross-fade weight for this node (see lod_node_fade_).  In a
+        // DEPTH-ONLY / shadow pass the transition zone is collapsed back
+        // to a hard pick at the halfway point: those pipelines don't run
+        // the dissolve, so drawing both bands there would double every
+        // caster in the overlap and darken a ring of the shadow map.
+        // Cascade shadows are soft enough that a hard swap is invisible.
+        float lod_fade = 1.0f;
+        const bool has_lod =
+            drawable_object->has_plant_lod_ &&
+            node_idx < static_cast<int32_t>(
+                drawable_object->lod_node_fade_.size());
+        if (has_lod) {
+            lod_fade = drawable_object->lod_node_fade_[node_idx];
+        }
+        bool lod_hidden =
             drawable_object->has_plant_lod_ &&
             node_idx < static_cast<int32_t>(
                 drawable_object->lod_node_visible_.size()) &&
             drawable_object->lod_node_visible_[node_idx] == 0;
+        if (depth_only && has_lod) {
+            // Depth / shadow passes take the STABLE single-owner band
+            // (lod_node_owner_) and no dissolve.  Selecting by which side
+            // of the transition currently wins made shadows flicker as
+            // the camera drifted across the halfway point; the hard
+            // ownership test is what the engine shadowed with before the
+            // cross-fade existed, and cascade softness hides its swap.
+            lod_hidden =
+                node_idx >= static_cast<int32_t>(
+                    drawable_object->lod_node_owner_.size()) ||
+                drawable_object->lod_node_owner_[node_idx] == 0;
+            lod_fade = 1.0f;
+        }
         if (node.mesh_idx_ >= 0 && !node_filtered && !lod_hidden) {
-            if (drawable_object->m_debug_force_red_ ||
-                drawable_object->m_debug_log_draws_) {
+            if (!depth_only &&
+                (drawable_object->m_debug_force_red_ ||
+                 drawable_object->m_debug_log_draws_)) {
                 ++drawable_object->m_debug_draw_nodes_with_mesh_;
             }
             glsl::ModelParams model_params{};
@@ -4594,6 +4982,13 @@ static void drawNodeMesh(
                 drawable_object->m_clutter_fade_start_m_;
             model_params.clutter_fade_end_m =
                 drawable_object->m_clutter_fade_end_m_;
+            // LOD cross-fade weight (see lod_node_fade_).  ZERO means
+            // "no dissolve" — the value a zero-initialised ModelParams
+            // already carries — so only a tile genuinely mid-transition
+            // ever pushes a non-zero value and every other draw path in
+            // the engine is unaffected by this field's existence.
+            model_params.lod_fade =
+                (glm::abs(lod_fade) >= 0.999f) ? 0.0f : lod_fade;
 
             drawMesh(cmd_buf,
                 drawable_object,
@@ -5672,6 +6067,53 @@ static std::shared_ptr<renderer::PipelineLayout> createInstanceBufferPipelineLay
 } // namespace
 
 namespace game_object {
+
+// ── RUNTIME LOD / GATE API ───────────────────────────────────────────
+// Declared in drawable_object.h.  These MUST live here, after the
+// anonymous namespace above closes: this file wraps everything from the
+// top of `namespace engine` down to that closing brace in an unnamed
+// namespace, so defining them up there — even inside a nested
+// `namespace game_object` — gives them INTERNAL linkage.  It compiles
+// clean and the symbol simply never leaves the translation unit, which
+// is the whole of LNK2019 here.  The anonymous namespace's members are
+// still reachable by unqualified lookup from this scope.
+
+
+void setPlantLodBands(const std::string& category,
+                      const std::vector<float>& edges_m) {
+    if (edges_m.empty()) plantLodTables().erase(category);
+    else                 plantLodTables()[category] = edges_m;
+    ++plantLodGenMutable();
+    std::cout << "[lod] band edges for '"
+              << (category.empty() ? std::string("<default>") : category)
+              << "' set to";
+    if (edges_m.empty()) {
+        std::cout << " AUTHORED (generator values)";
+    } else {
+        for (float e : edges_m) std::cout << " " << e;
+        std::cout << " m";
+    }
+    std::cout << std::endl;
+}
+
+const std::vector<float>& plantLodBands(const std::string& category) {
+    auto it = plantLodTables().find(category);
+    if (it != plantLodTables().end()) return it->second;
+    it = plantLodTables().find(std::string());
+    return (it != plantLodTables().end()) ? it->second : s_no_edges;
+}
+
+uint32_t plantLodBandGeneration() { return plantLodGenMutable(); }
+
+void setInteriorGateRadiusM(float m) {
+    interiorGateMutable() = m;
+    ++plantLodGenMutable();       // gates are re-applied by the same pass
+    std::cout << "[lod] interior prop gate radius floor set to " << m
+              << " m" << std::endl;
+}
+
+float interiorGateRadiusM() { return interiorGateMutable(); }
+
 
 // ── PCG world-manifest instance overrides (see drawable_object.h) ──────
 static std::mutex s_pcg_override_mutex;
@@ -7714,7 +8156,17 @@ void DrawableObject::draw(
     // a not-ready drawable also prints "0 draws" rather than carrying
     // last frame's count.  Cheap; only used when m_debug_force_red_
     // is set on the drawable.
-    if (object_ &&
+    //
+    // FORWARD PASS ONLY.  draw() runs several times a frame (forward,
+    // shadow, each CSM cascade, probe faces) and every call used to
+    // reset and re-fill these, so the once-a-second [placed.draw] print
+    // reported whichever pass happened to run LAST — a shadow pass,
+    // which deliberately skips frustum culling.  That is why the report
+    // read `frustumcull=0` even when the forward pass was culling
+    // properly, and it made the counters useless for the thing they
+    // exist to measure.  Latch the forward pass and the numbers describe
+    // the pass that actually dominates the frame.
+    if (object_ && draw_mode == DrawMode::kForward &&
         (object_->m_debug_force_red_ || object_->m_debug_log_draws_)) {
         object_->m_debug_draw_call_count_           = 0;
         object_->m_debug_draw_called_               = 1;
@@ -7887,6 +8339,7 @@ void DrawableObject::draw(
         // nodes) and dominated CPU command recording.
         if (!object_->mesh_node_flat_built_) {
             object_->mesh_node_flat_.clear();
+            object_->mesh_node_sphere_.clear();
             std::vector<int32_t> dfs;
             const auto& roots = object_->scenes_[root_node].nodes_;
             for (auto it = roots.rbegin(); it != roots.rend(); ++it) {
@@ -7900,6 +8353,22 @@ void DrawableObject::draw(
                 const auto& node = object_->nodes_[ni];
                 if (node.mesh_idx_ >= 0) {
                     object_->mesh_node_flat_.push_back(ni);
+                    // Cull sphere in drawable space: local AABB sphere
+                    // through cached_matrix_ with a conservative
+                    // max-axis-scale radius (see the member comment).
+                    const auto& mi = object_->meshes_[node.mesh_idx_];
+                    glm::vec3 bb_min = mi.cullBboxMin();
+                    glm::vec3 bb_max = mi.cullBboxMax();
+                    glm::vec3 lc = (bb_min + bb_max) * 0.5f;
+                    float lr = glm::length((bb_max - bb_min) * 0.5f);
+                    const glm::mat4& cm = node.cached_matrix_;
+                    glm::vec3 wc = glm::vec3(cm * glm::vec4(lc, 1.0f));
+                    float ms = glm::max(
+                        glm::length(glm::vec3(cm[0])),
+                        glm::max(glm::length(glm::vec3(cm[1])),
+                                 glm::length(glm::vec3(cm[2]))));
+                    object_->mesh_node_sphere_.push_back(
+                        glm::vec4(wc, lr * ms));
                 }
                 for (auto cit = node.child_idx_.rbegin();
                      cit != node.child_idx_.rend(); ++cit) {
@@ -7908,7 +8377,55 @@ void DrawableObject::draw(
             }
             object_->mesh_node_flat_built_ = true;
         }
-        for (const int32_t node_idx : object_->mesh_node_flat_) {
+        // Pre-stage rejection with the cached spheres: same predicates
+        // drawMesh applies (forward-only frustum cull, clutter distance
+        // cull), evaluated with one mat4×vec4 per node instead of the
+        // full ModelParams staging + call chain.  drawMesh re-tests the
+        // survivors exactly as before, so behaviour is unchanged — this
+        // only removes work for nodes that were going to be rejected
+        // anyway.
+        // Cached spheres bake node.cached_matrix_ at build time, so the
+        // fast rejection is only sound for drawables whose node
+        // transforms never change after load: no skins, no animations.
+        // (Skinned drawables also keep the same cull bypass drawMesh
+        // gives them — see the skinned-character note there.)
+        const bool drawable_static =
+            object_->skins_.empty() && object_->animations_.empty();
+        const bool pre_frustum =
+            !depth_only && s_frustum_cull_active && drawable_static;
+        const bool pre_dist =
+            !depth_only && s_viewer_pos_valid && drawable_static &&
+            object_->m_clutter_fade_end_m_ > 0.0f;
+        const glm::mat4 iw = object_->m_current_instance_world_;
+        const float iw_scale = glm::max(
+            glm::length(glm::vec3(iw[0])),
+            glm::max(glm::length(glm::vec3(iw[1])),
+                     glm::length(glm::vec3(iw[2]))));
+        const size_t flat_n = object_->mesh_node_flat_.size();
+        for (size_t fi = 0; fi < flat_n; ++fi) {
+            const int32_t node_idx = object_->mesh_node_flat_[fi];
+            if ((pre_frustum || pre_dist) &&
+                fi < object_->mesh_node_sphere_.size()) {
+                const glm::vec4 s = object_->mesh_node_sphere_[fi];
+                const glm::vec3 wc =
+                    glm::vec3(iw * glm::vec4(s.x, s.y, s.z, 1.0f));
+                const float wr = s.w * iw_scale;
+                if (pre_dist &&
+                    glm::distance(wc, s_viewer_pos_ws) - wr >
+                        object_->m_clutter_fade_end_m_) {
+                    continue;
+                }
+                if (pre_frustum) {
+                    bool outside = false;
+                    for (int p = 0; p < 6; ++p) {
+                        float dist = glm::dot(
+                            glm::vec3(s_frustum_planes[p]), wc) +
+                            s_frustum_planes[p].w;
+                        if (dist < -wr) { outside = true; break; }
+                    }
+                    if (outside) continue;
+                }
+            }
             drawNodeMesh(
                 cmd_buf,
                 object_,
@@ -10035,6 +10552,16 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     std::unordered_map<std::string, uint8_t> tex_cutout_cache;
     std::vector<uint8_t> tex_cutout;
 
+    // ── Cluster-sidecar census (why RT had no casters) ───────────────
+    // Every mesh this loader builds is supposed to get a cluster
+    // sidecar; syncPlacedObjectsToClusters and the RT-only caster scan
+    // both skip meshes whose cluster_mesh_ is empty, so one silent
+    // zero-face build here costs the whole scene its ray-traced
+    // shadows.  Count the outcomes and print the first few failures
+    // with the inputs that decided them.
+    size_t cs_meshes = 0, cs_ok = 0, cs_nofaces = 0, cs_noclusters = 0;
+    int    cs_reported = 0;
+
     const size_t kGeoChunk = 4096;   // ~bounded parsed-file RAM per chunk
     for (size_t chunk_begin = 0; chunk_begin < ordinal_geo.size();
          chunk_begin += kGeoChunk) {
@@ -10538,8 +11065,41 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                     face_prim.push_back(static_cast<uint32_t>(ai));
                 }
             }
+            ++cs_meshes;
+            if (cluster_src.faces_ptr->empty()) ++cs_nofaces;
+            // ── LAST-RESORT SOURCE ────────────────────────────────────
+            // A mesh with no sidecar is invisible to BOTH cluster
+            // consumers — the raster indirect draw and, fatally, the RT
+            // caster staging — so "this level's ranges produced nothing"
+            // must never be allowed to mean "no clusters at all".
+            // cpu_mesh is the LOD0 span and is always populated here, so
+            // fall back to it and map faces to primitives by which
+            // section's LOD0 range each face's index span lands in.
+            if (cluster_src.faces_ptr->empty() &&
+                cpu_mesh.faces_ptr && !cpu_mesh.faces_ptr->empty()) {
+                cluster_src.faces_ptr = cpu_mesh.faces_ptr;
+                face_prim.assign(cpu_mesh.faces_ptr->size(), 0u);
+                // section index -> position in `active` (primitive ord).
+                std::unordered_map<size_t, uint32_t> sec_to_prim;
+                for (size_t ai = 0; ai < active.size(); ++ai)
+                    sec_to_prim.emplace(active[ai],
+                                        static_cast<uint32_t>(ai));
+                for (size_t si = 0; si < num_sections; ++si) {
+                    const auto sit = sec_to_prim.find(si);
+                    if (sit == sec_to_prim.end()) continue;
+                    const uint32_t f0 = md.sections[si].first_index / 3u;
+                    const uint32_t f1 =
+                        (md.sections[si].first_index +
+                         md.sections[si].index_count) / 3u;
+                    for (uint32_t f = f0;
+                         f < f1 && f < face_prim.size(); ++f)
+                        face_prim[f] = sit->second;
+                }
+            }
             if (!cluster_src.faces_ptr->empty()) {
                 helper::buildClusterMesh(cluster_src, mesh.cluster_mesh_);
+                if (mesh.cluster_mesh_.empty()) ++cs_noclusters;
+                else ++cs_ok;
                 mesh.cluster_prim_map_.clear();
                 mesh.cluster_prim_map_.reserve(
                     mesh.cluster_mesh_.clusters.size());
@@ -10551,6 +11111,25 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                     }
                     mesh.cluster_prim_map_.push_back(prim_idx);
                 }
+            }
+            if (mesh.cluster_mesh_.empty() && cs_reported < 4) {
+                ++cs_reported;
+                std::cout
+                    << "[cluster-sidecar] EMPTY for '" << geo_path
+                    << "' level=" << geo_level
+                    << " verts=" << vtx_count
+                    << " indices=" << index_count
+                    << " sections=" << num_sections
+                    << " baked_lods=" << (baked_lods ? 1 : 0)
+                    << " lod_ranges=" << md.lod_ranges.size()
+                    << " active=" << active.size()
+                    << " use_level=" << (use_level ? 1 : 0)
+                    << " src_faces=" << cluster_src.faces_ptr->size()
+                    << " cpu_verts="
+                    << (cpu_mesh.vertex_data_ptr
+                            ? cpu_mesh.vertex_data_ptr->size()
+                            : 0)
+                    << std::endl;
             }
         }
 
@@ -10813,6 +11392,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         std::source_location::current(),
         idc.size() * sizeof(uint32_t), idc.data());
     drawable_object->num_prims_ = num_prims;
+
+    std::cout << "[cluster-sidecar] " << canon_name << ": "
+              << cs_ok << " built, " << cs_nofaces << " zero-face, "
+              << cs_noclusters << " zero-cluster (of " << cs_meshes
+              << " mesh build(s))" << std::endl;
 
     std::cout << "[rwinst] loaded '" << canon_name << "' ("
               << drawable_object->nodes_.size() << " nodes, "

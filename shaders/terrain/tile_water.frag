@@ -129,7 +129,9 @@ void main() {
     #endif
 
     vec3 color = f_diffuse + f_specular;
-    color = mix(linearTosRGB(color), bg_color, fade_rate);
+    // sceneTonemap: same exposure+ACES curve as every other final-colour
+    // writer (bg_color is already display-encoded scene colour).
+    color = mix(sceneTonemap(color), bg_color, fade_rate);
     outColor = vec4(color, 1.0f);
 /*
 	vec2 uv = gl_FragCoord.xy / vec2(1920, 1080) * 12.0;

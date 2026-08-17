@@ -567,7 +567,13 @@ vec3 toneMap(in PbrMaterialParams in_mat, vec3 color)
     }
 #endif
 
-    return linearTosRGB(color);
+    // TONEMAP_DEFAULT (and the NO_MTL build): the shared scene tonemap
+    // (exposure + ACES + sRGB, functions.glsl.h) instead of a bare
+    // linearTosRGB.  Forward-drawn objects land in the same LDR target
+    // the deferred resolve writes, so they must share its curve or every
+    // live-edited / skinned object shades visibly brighter than the
+    // clustered world around it.
+    return sceneTonemap(color);
 }
 
 #ifndef NO_MTL

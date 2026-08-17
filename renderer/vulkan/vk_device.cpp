@@ -1,6 +1,10 @@
 #include <iostream>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "../renderer.h"
 #include "vk_device.h"
@@ -1587,13 +1591,156 @@ void VulkanDevice::updateBufferMemory(
     const std::shared_ptr<DeviceMemory>& memory,
     uint64_t size,
     const void* src_data,
-    uint64_t offset/* = 0*/) {
-    if (memory) {
-        void* dst_data = mapMemory(memory, size, offset);
-        assert(dst_data);
-        memcpy(dst_data, src_data, size);
-        unmapMemory(memory);
+    uint64_t offset/* = 0*/,
+    bool deferrable/* = false*/) {
+    if (!memory) {
+        return;
     }
+    // Deferred path: queue the bytes and return.  Armed only around the
+    // render thread's command recording (see Device::
+    // beginDeferredBufferWrites), and only for THAT thread — an async
+    // loader calling in from a worker still writes immediately, so the
+    // queue is touched by one thread and needs no lock.
+    if (deferrable && deferred_writes_armed_ &&
+        std::this_thread::get_id() == deferred_writes_thread_ &&
+        size > 0 && src_data) {
+        PendingBufferWrite w;
+        w.memory = memory;
+        w.offset = offset;
+        w.data.resize(static_cast<size_t>(size));
+        memcpy(w.data.data(), src_data, static_cast<size_t>(size));
+        deferred_writes_.push_back(std::move(w));
+        return;
+    }
+    void* dst_data = mapMemory(memory, size, offset);
+    assert(dst_data);
+    memcpy(dst_data, src_data, size);
+    unmapMemory(memory);
+}
+
+// ── VRAM accounting by allocation site ──────────────────────────────
+// Bytes per texel for the formats this engine actually creates.  BC
+// block formats are reported per-texel too (a 4x4 block is 8 or 16
+// bytes), so the arithmetic below is uniform.  Anything unlisted falls
+// back to 4 B/texel, which keeps an unknown format from reading as zero.
+static double vramBytesPerTexel(int fmt) {
+    switch (fmt) {
+        case 9:                       return 1.0;    // R8_UNORM
+        case 16: case 20:             return 2.0;    // R8G8
+        case 23: case 29: case 30:    return 3.0;    // R8G8B8 / B8G8R8
+        case 37: case 43: case 44: case 50: return 4.0;  // RGBA8 / BGRA8
+        case 70: case 76:             return 2.0;    // R16
+        case 83: case 89:             return 4.0;    // R16G16
+        case 97:                      return 8.0;    // RGBA16F
+        case 100:                     return 4.0;    // R32F
+        case 103:                     return 8.0;    // RG32F
+        case 106:                     return 12.0;   // RGB32F
+        case 109:                     return 16.0;   // RGBA32F
+        case 122:                     return 4.0;    // B10G11R11_UFLOAT
+        case 124:                     return 2.0;    // D16
+        case 126:                     return 4.0;    // D32_SFLOAT
+        case 129: case 130:           return 4.0;    // D24S8 / D32S8
+        case 131: case 133:           return 0.5;    // BC1 (8 B / 4x4)
+        case 135: case 137:           return 1.0;    // BC2 / BC3
+        case 139:                     return 0.5;    // BC4
+        case 141:                     return 1.0;    // BC5
+        case 143: case 145:           return 1.0;    // BC6H / BC7
+        default:                      return 4.0;
+    }
+}
+
+void VulkanDevice::dumpVramBreakdown(const char* tag) {
+    struct Site { uint64_t bytes = 0; uint32_t count = 0; };
+    std::map<std::string, Site> buf_sites, img_sites;
+    uint64_t buf_total = 0, img_total = 0;
+    size_t buf_n = 0, img_n = 0;
+
+    auto key_of = [](const std::source_location& loc) {
+        std::string f = loc.file_name() ? loc.file_name() : "?";
+        // Basename only — full build paths make the report unreadable.
+        const size_t slash = f.find_last_of("/\\");
+        if (slash != std::string::npos) f = f.substr(slash + 1);
+        return f + ":" + std::to_string(loc.line());
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        buf_n = buffer_list_.size();
+        img_n = image_list_.size();
+        for (auto& b : buffer_list_) {
+            if (!b) continue;
+            const uint64_t sz = static_cast<uint64_t>(b->getSize());
+            auto& e = buf_sites[key_of(b->get_source_location())];
+            e.bytes += sz; ++e.count; buf_total += sz;
+        }
+        for (auto& im : image_list_) {
+            if (!im) continue;
+            const glm::uvec3 ext = im->getExtent();
+            const double bpt = vramBytesPerTexel(static_cast<int>(im->getFormat()));
+            const uint64_t sz = static_cast<uint64_t>(
+                double(std::max(ext.x, 1u)) * double(std::max(ext.y, 1u)) *
+                double(std::max(ext.z, 1u)) * bpt);
+            auto& e = img_sites[key_of(im->get_source_location())];
+            e.bytes += sz; ++e.count; img_total += sz;
+        }
+    }
+
+    auto report = [](const char* what,
+                     std::map<std::string, Site>& sites,
+                     uint64_t total, size_t n, const char* note) {
+        std::vector<std::pair<std::string, Site>> v(sites.begin(), sites.end());
+        std::sort(v.begin(), v.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second.bytes > b.second.bytes;
+                  });
+        std::printf("[vram] %s: %zu live, %.1f MB total%s\n",
+                    what, n, double(total) / (1024.0 * 1024.0), note);
+        const size_t show = std::min<size_t>(v.size(), 12);
+        for (size_t i = 0; i < show; ++i) {
+            std::printf("[vram]    %8.1f MB  x%-6u  %s\n",
+                        double(v[i].second.bytes) / (1024.0 * 1024.0),
+                        v[i].second.count, v[i].first.c_str());
+        }
+        if (v.size() > show) {
+            std::printf("[vram]    ... %zu more site(s)\n", v.size() - show);
+        }
+    };
+
+    std::printf("[vram] ===== breakdown (%s) =====\n", tag ? tag : "");
+    report("buffers", buf_sites, buf_total, buf_n, "  (exact)");
+    report("images",  img_sites, img_total, img_n,
+           "  (estimated: extent x format, mips/layers not tracked)");
+    std::printf("[vram] tracked total ~%.1f MB\n",
+                double(buf_total + img_total) / (1024.0 * 1024.0));
+    std::fflush(stdout);
+}
+
+void VulkanDevice::beginDeferredBufferWrites() {
+    // Re-arming without a flush would strand the previous window's
+    // writes; flush defensively so a mid-frame early-return in the
+    // caller can never silently drop a UBO update.
+    if (deferred_writes_armed_ && !deferred_writes_.empty()) {
+        flushDeferredBufferWrites();
+    }
+    deferred_writes_thread_ = std::this_thread::get_id();
+    deferred_writes_armed_  = true;
+}
+
+void VulkanDevice::flushDeferredBufferWrites() {
+    // Disarm FIRST: mapMemory/unmapMemory below must take the immediate
+    // path, and a re-entrant updateBufferMemory during the flush would
+    // otherwise append to the vector we are iterating.
+    deferred_writes_armed_ = false;
+    for (auto& w : deferred_writes_) {
+        if (!w.memory || w.data.empty()) {
+            continue;
+        }
+        void* dst_data = mapMemory(w.memory, w.data.size(), w.offset);
+        assert(dst_data);
+        memcpy(dst_data, w.data.data(), w.data.size());
+        unmapMemory(w.memory);
+    }
+    deferred_writes_.clear();
 }
 
 void VulkanDevice::dumpBufferMemory(
@@ -2146,11 +2293,17 @@ void VulkanDevice::getAccelerationStructureBuildSizes(
 
 AccelerationStructure VulkanDevice::createAccelerationStructure(
     const std::shared_ptr<Buffer>& buffer,
-    const AccelerationStructureType& as_type) {
+    const AccelerationStructureType& as_type,
+    uint64_t offset,
+    uint64_t size) {
     VkAccelerationStructureCreateInfoKHR as_create_info{};
     as_create_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
     as_create_info.buffer = RENDER_TYPE_CAST(Buffer, buffer)->get();
-    as_create_info.size = buffer->getSize();
+    // Sub-allocation: many small BLASes share one buffer (see device.h).
+    // VUID-VkAccelerationStructureCreateInfoKHR-offset-03734 requires a
+    // 256-byte alignment; callers pack with that stride.
+    as_create_info.offset = offset;
+    as_create_info.size = size != 0 ? size : (buffer->getSize() - offset);
     as_create_info.type = helper::toVkAccelerationStructureType(as_type);
     VkAccelerationStructureKHR as_handle;
     vkCreateAccelerationStructureKHR(device_, &as_create_info, nullptr, &as_handle);

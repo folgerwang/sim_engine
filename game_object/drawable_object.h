@@ -381,6 +381,23 @@ struct NodeInfo {
     float                       lod_tile_m_ = 0.0f;
     float                       lod_near_m_ = 0.0f;
     float                       lod_far_m_ = 0.0f;
+    // Which rung of its OWN chain this node is, 0 = nearest, and which
+    // chain that is.  An ordinal, not a distance, so it survives any
+    // runtime remap of the metres.  -1 = not a LOD node.
+    //
+    // The chain matters because one file carries several INDEPENDENT
+    // ones: terrain_pcg.py merges bushes and rocks into the tree stream
+    // to share meshes, so new-world_pcg_trees.glb holds _TREE_LOD
+    // (0/50/90/140/200/2600), _SHRUB_LOD (0/25/40/55/75/260) and
+    // _ROCK_LOD (0/50/100/170/260/700) at once.  Ordering every authored
+    // (near, far) pair in the file by `near` would interleave the three
+    // into one nonsense ladder — and applying a tree schedule to grass
+    // would push 4 m tuft clumps out to a 600 m card edge.  The chain is
+    // therefore keyed by the node name's leading token ("tree", "bush",
+    // "rock", "ground", ...), which is exactly the category the
+    // generator names them by.
+    int                         lod_band_idx_ = -1;
+    int                         lod_cat_idx_ = -1;
     // The tile rectangle in WORLD space, cached by selectPlantLodBands
     // for the drawable's current instance world (see DrawableData::
     // lod_world_from_).  Recomputed only when that transform changes,
@@ -612,6 +629,27 @@ struct DrawableData {
     // every file that carries no _lodtile_ names, i.e. all but the tree
     // GLB, which is also what has_plant_lod_ gates on.
     std::vector<uint8_t>        lod_node_visible_;
+    // ── LOD cross-fade weight, parallel to lod_node_visible_ ─────────
+    // 1 = fully this band's tile; 0 = not drawn; in between = inside a
+    // band TRANSITION, where this tile's mesh dissolves out (or in) via
+    // a screen-door threshold in base.frag instead of vanishing whole.
+    // Signed to say WHICH side of the transition the node is on, so the
+    // two neighbouring bands can use exactly complementary dither tests
+    // and never both-draw or both-drop a pixel:
+    //   > 0  fading OUT (or steady at 1.0)  → draw where  w >  ign
+    //   < 0  fading IN,  magnitude is alpha → draw where |w| > 1-ign
+    // A hard per-tile swap is what made whole 128 m squares of trees and
+    // grass change character in one frame — the tile-shaped LOD pop.
+    std::vector<float>          lod_node_fade_;
+    // Parallel again: the ORIGINAL hard band test, `d in [near, far)` —
+    // exactly one band owns each tile, no transition zone.  DEPTH-ONLY
+    // passes (shadow / CSM cascades) use this instead of the cross-fade,
+    // because those pipelines do not run the dissolve: picking by
+    // "whichever side of the transition is winning" made a tile's SHADOW
+    // pop on and off as the camera drifted across the halfway point,
+    // which is shadow flicker that the pre-cross-fade engine never had.
+    // Stable ownership costs nothing and is invisible in soft cascades.
+    std::vector<uint8_t>        lod_node_owner_;
     bool                        has_plant_lod_ = false;
     // Memo keys.  lod_eye_valid_ false means "no eye has been published
     // yet"; see selectPlantLodBands for what is drawn then.
@@ -621,6 +659,16 @@ struct DrawableData {
     // Largest far_ over all LOD nodes, i.e. which band is the outermost.
     // Only read by the no-eye-yet fallback, which draws that band alone.
     float                       lod_far_max_ = 0.0f;
+    // Per chain: its category name, and the (near, far) pairs it
+    // authored in rung order.  Kept so a runtime override can be
+    // reverted, and so a chain with more rungs than its override table
+    // still has something sane for the rungs the table does not cover.
+    std::vector<std::string>              lod_cat_names_;
+    std::vector<std::vector<glm::vec2>>   lod_band_authored_;
+    // Value of plantLodBandGeneration() the node distances were last
+    // written for.  Bumped by setPlantLodBands(), so the per-frame pass
+    // rewrites 690k node distances only when the table actually changed.
+    uint32_t                    lod_band_gen_ = 0xFFFFFFFFu;
     // Diagnostics for the per-second print: nodes kept by the last
     // selection, and how many tiles fell in each band.
     uint32_t                    lod_nodes_drawn_ = 0;
@@ -640,6 +688,17 @@ struct DrawableData {
     // The per-wrapper sub-object filter path (m_only_render_node_) keeps
     // the old targeted recursion and never touches this list.
     std::vector<int32_t>        mesh_node_flat_;
+    // Parallel to mesh_node_flat_: each node's cull sphere in DRAWABLE
+    // space (cached_matrix_ pre-applied) — xyz = center, w = radius.
+    // Lets the draw loop frustum/distance-reject a node with one
+    // mat4×vec4 + a few dots BEFORE staging ModelParams (a full
+    // mat4×mat4) and calling into drawMesh, which is what the ~50k-node
+    // ground-clutter file needs: nearly all of its tiles are past the
+    // fade distance every frame, and rejecting them used to cost more
+    // than drawing the survivors.  Conservative radii (per-axis max
+    // scale) so the fine tests in drawMesh never disagree toward
+    // dropping something this test kept.
+    std::vector<glm::vec4>      mesh_node_sphere_;
     bool                        mesh_node_flat_built_ = false;
 
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
@@ -713,6 +772,53 @@ public:
     void destroy(
         const std::shared_ptr<renderer::Device>& device);
 };
+
+// ── RUNTIME PLANT LOD BANDS ──────────────────────────────────────────
+// The generator bakes two different things and only one of them has to
+// stay baked.  The MESHES must be — a decimated tree and its impostor
+// card are minutes of offline work each, not a per-frame operation.  The
+// SWITCH DISTANCES were baked only because they happened to ride along
+// in the node name (`_lodtile_<i>_<j>_<tile>_<near>_<far>`), and they are
+// just numbers: changing them needs no new geometry, only a different
+// comparison.  Anything tunable by eye belongs at runtime, and a band
+// schedule is the definition of tunable by eye.
+//
+// setPlantLodBands({50, 150, 300, 600, 1200, 2600}) sets the rung EDGES:
+// rung 0 draws [0, 50), rung 1 [50, 150), and so on, with the last rung
+// running to the final edge.  A file with more rungs than the table has
+// edges keeps its authored metres for the rungs past the end, so a short
+// table degrades instead of blanking the far field.  Pass {} to go back
+// to exactly what the generator authored.
+//
+// This works on an ALREADY-BAKED world: it re-labels distances the file
+// already has meshes for.  What it cannot do is invent a rung — pushing
+// the impostor edge out on a 5-rung bake means the rung below it covers
+// more ground with the detail it was built at, not with new detail.
+// `category` is the node name's leading token — "tree", "bush", "rock",
+// "ground", and whatever else a bake introduces.  Pass "" to set the
+// fallback used by any category without a table of its own.  Each
+// category is independent, which is the point: grass, shrubs, rocks and
+// canopy stop being resolvable at wildly different distances, and one
+// shared schedule is wrong for at least three of them.
+void  setPlantLodBands(const std::string& category,
+                       const std::vector<float>& edges_m);
+const std::vector<float>& plantLodBands(const std::string& category);
+
+// ── INTERIOR PROP VISIBILITY ─────────────────────────────────────────
+// House contents ride _pgate_ nodes (mode 0: draw only INSIDE radius r
+// of the gate centre; mode 1: only outside — the closed door leaf that
+// swaps for the open one).  r is baked per house as that house's own
+// radius, which is a few metres.  This raises every gate radius to at
+// least `m`, so furniture is visible from further out.
+//
+// It must apply to BOTH modes or the pair stops partitioning: raising
+// only the open leaf's radius would leave a ring where the open and
+// closed leaves both draw.
+void  setInteriorGateRadiusM(float m);
+float interiorGateRadiusM();
+// Bumped on every set; drawables compare it against lod_band_gen_ so the
+// rewrite over every node happens on change, not every frame.
+uint32_t plantLodBandGeneration();
 
 class DrawableObject {
     enum {

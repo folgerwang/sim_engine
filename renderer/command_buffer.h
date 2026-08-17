@@ -44,8 +44,8 @@ public:
         std::vector<BufferImageCopyInfo> copy_regions,
         ImageLayout layout) = 0;
     virtual void bindPipeline(PipelineBindPoint bind, const std::shared_ptr<Pipeline>& pipeline) = 0;
-    virtual void bindVertexBuffers(uint32_t first_bind, const std::vector<std::shared_ptr<renderer::Buffer>>& vertex_buffers, std::vector<uint64_t> offsets) = 0;
-    virtual void bindIndexBuffer(std::shared_ptr<Buffer> index_buffer, uint64_t offset, IndexType index_type) = 0;
+    virtual void bindVertexBuffers(uint32_t first_bind, const std::vector<std::shared_ptr<renderer::Buffer>>& vertex_buffers, const std::vector<uint64_t>& offsets) = 0;
+    virtual void bindIndexBuffer(const std::shared_ptr<Buffer>& index_buffer, uint64_t offset, IndexType index_type) = 0;
     virtual void bindDescriptorSets(
         PipelineBindPoint bind_point,
         const std::shared_ptr<PipelineLayout>& pipeline_layout,

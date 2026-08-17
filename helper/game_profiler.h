@@ -10,7 +10,8 @@ namespace engine {
 namespace helper {
 
 // ---------------------------------------------------------------------------
-//  GpuProfiler – Vulkan timestamp-based GPU frame profiler with a
+//  GameProfiler (game_profiler.h — the in-game "Game Profiler") –
+//  CPU-scope + Vulkan-timestamp GPU frame profiler with a
 //  Nsight-style interactive flame-chart timeline.
 //
 //  Features:
@@ -65,14 +66,14 @@ struct FrameRecord {
     float total_cpu_ms = 0.0f;   // sum of depth-0 CPU scopes
 };
 
-class GpuProfiler {
+class GameProfiler {
 public:
     static constexpr int   kHistorySize      = 128;   // frames of ring history
     static constexpr int   kMaxScopesPerFrame = 64;   // max named scopes per frame
     static constexpr float kFrameGapMs       = 0.3f;  // visual gap between frames (ms)
 
-    GpuProfiler() = default;
-    ~GpuProfiler() = default;
+    GameProfiler() = default;
+    ~GameProfiler() = default;
 
     // Call once after device creation.
     void init(
@@ -155,12 +156,12 @@ public:
     // CPU bar measures recording time, the GPU bar measures execution
     // time.  Use:
     //   {
-    //     auto _t = gpu_profiler_.scope(cmd_buf, "My Pass");
+    //     auto _t = game_profiler_.scope(cmd_buf, "My Pass");
     //     // ... record + execute work ...
     //   }   // scope auto-closes both
     class Scope {
     public:
-        Scope(GpuProfiler& p, const std::shared_ptr<renderer::CommandBuffer>& cb,
+        Scope(GameProfiler& p, const std::shared_ptr<renderer::CommandBuffer>& cb,
               const char* name)
             : p_(p), cb_(cb) {
             cpu_h_ = p.beginCpuScope(name);
@@ -176,7 +177,7 @@ public:
         Scope(Scope&&) = delete;
         Scope& operator=(Scope&&) = delete;
     private:
-        GpuProfiler& p_;
+        GameProfiler& p_;
         std::shared_ptr<renderer::CommandBuffer> cb_;
         uint32_t cpu_h_ = UINT32_MAX;
         uint32_t gpu_h_ = UINT32_MAX;

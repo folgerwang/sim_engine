@@ -13,7 +13,7 @@
 #  include <windows.h>    // OutputDebugStringA
 #endif
 
-#include "gpu_profiler.h"
+#include "game_profiler.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cstring>
@@ -45,10 +45,10 @@ static void gpu_prof_trace(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     buf[sizeof(buf) - 1] = '\0';
-    fprintf(stderr, "[GpuProfiler] %s\n", buf);
+    fprintf(stderr, "[GameProfiler] %s\n", buf);
 #  ifdef _WIN32
     char dbuf[600];
-    snprintf(dbuf, sizeof(dbuf), "[GpuProfiler] %s\n", buf);
+    snprintf(dbuf, sizeof(dbuf), "[GameProfiler] %s\n", buf);
     OutputDebugStringA(dbuf);
 #  endif
 #else
@@ -79,7 +79,7 @@ static inline float gp_sanitize_px(float v, float fallback) {
 //  Init / Destroy
 // ============================================================================
 
-void GpuProfiler::init(
+void GameProfiler::init(
     const std::shared_ptr<renderer::Device>& device,
     uint32_t frames_in_flight,
     uint32_t max_scopes)
@@ -109,7 +109,7 @@ void GpuProfiler::init(
         frames_in_flight, max_scopes, m_timestamp_period_);
 }
 
-void GpuProfiler::destroy(const std::shared_ptr<renderer::Device>& device)
+void GameProfiler::destroy(const std::shared_ptr<renderer::Device>& device)
 {
     gpu_prof_trace("destroy: releasing %zu frame states", m_frame_states_.size());
 
@@ -135,7 +135,7 @@ void GpuProfiler::destroy(const std::shared_ptr<renderer::Device>& device)
 //  Per-frame recording
 // ============================================================================
 
-void GpuProfiler::beginFrame(
+void GameProfiler::beginFrame(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     uint32_t frame_index)
 {
@@ -153,7 +153,7 @@ void GpuProfiler::beginFrame(
     cmd_buf->writeTimestamp(fs.query_pool, fs.next_query++, /*after=*/false);
 }
 
-uint32_t GpuProfiler::beginScope(
+uint32_t GameProfiler::beginScope(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const char* name)
 {
@@ -182,7 +182,7 @@ uint32_t GpuProfiler::beginScope(
     return scope_idx;
 }
 
-void GpuProfiler::endScope(
+void GameProfiler::endScope(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     uint32_t scope_handle)
 {
@@ -201,7 +201,7 @@ void GpuProfiler::endScope(
     cmd_buf->writeTimestamp(fs->query_pool, entry.end_query, /*after=*/true);
 }
 
-void GpuProfiler::endFrame(
+void GameProfiler::endFrame(
     const std::shared_ptr<renderer::CommandBuffer>& /*cmd_buf*/,
     uint32_t /*frame_index*/)
 {
@@ -214,7 +214,7 @@ void GpuProfiler::endFrame(
 //  CPU scope API — chrono-based, parallel to the GPU one
 // ============================================================================
 
-void GpuProfiler::beginCpuFrame(uint32_t frame_index)
+void GameProfiler::beginCpuFrame(uint32_t frame_index)
 {
     if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return;
     auto& fs = m_frame_states_[frame_index % m_frames_in_flight_];
@@ -225,7 +225,7 @@ void GpuProfiler::beginCpuFrame(uint32_t frame_index)
     m_cpu_active_frame_idx_ = frame_index;
 }
 
-uint32_t GpuProfiler::beginCpuScope(const char* name)
+uint32_t GameProfiler::beginCpuScope(const char* name)
 {
     if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return UINT32_MAX;
     auto& fs = m_frame_states_[m_cpu_active_frame_idx_ % m_frames_in_flight_];
@@ -243,7 +243,7 @@ uint32_t GpuProfiler::beginCpuScope(const char* name)
     return scope_idx;
 }
 
-void GpuProfiler::endCpuScope(uint32_t scope_handle)
+void GameProfiler::endCpuScope(uint32_t scope_handle)
 {
     if (scope_handle == UINT32_MAX) return;
     if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return;
@@ -255,7 +255,7 @@ void GpuProfiler::endCpuScope(uint32_t scope_handle)
     fs.cpu_open_depth = std::max(0, fs.cpu_open_depth - 1);
 }
 
-void GpuProfiler::endCpuFrame(uint32_t frame_index)
+void GameProfiler::endCpuFrame(uint32_t frame_index)
 {
     if (m_frame_states_.empty() || m_frames_in_flight_ == 0) return;
     auto& fs = m_frame_states_[frame_index % m_frames_in_flight_];
@@ -278,7 +278,7 @@ void GpuProfiler::endCpuFrame(uint32_t frame_index)
 //  Result collection
 // ============================================================================
 
-void GpuProfiler::collectResults(
+void GameProfiler::collectResults(
     const std::shared_ptr<renderer::Device>& device,
     uint32_t frame_index)
 {
@@ -405,7 +405,7 @@ void GpuProfiler::collectResults(
     }
 }
 
-void GpuProfiler::recomputeGlobalPositions()
+void GameProfiler::recomputeGlobalPositions()
 {
     // Walk the ring in chronological order: oldest → newest.
     // The "oldest" slot is m_frame_write_idx_ when the ring is full,
@@ -435,7 +435,7 @@ void GpuProfiler::recomputeGlobalPositions()
 //  Colour helpers
 // ============================================================================
 
-uint32_t GpuProfiler::colorForName(const std::string& name)
+uint32_t GameProfiler::colorForName(const std::string& name)
 {
     // Hash the name to pick a hue; keep saturation and value fixed.
     uint32_t h = 2166136261u;
@@ -477,7 +477,7 @@ uint32_t GpuProfiler::colorForName(const std::string& name)
     return 0xFF000000u | (bi << 16) | (gi << 8) | ri;
 }
 
-uint32_t GpuProfiler::lerpColor(uint32_t a, uint32_t b, float t)
+uint32_t GameProfiler::lerpColor(uint32_t a, uint32_t b, float t)
 {
     auto lerp8 = [&](int shift) -> uint32_t {
         uint32_t ca = (a >> shift) & 0xFF;
@@ -491,7 +491,7 @@ uint32_t GpuProfiler::lerpColor(uint32_t a, uint32_t b, float t)
 //  ImGui flame-chart draw
 // ============================================================================
 
-void GpuProfiler::drawImGui()
+void GameProfiler::drawImGui()
 {
 #if GPU_PROF_DEBUG
     static int s_draw_counter = 0;
@@ -511,7 +511,7 @@ void GpuProfiler::drawImGui()
 
     // (Space-bar pause/resume is handled in the application's GLFW
     // key callback — it sets a static flag that drawFrame consumes
-    // by calling gpu_profiler_.togglePause(), which avoids fighting
+    // by calling game_profiler_.togglePause(), which avoids fighting
     // with ImGui's own key state and works even when ImGui doesn't
     // have window focus.  Don't add a second handler here — that
     // would double-toggle every press and the pause would appear
@@ -532,7 +532,7 @@ void GpuProfiler::drawImGui()
         ImGuiWindowFlags_NoDocking;
 
     ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
-    if (!ImGui::Begin("GPU Profiler", &m_show_window_, wflags)) {
+    if (!ImGui::Begin("Game Profiler", &m_show_window_, wflags)) {
         ImGui::End();
         return;
     }
@@ -794,13 +794,17 @@ void GpuProfiler::drawImGui()
                           ImVec2(cv_max.x, cpu_flame_y + (d + 1) * kLaneH),
                           bg);
     }
-    // CPU/GPU divider strip with labels.
+    // Divider strip between the two sections.  It marks where the GPU
+    // half starts, so it carries the "GPU" tag; the CPU tag is drawn as
+    // an overlay at the top of the CPU lanes (after the bars, so it
+    // stays readable).  The old combined label used ↑/↓ arrow glyphs
+    // the UI font doesn't cover — they rendered as "CPU ?  GPU ?".
     dl->AddRectFilled(ImVec2(cv_min.x, divider_y),
                       ImVec2(cv_max.x, divider_y + kDividerH),
                       IM_COL32(50, 50, 60, 255));
     dl->AddText(ImVec2(cv_min.x + 6.0f,
                        divider_y + (kDividerH - ImGui::GetFontSize()) * 0.5f),
-                IM_COL32(180, 200, 230, 255), "CPU ↑   GPU ↓");
+                IM_COL32(180, 200, 230, 255), "GPU");
     // GPU lane background stripes.
     for (int d = 0; d < kMaxDepth; ++d) {
         uint32_t bg = (d & 1) ? IM_COL32(28, 28, 28, 255)
@@ -951,6 +955,20 @@ void GpuProfiler::drawImGui()
     }
 
     dl->PopClipRect();
+
+    // ---- Section tag: CPU (top half) --------------------------------------
+    // Drawn AFTER the bar passes so it reads over the depth-0 scope bars;
+    // small dark backing chip keeps it legible on any bar colour.  The
+    // GPU tag lives on the divider strip above the GPU lanes.
+    {
+        const char* cpu_tag = "CPU";
+        ImVec2 ts = ImGui::CalcTextSize(cpu_tag);
+        ImVec2 p0(cv_min.x + 4.0f, cpu_flame_y + 2.0f);
+        dl->AddRectFilled(ImVec2(p0.x - 3.0f, p0.y - 1.0f),
+                          ImVec2(p0.x + ts.x + 3.0f, p0.y + ts.y + 1.0f),
+                          IM_COL32(30, 34, 44, 220), 3.0f);
+        dl->AddText(p0, IM_COL32(180, 200, 230, 255), cpu_tag);
+    }
 
     // ---- Canvas border -----------------------------------------------------
     dl->AddRect(cv_min, cv_max, IM_COL32(80, 80, 80, 200));

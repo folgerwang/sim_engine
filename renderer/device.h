@@ -118,11 +118,49 @@ public:
         const std::vector<uint32_t>& queue_index,
         const std::source_location& src_location =
             std::source_location::current()) = 0;
+    // deferrable: opt-in.  TRUE only for the small set of per-frame
+    // buffers the frame overwrites while the previous frame still reads
+    // them (see beginDeferredBufferWrites).  Everything else — staging
+    // uploads, load-time fills, anything followed by a synchronous
+    // transient submit or a buffer teardown — MUST keep the default and
+    // write immediately, or it would read stale bytes / map freed
+    // memory at flush time.
     virtual void updateBufferMemory(
         const std::shared_ptr<DeviceMemory>& memory,
         uint64_t size,
         const void* src_data,
-        uint64_t offset = 0) = 0;
+        uint64_t offset = 0,
+        bool deferrable = false) = 0;
+    // ── Deferred host-visible writes (frame pipelining) ──────────────
+    // While DEFERRED MODE is armed, updateBufferMemory() calls made ON
+    // THE ARMING THREAD are copied into a queue instead of being
+    // memcpy'd into mapped memory immediately; flushDeferredBufferWrites
+    // performs them all, in call order.
+    //
+    // Why: the per-frame UBOs (runtime lights, RT skeleton buffers, TLAS
+    // instances, grass indirect commands) are SINGLE-buffered and read by
+    // the previous frame's still-in-flight GPU work.  Writing them during
+    // command recording therefore forced a full "wait for frame N-1" at
+    // the top of recording — ~12 ms of dead CPU time every frame, which
+    // collapsed a 2-frames-in-flight setup into 1.  Queuing the writes
+    // lets the CPU record the entire frame first and pay the wait AFTER,
+    // where it overlaps with recording and usually costs nothing.
+    //
+    // Calls from OTHER threads (async mesh/texture loaders) are never
+    // deferred — they keep writing immediately, so no worker can have its
+    // upload delayed to (or raced against) the render thread's flush.
+    // ── VRAM accounting ──────────────────────────────────────────────
+    // Walks the live buffer/image tracking lists and prints how many
+    // bytes each ALLOCATION SITE is holding, biggest first.  Every
+    // create* call already carries a std::source_location, so this
+    // attributes VRAM to the exact file:line that asked for it — which
+    // is the only way to find a leak or an over-allocation in a scene
+    // with ~9k live buffers.  Buffer totals are exact; image totals are
+    // estimated from extent x format (mip chains and layer counts are
+    // not tracked, so a mipped texture reads low by up to ~33%).
+    virtual void dumpVramBreakdown(const char* tag) = 0;
+    virtual void beginDeferredBufferWrites() = 0;
+    virtual void flushDeferredBufferWrites() = 0;
     virtual void dumpBufferMemory(
         const std::shared_ptr<DeviceMemory>& memory,
         uint64_t size,
@@ -238,9 +276,16 @@ public:
         AccelerationStructureBuildType         as_build_type,
         const AccelerationStructureBuildGeometryInfo& build_info,
         AccelerationStructureBuildSizesInfo& size_info) = 0;
+    // `offset`/`size` sub-allocate the structure inside `buffer` (offset
+    // must be a multiple of 256, per the spec).  size == 0 means "the
+    // whole buffer", which is the historical behaviour.  Needed because
+    // one BLAS per unique mesh would otherwise be one vkAllocateMemory
+    // per mesh — this engine already carries 300k+ buffer allocations.
     virtual AccelerationStructure createAccelerationStructure(
         const std::shared_ptr<Buffer>& buffer,
-        const AccelerationStructureType& as_type) = 0;
+        const AccelerationStructureType& as_type,
+        uint64_t offset = 0,
+        uint64_t size = 0) = 0;
     virtual void destroyAccelerationStructure(const AccelerationStructure& as) = 0;
     virtual DeviceAddress getAccelerationStructureDeviceAddress(
         const AccelerationStructure& as) = 0;

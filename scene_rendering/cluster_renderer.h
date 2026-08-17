@@ -72,6 +72,29 @@ private:
     // ── CPU staging (populated by uploadMeshClusters, consumed by finalize) ──
     std::vector<glsl::ClusterCullInfo>        staging_cull_infos_;
     std::vector<glsl::ClusterDrawInfo>        staging_draw_infos_;
+    // ── Per-source-mesh tangent cache ────────────────────────────────
+    // computeMeshTangents() walks the FULL source mesh, and the RT
+    // instanced-caster rebuild calls uploadMeshClusters once per
+    // INSTANCE — ~1200 calls over the same ~20 tree species meshes per
+    // 96 m walk rebuild.  Recomputing whole-mesh tangents per instance
+    // was the single largest slice of the walk hitch ("upload 460-675
+    // ms" in the [rt-inst] scan lines).  Key by the source Mesh
+    // pointer; the weak_ptr detects a freed-and-reallocated Mesh at the
+    // same address (lock() no longer equals the caller's shared_ptr),
+    // so a stale entry can never leak wrong tangents onto new geometry.
+    struct TangentCacheEntry {
+        std::weak_ptr<const helper::Mesh>       source;
+        std::shared_ptr<std::vector<glm::vec4>> tangents;
+    };
+    std::unordered_map<const void*, TangentCacheEntry> tangent_cache_;
+    // ── Vertex-remap scratch (uploadMeshClusters) ────────────────────
+    // Replaces the per-cluster unordered_map<uint32_t,uint32_t> remap:
+    // array indexing stamped by an epoch counter instead of hashing.
+    // Sized to the largest source mesh seen; epoch bump per cluster
+    // makes clearing free.  ~3.6 M hash ops per walk rebuild gone.
+    std::vector<uint32_t> remap_scratch_idx_;
+    std::vector<uint32_t> remap_scratch_epoch_;
+    uint32_t              remap_epoch_ = 0;
     std::vector<glsl::BindlessMaterialParams> staging_material_params_;
     // Parallel to staging_material_params_: one (material_name, object_
     // name) pair per entry, captured during uploadMeshClusters from the

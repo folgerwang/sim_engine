@@ -17,7 +17,7 @@
 #include "scene/scene_types.h"     // group-node transform editing (Details)
 #include "scene_rendering/skydome.h"
 #include "shaders/global_definition.glsl.h"
-#include "helper/gpu_profiler.h"
+#include "helper/game_profiler.h"
 #include "chat_box.h"
 #include "title_screen_config.h"
 #include "imgui.h"
@@ -675,7 +675,7 @@ private:
     std::shared_ptr<ChatBox> chat_box_;
 
     // Optional GPU profiler — set from application after init.
-    engine::helper::GpuProfiler* gpu_profiler_ = nullptr;
+    engine::helper::GameProfiler* game_profiler_ = nullptr;
 
     // Plugin system — set from application after init.
     plugins::PluginManager* plugin_manager_ = nullptr;
@@ -1316,8 +1316,8 @@ public:
 
     void setBackgroundEnabled(bool enabled) { bg_enabled_ = enabled; }
     bool isBackgroundEnabled() const { return bg_enabled_; }
-    void setGpuProfiler(engine::helper::GpuProfiler* profiler) {
-        gpu_profiler_ = profiler;
+    void setGameProfiler(engine::helper::GameProfiler* profiler) {
+        game_profiler_ = profiler;
     }
     void setPluginManager(plugins::PluginManager* pm) {
         plugin_manager_ = pm;

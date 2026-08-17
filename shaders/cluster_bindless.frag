@@ -963,15 +963,16 @@ void main() {
     }
 #endif
 
-    // Gamma-correct to sRGB — matches base.frag's TONEMAP_DEFAULT path (exposure=1.0,
-    // linearTosRGB only). FBX materials set tonemap_type=TONEMAP_DEFAULT by default.
+    // Scene tonemap (exposure + ACES + sRGB, functions.glsl.h) — matches
+    // base.frag's default toneMap() path and deferred_resolve.comp, so
+    // forward and deferred pixels share one curve.
     //
     // Output alpha = albedo4.a (texture × factor) rather than just base_color.a
     // so semi-transparent textures contribute correctly to the translucent
     // pass blend equation.  For opaque materials albedo4.a ≈ 1.0, so the
     // translucent pipeline (drawn second) is a no-op for them — the cull
     // shader filters them out anyway.
-    vec4 final_color = vec4(linearTosRGB(color), albedo4.a);
+    vec4 final_color = vec4(sceneTonemap(color), albedo4.a);
 
 #if defined(GBUFFER_OUTPUT)
     // The GBUFFER_OUTPUT branch already wrote out_albedo_ao /

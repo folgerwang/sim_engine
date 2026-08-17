@@ -171,7 +171,11 @@ public:
         const std::shared_ptr<DeviceMemory>& memory,
         uint64_t size,
         const void* src_data,
-        uint64_t offset = 0) final;
+        uint64_t offset = 0,
+        bool deferrable = false) final;
+    virtual void dumpVramBreakdown(const char* tag) final;
+    virtual void beginDeferredBufferWrites() final;
+    virtual void flushDeferredBufferWrites() final;
     virtual void dumpBufferMemory(
         const std::shared_ptr<DeviceMemory>& memory,
         uint64_t size,
@@ -287,7 +291,9 @@ public:
         AccelerationStructureBuildSizesInfo& size_info) final;
     virtual AccelerationStructure createAccelerationStructure(
         const std::shared_ptr<Buffer>& buffer,
-        const AccelerationStructureType& as_type) final;
+        const AccelerationStructureType& as_type,
+        uint64_t offset = 0,
+        uint64_t size = 0) final;
     virtual void destroyAccelerationStructure(const AccelerationStructure& as) final;
     virtual DeviceAddress getAccelerationStructureDeviceAddress(
         const AccelerationStructure& as) final;
@@ -307,6 +313,21 @@ public:
         uint32_t query_count,
         std::vector<uint64_t>& results) final;
     virtual float getTimestampPeriod() final;
+
+private:
+    // ── Deferred host-visible writes ─────────────────────────────────
+    // See Device::beginDeferredBufferWrites for what this buys.  Only
+    // writes issued by deferred_writes_thread_ are queued; every other
+    // thread keeps the immediate path, so async loaders are unaffected
+    // and the queue needs no locking on the fast path.
+    struct PendingBufferWrite {
+        std::shared_ptr<DeviceMemory> memory;
+        uint64_t                      offset = 0;
+        std::vector<uint8_t>          data;
+    };
+    std::vector<PendingBufferWrite> deferred_writes_;
+    std::thread::id                 deferred_writes_thread_{};
+    bool                            deferred_writes_armed_ = false;
 };
 
 } // namespace vk

@@ -181,20 +181,35 @@ void VulkanCommandBuffer::bindPipeline(
 void VulkanCommandBuffer::bindVertexBuffers(
     uint32_t first_bind,
     const std::vector<std::shared_ptr<Buffer>>& vertex_buffers,
-    std::vector<uint64_t> offsets) {
-    std::vector<VkDeviceSize> vk_offsets(vertex_buffers.size());
-    std::vector<VkBuffer> vk_vertex_buffers(vertex_buffers.size());
-
-    for (int i = 0; i < vertex_buffers.size(); i++) {
+    const std::vector<uint64_t>& offsets) {
+    // HOT PATH: called once per recorded primitive (tens of thousands
+    // per frame).  Stack arrays for the common small counts — the two
+    // heap allocations here (plus the old by-value `offsets` copy) were
+    // a measurable slice of the forward-pass CPU record time.
+    constexpr size_t kStackN = 8;
+    VkBuffer     stack_bufs[kStackN];
+    VkDeviceSize stack_ofs[kStackN];
+    std::vector<VkBuffer>     heap_bufs;
+    std::vector<VkDeviceSize> heap_ofs;
+    VkBuffer*     vk_vertex_buffers = stack_bufs;
+    VkDeviceSize* vk_offsets        = stack_ofs;
+    const size_t n = vertex_buffers.size();
+    if (n > kStackN) {
+        heap_bufs.resize(n);
+        heap_ofs.resize(n);
+        vk_vertex_buffers = heap_bufs.data();
+        vk_offsets        = heap_ofs.data();
+    }
+    for (size_t i = 0; i < n; i++) {
         auto vk_vertex_buffer = RENDER_TYPE_CAST(Buffer, vertex_buffers[i]);
         vk_vertex_buffers[i] = vk_vertex_buffer->get();
         vk_offsets[i] = i < offsets.size() ? offsets[i] : 0;
     }
-    vkCmdBindVertexBuffers(cmd_buf_, first_bind, static_cast<uint32_t>(vk_vertex_buffers.size()), vk_vertex_buffers.data(), vk_offsets.data());
+    vkCmdBindVertexBuffers(cmd_buf_, first_bind, static_cast<uint32_t>(n), vk_vertex_buffers, vk_offsets);
 }
 
 void VulkanCommandBuffer::bindIndexBuffer(
-    std::shared_ptr<Buffer> index_buffer,
+    const std::shared_ptr<Buffer>& index_buffer,
     uint64_t offset,
     IndexType index_type) {
     auto vk_index_buffer = RENDER_TYPE_CAST(Buffer, index_buffer);
@@ -206,8 +221,19 @@ void VulkanCommandBuffer::bindDescriptorSets(
     const std::shared_ptr<PipelineLayout>& pipeline_layout,
     const DescriptorSetList& desc_sets,
     const uint32_t first_set_idx/* = 0 */ ) {
-    std::vector<VkDescriptorSet> vk_desc_sets;
-    vk_desc_sets.reserve(desc_sets.size());
+    // HOT PATH: called once per recorded primitive.  A stack run buffer
+    // replaces the per-call heap vector — set counts above 16 don't
+    // exist in this engine (fall back to heap defensively if they ever
+    // do).
+    constexpr size_t kStackSets = 16;
+    VkDescriptorSet stack_sets[kStackSets];
+    std::vector<VkDescriptorSet> heap_sets;
+    VkDescriptorSet* run = stack_sets;
+    if (desc_sets.size() > kStackSets) {
+        heap_sets.resize(desc_sets.size());
+        run = heap_sets.data();
+    }
+    size_t run_n = 0;
     auto vk_pipeline_layout =
         RENDER_TYPE_CAST(PipelineLayout, pipeline_layout);
 
@@ -215,10 +241,10 @@ void VulkanCommandBuffer::bindDescriptorSets(
     uint32_t start_set_idx = 0;
     while (i <= desc_sets.size()) {
         if (i < desc_sets.size() && desc_sets[i]) {
-            if (vk_desc_sets.size() == 0) {
+            if (run_n == 0) {
                 start_set_idx = first_set_idx + i;
             }
-            vk_desc_sets.push_back(RENDER_TYPE_CAST(DescriptorSet, desc_sets[i])->get());
+            run[run_n++] = RENDER_TYPE_CAST(DescriptorSet, desc_sets[i])->get();
         }
         else {
             // Only emit a vkCmdBindDescriptorSets call if we have accumulated
@@ -230,17 +256,17 @@ void VulkanCommandBuffer::bindDescriptorSets(
             // VkCmdBindDescriptorSets-descriptorSetCount-arraylength
             // ("descriptorSetCount must be greater than 0") on every leading
             // / consecutive nullptr.
-            if (!vk_desc_sets.empty()) {
+            if (run_n > 0) {
                 vkCmdBindDescriptorSets(
                     cmd_buf_,
                     helper::toVkPipelineBindPoint(bind_point),
                     vk_pipeline_layout->get(),
                     start_set_idx,
-                    static_cast<uint32_t>(vk_desc_sets.size()),
-                    vk_desc_sets.data(),
+                    static_cast<uint32_t>(run_n),
+                    run,
                     0,
                     nullptr);
-                vk_desc_sets.clear();
+                run_n = 0;
             }
         }
 

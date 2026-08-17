@@ -2,6 +2,7 @@
 #extension GL_ARB_separate_shader_objects : enable
 
 #include "global_definition.glsl.h"
+#include "tonemap.glsl.h"   // sceneTonemap
 
 // Sky envmap background fragment shader.
 //
@@ -73,8 +74,10 @@ void main()
     // The Y-flip in the write shaders compensates for that uvToXYZ/layer mismatch,
     // so textureLod here should use the un-flipped world-space view_dir directly.
     vec3 col = textureLod(u_envmap, view_dir, 0).rgb;
-    const float kExposure = 8.0;
-    col *= kExposure;
-    col = col / (col + vec3(1.0));   // Reinhard tone-mapping
-    outColor = vec4(col, 1.0);
+    // Envmap radiance sits well below the analytic skybox path, so keep a
+    // local pre-exposure — but finish through the SHARED scene tonemap
+    // (exposure + ACES + sRGB) instead of bare Reinhard-without-sRGB, so
+    // this sky path matches every other final-colour writer.
+    const float kEnvmapPreExposure = 8.0;
+    outColor = vec4(sceneTonemap(col * kEnvmapPreExposure), 1.0);
 }

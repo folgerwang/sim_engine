@@ -2566,7 +2566,7 @@ bool Menu::draw(
                 bake_collision_map_requested_ = true;
             }
 
-            if (ImGui::MenuItem("GPU Profiler", NULL, s_show_gpu_profiler)) {
+            if (ImGui::MenuItem("Game Profiler", NULL, s_show_gpu_profiler)) {
                 s_show_gpu_profiler = !s_show_gpu_profiler;
             }
 
@@ -3661,13 +3661,13 @@ bool Menu::draw(
     // ------------------------------------------------------------------------
 
     // ---- GPU Profiler window -----------------------------------------------
-    if (s_show_gpu_profiler && gpu_profiler_) {
-        gpu_profiler_->setWindowOpen(true);
-        gpu_profiler_->drawImGui();
+    if (s_show_gpu_profiler && game_profiler_) {
+        game_profiler_->setWindowOpen(true);
+        game_profiler_->drawImGui();
         // The window's [X] clears the profiler's own flag inside
         // drawImGui — mirror it back so the menu checkmark follows and
         // the window actually stays closed next frame.
-        s_show_gpu_profiler = gpu_profiler_->windowOpen();
+        s_show_gpu_profiler = game_profiler_->windowOpen();
     }
 
     // ---- AI terrain generation popup (Tools > Generate Terrain) ------------

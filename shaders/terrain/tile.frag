@@ -417,6 +417,72 @@ vec3 terrainSurfaceShade(vec4 w, float f, out float roughness) {
 
 // Light the same field instead of only painting it: relief is expressed
 // as an rms SLOPE per material, so it stays plausible at every distance.
+// ─────────────────────────────────────────────────────────────────────
+//  FOREST-FLOOR LITTER + GROUND PARALLAX
+// ─────────────────────────────────────────────────────────────────────
+// The procedural field above gives the ground SHADING character, but at
+// walking distance the surface still reads as a clean painted plane —
+// nothing lies ON it, and there is no depth cue when the eye moves.  Two
+// additions, both near-field only (kLitterFadeStartM..EndM) so they cost
+// nothing at range:
+//
+//  1. LITTER: a micro-height field shaped like ground debris — leaf
+//     clumps (~0.45 m blobs), fine grit (~0.13 m) and anisotropic twig
+//     streaks — with an analytic gradient so the same field TINTS the
+//     albedo, PERTURBS the normal and feeds the parallax, exactly the
+//     "one field drives colour, relief and roughness" rule the material
+//     system already follows.  Gated by the material weights: litter
+//     accumulates on grass and bare soil, never on rock faces or snow.
+//
+//  2. PARALLAX (bump-offset): the combined ground+litter height at the
+//     fragment offsets the SAMPLING position along the view ray's XZ
+//     projection, so hollows slide under crests as the camera moves.
+//     One field evaluation (not a stepped POM ray-march) — the relief is
+//     only ~0.2 m and the offset is clamped by view.y, so a single
+//     offset is visually indistinguishable from the march at a fraction
+//     of the cost.  Applied to the NEAR-FIELD samplers only (1 m detail
+//     tiles, procedural field, litter); the 4 m/texel macro maps would
+//     not show a 0.2 m shift, and moving the VT feedback uv would only
+//     perturb page streaming.
+#define kLitterFadeStartM   14.0f
+#define kLitterFadeEndM     26.0f
+#define kGroundParallaxAmpM 0.15f
+
+// Litter micro-height.  Returns signed height (~[-1,1]), its gradient
+// d h / d(x,z) (chain rule through every shaping curve, so the lit
+// relief matches the colour exactly), and the leaf / twig masks for
+// tinting.  Offsets keep every octave's hash1 origin-cross far outside
+// the map (see kGroundOrigin).
+float terrainLitterField(vec2 p, out vec2 grad,
+                         out float leaf, out float twig) {
+    // Leaf clumps: ~0.45 m value-noise blobs, sharpened into patches.
+    vec3 n1 = noised((p + kGroundOrigin + vec2( 337.7f,  911.3f))
+                     * (1.0f / 0.45f));
+    vec2 g1 = n1.yz * (1.0f / 0.45f);
+    float t1 = clamp((n1.x + 0.15f) / 0.70f, 0.0f, 1.0f);
+    leaf = t1 * t1 * (3.0f - 2.0f * t1);
+    vec2 dleaf = (6.0f * t1 * (1.0f - t1) / 0.70f) * g1;
+
+    // Fine grit / soil crumb: ~0.13 m, used raw.
+    vec3 n2 = noised((p + kGroundOrigin + vec2(1191.2f, 1553.8f))
+                     * (1.0f / 0.13f));
+    vec2 g2 = n2.yz * (1.0f / 0.13f);
+
+    // Twigs: strongly anisotropic ridges (2.1 m along x, 0.17 m across z)
+    // thresholded to thin streaks.  abs() folds the noise into ridges.
+    vec3 n3 = noised(vec2((p.x + kGroundOrigin.x + 217.9f) * (1.0f / 2.1f),
+                          (p.y + kGroundOrigin.y + 471.1f) * (1.0f / 0.17f)));
+    vec2 g3 = vec2(n3.y * (1.0f / 2.1f), n3.z * (1.0f / 0.17f));
+    float r  = 1.0f - abs(n3.x);
+    float t3 = clamp((r - 0.62f) / 0.30f, 0.0f, 1.0f);
+    twig = t3 * t3 * (3.0f - 2.0f * t3);
+    vec2 dtwig = (6.0f * t3 * (1.0f - t3) / 0.30f)
+               * (-sign(n3.x)) * g3;
+
+    grad = dleaf * 0.62f + g2 * 0.25f + dtwig * 0.13f;
+    return leaf * 0.62f + n2.x * 0.25f + twig * 0.13f - 0.30f;
+}
+
 vec3 terrainSurfaceNormal(vec3 n, vec4 w, vec3 grad) {
     float relief = w.x * 0.10f + w.y * 0.26f
                  + w.z * 0.13f + w.w * 0.04f;
@@ -456,6 +522,45 @@ void main() {
     vec3 normal = normalize(vec3((h_xn - h_xp) / (2.0f * eps),
                                  1.0f,
                                  (h_zn - h_zp) / (2.0f * eps)));
+
+    // ── View ray (moved up: the parallax below needs it) ─────────────
+    vec3 view_vec = camera_info.position.xyz - in_data.vertex_position;
+    float view_dist = length(view_vec);
+    vec3 view = normalize(view_vec);
+
+    // ── Ground parallax (see the LITTER + PARALLAX block above) ──────
+    // pos_p is the parallax-corrected position every NEAR-FIELD surface
+    // sampler uses from here on; pos keeps feeding geometry-derived
+    // quantities (heights, shadows, G-buffer position).
+    float lit_fade = 1.0f - smoothstep(kLitterFadeStartM,
+                                       kLitterFadeEndM, view_dist);
+    // VEGETATION GATE.  The litter+parallax treatment belongs to living
+    // ground; on the pale town/plaza albedo it warps a near-featureless
+    // surface into wobble ("ground texture looks really bad" was pale
+    // town ground under full-strength parallax).  Probe the macro
+    // albedo at the UNSHIFTED uv — coarse is fine, this is a where-am-I
+    // question, not a texture tap — and fade the whole near-field
+    // treatment out where the ground doesn't read green.
+    {
+        vec3 vp = texture(src_map_mask, in_data.world_map_uv).rgb;
+        float g_excess = 2.0f * vp.g - vp.r - vp.b;
+        lit_fade *= smoothstep(0.02f, 0.09f, g_excess);
+    }
+    vec3 pos_p = pos;
+    if (lit_fade > 0.0f && normal.y > 0.45f) {
+        vec3  g_par;
+        float f_par = terrainGroundField(pos, normal, view_dist, g_par);
+        vec2  lg_par; float leaf_par, twig_par;
+        float lh_par = terrainLitterField(pos.xz, lg_par,
+                                          leaf_par, twig_par);
+        float h01 = clamp(0.5f + 0.30f * f_par + 0.26f * lh_par,
+                          0.0f, 1.0f);
+        // Classic bump-offset: low points shift AWAY from the eye along
+        // the view ray's ground projection.  view.y clamp bounds the
+        // shift at grazing angles (max ~0.6 m) so silhouettes stay put.
+        pos_p.xz -= (view.xz / max(view.y, 0.35f))
+                    * ((1.0f - h01) * kGroundParallaxAmpM * lit_fade);
+    }
 
     // ── Anisotropy guard for the top-down macro albedo ────────────────
     // Every macro colour source (map mask, VT pages, 1 m detail tiles) is
@@ -577,7 +682,7 @@ void main() {
     // Near-field: the streamed 1 m albedo tile takes over from the
     // (4 m/texel) global map, fading with the same camera-distance band
     // as the height detail so colour and relief transition together.
-    albedo = terrainDetailAlbedo(pos.xz, albedo, detail_fade,
+    albedo = terrainDetailAlbedo(pos_p.xz, albedo, detail_fade,
                                  macro_blur_dir, macro_blur_m);
     // Beyond the terrain map: neutral surround (matches the height fade
     // in tile.vert — no stretched border stripes in colour or shading).
@@ -601,10 +706,6 @@ void main() {
     // resolve uses this for shadow-ray biasing (see out_emissive_metal).
     vec3 geom_normal = normal;
 
-    vec3 view_vec = camera_info.position.xyz - in_data.vertex_position;
-    float view_dist = length(view_vec);
-    vec3 view = normalize(view_vec);
-
     // ── Terrain material layers ──────────────────────────────────────
     // Applied AFTER the macro colour is resolved (VT / map-mask / 1 m
     // tiles) so it modulates whatever the generator produced.  There is
@@ -614,10 +715,45 @@ void main() {
     float slope01 = clamp(1.0f - normal.y, 0.0f, 1.0f);
     vec4  mat_w   = terrainMaterialWeights(albedo, slope01, pos.y);
     vec3  g_grad;
-    float g_field = terrainGroundField(pos, normal, view_dist, g_grad);
+    float g_field = terrainGroundField(pos_p, normal, view_dist, g_grad);
     float mat_rough;
     albedo *= terrainSurfaceShade(mat_w, g_field, mat_rough);
     normal  = terrainSurfaceNormal(normal, mat_w, g_grad);
+
+    // ── Forest-floor litter (near field) ─────────────────────────────
+    // Same field as the parallax, re-evaluated at the corrected position
+    // so colour, relief and depth agree.  Litter holds on grass and bare
+    // soil (mat_w.x + mat_w.z); rock and snow shed it.
+    if (lit_fade > 0.0f) {
+        vec2  lg; float leaf_m, twig_m;
+        float lh = terrainLitterField(pos_p.xz, lg, leaf_m, twig_m);
+        float ground_w = clamp(mat_w.x + mat_w.z, 0.0f, 1.0f);
+        float lw = lit_fade * ground_w * (1.0f - sfade);
+        if (lw > 0.003f) {
+            float luma = dot(albedo, vec3(0.299f, 0.587f, 0.114f));
+            // Dark macro ground (forest shade) decays toward wet leaves
+            // and humus; bright open ground reads as dry thatch.
+            vec3 leaf_col = mix(vec3(0.216f, 0.152f, 0.081f),
+                                vec3(0.412f, 0.331f, 0.174f),
+                                smoothstep(0.12f, 0.42f, luma));
+            // Per-clump value jitter so the litter isn't one dye lot.
+            leaf_col *= 0.85f + 0.42f * clamp(0.5f + 0.5f * lh, 0.0f, 1.0f);
+            vec3 humus_col = albedo * vec3(0.52f, 0.47f, 0.40f);
+            vec3 lit_col   = mix(humus_col, leaf_col, leaf_m);
+            lit_col        = mix(lit_col, vec3(0.34f, 0.26f, 0.15f),
+                                 twig_m * 0.7f);
+            float blend = lw * (0.28f + 0.45f * leaf_m + 0.27f * twig_m);
+            albedo = mix(albedo, lit_col, clamp(blend, 0.0f, 0.85f));
+            // The litter has real height — light it.  Tangent-plane
+            // projection like terrainSurfaceNormal, own relief scale.
+            vec3 t_lit = vec3(lg.x, 0.0f, lg.y);
+            t_lit -= dot(t_lit, normal) * normal;
+            normal = normalize(normal - t_lit * (0.22f * lw));
+            // Dry leaves and grit are matte.
+            mat_rough = clamp(mat_rough + 0.10f * lw * leaf_m,
+                              0.05f, 1.0f);
+        }
+    }
 
     // ── Authored surface maps over the procedural estimate ───────────
     // Three sources of relief, stacked by scale: the 1 m ML detail tile
@@ -627,7 +763,7 @@ void main() {
     // there is where neither map exists.  Nothing is switched off; the
     // authored data cross-fades in on top of what is already there.
     vec2  det_nrm_xy; float det_rough, det_ao;
-    float det_w = terrainDetailSurface(pos.xz, detail_fade,
+    float det_w = terrainDetailSurface(pos_p.xz, detail_fade,
                                        macro_blur_dir, macro_blur_m,
                                        det_nrm_xy, det_rough, det_ao);
     vec2  surf_nrm_xy  = mix(macro_nrm_xy, det_nrm_xy, det_w);
@@ -739,7 +875,10 @@ void main() {
     vec3 color = f_diffuse + f_specular;
 
     float alpha = 1.0f;
-    outColor = vec4(linearTosRGB(color), alpha);
+    // Shared scene tonemap — keeps the forward terrain branch on the same
+    // curve as the deferred resolve (which lights this same terrain when
+    // GBUFFER_OUTPUT is active).
+    outColor = vec4(sceneTonemap(color), alpha);
 //    outColor.xyz *= in_data.test_color;
 #endif  // !GBUFFER_OUTPUT
 }
