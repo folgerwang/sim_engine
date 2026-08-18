@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <unordered_map>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -105,17 +107,31 @@ float h01(uint32_t a, uint32_t b) {
 }
 
 constexpr float kClockScale = 60.0f;      // 1 real s = 1 game minute
-// EVERYONE simulates every frame; rendering is tiered by distance.
-// Full seven-box articulation inside kDetailRadius (capped at
-// kMaxDetailed nearest so a packed district can't explode the draw
-// count); a single person-box out to kShowRadius (10 km per the design
-// brief).  kMinAngular skips far persons whose box would land under
-// ~a third of a pixel — at 10 km a 1.7 m person is invisible anyway,
-// so this is where the 10 km budget actually stops costing.
+// EVERYONE is simulated, but at two rates.  Inside kNearSimRadius a
+// person gets the full per-frame tick — walking interpolation, yaw,
+// gait phase, door gestures.  Beyond it, a round-robin ring
+// (kFarSimPerFrame persons/frame) snaps each person to their current
+// schedule step's anchor: at 150k+ persons the full walk tick every
+// frame is real milliseconds, and a commuter 3 km away lerping between
+// anchors is indistinguishable from one teleported there once a
+// second.  Approach them and the near tick resumes mid-schedule.
+//
+// Rendering stays tiered by distance: full seven-box articulation
+// inside kDetailRadius (capped at kMaxDetailed nearest so a packed
+// district can't explode the draw count); a single person-box out to
+// kShowRadius (10 km per the design brief).  kMinAngular skips far
+// persons whose box would land under ~a third of a pixel — and it is
+// only the FLOOR of an adaptive threshold: with a whole town's
+// population in view the far tier caps itself at kMaxFarParts draws by
+// raising the cutoff until the crowd fits (nearest, tallest figures
+// keep priority as the angular test is height/dist).
+constexpr float kNearSimRadius = 700.0f;
+constexpr size_t kFarSimPerFrame = 8192;
 constexpr float kDetailRadius = 300.0f;
 constexpr size_t kMaxDetailed = 320;
+constexpr size_t kMaxFarParts = 12000;    // far-tier draw budget
 constexpr float kShowRadius = 10000.0f;   // 10 km
-constexpr float kMinAngular = 0.0003f;    // height/dist cutoff
+constexpr float kMinAngular = 0.0003f;    // height/dist cutoff (floor)
 constexpr float kGroundClampRadius = 400.0f;
 // The clock runs 60x real time, so schedule-accurate commuting needs
 // faster-than-life legs: at kWalkTimeScale 6 a 500 m commute costs one
@@ -123,7 +139,7 @@ constexpr float kGroundClampRadius = 400.0f;
 // Full 60x would be teleport-sprinting; 6x reads as "people getting
 // places" while staying watchable up close.
 constexpr float kWalkTimeScale = 6.0f;
-constexpr size_t kFarClampPerFrame = 256; // staggered height refresh
+constexpr size_t kFarClampPerFrame = 1024; // staggered height refresh
 
 }  // namespace
 
@@ -251,9 +267,12 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
         !std::filesystem::exists(world_json_path, ec)) {
         // LOUD on purpose: a silent false here cost a debugging round —
         // "why no npc has been rendered" with no line to grep for.
-        printf("[citizen] city data not found (%s / %s) — no citizens "
-               "this map.  Run the place stage to generate them.\n",
-               city_json_path.c_str(), world_json_path.c_str());
+        // std::cout, not printf: only std::cout reaches the engine log
+        // (main.cpp swaps its rdbuf; printf bypasses it entirely).
+        std::cout << "[citizen] city data not found (" << city_json_path
+                  << " / " << world_json_path << ") — no citizens this "
+                     "map.  Run the place stage to generate them."
+                  << std::endl;
         return false;
     }
     try {
@@ -343,13 +362,31 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
             persons_.push_back(std::move(p));
         }
         loaded_ = !persons_.empty();
-        printf("[citizen] loaded %zu persons, %zu buildings, %zu "
-               "houses from %s\n",
-               persons_.size(), buildings_.size(), houses_.size(),
-               std::filesystem::path(city_json_path)
-                   .filename().string().c_str());
+        district_centre_ = glm::vec2(0.0f);
+        if (!buildings_.empty()) {
+            for (const auto& b : buildings_) district_centre_ += b.entrance;
+            district_centre_ /= float(buildings_.size());
+        }
+        std::cout << "[citizen] loaded " << persons_.size()
+                  << " persons, " << buildings_.size() << " buildings, "
+                  << houses_.size() << " houses from "
+                  << std::filesystem::path(city_json_path)
+                         .filename().string()
+                  << " — civic district around ("
+                  << int(district_centre_.x) << ", "
+                  << int(district_centre_.y) << ")"
+                  << std::endl;
+        if (persons_.size() < houses_.size() / 4) {
+            std::cout << "[citizen] NOTE: only " << persons_.size()
+                      << " person records for " << houses_.size()
+                      << " houses — this city json predates the "
+                         "full-population export.  Re-run "
+                         "tools/terrain/city_sim.py to populate every "
+                         "household." << std::endl;
+        }
     } catch (const std::exception& e) {
-        printf("[citizen] city load failed: %s\n", e.what());
+        std::cout << "[citizen] city load failed: " << e.what()
+                  << std::endl;
         loaded_ = false;
     }
     return loaded_;
@@ -394,17 +431,24 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
 
     if (sim_.size() != persons_.size()) sim_.resize(persons_.size());
 
-    // ── EVERYONE ticks, every frame ──────────────────────────────────
-    // 8k persons x a compare, a lerp and a normalize is well under a
-    // millisecond; what does NOT scale is the terrain ground query, so
-    // that runs per frame only inside kGroundClampRadius and as a slow
-    // round-robin ring (kFarClampPerFrame/frame) beyond it — a far
+    // ── EVERYONE is simulated; only the NEAR ring pays per frame ─────
+    // Inside kNearSimRadius: the full walk tick, every frame.  Beyond:
+    // the round-robin ring below snaps persons to their schedule
+    // anchors.  What does NOT scale at all is the terrain ground
+    // query, so that runs per frame only inside kGroundClampRadius and
+    // as its own slow ring (kFarClampPerFrame/frame) — a far
     // commuter's height refreshes every couple of seconds, which at
-    // 300 m+ is beneath notice.
+    // 700 m+ is beneath notice.
     const size_t n = persons_.size();
+    const float near2 = kNearSimRadius * kNearSimRadius;
     for (size_t i = 0; i < n; ++i) {
-        const Person& p = persons_[i];
         SimState& a = sim_[i];
+        if (a.inited) {
+            const float dcx0 = a.pos.x - camera_pos.x;
+            const float dcz0 = a.pos.z - camera_pos.z;
+            if (dcx0 * dcx0 + dcz0 * dcz0 > near2) continue;
+        }
+        const Person& p = persons_[i];
         const auto& sched = scheduleOf(p);
         int cs = currentStep(sched, tod);
         const Step home_step{};
@@ -454,6 +498,38 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             }
         }
     }
+    // far persons: staggered schedule ring.  Each visit snaps the
+    // person to their CURRENT step's anchor — no walking interpolation
+    // out here (a lerp nobody can resolve is a lerp nobody pays for).
+    // With kFarSimPerFrame per frame a 150k-person town fully
+    // refreshes in ~20 frames — well inside one game-minute tick.
+    if (n) {
+        for (size_t k = 0; k < kFarSimPerFrame; ++k) {
+            const size_t i = (sim_cursor_ + k) % n;
+            SimState& a = sim_[i];
+            if (a.inited) {
+                const float dcx = a.pos.x - camera_pos.x;
+                const float dcz = a.pos.z - camera_pos.z;
+                if (dcx * dcx + dcz * dcz <= near2) continue;
+            }
+            const Person& p = persons_[i];
+            const auto& sched = scheduleOf(p);
+            const int cs = currentStep(sched, tod);
+            const Step home_step{};
+            const Step& st = cs >= 0 ? sched[cs] : home_step;
+            if (!a.inited) {
+                a.inited = true;
+                a.yaw = h01(uint32_t(i), 77u) * 6.2831853f;
+            }
+            if (cs != a.cur_step || glm::length(a.pos) < 1e-6f) {
+                a.cur_step = cs;
+                a.gesture_t = 0.0f;
+                a.pos = placePos(p, st, int(i));
+            }
+            a.walking = false;
+        }
+        sim_cursor_ = (sim_cursor_ + kFarSimPerFrame) % n;
+    }
     // far persons: staggered ground refresh ring
     if (ground_ && n) {
         for (size_t k = 0; k < kFarClampPerFrame; ++k) {
@@ -491,6 +567,8 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
     std::vector<uint8_t> is_detailed(n, 0);
     for (const auto& [d2, i] : near_ids) is_detailed[i] = 1;
 
+    if (far_thresh_ < kMinAngular) far_thresh_ = kMinAngular;
+    size_t far_emitted = 0;
     for (size_t i = 0; i < n; ++i) {
         if (!sim_[i].inited) continue;
         const float dx = sim_[i].pos.x - camera_pos.x;
@@ -501,9 +579,77 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             emitPerson(int(i), sim_[i], persons_[i], true);
         } else {
             const float dist = std::sqrt(std::max(d2, 1.0f));
-            if (persons_[i].height / dist < kMinAngular) continue;
+            if (persons_[i].height / dist < far_thresh_) continue;
+            // hard ceiling so the first frame at a new vantage cannot
+            // burst-draw the whole town before the controller reacts
+            if (far_emitted >= kMaxFarParts + kMaxFarParts / 2) continue;
+            ++far_emitted;
             emitPerson(int(i), sim_[i], persons_[i], false);
         }
+    }
+    // Far-tier draw budget: a whole town in frame is >100k one-box
+    // persons — more push-constant draws than the pass can afford.
+    // Nudge the angular cutoff until the emitted count sits inside
+    // kMaxFarParts (and relax it back when the crowd thins), so the
+    // nearest / largest figures always win the budget.
+    if (far_emitted > kMaxFarParts) {
+        far_thresh_ *= 1.25f;
+    } else if (far_emitted < kMaxFarParts / 2 &&
+               far_thresh_ > kMinAngular) {
+        far_thresh_ = glm::max(kMinAngular, far_thresh_ * 0.9f);
+    }
+    far_thresh_ = glm::min(far_thresh_, 0.02f);
+
+    // ── Telemetry: one [citizen] line every ~5 real seconds ──────────
+    // Answers "where are the citizens" from the log alone: game clock,
+    // how many are inited, how many sit within the detail / near-sim /
+    // show radii of the camera, the nearest person's position and
+    // distance, how many parts this frame actually emitted, and where
+    // the civic district is relative to the camera.  goes through
+    // std::cout so it lands in logs/engine_stdout_*.log.
+    dbg_timer_ += delta_t;
+    if (dbg_timer_ >= 5.0f) {
+        dbg_timer_ = 0.0f;
+        size_t n_init = 0, in_detail = 0, in_near = 0, in_show = 0;
+        float best_d2 = std::numeric_limits<float>::max();
+        int best_i = -1;
+        for (size_t i = 0; i < n; ++i) {
+            if (!sim_[i].inited) continue;
+            ++n_init;
+            const float dx = sim_[i].pos.x - camera_pos.x;
+            const float dz = sim_[i].pos.z - camera_pos.z;
+            const float d2 = dx * dx + dz * dz;
+            if (d2 < kDetailRadius * kDetailRadius) ++in_detail;
+            if (d2 < kNearSimRadius * kNearSimRadius) ++in_near;
+            if (d2 < kShowRadius * kShowRadius) ++in_show;
+            if (d2 < best_d2) { best_d2 = d2; best_i = int(i); }
+        }
+        const int day = dayOfWeek();
+        const int hh = int(std::fmod(clock_min_, 1440.0f)) / 60;
+        const int mm = int(std::fmod(clock_min_, 1440.0f)) % 60;
+        const float ddx = district_centre_.x - camera_pos.x;
+        const float ddz = district_centre_.y - camera_pos.z;
+        std::cout << "[citizen] day " << day << " "
+                  << (hh < 10 ? "0" : "") << hh << ":"
+                  << (mm < 10 ? "0" : "") << mm
+                  << " | pop " << n << " (inited " << n_init << ")"
+                  << " | <300m " << in_detail
+                  << "  <700m " << in_near
+                  << "  <10km " << in_show
+                  << " | drawn parts " << frame_parts_.size()
+                  << " (far_thresh " << far_thresh_ << ")";
+        if (best_i >= 0) {
+            std::cout << " | nearest #" << best_i << " at ("
+                      << int(sim_[best_i].pos.x) << ", "
+                      << int(sim_[best_i].pos.y) << ", "
+                      << int(sim_[best_i].pos.z) << ") d="
+                      << int(std::sqrt(best_d2)) << "m"
+                      << (sim_[best_i].walking ? " walking" : " idle");
+        }
+        std::cout << " | cam (" << int(camera_pos.x) << ", "
+                  << int(camera_pos.z) << ") district "
+                  << int(std::sqrt(ddx * ddx + ddz * ddz)) << "m away"
+                  << std::endl;
     }
 }
 

@@ -287,7 +287,18 @@ bool lodFadeDiscards(float w) {
 
 void main() {
     // Band transition: dissolve before any shading work is done.
-    if (lodFadeDiscards(model_params.lod_fade)) {
+    // Per-instance mode (model_params_pad0 != 0, dense ground cover)
+    // uses the weight base.vert computed from the instance's own
+    // camera distance; |w| ~ 0 means the instance sits entirely
+    // outside its band and drops whole.  The mid-transition dissolve
+    // reuses lodFadeDiscards' complementary screen-door — both bands
+    // derive w from the same shared instance translation, so their
+    // kept pixels partition exactly.  Node-tile mode is unchanged.
+    if (floatBitsToUint(model_params.model_params_pad0) != 0u) {
+        float w_ci = ps_in_data.vertex_ilod_fade;
+        if (abs(w_ci) < 0.001) discard;
+        if (lodFadeDiscards(w_ci)) discard;
+    } else if (lodFadeDiscards(model_params.lod_fade)) {
         discard;
     }
     bool is_front_face = gl_FrontFacing;

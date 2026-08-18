@@ -413,6 +413,15 @@ struct NodeInfo {
     // Tile origin in the file's own space, kept so the world rectangle
     // can be rebuilt if the wrapper moves.
     float                       lod_lx0_ = 0.0f, lod_lz0_ = 0.0f;
+    // ── Per-instance LOD (dense ground cover) ─────────────────────
+    // Category "ground": its band widths (20-40 m) are far smaller
+    // than the 256 m export tile, so the per-NODE rect test flipped a
+    // whole tile's cover at once — visible square LOD seams.  Flagged
+    // nodes resolve the band PER INSTANCE in the vertex shader
+    // (near/far packed into ModelParams::model_params_pad0 by
+    // drawNodeMesh); the CPU pass keeps only a conservative
+    // node-level cull.  Set by parsePlantLodBands.
+    uint8_t                     lod_per_instance_ = 0;
     // ── Proximity gate (house interiors / door leaves) ────────────
     // Parsed from a "_pgate_<x_dm>_<z_dm>_<r_dm>_<mode>" marker in the
     // node name (decimetre ints).  mode 0: node draws ONLY when the eye

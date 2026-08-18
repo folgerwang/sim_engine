@@ -700,6 +700,18 @@ struct ModelParams {
     // Written by DrawableObject::drawNodeMesh from
     // DrawableData::lod_node_fade_.
     float lod_fade;
+    // ── Per-instance LOD band window (dense ground cover) ────────────
+    // ZERO (the all-zero default) = feature off.  Otherwise the FLOAT'S
+    // RAW BITS pack this node's band: bit31 = a band exists beyond this
+    // one (fade out at far rather than hard-stop), bits30..16 =
+    // near_m*4, bits15..0 = far_m*4.  Ground-cover bands are 20-40 m
+    // wide on 256 m export tiles, so the per-node tile test flipped a
+    // whole tile at once (square LOD seams); with this set, base.vert
+    // resolves the band per INSTANCE from its own translation — shared
+    // byte-for-byte across the bands, so the two sides of a boundary
+    // compute identical distances and their complementary screen-door
+    // halves partition every pixel.  Written by drawNodeMesh for nodes
+    // with lod_per_instance_.
     float model_params_pad0;
 };
 
@@ -1407,6 +1419,13 @@ struct ObjectVsPsData {
     // base.vert for skinned primitives and consumed by the WEIGHT_SUM render-
     // debug mode in base.frag.  -1 = non-skinned vertex (no weights).
     float vertex_weight_sum;
+    // Per-INSTANCE LOD cross-fade weight (dense ground cover), written
+    // by base.vert / base_depthonly.vert when ModelParams::
+    // model_params_pad0 carries a packed band window, 1.0 otherwise.
+    // Same signed convention as ModelParams::lod_fade, but |w| ~ 0
+    // additionally means "instance entirely outside its band" and
+    // base.frag drops the fragment whole.
+    float vertex_ilod_fade;
 #ifdef HAS_NORMALS
     vec3 vertex_normal;
 #ifdef HAS_TANGENT

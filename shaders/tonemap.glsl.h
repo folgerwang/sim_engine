@@ -25,7 +25,13 @@
 // NOT for texture/IBL prebake passes (cube_skybox.frag, cube_ibl.frag,
 // sky LUTs…) — those must stay linear; they are inputs to lighting, not
 // display output.
-const float kSceneExposure = 0.75;
+// 0.58 (was 0.75): with near-white ground albedo the noon sum of sun +
+// full-sky IBL still pushed most of the frame past the ACES shoulder at
+// 0.75 — shadow terms and surface detail read as one blown white.  ACES
+// pins mid-gray, so this darkens the blown range ~25% while shadows
+// keep their footing.  ONE shared constant for every final-colour
+// writer — tune here, never per-shader.
+const float kSceneExposure = 0.58;
 
 // ACES filmic fit (Narkowicz 2016).
 vec3 sceneAcesFilm(vec3 x)

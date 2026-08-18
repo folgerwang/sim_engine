@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstddef>   // offsetof (indirect-command LOD rewrite)
 #include <cstdlib>        // std::strtoll, for the plant-LOD node-name parse
+#include <cstring>        // std::memcpy, per-instance LOD band packing
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -2905,6 +2906,13 @@ static void parsePlantLodBands(
             static_cast<double>(ti) * static_cast<double>(tile_m));
         node.lod_lz0_ = static_cast<float>(
             static_cast<double>(tj) * static_cast<double>(tile_m));
+        // Ground cover switches bands per INSTANCE in the shader (see
+        // lod_per_instance_ in the header): its 20-40 m bands on 256 m
+        // tiles made the per-node rect test flip whole tiles at once.
+        // Scoped to the "ground" category for now — trees/houses keep
+        // the node-tile path (their tiles are fine-grained per band).
+        node.lod_per_instance_ =
+            (lodCategoryOf(node.name_) == "ground") ? 1 : 0;
         near_far_min = glm::min(near_far_min, near_m);
         near_far_max = glm::max(near_far_max, far_m);
         ++matched;
@@ -3107,6 +3115,33 @@ static void selectPlantLodBands(
                                   eye.z - node.lod_wz1_);
         const float d = glm::sqrt(dx * dx + dz * dz);
 
+        if (node.lod_per_instance_) {
+            // Per-instance banding: the vertex shader resolves the band
+            // per clump (see lod_per_instance_), so the node level only
+            // CONSERVATIVELY culls tiles that cannot hold a live
+            // instance — nearest corner already past far+fade, or
+            // farthest corner still short of near-fade.  fade stays 1
+            // (the dissolve is per instance) and owner mirrors vis (the
+            // depth passes hard-pick per instance in the shader).
+            const float k_out_ci =
+                glm::clamp(node.lod_far_m_ * 0.05f, 2.0f, 24.0f);
+            const float k_in_ci =
+                glm::clamp(node.lod_near_m_ * 0.05f, 2.0f, 24.0f);
+            const float dxm = glm::max(glm::abs(eye.x - node.lod_wx0_),
+                                       glm::abs(eye.x - node.lod_wx1_));
+            const float dzm = glm::max(glm::abs(eye.z - node.lod_wz0_),
+                                       glm::abs(eye.z - node.lod_wz1_));
+            const float d_max = glm::sqrt(dxm * dxm + dzm * dzm);
+            const uint8_t v_ci =
+                (d < node.lod_far_m_ + k_out_ci &&
+                 d_max >= node.lod_near_m_ - k_in_ci) ? 1 : 0;
+            vis[i] = v_ci;
+            fade[i] = 1.0f;
+            owner[i] = v_ci;
+            drawn += v_ci;
+            continue;
+        }
+
         // ── Band selection with a CROSS-FADE transition ──────────────
         // The old test was a hard `d in [near, far)`: the instant the
         // eye crossed a boundary an entire 128 m tile swapped one mesh
@@ -3120,13 +3155,22 @@ static void selectPlantLodBands(
         // the swap happens per-pixel over several metres of travel
         // instead of per-tile in one frame.
         //
-        // The zone is a fraction of the band's own width, clamped: an
-        // absolute width would swamp a narrow near band and barely
-        // register on a 400 m far band.
-        const float band_w = glm::max(node.lod_far_m_ - node.lod_near_m_,
-                                      1.0f);
-        const float kLodFadeM =
-            glm::clamp(band_w * 0.12f, 2.0f, 24.0f);
+        // The half-width is anchored to the EDGE DISTANCE, not the
+        // band's own width.  The two bands meeting at one boundary have
+        // different widths (ext 220 m wide hands off to a 2380 m far
+        // band), so a width-derived zone gave each side a different
+        // half-width and the complementary dither halves stopped being
+        // complements: pixels discarded by BOTH sides opened dithered
+        // holes on one flank of the boundary and double-drew on the
+        // other.  Anchoring on the edge value makes the fade-out side
+        // (far edge D) and the fade-in side (near edge D) of the SAME
+        // boundary derive the SAME half-width, restoring the exact
+        // pixel partition — and scales the zone with distance, which
+        // is roughly constant angular width to the eye.
+        const float k_fade_out =
+            glm::clamp(node.lod_far_m_ * 0.05f, 2.0f, 24.0f);
+        const float k_fade_in =
+            glm::clamp(node.lod_near_m_ * 0.05f, 2.0f, 24.0f);
 
         // Fade IN across the near edge, OUT across the far edge.  The
         // outermost band has no neighbour beyond it, so it holds solid
@@ -3139,7 +3183,8 @@ static void selectPlantLodBands(
         float w_out = 1.0f;      // 1 inside, ramps to 0 past the far edge
         if (has_outer) {
             w_out = glm::clamp(
-                (node.lod_far_m_ + kLodFadeM - d) / (2.0f * kLodFadeM),
+                (node.lod_far_m_ + k_fade_out - d) /
+                    (2.0f * k_fade_out),
                 0.0f, 1.0f);
         } else {
             w_out = (d < node.lod_far_m_) ? 1.0f : 0.0f;
@@ -3147,7 +3192,8 @@ static void selectPlantLodBands(
         float w_in = 1.0f;       // 1 inside, ramps to 0 before the near edge
         if (has_inner) {
             w_in = glm::clamp(
-                (d - (node.lod_near_m_ - kLodFadeM)) / (2.0f * kLodFadeM),
+                (d - (node.lod_near_m_ - k_fade_in)) /
+                    (2.0f * k_fade_in),
                 0.0f, 1.0f);
         } else {
             w_in = (d >= node.lod_near_m_ - 1e-3f) ? 1.0f : 0.0f;
@@ -5000,6 +5046,27 @@ static void drawNodeMesh(
             // the engine is unaffected by this field's existence.
             model_params.lod_fade =
                 (glm::abs(lod_fade) >= 0.999f) ? 0.0f : lod_fade;
+            // Per-instance LOD (ground cover): pack this band's window
+            // into the spare pad float — base.vert resolves the band
+            // per clump from its instance translation; base.frag runs
+            // the complementary screen-door, base_depthonly.vert the
+            // hard midpoint pick.  Zero = off, which every other
+            // drawable's zero-initialised ModelParams already carries.
+            if (has_lod && node.lod_per_instance_ != 0) {
+                uint32_t ilod_bits =
+                    ((uint32_t(glm::clamp(node.lod_near_m_ * 4.0f,
+                                          0.0f, 32767.0f)) & 0x7FFFu)
+                     << 16) |
+                    (uint32_t(glm::clamp(node.lod_far_m_ * 4.0f,
+                                         0.0f, 65535.0f)) & 0xFFFFu);
+                if (node.lod_far_m_ <
+                    drawable_object->lod_far_max_ - 0.01f) {
+                    ilod_bits |= 0x80000000u;
+                }
+                std::memcpy(&model_params.model_params_pad0, &ilod_bits,
+                            sizeof(model_params.model_params_pad0));
+                model_params.lod_fade = 0.0f;
+            }
 
             drawMesh(cmd_buf,
                 drawable_object,

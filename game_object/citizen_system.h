@@ -81,6 +81,9 @@ public:
     float clockMinutes() const { return clock_min_; }
     int   dayOfWeek() const { return int(clock_min_ / 1440.0f) % 7; }
     bool  isWeekend() const { return dayOfWeek() >= 5; }
+    // The ENTIRE city population is loaded and simulated (near persons
+    // at frame rate, the rest on a snap-to-schedule ring); rendering is
+    // what stays distance-tiered.
     size_t populationLoaded() const { return persons_.size(); }
     size_t activeCount() const { return persons_.size(); }
 
@@ -141,6 +144,11 @@ private:
     std::vector<Person>    persons_;
     std::vector<SimState>  sim_;       // parallel to persons_
     size_t clamp_cursor_ = 0;          // far-person ground refresh ring
+    size_t sim_cursor_ = 0;            // far-person schedule ring
+    float  far_thresh_ = 0.0f;         // adaptive far-tier angular cutoff
+                                       // (0 = seed from kMinAngular)
+    float  dbg_timer_ = 0.0f;          // [citizen] telemetry cadence
+    glm::vec2 district_centre_{0.0f};  // civic-building centroid (log aid)
 
     float clock_min_ = 8.0f * 60.0f + 2.0f * 1440.0f;   // Wed 08:00
     GroundQueryFn ground_;

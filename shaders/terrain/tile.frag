@@ -239,9 +239,35 @@ layout(set = TILE_PARAMS_SET, binding = ROUGH_NOISE_TEXTURE_INDEX) uniform sampl
 //            fine grain survives right up to the camera.
 
 // Normalisation constants measured from the field (fp32, 4 km extent):
-// the raw 8-octave mean has rms 0.165 and unit-relief slope rms 0.461.
-#define kGroundFieldNorm   2.00f     // -> value rms ~0.33
-#define kGroundSlopeNorm   2.17f     // -> slope rms ~1.00 per unit relief
+// a SINGLE octave has value rms 0.467 and unit-relief slope rms 1.223.
+//
+// These divide by the RMS of the active weight set, sqrt(sum w^2), not by
+// its sum.  The octaves are uncorrelated, so stacking N of them grows the
+// total as sqrt(N), not N: dividing by the sum therefore over-normalises,
+// and by an amount that grows with octave count.  Under the old
+// sum-normalisation the value rms ran 0.33 at 8 active octaves (where the
+// constant was fitted) but 0.47 at 4 and 0.66 at 2 — contrast climbing
+// with view distance — and any octave ADDED at the fine end would have
+// pulled the near field down to 0.28.  That is the trap: extending the
+// spectrum downward while sum-normalised makes close ground FLATTER, not
+// more detailed.  sqrt(sum w^2) holds the rms at 0.33 for every octave
+// count, so the ladder below can be lengthened freely.
+#define kGroundFieldNorm   0.707f    // -> value rms ~0.33 at ANY octave count
+#define kGroundSlopeNorm   0.818f    // -> slope rms ~1.00 per unit relief
+
+// Octave count.  The ladder is 64 m / 2.31^i, so 8 octaves bottomed out at
+// 18 cm — coarser than anything the eye resolves on ground a metre away.
+// Dry sand ripples (5-15 cm), grit and soil crumb all live BELOW that
+// floor, so the near field carried no signal at its own scale and read as
+// a smooth painted plane however the material constants were tuned.  11
+// octaves reach 1.5 cm.
+//
+// Cost is bounded by each octave's own distance ramp and the coarse->fine
+// break below: octave 8 (7.9 cm) is confined to 87 m, octave 9 to 38 m,
+// octave 10 to 16 m.  Only pixels inside those radii pay for them.  Drop
+// to 10 or 9 if the near field costs too much — the floor rises to 3.4 cm
+// or 7.9 cm respectively.
+#define kGroundOctaves     11
 
 // hash1(vec2) is fract(a*b*(a+b)) with a,b = 50*fract(p/pi), so it
 // collapses to EXACTLY 0 along the whole p.x == 0 and p.y == 0 lattice
@@ -286,9 +312,9 @@ float terrainGroundField(vec3 pos_ws, vec3 n_ws, float dist, out vec3 grad) {
     mat2 rot   = mat2(1.0f, 0.0f, 0.0f, 1.0f);  // R_i
     mat2 rot_t = mat2(1.0f, 0.0f, 0.0f, 1.0f);  // (R_i)^T
     float period = kP0;
-    float sum = 0.0f, w_sum = 0.0f, sw_sum = 0.0f;
+    float sum = 0.0f, w2_sum = 0.0f, sw2_sum = 0.0f;
     grad = vec3(0.0f);
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kGroundOctaves; ++i) {
         // ~2 px at 1080p / 60 deg is period/dist ~= 1/515, so start the
         // ramp before that and finish well after it.
         float w = 1.0f - smoothstep(period * 380.0f, period * 1100.0f,
@@ -313,19 +339,23 @@ float terrainGroundField(vec3 pos_ws, vec3 n_ws, float dist, out vec3 grad) {
             v += tw.z * o.x;
             g += tw.z * vec3(o.y, o.z, 0.0f);
         }
-        sum   += v * w;
-        w_sum += w;
+        sum    += v * w;
+        w2_sum += w * w;
         // The macro heightfield already owns the large-scale slope, so
         // bias the RELIEF toward the finer octaves (colour stays flat 1/f).
-        float sw = w * (0.28f + 0.72f * float(i) * (1.0f / 7.0f));
-        grad   += g * sw;
-        sw_sum += sw;
+        // The ramp spans the whole ladder, so lengthening it moves the
+        // relief emphasis onto the new fine octaves — which is the point:
+        // close ground should be lit by centimetre relief, not decimetre.
+        float sw = w * (0.28f + 0.72f * float(i)
+                                * (1.0f / float(kGroundOctaves - 1)));
+        grad    += g * sw;
+        sw2_sum += sw * sw;
         rot    = m2  * rot;
         rot_t  = m2i * rot_t;
         period /= kLac;
     }
-    grad *= kGroundSlopeNorm / max(sw_sum, 1e-3f);
-    return clamp(sum * (kGroundFieldNorm / max(w_sum, 1e-3f)),
+    grad *= kGroundSlopeNorm / max(sqrt(sw2_sum), 1e-3f);
+    return clamp(sum * (kGroundFieldNorm / max(sqrt(w2_sum), 1e-3f)),
                  -1.0f, 1.0f);
 }
 

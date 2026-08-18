@@ -188,6 +188,37 @@ void main() {
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
 
+    // ── Per-instance LOD band (dense ground cover) ───────────────────
+    // See ModelParams::model_params_pad0.  Weight mirrors the CPU's
+    // per-tile cross-fade, but keyed on THIS INSTANCE's translation —
+    // the transforms are shared byte-for-byte across the bands, so both
+    // sides of a boundary compute identical distances and their
+    // screen-door halves partition every pixel: clumps swap band by
+    // their own camera distance, not by 256 m tile.
+    out_data.vertex_ilod_fade = 1.0;
+    {
+        uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
+        if (ilod_bits != 0u) {
+            vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
+                               in_loc_rot_mat_2.w);
+            float ilod_d = distance(inst_t.xz, camera_info.position.xz);
+            float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
+            float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;
+            float ilod_k_out = clamp(ilod_far * 0.05, 2.0, 24.0);
+            float ilod_k_in = clamp(ilod_near * 0.05, 2.0, 24.0);
+            float ilod_w_out = ((ilod_bits & 0x80000000u) != 0u)
+                ? clamp((ilod_far + ilod_k_out - ilod_d) /
+                            (2.0 * ilod_k_out), 0.0, 1.0)
+                : (ilod_d < ilod_far ? 1.0 : 0.0);
+            float ilod_w_in = (ilod_near > 0.01)
+                ? clamp((ilod_d - (ilod_near - ilod_k_in)) /
+                            (2.0 * ilod_k_in), 0.0, 1.0)
+                : 1.0;
+            out_data.vertex_ilod_fade =
+                (ilod_w_in < ilod_w_out) ? -ilod_w_in : ilod_w_out;
+        }
+    }
+
     // ── Weight-sum debug varying ─────────────────────────────────────────────
     // Carry the raw (pre-normalization) sum of all skin influences so the
     // WEIGHT_SUM render-debug mode can colour the mesh by it.  -1 marks a

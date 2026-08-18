@@ -105,6 +105,45 @@ void main() {
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
 #endif
     out_data.vertex_position = position_ws;
+    out_data.vertex_ilod_fade = 1.0;
+    // ── Per-instance LOD hard pick (depth / shadow passes) ───────────
+    // Same packed band window as base.vert, but collapsed to a hard
+    // midpoint ownership test — the depth pipelines don't run the
+    // dissolve, and drawing both bands would double every caster in
+    // the transition (the same reason node-level LOD uses
+    // lod_node_owner_ here).  Exactly one band keeps each instance:
+    // the fading-out side owns to the midpoint (w > 0.5), the
+    // fading-in side beyond it (w < -0.5).  A culled instance emits a
+    // degenerate clip position AND a far-underground vertex_position,
+    // so the CSM geometry-shader path (which re-projects
+    // vertex_position, not gl_Position) drops it too.
+    {
+        uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
+        if (ilod_bits != 0u) {
+            vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
+                               in_loc_rot_mat_2.w);
+            float ilod_d = distance(inst_t.xz, camera_info.position.xz);
+            float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
+            float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;
+            float ilod_k_out = clamp(ilod_far * 0.05, 2.0, 24.0);
+            float ilod_k_in = clamp(ilod_near * 0.05, 2.0, 24.0);
+            float ilod_w_out = ((ilod_bits & 0x80000000u) != 0u)
+                ? clamp((ilod_far + ilod_k_out - ilod_d) /
+                            (2.0 * ilod_k_out), 0.0, 1.0)
+                : (ilod_d < ilod_far ? 1.0 : 0.0);
+            float ilod_w_in = (ilod_near > 0.01)
+                ? clamp((ilod_d - (ilod_near - ilod_k_in)) /
+                            (2.0 * ilod_k_in), 0.0, 1.0)
+                : 1.0;
+            float ilod_w =
+                (ilod_w_in < ilod_w_out) ? -ilod_w_in : ilod_w_out;
+            out_data.vertex_ilod_fade = ilod_w;
+            if (!(ilod_w > 0.5 || ilod_w < -0.5)) {
+                gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+                out_data.vertex_position = vec3(0.0, -4.0e8, 0.0);
+            }
+        }
+    }
     out_data.vertex_tex_coord = vec4(0);
 #ifdef HAS_UV_SET0
     out_data.vertex_tex_coord.xy = in_tex_coord.xy;

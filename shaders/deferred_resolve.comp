@@ -588,8 +588,16 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
 // 2-sample pixel doesn't reuse the same disk point.
 // ─── RT indirect diffuse: 1-bounce GI radiance along one ray ─────────
 // Closest-hit walk over the SAME cluster BVH the shadow rays traverse.
-// On a miss the ray sees sky: the cosine-convolved irradiance cube is
-// exactly the smooth estimate a 1-sample-per-pixel estimator wants.  On
+// On a miss the ray sees sky: sample the IBL RADIANCE cubemap
+// (ggx_env_sampler, whose lower mips are the lightly prefiltered live
+// sky) along the ray.  With cosine-distributed rays the per-sample
+// radiance averages to exactly the E/pi the irradiance cube stores, so
+// the calibration is unchanged — but unlike the old lambertian-cube
+// fetch (irradiance re-sampled along one ray: doubly convolved, nearly
+// direction-free) the estimator now actually SEES the sky's directional
+// structure: a bright horizon, a sunset side, an overcast dome each
+// push different GI, and the temporal history integrates the extra
+// per-sample variance away.  On
 // a hit, the bounce radiance is the hit surface's (mip-filtered) albedo
 // lit by the sun — with a real occlusion ray from the hit point — plus
 // a small sky leak so back-faces don't return pure black.  Skinned
@@ -598,6 +606,11 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
 const float RT_GI_MAX_DIST    = 120.0;  // bounce interval; sky beyond
 const float RT_GI_NORMAL_BIAS = 0.05;   // metres off the surface
 const float RT_GI_TEX_LOD     = 4.0;    // prefiltered albedo fetch
+// Sky fetch mip in the GGX radiance chain: mip 0 is mirror-sharp sky,
+// each mip a wider prefilter.  1.0 keeps the horizon/zenith structure
+// that makes the GI directional while shaving the brightest-texel
+// fireflies a raw fetch would feed the 1-spp estimator.
+const float RT_GI_SKY_LOD     = 1.0;
 const float RT_GI_SKY_LEAK    = 0.35;   // hit surface's own ambient
 // Temporal history clamp.  1/RT_GI_HIST_MAX is the minimum blend factor
 // of the fresh sample, so the effective history weight is capped at
@@ -714,7 +727,11 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
     }
 
     if (!hit) {
-        vec3 sky = texture(lambertian_env_sampler, rd).rgb;
+        // Miss: the ray sees sky — the IBL radiance cubemap is the
+        // light source (see the block comment above; the lambertian
+        // cube stays for HIT-point ambient, where irradiance at the
+        // surface normal is the correct quantity).
+        vec3 sky = textureLod(ggx_env_sampler, rd, RT_GI_SKY_LOD).rgb;
 #ifndef USE_HDR
         sky = sRGBToLinear(sky);
 #endif
@@ -1194,9 +1211,10 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) ==
         gl_RayQueryCommittedIntersectionNoneEXT) {
-        // Miss: the cosine ray sees sky — the lambertian cube is the
-        // smooth 1-spp estimate (identical to the software path).
-        vec3 sky = texture(lambertian_env_sampler, rd).rgb;
+        // Miss: the ray sees sky — the IBL radiance cubemap is the
+        // light source (identical to the software path; see
+        // rtGiRadiance's block comment for the estimator math).
+        vec3 sky = textureLod(ggx_env_sampler, rd, RT_GI_SKY_LOD).rgb;
 #ifndef USE_HDR
         sky = sRGBToLinear(sky);
 #endif
