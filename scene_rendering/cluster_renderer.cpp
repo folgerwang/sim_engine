@@ -469,6 +469,66 @@ renderer::BufferInfo createCounterBuffer(
     return info;
 }
 
+// ── Scope-managed buffer lifetime for re-finalize / RT rebuilds ───────
+// finalizeUploads and the RT shadow builds re-run every
+// kRtInstRebuildMoveM metres of camera travel (the RT-only staged set
+// follows the eye).  The buffer helpers above RETURN a fresh BufferInfo
+// that the caller assigned over the old one — and the shared_ptr
+// wrappers carry no destructor, so every overwritten handle simply
+// ORPHANED its VkBuffer + VkDeviceMemory: ~200 MB of VRAM leaked per
+// rebuild while moving around, on top of the allocator churn.
+//
+// reuseOrRelease is the policy in one place: KEEP the existing
+// allocation when the new payload fits and is at least half the
+// capacity (the keep-a-buffer hysteresis — wandering back and forth
+// across a rebuild boundary must not thrash reallocations, and rebuild
+// sizes only drift a few percent), otherwise DESTROY it before the
+// caller creates the right-sized replacement.  Callers on the finalize
+// path run after finalizeUploads' waitIdle, so destruction cannot pull
+// memory out from under an in-flight frame.
+static bool reuseOrRelease(const std::shared_ptr<er::Device>& device,
+                           renderer::BufferInfo& info, uint64_t need) {
+    if (info.buffer) {
+        const uint64_t cap = info.buffer->getSize();
+        if (cap >= need && need * 2u >= cap) {
+            return true;                    // fits, and not < half: keep
+        }
+        info.destroy(device);               // outgrown or oversized 2x+
+    }
+    return false;
+}
+
+// In-place variants of the create* helpers above: reuse-or-recreate,
+// refreshing contents on the reuse path so behaviour is identical to a
+// fresh creation with `data`.
+static void ensureSSBO(const std::shared_ptr<er::Device>& device,
+                       renderer::BufferInfo& info,
+                       uint64_t size, const void* data) {
+    if (reuseOrRelease(device, info, size)) {
+        if (data) device->updateBufferMemory(info.memory, size, data);
+        return;
+    }
+    info = createSSBO(device, size, data);
+}
+
+static void ensureIndirectSSBO(const std::shared_ptr<er::Device>& device,
+                               renderer::BufferInfo& info, uint64_t size) {
+    // GPU-written scratch: contents are rebuilt by the cull dispatch
+    // every frame, so the reuse path needs no refresh.
+    if (reuseOrRelease(device, info, size)) return;
+    info = createIndirectSSBO(device, size);
+}
+
+static void ensureCounterBuffer(const std::shared_ptr<er::Device>& device,
+                                renderer::BufferInfo& info) {
+    if (info.buffer) {                       // fixed 4 bytes: always reuse
+        const uint32_t zero = 0;
+        device->updateBufferMemory(info.memory, sizeof(zero), &zero);
+        return;
+    }
+    info = createCounterBuffer(device);
+}
+
 } // anonymous namespace
 
 // ─── Constructor ───────────────────────────────────────────────────
@@ -1267,6 +1327,12 @@ void ClusterRenderer::finalizeUploads() {
     // Create cull_info as HOST_VISIBLE so we can verify the data.
     {
         const uint64_t sz = total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo);
+        // reuse-or-release: see reuseOrRelease — the fresh refinalize
+        // waitIdle above makes destroy-on-grow safe here.
+        if (reuseOrRelease(device_, cull_info_buffer_, sz)) {
+            device_->updateBufferMemory(cull_info_buffer_.memory, sz,
+                                        staging_cull_infos_.data());
+        } else {
         er::Helper::createBuffer(
             device_,
             SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, TRANSFER_DST_BIT),
@@ -1277,6 +1343,7 @@ void ClusterRenderer::finalizeUploads() {
             std::source_location::current(),
             sz,
             staging_cull_infos_.data());
+        }
 
         // Read back and verify first few entries.
         void* mapped = device_->mapMemory(cull_info_buffer_.memory, sz, 0);
@@ -1296,42 +1363,36 @@ void ClusterRenderer::finalizeUploads() {
         }
     }
 
-    draw_info_buffer_ = createSSBO(
-        device_,
-        total_clusters_all_meshes_ * sizeof(glsl::ClusterDrawInfo),
-        staging_draw_infos_.data());
+    ensureSSBO(device_, draw_info_buffer_,
+               total_clusters_all_meshes_ * sizeof(glsl::ClusterDrawInfo),
+               staging_draw_infos_.data());
 
     // Material params SSBO — one entry per unique material (or per upload call).
     if (!staging_material_params_.empty()) {
-        material_params_buffer_ = createSSBO(
-            device_,
-            staging_material_params_.size() * sizeof(glsl::BindlessMaterialParams),
-            staging_material_params_.data());
+        ensureSSBO(device_, material_params_buffer_,
+                   staging_material_params_.size() *
+                       sizeof(glsl::BindlessMaterialParams),
+                   staging_material_params_.data());
         clog_printf("[CLUSTER_RENDERER] Uploaded %zu material(s) to GPU.\n",
                     staging_material_params_.size());
     } else {
         // Fallback: single white material entry so the shader always has data.
         glsl::BindlessMaterialParams white;
         white.base_color_factor = glm::vec4(1.0f);
-        material_params_buffer_ = createSSBO(
-            device_,
-            sizeof(glsl::BindlessMaterialParams),
-            &white);
+        ensureSSBO(device_, material_params_buffer_,
+                   sizeof(glsl::BindlessMaterialParams), &white);
     }
 
     // Indirect draw buffer: worst case all clusters visible (opaque bucket).
-    indirect_draw_buffer_ = createIndirectSSBO(
-        device_,
-        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+    ensureIndirectSSBO(device_, indirect_draw_buffer_,
+                       total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
 
     // Atomic draw count buffer (host visible for readback).
-    draw_count_buffer_ = createCounterBuffer(device_);
+    ensureCounterBuffer(device_, draw_count_buffer_);
 
     // Visible cluster indices buffer (opaque bucket only).
-    visible_buffer_ = createSSBO(
-        device_,
-        total_clusters_all_meshes_ * sizeof(uint32_t),
-        nullptr);
+    ensureSSBO(device_, visible_buffer_,
+               total_clusters_all_meshes_ * sizeof(uint32_t), nullptr);
 
     // Translucent bucket — right-sized from the ACTUAL translucent
     // cluster count instead of the old "100%-glass scene" worst case
@@ -1357,10 +1418,9 @@ void ClusterRenderer::finalizeUploads() {
             total_clusters_all_meshes_,
             std::max(1024u, trans_clusters * 2u));
     }
-    trans_indirect_draw_buffer_ = createIndirectSSBO(
-        device_,
-        trans_indirect_capacity_ * 5 * sizeof(uint32_t));
-    trans_draw_count_buffer_ = createCounterBuffer(device_);
+    ensureIndirectSSBO(device_, trans_indirect_draw_buffer_,
+                       trans_indirect_capacity_ * 5 * sizeof(uint32_t));
+    ensureCounterBuffer(device_, trans_draw_count_buffer_);
 
     // ── Shadow cull scratch buffers ──────────────────────────────────
     // The shadow cull dispatch needs a separate place to land its
@@ -1373,19 +1433,16 @@ void ClusterRenderer::finalizeUploads() {
     constexpr uint32_t kShadowCullTransScratchCapacity = 4096u;
     shadow_cull_trans_capacity_ = std::min(
         total_clusters_all_meshes_, kShadowCullTransScratchCapacity);
-    shadow_cull_trans_indirect_buffer_ = createIndirectSSBO(
-        device_,
-        shadow_cull_trans_capacity_ * 5 * sizeof(uint32_t));
-    shadow_cull_trans_count_buffer_ = createCounterBuffer(device_);
+    ensureIndirectSSBO(device_, shadow_cull_trans_indirect_buffer_,
+                       shadow_cull_trans_capacity_ * 5 * sizeof(uint32_t));
+    ensureCounterBuffer(device_, shadow_cull_trans_count_buffer_);
 
     // Scratch visible-buffer for the shadow cull dispatches — see the
     // header doc for why this is necessary (avoids clobbering the main
     // cull's visible_buffer_, which is read back next frame for
     // per-mesh visibility tracking).
-    shadow_cull_visible_buffer_ = createSSBO(
-        device_,
-        total_clusters_all_meshes_ * sizeof(uint32_t),
-        nullptr);
+    ensureSSBO(device_, shadow_cull_visible_buffer_,
+               total_clusters_all_meshes_ * sizeof(uint32_t), nullptr);
 
     // ── Per-cascade shadow indirect buffers (Option B) ───────────────
     // Allocate one (indirect, count) pair per CSM cascade.  cullShadow
@@ -1423,10 +1480,9 @@ void ClusterRenderer::finalizeUploads() {
           : (k <= 2) ? std::max(1u, total_clusters_all_meshes_ / 2u)
                      : total_clusters_all_meshes_;
         shadow_indirect_capacities_[k] = cascade_capacity;
-        shadow_indirect_draw_buffers_[k] = createIndirectSSBO(
-            device_,
-            cascade_capacity * 5 * sizeof(uint32_t));
-        shadow_draw_count_buffers_[k] = createCounterBuffer(device_);
+        ensureIndirectSSBO(device_, shadow_indirect_draw_buffers_[k],
+                           cascade_capacity * 5 * sizeof(uint32_t));
+        ensureCounterBuffer(device_, shadow_draw_count_buffers_[k]);
     }
 
     // ── Two-pass occlusion buffers ──────────────────────────────────────
@@ -1442,19 +1498,16 @@ void ClusterRenderer::finalizeUploads() {
         vis_word_count_ = (total_clusters_all_meshes_ + 31u) / 32u;
         vis_parity_     = 0;
         std::vector<uint32_t> zeros(vis_word_count_ * 2u, 0u);
-        visibility_bit_buffer_ = createSSBO(
-            device_,
-            vis_word_count_ * 2u * sizeof(uint32_t),
-            zeros.data());
+        ensureSSBO(device_, visibility_bit_buffer_,
+                   vis_word_count_ * 2u * sizeof(uint32_t), zeros.data());
     }
     // Phase A indirect output — same worst-case size as the single-pass
     // opaque buffer.  In steady state Phase A's count converges on the
     // visible-this-frame count, but we size for "all clusters were
     // visible last frame" to avoid overflow during teleport / cut events.
-    indirect_draw_buffer_phase_a_ = createIndirectSSBO(
-        device_,
-        total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
-    draw_count_buffer_phase_a_ = createCounterBuffer(device_);
+    ensureIndirectSSBO(device_, indirect_draw_buffer_phase_a_,
+                       total_clusters_all_meshes_ * 5 * sizeof(uint32_t));
+    ensureCounterBuffer(device_, draw_count_buffer_phase_a_);
 
     // Allocate (once — reused on re-finalize) and write descriptor set.
     if (!cull_desc_set_) {
@@ -1595,6 +1648,18 @@ void ClusterRenderer::finalizeUploads() {
         // the merged VB as an SSBO (cluster_bindless_shadow.mesh).  The
         // forward / G-buffer paths still bind it through VERTEX_BUFFER_BIT
         // via the input assembler.
+        const uint64_t vb_bytes =
+            total_merged_vertices_ * sizeof(BindlessVertex);
+        if (reuseOrRelease(device_, merged_vertex_buffer_, vb_bytes)) {
+            // Re-finalize with a similar-sized set: refresh in place
+            // (staged copy) instead of leaking the old ~90 MB buffer,
+            // which is what the plain overwrite below used to do on
+            // every kRtInstRebuildMoveM camera-move rebuild.
+            er::Helper::updateBufferWithSrcData(
+                device_, vb_bytes, staging_vertices_.data(),
+                merged_vertex_buffer_.buffer,
+                std::source_location::current());
+        } else {
         er::Helper::createBuffer(
             device_,
             SET_3_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT,
@@ -1604,8 +1669,9 @@ void ClusterRenderer::finalizeUploads() {
             merged_vertex_buffer_.buffer,
             merged_vertex_buffer_.memory,
             std::source_location::current(),
-            total_merged_vertices_ * sizeof(BindlessVertex),
+            vb_bytes,
             staging_vertices_.data());
+        }
     }
 
     if (total_merged_indices_ > 0) {
@@ -1617,6 +1683,13 @@ void ClusterRenderer::finalizeUploads() {
         // STORAGE_BUFFER_BIT for the mesh-shader shadow path (reads indices
         // as a plain uint[] SSBO and computes its own primitive emission)
         // and for the RT trace in deferred_resolve.comp.
+        const uint64_t ib_bytes = total_merged_indices_ * sizeof(uint32_t);
+        if (reuseOrRelease(device_, merged_index_buffer_, ib_bytes)) {
+            er::Helper::updateBufferWithSrcData(
+                device_, ib_bytes, staging_indices_.data(),
+                merged_index_buffer_.buffer,
+                std::source_location::current());
+        } else {
         er::Helper::createBuffer(
             device_,
             SET_3_FLAG_BITS(BufferUsage, INDEX_BUFFER_BIT,
@@ -1626,8 +1699,9 @@ void ClusterRenderer::finalizeUploads() {
             merged_index_buffer_.buffer,
             merged_index_buffer_.memory,
             std::source_location::current(),
-            total_merged_indices_ * sizeof(uint32_t),
+            ib_bytes,
             staging_indices_.data());
+        }
     }
 
     gpu_ready_ = true;
@@ -4814,6 +4888,24 @@ static renderer::BufferInfo createDeviceSSBO(
     return info;
 }
 
+// In-place reuse-or-recreate variant of createDeviceSSBO (see
+// reuseOrRelease): the RT shadow build re-runs on every camera-move
+// rebuild, and plain reassignment orphaned every previous buffer.
+static void ensureDeviceSSBO(const std::shared_ptr<er::Device>& device,
+                             renderer::BufferInfo& info,
+                             uint64_t size, const void* data,
+                             bool as_input = false) {
+    if (reuseOrRelease(device, info, size)) {
+        if (data) {
+            er::Helper::updateBufferWithSrcData(
+                device, size, data, info.buffer,
+                std::source_location::current());
+        }
+        return;
+    }
+    info = createDeviceSSBO(device, size, data, as_input);
+}
+
 void ClusterRenderer::buildRtShadowBvh() {
     rt_shadow_ready_ = false;
     if (staging_cull_infos_.empty() || total_clusters_all_meshes_ == 0) {
@@ -4901,10 +4993,11 @@ void ClusterRenderer::buildRtShadowBvh() {
     }
 
     rt_bvh_node_count_    = (uint32_t)nodes.size();
-    rt_bvh_nodes_buffer_  = createDeviceSSBO(
-        device_, nodes.size() * sizeof(glsl::RtBvhNode), nodes.data());
-    rt_bvh_leaves_buffer_ = createDeviceSSBO(
-        device_, leaf_indices.size() * sizeof(uint32_t), leaf_indices.data());
+    ensureDeviceSSBO(device_, rt_bvh_nodes_buffer_,
+                     nodes.size() * sizeof(glsl::RtBvhNode), nodes.data());
+    ensureDeviceSSBO(device_, rt_bvh_leaves_buffer_,
+                     leaf_indices.size() * sizeof(uint32_t),
+                     leaf_indices.data());
 
     // ── Packed position + UV SoA (binding 2) ─────────────────────────
     // The trace's inner loop is memory-bound on vertex fetches: the
@@ -4927,9 +5020,9 @@ void ClusterRenderer::buildRtShadowBvh() {
         }
         // as_input: also the vertex source of the hardware-RT BLAS
         // (positions at offset 0, stride 16 B, format R32G32B32_SFLOAT).
-        rt_pos_uv_buffer_ = createDeviceSSBO(
-            device_, pos_uv.size() * sizeof(glm::vec4), pos_uv.data(),
-            /*as_input*/ true);
+        ensureDeviceSSBO(device_, rt_pos_uv_buffer_,
+                         pos_uv.size() * sizeof(glm::vec4), pos_uv.data(),
+                         /*as_input*/ true);
     }
 
     // ── Device-local copies of the shared cluster buffers ────────────
@@ -4943,14 +5036,12 @@ void ClusterRenderer::buildRtShadowBvh() {
     // merged INDEX buffer has no CPU access after finalize and is now
     // DEVICE_LOCAL itself (see finalizeUploads), so the trace binds it
     // directly instead of a ~25 MiB rt_indices duplicate.
-    rt_cull_infos_buffer_ = createDeviceSSBO(
-        device_,
-        staging_cull_infos_.size() * sizeof(glsl::ClusterCullInfo),
-        staging_cull_infos_.data());
-    rt_draw_infos_buffer_ = createDeviceSSBO(
-        device_,
-        staging_draw_infos_.size() * sizeof(glsl::ClusterDrawInfo),
-        staging_draw_infos_.data());
+    ensureDeviceSSBO(device_, rt_cull_infos_buffer_,
+                     staging_cull_infos_.size() * sizeof(glsl::ClusterCullInfo),
+                     staging_cull_infos_.data());
+    ensureDeviceSSBO(device_, rt_draw_infos_buffer_,
+                     staging_draw_infos_.size() * sizeof(glsl::ClusterDrawInfo),
+                     staging_draw_infos_.data());
     {
         std::vector<glsl::BindlessMaterialParams> mat_fallback;
         const glsl::BindlessMaterialParams* mat_data =
@@ -4963,10 +5054,9 @@ void ClusterRenderer::buildRtShadowBvh() {
             mat_data = mat_fallback.data();
             mat_n    = 1;
         }
-        rt_materials_buffer_ = createDeviceSSBO(
-            device_,
-            mat_n * sizeof(glsl::BindlessMaterialParams),
-            mat_data);
+        ensureDeviceSSBO(device_, rt_materials_buffer_,
+                         mat_n * sizeof(glsl::BindlessMaterialParams),
+                         mat_data);
     }
 
     // ── COMPUTE-visible descriptor set: geometry + BVH + textures ────
@@ -5167,18 +5257,18 @@ void ClusterRenderer::buildHwRtShadowAs() {
     if (opaque_idx.empty())     opaque_idx.assign(3, 0u);
     if (opaque_tri_mat.empty()) opaque_tri_mat.assign(1, 0u);
 
-    hw_rt_opaque_index_buffer_ = createDeviceSSBO(
-        device_, opaque_idx.size() * sizeof(uint32_t), opaque_idx.data(),
-        /*as_input*/ true);
-    hw_rt_masked_index_buffer_ = createDeviceSSBO(
-        device_, masked_idx.size() * sizeof(uint32_t), masked_idx.data(),
-        /*as_input*/ true);
-    hw_rt_masked_tri_mat_buffer_ = createDeviceSSBO(
-        device_, masked_tri_mat.size() * sizeof(uint32_t),
-        masked_tri_mat.data());
-    hw_rt_opaque_tri_mat_buffer_ = createDeviceSSBO(
-        device_, opaque_tri_mat.size() * sizeof(uint32_t),
-        opaque_tri_mat.data());
+    ensureDeviceSSBO(device_, hw_rt_opaque_index_buffer_,
+                     opaque_idx.size() * sizeof(uint32_t),
+                     opaque_idx.data(), /*as_input*/ true);
+    ensureDeviceSSBO(device_, hw_rt_masked_index_buffer_,
+                     masked_idx.size() * sizeof(uint32_t),
+                     masked_idx.data(), /*as_input*/ true);
+    ensureDeviceSSBO(device_, hw_rt_masked_tri_mat_buffer_,
+                     masked_tri_mat.size() * sizeof(uint32_t),
+                     masked_tri_mat.data());
+    ensureDeviceSSBO(device_, hw_rt_opaque_tri_mat_buffer_,
+                     opaque_tri_mat.size() * sizeof(uint32_t),
+                     opaque_tri_mat.data());
 
     // ── 2. BLAS: geometry 0 = opaque, geometry 1 = alpha-masked ──────
     const auto vertex_addr = rt_pos_uv_buffer_.buffer->getDeviceAddress();
@@ -5232,6 +5322,12 @@ void ClusterRenderer::buildHwRtShadowAs() {
         er::AccelerationStructureBuildType::DEVICE_KHR,
         blas_info, blas_sizes);
 
+    // Reuse-or-release the ~100 MB BLAS backing store across rebuilds:
+    // the AS HANDLE was already destroyed above, but the backing buffer
+    // was overwritten and leaked on every camera-move rebuild.  An
+    // oversized backing buffer is legal (create-info size only has to
+    // fit), so the hysteresis keeps it while sizes drift.
+    if (!reuseOrRelease(device_, hw_rt_blas_buffer_, blas_sizes.as_size)) {
     device_->createBuffer(
         blas_sizes.as_size,
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
@@ -5241,6 +5337,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
         hw_rt_blas_buffer_.buffer,
         hw_rt_blas_buffer_.memory,
         std::source_location::current());
+    }
     hw_rt_blas_handle_ = device_->createAccelerationStructure(
         hw_rt_blas_buffer_.buffer,
         er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
@@ -5284,6 +5381,14 @@ void ClusterRenderer::buildHwRtShadowAs() {
         SET_FLAG_BIT(GeometryInstance, TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
     instance.acceleration_structure_reference = blas_addr;
 
+    // Reuse across rebuilds (fixed 64 B): recreating it every camera-
+    // move rebuild orphaned one buffer + one vkAllocateMemory object
+    // per rebuild.  The REFRESH is required either way — blas_addr
+    // changes whenever the BLAS backing store was recreated.
+    if (hw_rt_instance_buffer_.buffer) {
+        device_->updateBufferMemory(hw_rt_instance_buffer_.memory,
+                                    sizeof(instance), &instance);
+    } else {
     er::Helper::createBuffer(
         device_,
         SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
@@ -5297,6 +5402,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
         std::source_location::current(),
         sizeof(instance),
         &instance);
+    }
 
     // Cache the static instance's BLAS address — the per-frame skeleton
     // path (updateRtSkeletons) rebuilds the TLAS with static + skeleton
@@ -5329,6 +5435,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
         er::AccelerationStructureBuildType::DEVICE_KHR,
         tlas_info, tlas_sizes);
 
+    if (!reuseOrRelease(device_, hw_rt_tlas_buffer_, tlas_sizes.as_size)) {
     device_->createBuffer(
         tlas_sizes.as_size,
         SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
@@ -5338,6 +5445,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
         hw_rt_tlas_buffer_.buffer,
         hw_rt_tlas_buffer_.memory,
         std::source_location::current());
+    }
     hw_rt_tlas_handle_ = device_->createAccelerationStructure(
         hw_rt_tlas_buffer_.buffer,
         er::AccelerationStructureType::TOP_LEVEL_KHR);
@@ -5346,6 +5454,8 @@ void ClusterRenderer::buildHwRtShadowAs() {
     // it every frame for the static+skeleton TLAS rebuild (same 2-
     // instance geometry, so the size computed here always suffices).
     // It is a few KiB, not worth per-frame reallocation.
+    if (!reuseOrRelease(device_, hw_rt_tlas_scratch_buffer_,
+                        tlas_sizes.build_scratch_size)) {
     device_->createBuffer(
         tlas_sizes.build_scratch_size,
         SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
@@ -5355,6 +5465,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
         hw_rt_tlas_scratch_buffer_.buffer,
         hw_rt_tlas_scratch_buffer_.memory,
         std::source_location::current());
+    }
 
     tlas_info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
     tlas_info.dst_as = hw_rt_tlas_handle_;
@@ -5466,6 +5577,51 @@ void ClusterRenderer::writeRtSkeletonDescriptors() {
     device_->updateDescriptorSets(w);
 }
 
+// See the header doc: deferred destruction for buffers replaced on the
+// per-frame skeleton path, where an in-flight frame may still read the
+// old allocation.  ~3 ticks of latency is the "keep a buffer" cushion;
+// after that the memory is provably out of scope and released.
+void ClusterRenderer::retireBuffer(renderer::BufferInfo& info) {
+    if (info.buffer || info.memory) {
+        retired_buffers_.emplace_back(retire_tick_, info);
+        info = {};
+    }
+}
+
+// Same deferral for ACCELERATION STRUCTURE handles replaced on the
+// per-frame skeleton path: the in-flight frame's ray query may still
+// traverse the old AS via the previous TLAS, so destroying the handle
+// at record time is exactly the hazard the buffer ring exists to
+// avoid — retire it alongside its backing store.
+void ClusterRenderer::retireAs(renderer::AccelerationStructure& as) {
+    if (as) {
+        retired_as_.emplace_back(retire_tick_, as);
+        as = {};
+    }
+}
+
+void ClusterRenderer::flushRetiredBuffers(bool force) {
+    ++retire_tick_;
+    size_t kept = 0;
+    for (auto& e : retired_buffers_) {
+        if (!force && e.first + 3u >= retire_tick_) {
+            retired_buffers_[kept++] = e;      // still potentially in flight
+        } else {
+            e.second.destroy(device_);
+        }
+    }
+    retired_buffers_.resize(kept);
+    kept = 0;
+    for (auto& e : retired_as_) {
+        if (!force && e.first + 3u >= retire_tick_) {
+            retired_as_[kept++] = e;
+        } else {
+            device_->destroyAccelerationStructure(e.second);
+        }
+    }
+    retired_as_.resize(kept);
+}
+
 void ClusterRenderer::updateRtSkeletons(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const std::vector<RtSkeletonFrameData>& skeletons) {
@@ -5474,6 +5630,8 @@ void ClusterRenderer::updateRtSkeletons(
         !rt_skel_header_buffer_.buffer) {
         return;
     }
+    // Age out buffers retired on previous ticks (grow paths below).
+    flushRetiredBuffers();
 
     // ── 0. Change detection ───────────────────────────────────────────
     // Pose = model matrix + joint matrices.  If every skeleton's pose
@@ -5629,7 +5787,7 @@ void ClusterRenderer::updateRtSkeletons(
         if (need_elems <= cap_elems && buf.buffer) return false;
         uint32_t new_cap = std::max(cap_elems, 256u);
         while (new_cap < need_elems) new_cap *= 2u;
-        buf = {};
+        retireBuffer(buf);   // deferred: last frame may still read it
         er::Helper::createBuffer(
             device_,
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
@@ -5714,10 +5872,9 @@ void ClusterRenderer::updateRtSkeletons(
     // (Re)create the skeleton BLAS when the triangle budget grows.
     if (has_skels &&
         (skel_tris > hw_rt_skel_blas_tri_cap_ || !hw_rt_skel_blas_handle_)) {
-        if (hw_rt_skel_blas_handle_) {
-            device_->destroyAccelerationStructure(hw_rt_skel_blas_handle_);
-            hw_rt_skel_blas_handle_ = {};
-        }
+        // Deferred (in-flight): frame N-1's ray query may still hold
+        // this BLAS through the previous TLAS.
+        retireAs(hw_rt_skel_blas_handle_);
         uint32_t tri_cap = std::max(1024u, hw_rt_skel_blas_tri_cap_);
         while (tri_cap < skel_tris) tri_cap *= 2u;
 
@@ -5750,7 +5907,7 @@ void ClusterRenderer::updateRtSkeletons(
         device_->getAccelerationStructureBuildSizes(
             er::AccelerationStructureBuildType::DEVICE_KHR, info, sz);
 
-        hw_rt_skel_blas_buffer_ = {};
+        retireBuffer(hw_rt_skel_blas_buffer_);   // deferred (in-flight)
         device_->createBuffer(
             sz.as_size,
             SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
@@ -5763,7 +5920,7 @@ void ClusterRenderer::updateRtSkeletons(
         hw_rt_skel_blas_handle_ = device_->createAccelerationStructure(
             hw_rt_skel_blas_buffer_.buffer,
             er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
-        hw_rt_skel_blas_scratch_ = {};
+        retireBuffer(hw_rt_skel_blas_scratch_);  // deferred (in-flight)
         device_->createBuffer(
             sz.build_scratch_size,
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
@@ -5912,6 +6069,8 @@ void ClusterRenderer::updateRtSkeletons(
 }
 
 void ClusterRenderer::destroy() {
+    // Drain the deferred-retirement list before member teardown.
+    flushRetiredBuffers(/*force*/ true);
     bindless_pipeline_.reset();
     bindless_translucent_pipeline_.reset();
     bindless_translucent_oit_pipeline_.reset();

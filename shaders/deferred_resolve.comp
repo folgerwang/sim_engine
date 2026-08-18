@@ -599,7 +599,20 @@ const float RT_GI_MAX_DIST    = 120.0;  // bounce interval; sky beyond
 const float RT_GI_NORMAL_BIAS = 0.05;   // metres off the surface
 const float RT_GI_TEX_LOD     = 4.0;    // prefiltered albedo fetch
 const float RT_GI_SKY_LEAK    = 0.35;   // hit surface's own ambient
-const float RT_GI_HIST_MAX    = 24.0;   // temporal history clamp
+// Temporal history clamp.  1/RT_GI_HIST_MAX is the minimum blend factor
+// of the fresh sample, so the effective history weight is capped at
+// 1 - 1/16 = 0.9375 — inside the ~0.90-0.95 band where lighting changes
+// still land within a third of a second.  Was 24 (0.958): visibly laggy
+// ("temporal of ray tracing very noticeable") whenever the sun or the
+// camera moved.
+const float RT_GI_HIST_MAX    = 16.0;
+// Disocclusion rejection threshold: relative linear-depth mismatch
+// between the reprojected history texel's stored depth and this pixel's
+// depth above which the history belongs to a DIFFERENT surface (edge
+// revealed by camera/object motion) and must be dropped.  10% tolerates
+// normal forward camera motion between frames while still catching
+// foreground/background swaps, which are always a large depth jump.
+const float RT_GI_DEPTH_REJECT = 0.10;
 
 // Möller–Trumbore with the hit DISTANCE returned (rtRayTri drops it —
 // any-hit callers never need it, this closest-hit walk does).
@@ -956,12 +969,38 @@ vec3 restirDirectLighting(ivec2 px, ivec2 sz, vec2 uv,
                 !isnan(prev.target_pdf) && !isinf(prev.target_pdf) &&
                 prev.target_pdf > 0.0;
             if (valid) {
-                p_m = min(p_m, RESTIR_M_CLAMP * max(m_initial, 1.0));
-                float prev_W = prev.w_sum / max(p_m * prev.target_pdf, 1e-6);
+                // Unbiased W of the previous reservoir MUST use its
+                // honest stored M.  The old code divided w_sum by the
+                // CLAMPED M and then multiplied the clamped M back in,
+                // so the merge weight collapsed to
+                // p_hat_now * w_sum / target_pdf — i.e. the M clamp
+                // cancelled out entirely and the history's weight
+                // (w_sum, which grows every frame) entered the merge
+                // UNBOUNDED: lighting changes took ever longer to
+                // surface the longer a pixel had been on screen.
+                float prev_W =
+                    prev.w_sum / max(p_m * prev.target_pdf, 1e-6);
                 vec3  p_dirv = restirOctDecodeDir(prev.dir_oct);
                 float p_hat_now = restirLuma(restirEvalSample(
                     p_id, p_dirv, world_pos, N, albedo, V,
                     ray_dir, ray_tmax));
+                // History clamp — NOW effective, because w below scales
+                // linearly with the clamped p_m.  20 x the per-frame
+                // candidate count keeps the fresh candidates at ~5% of
+                // the merged mass (blend ~0.95).
+                p_m = min(p_m, RESTIR_M_CLAMP * max(m_initial, 1.0));
+                // Disocclusion / light-change rejection.  The reservoir
+                // stores no geometry, but target_pdf is the winner's
+                // p-hat AT THE SURFACE THAT WROTE IT: re-evaluating the
+                // same sample at THIS pixel (p_hat_now) differing by
+                // more than 4x means the reprojection landed on a
+                // different surface (normal/albedo changed) or the light
+                // itself changed — either way the history is stale, so
+                // collapse it to one frame's worth instead of letting it
+                // outvote the fresh candidates.
+                float phat_ratio = p_hat_now / max(prev.target_pdf, 1e-6);
+                if (phat_ratio < 0.25 || phat_ratio > 4.0)
+                    p_m = min(p_m, max(m_initial, 1.0));
                 float w = p_hat_now * prev_W * p_m;
                 if (w > 0.0) {
                     restirUpdate(r_id, r_dir, r_wsum, r_m, r_phat,
@@ -1642,6 +1681,12 @@ void main() {
     // buffer, ReSTIR-style parity ping-pong) so 1 spp converges.
     vec3 ambient_diffuse =
         getIBLRadianceLambertian(N, c_diff) * (ao * rt_ao);
+    // Traced sky visibility for the OTHER ambient terms (specular IBL).
+    // 1.0 when RT GI is off (flat-IBL behaviour unchanged); under RT GI
+    // it becomes the ratio of the traced irradiance estimate to the flat
+    // "full open sky" lambertian estimate at the same normal — ~1 in the
+    // open, ~0 inside an enclosed room, in between at windows/doorways.
+    float traced_sky_vis = 1.0;
     if ((camera_info.input_features & FEATURE_INPUT_RT_GI) != 0u) {
         uint  gi_w    = uint(sz.x);
         uint  gi_half = uint(sz.x) * uint(sz.y);
@@ -1677,6 +1722,21 @@ void main() {
         }
 
         // Temporal accumulation with velocity reprojection.
+        //
+        // Disocclusion rejection: the reprojected texel can belong to a
+        // DIFFERENT surface (an edge revealed by camera/object motion),
+        // and blending 90%+ of a wrong-surface history is exactly the
+        // ghost trail the accumulation used to smear across depth edges.
+        // The accumulator's .w now packs (history, linear view depth) as
+        // 2x16-bit halves; history survives only when the stored depth
+        // matches this pixel's depth within RT_GI_DEPTH_REJECT — else we
+        // fall back to the fresh 1-spp sample (hist = 1).  Old-format /
+        // zero-cleared texels unpack to history 0 and self-reject, so no
+        // buffer versioning is needed.  Vulkan [0,1] perspective:
+        // linZ = b / (a + z), a/b prestashed in depth_params (see the
+        // SSRT + Hi-Z paths above).
+        float view_lin_z =
+            camera_info.depth_params.y / (camera_info.depth_params.x + z);
         vec3  gi_E  = gi_s;
         float hist  = 1.0;
         vec2  uv_prev = uv - texture(gbuf_velocity, uv).rg * 0.5;
@@ -1685,23 +1745,53 @@ void main() {
             ivec2 pp = clamp(ivec2(uv_prev * vec2(sz)),
                              ivec2(0), sz - 1);
             vec4 prev = gi_accum[gi_rofs + uint(pp.y) * gi_w + uint(pp.x)];
-            if (prev.w > 0.5) {
-                hist = min(prev.w + 1.0, RT_GI_HIST_MAX);
+            vec2 prev_hd = unpackHalf2x16(floatBitsToUint(prev.w));
+            bool same_surface =
+                prev_hd.x > 0.5 &&
+                abs(prev_hd.y - view_lin_z) <=
+                    RT_GI_DEPTH_REJECT * max(view_lin_z, 1e-3);
+            if (same_surface) {
+                hist = min(prev_hd.x + 1.0, RT_GI_HIST_MAX);
                 gi_E = mix(prev.rgb, gi_s, 1.0 / hist);
             }
         }
+        // Depth clamped under half-float max so far-field pixels never
+        // pack to +inf (which would poison the compare next frame).
         gi_accum[gi_wofs + uint(px.y) * gi_w + uint(px.x)] =
-            vec4(gi_E, hist);
+            vec4(gi_E, uintBitsToFloat(packHalf2x16(
+                vec2(hist, min(view_lin_z, 65000.0)))));
         // Cosine-sampled estimator: E[L(dir)] IS irradiance/PI, so the
         // diffuse ambient is simply c_diff * estimate.  Micro-AO from
         // the G-buffer still applies; rt_ao does NOT (the trace already
         // measured the occlusion rt_ao approximates).
         ambient_diffuse = c_diff * gi_E * ao;
+
+        // Derive the sky-visibility scale for the specular IBL from the
+        // SAME traced result: luma(traced estimate) / luma(flat-sky
+        // estimate at N).  Enclosed pixels (gi_E ~ 0 while the cube says
+        // "full sky") drive this to 0; open pixels to ~1; bounce-lit
+        // pixels can exceed the flat estimate, hence the clamp.  This
+        // reuses the accumulated gi_E, so the scale is temporally smooth
+        // for free — no extra rays.
+        vec3 flat_sky = texture(lambertian_env_sampler, N).rgb;
+#ifndef USE_HDR
+        flat_sky = sRGBToLinear(flat_sky);
+#endif
+        traced_sky_vis = clamp(
+            restirLuma(gi_E) / max(restirLuma(flat_sky), 1e-4), 0.0, 1.0);
     }
 
+    // Specular (GGX) IBL was the last UNGATED enclosed-pixel light term:
+    // rt_ao is 1.0 whenever RT AO is toggled off, and even when on its
+    // 2 m hemisphere rays read most of a room-sized interior as "open" —
+    // either way the environment cube delivered full skylight to fully
+    // enclosed pixels, which is why closed interiors rendered as bright
+    // as outdoors.  Scale it by the traced sky visibility so it follows
+    // the same architecture the GI diffuse uses: dark inside, lit at
+    // real openings.
     vec3 ambient = ambient_diffuse +
         getIBLRadianceGGX(N, V, perceptual_rough, f0, kIblMipCount) *
-            (ao * rt_ao);
+            (ao * rt_ao * traced_sky_vis);
 
     vec3 diffuse = restir_active
         ? restir_direct

@@ -523,6 +523,25 @@ private:
     uint32_t rt_skel_idx_cap_   = 0;
     renderer::BufferInfo hw_rt_skel_blas_buffer_;
     renderer::BufferInfo hw_rt_skel_blas_scratch_;
+    // ── Deferred buffer retirement (per-frame rebuild paths) ─────────
+    // The skeleton BLAS/scratch/vertex buffers grow on the PER-FRAME
+    // updateRtSkeletons path, where the previous allocation may still
+    // be referenced by an in-flight frame — destroying it immediately
+    // would free memory the GPU is reading (the old `buf = {};` code
+    // "solved" that by leaking the buffer outright).  retireBuffer
+    // parks the old allocation with the current tick; entries are
+    // destroyed once they are kMaxFramesInFlight+1 ticks old, i.e.
+    // provably out of scope, keeping at most a frame or two of spare
+    // buffers around as the get-back cushion.
+    std::vector<std::pair<uint64_t, renderer::BufferInfo>> retired_buffers_;
+    // AS handles replaced on the per-frame skeleton path ride the same
+    // ring — the old AS is still traversable by the in-flight frame.
+    std::vector<std::pair<uint64_t, renderer::AccelerationStructure>>
+        retired_as_;
+    uint64_t retire_tick_ = 0;
+    void retireBuffer(renderer::BufferInfo& info);
+    void retireAs(renderer::AccelerationStructure& as);
+    void flushRetiredBuffers(bool force = false);
     renderer::AccelerationStructure hw_rt_skel_blas_handle_{};
     uint32_t hw_rt_skel_blas_tri_cap_ = 0;  // BLAS sized for this many tris
     renderer::BufferInfo hw_rt_frame_instance_buffer_;  // TLAS rebuild input
