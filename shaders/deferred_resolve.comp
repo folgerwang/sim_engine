@@ -638,6 +638,19 @@ const float RT_GI_HIST_MAX    = 16.0;
 // normal forward camera motion between frames while still catching
 // foreground/background swaps, which are always a large depth jump.
 const float RT_GI_DEPTH_REJECT = 0.10;
+// ── Indirect-diffuse FLOOR ──────────────────────────────────────────
+// Minimum fraction of the unoccluded sky irradiance that a deferred
+// pixel keeps, no matter what the tracer returns.  This is a safety
+// net, not a lighting model: a 1-spp estimator that returns ~0 on a
+// surface which is plainly open to the sky is reporting a failure (a
+// bad launch normal, a ray that started inside geometry, an
+// acceleration structure that does not contain what the raster pass
+// drew), and the honest response to a failed estimate is to fall back
+// toward the value we know is an upper bound, not to paint the surface
+// black.  0.30 keeps real occlusion contrast — a closed interior still
+// reads much darker than open ground — while making pure black
+// impossible.  Set to 0.0 to see the raw estimator again.
+const float RT_GI_AMBIENT_FLOOR = 0.30;
 
 // ═════════════════════════════════════════════════════════════════════
 //  SCREEN-PROBE GI  (Lumen-style screen probe gather)
@@ -813,6 +826,60 @@ vec3 giShIrradiance(vec3 c[9], vec3 n) {
 // rather than "the room glows".
 const float RT_GI_BOUNCE_GAIN = 0.70;
 
+// ── Second bounce, per-pixel variant: temporal feedback ─────────────
+// The screen-probe cache below is not the only radiance cache in this
+// shader.  The PER-PIXEL estimator already keeps `gi_accum`: one
+// temporally-accumulated irradiance/PI per pixel, exactly the quantity
+// a ray hit needs for "how much indirect light arrives here".  So a GI
+// ray that lands on a surface which was ON SCREEN last frame can simply
+// read that pixel's accumulated value — multi-bounce for ZERO extra
+// rays, on the estimator that is actually the default.
+//
+// Why the surface normal is not a problem: the depth test below accepts
+// only when the reprojected pixel's stored linear depth matches the
+// hit's, i.e. that screen pixel IS the surface point the ray hit.  Its
+// accumulated irradiance was therefore integrated over that same
+// surface's hemisphere with that same normal, by construction.
+//
+// clip.w of a standard perspective projection IS linear view depth, so
+// the hit's previous-frame depth comes free with the reprojection.
+//
+// Convergence: steady state solves E = E_1 + gain*albedo*E, so with
+// gain 0.7 and albedo <= 1 the series is bounded at 3.3x the first
+// bounce.  No clamp needed.
+bool giTemporalSecondBounce(vec3 wp, out vec3 o_E) {
+    o_E = vec3(0.0);
+    if ((camera_info.input_features & FEATURE_INPUT_GI_MULTI_BOUNCE) == 0u)
+        return false;
+
+    vec4 clip = camera_info.prev_view_proj * vec4(wp, 1.0);
+    if (clip.w <= 1e-4) return false;                    // behind camera
+    vec2 uv = (clip.xy / clip.w) * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) ||
+        any(greaterThanEqual(uv, vec2(1.0)))) return false;
+
+    ivec2 sz = imageSize(hdr_out);
+    ivec2 p  = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1);
+    // Same ping-pong convention as the per-pixel accumulator: read the
+    // half the CURRENT frame is not writing.
+    uint gi_half = uint(sz.x) * uint(sz.y);
+    bool gi_par  = (camera_info.input_features &
+                    FEATURE_INPUT_RESTIR_PARITY) != 0u;
+    uint gi_rofs = gi_par ? 0u : gi_half;
+
+    vec4 prev    = gi_accum[gi_rofs + uint(p.y) * uint(sz.x) + uint(p.x)];
+    vec2 prev_hd = unpackHalf2x16(floatBitsToUint(prev.w));
+    // prev_hd = (history, stored linear view depth).  History 0 means
+    // never written / zero-cleared, and self-rejects.
+    if (prev_hd.x <= 0.5) return false;
+    float hit_lin_z = clip.w;
+    if (abs(prev_hd.y - hit_lin_z) >
+        RT_GI_DEPTH_REJECT * max(hit_lin_z, 1e-3)) return false;
+
+    o_E = prev.rgb;
+    return true;
+}
+
 bool giProbeSecondBounce(vec3 wp, vec3 n, out vec3 o_E) {
     o_E = vec3(0.0);
     if ((camera_info.input_features & FEATURE_INPUT_GI_SCREEN_PROBE) == 0u)
@@ -870,6 +937,16 @@ bool giProbeSecondBounce(vec3 wp, vec3 n, out vec3 o_E) {
     if (wsum <= 1e-5) return false;
     o_E = sum / wsum;
     return true;
+}
+
+// Whichever radiance cache this frame actually has.  The screen probes
+// carry direction (SH), so they win when they are running; otherwise the
+// per-pixel accumulator's temporal feedback covers the default path.
+// Both fail closed, and the caller keeps the flat sky leak.
+bool giSecondBounce(vec3 wp, vec3 n, out vec3 o_E) {
+    if ((camera_info.input_features & FEATURE_INPUT_GI_SCREEN_PROBE) != 0u)
+        return giProbeSecondBounce(wp, n, o_E);
+    return giTemporalSecondBounce(wp, o_E);
 }
 
 // Möller–Trumbore with the hit DISTANCE returned (rtRayTri drops it —
@@ -998,7 +1075,7 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
     // without it (or off-screen) it falls back to the flat sky leak this
     // estimator has always used.
     vec3 hit_amb;
-    if (giProbeSecondBounce(hp, hn, hit_amb)) {
+    if (giSecondBounce(hp, hn, hit_amb)) {
         hit_amb *= RT_GI_BOUNCE_GAIN;
     } else {
         vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
@@ -1490,7 +1567,7 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
     // reading cluster streams the skeleton BLAS has no entries in.
     if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) != 0) {
         vec3 amb;
-        if (giProbeSecondBounce(hp, -rd, amb)) {
+        if (giSecondBounce(hp, -rd, amb)) {
             amb *= RT_GI_BOUNCE_GAIN;
         } else {
             vec3 sky_amb = texture(lambertian_env_sampler, -rd).rgb;
@@ -1545,7 +1622,7 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         : 0.0;
     // Second bounce out of the screen-probe cache (see rtGiRadiance).
     vec3 hit_amb;
-    if (giProbeSecondBounce(hp, hn, hit_amb)) {
+    if (giSecondBounce(hp, hn, hit_amb)) {
         hit_amb *= RT_GI_BOUNCE_GAIN;
     } else {
         vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
@@ -2378,6 +2455,25 @@ void main() {
     vec3 world_pos = world_h.xyz / world_h.w;
 
     vec3 V = normalize(camera_info.position - world_pos);
+
+    // ── Face-forward the G-buffer normals ────────────────────────────
+    // A VISIBLE opaque fragment cannot have its geometric normal
+    // pointing away from the camera: if it does, the normal is
+    // inverted (wrong winding, a two-sided wall slab whose back face
+    // won the depth test, a mirrored instance transform).  This matters
+    // far more than it sounds, because N_geom is what launches every RT
+    // GI ray: an inverted normal starts the ray BEHIND the surface and
+    // fires the whole cosine hemisphere INTO the object, so every
+    // sample hits interior geometry and the estimator returns ~0.  That
+    // is a white wall shading pure black while its forward-rendered
+    // trim beside it looks correct — which is exactly the symptom this
+    // was found from.  One dot product; correct for single- and
+    // double-sided geometry alike.
+    if (dot(N_geom, V) < 0.0) {
+        N_geom = -N_geom;
+        if (dot(N, V) < 0.0) N = -N;
+    }
+
     vec3 L = normalize(-runtime_lights.lights[0].direction);
     vec3 light_col = runtime_lights.lights[0].color *
                      runtime_lights.lights[0].intensity;
@@ -2497,14 +2593,25 @@ void main() {
     // only where sky is actually visible, sunlit bounce colour where
     // it is not, temporally accumulated (reprojected by the velocity
     // buffer, ReSTIR-style parity ping-pong) so 1 spp converges.
-    vec3 ambient_diffuse =
-        getIBLRadianceLambertian(N, c_diff) * (ao * rt_ao);
+    // Unoccluded sky irradiance at this normal — both the no-GI value
+    // and, scaled by RT_GI_AMBIENT_FLOOR below, the floor under every
+    // traced estimate.
+    vec3 ambient_flat    = getIBLRadianceLambertian(N, c_diff) * ao;
+    vec3 ambient_diffuse = ambient_flat * rt_ao;
     // Traced sky visibility for the OTHER ambient terms (specular IBL).
     // 1.0 when RT GI is off (flat-IBL behaviour unchanged); under RT GI
     // it becomes the ratio of the traced irradiance estimate to the flat
     // "full open sky" lambertian estimate at the same normal — ~1 in the
     // open, ~0 inside an enclosed room, in between at windows/doorways.
     float traced_sky_vis = 1.0;
+    // Raw estimate kept aside for DEBUG_RENDER_MODE_INDIRECT.  Seeded
+    // with the flat-IBL value so the view still reads correctly when RT
+    // GI is off entirely.
+    vec3 gi_debug_E = texture(lambertian_env_sampler, N).rgb;
+#ifndef USE_HDR
+    gi_debug_E = sRGBToLinear(gi_debug_E);
+#endif
+    gi_debug_E *= (ao * rt_ao);
     if ((camera_info.input_features &
          (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) ==
         (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) {
@@ -2519,6 +2626,7 @@ void main() {
             camera_info.depth_params.y / (camera_info.depth_params.x + z);
         vec3 gi_E;
         if (giProbeGather(px, sz, world_pos, N_geom, N, view_lin_z, gi_E)) {
+            gi_debug_E      = gi_E;
             ambient_diffuse = c_diff * gi_E * ao;
             vec3 flat_sky = texture(lambertian_env_sampler, N).rgb;
 #ifndef USE_HDR
@@ -2607,6 +2715,7 @@ void main() {
         // diffuse ambient is simply c_diff * estimate.  Micro-AO from
         // the G-buffer still applies; rt_ao does NOT (the trace already
         // measured the occlusion rt_ao approximates).
+        gi_debug_E = gi_E;
         ambient_diffuse = c_diff * gi_E * ao;
 
         // Derive the sky-visibility scale for the specular IBL from the
@@ -2632,6 +2741,31 @@ void main() {
     // as outdoors.  Scale it by the traced sky visibility so it follows
     // the same architecture the GI diffuse uses: dark inside, lit at
     // real openings.
+    // ── Floor the traced estimate ────────────────────────────────────
+    // See RT_GI_AMBIENT_FLOOR.  A no-op when GI is off (the flat value
+    // is already above its own fraction) and a no-op wherever the
+    // tracer returns a healthy estimate; it only catches the pixels the
+    // estimator gave up on.  traced_sky_vis is floored with it so the
+    // specular IBL cannot be driven to zero on the same pixels either.
+    ambient_diffuse = max(ambient_diffuse,
+                          ambient_flat * RT_GI_AMBIENT_FLOOR);
+    traced_sky_vis  = max(traced_sky_vis, RT_GI_AMBIENT_FLOOR);
+
+    // ── DEBUG: raw indirect diffuse, albedo NOT applied ──────────────
+    // Answers the one question a black wall cannot answer by itself:
+    // is no light arriving, or is the material dark?  Bright here means
+    // the GI estimator is working and the surface is simply dark;
+    // black here means the bounce path is delivering nothing.
+    {
+        uint dbg_gi =
+            (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+                >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+        if (dbg_gi == DEBUG_RENDER_MODE_INDIRECT && rpc.pass_mode != 1u) {
+            imageStore(hdr_out, px, vec4(sceneTonemap(gi_debug_E), 1.0));
+            return;
+        }
+    }
+
     vec3 ambient = ambient_diffuse +
         getIBLRadianceGGX(N, V, perceptual_rough, f0, kIblMipCount) *
             (ao * rt_ao * traced_sky_vis);

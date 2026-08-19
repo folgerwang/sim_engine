@@ -2292,6 +2292,18 @@ bool Menu::draw(
                     gi_screen_probe_ = !gi_screen_probe_;
                 }
 
+                // Multi-bounce GI. ON (default): a GI ray's hit point
+                // reads last frame's accumulated irradiance at that
+                // surface instead of a flat sky constant, so light
+                // bounces more than once — for zero extra rays. OFF:
+                // single bounce, the original constant sky leak.  This
+                // is the toggle that decides whether a wall in shadow
+                // picks up colour from the sunlit ground in front of it.
+                if (ImGui::MenuItem("Multi-bounce GI (temporal feedback)",
+                                    NULL, gi_multi_bounce_)) {
+                    gi_multi_bounce_ = !gi_multi_bounce_;
+                }
+
                 // CSM silhouette prepass — see the member field comment in
                 // menu.h and csm_silhouette_prepass.mesh's header.  Off →
                 // the shadow pass clears depth to 1.0 (legacy) and skips
@@ -9380,6 +9392,10 @@ void Menu::drawRenderDebugMenuContent() {
         { 14, "14: Object ID (per mesh)"   },
         { 15, "15: Weight sum (skin)"      },
         { 16, "16: Render path (fwd/deferred)"},
+        // Raw indirect diffuse WITHOUT albedo — separates "no light is
+        // arriving" from "the material is dark", which final-shaded
+        // pixels cannot distinguish.  Deferred pixels only.
+        { 17, "17: Indirect diffuse (GI)"  },
     };
     for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
         const auto& item = kRenderDebugItems[i];

@@ -265,6 +265,12 @@ class Menu {
     // yet as temporally stable as the per-pixel one, so plain ray-traced
     // GI stays the shipping default and the probe gather is opt-in.
     bool gi_screen_probe_ = false;
+    // Multi-bounce GI by temporal feedback: a GI ray's hit point reads
+    // last frame's accumulated irradiance there instead of a flat sky
+    // constant, so the bounce series converges to multi-bounce at zero
+    // extra ray cost.  Works with EITHER estimator.  Default ON — this
+    // is what makes a wall in shadow pick up light from the ground.
+    bool gi_multi_bounce_ = true;
     // Rendering > Shadow > Shadow technique.  Both raytraced variants
     // skip the CSM render pass entirely and shade only deferred
     // (cluster) pixels — forward-lit pixels render unshadowed while
@@ -2030,6 +2036,11 @@ public:
     // comment above and the SCREEN-PROBE GI block in
     // deferred_resolve.comp.
     inline bool isGiScreenProbeOn() const { return gi_screen_probe_; }
+
+    // Rendering > Shadow > "Multi-bounce GI (temporal feedback)".  See
+    // the member comment above and giTemporalSecondBounce() in
+    // deferred_resolve.comp.
+    inline bool isGiMultiBounceOn() const { return gi_multi_bounce_; }
 
     // Current selected CSM drawable-shadow draw-mode (see enum comment above).
     inline CsmDrawMode getCsmDrawMode() const { return csm_draw_mode_; }

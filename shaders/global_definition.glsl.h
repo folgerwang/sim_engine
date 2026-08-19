@@ -322,6 +322,16 @@
 // rather than single-bounce.  See the SCREEN-PROBE GI block and
 // giProbeSecondBounce() in deferred_resolve.comp.
 #define FEATURE_INPUT_GI_SCREEN_PROBE           0x00002000
+// Multi-bounce GI by TEMPORAL FEEDBACK.  Costs no extra rays: a GI ray
+// that lands on a surface which was on screen last frame reads that
+// pixel's accumulated irradiance out of gi_accum and uses it as the
+// indirect light arriving at the hit, instead of the flat
+// RT_GI_SKY_LEAK constant.  Because each frame's accumulation feeds the
+// next frame's rays, the series converges to multi-bounce GI (bounded
+// at ~3.3x the first bounce by RT_GI_BOUNCE_GAIN).  Only meaningful
+// alongside FEATURE_INPUT_RT_GI.  See giTemporalSecondBounce() in
+// deferred_resolve.comp.
+#define FEATURE_INPUT_GI_MULTI_BOUNCE           0x00004000
 // Reservoir ping-pong parity for the current frame: 0 → read half A / write
 // half B, 1 → the reverse.  Flipped by the app each frame.
 #define FEATURE_INPUT_RESTIR_PARITY             0x00000200
@@ -471,6 +481,15 @@
 // visits every pixel and already knows the sentinel, so no forward
 // shader needed a debug branch added to it.
 #define DEBUG_RENDER_MODE_RENDER_PATH           16
+// Raw INDIRECT DIFFUSE estimate (irradiance / PI), before albedo is
+// applied.  The point of leaving albedo out: a wall that renders black
+// is either receiving no light or made of near-black material, and
+// those need opposite fixes.  This view answers that directly — bright
+// here + black on screen means the material is dark; black here means
+// the GI estimator is delivering nothing and the bounce path is the
+// problem.  Deferred pixels only (forward pixels have no G-buffer to
+// estimate from and stay untouched).
+#define DEBUG_RENDER_MODE_INDIRECT              17
 
 #define LIGHT_COUNT                             1
 // 6 cascades (was 4): smaller extent ratio between adjacent cascades
