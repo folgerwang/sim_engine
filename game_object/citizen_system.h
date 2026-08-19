@@ -22,13 +22,15 @@
 // colour/depth buffers in a LOAD-op dynamic-rendering pass right after
 // the terrain tiles — depth-tested against the world, tonemapped with
 // the shared scene curve.  Citizens are DELIBERATELY absent from the
-// shadow/RT paths: they are gameplay markers, and 140 x 7 animated
-// boxes in a TLAS rebuilt per frame is exactly the cost this engine
-// spent the week avoiding.
+// shadow/RT paths: they are gameplay markers, and thousands of
+// 7-box figures in a TLAS rebuilt per frame is exactly the cost this
+// engine spent the week avoiding.
 
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "renderer/renderer.h"
@@ -113,6 +115,17 @@ private:
     };
     struct Person {
         int   house = 0;
+        int   slot = 0;                // index among this destination's
+                                       // residents — their standing spot
+        int   shop_b = -1;             // errand shop, when it differs
+        int   shop_slot = 0;           // and their standing spot THERE:
+                                       // slot is an index at the PRIMARY
+                                       // destination and means nothing
+                                       // at another building
+        int   hslot = 0;               // index within their household,
+        int   hcount = 1;              // and how many share the house —
+                                       // packs a family apart at home
+                                       // the same way slot does at work
         int   duty = 0;                // Duty enum
         float height = 1.7f;
         float bulk = 1.0f;             // width factor from body status
@@ -133,6 +146,11 @@ private:
         // widen it with their headcount so a cell's whole workforce
         // does not stack inside one doorway.
         float spread = 6.0f;
+        // How many residents report here.  With the slot index below it
+        // turns the arrival scatter from a random jitter box (where six
+        // people routinely land on top of one another) into an even
+        // packing.
+        int   headcount = 1;
     };
     struct SimState {                   // per-person, ALWAYS ticking
         glm::vec3 pos{0.0f};
@@ -148,8 +166,10 @@ private:
         return (isWeekend() && !p.works_weekend && !p.weekend.empty())
                    ? p.weekend : p.weekday;
     }
-    // Fallback population: ONE resident per house, synthesized from the
-    // world manifest alone.  The city json (city_sim.py) is optional —
+    // Fallback population: a HOUSEHOLD of 3-5 per house, synthesized
+    // from the world manifest alone.  Household size is drawn per house
+    // and the seats read as a family (earner, second adult, students),
+    // so a town's population is house_count x 3 .. house_count x 5.  The city json (city_sim.py) is optional —
     // it only exists for maps that got a civic district, and without it
     // every house used to stand empty (loadCity returned false and the
     // whole system went inert, which is the "where are the people?"
@@ -159,6 +179,19 @@ private:
     // rendering — is the same code path.
     void synthesizeResidents();
     glm::vec3 placePos(const Person& p, const Step& s, int pid) const;
+
+    // ── Walking around buildings ─────────────────────────────────────
+    // Citizens walked the straight line between anchors, which took
+    // them clean through their neighbours' houses.  There is no nav
+    // mesh here (and ~230k agents could not afford one), so this is local
+    // steering: houses are treated as discs in a coarse spatial hash,
+    // and a walker whose next step would enter one slides along its
+    // tangent instead.  `exempt_*` are the buildings they are allowed
+    // to be inside — their own home, and wherever they are heading.
+    void buildHouseGrid();
+    glm::vec2 steerAroundHouses(const glm::vec2& pos, const glm::vec2& dir,
+                                int exempt_house, int exempt_dest) const;
+    std::unordered_map<uint64_t, std::vector<int>> house_grid_;
     int currentStep(const std::vector<Step>& sched, float tod) const;
     void emitPerson(int pid, const SimState& a, const Person& p,
                     bool detailed);
@@ -178,6 +211,7 @@ private:
     std::vector<SimState>  sim_;       // parallel to persons_
     size_t clamp_cursor_ = 0;          // far-person ground refresh ring
     size_t sim_cursor_ = 0;            // far-person schedule ring
+    size_t near_clamp_cursor_ = 0;     // budgeted near-ring clamp start
     float  far_thresh_ = 0.0f;         // adaptive far-tier angular cutoff
                                        // (0 = seed from kMinAngular)
     float  dbg_timer_ = 0.0f;          // [citizen] telemetry cadence
@@ -195,6 +229,12 @@ private:
 
     struct PartInstance { glm::mat4 xform; glm::vec4 color; };
     std::vector<PartInstance> frame_parts_;
+    // Per-frame scratch, kept as members so the render-tier pass does
+    // not heap-allocate (and free) a population-sized buffer every
+    // frame — with 3-5 residents per house that is a quarter-megabyte
+    // malloc per frame, for nothing.
+    std::vector<uint8_t> is_detailed_;
+    std::vector<std::pair<float, int>> near_ids_;
 };
 
 }  // namespace game_object
