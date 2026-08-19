@@ -89,6 +89,35 @@ public:
     //
     // The caller must have written this view's depth copy into
     // SCENE_DEPTH_TEX_INDEX of the set-0 descriptor passed in desc_sets.
+    // Deferred re-rasterise: draw every registered drawable into the
+    // cluster G-buffer (4 RTs + the depth this view's forward pass
+    // stamped earlier this frame, all LOAD).  DrawMode::kGBuffer
+    // pipelines depth-test LESS_OR_EQUAL with writes off, so only
+    // visible surfaces write attributes; deferred_resolve.comp then
+    // lights those pixels with the traced shadow / RT-GI path.  The
+    // decal list is deliberately excluded — alpha-blended geometry has
+    // no place in an opaque G-buffer (same rule terrain applies to its
+    // grass and water).
+    void drawGbuffer(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& buffer_size);
+
+    // Forward translucent GLASS pass: draw ONLY the Blend/glass
+    // primitives of every registered drawable, alpha-blended over the
+    // finished scene colour (depth test on, writes off).  Runs AFTER
+    // the resolve + sky + decals, so what shows through a pane is the
+    // real rendered world — rasterised translucency IS the thin-pane
+    // transmission term.
+    void drawGlassForward(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::shared_ptr<renderer::ImageView>& color_view,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& buffer_size);
+
     void drawDecals(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_sets,

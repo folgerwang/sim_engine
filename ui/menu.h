@@ -253,6 +253,18 @@ class Menu {
     bool csm_silhouette_prepass_enabled_ = true;
     // RT shadow/AO bilateral smooth pass (trace → filter → shade).
     bool rt_smoothing_ = true;
+    // Screen-probe GI (Lumen-style screen probe gather).  ON: indirect
+    // diffuse is traced at ONE probe per 16x16 pixel tile (64
+    // hemi-octahedral rays each, SH-projected, bilaterally gathered) —
+    // 0.25 rays/pixel instead of 1.0, and far more ray coherence.  OFF:
+    // the original one-cosine-ray-per-pixel estimator, kept for A/B
+    // quality and timing comparison.  Only has an effect while RT GI
+    // itself is active (any RT shadow technique + the cluster BVH).
+    //
+    // DEFAULT OFF: the probe path is the faster estimator but it is not
+    // yet as temporally stable as the per-pixel one, so plain ray-traced
+    // GI stays the shipping default and the probe gather is opt-in.
+    bool gi_screen_probe_ = false;
     // Rendering > Shadow > Shadow technique.  Both raytraced variants
     // skip the CSM render pass entirely and shade only deferred
     // (cluster) pixels — forward-lit pixels render unshadowed while
@@ -313,6 +325,13 @@ private:
     // DEBUG_RENDER_MODE_* in global_definition.glsl.h.  Driven by the
     // "Render Debug" combo in the menu bar.
     int debug_render_mode_ = 0;
+    // Render-path isolation, packed into camera_info.input_features as
+    // FEATURE_INPUT_HIDE_FORWARD / _HIDE_DEFERRED by drawScene.  Both
+    // are resolved inside deferred_resolve.comp; see the flag comments
+    // in global_definition.glsl.h.  Mutually exclusive in the UI (hiding
+    // both leaves only sky), but the shader tolerates both being set.
+    bool debug_hide_forward_ = false;
+    bool debug_hide_deferred_ = false;
     // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
     // 0 = half-res (richest detail), higher = increasingly down-sampled.
     // Clamped to the actual pyramid mip count by the menu UI.  Packed into
@@ -2006,6 +2025,12 @@ public:
     // RT techniques (not ReSTIR — its estimator owns its own noise).
     inline bool isRtSmoothingOn() const { return rt_smoothing_; }
 
+    // Rendering > Shadow > "Screen-probe GI (Lumen-style)".  Selects the
+    // screen probe gather over the per-pixel GI ray — see the member
+    // comment above and the SCREEN-PROBE GI block in
+    // deferred_resolve.comp.
+    inline bool isGiScreenProbeOn() const { return gi_screen_probe_; }
+
     // Current selected CSM drawable-shadow draw-mode (see enum comment above).
     inline CsmDrawMode getCsmDrawMode() const { return csm_draw_mode_; }
     inline void setCsmDrawMode(CsmDrawMode m) { csm_draw_mode_ = m; }
@@ -2015,6 +2040,13 @@ public:
     // global_definition.glsl.h).  application.cpp packs it into the upper
     // bits of camera_info.input_features each frame.
     inline int getDebugRenderMode() const { return debug_render_mode_; }
+
+    // Render-path isolation (Rendering > Render Debug).  True = black out
+    // the pixels that pass owns, so what remains on screen is exactly the
+    // OTHER pass's output.  See FEATURE_INPUT_HIDE_* in
+    // global_definition.glsl.h.
+    inline bool isHideForwardPixels() const { return debug_hide_forward_; }
+    inline bool isHideDeferredPixels() const { return debug_hide_deferred_; }
 
     // Forward vs deferred toggle — read by application drawScene to
     // route the cluster opaque pass through the G-buffer + compute

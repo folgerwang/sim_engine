@@ -1,0 +1,188 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ── D2Q9 shallow-water Lattice-Boltzmann river surface ───────────────
+// A REAL LBM this time (the old lbm_patch.comp was a stranded hair
+// demo): nine distribution functions on a square lattice, BGK single-
+// relaxation-time collision against the shallow-water equilibrium
+//
+//   f_eq_0 = h (1 - 5gh/6e^2 - 2u.u/3e^2)
+//   f_eq_i = h (gh/6e^2 + e_i.u/3e^2 + (e_i.u)^2/2e^4 - u.u/6e^2)   axis
+//   f_eq_i = h (gh/24e^2 + e_i.u/12e^2 + (e_i.u)^2/8e^4 - u.u/24e^2) diag
+//
+// (Zhou, "Lattice Boltzmann Methods for Shallow Water Flows").  The
+// patch FOLLOWS THE CAMERA: push constants carry this frame's patch
+// origin and last frame's, and the pull-streaming step reads the
+// neighbour at the shifted texel so the sim state stays glued to the
+// world while the window slides over it.  Cells scrolled in from
+// outside the previous window initialise to rest depth.
+//
+// Forcing: a steady body force along the river's flow direction (the
+// classic bed-slope term) plus a slow procedural stirring so the
+// surface never settles glassy-flat.  Output is what the WATER_ATTR
+// terrain pass consumes: xyz = world-space surface normal of the LBM
+// height field, w = height deviation from rest (metres).
+//
+// Nine distributions ride three RGBA32F images (fA = f0..f3,
+// fB = f4..f7, fC.r = f8), ping-ponged A→B each dispatch.  One
+// dispatch per frame = one LBM time step; at 60 fps and 0.25 m cells
+// the lattice speed e = dx/dt is ~15 m/s, comfortably above river
+// surface wave speeds, so the sim stays in its stable regime.
+
+layout(push_constant) uniform LbmWaterPush {
+    LbmWaterParams params;
+};
+
+layout(set = 0, binding = 0, rgba32f) uniform image2D src_fA;
+layout(set = 0, binding = 1, rgba32f) uniform image2D src_fB;
+layout(set = 0, binding = 2, rgba32f) uniform image2D src_fC;
+layout(set = 0, binding = 3, rgba32f) uniform image2D dst_fA;
+layout(set = 0, binding = 4, rgba32f) uniform image2D dst_fB;
+layout(set = 0, binding = 5, rgba32f) uniform image2D dst_fC;
+// xyz = surface normal (world space), w = height deviation (m)
+layout(set = 0, binding = 6, rgba16f) uniform image2D dst_surface;
+
+// D2Q9 lattice: 0 = rest, 1..4 axis (+x, +y, -x, -y), 5..8 diagonal
+// (+x+y, -x+y, -x-y, +x-y).  "y" here is the patch's Z in world space.
+const ivec2 kE[9] = ivec2[9](
+    ivec2(0, 0),
+    ivec2(1, 0), ivec2(0, 1), ivec2(-1, 0), ivec2(0, -1),
+    ivec2(1, 1), ivec2(-1, 1), ivec2(-1, -1), ivec2(1, -1));
+
+float loadF(int i, ivec2 p) {
+    if (i < 4)  return imageLoad(src_fA, p)[i];
+    if (i < 8)  return imageLoad(src_fB, p)[i - 4];
+    return imageLoad(src_fC, p).r;
+}
+
+// hash for the stirring term — deterministic per cell+frame
+float lw_h21(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    int N = int(params.grid_size);
+    if (pc.x >= N || pc.y >= N) return;
+
+    const float h0    = params.rest_depth;      // rest water depth (m)
+    const float e     = params.cell_m / params.dt;  // lattice speed
+    const float inv_e2 = 1.0 / (e * e);
+    const float g     = 9.81;
+    const float tau   = 0.60;                   // BGK relaxation (stable > 0.5)
+
+    // How far (in cells) the patch origin moved since last frame: the
+    // pull below reads last frame's grid at (p + shift), keeping every
+    // distribution anchored to its WORLD cell as the window slides.
+    ivec2 shift = ivec2(round(
+        (params.origin_ws.xz - params.prev_origin_ws.xz) / params.cell_m));
+
+    float f[9];
+    bool fresh = (params.reset != 0u);
+    for (int i = 0; i < 9; ++i) {
+        // Pull streaming: f_i at this cell came from the neighbour one
+        // lattice vector upstream — combined with the window shift.
+        ivec2 src = pc + shift - kE[i];
+        if (src.x < 0 || src.y < 0 || src.x >= N || src.y >= N) {
+            // Open boundary / newly scrolled-in cell: rest state.
+            f[i] = -1.0;
+        } else {
+            f[i] = loadF(i, src);
+        }
+    }
+
+    // Rest-state equilibrium fill for fresh cells / first frame.
+    // (h = h0, u = 0.)
+    float gh6 = g * h0 * inv_e2 / 6.0;
+    float w_axis_rest = h0 * gh6;
+    float w_diag_rest = h0 * gh6 * 0.25;
+    float f0_rest = h0 - 4.0 * w_axis_rest - 4.0 * w_diag_rest;
+    for (int i = 0; i < 9; ++i) {
+        if (fresh || f[i] < 0.0) {
+            f[i] = (i == 0) ? f0_rest : (i < 5 ? w_axis_rest : w_diag_rest);
+        }
+    }
+
+    // Macroscopic depth + velocity.
+    float h = 0.0;
+    vec2  hu = vec2(0.0);
+    for (int i = 0; i < 9; ++i) {
+        h  += f[i];
+        hu += vec2(kE[i]) * (e * f[i]);
+    }
+    h = max(h, 1e-4);
+    vec2 u = hu / h;
+    // velocity clamp keeps the sim stable if forcing spikes
+    float umax = 0.35 * e;
+    float ul = length(u);
+    if (ul > umax) u *= umax / ul;
+
+    // ── Forcing ─────────────────────────────────────────────────────
+    // Bed-slope body force along the river flow direction + a gentle
+    // travelling stir so the surface carries ripples even where the
+    // mean flow is slow.  Scaled by dt (force per step).
+    vec2 flow = params.flow_dir.xy;
+    vec2 wpos = params.origin_ws.xz + vec2(pc) * params.cell_m;
+    float stir =
+        sin(dot(wpos, vec2(0.9, 0.37)) * 1.7 + params.time * 2.6) *
+        sin(dot(wpos, vec2(-0.31, 0.83)) * 2.3 + params.time * 1.9);
+    float drop = (lw_h21(wpos + params.time) > 0.99985) ? 0.03 : 0.0;
+    vec2 force = flow * params.flow_strength +
+                 vec2(stir, -stir) * 0.02;
+
+    // ── BGK collision against shallow-water equilibrium ─────────────
+    float uu = dot(u, u) * inv_e2;
+    float gh = g * h * inv_e2;
+    float out_f[9];
+    for (int i = 0; i < 9; ++i) {
+        float feq;
+        if (i == 0) {
+            feq = h * (1.0 - 5.0 * gh / 6.0 - 2.0 * uu / 3.0);
+        } else {
+            vec2 ei = vec2(kE[i]);
+            float eu = dot(ei * e, u) * inv_e2;
+            if (i < 5) {
+                feq = h * (gh / 6.0 + eu / 3.0 + eu * eu * 0.5 - uu / 6.0);
+            } else {
+                feq = h * (gh / 24.0 + eu / 12.0 + eu * eu * 0.125 - uu / 24.0);
+            }
+        }
+        // force term distributed over the axis/diagonal directions
+        float fi = (i == 0) ? 0.0
+                 : dot(vec2(kE[i]), force) * params.dt *
+                       (i < 5 ? (1.0 / 6.0) : (1.0 / 24.0)) * h / e;
+        out_f[i] = f[i] - (f[i] - feq) / tau + fi;
+        out_f[i] = max(out_f[i], 0.0);
+    }
+    out_f[0] += drop;      // rain-drop perturbations enter as mass
+
+    imageStore(dst_fA, pc, vec4(out_f[0], out_f[1], out_f[2], out_f[3]));
+    imageStore(dst_fB, pc, vec4(out_f[4], out_f[5], out_f[6], out_f[7]));
+    imageStore(dst_fC, pc, vec4(out_f[8], 0.0, 0.0, 0.0));
+
+    // ── Surface output: height deviation + normal ───────────────────
+    // Central differences over THIS step's neighbours (previous-step
+    // heights — one frame of latency, invisible at ripple scale).
+    float hl = 0.0, hr = 0.0, hd = 0.0, hup = 0.0;
+    ivec2 pl = ivec2(max(pc.x - 1, 0), pc.y);
+    ivec2 pr = ivec2(min(pc.x + 1, N - 1), pc.y);
+    ivec2 pd = ivec2(pc.x, max(pc.y - 1, 0));
+    ivec2 pu = ivec2(pc.x, min(pc.y + 1, N - 1));
+    for (int i = 0; i < 9; ++i) {
+        hl += loadF(i, pl); hr += loadF(i, pr);
+        hd += loadF(i, pd); hup += loadF(i, pu);
+    }
+    // amplify: LBM height variance at this cell size is centimetres;
+    // the visual ripple wants to read at ~decimetre scale
+    float amp = params.normal_amp;
+    vec3 nrm = normalize(vec3(
+        -(hr - hl) * amp / (2.0 * params.cell_m),
+        1.0,
+        -(hup - hd) * amp / (2.0 * params.cell_m)));
+    imageStore(dst_surface, pc, vec4(nrm, (h - h0)));
+}

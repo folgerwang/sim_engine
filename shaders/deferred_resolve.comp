@@ -132,6 +132,18 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 8)
 // DI reservoirs above — temporal reuse in the ReSTIR spirit: each
 // frame's single-sample estimate is folded into the reprojected
 // surviving history instead of being resampled from scratch.
+// ── Glass / water attributes (bindings 12/13) ────────────────────────
+// Written by the glass-attribute pass (window/door panes via
+// base_frag_*_GLASS, river surfaces via tile_water_attr_frag) after the
+// opaque G-buffer passes.  Cleared to 0 each frame; .a of the tint
+// target is the KIND: 0 = nothing, 0.25+0.5*alpha = glass pane,
+// 1.0 = water.  The overlay at the end of this shader ray-traces
+// reflection AND refraction/transmission for these pixels.
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 12)
+    uniform sampler2D gbuf_glass_nr;     // octN.xy, view linZ (m), rough
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 13)
+    uniform sampler2D gbuf_glass_tint;   // tint.rgb, kind
+
 layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 11)
     buffer GiAccumBuf {
     vec4 gi_accum[];
@@ -627,6 +639,239 @@ const float RT_GI_HIST_MAX    = 16.0;
 // foreground/background swaps, which are always a large depth jump.
 const float RT_GI_DEPTH_REJECT = 0.10;
 
+// ═════════════════════════════════════════════════════════════════════
+//  SCREEN-PROBE GI  (Lumen-style screen probe gather)
+// ═════════════════════════════════════════════════════════════════════
+//
+// The per-pixel estimator above traces ONE cosine ray for EVERY shaded
+// pixel — 2.07 M rays at 1080p, every frame, from 2.07 M *different*
+// origins.  That is the single most expensive thing this resolve does,
+// and it is mostly wasted: indirect diffuse is a low-frequency signal,
+// so neighbouring pixels are integrating almost the same hemisphere.
+//
+// Unreal's Lumen answers this with a SCREEN PROBE GATHER, and that is
+// what this block implements:
+//
+//   1. Place one probe per GI_PROBE_TILE x GI_PROBE_TILE pixel tile
+//      (16x16), jittered inside its tile each frame so that over a few
+//      frames the probes sweep the whole screen.
+//   2. Each probe traces GI_OCTA_RES^2 (8x8 = 64) rays laid out on a
+//      HEMI-OCTAHEDRAL map around the probe's geometric normal — a
+//      structured, near-uniform-solid-angle direction set instead of a
+//      random one, so the estimate is low-variance by construction.
+//   3. The 64 radiance samples are temporally accumulated per texel
+//      (probe-space reprojection through the velocity buffer, rejected
+//      on plane/normal mismatch) and then projected to 2nd-order
+//      spherical harmonics ONCE, in shared memory, by the same
+//      workgroup that traced them.
+//   4. Every pixel then reconstructs its irradiance by bilaterally
+//      interpolating the SH of the 4 probes around it and evaluating
+//      the Lambert-convolved SH in its own normal direction.  No rays.
+//
+// Ray budget: 64 rays / 256 pixels = 0.25 rays/pixel, a 4x reduction —
+// and the surviving rays are FAR more coherent (one origin, one
+// hemisphere fan per workgroup) which is worth another large factor on
+// the hardware ray-query path.  The per-pixel cost that replaces the
+// trace is 4 probe headers + 4x9 SH loads, all L2-resident.
+//
+// One workgroup (8x8 = 64 invocations) handles exactly one probe, so
+// the octahedral texel index IS gl_LocalInvocationID.xy and the probe
+// index IS gl_WorkGroupID.xy.  That identity is why the local size is
+// not allowed to change.
+const int   GI_PROBE_TILE  = 16;    // pixels per probe, both axes
+const int   GI_OCTA_RES    = 8;     // hemi-octahedral atlas side
+const int   GI_OCTA_TEXELS = GI_OCTA_RES * GI_OCTA_RES;   // = 64
+// Longer than the per-pixel path's 16 (RT_GI_HIST_MAX): a probe's 64
+// structured rays are already low-variance, so history here buys
+// stability rather than convergence and can afford to be deeper.
+const float GI_PROBE_HIST_MAX = 24.0;
+// Reprojected-probe acceptance.  Tighter than the per-pixel depth test
+// because the atlas is stored in the probe normal's TANGENT frame — a
+// large normal change would reinterpret every texel.
+const float GI_PROBE_N_ACCEPT = 0.95;   // cos(N_now, N_prev)
+// Plane distance (metres) at which a neighbour probe's contribution has
+// decayed to ~e^-1 during the gather, expressed as a fraction of view
+// depth.  0.02 * z is roughly one probe spacing for a 60 deg vertical
+// FOV at 1080p, so this is "one tile away from my plane".
+const float GI_PROBE_PLANE_K  = 0.02;
+
+// ── gi_accum sub-allocation ─────────────────────────────────────────
+// The screen-probe path reuses the SAME storage buffer the per-pixel
+// accumulator uses (2 * W * H vec4), because it needs far less of it:
+//   atlas   2 * n * 64  vec4   (ping-pong radiance, n = probe count)
+//   header  2 * n * 2   vec4   (ping-pong; TWO vec4 per probe —
+//                               [world_pos, history] and [normal, linZ])
+//   SH      2 * n * 9   vec4   (ping-pong — the trace pass READS last
+//                               frame's SH for the second bounce while
+//                               it writes this frame's, so these cannot
+//                               share one slot)
+// = 150 * n vec4, and n = W*H/256, so the whole thing is 0.59 * W * H
+// vec4 — comfortably inside the existing allocation.  The two paths
+// never run in the same frame; toggling between them raises
+// rt_gi_dirty_ on the CPU so the buffer is re-zeroed.
+ivec2 giProbeDim(ivec2 sz) {
+    return (sz + ivec2(GI_PROBE_TILE - 1)) / GI_PROBE_TILE;
+}
+uint giProbeCount(ivec2 sz) {
+    ivec2 d = giProbeDim(sz);
+    return uint(d.x) * uint(d.y);
+}
+uint giAtlasOfs(uint nprobes, bool slot, uint probe, uint texel) {
+    return (slot ? nprobes * uint(GI_OCTA_TEXELS) : 0u) +
+           probe * uint(GI_OCTA_TEXELS) + texel;
+}
+// Header stride is 2: [0] = (world_pos.xyz, history)  — history 0 marks
+// the probe INVALID (sky tile, forward-shaded tile, never written);
+//                     [1] = (geometric normal.xyz, linear view depth).
+uint giHdrOfs(uint nprobes, bool slot, uint probe) {
+    return 2u * nprobes * uint(GI_OCTA_TEXELS) +
+           (slot ? 2u * nprobes : 0u) + probe * 2u;
+}
+uint giShOfs(uint nprobes, bool slot, uint probe, uint coef) {
+    return 2u * nprobes * uint(GI_OCTA_TEXELS) + 4u * nprobes +
+           (slot ? 9u * nprobes : 0u) + probe * 9u + coef;
+}
+
+// ── Hemi-octahedral direction set ───────────────────────────────────
+// Maps the unit square onto the upper hemisphere with near-constant
+// solid angle per texel (the octahedral map's defining property), which
+// is exactly what an unbiased uniform-hemisphere estimator wants:
+// every texel carries the same weight dw = 2*PI / 64.
+vec3 giHemiOctDecode(vec2 f) {          // f in [0,1]^2 -> |d| = 1, d.z >= 0
+    vec2 t = f * 2.0 - 1.0;
+    vec2 p = vec2(t.x + t.y, t.x - t.y) * 0.5;
+    return normalize(vec3(p, 1.0 - abs(p.x) - abs(p.y)));
+}
+
+// Duff et al. branchless orthonormal basis — continuous in n (away from
+// the n.z = -1 pole), which is what makes the tangent-frame atlas
+// reprojectable across frames.
+void giOnb(vec3 n, out vec3 t, out vec3 b) {
+    float s  = n.z >= 0.0 ? 1.0 : -1.0;
+    float a  = -1.0 / (s + n.z);
+    float bb = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+    b = vec3(bb, s + n.y * n.y * a, -n.y);
+}
+
+// ── 2nd-order real SH ───────────────────────────────────────────────
+// giShBasis returns Y_00 .. Y_22 for a direction; giShIrradiance folds
+// in the Lambert transfer coefficients A_l / PI = (1, 2/3, 1/4) so the
+// result is E(N) / PI — the SAME quantity the cosine-sampled per-pixel
+// estimator produced, which is why `ambient_diffuse = c_diff * gi_E`
+// downstream is untouched.
+void giShBasis(vec3 d, out float y[9]) {
+    y[0] = 0.282095;
+    y[1] = 0.488603 * d.y;
+    y[2] = 0.488603 * d.z;
+    y[3] = 0.488603 * d.x;
+    y[4] = 1.092548 * d.x * d.y;
+    y[5] = 1.092548 * d.y * d.z;
+    y[6] = 0.315392 * (3.0 * d.z * d.z - 1.0);
+    y[7] = 1.092548 * d.x * d.z;
+    y[8] = 0.546274 * (d.x * d.x - d.y * d.y);
+}
+vec3 giShIrradiance(vec3 c[9], vec3 n) {
+    float y[9];
+    giShBasis(n, y);
+    const float a0 = 1.0;          // A_0 / PI
+    const float a1 = 2.0 / 3.0;    // A_1 / PI
+    const float a2 = 0.25;         // A_2 / PI
+    vec3 e = c[0] * (a0 * y[0]);
+    e += (c[1] * y[1] + c[2] * y[2] + c[3] * y[3]) * a1;
+    e += (c[4] * y[4] + c[5] * y[5] + c[6] * y[6] +
+          c[7] * y[7] + c[8] * y[8]) * a2;
+    return max(e, vec3(0.0));      // ringing can push L2 SH negative
+}
+
+// ── Second bounce: the ray hit reads the radiance cache ─────────────
+// The single most valuable thing Lumen does with its cache is CLOSE THE
+// LOOP: a GI ray that lands on a wall does not need its own hemisphere
+// of rays to know how much indirect light reaches that wall — last
+// frame's probes already integrated exactly that, and they are still
+// resident.  Projecting the hit point into the PREVIOUS frame's screen
+// and reading the probe there upgrades a 1-bounce estimator to a
+// multi-bounce one for the price of a handful of loads, and because
+// each frame's probes are fed back into the next frame's, the series
+// converges to full multi-bounce GI over a few frames.
+//
+// Everything here reads the PREVIOUS ping-pong slot (with
+// prev_view_proj to match, since that is the screen the probes were
+// placed on), which is also what makes it safe to call from inside the
+// probe trace pass while that pass writes the current slot.
+//
+// Fails — and the caller keeps the old constant sky leak — when the hit
+// is off-screen, behind the camera, or lands where no probe agrees with
+// its plane.  Those are exactly the cases where a screen-space cache
+// has no information, and pretending otherwise is how light leaks.
+//
+// Damping: the feedback is a geometric series in surface albedo, and a
+// white interior (albedo ~0.9) would converge to ~10x the first bounce
+// — physically right, but this scene already reads bright and the sun
+// is not energy-matched to it.  0.7 per bounce keeps the series near
+// 2.5x, which is where a second bounce reads as "the room fills in"
+// rather than "the room glows".
+const float RT_GI_BOUNCE_GAIN = 0.70;
+
+bool giProbeSecondBounce(vec3 wp, vec3 n, out vec3 o_E) {
+    o_E = vec3(0.0);
+    if ((camera_info.input_features & FEATURE_INPUT_GI_SCREEN_PROBE) == 0u)
+        return false;
+
+    vec4 clip = camera_info.prev_view_proj * vec4(wp, 1.0);
+    if (clip.w <= 1e-4) return false;                    // behind camera
+    vec2 uv = (clip.xy / clip.w) * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) ||
+        any(greaterThanEqual(uv, vec2(1.0)))) return false;
+
+    ivec2 sz      = imageSize(hdr_out);
+    ivec2 dim     = giProbeDim(sz);
+    uint  nprobes = uint(dim.x) * uint(dim.y);
+    // Previous slot — see the note above.
+    bool  slot = (camera_info.input_features &
+                  FEATURE_INPUT_RESTIR_PARITY) == 0u;
+
+    vec2  pf = (uv * vec2(sz)) / float(GI_PROBE_TILE) - 0.5;
+    ivec2 p0 = ivec2(floor(pf));
+    vec2  fr = fract(pf);
+    // No linear view depth at a ray hit, so scale the plane tolerance by
+    // the hit's distance from the camera instead — same intent, same
+    // "one probe spacing" magnitude.
+    float plane_scale =
+        1.0 / max(GI_PROBE_PLANE_K * distance(wp, camera_info.position),
+                  0.10);
+
+    vec3  sum  = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 pc = p0 + ivec2(i, j);
+            if (any(lessThan(pc, ivec2(0))) ||
+                any(greaterThanEqual(pc, dim))) continue;
+            uint q  = uint(pc.y) * uint(dim.x) + uint(pc.x);
+            uint hb = giHdrOfs(nprobes, slot, q);
+            vec4 h0 = gi_accum[hb];
+            if (h0.w < 0.5) continue;
+            vec4 h1 = gi_accum[hb + 1u];
+            float wn = dot(n, h1.xyz);
+            if (wn <= 0.0) continue;
+            float pd = abs(dot(wp - h0.xyz, n)) * plane_scale;
+            float wb = (i == 0 ? 1.0 - fr.x : fr.x) *
+                       (j == 0 ? 1.0 - fr.y : fr.y) + 0.05;
+            float w  = wb * (wn * wn) * exp(-pd * pd);
+            if (w <= 1e-5) continue;
+            vec3 c[9];
+            uint sb = giShOfs(nprobes, slot, q, 0u);
+            for (int k = 0; k < 9; ++k) c[k] = gi_accum[sb + uint(k)].rgb;
+            sum  += giShIrradiance(c, n) * w;
+            wsum += w;
+        }
+    }
+    if (wsum <= 1e-5) return false;
+    o_E = sum / wsum;
+    return true;
+}
+
 // Möller–Trumbore with the hit DISTANCE returned (rtRayTri drops it —
 // any-hit callers never need it, this closest-hit walk does).
 bool rtGiRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
@@ -649,7 +894,9 @@ bool rtGiRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
     return true;
 }
 
-vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
+vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
+                  out float o_hit_t) {
+    o_hit_t = RT_GI_MAX_DIST;
     vec3 inv_dir = 1.0 / rd;
     float best_t   = RT_GI_MAX_DIST;
     vec3  best_n   = vec3(0.0);
@@ -738,6 +985,7 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
         return sky;
     }
 
+    o_hit_t = best_t;
     vec3 hp = ro + rd * best_t;
     vec3 hn = (dot(best_n, rd) < 0.0) ? best_n : -best_n;
     float ndl = max(dot(hn, sun_L), 0.0);
@@ -745,12 +993,21 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
         ? rtShadowRayVisible(hp + hn * RT_GI_NORMAL_BIAS, sun_L,
                              RT_SHADOW_MAX_DIST)
         : 0.0;
-    vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
+    // Indirect arriving AT the hit point.  With the screen-probe cache
+    // live this is a real second bounce read out of last frame's probes;
+    // without it (or off-screen) it falls back to the flat sky leak this
+    // estimator has always used.
+    vec3 hit_amb;
+    if (giProbeSecondBounce(hp, hn, hit_amb)) {
+        hit_amb *= RT_GI_BOUNCE_GAIN;
+    } else {
+        vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
 #ifndef USE_HDR
-    sky_amb = sRGBToLinear(sky_amb);
+        sky_amb = sRGBToLinear(sky_amb);
 #endif
-    return best_alb * (sun_col * (ndl * vis / M_PI) +
-                       sky_amb * RT_GI_SKY_LEAK);
+        hit_amb = sky_amb * RT_GI_SKY_LEAK;
+    }
+    return best_alb * (sun_col * (ndl * vis / M_PI) + hit_amb);
 }
 
 float rtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
@@ -1171,7 +1428,9 @@ float hwRtAoFactor(vec3 world_pos, vec3 world_normal,
 // opaque hits commit in hardware.  The committed hit's geometry index
 // picks the right index/material stream (geom 0 = opaque, 1 = masked),
 // and both index buffers hold GLOBAL vertex ids into rt_pos_uv[].
-vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
+vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
+                    out float o_hit_t) {
+    o_hit_t = RT_GI_MAX_DIST;
     rayQueryEXT rq;
     rayQueryInitializeEXT(
         rq, hw_rt_tlas,
@@ -1222,6 +1481,7 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
     }
 
     const float ht = rayQueryGetIntersectionTEXT(rq, true);
+    o_hit_t = ht;
     const vec3  hp = ro + rd * ht;
 
     // Skeleton-instance hit (custom index 1).  The software path skips
@@ -1229,11 +1489,17 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
     // walk finds them anyway, so shade a neutral matte bounce instead of
     // reading cluster streams the skeleton BLAS has no entries in.
     if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) != 0) {
-        vec3 sky_amb = texture(lambertian_env_sampler, -rd).rgb;
+        vec3 amb;
+        if (giProbeSecondBounce(hp, -rd, amb)) {
+            amb *= RT_GI_BOUNCE_GAIN;
+        } else {
+            vec3 sky_amb = texture(lambertian_env_sampler, -rd).rgb;
 #ifndef USE_HDR
-        sky_amb = sRGBToLinear(sky_amb);
+            sky_amb = sRGBToLinear(sky_amb);
 #endif
-        return vec3(0.35) * sky_amb * RT_GI_SKY_LEAK;
+            amb = sky_amb * RT_GI_SKY_LEAK;
+        }
+        return vec3(0.35) * amb;
     }
 
     const int  geom = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
@@ -1277,14 +1543,142 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col) {
         ? hwRtShadowRayVisible(hp + hn * RT_GI_NORMAL_BIAS, sun_L,
                                RT_SHADOW_MAX_DIST)
         : 0.0;
-    vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
+    // Second bounce out of the screen-probe cache (see rtGiRadiance).
+    vec3 hit_amb;
+    if (giProbeSecondBounce(hp, hn, hit_amb)) {
+        hit_amb *= RT_GI_BOUNCE_GAIN;
+    } else {
+        vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
 #ifndef USE_HDR
-    sky_amb = sRGBToLinear(sky_amb);
+        sky_amb = sRGBToLinear(sky_amb);
 #endif
-    return best_alb * (sun_col * (ndl * vis / M_PI) +
-                       sky_amb * RT_GI_SKY_LEAK);
+        hit_amb = sky_amb * RT_GI_SKY_LEAK;
+    }
+    return best_alb * (sun_col * (ndl * vis / M_PI) + hit_amb);
 }
 #endif
+
+// ═══ Ray-traced glass & water (window panes, river surface) ══════════
+// Consumes the glass-attribute targets (bindings 12/13).  Per covered
+// pixel: reconstruct the pane/surface point from its stored linear
+// view depth, then trace a REFLECTION ray and a TRANSMISSION ray
+// against the same cluster BVH / TLAS the shadows and GI walk:
+//   glass — thin pane: the transmitted ray continues STRAIGHT (the
+//           parallel offset of a few mm of glass is sub-pixel), tinted
+//           by the pane colour times its authored alpha.
+//   water — refract(1/1.33) bends the ray properly; the traced hit
+//           distance drives Beer-Lambert absorption toward the water
+//           tint, so shallow edges stay clear and the channel centre
+//           reads deep.  Total internal reflection falls back to pure
+//           reflection.
+// Both rays shade through the same estimator the GI bounce uses
+// (albedo x sun with a real occlusion ray + sky leak; sky on miss), so
+// what a window reflects agrees with how the world lights.
+bool glassWaterOverlay(vec2 uv, ivec2 px_dbg, float opaque_lin_z,
+                       out vec3 out_color) {
+    vec4 g0 = texture(gbuf_glass_nr, uv);
+    vec4 g1 = texture(gbuf_glass_tint, uv);
+    float kind = g1.a;
+    // WATER ONLY.  Glass left this path: a thin pane's transmission is
+    // exactly the rasterised scene behind it, so panes now draw as
+    // plain alpha-blended forward geometry after the resolve (see
+    // ObjectSceneView::drawGlassForward).  Water genuinely needs the
+    // traced rays — the refracted path bends to the river bed — so the
+    // overlay keeps it.
+    if (kind < 0.9) return false;
+    float glass_z = g0.z;
+    // A pane strictly behind the opaque surface at this pixel is
+    // occluded (belt and braces — the attribute pass depth-tests too).
+    if (opaque_lin_z > 0.0 && glass_z > opaque_lin_z + 0.05) return false;
+
+    // Surface point: invert the stored linear view depth back to NDC z
+    // (linZ = b/(a+z)  =>  z = b/linZ - a) and unproject — the EXACT
+    // inverse of how the attribute pass encoded it, and the same
+    // inv_view_proj reconstruction the resolve uses for opaque pixels.
+    // (The first version walked the camera ray by linZ over a
+    // facing-vector cosine; any convention drift in that vector put
+    // the trace origin inside the wall and both rays died in the dark.)
+    float glass_ndc_z = camera_info.depth_params.y / max(glass_z, 1e-3)
+                        - camera_info.depth_params.x;
+    vec4 gh = camera_info.inv_view_proj *
+              vec4(uv * 2.0 - 1.0, glass_ndc_z, 1.0);
+    vec3 gpos = gh.xyz / gh.w;
+    vec3 ray = normalize(gpos - camera_info.position);
+
+    vec3 N = octDecode(g0.xy);
+    if (dot(N, ray) > 0.0) N = -N;         // face the viewer
+    float rough = g0.w;
+    vec3  tint  = g1.rgb;
+
+    vec3 L = normalize(-runtime_lights.lights[0].direction);
+    vec3 sun_col = runtime_lights.lights[0].color *
+                   runtime_lights.lights[0].intensity;
+
+    // Fresnel (Schlick) — F0 2% water, 4% glass.
+    float cos_t = clamp(dot(N, -ray), 0.0, 1.0);
+    const float F0 = 0.02;                 // water
+    float F  = F0 + (1.0 - F0) * pow(1.0 - cos_t, 5.0);
+
+    const bool use_hw =
+#ifdef HW_RT_SHADOW
+        (camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u;
+#else
+        false;
+#endif
+
+    // ── Reflection ray ──────────────────────────────────────────────
+    vec3 rdir = normalize(reflect(ray, N));
+    float refl_t;
+    vec3 refl;
+#ifdef HW_RT_SHADOW
+    if (use_hw) {
+        refl = hwRtGiRadiance(gpos + N * 0.02, rdir, L, sun_col, refl_t);
+    } else
+#endif
+    {
+        refl = rtGiRadiance(gpos + N * 0.02, rdir, L, sun_col, refl_t);
+    }
+
+    // ── Transmission ray (water) ────────────────────────────────────
+    vec3 trans = vec3(0.0);
+    {
+        vec3 tdir = refract(ray, N, 1.0 / 1.33);
+        if (dot(tdir, tdir) < 1e-4) {
+            F = 1.0;                        // total internal reflection
+        } else {
+            tdir = normalize(tdir);
+            float hit_t;
+#ifdef HW_RT_SHADOW
+            if (use_hw) {
+                trans = hwRtGiRadiance(gpos - N * 0.02, tdir,
+                                       L, sun_col, hit_t);
+            } else
+#endif
+            {
+                trans = rtGiRadiance(gpos - N * 0.02, tdir,
+                                     L, sun_col, hit_t);
+            }
+            // Beer-Lambert toward the water tint over the refracted
+            // travel distance; ~35% extinction per metre keeps a
+            // half-metre shallows readable and a 5 m channel opaque.
+            float travel = min(hit_t, 24.0);
+            vec3 absorb = exp(-travel * 0.35 *
+                              (vec3(1.05) - clamp(tint, 0.0, 1.0)));
+            trans = mix(tint * 0.25, trans, absorb);
+        }
+    }
+
+    // Rough glass scatters its reflection: pull the mirror term toward
+    // its own luminance (cheap blur substitute — the reflection ray is
+    // 1 spp and the env-mip machinery lives inside the tracer's miss).
+    if (rough > 0.15) {
+        float rl = dot(refl, vec3(0.2126, 0.7152, 0.0722));
+        refl = mix(refl, vec3(rl), clamp((rough - 0.15) * 1.6, 0.0, 0.6));
+    }
+
+    out_color = mix(trans, refl, clamp(F, 0.0, 1.0));
+    return true;
+}
 
 float ssrtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     vec3 L = normalize(-runtime_lights.lights[0].direction);
@@ -1481,8 +1875,306 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
     return mix(sum * (1.0 / float(CSM_PCF_SAMPLES)), 1.0, range_fade);
 }
 
+// ═════════════════════════════════════════════════════════════════════
+//  Screen-probe GI — trace pass (pass_mode 3) and gather (in main)
+// ═════════════════════════════════════════════════════════════════════
+
+// One workgroup == one probe == 64 octahedral texels, so this scratch
+// array is exactly the probe's radiance atlas for the current frame.
+shared vec3 s_gi_probe_rad[GI_OCTA_TEXELS];
+
+// pass_mode 3.  Dispatched with (probe_dim.x, probe_dim.y, 1) groups —
+// NOT the pixel grid.  Traces, temporally accumulates and SH-projects
+// one probe; writes nothing to hdr_out.
+void giProbeTracePass() {
+    ivec2 sz  = imageSize(hdr_out);
+    ivec2 dim = giProbeDim(sz);
+    ivec2 pid = ivec2(gl_WorkGroupID.xy);
+    if (pid.x >= dim.x || pid.y >= dim.y) return;   // workgroup-uniform
+
+    uint nprobes = uint(dim.x) * uint(dim.y);
+    uint probe   = uint(pid.y) * uint(dim.x) + uint(pid.x);
+    uint texel   = gl_LocalInvocationID.y * uint(GI_OCTA_RES) +
+                   gl_LocalInvocationID.x;
+
+    bool parity = (camera_info.input_features &
+                   FEATURE_INPUT_RESTIR_PARITY) != 0u;
+    uint frame  = (camera_info.input_features & FEATURE_INPUT_FRAME_MASK)
+                      >> FEATURE_INPUT_FRAME_SHIFT;
+
+    // ── Anchor the probe on real deferred geometry ───────────────────
+    // DETERMINISTIC placement: tile centre first, then a fixed in-tile
+    // ring for tiles whose centre lands on sky or on a FORWARD-shaded
+    // pixel (no G-buffer normal there).  Every invocation runs the
+    // identical loop, so the choice is workgroup-uniform by
+    // construction.
+    //
+    // This used to jitter the anchor by up to 7 px per frame — Lumen
+    // does that, and it does let thin geometry get sampled eventually.
+    // Here it was the primary source of flicker: a tile straddling a
+    // silhouette would anchor on the WALL one frame and the GROUND the
+    // next, which (a) fails the probe's own plane/normal history test
+    // so the probe restarts from a 1-sample estimate, and (b) fails the
+    // GATHER's plane test for the pixels that were using it, dropping
+    // them to the flat sky IBL — a bright/dark flip over a whole 16x16
+    // block, every frame.  A static anchor makes the history test pass
+    // essentially always while the camera is still, which is the case
+    // where flicker is most visible.  The rays still jitter (below);
+    // that is where the extra coverage comes from now.
+    ivec2 org = pid * GI_PROBE_TILE;
+    ivec2 ppx = ivec2(-1);
+    float pz  = 1.0;
+    for (int k = 0; k < 6; ++k) {
+        ivec2 off = ivec2(8, 8);
+        if (k == 1) off = ivec2(4, 4);
+        else if (k == 2) off = ivec2(12, 12);
+        else if (k == 3) off = ivec2(4, 12);
+        else if (k == 4) off = ivec2(12, 4);
+        else if (k == 5) off = ivec2(8, 2);
+        ivec2 c = clamp(org + off, ivec2(0), sz - 1);
+        vec2  cuv = (vec2(c) + 0.5) / vec2(sz);
+        float cz  = textureLod(gbuf_depth, cuv, 0.0).r;
+        if (cz >= 1.0) continue;                       // sky
+        if (textureLod(gbuf_albedo_ao, cuv, 0.0).a < 0.5) continue;  // forward
+        ppx = c;
+        pz  = cz;
+        break;
+    }
+
+    if (ppx.x < 0) {
+        // Dead probe: zero the header (history 0 = invalid) so the
+        // gather skips it and falls back to the flat sky IBL.
+        gi_accum[giAtlasOfs(nprobes, parity, probe, texel)] = vec4(0.0);
+        if (texel == 0u) {
+            uint h = giHdrOfs(nprobes, parity, probe);
+            gi_accum[h]      = vec4(0.0);
+            gi_accum[h + 1u] = vec4(0.0);
+            for (uint c = 0u; c < 9u; ++c)
+                gi_accum[giShOfs(nprobes, parity, probe, c)] = vec4(0.0);
+        }
+        return;
+    }
+
+    vec2 puv   = (vec2(ppx) + 0.5) / vec2(sz);
+    vec4 ndc   = vec4(puv * 2.0 - 1.0, pz, 1.0);
+    vec4 wh    = camera_info.inv_view_proj * ndc;
+    vec3 pwp   = wh.xyz / wh.w;
+    vec3 pn    = octDecode(textureLod(gbuf_emissive_metal, puv, 0.0).xy);
+    pn = (dot(pn, pn) > 1e-6) ? normalize(pn) : vec3(0.0, 1.0, 0.0);
+    float plinz = camera_info.depth_params.y /
+                  (camera_info.depth_params.x + pz);
+
+    vec3 tX, tY;
+    giOnb(pn, tX, tY);
+
+    // Sub-texel jitter, rotated by the golden pair each frame: the 64
+    // directions stay structured (one per octahedral cell) but do not
+    // freeze on the same 64 rays, so the temporal history integrates a
+    // continuum of directions instead of a fixed lattice.
+    vec2 jit2 = vec2(fract(float(frame) * 0.6180339887),
+                     fract(float(frame) * 0.7548776662));
+    vec2 f    = (vec2(gl_LocalInvocationID.xy) + jit2) / float(GI_OCTA_RES);
+    vec3 dl   = giHemiOctDecode(f);
+    vec3 rd   = normalize(tX * dl.x + tY * dl.y + pn * dl.z);
+
+    vec3 sun_L   = normalize(-runtime_lights.lights[0].direction);
+    vec3 sun_col = runtime_lights.lights[0].color *
+                   runtime_lights.lights[0].intensity;
+
+    vec3  rad;
+    float t_unused;
+#ifdef HW_RT_SHADOW
+    if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
+        rad = hwRtGiRadiance(pwp + pn * RT_GI_NORMAL_BIAS, rd,
+                             sun_L, sun_col, t_unused);
+    } else
+#endif
+    {
+        rad = rtGiRadiance(pwp + pn * RT_GI_NORMAL_BIAS, rd,
+                           sun_L, sun_col, t_unused);
+    }
+
+    // ── Temporal: reproject the PROBE, not the pixel ─────────────────
+    // The probe's anchor pixel has a velocity, so last frame's screen
+    // position maps to a tile, and that tile's probe is this probe's
+    // history — provided it sat on the same surface.  Both tests matter:
+    // the plane test catches foreground/background swaps, and the normal
+    // test protects the tangent-frame atlas (the 64 texels are stored
+    // relative to the probe normal, so a large normal change would
+    // reinterpret every one of them).
+    float hist     = 1.0;
+    vec3  prev_rad = vec3(0.0);
+    {
+        vec2 uvp = puv - textureLod(gbuf_velocity, puv, 0.0).rg * 0.5;
+        if (all(greaterThanEqual(uvp, vec2(0.0))) &&
+            all(lessThan(uvp, vec2(1.0)))) {
+            ivec2 qpx = clamp(ivec2(uvp * vec2(sz)), ivec2(0), sz - 1);
+            ivec2 qid = clamp(qpx / GI_PROBE_TILE, ivec2(0), dim - ivec2(1));
+            uint  q   = uint(qid.y) * uint(dim.x) + uint(qid.x);
+            uint  qh  = giHdrOfs(nprobes, !parity, q);
+            vec4  h0  = gi_accum[qh];
+            vec4  h1  = gi_accum[qh + 1u];
+            if (h0.w > 0.5 &&
+                dot(h1.xyz, pn) > GI_PROBE_N_ACCEPT &&
+                abs(dot(pwp - h0.xyz, pn)) <=
+                    max(GI_PROBE_PLANE_K * plinz, 0.05)) {
+                hist     = min(h0.w + 1.0, GI_PROBE_HIST_MAX);
+                prev_rad = gi_accum[
+                    giAtlasOfs(nprobes, !parity, q, texel)].rgb;
+            }
+        }
+    }
+    vec3 out_rad = (hist > 1.5) ? mix(prev_rad, rad, 1.0 / hist) : rad;
+
+    gi_accum[giAtlasOfs(nprobes, parity, probe, texel)] = vec4(out_rad, 0.0);
+    if (texel == 0u) {
+        uint h = giHdrOfs(nprobes, parity, probe);
+        gi_accum[h]      = vec4(pwp, hist);
+        gi_accum[h + 1u] = vec4(pn, plinz);
+    }
+
+    // ── SH projection, in shared memory, by the tracing workgroup ────
+    // Doing it here (rather than in a second dispatch) costs one barrier
+    // and saves a whole pass plus its buffer hazard.  The gather then
+    // reads 9 vec4 per probe instead of 64.
+    s_gi_probe_rad[texel] = out_rad;
+    memoryBarrierShared();
+    barrier();
+    if (texel == 0u) {
+        vec3  c[9];
+        float wc[9];              // same projection with radiance == 1
+        for (int k = 0; k < 9; ++k) { c[k] = vec3(0.0); wc[k] = 0.0; }
+        const float dw = (2.0 * M_PI) / float(GI_OCTA_TEXELS);
+        for (int i = 0; i < GI_OCTA_TEXELS; ++i) {
+            // Project along the texel's FIXED cell centre, not the
+            // frame-jittered direction it was traced along.  The
+            // accumulated texel value is the average radiance over its
+            // cell, so the cell centre is the correct quadrature point —
+            // and, more importantly, it makes the SH basis assignment
+            // frame-invariant.  Using jit2 here rotated the whole basis
+            // slightly every frame, which showed up as a low-amplitude
+            // shimmer on top of everything else.
+            vec2 ff = (vec2(float(i % GI_OCTA_RES),
+                            float(i / GI_OCTA_RES)) + 0.5) /
+                      float(GI_OCTA_RES);
+            vec3 d  = giHemiOctDecode(ff);
+            vec3 dw_ws = normalize(tX * d.x + tY * d.y + pn * d.z);
+            float y[9];
+            giShBasis(dw_ws, y);
+            vec3 Li = s_gi_probe_rad[i];
+            for (int k = 0; k < 9; ++k) {
+                c[k]  += Li * (y[k] * dw);
+                wc[k] +=      (y[k] * dw);
+            }
+        }
+        // ── White-furnace normalisation ──────────────────────────────
+        // The octahedral map is only APPROXIMATELY equal-area (its
+        // Jacobian varies ~1.5x corner to centre), and 2nd-order SH
+        // truncates energy on top of that.  Both are systematic, and
+        // both are measured exactly by projecting a constant radiance
+        // of 1 through the identical direction set and asking what
+        // irradiance comes back: under a uniform white sky the answer
+        // must be 1.  Dividing by it removes the map's directional bias
+        // and the truncation loss in one scalar, so an unoccluded probe
+        // reproduces the flat sky IBL instead of drifting off it.
+        vec3 wcv[9];
+        for (int k = 0; k < 9; ++k) wcv[k] = vec3(wc[k]);
+        float w_norm = max(giShIrradiance(wcv, pn).x, 1e-3);
+        for (int k = 0; k < 9; ++k)
+            gi_accum[giShOfs(nprobes, parity, probe, uint(k))] =
+                vec4(c[k] / w_norm, 0.0);
+    }
+}
+
+// Per-pixel reconstruction: bilaterally blend the 4 screen probes around
+// this pixel and evaluate their Lambert-convolved SH along N.  Returns
+// false when no probe around this pixel is usable (all sky / all on a
+// different surface), in which case the caller keeps the flat sky IBL.
+// N_geom drives the WEIGHTS (it is what the probes stored, so it is the
+// only normal the plane/facing tests can compare against); N_shade is
+// what the SH is EVALUATED along, so normal-mapped detail still shapes
+// the indirect diffuse the way it does in the forward IBL path.
+bool giProbeGather(ivec2 px, ivec2 sz, vec3 world_pos, vec3 N,
+                   vec3 N_shade, float view_lin_z, out vec3 o_E) {
+    ivec2 dim     = giProbeDim(sz);
+    uint  nprobes = uint(dim.x) * uint(dim.y);
+    bool  parity  = (camera_info.input_features &
+                     FEATURE_INPUT_RESTIR_PARITY) != 0u;
+
+    // Probe centres are tile centres, so probe-grid space is the pixel
+    // divided by the tile size, shifted half a tile.
+    vec2  pf = (vec2(px) + 0.5) / float(GI_PROBE_TILE) - 0.5;
+    ivec2 p0 = ivec2(floor(pf));
+    vec2  fr = fract(pf);
+
+    // Plane-distance falloff scaled to roughly one probe spacing at this
+    // depth — a neighbour probe a tile-width off my tangent plane is a
+    // different surface and must not bleed onto me.
+    float plane_scale = 1.0 / max(GI_PROBE_PLANE_K * view_lin_z, 0.05);
+
+    // TWO accumulators, filled in one pass:
+    //   strict — bilinear x normal x plane, the correct reconstruction;
+    //   loose  — bilinear over any VALID probe, plane test ignored.
+    // The loose one exists because the alternative when the strict test
+    // finds nothing is to fall back to the flat sky IBL, and that is a
+    // huge brightness step.  A pixel near a silhouette can pass the
+    // strict test one frame and fail it the next, and flipping between
+    // "traced GI" and "full unoccluded skylight" over a whole tile is
+    // the single most visible flicker this path can produce.  A
+    // neighbouring probe on a slightly different plane is a much
+    // smaller error than the open-sky cube, and it moves smoothly.
+    vec3  sum   = vec3(0.0);
+    float wsum  = 0.0;
+    vec3  sum_l = vec3(0.0);
+    float wsum_l = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 pc = p0 + ivec2(i, j);
+            if (any(lessThan(pc, ivec2(0))) ||
+                any(greaterThanEqual(pc, dim))) continue;
+            uint q  = uint(pc.y) * uint(dim.x) + uint(pc.x);
+            uint hb = giHdrOfs(nprobes, parity, q);
+            vec4 h0 = gi_accum[hb];
+            if (h0.w < 0.5) continue;                    // invalid probe
+            vec4 h1 = gi_accum[hb + 1u];
+
+            vec3 c[9];
+            uint sb = giShOfs(nprobes, parity, q, 0u);
+            for (int k = 0; k < 9; ++k) c[k] = gi_accum[sb + uint(k)].rgb;
+            vec3 E = giShIrradiance(c, N_shade);
+
+            // Small floor on the bilinear term so a pixel sitting
+            // exactly on a probe centre still gets its neighbours if
+            // that probe happens to be the invalid one.
+            float wb = (i == 0 ? 1.0 - fr.x : fr.x) *
+                       (j == 0 ? 1.0 - fr.y : fr.y) + 0.05;
+            sum_l  += E * wb;
+            wsum_l += wb;
+
+            float wn = dot(N, h1.xyz);
+            if (wn <= 0.0) continue;                     // facing away
+            float pd = abs(dot(world_pos - h0.xyz, N)) * plane_scale;
+            float w  = wb * (wn * wn) * exp(-pd * pd);
+            if (w <= 1e-5) continue;
+            sum  += E * w;
+            wsum += w;
+        }
+    }
+    if (wsum > 1e-4)   { o_E = sum   / wsum;   return true; }
+    if (wsum_l > 1e-4) { o_E = sum_l / wsum_l; return true; }
+    o_E = vec3(0.0);
+    return false;
+}
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
+    // Screen-probe GI trace runs on a completely different thread
+    // mapping (one workgroup per probe) — branch out before anything
+    // below interprets gl_GlobalInvocationID as a pixel.
+    if (rpc.pass_mode == 3u) {
+        giProbeTracePass();
+        return;
+    }
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = imageSize(hdr_out);
     if (px.x >= sz.x || px.y >= sz.y) return;
@@ -1529,14 +2221,106 @@ void main() {
         }
     }
 
+    // ── Render-path debug: WHO shaded this pixel ────────────────────
+    // Runs before the sentinel early-outs below, because the whole point
+    // is to report on the pixels this pass would otherwise SKIP.
+    //
+    // The test is the engine's own forward/deferred sentinel: the
+    // cluster G-buffer is cleared to alpha 0 and every GBUFFER_OUTPUT
+    // branch writes albedo_ao.a >= 0.5, so alpha < 0.5 on a pixel that
+    // HAS depth means "no G-buffer fragment here — a forward writer owns
+    // this pixel and its colour is already in hdr_out".
+    //
+    // Why this matters: only the deferred side runs RT GI, traced sky
+    // visibility and ReSTIR.  Anything red in this view is lit by the
+    // raw IBL cubes with no occlusion at all, which is the difference
+    // between a room that goes dark indoors and one that renders as
+    // bright as the lawn outside.
+    {
+        uint dbg_path =
+            (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+                >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+        bool path_view = (dbg_path == DEBUG_RENDER_MODE_RENDER_PATH);
+        bool hide_fwd =
+            (camera_info.input_features & FEATURE_INPUT_HIDE_FORWARD) != 0u;
+        bool hide_def =
+            (camera_info.input_features & FEATURE_INPUT_HIDE_DEFERRED) != 0u;
+        if (path_view || hide_fwd || hide_def) {
+            float z_path = texture(gbuf_depth, uv).r;
+            // Glass/water pixels first: CYAN in the path view, so "are
+            // the attributes even being written" is answerable at a
+            // glance (a black window with no cyan here means the
+            // glass-attribute pass never covered it).
+            if (path_view) {
+                float dbg_kind = texture(gbuf_glass_tint, uv).a;
+                if (dbg_kind > 0.1) {
+                    vec3 c = dbg_kind > 0.9 ? vec3(0.15, 0.55, 0.95)
+                                            : vec3(0.10, 0.95, 0.90);
+                    imageStore(hdr_out, px, vec4(linearTosRGB(c), 1.0));
+                    return;
+                }
+            }
+            if (z_path < 1.0) {                       // sky stays untouched
+                vec4 aa_path = texture(gbuf_albedo_ao, uv);
+                bool is_forward = aa_path.a < 0.5;
+                if (is_forward) {
+                    if (hide_fwd) {
+                        imageStore(hdr_out, px, vec4(0.0, 0.0, 0.0, 1.0));
+                        return;
+                    }
+                    if (path_view) {
+                        // No G-buffer to shade with, so shape comes from
+                        // depth: nearer reads brighter.  Flat-ish red is
+                        // deliberate — this pixel is the problem case.
+                        float linz = camera_info.depth_params.y /
+                                     (camera_info.depth_params.x + z_path);
+                        float sh = clamp(1.0 - linz / 300.0, 0.30, 1.0);
+                        imageStore(hdr_out, px,
+                                   vec4(linearTosRGB(
+                                       vec3(0.95, 0.16, 0.12) * sh), 1.0));
+                        return;
+                    }
+                } else {
+                    if (hide_def) {
+                        imageStore(hdr_out, px, vec4(0.0, 0.0, 0.0, 1.0));
+                        return;
+                    }
+                    if (path_view) {
+                        // G-buffer albedo gives this side real surface
+                        // detail, so the two halves are told apart by hue
+                        // AND by texture, not hue alone.
+                        float luma = dot(aa_path.rgb,
+                                         vec3(0.2126, 0.7152, 0.0722));
+                        float sh = 0.35 + 0.65 * clamp(luma, 0.0, 1.0);
+                        imageStore(hdr_out, px,
+                                   vec4(linearTosRGB(
+                                       vec3(0.18, 0.95, 0.34) * sh), 1.0));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Sky / empty pixels: depth was never written by the cluster G-buffer
     // pass.  Skip — sky envmap pass paints these later in drawScene.
     // In GEN mode store a neutral (lit, open) sample first so the blur
     // pass never smears uninitialised texels across geometry edges.
     float z = texture(gbuf_depth, uv).r;
     if (z >= 1.0) {
-        if (rpc.pass_mode == 1u)
+        if (rpc.pass_mode == 1u) {
             imageStore(rt_raw_out, px, vec4(1.0, 1.0, 0.0, 0.0));
+            return;
+        }
+        // Glass/water over open sky (a pane against the horizon, the
+        // far reach of the river): nothing opaque behind, so the
+        // transmission ray's miss-to-sky IS the correct background.
+        {
+            vec3 gcol;
+            if (glassWaterOverlay(uv, px, -1.0, gcol)) {
+                imageStore(hdr_out, px, vec4(sceneTonemap(gcol), 1.0));
+            }
+        }
         return;
     }
 
@@ -1547,8 +2331,24 @@ void main() {
     // Forward base (terrain/grass/hair/...) already lit these pixels in
     // its own forward pass; leave their colour alone.
     if (albedo_ao.a < 0.5) {
-        if (rpc.pass_mode == 1u)
+        if (rpc.pass_mode == 1u) {
             imageStore(rt_raw_out, px, vec4(1.0, 1.0, 0.0, 0.0));
+            return;
+        }
+        // THE glass path: a window pane / water surface wrote depth in
+        // its forward pass, so the pixel has depth but no G-buffer —
+        // and the attribute pass tagged it.  Both secondary rays are
+        // traced from the surface point; the traced transmission sees
+        // the room behind the window and the river bed under the
+        // water, neither of which the screen has.
+        {
+            float fwd_lin_z = camera_info.depth_params.y /
+                              (camera_info.depth_params.x + z);
+            vec3 gcol;
+            if (glassWaterOverlay(uv, px, fwd_lin_z * 1.02, gcol)) {
+                imageStore(hdr_out, px, vec4(sceneTonemap(gcol), 1.0));
+            }
+        }
         return;
     }
 
@@ -1705,7 +2505,30 @@ void main() {
     // "full open sky" lambertian estimate at the same normal — ~1 in the
     // open, ~0 inside an enclosed room, in between at windows/doorways.
     float traced_sky_vis = 1.0;
-    if ((camera_info.input_features & FEATURE_INPUT_RT_GI) != 0u) {
+    if ((camera_info.input_features &
+         (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) ==
+        (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) {
+        // ── Lumen-style screen probe gather ──────────────────────────
+        // All the tracing already happened in the pass_mode 3 dispatch
+        // (0.25 rays/pixel, coherent, one probe per 16x16 tile).  What
+        // is left here is a 4-tap bilateral blend of pre-integrated SH —
+        // no rays, no per-pixel history, nothing that scales with ray
+        // cost.  Falls back to the flat sky IBL only where every
+        // neighbouring probe is unusable.
+        float view_lin_z =
+            camera_info.depth_params.y / (camera_info.depth_params.x + z);
+        vec3 gi_E;
+        if (giProbeGather(px, sz, world_pos, N_geom, N, view_lin_z, gi_E)) {
+            ambient_diffuse = c_diff * gi_E * ao;
+            vec3 flat_sky = texture(lambertian_env_sampler, N).rgb;
+#ifndef USE_HDR
+            flat_sky = sRGBToLinear(flat_sky);
+#endif
+            traced_sky_vis = clamp(
+                restirLuma(gi_E) / max(restirLuma(flat_sky), 1e-4),
+                0.0, 1.0);
+        }
+    } else if ((camera_info.input_features & FEATURE_INPUT_RT_GI) != 0u) {
         uint  gi_w    = uint(sz.x);
         uint  gi_half = uint(sz.x) * uint(sz.y);
         bool  gi_par  =
@@ -1728,15 +2551,17 @@ void main() {
 #ifdef HW_RT_SHADOW
         if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW)
             != 0u) {
+            float gi_t_unused;
             gi_s = hwRtGiRadiance(
                 world_pos + N_geom * RT_GI_NORMAL_BIAS, gi_dir,
-                L, light_col);
+                L, light_col, gi_t_unused);
         } else
 #endif
         {
+            float gi_t_unused;
             gi_s = rtGiRadiance(
                 world_pos + N_geom * RT_GI_NORMAL_BIAS, gi_dir,
-                L, light_col);
+                L, light_col, gi_t_unused);
         }
 
         // Temporal accumulation with velocity reprojection.
@@ -1911,7 +2736,18 @@ void main() {
     // shoulder.  Debug views (dbg_mode != 0) stay raw linearTosRGB so
     // ROUGHNESS/SHADOW/etc. remain readable data, not display imagery.
     if (dbg_mode == 0u) {
-        imageStore(hdr_out, px, vec4(sceneTonemap(color), 1.0));
+        // Glass/water overlay for pixels whose opaque background this
+        // dispatch just shaded: only applies when the tagged surface is
+        // nearer than the opaque depth (see glassWaterOverlay's guard).
+        float opq_lin_z = camera_info.depth_params.y /
+                          (camera_info.depth_params.x + z);
+        vec3 gcol;
+        if (rpc.pass_mode != 1u &&
+            glassWaterOverlay(uv, px, opq_lin_z, gcol)) {
+            imageStore(hdr_out, px, vec4(sceneTonemap(gcol), 1.0));
+        } else {
+            imageStore(hdr_out, px, vec4(sceneTonemap(color), 1.0));
+        }
     } else {
         imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));
     }

@@ -307,6 +307,21 @@
 // FEATURE_INPUT_RESTIR_PARITY.  Raised by the app whenever any RT
 // shadow technique is active and the software BVH exists.
 #define FEATURE_INPUT_RT_GI                     0x00000400
+// Screen-probe GI (Lumen-style screen probe gather).  Modifies HOW
+// FEATURE_INPUT_RT_GI is evaluated — it does not enable GI on its own,
+// and is only meaningful when RT_GI is also set.  With this bit raised
+// the resolve stops tracing per pixel entirely: a separate pass_mode 3
+// dispatch traces ONE probe per 16x16 pixel tile (64 hemi-octahedral
+// rays each = 0.25 rays/pixel instead of 1.0, and coherent within a
+// workgroup), temporally accumulates the probe atlas, projects it to
+// 2nd-order SH, and the shading pass reconstructs each pixel's
+// irradiance by bilaterally blending the 4 surrounding probes.  It also
+// closes the cache loop: a GI ray's HIT point reads last frame's probes
+// for the light arriving there instead of the old constant sky leak, so
+// the estimator becomes multi-bounce (converging over a few frames)
+// rather than single-bounce.  See the SCREEN-PROBE GI block and
+// giProbeSecondBounce() in deferred_resolve.comp.
+#define FEATURE_INPUT_GI_SCREEN_PROBE           0x00002000
 // Reservoir ping-pong parity for the current frame: 0 → read half A / write
 // half B, 1 → the reverse.  Flipped by the app each frame.
 #define FEATURE_INPUT_RESTIR_PARITY             0x00000200
@@ -335,6 +350,19 @@
 // (8 bits, values 0..255).  base.frag and cluster_bindless.frag both unpack
 // it as `(input_features >> SHIFT) & 0xFF` and override outColor when the
 // value is non-zero.  Driven by the "Render Debug" combo in the menu bar.
+// ── Render-path isolation (debug) ────────────────────────────────────
+// Companions to DEBUG_RENDER_MODE_RENDER_PATH, but they work in ANY
+// debug mode (including 0 / final shaded) so you can judge a path's real
+// output rather than a tint.  Applied in deferred_resolve.comp, which is
+// the one pass that sees every pixel AND the forward/deferred sentinel:
+//   HIDE_FORWARD   blacks out pixels no G-buffer fragment covered
+//                  -> what remains is exactly the deferred content
+//   HIDE_DEFERRED  blacks out pixels the G-buffer DID cover
+//                  -> what remains is exactly the forward content
+// Sky is left alone by both, so the horizon stays readable.
+#define FEATURE_INPUT_HIDE_FORWARD              0x00000800
+#define FEATURE_INPUT_HIDE_DEFERRED             0x00001000
+
 #define FEATURE_INPUT_DEBUG_MODE_SHIFT          16
 #define FEATURE_INPUT_DEBUG_MODE_MASK           0x00FF0000
 
@@ -424,6 +452,25 @@
                                                     // G-buffer doesn't carry per-vertex skin
                                                     // weights, so application.cpp force-flips
                                                     // to forward while it's active.
+
+// ── Which pass shaded this pixel ─────────────────────────────────────
+// DEBUG_RENDER_MODE_RENDER_PATH tints every non-sky pixel by the pass
+// that owns it, using the engine's own test: the cluster G-buffer's
+// albedo_ao.a sentinel (>= 0.5 means a G-buffer fragment landed here and
+// deferred_resolve.comp shaded it; < 0.5 means nothing wrote the
+// G-buffer and the pixel keeps whatever the FORWARD writers left).
+//
+//   GREEN  deferred  — shaded by deferred_resolve.comp (RT GI, traced
+//                      sky visibility, ReSTIR all apply here)
+//   RED    forward   — shaded by base.frag / cluster_bindless.frag /
+//                      tile.frag, which have NO ray tracer bound and so
+//                      light purely from the unoccluded IBL cubes
+//   grey             — sky / empty (no depth written)
+//
+// Entirely resolved inside deferred_resolve.comp: that pass already
+// visits every pixel and already knows the sentinel, so no forward
+// shader needed a debug branch added to it.
+#define DEBUG_RENDER_MODE_RENDER_PATH           16
 
 #define LIGHT_COUNT                             1
 // 6 cascades (was 4): smaller extent ratio between adjacent cascades
@@ -631,8 +678,18 @@ struct ViewParams {
     vec4 depth_params;
 };
 
+// Bit 2 of ModelParams::flip_uv_coord (bits 0/1 are the UV flips).
+// Set by drawNodeMesh for nodes the generator marked as building
+// INTERIOR — house "_int_lodtile_" bands and "_pgate_" mode-0 room
+// props.  base.frag scales its IBL ambient by kInteriorSkyAmbient when
+// this is set: the forward path has no ray tracer, so without it a
+// windowless room receives the SAME full-sky irradiance as open ground
+// (see the block comment at kInteriorSkyAmbient in base.frag).
+#define MODEL_FLAG_INTERIOR 0x04u
+
 struct ModelParams {
     mat4 model_mat;
+    // bits 0/1: flip U / flip V.  bit 2: MODEL_FLAG_INTERIOR (above).
     uint flip_uv_coord;
     // cascade_idx: only consumed by the CSM_PER_CASCADE permutation of
     // base_depthonly.vert (DrawMode::kCsmPerCascade — the "Regular"
@@ -713,6 +770,26 @@ struct ModelParams {
     // halves partition every pixel.  Written by drawNodeMesh for nodes
     // with lod_per_instance_.
     float model_params_pad0;
+};
+
+// ── LBM river-surface sim (lbm_water.comp push constants) ────────────
+// The patch follows the camera: origin_ws is this frame's patch corner
+// in world space, prev_origin_ws last frame's — the compute shifts its
+// pull-streaming reads by the delta so the water state stays anchored
+// to the WORLD while the window slides.  vec4s for C++/GLSL layout
+// agreement (xz used).
+struct LbmWaterParams {
+    vec4  origin_ws;        // xz = patch corner, world metres
+    vec4  prev_origin_ws;
+    vec4  flow_dir;         // xy = mean river flow dir (world xz)
+    float cell_m;           // lattice spacing, metres
+    float dt;               // step seconds (per frame)
+    float rest_depth;       // rest water column, metres
+    float time;             // scene seconds, for the stirring term
+    float flow_strength;    // body-force magnitude
+    float normal_amp;       // visual ripple amplification
+    uint  grid_size;        // cells per side
+    uint  reset;            // 1 = reinitialise every cell to rest
 };
 
 struct PrtLightParams {

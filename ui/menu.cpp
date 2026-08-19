@@ -2276,6 +2276,22 @@ bool Menu::draw(
                     rt_smoothing_ = !rt_smoothing_;
                 }
 
+                // Indirect diffuse estimator.  OFF (default) = the
+                // original one cosine ray per pixel — slower, but the
+                // temporally stable one, so it stays the default.  ON =
+                // Lumen-style screen probe gather: one probe per 16x16
+                // pixel tile, 64 hemi-octahedral rays each, temporally
+                // accumulated, SH-projected and bilaterally
+                // reconstructed per pixel, plus a second bounce read out
+                // of the probe cache — 0.25 rays/pixel and coherent
+                // within a workgroup, but still shimmier than the
+                // per-pixel path.  Shadows are NOT affected either way;
+                // this only changes GI.
+                if (ImGui::MenuItem("Screen-probe GI (Lumen-style)", NULL,
+                                    gi_screen_probe_)) {
+                    gi_screen_probe_ = !gi_screen_probe_;
+                }
+
                 // CSM silhouette prepass — see the member field comment in
                 // menu.h and csm_silhouette_prepass.mesh's header.  Off →
                 // the shadow pass clears depth to 1.0 (legacy) and skips
@@ -9363,6 +9379,7 @@ void Menu::drawRenderDebugMenuContent() {
         { 13, "13: Mesh category (solid)"  },
         { 14, "14: Object ID (per mesh)"   },
         { 15, "15: Weight sum (skin)"      },
+        { 16, "16: Render path (fwd/deferred)"},
     };
     for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
         const auto& item = kRenderDebugItems[i];
@@ -9370,6 +9387,26 @@ void Menu::drawRenderDebugMenuContent() {
         if (ImGui::MenuItem(item.label, NULL, selected)) {
             debug_render_mode_ = item.mode_id;
         }
+    }
+
+    // ── Render-path isolation ───────────────────────────────────────
+    // Mode 16 above TINTS the two paths; these two black one of them out
+    // so the other can be judged on its own real shading (works in every
+    // mode, including 0 / final).  Only the deferred side runs RT GI and
+    // traced sky visibility, so "Forward only" is the quickest way to see
+    // what is still lit by the raw, unoccluded IBL cubes.
+    ImGui::Separator();
+    if (ImGui::MenuItem("Deferred only (hide forward)", NULL,
+                        debug_hide_forward_)) {
+        debug_hide_forward_ = !debug_hide_forward_;
+        // Hiding both leaves nothing but sky, which reads as a bug
+        // rather than a view — so the two are exclusive here.
+        if (debug_hide_forward_) debug_hide_deferred_ = false;
+    }
+    if (ImGui::MenuItem("Forward only (hide deferred)", NULL,
+                        debug_hide_deferred_)) {
+        debug_hide_deferred_ = !debug_hide_deferred_;
+        if (debug_hide_deferred_) debug_hide_forward_ = false;
     }
 
     // ── Skeleton view selector ──────────────────────────────────────

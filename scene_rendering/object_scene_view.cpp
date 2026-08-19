@@ -123,6 +123,163 @@ void ObjectSceneView::duplicateDepthBuffer(
         m_depth_buffer_copy_->size);
 }
 
+void ObjectSceneView::drawGbuffer(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& buffer_size) {
+
+    if (m_drawable_objects_.empty() || !depth_view) {
+        return;
+    }
+
+    renderer::DescriptorSetList desc_set_list = desc_sets;
+    desc_set_list[VIEW_PARAMS_SET] =
+        m_camera_object_->getViewCameraDescriptorSet();
+
+    {
+        // LOAD everything: the cluster phases and the terrain G-buffer
+        // pass already wrote these targets; the drawables add their
+        // pixels on top, depth-gated against the forward pass's depth.
+        std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+        color_attachment_infos.reserve(gbuffer_views.size());
+        for (const auto& view : gbuffer_views) {
+            er::RenderingAttachmentInfo attachment_info;
+            attachment_info.image_view = view;
+            attachment_info.image_layout =
+                er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+            attachment_info.store_op = er::AttachmentStoreOp::STORE;
+            color_attachment_infos.push_back(attachment_info);
+        }
+
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = depth_view;
+        depth_attachment_info.image_layout =
+            er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { buffer_size.x, buffer_size.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = color_attachment_infos;
+        renderingInfo.depth_attachments = { depth_attachment_info };
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(buffer_size.x);
+    viewports[0].height = float(buffer_size.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = buffer_size;
+
+    // Same eye publish as draw(): the LOD band memo keys on the eye, so
+    // this pass re-uses the exact band selection the forward pass made
+    // this frame — the G-buffer can never disagree with the forward
+    // depth about which LOD is standing at a tile.
+    ego::DrawableObject::setPlantLodEye(
+        m_camera_object_->getCameraViewInfo().position);
+
+    for (auto& drawable_obj : m_drawable_objects_) {
+        drawable_obj->draw(
+            cmd_buf,
+            desc_set_list,
+            viewports,
+            scissors,
+            false,
+            ego::DrawableObject::DrawMode::kGBuffer,
+            0u);
+    }
+
+    cmd_buf->endDynamicRendering();
+}
+
+void ObjectSceneView::drawGlassForward(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::shared_ptr<renderer::ImageView>& color_view,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& buffer_size) {
+
+    if (m_drawable_objects_.empty() || !color_view || !depth_view) {
+        return;
+    }
+
+    renderer::DescriptorSetList desc_set_list = desc_sets;
+    desc_set_list[VIEW_PARAMS_SET] =
+        m_camera_object_->getViewCameraDescriptorSet();
+
+    {
+        // LOAD both: the whole point is to blend onto the finished
+        // scene, and the depth (with writes off in the pipeline) only
+        // gates panes behind walls.
+        std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+        er::RenderingAttachmentInfo attachment_info;
+        attachment_info.image_view = color_view;
+        attachment_info.image_layout =
+            er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        attachment_info.store_op = er::AttachmentStoreOp::STORE;
+        color_attachment_infos.push_back(attachment_info);
+
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = depth_view;
+        depth_attachment_info.image_layout =
+            er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { buffer_size.x, buffer_size.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = color_attachment_infos;
+        renderingInfo.depth_attachments = { depth_attachment_info };
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(buffer_size.x);
+    viewports[0].height = float(buffer_size.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = buffer_size;
+
+    ego::DrawableObject::setPlantLodEye(
+        m_camera_object_->getCameraViewInfo().position);
+
+    for (auto& drawable_obj : m_drawable_objects_) {
+        drawable_obj->draw(
+            cmd_buf,
+            desc_set_list,
+            viewports,
+            scissors,
+            false,
+            ego::DrawableObject::DrawMode::kGlassAttr,
+            0u);
+    }
+
+    cmd_buf->endDynamicRendering();
+}
+
 void ObjectSceneView::drawDecals(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_sets,

@@ -422,6 +422,16 @@ struct NodeInfo {
     // drawNodeMesh); the CPU pass keeps only a conservative
     // node-level cull.  Set by parsePlantLodBands.
     uint8_t                     lod_per_instance_ = 0;
+    // ── Building interior (forward-path sky occlusion) ────────────
+    // 1 for geometry the generator marked as INSIDE a building: the
+    // house "_int_lodtile_" band (interior shell, door leaves) and the
+    // "_pgate_" mode-0 room props (furniture, which exists only when
+    // the eye is at the house).  drawNodeMesh forwards it to base.frag
+    // as MODEL_FLAG_INTERIOR, which scales the environment term down —
+    // the forward path has no ray tracer, so without this a room gets
+    // full open-sky irradiance and renders as bright as the lawn.
+    // Set by parsePlantLodBands alongside the LOD/gate parse.
+    uint8_t                     interior_ = 0;
     // ── Proximity gate (house interiors / door leaves) ────────────
     // Parsed from a "_pgate_<x_dm>_<z_dm>_<r_dm>_<mode>" marker in the
     // node name (decimetre ints).  mode 0: node draws ONLY when the eye
@@ -991,6 +1001,28 @@ private:
     // Selected by DrawMode::kDecal; populated only for objects the host
     // registered via ObjectSceneView::addDecalObject.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_decal_pipeline_list_;
+    // ── G-buffer pipelines (DrawMode::kGBuffer) ───────────────────────
+    // base_vert_* + base_frag_*_GBUF against the 4-RT cluster G-buffer
+    // formats: depth test LESS_OR_EQUAL, depth writes OFF — the pass
+    // re-rasterises the drawables over the depth the forward pass
+    // already stamped, adding material attributes only where they are
+    // the visible surface (same contract as terrain's tile_gbuf pass).
+    // Populated lazily at the same three sites as the forward list, but
+    // only for non-skinned primitives WITH a material — skinned
+    // characters keep forward shading (static-world velocity would be
+    // wrong for them), and _NOMTL has no _GBUF permutation compiled.
+    // Requires setGbufferRenderbufferFormats() to have been called; the
+    // application does so right after it builds the G-buffer formats.
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_gbuffer_pipeline_list_;
+    static renderer::PipelineRenderbufferFormats gbuffer_renderbuffer_formats_;
+    static bool gbuffer_formats_valid_;
+    // ── Glass-attribute pipelines (DrawMode::kGlassAttr) ──────────────
+    // base_vert_* + base_frag_*_GLASS against the two glass targets:
+    // depth test LESS_OR_EQUAL vs the forward pass's depth, writes off.
+    // Same population sites and skip rules as the G-buffer list.
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_glass_pipeline_list_;
+    static renderer::PipelineRenderbufferFormats glass_renderbuffer_formats_;
+    static bool glass_formats_valid_;
     static std::shared_ptr<renderer::DescriptorSetLayout> mesh_shader_shadow_desc_set_layout_;
     static std::shared_ptr<renderer::PipelineLayout>      mesh_shader_shadow_pipeline_layout_;
     static std::unordered_map<std::string, std::shared_ptr<DrawableData>> drawable_object_list_;
@@ -1406,6 +1438,15 @@ public:
                         // SSBOs.  Ineligible primitives (skinned,
                         // cutout, UINT16 indices, >256 verts/tris) fall
                         // back to the GS pipeline inside drawMesh.
+        kGlassAttr,     // Glass/water attribute pass: ONLY Blend/glass
+                        // primitives, into the two glass targets the
+                        // resolve ray-traces reflection/refraction from.
+                        // Uses drawable_glass_pipeline_list_.
+        kGBuffer,       // Deferred re-rasterise: material attributes into
+                        // the 4-RT cluster G-buffer (depth-gated LEQUAL
+                        // against the forward pass's depth, no depth
+                        // writes).  deferred_resolve.comp lights the
+                        // pixels.  Uses drawable_gbuffer_pipeline_list_.
         kDecal,         // Ground-decal forward pass.  Lit exactly like
                         // kForward — same VS, same material bindings —
                         // but runs AFTER the terrain tiles, with alpha
@@ -1434,6 +1475,24 @@ public:
     // Static accessor for the mesh-shader shadow pipeline layout.
     // Needed by drawMesh (file-scope static) which can't reach the
     // private static directly.
+    // Hand the drawable path the G-buffer attachment formats so the
+    // population sites can build DrawMode::kGBuffer pipelines.  Call
+    // once at init (application.cpp, right after the formats are
+    // assembled) and again on any format change; idempotent.
+    static void setGbufferRenderbufferFormats(
+        const renderer::PipelineRenderbufferFormats& formats) {
+        gbuffer_renderbuffer_formats_ = formats;
+        gbuffer_formats_valid_ = true;
+    }
+
+    // Same contract for the glass-attribute targets (octN/linZ/rough +
+    // tint/kind).  Call once at init, before assets import.
+    static void setGlassRenderbufferFormats(
+        const renderer::PipelineRenderbufferFormats& formats) {
+        glass_renderbuffer_formats_ = formats;
+        glass_formats_valid_ = true;
+    }
+
     static const std::shared_ptr<renderer::PipelineLayout>&
         getMeshShaderShadowPipelineLayout() {
         return mesh_shader_shadow_pipeline_layout_;

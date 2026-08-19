@@ -23,7 +23,41 @@ layout(location = 0) in VsPsData {
     float   water_depth;
 } in_data;
 
+#ifdef WATER_ATTR
+// Water attribute permutation (tile_water_attr_frag.spv): river/pond
+// surfaces re-rasterise into the same two GLASS ATTRIBUTE targets the
+// window glass writes, tagged KIND = 1.0 (water).  The deferred
+// resolve then runs REAL ray-traced reflection AND refraction for the
+// surface — the screen-space refraction hack in the forward branch
+// below can only bend what is already on screen; the traced version
+// sees the river bed, the far bank, the bridge above.
+//   attr0 = octEncode(N).xy, linear view depth (m), roughness
+//   attr1 = water tint rgb, 1.0
+layout(location = 0) out vec4 out_glass_nr;
+layout(location = 1) out vec4 out_glass_tint;
+
+// LBM river-surface sim output (lbm_water.comp): xyz = ripple normal,
+// w = height deviation.  Bound on a DEDICATED set 3 so the existing
+// tile descriptor layouts stay byte-identical for every other pass.
+layout(set = 3, binding = 0) uniform sampler2D lbm_surface_tex;
+layout(std430, set = 3, binding = 1) readonly buffer LbmRegionBuf {
+    // xz = patch origin (world m), y = cell size, w = grid size
+    vec4 lbm_region;
+};
+
+vec2 octEncodeDir(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 oct = (n.z >= 0.0) ? n.xy
+                            : (1.0 - abs(n.yx)) * vec2(
+                                  n.x >= 0.0 ? 1.0 : -1.0,
+                                  n.y >= 0.0 ? 1.0 : -1.0);
+    return oct * 0.5 + 0.5;
+}
+
+vec4 outColor;   // satisfies the dead forward code past our early return
+#else
 layout(location = 0) out vec4 outColor;
+#endif
 
 vec3  kSunDir = vec3(-0.624695f, 0.468521f, -0.624695f);
 
@@ -66,6 +100,41 @@ void main() {
     water_normal.xz += water_flow * 0.5;
     water_normal.y += water_noise * 0.35;
     water_normal = normalize(water_normal);
+
+#ifdef WATER_ATTR
+    {
+        // Blend the LBM ripple normal in where the camera-following
+        // patch covers this fragment: the D2Q9 sim carries travelling
+        // waves, wakes and rain-rings the procedural noise can't, and
+        // it fades back to the noise normal at the patch edge so the
+        // handoff is invisible.
+        float lbm_cell = lbm_region.y;
+        float lbm_span = lbm_region.w * lbm_cell;
+        if (lbm_span > 1.0) {
+            vec2 luv = (pos.xz - lbm_region.xz) / lbm_span;
+            if (all(greaterThan(luv, vec2(0.0))) &&
+                all(lessThan(luv, vec2(1.0)))) {
+                vec3 lbm_n = texture(lbm_surface_tex, luv).xyz;
+                // edge fade over the outer 15% of the patch
+                vec2 ef = smoothstep(0.0, 0.15, luv) *
+                          (1.0 - smoothstep(0.85, 1.0, luv));
+                float wgt = ef.x * ef.y;
+                water_normal = normalize(
+                    mix(water_normal, lbm_n, 0.8 * wgt));
+            }
+        }
+        float water_linz = camera_info.depth_params.y /
+                           (camera_info.depth_params.x + gl_FragCoord.z);
+        out_glass_nr = vec4(octEncodeDir(water_normal),
+                            water_linz,
+                            0.06);          // near-mirror water
+        // Absorption tint the resolve applies per metre of refracted
+        // travel — deep river water pulls toward blue-green.
+        out_glass_tint = vec4(0.12, 0.32, 0.38, 1.0);
+        return;
+    }
+#endif // WATER_ATTR
+
     vec2 screen_uv = gl_FragCoord.xy * tile_params.inv_screen_size;
     float dist_scale = length(vec3((screen_uv * 2.0f - 1.0f) * camera_info.depth_params.zw, 1.0f));
 

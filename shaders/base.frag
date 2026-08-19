@@ -40,7 +40,58 @@ layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
 
 layout(location = 0) in ObjectVsPsData ps_in_data;
 
+#ifdef GBUFFER_OUTPUT
+// Deferred permutation (base_frag*_GBUF.spv): the classic drawable path
+// re-rasterises into the cluster G-buffer instead of shading forward,
+// exactly the way tile_gbuf_frag re-rasterises terrain.  Layout and
+// packing MUST match cluster_bindless.frag's GBUFFER_OUTPUT branch and
+// tile.frag — deferred_resolve.comp decodes all three identically.
+layout(location = 0) out vec4 out_albedo_ao;
+layout(location = 1) out vec4 out_normal_rough;
+layout(location = 2) out vec4 out_emissive_metal;
+layout(location = 3) out vec2 out_velocity;
+
+// The forward path's code after our early return still names outColor;
+// a plain global (not an output) lets it compile and the compiler
+// dead-strips everything past the return.
+vec4 outColor;
+
+// Octahedral encode — identical to cluster_bindless.frag's copy, paired
+// with octDecode in deferred_resolve.comp.
+vec2 octEncodeDir(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 oct = (n.z >= 0.0) ? n.xy
+                            : (1.0 - abs(n.yx)) * vec2(
+                                  n.x >= 0.0 ? 1.0 : -1.0,
+                                  n.y >= 0.0 ? 1.0 : -1.0);
+    return oct * 0.5 + 0.5;
+}
+#elif defined(GLASS_ATTR)
+// Glass/water attribute permutation (base_frag*_GLASS.spv): the glass
+// panes of windows and doors re-rasterise into the two GLASS ATTRIBUTE
+// targets after the opaque G-buffer passes; deferred_resolve.comp then
+// shades them with REAL ray-traced reflection and refraction against
+// the cluster TLAS/BVH.  Packing (decoded in the resolve):
+//   attr0 = octEncode(N).xy, linear view depth (m), roughness
+//   attr1 = transmission tint rgb, KIND — 0.25+0.5*alpha for glass
+//           (encodes the material alpha), 1.0 for water (written by
+//           the terrain water-attr pass, not this shader)
+layout(location = 0) out vec4 out_glass_nr;
+layout(location = 1) out vec4 out_glass_tint;
+
+vec4 outColor;   // satisfies the dead code past our early return
+
+vec2 octEncodeDir(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 oct = (n.z >= 0.0) ? n.xy
+                            : (1.0 - abs(n.yx)) * vec2(
+                                  n.x >= 0.0 ? 1.0 : -1.0,
+                                  n.y >= 0.0 ? 1.0 : -1.0);
+    return oct * 0.5 + 0.5;
+}
+#else
 layout(location = 0) out vec4 outColor;
+#endif
 
 #ifdef DECAL
 // ── Ground-decal soft blend ──────────────────────────────────────────
@@ -265,6 +316,33 @@ float calculateShadowFactor(
     return mix(sum * (1.0 / float(CSM_PCF_SAMPLES)), 1.0, range_fade);
 }
 
+// ── Interior sky occlusion (forward path) ────────────────────────────
+// The IBL cubes hold OPEN-SKY irradiance, and iblLighting() adds them
+// unconditionally — no AO, no visibility term.  Outdoors that is right;
+// inside a house it means a room with one small window receives exactly
+// the same skylight as the lawn outside, which is why interiors render
+// as bright as noon with no lights placed.
+//
+// The deferred path solves this properly: deferred_resolve.comp REPLACES
+// the flat ambient with a traced 1-bounce GI estimate and scales the
+// specular IBL by the traced sky visibility.  The forward path has no
+// ray tracer bound (no BVH/TLAS in its descriptor sets), so it gets the
+// cheap approximation instead: geometry the generator already marked as
+// interior (MODEL_FLAG_INTERIOR) keeps this fraction of the sky term.
+//
+// 0.10 is the rule-of-thumb daylight factor for a room with modest
+// glazing — real rooms sit around 2-10% of the outdoor horizontal
+// illuminance.  Direct sun through the window still arrives at full
+// strength via the punctual term below, so a sunbeam on the floor stays
+// bright while the room around it falls back to a plausible interior
+// level.  This is an APPROXIMATION, not a light transport solution: it
+// cannot know where the windows are.
+// 0.18 (was 0.10): with the panes now truly translucent the window
+// itself reads bright, and a 10% interior against that contrast felt
+// like a cellar.  Still inside the plausible daylight-factor band for
+// a well-glazed room.
+const float kInteriorSkyAmbient = 0.18;
+
 // ── LOD band cross-fade dissolve ─────────────────────────────────────
 // See ModelParams::lod_fade.  A tile inside a band transition is drawn
 // by BOTH neighbouring bands; this screen-door test decides, per pixel,
@@ -328,6 +406,88 @@ void main() {
             v,
             baseColor.xyz);
 
+#ifdef GLASS_ATTR
+    // ── Glass: write reflection/refraction attributes and stop ───────
+    // Only Blend-mode (glass-forced) primitives reach this pipeline —
+    // DrawableObject::draw filters by material in DrawMode::kGlassAttr.
+    // The pass depth-tests LEQUAL against the opaque depth with writes
+    // off, so panes behind walls never shade; among overlapping panes
+    // the last write wins (window glass rarely stacks on screen).
+    {
+        float glass_linz = camera_info.depth_params.y /
+                           (camera_info.depth_params.x + gl_FragCoord.z);
+        // Face the normal toward the viewer: a pane seen from either
+        // side reflects on the side you look at.
+        vec3 gn = normal_info.n;
+        if (dot(gn, v) < 0.0) gn = -gn;
+        // Real window glass is smooth whatever the albedo pipeline's
+        // default roughnessFactor says — clamp so the traced
+        // reflection stays a reflection.
+        out_glass_nr = vec4(octEncodeDir(gn),
+                            glass_linz,
+                            min(material_info.perceptualRoughness, 0.08));
+        float glass_alpha = clamp(baseColor.a, 0.0, 1.0);
+        // Transmission tint: clear glass passes ~90% of the light with
+        // only a HINT of the authored pane colour.  Multiplying by the
+        // raw window-texture albedo (a dark blue) crushed everything
+        // seen through a window toward black — the texture is how the
+        // pane looked as an OPAQUE quad, not a transmittance spectrum.
+        vec3 glass_tint = mix(vec3(0.92), normalize(baseColor.rgb + 1e-4)
+                                              * 0.92, 0.35);
+        out_glass_tint = vec4(glass_tint,
+                              0.25 + 0.5 * glass_alpha);
+    }
+    return;
+#endif // GLASS_ATTR
+
+#ifdef GBUFFER_OUTPUT
+    // ── Deferred: write material attributes and stop ─────────────────
+    // No lighting runs in this permutation — deferred_resolve.comp does
+    // PBR once per visible pixel with the traced shadow / RT-GI /
+    // traced-sky-visibility path, which is the entire point of routing
+    // these drawables through the G-buffer (a forward-shaded house gets
+    // the raw unoccluded IBL cubes; a deferred one gets a room that
+    // actually goes dark).  The LOD dissolve / per-instance-band
+    // discards already ran at the top of main(), so the G-buffer
+    // respects the same dithered band handoff the forward pass shows.
+#if defined(ALPHAMODE_MASK) && !defined(DECAL)
+    // The forward path's cutout discard sits AFTER its lighting; here it
+    // must run before the writes or masked foliage would stamp opaque
+    // rectangles into the G-buffer.
+    if (baseColor.a < material.alpha_cutoff) {
+        discard;
+    }
+#endif // ALPHAMODE_MASK
+    // .a >= 0.5 is the resolve's "G-buffer written" sentinel — see
+    // tile.frag, which compresses its AO into [0.5, 1] for the same
+    // reason.  The drawable path has no baked AO, so a flat 1.0.
+    out_albedo_ao = vec4(baseColor.rgb, 1.0);
+    // flags.w = 0: no foliage-SSS classification on this path (parity
+    // with the forward branch, which never applied foliageTranslucency
+    // to classic drawables either).
+    out_normal_rough = vec4(
+        octEncodeDir(normal_info.n),
+        material_info.perceptualRoughness, 0.0);
+    vec2 oct_geom_dr = octEncodeDir(normal_info.ng);
+    out_emissive_metal =
+        vec4(oct_geom_dr.x, oct_geom_dr.y, 0.0, material_info.metallic);
+    // Static-world velocity from the camera matrices, exactly like
+    // tile.frag: this permutation is only built for NON-skinned vertex
+    // layouts (see CompileShaders.cmake), so world positions are
+    // camera-relative-constant and the matrix delta IS the velocity.
+    {
+        vec4 cur_clip =
+            camera_info.view_proj *
+            vec4(ps_in_data.vertex_position, 1.0);
+        vec4 prev_clip =
+            camera_info.prev_view_proj *
+            vec4(ps_in_data.vertex_position, 1.0);
+        out_velocity =
+            cur_clip.xy / cur_clip.w - prev_clip.xy / prev_clip.w;
+    }
+    return;
+#endif // GBUFFER_OUTPUT
+
     // Skip shadow sampling when the pass is disabled (avoids stale/zero CSM
     // texture reads that would incorrectly shadow the whole scene).
     float shadow = 1.0;
@@ -363,6 +523,15 @@ void main() {
         material,
         material_info,
         back_normal_info, v);
+    // Interior sky occlusion — see kInteriorSkyAmbient.  Applied HERE,
+    // between the IBL and punctual calls, so it scales only the
+    // environment term: the sun (and its shadow) is untouched.
+    if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u) {
+        back_color_info.f_specular  *= kInteriorSkyAmbient;
+        back_color_info.f_diffuse   *= kInteriorSkyAmbient;
+        back_color_info.f_clearcoat *= kInteriorSkyAmbient;
+        back_color_info.f_sheen     *= kInteriorSkyAmbient;
+    }
 #endif // USE_IBL
 
 	// Calculate lighting contribution from punctual light sources
@@ -391,6 +560,13 @@ void main() {
         material,
         material_info,
         normal_info, v);
+    // Interior sky occlusion — see kInteriorSkyAmbient.
+    if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u) {
+        color_info.f_specular  *= kInteriorSkyAmbient;
+        color_info.f_diffuse   *= kInteriorSkyAmbient;
+        color_info.f_clearcoat *= kInteriorSkyAmbient;
+        color_info.f_sheen     *= kInteriorSkyAmbient;
+    }
 #endif // USE_IBL
 
 	// Calculate lighting contribution from punctual light sources

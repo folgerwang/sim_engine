@@ -56,6 +56,15 @@ static glm::vec4 s_frustum_planes[6];
 // place to publish the camera position.
 static bool      s_viewer_pos_valid = false;
 static glm::vec3 s_viewer_pos_ws = glm::vec3(0.0f);
+// ── Render-path material filter ──────────────────────────────────────
+// Set by DrawableObject::draw from the draw mode, read by drawMesh's
+// primitive loop.  0 = draw everything (default), 1 = exclude
+// Blend/glass primitives (the opaque G-buffer pass — an opaque
+// G-buffer cannot hold translucency), 2 = ONLY Blend/glass primitives
+// (the glass-attribute pass).  A static like the frustum/viewer state
+// above so the filter reaches drawMesh without widening four
+// signatures; every draw() sets it, so it can never go stale.
+static int       s_material_filter = 0;
 
 // ── Eye position for plant LOD LOD selection ──────────────────────────
 // Separate from s_viewer_pos_ws and never cleared; see the doc-comment on
@@ -2886,6 +2895,9 @@ static void parsePlantLodBands(
                 node.gate_z_ = gz;
                 node.gate_r_ = gr;
                 node.gate_mode_ = gmode;
+                // mode 0 = "drawn only INSIDE the radius" — room props
+                // and interior fittings.  See NodeInfo::interior_.
+                if (gmode == 0) node.interior_ = 1;
                 ++matched;   // arms has_plant_lod_ / the per-node pass
             }
         }
@@ -2913,6 +2925,13 @@ static void parsePlantLodBands(
         // the node-tile path (their tiles are fine-grained per band).
         node.lod_per_instance_ =
             (lodCategoryOf(node.name_) == "ground") ? 1 : 0;
+        // House bands are named "<sample>_<band>_lodtile_..." — the
+        // "int" band IS the room shell (walls seen from inside, floors,
+        // door leaves).  Marking it interior is what lets the forward
+        // path dim its sky ambient; see NodeInfo::interior_.
+        if (node.name_.find("_int_lodtile_") != std::string::npos) {
+            node.interior_ = 1;
+        }
         near_far_min = glm::min(near_far_min, near_m);
         near_far_max = glm::max(near_far_max, far_m);
         ++matched;
@@ -4568,6 +4587,17 @@ static void drawMesh(
     for (size_t prim_i = 0; prim_i < prims_count; ++prim_i) {
         const auto* prim_ptr = prims_begin[prim_i];
         const auto& prim = *prim_ptr;
+        // Render-path material filter — see s_material_filter.
+        if (s_material_filter != 0) {
+            const bool prim_is_blend =
+                prim.material_idx_ >= 0 &&
+                prim.material_idx_ <
+                    int(drawable_object->materials_.size()) &&
+                drawable_object->materials_[prim.material_idx_]
+                        .alpha_mode_ == ego::AlphaMode::Blend;
+            if (s_material_filter == 1 && prim_is_blend) continue;
+            if (s_material_filter == 2 && !prim_is_blend) continue;
+        }
         const auto& attrib_list = prim.attribute_descs_;
         if (!depth_only &&
             (drawable_object->m_debug_force_red_ ||
@@ -5007,7 +5037,11 @@ static void drawNodeMesh(
                 node.cached_matrix_;
             model_params.flip_uv_coord =
                 (drawable_object->m_flip_u_ ? 0x01 : 0x00) |
-                (drawable_object->m_flip_v_ ? 0x02 : 0x00);
+                (drawable_object->m_flip_v_ ? 0x02 : 0x00) |
+                // bit 2: interior geometry — base.frag scales its IBL
+                // ambient by kInteriorSkyAmbient (the forward path has
+                // no ray tracer to occlude the sky for it).
+                (node.interior_ ? 0x04 : 0x00);
             // Only consumed by the _CSMCASC vertex-shader permutation
             // (DrawMode::kCsmPerCascade pipelines).  Other pipelines
             // ignore this field — it sits in former-pad bytes.
@@ -5239,7 +5273,16 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     // gl_FragCoord and the scene depth copy, and touches nothing the
     // vertex stage produces, so every base_vert*.spv is reused verbatim
     // and there is deliberately no base_vert_*_DECAL.
-    bool is_decal = false) {
+    bool is_decal = false,
+    // G-buffer permutation (DrawMode::kGBuffer).  Fragment stage only,
+    // like the decal: base_frag_*_GBUF writes the 4-RT attribute set
+    // and the vertex stages are reused verbatim.  Mutually exclusive
+    // with is_decal (caller's contract).
+    bool is_gbuffer = false,
+    // Glass-attribute permutation (DrawMode::kGlassAttr): fragment
+    // stage only, base_frag_*_GLASS.  Mutually exclusive with both
+    // flags above.
+    bool is_glass = false) {
     renderer::ShaderModuleList shader_modules(2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "") +
         (has_tangent ? "_TN" : (has_normals ? "_N" : ""));
@@ -5257,6 +5300,14 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     // these two suffixes is part of the filename contract.
     if (is_decal) {
         frag_feature_str += "_DECAL";
+    }
+    // Appended in the same position _DECAL occupies (after _DS):
+    // CompileShaders.cmake registers base_frag<layout>[_DS]_GBUF.spv.
+    if (is_gbuffer) {
+        frag_feature_str += "_GBUF";
+    }
+    if (is_glass) {
+        frag_feature_str += "_GLASS";
     }
 
     shader_modules[0] =
@@ -5498,6 +5549,189 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDecalPipeline(
     return createDrawablePipeline(
         device, renderbuffer_formats, pipeline_layout,
         graphic_pipeline_info, primitive, /*is_decal*/ true);
+}
+
+// G-buffer re-rasterise pipeline (DrawMode::kGBuffer).  Fixed-function
+// state mirrors TerrainSceneView::initGbufferPipeline: one no-blend
+// attachment per G-buffer RT, depth test LESS_OR_EQUAL against the depth
+// the forward pass stamped this frame, depth writes OFF — the pass adds
+// material attributes only where the drawable is the visible surface.
+static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& gbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+    auto shader_modules = getDrawableShaderModules(
+        device,
+        primitive.tag_.has_normal,
+        primitive.tag_.has_tangent,
+        primitive.tag_.has_texcoord_0,
+        primitive.tag_.has_skin_set_0,
+        primitive.material_idx_ >= 0,
+        primitive.tag_.double_sided,
+        primitive.tag_.has_skin_set_1,
+        /*is_decal*/ false,
+        /*is_gbuffer*/ true);
+
+    // Function-local statics for the same lifetime reason the decal
+    // states are static: GraphicPipelineInfo holds shared_ptrs.
+    static auto s_gbuf_blend_attachments =
+        std::vector<renderer::PipelineColorBlendAttachmentState>(
+            4, renderer::helper::fillPipelineColorBlendAttachmentState());
+    static auto s_gbuf_blend_state_info =
+        std::make_shared<renderer::PipelineColorBlendStateCreateInfo>(
+            renderer::helper::fillPipelineColorBlendStateCreateInfo(
+                s_gbuf_blend_attachments));
+    static auto s_gbuf_depth_stencil_info =
+        std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+            renderer::helper::fillPipelineDepthStencilStateCreateInfo(
+                /*depth_test_enable*/ true,
+                /*depth_write_enable*/ false,
+                renderer::CompareOp::LESS_OR_EQUAL));
+
+    renderer::GraphicPipelineInfo gbuf_pipeline_info = graphic_pipeline_info;
+    gbuf_pipeline_info.blend_state_info = s_gbuf_blend_state_info;
+    gbuf_pipeline_info.depth_stencil_info = s_gbuf_depth_stencil_info;
+
+    renderer::PipelineInputAssemblyStateCreateInfo topology_info;
+    topology_info.restart_enable = primitive.tag_.restart_enable;
+    topology_info.topology = static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
+
+    auto binding_descs = primitive.binding_descs_;
+    auto attribute_descs = primitive.attribute_descs_;
+
+    renderer::VertexInputBindingDescription desc;
+    desc.binding = VINPUT_INSTANCE_BINDING_POINT;
+    desc.input_rate = renderer::VertexInputRate::INSTANCE;
+    desc.stride = sizeof(glsl::InstanceDataInfo);
+    binding_descs.push_back(desc);
+
+    renderer::VertexInputAttributeDescription attr;
+    attr.binding = VINPUT_INSTANCE_BINDING_POINT;
+    attr.buffer_offset = 0;
+    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
+    attr.buffer_view = 0;
+    attr.location = IINPUT_MAT_ROT_0;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_0);
+    attribute_descs.push_back(attr);
+    attr.location = IINPUT_MAT_ROT_1;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_1);
+    attribute_descs.push_back(attr);
+    attr.location = IINPUT_MAT_ROT_2;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
+    attribute_descs.push_back(attr);
+
+    renderer::RasterizationStateOverride rasterization_state_override;
+    rasterization_state_override.override_double_sided = true;
+    rasterization_state_override.double_sided = primitive.tag_.double_sided;
+
+    return device->createPipeline(
+        pipeline_layout,
+        binding_descs,
+        attribute_descs,
+        topology_info,
+        gbuf_pipeline_info,
+        shader_modules,
+        gbuffer_formats,
+        rasterization_state_override,
+        std::source_location::current());
+}
+
+// Forward translucent GLASS pipeline (DrawMode::kGlassAttr).  Glass is
+// TRANSLUCENT, so it does not belong in any deferred/attribute target:
+// the scene behind a thin pane is already on screen, which makes
+// rasterised alpha blending the exact transmission term for free.  The
+// pass draws AFTER the resolve + sky + decals with the textbook "over"
+// blend, depth test ON (walls still occlude panes) and depth writes
+// OFF, using the STANDARD forward shaders — base.frag's normal path
+// already computes IBL specular/Fresnel and outputs baseColor.a, which
+// the glass-forced material clamp holds at 0.4.
+static std::shared_ptr<renderer::Pipeline> createDrawableGlassPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+    auto shader_modules = getDrawableShaderModules(
+        device,
+        primitive.tag_.has_normal,
+        primitive.tag_.has_tangent,
+        primitive.tag_.has_texcoord_0,
+        primitive.tag_.has_skin_set_0,
+        primitive.material_idx_ >= 0,
+        primitive.tag_.double_sided,
+        primitive.tag_.has_skin_set_1);
+
+    static auto s_glass_blend_attachments =
+        std::vector<renderer::PipelineColorBlendAttachmentState>(
+            1,
+            renderer::helper::fillPipelineColorBlendAttachmentState(
+                SET_FLAG_BIT(ColorComponent, ALL_BITS),
+                true,
+                renderer::BlendFactor::SRC_ALPHA,
+                renderer::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                renderer::BlendOp::ADD,
+                renderer::BlendFactor::ONE,
+                renderer::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                renderer::BlendOp::ADD));
+    static auto s_glass_blend_state_info =
+        std::make_shared<renderer::PipelineColorBlendStateCreateInfo>(
+            renderer::helper::fillPipelineColorBlendStateCreateInfo(
+                s_glass_blend_attachments));
+    static auto s_glass_depth_stencil_info =
+        std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+            renderer::helper::fillPipelineDepthStencilStateCreateInfo(
+                /*depth_test_enable*/ true,
+                /*depth_write_enable*/ false));
+
+    renderer::GraphicPipelineInfo glass_pipeline_info = graphic_pipeline_info;
+    glass_pipeline_info.blend_state_info = s_glass_blend_state_info;
+    glass_pipeline_info.depth_stencil_info = s_glass_depth_stencil_info;
+
+    renderer::PipelineInputAssemblyStateCreateInfo topology_info;
+    topology_info.restart_enable = primitive.tag_.restart_enable;
+    topology_info.topology = static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
+
+    auto binding_descs = primitive.binding_descs_;
+    auto attribute_descs = primitive.attribute_descs_;
+
+    renderer::VertexInputBindingDescription desc;
+    desc.binding = VINPUT_INSTANCE_BINDING_POINT;
+    desc.input_rate = renderer::VertexInputRate::INSTANCE;
+    desc.stride = sizeof(glsl::InstanceDataInfo);
+    binding_descs.push_back(desc);
+
+    renderer::VertexInputAttributeDescription attr;
+    attr.binding = VINPUT_INSTANCE_BINDING_POINT;
+    attr.buffer_offset = 0;
+    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
+    attr.buffer_view = 0;
+    attr.location = IINPUT_MAT_ROT_0;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_0);
+    attribute_descs.push_back(attr);
+    attr.location = IINPUT_MAT_ROT_1;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_1);
+    attribute_descs.push_back(attr);
+    attr.location = IINPUT_MAT_ROT_2;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
+    attribute_descs.push_back(attr);
+
+    renderer::RasterizationStateOverride rasterization_state_override;
+    rasterization_state_override.override_double_sided = true;
+    // Panes are sheets: both faces, so a window works from inside and out.
+    rasterization_state_override.double_sided = true;
+
+    return device->createPipeline(
+        pipeline_layout,
+        binding_descs,
+        attribute_descs,
+        topology_info,
+        glass_pipeline_info,
+        shader_modules,
+        renderbuffer_formats,
+        rasterization_state_override,
+        std::source_location::current());
 }
 
 static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
@@ -6598,6 +6832,12 @@ std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::material_desc_set
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::skin_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout> DrawableObject::drawable_pipeline_layout_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_gbuffer_pipeline_list_;
+renderer::PipelineRenderbufferFormats DrawableObject::gbuffer_renderbuffer_formats_;
+bool DrawableObject::gbuffer_formats_valid_ = false;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_glass_pipeline_list_;
+renderer::PipelineRenderbufferFormats DrawableObject::glass_renderbuffer_formats_;
+bool DrawableObject::glass_formats_valid_ = false;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_shadow_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_layered_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_per_cascade_pipeline_list_;
@@ -6921,6 +7161,48 @@ DrawableObject::DrawableObject(
                     }
                 }
 
+                {
+                    // G-buffer pipeline (DrawMode::kGBuffer) — deferred
+                    // re-rasterise of this primitive.  Skinned layouts
+                    // and material-less primitives are skipped: no
+                    // _GBUF permutation exists for them (see
+                    // CompileShaders.cmake), and skinned world
+                    // velocity would be wrong anyway.
+                    if (gbuffer_formats_valid_ &&
+                        !primitive.tag_.has_skin_set_0 &&
+                        primitive.material_idx_ >= 0) {
+                        auto hash_value = primitive.getHash();
+                        auto result =
+                            drawable_gbuffer_pipeline_list_.find(hash_value);
+                        if (result == drawable_gbuffer_pipeline_list_.end()) {
+                            drawable_gbuffer_pipeline_list_[hash_value] =
+                                createDrawableGbufferPipeline(
+                                    device,
+                                    gbuffer_renderbuffer_formats_,
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
+                    // Glass-attribute pipeline (DrawMode::kGlassAttr) —
+                    // same skip rules; the per-primitive Blend filter
+                    // happens at draw time (s_material_filter).
+                    if (!primitive.tag_.has_skin_set_0 &&
+                        primitive.material_idx_ >= 0) {
+                        auto hash_value = primitive.getHash();
+                        auto result =
+                            drawable_glass_pipeline_list_.find(hash_value);
+                        if (result == drawable_glass_pipeline_list_.end()) {
+                            drawable_glass_pipeline_list_[hash_value] =
+                                createDrawableGlassPipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
+                }
                 {
                     // Ground-decal pipeline.  Built for EVERY drawable,
                     // not just the ones the host will register as
@@ -7252,6 +7534,44 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                                     drawable_pipeline_layout_,
                                     graphic_pipeline_info,
                                     primitive);
+                        }
+                    }
+                    {
+                        // G-buffer pipeline — see the sync ctor.
+                        if (gbuffer_formats_valid_ &&
+                            !primitive.tag_.has_skin_set_0 &&
+                            primitive.material_idx_ >= 0) {
+                            auto hash_value = primitive.getHash();
+                            auto result =
+                                drawable_gbuffer_pipeline_list_.find(
+                                    hash_value);
+                            if (result ==
+                                drawable_gbuffer_pipeline_list_.end()) {
+                                drawable_gbuffer_pipeline_list_[hash_value] =
+                                    createDrawableGbufferPipeline(
+                                        device,
+                                        gbuffer_renderbuffer_formats_,
+                                        drawable_pipeline_layout_,
+                                        graphic_pipeline_info,
+                                        primitive);
+                            }
+                        }
+                        if (!primitive.tag_.has_skin_set_0 &&
+                            primitive.material_idx_ >= 0) {
+                            auto hash_value = primitive.getHash();
+                            auto result =
+                                drawable_glass_pipeline_list_.find(
+                                    hash_value);
+                            if (result ==
+                                drawable_glass_pipeline_list_.end()) {
+                                drawable_glass_pipeline_list_[hash_value] =
+                                    createDrawableGlassPipeline(
+                                        device,
+                                        renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                        drawable_pipeline_layout_,
+                                        graphic_pipeline_info,
+                                        primitive);
+                            }
                         }
                     }
                     {
@@ -7715,6 +8035,14 @@ void DrawableObject::recreateStaticMembers(
 
     createStaticMembers(device, global_desc_set_layouts);
 
+    for (auto& pipeline : drawable_glass_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_glass_pipeline_list_.clear();
+    for (auto& pipeline : drawable_gbuffer_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_gbuffer_pipeline_list_.clear();
     for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -7753,6 +8081,37 @@ void DrawableObject::recreateStaticMembers(
                             drawable_pipeline_layout_,
                             graphic_pipeline_info,
                             primitive);
+                }
+                // G-buffer pipeline — see the sync ctor for the skip rules.
+                if (gbuffer_formats_valid_ &&
+                    !primitive.tag_.has_skin_set_0 &&
+                    primitive.material_idx_ >= 0) {
+                    auto gbuf_result =
+                        drawable_gbuffer_pipeline_list_.find(hash_value);
+                    if (gbuf_result == drawable_gbuffer_pipeline_list_.end()) {
+                        drawable_gbuffer_pipeline_list_[hash_value] =
+                            createDrawableGbufferPipeline(
+                                device,
+                                gbuffer_renderbuffer_formats_,
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
+                }
+                // Forward translucent glass pipeline — same skip rules.
+                if (!primitive.tag_.has_skin_set_0 &&
+                    primitive.material_idx_ >= 0) {
+                    auto glass_result =
+                        drawable_glass_pipeline_list_.find(hash_value);
+                    if (glass_result == drawable_glass_pipeline_list_.end()) {
+                        drawable_glass_pipeline_list_[hash_value] =
+                            createDrawableGlassPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kForward)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
                 }
             }
         }
@@ -7880,6 +8239,14 @@ void DrawableObject::destroyStaticMembers(
     device->destroyDescriptorSetLayout(material_desc_set_layout_);
     device->destroyDescriptorSetLayout(skin_desc_set_layout_);
     device->destroyPipelineLayout(drawable_pipeline_layout_);
+    for (auto& pipeline : drawable_glass_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_glass_pipeline_list_.clear();
+    for (auto& pipeline : drawable_gbuffer_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_gbuffer_pipeline_list_.clear();
     for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -8366,8 +8733,20 @@ void DrawableObject::draw(
         (draw_mode == DrawMode::kCsmPerCascade) ? drawable_csm_per_cascade_pipeline_list_ :
         (draw_mode == DrawMode::kCsmMeshShader) ? drawable_csm_mesh_shader_pipeline_list_ :
         (draw_mode == DrawMode::kDecal)         ? drawable_decal_pipeline_list_           :
+        (draw_mode == DrawMode::kGBuffer)       ? drawable_gbuffer_pipeline_list_         :
+        (draw_mode == DrawMode::kGlassAttr)     ? drawable_glass_pipeline_list_           :
         depth_only                              ? drawable_shadow_pipeline_list_           :
                                                   drawable_pipeline_list_;
+    // Material routing — see s_material_filter at the top of the file.
+    // Blend/glass primitives draw ONLY in the dedicated translucent
+    // glass pass: excluded from the opaque forward pass (they'd write
+    // opaque colour + depth and the window would occlude the world it
+    // should reveal), from the G-buffer (opaque attributes), and from
+    // every shadow/CSM pass (a pane that casts a full-dark shadow is a
+    // wall; the RT paths handle glass shadowing their own way).
+    s_material_filter =
+        (draw_mode == DrawMode::kGlassAttr) ? 2 :
+        (draw_mode == DrawMode::kDecal)     ? 0 : 1;
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);
