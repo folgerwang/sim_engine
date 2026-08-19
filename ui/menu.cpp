@@ -1987,14 +1987,19 @@ bool Menu::draw(
             // Mesh-load HUD: top-right of the viewport (editor) or window.
             ImVec2 mlv_pos, mlv_size, mlv_c;
             getViewportScreenRect(mlv_pos, mlv_size, mlv_c);
-            const float mlv_top = isViewportValid() ? 40.0f
-                                                    : (menu_height + 40.0f);
+            // BOTTOM-RIGHT of the viewport/window: the old top-right
+            // anchor sat directly on the FPS/VRAM HUD and the two
+            // overlays fought for the same corner.  Pivot (1,1) pins
+            // the window's bottom-right corner, so AlwaysAutoResize
+            // grows the list UPWARD from the corner and the anchor
+            // needs no knowledge of the window's height.
             const ImVec2 mesh_win_pos = {
-                mlv_pos.x + mlv_size.x - 380.0f,
-                mlv_pos.y + mlv_top };
+                mlv_pos.x + mlv_size.x - 12.0f,
+                mlv_pos.y + mlv_size.y - 12.0f };
 
             ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
-            ImGui::SetNextWindowPos(mesh_win_pos);
+            ImGui::SetNextWindowPos(mesh_win_pos, ImGuiCond_Always,
+                                    ImVec2(1.0f, 1.0f));
             ImGui::Begin(
                 "mesh_loads",
                 nullptr,
@@ -3750,7 +3755,7 @@ bool Menu::draw(
         ImGui::End();
     }
 
-    // ---- Analog clock overlay (top-left, always on top) --------------------
+    // ---- Analog clock overlay (right of the Play button, always on top) ----
     // Drawn directly on the foreground draw list so it is always visible
     // above every ImGui window, regardless of window z-order.  Only shown in
     // PLAY mode (the time-of-day clock is a gameplay element).
@@ -3763,11 +3768,14 @@ bool Menu::draw(
         // menu bar) or the full window below the menu bar otherwise.
         ImVec2 clk_pos, clk_size, clk_c;
         getViewportScreenRect(clk_pos, clk_size, clk_c);
-        // Shifted DOWN by half the face size (leaves room for the Play button
-        // above it in the editor viewport's top-left corner).
-        const float clk_top =
-            (isViewportValid() ? 8.0f : (kMenuH + 8.0f)) + kFaceSize * 0.5f;
-        const ImVec2 origin(clk_pos.x + 14.0f, clk_pos.y + clk_top);
+        // RIGHT of the Play/Stop button, top-aligned with it: the 90 px
+        // button window spans x ~[8, 114] (button + 2x8 window padding),
+        // and the old half-face downward shift left the dial overlapping
+        // the button's window instead of beside it.
+        constexpr float kPlayBtnSpan = 8.0f + 90.0f + 16.0f;  // pos + button + pad
+        const float clk_top = (isViewportValid() ? 8.0f : (kMenuH + 8.0f));
+        const ImVec2 origin(clk_pos.x + kPlayBtnSpan + 12.0f,
+                            clk_pos.y + clk_top);
         const ImVec2 ctr(origin.x + kPad + kFaceSize * 0.5f,
                          origin.y + kPad + kFaceSize * 0.5f);
         const float  R = kFaceSize * 0.5f;

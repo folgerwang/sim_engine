@@ -99,6 +99,19 @@ int activityOf(const std::string& act, const std::string& place,
     return kActIdle;
 }
 
+// Avalanche an index before it is used as a hash key (murmur3's
+// finalizer).  h01 alone is fine over a whole map but has strong LOCAL
+// structure on sequential inputs: feeding it raw house indices put
+// 2.7% homemakers in a 4000-house town where the thresholds ask for
+// 12%, and clumped whole contiguous streets onto one occupation.
+// Mixing first holds every band to its intended share at any town size.
+uint32_t mix32(uint32_t x) {
+    x ^= x >> 16; x *= 0x85EBCA6Bu;
+    x ^= x >> 13; x *= 0xC2B2AE35u;
+    x ^= x >> 16;
+    return x;
+}
+
 float h01(uint32_t a, uint32_t b) {
     uint32_t h = 2166136261u;
     h = (h ^ a) * 16777619u;
@@ -140,6 +153,11 @@ constexpr float kGroundClampRadius = 400.0f;
 // places" while staying watchable up close.
 constexpr float kWalkTimeScale = 6.0f;
 constexpr size_t kFarClampPerFrame = 1024; // staggered height refresh
+// How many houses per grid cell get promoted to destinations by
+// synthesizeResidents (first four workplaces, the rest shops).  Lives
+// out here because a LOCAL class may not declare a static data member
+// (MSVC C2258 / [class.local]) — the cell picker is a local struct.
+constexpr int kCellAnchors = 6;
 
 }  // namespace
 
@@ -263,17 +281,33 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
     persons_.clear();
     sim_.clear();
     std::error_code ec;
-    if (!std::filesystem::exists(city_json_path, ec) ||
-        !std::filesystem::exists(world_json_path, ec)) {
-        // LOUD on purpose: a silent false here cost a debugging round —
-        // "why no npc has been rendered" with no line to grep for.
-        // std::cout, not printf: only std::cout reaches the engine log
-        // (main.cpp swaps its rdbuf; printf bypasses it entirely).
-        std::cout << "[citizen] city data not found (" << city_json_path
-                  << " / " << world_json_path << ") — no citizens this "
-                     "map.  Run the place stage to generate them."
+    // ── WHAT IS ACTUALLY REQUIRED ────────────────────────────────────
+    // Only the WORLD manifest: it carries the house transforms, which
+    // is all a resident needs to exist somewhere.  The CITY json is
+    // OPTIONAL — city_sim.py writes it only for maps that also got a
+    // civic district (it reads <stem>_pcg_city_buildings.json, and
+    // bails when that is absent), so on an ordinary settlement map the
+    // file never appeared, loadCity returned false, and the entire
+    // system stayed inert: every house empty, no citizens anywhere.
+    // Without the city json we synthesize one resident per house
+    // instead (see synthesizeResidents).
+    // LOUD on purpose: a silent false here cost a debugging round —
+    // "why no npc has been rendered" with no line to grep for.
+    // std::cout, not printf: only std::cout reaches the engine log
+    // (main.cpp swaps its rdbuf; printf bypasses it entirely).
+    if (!std::filesystem::exists(world_json_path, ec)) {
+        std::cout << "[citizen] world manifest not found ("
+                  << world_json_path << ") — no citizens this map.  "
+                     "Run the place stage to generate it."
                   << std::endl;
         return false;
+    }
+    const bool have_city = std::filesystem::exists(city_json_path, ec);
+    if (!have_city) {
+        std::cout << "[citizen] no city json (" << city_json_path
+                  << ") — populating from the world manifest instead: "
+                     "one resident per house."
+                  << std::endl;
     }
     try {
         json world;
@@ -289,6 +323,18 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
             houses_.emplace_back(float(t[3 * i]), float(t[3 * i + 1]),
                                  float(t[3 * i + 2]));
         }
+        // The whole city-json parse is conditional now.  The body is
+        // NOT re-indented so this stays a reviewable diff — it is the
+        // same code, one scope deeper.
+        //
+        // Its OWN try: the parse is all json::at(), so a stale or
+        // schema-drifted city json throws — and letting that escape to
+        // the outer handler would skip the synthesized fallback below,
+        // leaving the map with zero citizens for exactly the reason the
+        // fallback exists.  Discard the half-parsed city and populate
+        // from the manifest instead.
+        if (have_city) {
+        try {
         json city;
         {
             std::ifstream f(city_json_path);
@@ -361,6 +407,22 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
             if (p.weekday.empty()) continue;
             persons_.push_back(std::move(p));
         }
+        } catch (const std::exception& ce) {
+            std::cout << "[citizen] city json unusable (" << ce.what()
+                      << ") — falling back to synthesized residents"
+                      << std::endl;
+            buildings_.clear();
+            persons_.clear();
+        }
+        }   // if (have_city)
+
+        // No city json, or one that yielded nobody (an old export, or a
+        // map whose households never got allocated): give every house a
+        // resident so the town is inhabited from the moment the terrain
+        // finishes loading.
+        if (persons_.empty() && !houses_.empty()) {
+            synthesizeResidents();
+        }
         loaded_ = !persons_.empty();
         district_centre_ = glm::vec2(0.0f);
         if (!buildings_.empty()) {
@@ -370,13 +432,16 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
         std::cout << "[citizen] loaded " << persons_.size()
                   << " persons, " << buildings_.size() << " buildings, "
                   << houses_.size() << " houses from "
-                  << std::filesystem::path(city_json_path)
-                         .filename().string()
+                  << (have_city
+                          ? std::filesystem::path(city_json_path)
+                                .filename().string()
+                          : std::string("the world manifest "
+                                        "(synthesized residents)"))
                   << " — civic district around ("
                   << int(district_centre_.x) << ", "
                   << int(district_centre_.y) << ")"
                   << std::endl;
-        if (persons_.size() < houses_.size() / 4) {
+        if (have_city && persons_.size() < houses_.size() / 4) {
             std::cout << "[citizen] NOTE: only " << persons_.size()
                       << " person records for " << houses_.size()
                       << " houses — this city json predates the "
@@ -390,6 +455,326 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
         loaded_ = false;
     }
     return loaded_;
+}
+
+void CitizenSystem::synthesizeResidents() {
+    // ── WHY THIS EXISTS ──────────────────────────────────────────────
+    // The city json (city_sim.py) is what normally allocates households
+    // to houses and jobs/school seats to civic buildings.  It only gets
+    // written for maps that also got a civic district, so on an
+    // ordinary settlement it is absent and every house stood empty.
+    // Here we build BOTH halves from the world manifest alone: a set of
+    // destination anchors picked out of the house field, and one
+    // resident per house with a real day built around them.
+    persons_.clear();
+    buildings_.clear();
+    if (houses_.empty()) return;
+
+    // ── 1. DESTINATIONS ──────────────────────────────────────────────
+    // A village's workplaces and shops ARE buildings on its streets, so
+    // promote a few houses to that role rather than inventing floating
+    // waypoints.  Grid the world and let each cell nominate the house
+    // nearest its centre (workplace) and the runner-up (shop); a
+    // coarser grid nominates schools.  This is O(houses), it is local
+    // by construction — nobody commutes across the map because their
+    // anchor is always in their own cell — and it is deterministic.
+    constexpr float kWorkCellM   = 420.0f;    // ~5 min walk across
+    constexpr float kSchoolCellM = 1680.0f;   // one school per 4x4 cells
+    auto cellKey = [](float x, float z, float m) -> uint64_t {
+        const int32_t cx = int32_t(std::floor(x / m));
+        const int32_t cz = int32_t(std::floor(z / m));
+        return (uint64_t(uint32_t(cx)) << 32) | uint32_t(cz);
+    };
+    // SEVERAL anchors per cell, not one.  A 420 m cell in a real
+    // settlement holds a hundred-plus houses; sending all of their
+    // workers to a single doorway stacks bodies inside one another.
+    // Keep the six houses nearest the cell centre — four become
+    // workplaces, two become shops — and hash residents across them.
+    struct CellPick {
+        // Only entries [0, n) are ever read, so the arrays need no
+        // initializer list — which also keeps them correct if
+        // kCellAnchors changes.
+        int   idx[kCellAnchors];
+        float d2[kCellAnchors];
+        int   n = 0;
+        void offer(int house, float dist2) {
+            int p = 0;
+            while (p < n && d2[p] <= dist2) ++p;
+            if (p >= kCellAnchors) return;       // worse than all kept
+            const int last = (n < kCellAnchors ? n : kCellAnchors - 1);
+            for (int k = last; k > p; --k) {
+                idx[k] = idx[k - 1];
+                d2[k]  = d2[k - 1];
+            }
+            idx[p] = house;
+            d2[p]  = dist2;
+            if (n < kCellAnchors) ++n;
+        }
+    };
+    std::unordered_map<uint64_t, CellPick> work_cells, school_cells;
+    auto nominate = [&](std::unordered_map<uint64_t, CellPick>& cells,
+                        float cm, size_t hi_idx, const glm::vec3& h) {
+        const float ccx = (std::floor(h.x / cm) + 0.5f) * cm;
+        const float ccz = (std::floor(h.z / cm) + 0.5f) * cm;
+        const float d2 = (h.x - ccx) * (h.x - ccx) +
+                         (h.z - ccz) * (h.z - ccz);
+        cells[cellKey(h.x, h.z, cm)].offer(int(hi_idx), d2);
+    };
+    for (size_t i = 0; i < houses_.size(); ++i) {
+        nominate(work_cells,   kWorkCellM,   i, houses_[i]);
+        nominate(school_cells, kSchoolCellM, i, houses_[i]);
+    }
+    // Sorted key order: unordered_map iteration order is an
+    // implementation detail, and building INDICES are what the
+    // schedules below bake in — so walk the keys sorted to keep two
+    // runs of the same map identical.
+    auto sortedKeys = [](const std::unordered_map<uint64_t, CellPick>& m) {
+        std::vector<uint64_t> ks;
+        ks.reserve(m.size());
+        for (const auto& kv : m) ks.push_back(kv.first);
+        std::sort(ks.begin(), ks.end());
+        return ks;
+    };
+    std::unordered_map<uint64_t, std::vector<int>> work_bi, shop_bi;
+    std::unordered_map<uint64_t, int> school_bi;
+    auto addBuilding = [&](int house_idx, const char* type) -> int {
+        const glm::vec3& h = houses_[house_idx];
+        Building b;
+        b.type = type;
+        b.centre = {h.x, h.z};
+        // Stand arrivals just OUTSIDE the shell — placePos jitters
+        // +/-3 m around this, and an entrance ON the house centre would
+        // park half the staff inside the walls.
+        b.entrance = {h.x + 4.5f, h.z + 4.5f};
+        b.yaw = 0.0f;
+        b.base_y = h.y;
+        buildings_.push_back(b);
+        return int(buildings_.size()) - 1;
+    };
+    for (uint64_t k : sortedKeys(work_cells)) {
+        const CellPick& c = work_cells[k];
+        const int n_work = std::min(c.n, 4);
+        for (int j = 0; j < n_work; ++j) {
+            work_bi[k].push_back(addBuilding(c.idx[j], "work"));
+        }
+        for (int j = n_work; j < c.n; ++j) {
+            shop_bi[k].push_back(addBuilding(c.idx[j], "shop"));
+        }
+    }
+    for (uint64_t k : sortedKeys(school_cells)) {
+        const CellPick& c = school_cells[k];
+        if (c.n > 0) school_bi[k] = addBuilding(c.idx[0], "school");
+    }
+    // Pick one of a cell's anchors for this resident — spreading the
+    // cell's workforce over its workplaces instead of one doorway.
+    auto pick = [](const std::unordered_map<uint64_t,
+                                            std::vector<int>>& m,
+                   uint64_t k, uint32_t salt) -> int {
+        auto it = m.find(k);
+        if (it == m.end() || it->second.empty()) return -1;
+        return it->second[mix32(salt) % it->second.size()];
+    };
+    auto lookup1 = [](const std::unordered_map<uint64_t, int>& m,
+                      uint64_t k) -> int {
+        auto it = m.find(k);
+        return it == m.end() ? -1 : it->second;
+    };
+    // Headcount per building, so the arrival scatter can widen with it.
+    std::vector<int> occupancy(buildings_.size(), 0);
+
+    // ── 2. RESIDENTS ─────────────────────────────────────────────────
+    persons_.reserve(houses_.size());
+    for (size_t i = 0; i < houses_.size(); ++i) {
+        // Mixed id for every attribute draw below — see mix32.
+        const uint32_t hi = mix32(static_cast<uint32_t>(i));
+        const glm::vec3& home = houses_[i];
+        Person p;
+        p.house = static_cast<int>(i);
+        // Duty drives the body colour in emitPerson, where the person
+        // spends their day, and what they do once they get there.
+        const float du = h01(hi, 0x51A1u);
+        p.duty = du < 0.34f ? kDutyWorker
+               : du < 0.48f ? kDutyOffice
+               : du < 0.60f ? kDutyShop
+               : du < 0.76f ? kDutyStudent
+               : du < 0.88f ? kDutyHomemaker
+                            : kDutyRetiree;
+        p.height = 1.55f + h01(hi, 0x0077u) * 0.35f;
+        p.bulk   = 0.88f + h01(hi, 0x009Bu) * 0.40f;
+        p.speed  = (p.duty == kDutyStudent) ? 1.50f
+                 : (p.duty == kDutyRetiree) ? 0.90f
+                 : 1.15f + h01(hi, 0x00C3u) * 0.35f;
+        p.works_weekend = (p.duty == kDutyShop) &&
+                          h01(hi, 0x002Du) < 0.5f;
+
+        // Where this person's day happens.  A missing anchor (a lone
+        // house with no cell neighbours) falls back to OUTDOORS (-2),
+        // which placePos resolves to a spot beside the house — so a
+        // schedule always has somewhere to send them.
+        const uint64_t wk = cellKey(home.x, home.z, kWorkCellM);
+        const uint64_t sk = cellKey(home.x, home.z, kSchoolCellM);
+        int work   = pick(work_bi, wk, uint32_t(i) * 2654435761u);
+        int shop   = pick(shop_bi, wk, uint32_t(i) * 40503u + 7u);
+        int school = lookup1(school_bi, sk);
+        if (shop < 0)   shop = work;
+        if (work < 0)   work = -2;
+        if (shop < 0)   shop = -2;
+        if (school < 0) school = work;
+
+        int dest = work;
+        int dest_act = kActDeskWork;
+        switch (p.duty) {
+            case kDutyStudent:   dest = school; dest_act = kActSit;    break;
+            case kDutyShop:      dest = shop;   dest_act = kActBrowse; break;
+            case kDutyHomemaker: dest = shop;   dest_act = kActBrowse; break;
+            case kDutyRetiree:   dest = shop;   dest_act = kActSit;    break;
+            case kDutyOffice:    dest = work;   dest_act = kActDeskWork; break;
+            default:             dest = work;   dest_act = kActIdle;   break;
+        }
+        if (dest >= 0 && dest < int(occupancy.size())) ++occupancy[dest];
+        const int home_act = (p.duty == kDutyRetiree) ? kActSit
+                           : (p.duty == kDutyStudent) ? kActPlay
+                                                      : kActIdle;
+
+        // Day shape by duty.  Students start earliest and finish
+        // mid-afternoon; the employed keep office hours; the retired
+        // and homemakers make a late-morning errand and are home well
+        // before dark.  Minutes since midnight.
+        float wake, leave, ret, bed;
+        if (p.duty == kDutyStudent) {
+            wake =  6.75f * 60.0f; leave =  7.70f * 60.0f;
+            ret  = 15.60f * 60.0f; bed   = 21.50f * 60.0f;
+        } else if (p.duty == kDutyHomemaker || p.duty == kDutyRetiree) {
+            wake =  7.50f * 60.0f; leave = 10.00f * 60.0f;
+            ret  = 13.00f * 60.0f; bed   = 22.00f * 60.0f;
+        } else {
+            wake =  6.50f * 60.0f; leave =  7.60f * 60.0f;
+            ret  = 17.60f * 60.0f; bed   = 22.50f * 60.0f;
+        }
+        auto jit = [&](float base_min, float span_min, uint32_t k) {
+            return base_min + (h01(hi, k) - 0.5f) * span_min;
+        };
+        auto step = [](float minutes, int activity, int place) {
+            Step st;
+            st.minutes = minutes;
+            st.activity = activity;
+            st.place = place;
+            return st;
+        };
+        // Walking is not scheduled: update() walks a person toward
+        // whatever anchor their CURRENT step names, and emitPerson
+        // overrides the pose with the walk cycle while they are in
+        // transit — so "leave for work at 07:40" is one step whose
+        // place is the workplace, and the commute happens on its own.
+        // ── WHY THE HINGES ARE SMEARED THIS WIDE ─────────────────
+        // A realistic town leaves for work inside a 40-minute window,
+        // and that makes a DEAD town to look at: outside those few
+        // windows not one person in 57,000 is in transit, so the
+        // player sees a field of statues.  Measured in-engine: at
+        // 15:40 every sampled citizen reported "idle", because the
+        // next hinge was two game-hours away and the world clock
+        // advances ~4 game-minutes per real minute at the default TOD
+        // speed — a 20+ real-minute wait for anyone to take a step.
+        //
+        // So the commute is smeared over hours (+/- 2.5 h on the
+        // outbound, +/- 3 h on the return) and every resident gets two
+        // extra ERRANDS at independently drawn times.  At any hour of
+        // the day some slice of the town is walking, whatever speed
+        // the clock runs at, and an individual's day still reads as
+        // sleep -> out -> home -> sleep.
+        const float errand1 = jit(11.0f * 60.0f, 300.0f, 0x111u);
+        const float errand2 = jit(16.0f * 60.0f, 300.0f, 0x112u);
+        p.weekday = {
+            step(0.0f,                              kActSleepish, -1),
+            step(jit(wake,   90.0f, 0x101u),        home_act,     -1),
+            step(jit(leave, 150.0f, 0x102u),        dest_act,     dest),
+            // Mid-day errand: out to the shops and back, so the
+            // streets are never empty between the two commutes.
+            step(errand1,                           kActBrowse,   shop),
+            step(errand1 + 45.0f,                   dest_act,     dest),
+            step(errand2,                           kActWalk,     -2),
+            step(errand2 + 40.0f,                   dest_act,     dest),
+            step(jit(ret,   180.0f, 0x103u),        home_act,     -1),
+            // Dinner is an EVENING hinge, not "100 minutes after
+            // whenever you got home": the homemaker/retiree branch
+            // returns at 13:00, and ret+100 had a fifth of the town
+            // cooking from mid-afternoon until bed.
+            step(jit(std::max(ret + 100.0f, 18.5f * 60.0f),
+                     60.0f, 0x104u),               kActCook,     -1),
+            step(jit(bed,    50.0f, 0x105u),        kActSleepish, -1),
+        };
+        // Weekend: a lie-in, an errand or a stroll, home for the
+        // evening.  Whoever works weekends keeps the weekday shape
+        // (scheduleOf only reaches for this list when they do not).
+        p.weekend = {
+            step(0.0f,                              kActSleepish, -1),
+            step(jit( 9.00f * 60.0f, 150.0f, 0x201u), home_act,   -1),
+            step(jit(11.00f * 60.0f, 240.0f, 0x202u), kActBrowse, shop),
+            step(jit(13.00f * 60.0f, 240.0f, 0x207u), home_act,   -1),
+            step(jit(15.00f * 60.0f, 300.0f, 0x203u), kActWalk,   -2),
+            step(jit(17.50f * 60.0f, 240.0f, 0x204u), home_act,   -1),
+            step(jit(19.50f * 60.0f, 120.0f, 0x205u), kActCook,   -1),
+            step(jit(22.50f * 60.0f, 60.0f, 0x206u),  kActSleepish, -1),
+        };
+        // Jitter can reorder two hinges that started close together;
+        // currentStep walks the list assuming ascending minutes.
+        auto by_time = [](const Step& a, const Step& b) {
+            return a.minutes < b.minutes;
+        };
+        std::sort(p.weekday.begin(), p.weekday.end(), by_time);
+        std::sort(p.weekend.begin(), p.weekend.end(), by_time);
+        persons_.push_back(std::move(p));
+    }
+    // A doorway that 80 people report to needs a forecourt, not a
+    // 6 m jitter box: widen with sqrt(headcount) so density stays
+    // roughly constant however many a cell sends.
+    for (size_t b = 0; b < buildings_.size() && b < occupancy.size(); ++b) {
+        buildings_[b].spread =
+            6.0f + 1.8f * std::sqrt(float(occupancy[b]));
+    }
+    std::cout << "[citizen] synthesized " << persons_.size()
+              << " resident(s) — one per house — around "
+              << buildings_.size() << " workplace/shop/school anchor(s)"
+              << std::endl;
+}
+
+void CitizenSystem::setTimeOfDayHours(float hours) {
+    clock_external_ = true;
+    const float tod = std::fmod(hours * 60.0f + 1440.0f, 1440.0f);
+    const float prev = std::fmod(clock_min_, 1440.0f);
+    int day = int(clock_min_ / 1440.0f) % 7;
+    // Forward wrap only, and only a SMALL forward step: late evening
+    // -> small hours across midnight is a new day, but a user dragging
+    // the slider (or hitting the Midnight button) is a scrub, not a
+    // day passing.  fwd is the forward distance in minutes, so a real
+    // 23:59 -> 00:01 tick reads as 2 while a 23:00 -> 00:00 jump reads
+    // as 60 and is rejected.
+    const float fwd = tod - prev + (tod < prev ? 1440.0f : 0.0f);
+    if (prev > 18.0f * 60.0f && tod < 6.0f * 60.0f && fwd < 60.0f) {
+        day = (day + 1) % 7;
+    }
+    clock_min_ = float(day) * 1440.0f + tod;
+}
+
+void CitizenSystem::placeAll() {
+    // Wipe the per-person sim state: pos 0, inited false, cur_step -1.
+    // The next update() then places every person at the anchor their
+    // schedule names for the CURRENT clock (near ones immediately, the
+    // rest over the next few frames via the far ring) — which is the
+    // whole spawn-on-Play behaviour, without a second placement path
+    // that could disagree with the simulation's own.
+    sim_.assign(persons_.size(), SimState{});
+    // Restart the clock-rate measurement: the gap across an edit-mode
+    // pause is not a rate sample, and a rate carried over from a
+    // faster session would sprint everyone for its first second.
+    prev_clock_min_ = -1.0f;
+    clock_rate_ = 0.0f;
+    const float tod = std::fmod(clock_min_, 1440.0f);
+    std::cout << "[citizen] placing " << persons_.size()
+              << " citizen(s) at day " << dayOfWeek() << " "
+              << int(tod / 60.0f) << ":"
+              << (int(tod) % 60 < 10 ? "0" : "")
+              << int(tod) % 60 << std::endl;
 }
 
 glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
@@ -407,7 +792,11 @@ glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
         return {h.x + 12.0f + jx, h.y, h.z + 12.0f + jz};
     }
     const Building& b = buildings_[s.place];
-    return {b.entrance.x + jx, b.base_y, b.entrance.y + jz};
+    // jx/jz span +/-3 m (a 6 m box); rescale to this building's own
+    // forecourt width (6 m for city-json buildings, wider for a
+    // synthesized workplace with a big headcount).
+    const float sc = b.spread / 6.0f;
+    return {b.entrance.x + jx * sc, b.base_y, b.entrance.y + jz * sc};
 }
 
 int CitizenSystem::currentStep(const std::vector<Step>& sched,
@@ -424,10 +813,44 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                            const GroundQueryFn& ground) {
     if (!loaded_) return;
     ground_ = ground;
-    // kClockScale game-seconds per real second -> minutes here.
-    clock_min_ = std::fmod(clock_min_ + delta_t * (kClockScale / 60.0f),
-                           7.0f * 1440.0f);
+    // kClockScale game-seconds per real second -> minutes here.  Skipped
+    // when the application drives the clock (setTimeOfDayHours): two
+    // clocks running at different rates is how the sun and the town
+    // drift apart.
+    if (!clock_external_) {
+        clock_min_ = std::fmod(clock_min_ + delta_t * (kClockScale / 60.0f),
+                               7.0f * 1440.0f);
+    }
     const float tod = std::fmod(clock_min_, 1440.0f);
+
+    // ── HOW FAST IS THE CLOCK? ───────────────────────────────────────
+    // kWalkTimeScale was tuned against this class's own 60x clock (1
+    // real second = 1 game minute).  Driven from the world clock the
+    // rate is whatever the TOD slider says — at its default 5x that is
+    // 0.083 game-minutes per real second, and a fixed 6x leg speed
+    // would have everyone sprinting at 8 m/s across the village.
+    // Measure the rate and scale legs with it, floored at life speed
+    // (walking must always LOOK like walking) and capped at the old
+    // 6x (past that it reads as teleporting).  Wraps and slider jumps
+    // are discarded rather than smoothed.
+    if (delta_t > 1e-4f && prev_clock_min_ >= 0.0f) {
+        const float dmin = clock_min_ - prev_clock_min_;
+        const float a_ = std::min(1.0f, delta_t * 2.0f);
+        if (dmin > 0.0f && dmin < 60.0f) {
+            const float inst = dmin / delta_t;
+            clock_rate_ += (inst - clock_rate_) * a_;
+        } else if (dmin <= 0.0f) {
+            // Clock PAUSED (auto-advance off) or scrubbed backwards.
+            // Decay toward zero rather than holding the last rate —
+            // a frozen clock left over from a 500x session would
+            // otherwise keep everyone sprinting at the 6x cap.
+            clock_rate_ += (0.0f - clock_rate_) * a_;
+        }
+    }
+    prev_clock_min_ = clock_min_;
+    const float walk_scale =
+        std::min(kWalkTimeScale,
+                 std::max(1.0f, kWalkTimeScale * clock_rate_));
 
     if (sim_.size() != persons_.size()) sim_.resize(persons_.size());
 
@@ -470,7 +893,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         a.walking = dist > 0.6f;
         if (a.walking) {
             glm::vec3 dir = d / dist;
-            const float v = p.speed * kWalkTimeScale;
+            const float v = p.speed * walk_scale;
             a.pos += dir * std::min(v * delta_t, dist) * 1.0f;
             a.yaw = std::atan2(dir.x, dir.z);
             a.phase += delta_t * v * 1.7f;
@@ -790,6 +1213,28 @@ void CitizenSystem::draw(
     const glm::uvec2& buffer_size) {
     if (!loaded_ || frame_parts_.empty() || !s_pipeline_) return;
     if (!color_view || !depth_view) return;
+    if (!s_pipeline_layout_ || !s_cube_pos_ || !s_cube_nrm_ ||
+        !s_cube_idx_) {
+        return;
+    }
+    // CONTRACT: desc_sets must be exactly the sets s_pipeline_layout_
+    // was created with, in order — { PBR global, view camera } — and
+    // none of them null.  A longer list, or a null handle, is undefined
+    // behaviour in vkCmdBindDescriptorSets and crashes inside the
+    // driver rather than failing anywhere we can see it.  Degrade to
+    // "no citizens this frame" instead; the caller's log tells us why.
+    for (const auto& ds : desc_sets) {
+        if (!ds) {
+            static bool s_warned = false;
+            if (!s_warned) {
+                s_warned = true;
+                std::cout << "[citizen] draw skipped: null descriptor "
+                             "set in the bind list (expected { PBR "
+                             "global, view camera })" << std::endl;
+            }
+            return;
+        }
+    }
 
     er::RenderingAttachmentInfo color_att;
     color_att.image_view = color_view;

@@ -61,6 +61,23 @@ public:
                   const std::string& world_json_path);
     bool loaded() const { return loaded_; }
 
+    // (Re)place EVERY citizen at the anchor their schedule puts them at
+    // for the current game clock — the Play button's spawn.  Called on
+    // the edit->play edge: the town is populated the instant play
+    // starts, at whatever hour the clock says (asleep at home at 03:00,
+    // at work at 10:00), instead of drifting in from wherever the last
+    // session left them.  Cheap: it just clears the per-person sim
+    // state, and the next update() places everyone from their schedule.
+    void placeAll();
+
+    // Drive the citizen day from the WORLD clock (the menu's
+    // time-of-day, which also drives the sun and the clock face) so the
+    // town and the sky can never disagree — people asleep under a noon
+    // sun is the failure this prevents.  Hours in [0, 24); the weekday
+    // advances on each midnight wrap.  Once called, update() stops
+    // running its own clock.
+    void setTimeOfDayHours(float hours);
+
     // Advance the game clock and every active citizen; refresh which
     // persons are active around the camera.
     void update(float delta_t, const glm::vec3& camera_pos,
@@ -110,6 +127,12 @@ private:
         glm::vec2 centre{0.0f};
         float yaw = 0.0f;
         float base_y = 0.0f;
+        // Full width (metres) of the arrival scatter placePos spreads
+        // people over.  6 m is the historical fixed jitter and stays
+        // the default for city-json buildings; synthesized workplaces
+        // widen it with their headcount so a cell's whole workforce
+        // does not stack inside one doorway.
+        float spread = 6.0f;
     };
     struct SimState {                   // per-person, ALWAYS ticking
         glm::vec3 pos{0.0f};
@@ -125,6 +148,16 @@ private:
         return (isWeekend() && !p.works_weekend && !p.weekend.empty())
                    ? p.weekend : p.weekday;
     }
+    // Fallback population: ONE resident per house, synthesized from the
+    // world manifest alone.  The city json (city_sim.py) is optional —
+    // it only exists for maps that got a civic district, and without it
+    // every house used to stand empty (loadCity returned false and the
+    // whole system went inert, which is the "where are the people?"
+    // report).  It also promotes a few houses per neighbourhood to
+    // workplaces, shops and schools, so a synthesized day is a real
+    // commute; everything else — bodies, walking, ground clamping,
+    // rendering — is the same code path.
+    void synthesizeResidents();
     glm::vec3 placePos(const Person& p, const Step& s, int pid) const;
     int currentStep(const std::vector<Step>& sched, float tod) const;
     void emitPerson(int pid, const SimState& a, const Person& p,
@@ -151,6 +184,13 @@ private:
     glm::vec2 district_centre_{0.0f};  // civic-building centroid (log aid)
 
     float clock_min_ = 8.0f * 60.0f + 2.0f * 1440.0f;   // Wed 08:00
+    bool  clock_external_ = false;     // driven by setTimeOfDayHours
+    // Measured clock rate (game-minutes per real second) and the walk
+    // scale derived from it — see the kWalkTimeScale note in the .cpp:
+    // legs have to keep up with whatever speed the world clock runs at,
+    // without turning into a sprint when it runs slowly.
+    float prev_clock_min_ = -1.0f;
+    float clock_rate_ = 0.0f;          // 0 = unmeasured -> life speed
     GroundQueryFn ground_;
 
     struct PartInstance { glm::mat4 xform; glm::vec4 color; };
