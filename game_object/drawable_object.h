@@ -1526,6 +1526,36 @@ public:
     // world space (Gribb-Hartmann, normalised).
     static void setFrustumCullPlanes(const glm::vec4 planes[6]);
     static void clearFrustumCull();
+    // Live state of the frustum test — lets a caller record WHETHER
+    // culling was armed for a pass, not just how many nodes it lost.
+    static bool frustumCullArmed();
+
+    // ── CPU RECORDING COST INSTRUMENTATION ───────────────────────────────
+    // The GPU renders this scene in ~7 ms while drawScene spends ~76 ms
+    // RECORDING it, so the interesting number is not "how long did a pass
+    // take" but "how many things did it walk, and how many did culling
+    // actually throw away".  A wall-clock scope cannot tell a pass that
+    // recorded 300k draw calls apart from one that recorded 3k and stalled;
+    // these counters can.
+    //
+    // Plain (non-atomic) counters ON PURPOSE: every one of these is
+    // incremented from the single thread that records the command buffer.
+    // If that ever stops being true these turn into a data race, which is
+    // exactly the tripwire you want when someone parallelises recording.
+    struct DrawStats {
+        uint64_t drawables = 0;     // DrawableObject::draw() bodies entered
+        uint64_t nodes = 0;         // mesh nodes considered (flat lane)
+        uint64_t sub_lane = 0;      // drawables that took the recursive
+                                    // sub-object lane, whose nodes the
+                                    // counter above does not see
+        uint64_t cull_frustum = 0;  // ...rejected by the frustum sphere test
+        uint64_t cull_dist = 0;     // ...rejected by the clutter-fade test
+        uint64_t cull_lod = 0;      // ...rejected by the LOD band table
+        uint64_t prims = 0;         // drawIndexedIndirect calls recorded
+        uint64_t desc_binds = 0;    // bindDescriptorSets calls recorded
+    };
+    static void resetDrawStats();
+    static const DrawStats& drawStats();
 
     // Per-frame eye position in world space, used by drawMesh's clutter
     // distance cull.  Kept separate from the frustum planes because the

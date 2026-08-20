@@ -45,6 +45,10 @@ static uint32_t num_draw_meshes = 0;
 
 // ── Per-frame frustum cull state (set by application.cpp) ──────────────
 static bool     s_frustum_cull_active = false;
+// CPU recording counters — see the DrawStats comment in the header.
+// Defined here rather than beside its accessors because drawMesh (far
+// earlier in this file) increments it.
+static engine::game_object::DrawableObject::DrawStats s_draw_stats;
 static glm::vec4 s_frustum_planes[6];
 
 // ── Per-frame eye position (set by ObjectSceneView::drawDecals) ────────
@@ -4831,6 +4835,7 @@ static void drawMesh(
                 renderer::PipelineBindPoint::GRAPHICS,
                 drawable_pipeline_layout,
                 desc_sets);
+            ++s_draw_stats.desc_binds;
             s_bound_desc_list = (const void*)&desc_set_list;
         }
 
@@ -4884,6 +4889,7 @@ static void drawMesh(
         // counter: this loop walks a depth-sorted copy of the primitive
         // list and skips primitives with no pipeline, so a counter would
         // drift off the commands the fill wrote.
+        ++s_draw_stats.prims;
         cmd_buf->drawIndexedIndirect(
             drawable_object->indirect_draw_cmd_,
             node_cmd_ofs >= 0
@@ -7793,6 +7799,18 @@ void DrawableObject::clearFrustumCull() {
     s_frustum_cull_active = false;
 }
 
+bool DrawableObject::frustumCullArmed() {
+    return s_frustum_cull_active;
+}
+
+void DrawableObject::resetDrawStats() {
+    s_draw_stats = DrawStats{};
+}
+
+const DrawableObject::DrawStats& DrawableObject::drawStats() {
+    return s_draw_stats;
+}
+
 void DrawableObject::setViewerWorldPos(const glm::vec3& pos) {
     s_viewer_pos_ws = pos;
     s_viewer_pos_valid = true;
@@ -8756,6 +8774,7 @@ void DrawableObject::draw(
 
     num_draw_meshes = 0;
     size_t last_hash = 0;
+    ++s_draw_stats.drawables;
 
     // In mesh-shader mode, drawMesh needs the GS pipeline list as a
     // fallback for ineligible primitives (skinned, cutout, UINT16
@@ -8778,6 +8797,11 @@ void DrawableObject::draw(
         // nothing at all.
         if (object_->m_only_render_node_ <
             (int32_t)object_->nodes_.size()) {
+            // Sub-object wrapper lane: a recursive walk, so `nodes`
+            // below never sees it.  Counted separately so a small
+            // `nodes` against a large `draws` reads as "most of the
+            // work came through here" rather than as a broken counter.
+            ++s_draw_stats.sub_lane;
             drawNodes(
                 cmd_buf,
                 object_,
@@ -8860,14 +8884,58 @@ void DrawableObject::draw(
         const bool pre_dist =
             !depth_only && s_viewer_pos_valid && drawable_static &&
             object_->m_clutter_fade_end_m_ > 0.0f;
+        // ── LOD BAND PRE-REJECT ──────────────────────────────────────
+        // This is the test that actually rejects.  Measured on the
+        // 'new-world' scene: 2,014,370 mesh nodes walked per pass, of
+        // which the frustum sphere threw away 1,467 (0.07%) and the
+        // clutter-distance test 0 — while the LOD band test inside
+        // drawNodeMesh rejected ~95% of them.  Every one of those
+        // rejections was paid for at full price: a 13-argument call,
+        // the node fetch, the sub-object filter, the fade lookup, and
+        // only THEN the reject.  Three drawable passes a frame over 2M
+        // nodes is ~73 ms of CPU recording against a 7 ms GPU frame.
+        //
+        // The answer is already sitting in a flat array.
+        // selectPlantLodBands (called above, at the top of this
+        // function) fills lod_node_visible_ / lod_node_owner_ and
+        // early-outs when the eye and world transform are unchanged, so
+        // the table is CORRECT AND CURRENT here — the per-node work is
+        // one bounds check and one byte load.
+        //
+        // The predicate below mirrors drawNodeMesh's `lod_hidden`
+        // EXACTLY, including its asymmetry: on the depth-only path an
+        // out-of-range owner index means HIDDEN, while on the forward
+        // path an out-of-range visible index means SHOWN.  Getting that
+        // backwards would silently drop shadow casters, so it is
+        // replicated rather than simplified.  drawNodeMesh keeps its
+        // own copy of the test; this only stops nodes reaching it.
+        const bool pre_lod = object_->has_plant_lod_;
+        const size_t lod_fade_n = object_->lod_node_fade_.size();
+        const size_t lod_vis_n = object_->lod_node_visible_.size();
+        const size_t lod_own_n = object_->lod_node_owner_.size();
         const glm::mat4 iw = object_->m_current_instance_world_;
         const float iw_scale = glm::max(
             glm::length(glm::vec3(iw[0])),
             glm::max(glm::length(glm::vec3(iw[1])),
                      glm::length(glm::vec3(iw[2]))));
         const size_t flat_n = object_->mesh_node_flat_.size();
+        s_draw_stats.nodes += flat_n;
         for (size_t fi = 0; fi < flat_n; ++fi) {
             const int32_t node_idx = object_->mesh_node_flat_[fi];
+            if (pre_lod) {
+                const size_t ni = static_cast<size_t>(node_idx);
+                const bool has_lod = ni < lod_fade_n;
+                const bool lod_hidden =
+                    (depth_only && has_lod)
+                        ? (ni >= lod_own_n ||
+                           object_->lod_node_owner_[ni] == 0)
+                        : (ni < lod_vis_n &&
+                           object_->lod_node_visible_[ni] == 0);
+                if (lod_hidden) {
+                    ++s_draw_stats.cull_lod;
+                    continue;
+                }
+            }
             if ((pre_frustum || pre_dist) &&
                 fi < object_->mesh_node_sphere_.size()) {
                 const glm::vec4 s = object_->mesh_node_sphere_[fi];
@@ -8877,6 +8945,7 @@ void DrawableObject::draw(
                 if (pre_dist &&
                     glm::distance(wc, s_viewer_pos_ws) - wr >
                         object_->m_clutter_fade_end_m_) {
+                    ++s_draw_stats.cull_dist;
                     continue;
                 }
                 if (pre_frustum) {
@@ -8887,7 +8956,7 @@ void DrawableObject::draw(
                             s_frustum_planes[p].w;
                         if (dist < -wr) { outside = true; break; }
                     }
-                    if (outside) continue;
+                    if (outside) { ++s_draw_stats.cull_frustum; continue; }
                 }
             }
             drawNodeMesh(
