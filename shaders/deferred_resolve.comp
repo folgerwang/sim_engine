@@ -163,6 +163,33 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = 9, rg16f)
     uniform writeonly image2D rt_raw_out;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 10, rg16f)
     uniform readonly image2D rt_filtered_in;
+
+// ── "no measurement here" sentinel for the smooth chain ──────────────
+// GEN only traces rays for DEFERRED pixels.  Sky pixels and every
+// FORWARD-shaded pixel (grass, hair, ground clutter, water — anything
+// whose albedo_ao.a sentinel is < 0.5) exit before any ray is cast, and
+// they still have to write SOMETHING into the raw target or the à-trous
+// pass reads uninitialised texels.
+//
+// That "something" used to be (1.0, 1.0): fully lit, fully open.  It is
+// the single worst value that could have been chosen.  rt_filter.comp
+// rejects a neighbour only when its DEPTH says sky (zq >= 1.0), and a
+// forward pixel is not sky — a grass blade standing 10 cm above the sand
+// passes the depth-similarity weight at essentially full strength.  So
+// every forward pixel was injecting a hard "unshadowed, unoccluded" vote
+// into its deferred neighbours, and three à-trous iterations at tap
+// spacing 1/2/4 spread that vote over a ~29x29 footprint.  In any
+// vegetated area the terrain's traced shadow and AO were being averaged
+// toward 1.0 by pixels that were never traced at all — the ground went
+// flat and blew out, and only in the RT modes, because the GEN/filter/
+// APPLY chain does not exist on the CSM path.
+//
+// rg16f is SIGNED, so a negative value is free and unambiguous: no real
+// visibility term can be < 0.  rt_filter.comp skips these taps entirely
+// and passes them through untouched, so they survive all three
+// iterations and never contaminate anything.  APPLY never reads one —
+// it early-outs on the same two conditions that write it.
+const float RT_SMOOTH_INVALID = -1.0;
 // Base-colour textures — the SAME views the bindless raster set exposes,
 // re-written onto this COMPUTE-visible set by buildRtShadowBvh().
 // Sampled ONLY on alpha-masked triangle hits so foliage / fence cards
@@ -1055,7 +1082,8 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         // light source (see the block comment above; the lambertian
         // cube stays for HIT-point ambient, where irradiance at the
         // surface normal is the correct quantity).
-        vec3 sky = textureLod(ggx_env_sampler, rd, RT_GI_SKY_LOD).rgb;
+        vec3 sky = textureLod(ggx_env_sampler, rd, RT_GI_SKY_LOD).rgb *
+                   kIblIrradianceScale;
 #ifndef USE_HDR
         sky = sRGBToLinear(sky);
 #endif
@@ -1078,7 +1106,8 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
     if (giSecondBounce(hp, hn, hit_amb)) {
         hit_amb *= RT_GI_BOUNCE_GAIN;
     } else {
-        vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
+        vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb *
+                       kIblIrradianceScale;
 #ifndef USE_HDR
         sky_amb = sRGBToLinear(sky_amb);
 #endif
@@ -1550,7 +1579,8 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         // Miss: the ray sees sky — the IBL radiance cubemap is the
         // light source (identical to the software path; see
         // rtGiRadiance's block comment for the estimator math).
-        vec3 sky = textureLod(ggx_env_sampler, rd, RT_GI_SKY_LOD).rgb;
+        vec3 sky = textureLod(ggx_env_sampler, rd, RT_GI_SKY_LOD).rgb *
+                   kIblIrradianceScale;
 #ifndef USE_HDR
         sky = sRGBToLinear(sky);
 #endif
@@ -1570,7 +1600,8 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         if (giSecondBounce(hp, -rd, amb)) {
             amb *= RT_GI_BOUNCE_GAIN;
         } else {
-            vec3 sky_amb = texture(lambertian_env_sampler, -rd).rgb;
+            vec3 sky_amb = texture(lambertian_env_sampler, -rd).rgb *
+                           kIblIrradianceScale;
 #ifndef USE_HDR
             sky_amb = sRGBToLinear(sky_amb);
 #endif
@@ -1625,7 +1656,8 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
     if (giSecondBounce(hp, hn, hit_amb)) {
         hit_amb *= RT_GI_BOUNCE_GAIN;
     } else {
-        vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb;
+        vec3 sky_amb = texture(lambertian_env_sampler, hn).rgb *
+                       kIblIrradianceScale;
 #ifndef USE_HDR
         sky_amb = sRGBToLinear(sky_amb);
 #endif
@@ -2381,12 +2413,13 @@ void main() {
 
     // Sky / empty pixels: depth was never written by the cluster G-buffer
     // pass.  Skip — sky envmap pass paints these later in drawScene.
-    // In GEN mode store a neutral (lit, open) sample first so the blur
-    // pass never smears uninitialised texels across geometry edges.
+    // In GEN mode store the INVALID sentinel (see RT_SMOOTH_INVALID) so
+    // the à-trous pass neither smears uninitialised texels across
+    // geometry edges nor treats this pixel as a real measurement.
     float z = texture(gbuf_depth, uv).r;
     if (z >= 1.0) {
         if (rpc.pass_mode == 1u) {
-            imageStore(rt_raw_out, px, vec4(1.0, 1.0, 0.0, 0.0));
+            imageStore(rt_raw_out, px, vec4(RT_SMOOTH_INVALID));
             return;
         }
         // Glass/water over open sky (a pane against the horizon, the
@@ -2409,7 +2442,10 @@ void main() {
     // its own forward pass; leave their colour alone.
     if (albedo_ao.a < 0.5) {
         if (rpc.pass_mode == 1u) {
-            imageStore(rt_raw_out, px, vec4(1.0, 1.0, 0.0, 0.0));
+            // INVALID, not "lit and open".  This pixel belongs to a
+            // FORWARD writer (grass, hair, ground clutter, water) and
+            // no shadow ray was traced for it — see RT_SMOOTH_INVALID.
+            imageStore(rt_raw_out, px, vec4(RT_SMOOTH_INVALID));
             return;
         }
         // THE glass path: a window pane / water surface wrote depth in
@@ -2607,7 +2643,8 @@ void main() {
     // Raw estimate kept aside for DEBUG_RENDER_MODE_INDIRECT.  Seeded
     // with the flat-IBL value so the view still reads correctly when RT
     // GI is off entirely.
-    vec3 gi_debug_E = texture(lambertian_env_sampler, N).rgb;
+    vec3 gi_debug_E = texture(lambertian_env_sampler, N).rgb *
+                      kIblIrradianceScale;
 #ifndef USE_HDR
     gi_debug_E = sRGBToLinear(gi_debug_E);
 #endif
@@ -2628,7 +2665,8 @@ void main() {
         if (giProbeGather(px, sz, world_pos, N_geom, N, view_lin_z, gi_E)) {
             gi_debug_E      = gi_E;
             ambient_diffuse = c_diff * gi_E * ao;
-            vec3 flat_sky = texture(lambertian_env_sampler, N).rgb;
+            vec3 flat_sky = texture(lambertian_env_sampler, N).rgb *
+                        kIblIrradianceScale;
 #ifndef USE_HDR
             flat_sky = sRGBToLinear(flat_sky);
 #endif
@@ -2725,7 +2763,8 @@ void main() {
         // pixels can exceed the flat estimate, hence the clamp.  This
         // reuses the accumulated gi_E, so the scale is temporally smooth
         // for free — no extra rays.
-        vec3 flat_sky = texture(lambertian_env_sampler, N).rgb;
+        vec3 flat_sky = texture(lambertian_env_sampler, N).rgb *
+                        kIblIrradianceScale;
 #ifndef USE_HDR
         flat_sky = sRGBToLinear(flat_sky);
 #endif

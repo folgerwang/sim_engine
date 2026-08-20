@@ -118,12 +118,29 @@ public:
         const std::shared_ptr<renderer::ImageView>& depth_view,
         const glm::uvec2& buffer_size);
 
+    // Forward ground-decal pass: blends the decal meshes over the
+    // finished scene colour.  Used by the PURE-FORWARD configuration
+    // only — in deferred mode the decals go through
+    // drawDecalsGbuffer() instead, because a forward decal drawn after
+    // the resolve gets no shadow in any RT mode (see that function).
     void drawDecals(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_sets,
         int dbuf_idx,
         float delta_t,
         float cur_time);
+
+    // Deferred ground-decal pass: the same meshes re-rasterised into
+    // the cluster G-buffer BEFORE the resolve, so deferred_resolve.comp
+    // lights ground-plus-decal as one surface and the decal inherits
+    // the ground's traced shadow / RT AO / RT GI.  Issue AFTER
+    // drawGbuffer() and the terrain tiles' G-buffer pass.
+    void drawDecalsGbuffer(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& buffer_size);
 
     virtual void draw(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,

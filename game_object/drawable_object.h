@@ -1001,6 +1001,18 @@ private:
     // Selected by DrawMode::kDecal; populated only for objects the host
     // registered via ObjectSceneView::addDecalObject.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_decal_pipeline_list_;
+    // ── Deferred-decal pipelines (DrawMode::kDecalGBuffer) ────────────
+    // base_vert_* + base_frag_*_DECAL_GBUF against the 4-RT cluster
+    // G-buffer formats.  Same depth state as the plain G-buffer list
+    // (LESS_OR_EQUAL, writes OFF); what differs is the blend state —
+    // attachment 0 blends the decal albedo over the ground albedo with
+    // the textbook "over" factors, its ALPHA channel is ZERO/ONE so the
+    // deferred sentinel the terrain stamped survives, and attachments
+    // 1..3 are write-masked off entirely so the ground keeps its normal,
+    // geometric normal and velocity.  Populated at the same sites and
+    // under the same skip rules as drawable_gbuffer_pipeline_list_
+    // (needs setGbufferRenderbufferFormats(), non-skinned, has material).
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_decal_gbuffer_pipeline_list_;
     // ── G-buffer pipelines (DrawMode::kGBuffer) ───────────────────────
     // base_vert_* + base_frag_*_GBUF against the 4-RT cluster G-buffer
     // formats: depth test LESS_OR_EQUAL, depth writes OFF — the pass
@@ -1458,6 +1470,39 @@ public:
                         // there.  That is what makes the road ribbon
                         // blend into the terrain instead of drawing a
                         // hard silhouette edge over it.
+                        //
+                        // DEFERRED MODE DOES NOT USE THIS — see
+                        // kDecalGBuffer below.  kDecal remains the path
+                        // for the pure-forward (CSM / no-deferred)
+                        // configuration.
+        kDecalGBuffer,  // Deferred ground decals: the same decal meshes
+                        // re-rasterised into the cluster G-buffer
+                        // BEFORE the resolve, blending their albedo
+                        // over whatever the terrain tiles / drawables
+                        // wrote there.  deferred_resolve.comp then
+                        // lights ground-plus-decal as ONE surface, so
+                        // the decal inherits the traced shadow, RT AO
+                        // and RT GI of the ground it lies on.
+                        //
+                        // Why this mode exists: drawn forward AFTER the
+                        // resolve (kDecal), a decal got shadow = 1.0 in
+                        // every RT mode — the app raises
+                        // FEATURE_INPUT_SHADOW_DISABLED as soon as an
+                        // RT technique arms (the CSM cascades are stale
+                        // and must not be sampled), and nothing else
+                        // re-lit those pixels.  The result was a fully
+                        // lit road ribbon sitting on correctly shadowed
+                        // terrain, which reads as a sticker floating
+                        // above the ground.
+                        //
+                        // Uses drawable_decal_gbuffer_pipeline_list_:
+                        // base_frag*_DECAL_GBUF.spv, albedo blended
+                        // SRC_ALPHA/ONE_MINUS_SRC_ALPHA, alpha channel
+                        // ZERO/ONE so the resolve's ">= 0.5 G-buffer
+                        // written" sentinel survives, and the other
+                        // three G-buffer targets write-masked off so
+                        // the ground keeps its own normal / geometric
+                        // normal / velocity.
     };
 
     void draw(const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,

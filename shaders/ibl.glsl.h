@@ -15,6 +15,45 @@ layout(set = PBR_GLOBAL_PARAMS_SET, binding = DIRECT_SHADOW_INDEX) uniform sampl
 // DECAL permutation actually fetches from it.
 layout(set = PBR_GLOBAL_PARAMS_SET, binding = SCENE_DEPTH_TEX_INDEX) uniform sampler2D scene_depth_sampler;
 
+// ── Sky-IBL radiance scale ───────────────────────────────────────────
+// The environment cubes are convolved from the atmospheric scattering
+// LUT, which is evaluated with a sun intensity of 22.0 (see
+// cube_skybox.frag / cube_skybox_mini.comp).  That number belongs to the
+// SKY SIMULATION; nothing ever reconciled it with the units the
+// directional light and the shared ACES tonemapper use, so the ambient
+// term arrived roughly an order of magnitude too hot and drowned the
+// sun.
+//
+// Solved from a measurement rather than guessed.  With the sun already
+// at 6.0 the frame STILL tonemapped to ~0.94 sRGB on terrain whose
+// albedo is linear 0.515 (sampled from new-world_color.png at the
+// camera; that neighbourhood's maximum luma is 208/255, so nothing in
+// it is remotely white):
+//
+//   observed 0.94 sRGB          -> 2.52 linear
+//   direct at sun 6.0           =  0.69 linear
+//   => ambient                  =  1.83 linear
+//   => lambertian_env(N)        =  3.55
+//
+// which puts sky : sun irradiance at 2.7 : 1.  A clear day with the hard
+// tree shadows this scene renders is nearer 1 : 3 — the ambient was
+// close to TEN TIMES the sun.  That is why every surface came out pale
+// and desaturated instead of shadowed and saturated: a large uniform
+// white term washes colour out of everything it is added to.
+//
+// Targeting shadowed ground at ~0.40 sRGB and sunlit at ~0.80 gives
+// lambertian_env(N) = 0.349 and sun = 5.85 — the sun is already right,
+// so the whole correction lands here: 0.349 / 3.55 = 0.098.
+//
+// Why this ALSO explains the load-time change: cube_ibl_mini.comp
+// accumulates the irradiance cube across frames with a temporal EMA.
+// At 8 fps during streaming it converges slowly, so early frames sample
+// an UNDER-converged (dark) cube — which is exactly the tan sand, deep
+// blue water and saturated greens that looked correct.  Nothing about
+// loading changed the lighting; the cube simply had not finished
+// climbing to its (far too bright) steady state yet.
+const float kIblIrradianceScale = 0.10;
+
 vec3 getIBLRadianceGGX(vec3 n, vec3 v, float perceptualRoughness, vec3 specularColor, float mip_count)
 {
     float n_dot_v = clampedDot(n, v);
@@ -31,7 +70,8 @@ vec3 getIBLRadianceGGX(vec3 n, vec3 v, float perceptualRoughness, vec3 specularC
     specularLight = sRGBToLinear(specularLight);
 #endif
 
-    return specularLight * (specularColor * brdf.x + brdf.y);
+    return specularLight * kIblIrradianceScale *
+           (specularColor * brdf.x + brdf.y);
 }
 
 vec3 getIBLRadianceTransmission(vec3 n, vec3 v, float perceptualRoughness, float ior, vec3 baseColor, float mip_count)
@@ -56,7 +96,7 @@ vec3 getIBLRadianceTransmission(vec3 n, vec3 v, float perceptualRoughness, float
     specularLight = sRGBToLinear(specularLight);
 #endif
 
-   return specularLight * (brdf.x + brdf.y);
+   return specularLight * kIblIrradianceScale * (brdf.x + brdf.y);
 }
 
 vec3 getIBLRadianceLambertian(vec3 n, vec3 diffuseColor)
@@ -67,7 +107,9 @@ vec3 getIBLRadianceLambertian(vec3 n, vec3 diffuseColor)
         diffuseLight = sRGBToLinear(diffuseLight);
     #endif
 
-    return diffuseLight * diffuseColor;
+    // See kIblIrradianceScale: the cubes are convolved from a sky LUT
+    // whose units were never reconciled with the sun or the tonemapper.
+    return diffuseLight * kIblIrradianceScale * diffuseColor;
 }
 
 vec3 getIBLRadianceCharlie(vec3 n, vec3 v, float sheenRoughness, vec3 sheenColor, float sheenIntensity, float mip_count)
@@ -86,7 +128,8 @@ vec3 getIBLRadianceCharlie(vec3 n, vec3 v, float sheenRoughness, vec3 sheenColor
     sheenLight = sRGBToLinear(sheenLight);
     #endif
 
-    return sheenIntensity * sheenLight * sheenColor * brdf;
+    return sheenIntensity * sheenLight * kIblIrradianceScale *
+           sheenColor * brdf;
 }
 
 vec3 getIBLRadianceSubsurface(vec3 n, vec3 v, float scale, float distortion, float power, vec3 color, float thickness)
@@ -97,7 +140,8 @@ vec3 getIBLRadianceSubsurface(vec3 n, vec3 v, float scale, float distortion, flo
         diffuseLight = sRGBToLinear(diffuseLight);
     #endif
 
-    return diffuseLight * getPunctualRadianceSubsurface(n, v, -v, scale, distortion, power, color, thickness);
+    return diffuseLight * kIblIrradianceScale *
+           getPunctualRadianceSubsurface(n, v, -v, scale, distortion, power, color, thickness);
 }
 
 #endif // IBL_GLSL_H

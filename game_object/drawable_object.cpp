@@ -5644,6 +5644,144 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
         std::source_location::current());
 }
 
+// Deferred-decal pipeline (DrawMode::kDecalGBuffer).  The decal meshes
+// re-rasterised into the cluster G-buffer BEFORE the resolve, so that
+// deferred_resolve.comp lights ground-plus-decal as one surface and the
+// decal inherits the ground's traced shadow / RT AO / RT GI.  Replaces
+// the post-resolve forward blend (createDrawableDecalPipeline) whenever
+// deferred is active — that path had no shadow at all in any RT mode.
+//
+// Depth state matches createDrawableGbufferPipeline exactly (test
+// LESS_OR_EQUAL against the depth the forward pass stamped, writes OFF).
+// The blend state is where the two differ, and the split between the
+// colour and alpha channels is the whole trick:
+//
+//   • attachment 0 (albedo_ao), COLOUR: SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+//     — the textbook "over".  base_frag*_DECAL_GBUF writes the decal's
+//     coverage (ground-contact fade x clutter distance fade x material
+//     alpha) into .a, so the same dissolve the forward decal had now
+//     drives the G-buffer composite.
+//   • attachment 0 (albedo_ao), ALPHA: ZERO / ONE — dst kept verbatim.
+//     That channel is NOT a colour, it is the resolve's ">= 0.5
+//     G-buffer written" sentinel.  Blending it the same way as the
+//     colour would drag a partially-covered pixel below 0.5 and hand it
+//     back to the forward path, which is precisely the bug this
+//     pipeline exists to fix.  Note SRC_ALPHA on the colour side still
+//     reads the fragment's .a regardless of what the alpha channel
+//     write does, so one shader output drives both.
+//   • attachments 1..3 (normal_rough, emissive_metal, velocity):
+//     colour_write_mask 0 — no writes at all.  A ground decal lies
+//     flush on its surface and has no normal of its own; letting it
+//     stamp one would break the RT GI ray origin (which reads the
+//     geometric normal out of emissive_metal.xy) for a ribbon that is
+//     geometrically the terrain.  Same argument for velocity: both are
+//     static world geometry, so the terrain's value is already correct.
+static std::shared_ptr<renderer::Pipeline> createDrawableDecalGbufferPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& gbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive) {
+    auto shader_modules = getDrawableShaderModules(
+        device,
+        primitive.tag_.has_normal,
+        primitive.tag_.has_tangent,
+        primitive.tag_.has_texcoord_0,
+        primitive.tag_.has_skin_set_0,
+        primitive.material_idx_ >= 0,
+        primitive.tag_.double_sided,
+        primitive.tag_.has_skin_set_1,
+        /*is_decal*/ true,
+        /*is_gbuffer*/ true);
+
+    // Function-local statics for the same lifetime reason the plain
+    // G-buffer and decal states are static: GraphicPipelineInfo holds
+    // shared_ptrs, and every deferred-decal pipeline wants identical
+    // fixed-function state anyway.
+    static auto s_decal_gbuf_blend_attachments = []() {
+        std::vector<renderer::PipelineColorBlendAttachmentState> a;
+        a.reserve(4);
+        // 0: albedo_ao — colour blends, alpha (the sentinel) is kept.
+        a.push_back(
+            renderer::helper::fillPipelineColorBlendAttachmentState(
+                SET_FLAG_BIT(ColorComponent, ALL_BITS),
+                /*blend_enable*/ true,
+                renderer::BlendFactor::SRC_ALPHA,
+                renderer::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                renderer::BlendOp::ADD,
+                renderer::BlendFactor::ZERO,
+                renderer::BlendFactor::ONE,
+                renderer::BlendOp::ADD));
+        // 1..3: normal_rough, emissive_metal, velocity — untouched.
+        for (int i = 0; i < 3; ++i) {
+            a.push_back(
+                renderer::helper::fillPipelineColorBlendAttachmentState(
+                    /*color_write_mask*/ 0));
+        }
+        return a;
+    }();
+    static auto s_decal_gbuf_blend_state_info =
+        std::make_shared<renderer::PipelineColorBlendStateCreateInfo>(
+            renderer::helper::fillPipelineColorBlendStateCreateInfo(
+                s_decal_gbuf_blend_attachments));
+    static auto s_decal_gbuf_depth_stencil_info =
+        std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+            renderer::helper::fillPipelineDepthStencilStateCreateInfo(
+                /*depth_test_enable*/ true,
+                /*depth_write_enable*/ false,
+                renderer::CompareOp::LESS_OR_EQUAL));
+
+    renderer::GraphicPipelineInfo decal_gbuf_pipeline_info =
+        graphic_pipeline_info;
+    decal_gbuf_pipeline_info.blend_state_info =
+        s_decal_gbuf_blend_state_info;
+    decal_gbuf_pipeline_info.depth_stencil_info =
+        s_decal_gbuf_depth_stencil_info;
+
+    renderer::PipelineInputAssemblyStateCreateInfo topology_info;
+    topology_info.restart_enable = primitive.tag_.restart_enable;
+    topology_info.topology = static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
+
+    auto binding_descs = primitive.binding_descs_;
+    auto attribute_descs = primitive.attribute_descs_;
+
+    renderer::VertexInputBindingDescription desc;
+    desc.binding = VINPUT_INSTANCE_BINDING_POINT;
+    desc.input_rate = renderer::VertexInputRate::INSTANCE;
+    desc.stride = sizeof(glsl::InstanceDataInfo);
+    binding_descs.push_back(desc);
+
+    renderer::VertexInputAttributeDescription attr;
+    attr.binding = VINPUT_INSTANCE_BINDING_POINT;
+    attr.buffer_offset = 0;
+    attr.format = renderer::Format::R32G32B32A32_SFLOAT;
+    attr.buffer_view = 0;
+    attr.location = IINPUT_MAT_ROT_0;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_0);
+    attribute_descs.push_back(attr);
+    attr.location = IINPUT_MAT_ROT_1;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_1);
+    attribute_descs.push_back(attr);
+    attr.location = IINPUT_MAT_ROT_2;
+    attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
+    attribute_descs.push_back(attr);
+
+    renderer::RasterizationStateOverride rasterization_state_override;
+    rasterization_state_override.override_double_sided = true;
+    rasterization_state_override.double_sided = primitive.tag_.double_sided;
+
+    return device->createPipeline(
+        pipeline_layout,
+        binding_descs,
+        attribute_descs,
+        topology_info,
+        decal_gbuf_pipeline_info,
+        shader_modules,
+        gbuffer_formats,
+        rasterization_state_override,
+        std::source_location::current());
+}
+
 // Forward translucent GLASS pipeline (DrawMode::kGlassAttr).  Glass is
 // TRANSLUCENT, so it does not belong in any deferred/attribute target:
 // the scene behind a thin pane is already on screen, which makes
@@ -6849,6 +6987,7 @@ std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_per_cascade_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_mesh_shader_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_decal_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_decal_gbuffer_pipeline_list_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::mesh_shader_shadow_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout>      DrawableObject::mesh_shader_shadow_pipeline_layout_;
 std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
@@ -7231,6 +7370,26 @@ DrawableObject::DrawableObject(
                                 graphic_pipeline_info,
                                 primitive);
                     }
+                    // Deferred variant of the same decal (kDecalGBuffer).
+                    // Skip rules follow the plain G-buffer list, not the
+                    // forward decal list above: the _DECAL_GBUF matrix has
+                    // no _NOMTL and no skinned permutations.
+                    if (gbuffer_formats_valid_ &&
+                        !primitive.tag_.has_skin_set_0 &&
+                        primitive.material_idx_ >= 0) {
+                        auto dg_result =
+                            drawable_decal_gbuffer_pipeline_list_.find(hash_value);
+                        if (dg_result ==
+                            drawable_decal_gbuffer_pipeline_list_.end()) {
+                            drawable_decal_gbuffer_pipeline_list_[hash_value] =
+                                createDrawableDecalGbufferPipeline(
+                                    device,
+                                    gbuffer_renderbuffer_formats_,
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive);
+                        }
+                    }
                 }
 
                 {
@@ -7594,6 +7753,24 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                                     drawable_pipeline_layout_,
                                     graphic_pipeline_info,
                                     primitive);
+                        }
+                        // Deferred variant — G-buffer skip rules.
+                        if (gbuffer_formats_valid_ &&
+                            !primitive.tag_.has_skin_set_0 &&
+                            primitive.material_idx_ >= 0) {
+                            auto dg_result =
+                                drawable_decal_gbuffer_pipeline_list_.find(
+                                    hash_value);
+                            if (dg_result ==
+                                drawable_decal_gbuffer_pipeline_list_.end()) {
+                                drawable_decal_gbuffer_pipeline_list_[hash_value] =
+                                    createDrawableDecalGbufferPipeline(
+                                        device,
+                                        gbuffer_renderbuffer_formats_,
+                                        drawable_pipeline_layout_,
+                                        graphic_pipeline_info,
+                                        primitive);
+                            }
                         }
                     }
                     {
@@ -8074,6 +8251,12 @@ void DrawableObject::recreateStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_decal_pipeline_list_.clear();
+    // Same argument for the deferred decal list, against the G-buffer
+    // formats instead of the forward ones.
+    for (auto& pipeline : drawable_decal_gbuffer_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_decal_gbuffer_pipeline_list_.clear();
 
     for (auto& object : drawable_object_list_) {
         for (int i_mesh = 0; i_mesh < object.second->meshes_.size(); i_mesh++) {
@@ -8099,6 +8282,23 @@ void DrawableObject::recreateStaticMembers(
                             drawable_pipeline_layout_,
                             graphic_pipeline_info,
                             primitive);
+                }
+                // Deferred variant — G-buffer skip rules.
+                if (gbuffer_formats_valid_ &&
+                    !primitive.tag_.has_skin_set_0 &&
+                    primitive.material_idx_ >= 0) {
+                    auto decal_gbuf_result =
+                        drawable_decal_gbuffer_pipeline_list_.find(hash_value);
+                    if (decal_gbuf_result ==
+                        drawable_decal_gbuffer_pipeline_list_.end()) {
+                        drawable_decal_gbuffer_pipeline_list_[hash_value] =
+                            createDrawableDecalGbufferPipeline(
+                                device,
+                                gbuffer_renderbuffer_formats_,
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive);
+                    }
                 }
                 // G-buffer pipeline — see the sync ctor for the skip rules.
                 if (gbuffer_formats_valid_ &&
@@ -8273,6 +8473,10 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_decal_pipeline_list_.clear();
+    for (auto& pipeline : drawable_decal_gbuffer_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_decal_gbuffer_pipeline_list_.clear();
     for (auto& pipeline : drawable_shadow_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -8751,6 +8955,7 @@ void DrawableObject::draw(
         (draw_mode == DrawMode::kCsmPerCascade) ? drawable_csm_per_cascade_pipeline_list_ :
         (draw_mode == DrawMode::kCsmMeshShader) ? drawable_csm_mesh_shader_pipeline_list_ :
         (draw_mode == DrawMode::kDecal)         ? drawable_decal_pipeline_list_           :
+        (draw_mode == DrawMode::kDecalGBuffer)  ? drawable_decal_gbuffer_pipeline_list_   :
         (draw_mode == DrawMode::kGBuffer)       ? drawable_gbuffer_pipeline_list_         :
         (draw_mode == DrawMode::kGlassAttr)     ? drawable_glass_pipeline_list_           :
         depth_only                              ? drawable_shadow_pipeline_list_           :
@@ -8762,9 +8967,13 @@ void DrawableObject::draw(
     // should reveal), from the G-buffer (opaque attributes), and from
     // every shadow/CSM pass (a pane that casts a full-dark shadow is a
     // wall; the RT paths handle glass shadowing their own way).
+    // kDecalGBuffer takes the same filter as kDecal: a decal GLB's own
+    // materials decide what it draws, and a Blend-tagged decal must not
+    // be diverted into the glass pass.
     s_material_filter =
-        (draw_mode == DrawMode::kGlassAttr) ? 2 :
-        (draw_mode == DrawMode::kDecal)     ? 0 : 1;
+        (draw_mode == DrawMode::kGlassAttr)    ? 2 :
+        (draw_mode == DrawMode::kDecal ||
+         draw_mode == DrawMode::kDecalGBuffer) ? 0 : 1;
 
     std::vector<std::shared_ptr<renderer::Buffer>> buffers(1);
     std::vector<uint64_t> offsets(1);

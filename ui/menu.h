@@ -265,6 +265,76 @@ class Menu {
     // yet as temporally stable as the per-pixel one, so plain ray-traced
     // GI stays the shipping default and the probe gather is opt-in.
     bool gi_screen_probe_ = false;
+    // ── Master switch for RT indirect diffuse ────────────────────────
+    // ON (default): the resolve's ambient diffuse comes from the traced
+    // GI estimate (whichever estimator gi_screen_probe_ selects).  OFF:
+    // it falls back to the flat lambertian IBL cube, exactly what the
+    // CSM path uses — shadows, RT AO and the RT technique itself are
+    // untouched.
+    //
+    // This is a DIAGNOSTIC as much as a feature.  The traced estimate
+    // and the flat cube are two different estimators of the same
+    // quantity and they are NOT calibrated against each other: the cube
+    // is a plain mean of radiance over cosine-distributed samples that
+    // are then culled by `NdotL > 0` on a REFLECTED vector
+    // (cube_ibl_mini.comp) — which for the Lambertian branch throws away
+    // every sample more than 45 degrees off the normal, i.e. half of
+    // them, keeping the zenith-biased half.  The traced estimator
+    // integrates the real hemisphere.  Flipping this switch is the one
+    // measurement that separates "the ambient changed" from "the shadow
+    // or AO changed" when the frame brightness jumps between the CSM and
+    // RT paths.
+    bool rt_gi_enabled_ = true;
+    // ── Auto-arm the selected RT technique once its BVH/TLAS is ready ──
+    // ON (default, and the historical behaviour): the moment the cluster
+    // BVH/TLAS finishes building, the effective shadow path flips from
+    // the CSM fallback to the selected RT technique — MID-LOAD, without
+    // the user doing anything.
+    //
+    // OFF: the CSM fallback is held for the whole session no matter what
+    // becomes ready.  That makes "did the picture change because the
+    // scene finished streaming, or because the renderer switched
+    // techniques?" answerable, which it is not while the switch fires on
+    // its own somewhere in the middle of loading.  Turn it back on by
+    // hand once everything is resident and the camera is parked, and the
+    // resulting change is a clean, single, observed A/B.
+    //
+    // DEFAULT OFF.  The auto-arm fires long before the menu is even
+    // reachable, so leaving it on by default meant the technique had
+    // ALWAYS already switched by the time anyone could observe it — the
+    // switch was unobservable in principle, not just in practice.  Off
+    // by default makes the technique change something the user does,
+    // deliberately, at a moment of their choosing.  Pass --rt-autoarm to
+    // restore the old behaviour (see Application::setRtAutoArm).
+    bool shadow_auto_arm_ = false;
+    // ── Directional-sun radiance (Rendering > Sun intensity) ─────────
+    // Multiplied into RuntimeLightsParams.lights[].intensity every
+    // frame, so it is live — no rebuild, no reload.
+    //
+    // Was a hardcoded 20.0f, and that number was never calibrated
+    // against the tonemapper.  With the shared ACES curve at
+    // kSceneExposure = 0.58, a surface of ordinary albedo in full sun
+    // lands far past the shoulder:
+    //
+    //   sand albedo, measured off new-world_color.png at the camera:
+    //       sRGB 190/255 -> linear 0.515
+    //   deferred_resolve.comp: diffuse = c_diff * light_col * NdotL/PI
+    //       0.515 * 20.0 * 0.7 / PI          = 2.29
+    //     + ambient                          ~ 0.40
+    //     = 2.69 linear -> sceneTonemap -> 0.945 sRGB  (240/255)
+    //
+    // i.e. clipped white, from an albedo that is mid-grey in the source
+    // map (that neighbourhood's MAXIMUM luma is 208/255 — nothing in it
+    // is anywhere near white).  Every sunlit surface of decent albedo
+    // was being pushed into the shoulder; only darker materials (tree
+    // bark, roof tiles) stayed inside it, which is why the ground blew
+    // out while the buildings looked fine.
+    //
+    // 6.0 puts that same sand at ~0.74 sRGB — bright, still white-ish
+    // sand, but with headroom left for specular and for genuinely
+    // brighter materials.  It is a starting point, not a law: the
+    // ambient term above is an estimate, so slide it and see.
+    float sun_intensity_ = 6.0f;
     // Multi-bounce GI by temporal feedback: a GI ray's hit point reads
     // last frame's accumulated irradiance there instead of a flat sky
     // constant, so the bounce series converges to multi-bounce at zero
@@ -2036,6 +2106,25 @@ public:
     // comment above and the SCREEN-PROBE GI block in
     // deferred_resolve.comp.
     inline bool isGiScreenProbeOn() const { return gi_screen_probe_; }
+
+    // Rendering > Shadow > "RT indirect diffuse (GI)".  Master switch —
+    // OFF puts the resolve's ambient diffuse back on the flat lambertian
+    // IBL cube (the CSM path's ambient) while leaving the RT shadow and
+    // RT AO terms alone.  See the member comment above.
+    inline bool isRtGiOn() const { return rt_gi_enabled_; }
+
+    // Rendering > Shadow > "Auto-arm RT when ready".  OFF pins the CSM
+    // fallback for the whole session so the shadow technique never
+    // switches on its own partway through loading — see the member
+    // comment above.  setShadowAutoArm() is the --no-rt-autoarm hook.
+    inline bool isShadowAutoArmOn() const { return shadow_auto_arm_; }
+    inline void setShadowAutoArm(bool e) { shadow_auto_arm_ = e; }
+
+    // Rendering > "Sun intensity".  Live directional-light radiance —
+    // see the member comment above for why the old hardcoded 20.0f was
+    // clipping every sunlit surface of ordinary albedo.
+    inline float getSunIntensity() const { return sun_intensity_; }
+    inline void  setSunIntensity(float v) { sun_intensity_ = v; }
 
     // Rendering > Shadow > "Multi-bounce GI (temporal feedback)".  See
     // the member comment above and giTemporalSecondBounce() in

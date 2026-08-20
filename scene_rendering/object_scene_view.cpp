@@ -205,6 +205,121 @@ void ObjectSceneView::drawGbuffer(
     cmd_buf->endDynamicRendering();
 }
 
+// ── Deferred ground decals ───────────────────────────────────────────
+// The deferred counterpart of drawDecals(): the same decal meshes, but
+// re-rasterised into the cluster G-buffer BEFORE the resolve instead of
+// blended over the finished image after it.  The decal's albedo lands on
+// top of whatever the terrain-tile / drawable G-buffer passes already
+// wrote, and deferred_resolve.comp then lights ground-plus-decal as ONE
+// surface — so the decal inherits the ground's traced shadow, RT AO and
+// RT GI for free.
+//
+// This exists because the post-resolve forward pass could not: the app
+// raises FEATURE_INPUT_SHADOW_DISABLED the moment any RT technique arms
+// (the CSM cascades are stale and must not be sampled), so base.frag's
+// forward path shaded every decal fragment with shadow = 1.0 and no
+// occlusion of any kind, while the terrain it sat on was fully
+// RT-relit.  A brightly lit ribbon on shadowed ground reads as a decal
+// hovering above the surface.
+//
+// MUST be issued AFTER drawGbuffer() and after the terrain tiles'
+// G-buffer pass: the blend needs the ground albedo already in the
+// target, and the ">= 0.5 written" sentinel it preserves has to be
+// there to preserve.
+void ObjectSceneView::drawDecalsGbuffer(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
+    const std::shared_ptr<renderer::ImageView>& depth_view,
+    const glm::uvec2& buffer_size) {
+
+    if (m_decal_objects_.empty() || !depth_view) {
+        return;
+    }
+
+    // Same reason as drawDecals(): the DECAL permutations sample the
+    // scene depth to compute their ground-contact fade, and sampling
+    // m_depth_buffer_ while it is bound as the depth attachment would
+    // trip VUID-vkCmdDraw-None-09600.  Must happen outside the render
+    // pass, so before beginDynamicRendering below.
+    duplicateDepthBuffer(cmd_buf);
+
+    renderer::DescriptorSetList desc_set_list = desc_sets;
+    desc_set_list[VIEW_PARAMS_SET] =
+        m_camera_object_->getViewCameraDescriptorSet();
+
+    {
+        // LOAD every target — this pass blends onto them, and the three
+        // it does not touch are write-masked off in the pipeline rather
+        // than detached here, so the attachment list still has to match
+        // the G-buffer pipeline's colour-attachment count.
+        std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
+        color_attachment_infos.reserve(gbuffer_views.size());
+        for (const auto& view : gbuffer_views) {
+            er::RenderingAttachmentInfo attachment_info;
+            attachment_info.image_view = view;
+            attachment_info.image_layout =
+                er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+            attachment_info.store_op = er::AttachmentStoreOp::STORE;
+            color_attachment_infos.push_back(attachment_info);
+        }
+
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = depth_view;
+        depth_attachment_info.image_layout =
+            er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::LOAD;
+        // STORE, not DONT_CARE: the pipeline does not write depth, but
+        // the resolve and every later pass still read this buffer.
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { buffer_size.x, buffer_size.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = color_attachment_infos;
+        renderingInfo.depth_attachments = { depth_attachment_info };
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(buffer_size.x);
+    viewports[0].height = float(buffer_size.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = buffer_size;
+
+    // Same eye publish drawDecals() makes, and for the same reason: the
+    // ground-clutter distance cull on the CPU and the alpha ramp on the
+    // GPU must agree about where the camera is, or tiles vanish while
+    // still partly opaque.
+    ego::DrawableObject::setViewerWorldPos(
+        m_camera_object_->getCameraViewInfo().position);
+
+    for (auto& decal_obj : m_decal_objects_) {
+        decal_obj->draw(
+            cmd_buf,
+            desc_set_list,
+            viewports,
+            scissors,
+            false,
+            ego::DrawableObject::DrawMode::kDecalGBuffer,
+            0u);
+    }
+
+    ego::DrawableObject::clearViewerWorldPos();
+
+    cmd_buf->endDynamicRendering();
+}
+
 void ObjectSceneView::drawGlassForward(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const renderer::DescriptorSetList& desc_sets,

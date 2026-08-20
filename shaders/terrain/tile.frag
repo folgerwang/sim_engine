@@ -820,15 +820,38 @@ void main() {
         float nz = sqrt(max(1e-4f, 1.0f - min(dot(nxy, nxy), 0.9999f)));
         normal = normalize(nxy.x * T + nxy.y * B + nz * normal);
     }
-    // Authored roughness replaces the guess in proportion to how much of
-    // it is real, but keeps the ground field's damp-hollow / dry-crest
-    // modulation on top: that lives below the 4 m texel and below the 1 m
-    // one too, so no map can carry it.
-    // Floor raised 0.05→0.50: whatever the authored ORM/detail maps
-    // say, walkable GROUND is never glossier than semi-matte — the low
-    // floor let pale detail tiles read as wet plastic in full sun.
-    mat_rough = clamp(mix(mat_rough, surf_rough + g_field * 0.07f,
-                          surf_rough_w), 0.50f, 1.0f);
+    // ── Authored roughness MODULATES the material guess ───────────────
+    // It used to REPLACE it: surf_rough_w goes to 1.0 the moment a detail
+    // surface tile becomes resident, so mix(mat_rough, surf_rough, 1.0)
+    // discarded the material-derived value entirely and handed the whole
+    // surface to the tile's B channel.
+    //
+    // That is what made the ground turn white as a scene finished
+    // streaming, with nothing else changing — same camera, same shadow
+    // technique, the tiles simply arrived.  Measured over all 90 cached
+    // tile_*_surf.png of this map, the authored roughness runs
+    //     min 0.505   p25 0.729   median 0.867   p75 0.925
+    // against material values of grass 0.97 / loose 0.98 / rock 0.88 /
+    // snow 0.72.  So residency drags walkable ground from ~0.97 toward
+    // ~0.87, and a quarter of it below 0.73.  Terrain is DIELECTRIC
+    // (metallic 0, achromatic f0 = 0.04), so everything that gain buys
+    // is WHITE specular off the sky laid over the albedo — a sheen that
+    // washes sand out completely while darker patches still read
+    // through it.  The 0.50 floor below was supposed to catch this and
+    // is simply too permissive to.
+    //
+    // The authored map still has real information — damp hollows, packed
+    // tracks, polished rock — so it is not ignored.  It is bounded: the
+    // detail tile may texture the roughness DOWN by a limited fraction,
+    // never polish ground to semi-gloss.  kDetailRoughFloorFrac is that
+    // bound; 1.0 restores the old replace-outright behaviour.
+    const float kDetailRoughFloorFrac = 0.85f;
+    float bounded_rough = max(surf_rough, mat_rough * kDetailRoughFloorFrac);
+    // Absolute floor raised 0.50 -> 0.75 for the same reason the material
+    // constants were raised: walkable GROUND is never glossier than
+    // semi-matte, whatever any authored map says.
+    mat_rough = clamp(mix(mat_rough, bounded_rough + g_field * 0.07f,
+                          surf_rough_w), 0.75f, 1.0f);
 
 #ifdef GBUFFER_OUTPUT
     // Deferred path: write material attributes and stop.  Lighting (sun +
@@ -909,6 +932,39 @@ void main() {
     // curve as the deferred resolve (which lights this same terrain when
     // GBUFFER_OUTPUT is active).
     outColor = vec4(sceneTonemap(color), alpha);
+
+    // ── Runtime render-debug override ────────────────────────────────
+    // The forward terrain branch had NO debug-mode dispatch at all,
+    // which made it the one surface in the frame you could not inspect:
+    // "Render Debug > Albedo" answered for every drawable and for
+    // deferred terrain (deferred_resolve.comp decodes the G-buffer) but
+    // silently did nothing here, so the forward path could only ever be
+    // debugged by staring at the shaded result.  Same modes, same
+    // meanings, same packing as base.frag and cluster_bindless.frag.
+    uint dbg_mode =
+        (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+            >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+    if (dbg_mode == DEBUG_RENDER_MODE_ALBEDO) {
+        outColor = vec4(albedo, 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_NORMAL) {
+        outColor = vec4(normal * 0.5f + 0.5f, 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_GEOMETRIC_NORMAL) {
+        outColor = vec4(geom_normal * 0.5f + 0.5f, 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_DIFFUSE) {
+        outColor = vec4(f_diffuse, 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SPECULAR) {
+        outColor = vec4(f_specular, 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_ROUGHNESS) {
+        outColor = vec4(vec3(material_info.perceptualRoughness), 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_METALLIC) {
+        outColor = vec4(vec3(material_info.metallic), 1.0f);
+    } else if (dbg_mode == DEBUG_RENDER_MODE_SSAO) {
+        // Parity with base.frag / cluster_bindless.frag: white here so
+        // ssao_apply.comp's multiply leaves vec3(ao) on screen.  The
+        // terrain's OWN occlusion is surf_ao and is already folded into
+        // the ambient terms above.
+        outColor = vec4(1.0f);
+    }
 //    outColor.xyz *= in_data.test_color;
 #endif  // !GBUFFER_OUTPUT
 }

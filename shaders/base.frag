@@ -124,6 +124,92 @@ float linearizeSceneDepth(float window_z) {
     return camera_info.depth_params.y /
            (window_z + camera_info.depth_params.x);
 }
+
+// ── Decal coverage ───────────────────────────────────────────────────
+// The ground-contact fade times the ground-clutter distance fade, in
+// [0, 1].  Factored out of main() because BOTH decal permutations need
+// the identical number: the forward one (DECAL) multiplies it into
+// outColor.a, and the deferred one (DECAL + GBUFFER_OUTPUT) hands it to
+// the G-buffer pipeline's SRC_ALPHA blend.  Two copies of this would
+// drift, and a drift here shows up as the road dissolving at a
+// different distance depending on which shadow technique is selected —
+// which is exactly the class of bug the deferred decal path exists to
+// remove.
+//
+// The depth copy is the same resolution and the same viewport as this
+// render target, so gl_FragCoord indexes it directly -- no screen-size
+// uniform and no filtering wanted (a filtered depth read would
+// interpolate across silhouettes and invent surfaces that are not
+// there).
+float decalCoverage(vec3 view_dir, vec3 geom_normal, vec3 world_pos) {
+    float scene_win_z =
+        texelFetch(scene_depth_sampler, ivec2(gl_FragCoord.xy), 0).r;
+    // Positive when the decal floats in FRONT of the scene, which is
+    // the only direction worth fading -- a decal behind the scene has
+    // already been rejected by the depth test.
+    float ray_gap =
+        max(linearizeSceneDepth(scene_win_z) -
+            linearizeSceneDepth(gl_FragCoord.z), 0.0);
+    // ── Along-ray gap -> PERPENDICULAR gap ───────────────────────────
+    // What DECAL_FADE_START/END want to measure is "how far is this
+    // decal floating off the surface underneath it" -- a property of
+    // the geometry alone.  ray_gap is not that: it is the separation
+    // measured ALONG THE VIEW RAY, which for two near-parallel
+    // surfaces is perpendicular_gap / |dot(V, N)| and therefore blows
+    // up at grazing angles.  A ground-hugging quad lifted 9 cm, seen
+    // from eye height 1.7 m at 20 m range, has sin(elevation) ~ 0.085
+    // and so reads as a 1.06 m gap -- past DECAL_FADE_END, i.e. it
+    // dissolves to nothing precisely where a player stands and looks
+    // out across the ground.  That is why the road only ever looked
+    // right close up and under the feet, and why ground clutter was
+    // invisible entirely.
+    //
+    // Multiplying back by |dot(V, N)| recovers the perpendicular
+    // separation, which is view-independent: a decal 9 cm off the
+    // ground now reads as 9 cm from every angle.  view_dir is the
+    // fragment->eye direction and geom_normal the GEOMETRIC normal,
+    // both world-space and both already computed by the caller for the
+    // lighting.
+    //
+    // Exactly edge-on (dot -> 0) the perpendicular gap tends to zero
+    // and the decal stays solid, which is the correct limit: a surface
+    // seen edge-on has no visible float to dissolve.  No epsilon floor
+    // here on purpose -- a floor would reintroduce the angle
+    // dependence this line exists to remove.
+    float depth_gap = ray_gap * abs(dot(view_dir, geom_normal));
+    float coverage =
+        1.0 - smoothstep(DECAL_FADE_START, DECAL_FADE_END, depth_gap);
+
+    // ── Ground-clutter distance fade ─────────────────────────────────
+    // Zero end distance = "this decal does not fade with range" (the
+    // road ribbon), so the whole thing costs one scalar compare there.
+    // Distance is measured in world space from the eye to the FRAGMENT
+    // rather than to the patch centre: a 3 m quad viewed edge-on at the
+    // fade boundary would otherwise pop as a unit, and per-fragment
+    // costs nothing extra since vertex_position is already interpolated
+    // in for the lighting.
+    if (model_params.clutter_fade_end_m > 0.0) {
+        float view_dist = distance(camera_info.position.xyz, world_pos);
+        coverage *= 1.0 - smoothstep(model_params.clutter_fade_start_m,
+                                     model_params.clutter_fade_end_m,
+                                     view_dist);
+    }
+    return coverage;
+}
+
+// ── Screen-door dissolve for MASK-mode decal cards ───────────────────
+// The glTF authors the clutter/meadow cards as MASK, so the decal
+// permutations cut instead of blending: texture alpha tests against the
+// material cutoff, and the coverage above becomes a per-pixel
+// interleaved-gradient threshold, so the distance fade survives without
+// any partial transparency.  Returns true when this fragment should be
+// discarded.  Shared for the same anti-drift reason as decalCoverage.
+bool decalScreenDoorCull(float base_alpha, float cutoff, float coverage) {
+    float ign = fract(52.9829189 *
+                      fract(dot(gl_FragCoord.xy,
+                                vec2(0.06711056, 0.00583715))));
+    return base_alpha < cutoff || coverage <= ign;
+}
 #endif // DECAL
 
 #include "pbr_lighting.glsl.h"
@@ -458,10 +544,56 @@ void main() {
         discard;
     }
 #endif // ALPHAMODE_MASK
+
+    // ── Deferred decals (DECAL + GBUFFER_OUTPUT) ─────────────────────
+    // A ground decal is not a surface of its own: it is a change to the
+    // ALBEDO of the surface it lies on.  Writing it into the G-buffer
+    // and letting deferred_resolve.comp light the combined result once
+    // is therefore both cheaper and more correct than lighting the
+    // decal separately and compositing — and it is the only way the
+    // decal can pick up the traced shadow / RT-AO / RT-GI the ground
+    // under it gets.  Drawn forward AFTER the resolve (as it used to
+    // be) the decal had no shadow at all in any RT mode, because
+    // FEATURE_INPUT_SHADOW_DISABLED is raised whenever an RT technique
+    // is armed and nothing else re-lit it: a fully lit ribbon floating
+    // over correctly shadowed terrain.
+    //
+    // The coverage goes in .a, which the pipeline's colour blend reads
+    // as SRC_ALPHA.  The ALPHA channel's own blend is ZERO/ONE, so the
+    // >= 0.5 "G-buffer written" sentinel the terrain already stamped
+    // here survives untouched — see createDrawableDecalGbufferPipeline.
+    // Consequence worth knowing: a decal over a pixel NO deferred
+    // writer covered stays invisible (sentinel 0 → the resolve skips
+    // it).  That fails safe, and every surface decals are authored onto
+    // (terrain tiles, placed props) does go through the G-buffer.
+    float gbuf_alpha = 1.0;
+#ifdef DECAL
+    {
+        float coverage =
+            decalCoverage(v, normal_info.ng, ps_in_data.vertex_position);
+        if ((material.material_features & FEATURE_MATERIAL_ALPHA_MASK) != 0u) {
+            // Foliage cards: cut, don't blend.  Survivors are fully
+            // opaque so overlapping cards stop compositing into soup —
+            // identical policy to the forward decal branch.
+            if (decalScreenDoorCull(baseColor.a, material.alpha_cutoff,
+                                    coverage)) {
+                discard;
+            }
+            gbuf_alpha = 1.0;
+        } else {
+            // Road skirt & true decals: baseColor.a still carries the
+            // material's own alpha (the road-fade skirt's texture ramp),
+            // so the two multiply rather than one overriding the other.
+            gbuf_alpha = baseColor.a * coverage;
+        }
+    }
+#endif // DECAL
+
     // .a >= 0.5 is the resolve's "G-buffer written" sentinel — see
     // tile.frag, which compresses its AO into [0.5, 1] for the same
-    // reason.  The drawable path has no baked AO, so a flat 1.0.
-    out_albedo_ao = vec4(baseColor.rgb, 1.0);
+    // reason.  The drawable path has no baked AO, so a flat 1.0 (the
+    // decal permutation overrides it with its coverage, above).
+    out_albedo_ao = vec4(baseColor.rgb, gbuf_alpha);
     // flags.w = 0: no foliage-SSS classification on this path (parity
     // with the forward branch, which never applied foliageTranslucency
     // to classic drawables either).
@@ -622,80 +754,17 @@ void main() {
 #endif // ALPHAMODE_MASK
 
 #ifdef DECAL
-    // The depth copy is the same resolution and the same viewport as
-    // this render target, so gl_FragCoord indexes it directly -- no
-    // screen-size uniform and no filtering wanted (a filtered depth
-    // read would interpolate across silhouettes and invent surfaces
-    // that are not there).
-    float scene_win_z =
-        texelFetch(scene_depth_sampler, ivec2(gl_FragCoord.xy), 0).r;
-    // Positive when the decal floats in FRONT of the scene, which is
-    // the only direction worth fading -- a decal behind the scene has
-    // already been rejected by the depth test.
-    float ray_gap =
-        max(linearizeSceneDepth(scene_win_z) -
-            linearizeSceneDepth(gl_FragCoord.z), 0.0);
-    // ── Along-ray gap -> PERPENDICULAR gap ───────────────────────────
-    // What DECAL_FADE_START/END want to measure is "how far is this
-    // decal floating off the surface underneath it" -- a property of
-    // the geometry alone.  ray_gap is not that: it is the separation
-    // measured ALONG THE VIEW RAY, which for two near-parallel
-    // surfaces is perpendicular_gap / |dot(V, N)| and therefore blows
-    // up at grazing angles.  A ground-hugging quad lifted 9 cm, seen
-    // from eye height 1.7 m at 20 m range, has sin(elevation) ~ 0.085
-    // and so reads as a 1.06 m gap -- past DECAL_FADE_END, i.e. it
-    // dissolves to nothing precisely where a player stands and looks
-    // out across the ground.  That is why the road only ever looked
-    // right close up and under the feet, and why ground clutter was
-    // invisible entirely.
-    //
-    // Multiplying back by |dot(V, N)| recovers the perpendicular
-    // separation, which is view-independent: a decal 9 cm off the
-    // ground now reads as 9 cm from every angle.  V is the
-    // fragment->eye direction and N the GEOMETRIC normal, both
-    // world-space and both already computed above for the lighting.
-    //
-    // Exactly edge-on (dot -> 0) the perpendicular gap tends to zero
-    // and the decal stays solid, which is the correct limit: a surface
-    // seen edge-on has no visible float to dissolve.  No epsilon floor
-    // here on purpose -- a floor would reintroduce the angle
-    // dependence this line exists to remove.
-    float depth_gap = ray_gap * abs(dot(v, normal_info.ng));
+    // Ground-contact + distance fade.  Same call the deferred decal
+    // branch above makes, so the two permutations dissolve identically.
     float decal_alpha =
-        1.0 - smoothstep(DECAL_FADE_START, DECAL_FADE_END, depth_gap);
-
-    // ── Ground-clutter distance fade ─────────────────────────────────
-    // Zero end distance = "this decal does not fade with range" (the
-    // road ribbon), so the whole thing costs one scalar compare there.
-    // Distance is measured in world space from the eye to the FRAGMENT
-    // rather than to the patch centre: a 3 m quad viewed edge-on at the
-    // fade boundary would otherwise pop as a unit, and per-fragment
-    // costs nothing extra since vertex_position is already interpolated
-    // in for the lighting.
-    if (model_params.clutter_fade_end_m > 0.0) {
-        float view_dist =
-            distance(camera_info.position.xyz, ps_in_data.vertex_position);
-        decal_alpha *= 1.0 - smoothstep(model_params.clutter_fade_start_m,
-                                        model_params.clutter_fade_end_m,
-                                        view_dist);
-    }
+        decalCoverage(v, normal_info.ng, ps_in_data.vertex_position);
 
     if ((material.material_features & FEATURE_MATERIAL_ALPHA_MASK) != 0u) {
-        // ── Foliage cards: NO blending — alpha-cutoff only ───────────
-        // The glTF authors these clutter/meadow cards as MASK now, so
-        // the decal permutation cuts instead of blending: texture alpha
-        // tests against the material cutoff, and the two decal fades
-        // (ground-contact gap + clutter distance, folded into
-        // decal_alpha above) become a screen-door dissolve — a
-        // per-pixel interleaved-gradient threshold — so distance fade
-        // survives without any partial transparency.  Surviving
-        // fragments write alpha 1.0: under the decal pipeline's blend
-        // state that is a full overwrite, i.e. effectively opaque, and
-        // overlapping foliage cards stop compositing into soup.
-        float ign = fract(52.9829189 *
-                          fract(dot(gl_FragCoord.xy,
-                                    vec2(0.06711056, 0.00583715))));
-        if (baseColor.a < material.alpha_cutoff || decal_alpha <= ign) {
+        // Foliage cards: screen-door cut, survivors fully opaque (under
+        // the decal pipeline's blend state alpha 1.0 is a full
+        // overwrite, so overlapping cards stop compositing into soup).
+        if (decalScreenDoorCull(baseColor.a, material.alpha_cutoff,
+                                decal_alpha)) {
             discard;
         }
         outColor = vec4(toneMap(material, color), 1.0);

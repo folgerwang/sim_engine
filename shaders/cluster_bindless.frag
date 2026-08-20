@@ -913,7 +913,12 @@ void main() {
         // env to appear in the mirror direction with strength controlled
         // by Fresnel below.
         vec3 reflect_dir     = normalize(reflect(-V, N));
-        vec3 reflection_term = textureLod(ggx_env_sampler, reflect_dir, glass_env_lod).rgb;
+        // kIblIrradianceScale: same sky-radiance normalisation the rest
+        // of the IBL carries (see ibl.glsl.h).  Without it a glass pane
+        // reflects a sky 10x brighter than every other surface samples.
+        vec3 reflection_term = textureLod(ggx_env_sampler, reflect_dir,
+                                          glass_env_lod).rgb *
+                               kIblIrradianceScale;
 
         // ── Refraction — slightly bent ray to simulate pane thickness ──
         // refract() gives the direction the view ray continues *inside*
@@ -937,7 +942,8 @@ void main() {
         vec3 refraction_term = vec3(
             textureLod(ggx_env_sampler, view_r, glass_env_lod).r,
             textureLod(ggx_env_sampler, view_g, glass_env_lod).g,
-            textureLod(ggx_env_sampler, view_b, glass_env_lod).b);
+            textureLod(ggx_env_sampler, view_b, glass_env_lod).b) *
+            kIblIrradianceScale;
 
         // Albedo tints what's seen through the glass — a green pane
         // greens the world behind it, clear glass leaves it untouched.

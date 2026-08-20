@@ -13,6 +13,19 @@
 //             projection constants.
 // Sky / unwritten pixels (depth == 1) pass through untouched and are
 // excluded as neighbours, so geometry edges against sky stay crisp.
+//
+// ── Validity ─────────────────────────────────────────────────────────
+// The depth test above is NOT sufficient on its own.  GEN only traces
+// rays for DEFERRED pixels; every FORWARD-shaded pixel (grass, hair,
+// ground clutter, water) exits early and writes RT_SMOOTH_INVALID into
+// raw_in.  Those pixels have real depth — a grass blade sits 10 cm above
+// the sand — so the depth weight accepts them at full strength.  Before
+// the sentinel existed they wrote (1.0, 1.0) instead, i.e. "fully lit,
+// fully open", and three iterations at tap spacing 1/2/4 spread that
+// vote across a ~29x29 footprint: terrain shadow and AO were being
+// averaged toward 1.0 by pixels that were never traced.  Any tap whose
+// .r is negative is therefore skipped, and an invalid CENTER is copied
+// through unchanged so it stays invalid across all three iterations.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rg16f) uniform readonly  image2D raw_in;
@@ -42,8 +55,11 @@ void main() {
 
     vec2  uv = (vec2(px) + vec2(0.5)) / vec2(sz);
     float zc = texture(depth_tex, uv).r;
-    if (zc >= 1.0) {
-        imageStore(filtered_out, px, imageLoad(raw_in, px));
+    vec2  rc = imageLoad(raw_in, px).rg;
+    // Sky, or a pixel GEN never traced (see the Validity note above):
+    // copy through so the sentinel survives every iteration.
+    if (zc >= 1.0 || rc.r < 0.0) {
+        imageStore(filtered_out, px, vec4(rc, 0.0, 0.0));
         return;
     }
 
@@ -58,16 +74,24 @@ void main() {
             float zq  = texture(depth_tex, quv).r;
             if (zq >= 1.0) continue;   // sky — not a valid neighbour
 
+            // Untraced neighbour (forward-shaded pixel).  Depth alone
+            // cannot reject these — see the Validity note at the top.
+            vec2 rq = imageLoad(raw_in, q).rg;
+            if (rq.r < 0.0) continue;
+
             float dz = abs(zq - zc);
             float wz = exp(-dz / max(RTF_DEPTH_REL * (1.0 - zc), 1e-6));
             float ws = exp(-float(dx * dx + dy * dy) * RTF_SPATIAL_SIGMA);
             float w  = wz * ws;
 
-            sum  += imageLoad(raw_in, q).rg * w;
+            sum  += rq * w;
             wsum += w;
         }
     }
 
-    vec2 f = (wsum > 1e-5) ? sum / wsum : imageLoad(raw_in, px).rg;
+    // wsum always includes the (valid) center tap, so the fallback only
+    // fires on degenerate weights; it keeps this pixel's own traced
+    // value rather than inventing one.
+    vec2 f = (wsum > 1e-5) ? sum / wsum : rc;
     imageStore(filtered_out, px, vec4(f, 0.0, 0.0));
 }

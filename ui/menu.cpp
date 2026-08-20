@@ -2276,6 +2276,45 @@ bool Menu::draw(
                     rt_smoothing_ = !rt_smoothing_;
                 }
 
+                // Directional-sun radiance, live.  This is the knob that
+                // decides whether a sunlit surface of ordinary albedo
+                // lands inside the ACES curve or past its shoulder; at
+                // the old hardcoded 20.0 a mid-grey terrain albedo
+                // tonemapped to 240/255, i.e. clipped white, while
+                // darker materials stayed in range — which reads as
+                // "the ground blew out but the buildings look fine".
+                // Drag it and watch the ground: the target is bright
+                // sand that still has tonal separation in it, not a
+                // flat white sheet.
+                ImGui::SetNextItemWidth(180.0f);
+                ImGui::SliderFloat("Sun intensity", &sun_intensity_,
+                                   0.0f, 25.0f, "%.1f");
+
+                // Auto-arm.  OFF holds the CSM fallback for the whole
+                // session, so the renderer never changes technique on
+                // its own partway through loading — the switch becomes
+                // a deliberate, single, observable event instead of
+                // something that fires while the scene is still
+                // streaming.  Also settable from the command line as
+                // --no-rt-autoarm, which is the only way to have it off
+                // before the auto-arm would have fired.
+                if (ImGui::MenuItem("Auto-arm RT when ready", NULL,
+                                    shadow_auto_arm_)) {
+                    shadow_auto_arm_ = !shadow_auto_arm_;
+                }
+
+                // Master switch for the traced indirect diffuse.  OFF
+                // puts the ambient back on the flat lambertian IBL cube
+                // — the SAME ambient the CSM path uses — while leaving
+                // the RT shadow and RT AO terms running.  Flip it to
+                // find out whether a brightness jump between CSM and RT
+                // comes from the ambient or from shadow/AO: the two
+                // estimators are not calibrated against each other.
+                if (ImGui::MenuItem("RT indirect diffuse (GI)", NULL,
+                                    rt_gi_enabled_)) {
+                    rt_gi_enabled_ = !rt_gi_enabled_;
+                }
+
                 // Indirect diffuse estimator.  OFF (default) = the
                 // original one cosine ray per pixel — slower, but the
                 // temporally stable one, so it stays the default.  ON =
