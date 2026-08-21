@@ -2,6 +2,7 @@
 #include <cstddef>   // offsetof (indirect-command LOD rewrite)
 #include <cstdlib>        // std::strtoll, for the plant-LOD node-name parse
 #include <cstring>        // std::memcpy, per-instance LOD band packing
+#include <cmath>          // std::floor, tile-grid cell keys
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -45,6 +46,12 @@ static uint32_t num_draw_meshes = 0;
 
 // ── Per-frame frustum cull state (set by application.cpp) ──────────────
 static bool     s_frustum_cull_active = false;
+// Shadow-caster cull volume for depth-only passes — see
+// DrawableObject::setShadowCullVolume.  The four SIDE planes of the
+// union light frustum; near/far are deliberately absent (depth clamp
+// owns the light axis).
+static bool      s_shadow_cull_active = false;
+static glm::vec4 s_shadow_planes[4];
 // CPU recording counters — see the DrawStats comment in the header.
 // Defined here rather than beside its accessors because drawMesh (far
 // earlier in this file) increments it.
@@ -3030,6 +3037,10 @@ static void selectPlantLodBands(
     if (drawable_object->lod_band_gen_ !=
         game_object::plantLodBandGeneration()) {
         applyPlantLodBands(drawable_object);
+        // The per-node band distances just changed, so anything derived
+        // from the visibility tables is stale even if the eye did not
+        // move (see lod_tables_version_).
+        ++drawable_object->lod_tables_version_;
     }
 
     if (!drawable_object->has_plant_lod_) {
@@ -3274,6 +3285,11 @@ static void selectPlantLodBands(
         drawn += v;
     }
     drawable_object->lod_nodes_drawn_ = drawn;
+    // Every consumer that caches a derived form of vis/owner watches
+    // this counter — see DrawableData::lod_tables_version_.  Bumped only
+    // on the recompute path: the early-outs above leave the tables (and
+    // therefore the caches) exactly as they were.
+    ++drawable_object->lod_tables_version_;
 }
 
 // ── EXT_mesh_gpu_instancing: build the flat per-instance table ──────────
@@ -7980,6 +7996,23 @@ bool DrawableObject::frustumCullArmed() {
     return s_frustum_cull_active;
 }
 
+void DrawableObject::setShadowCullVolume(const glm::vec4 planes[4]) {
+    if (planes == nullptr) {
+        // Treated as a disarm rather than an error: a caller with no
+        // valid cascade fit yet must not end up culling everything.
+        s_shadow_cull_active = false;
+        return;
+    }
+    for (int i = 0; i < 4; ++i) {
+        s_shadow_planes[i] = planes[i];
+    }
+    s_shadow_cull_active = true;
+}
+
+void DrawableObject::clearShadowCull() {
+    s_shadow_cull_active = false;
+}
+
 void DrawableObject::resetDrawStats() {
     s_draw_stats = DrawStats{};
 }
@@ -9072,6 +9105,123 @@ void DrawableObject::draw(
                     dfs.push_back(*cit);
                 }
             }
+
+            // ── TILE GRID ────────────────────────────────────────────
+            // "Cull by tile first."  Bucket the flat list into a 2D grid
+            // whose cells are the size of a terrain tile, REORDER the
+            // list so each cell's nodes are contiguous, and record each
+            // cell's node range plus the union AABB of its members' cull
+            // spheres.  One box test per cell then throws away a whole
+            // tile's worth of nodes, and the per-node tests below only
+            // ever run inside cells that survived.
+            //
+            // The spheres are in drawable space, so the cells are too;
+            // the size is chosen so a cell is ~kTileSizeM metres across
+            // once the instance world transform is applied.  If that
+            // transform later changes, the grid is still a valid
+            // partition (only its size in metres drifts), so nothing
+            // depends on the estimate being exact.
+            //
+            // Sorted by (cell, mesh index): cell so the ranges exist at
+            // all, mesh within the cell so consecutive draws keep
+            // sharing a pipeline and descriptor set the way DFS order
+            // did.  Reordering is safe because no drawable pass
+            // depth-sorts across nodes — the translucent sort lives
+            // inside a single mesh's primitive list.
+            //
+            // Instanced nodes' cull bbox already spans every instance,
+            // so a cell's AABB covers the tile AND everything attached
+            // to it without any extra bookkeeping.
+            object_->mesh_node_cells_.clear();
+            const size_t tile_node_n = object_->mesh_node_flat_.size();
+            if (tile_node_n > 1 &&
+                object_->mesh_node_sphere_.size() == tile_node_n) {
+                const glm::mat4& bw = object_->m_current_instance_world_;
+                const float bw_scale = glm::max(
+                    glm::length(glm::vec3(bw[0])),
+                    glm::max(glm::length(glm::vec3(bw[1])),
+                             glm::length(glm::vec3(bw[2]))));
+                const float kTileSizeM = 128.0f;
+                const float cell_size =
+                    kTileSizeM / glm::max(bw_scale, 1e-6f);
+                const float inv_cell = 1.0f / cell_size;
+                struct TileKey {
+                    int32_t  cx;
+                    int32_t  cz;
+                    uint32_t mesh;
+                    uint32_t src;
+                };
+                std::vector<TileKey> keys(tile_node_n);
+                // Cell indices are clamped before the cast: a stray
+                // NaN or a coordinate far outside any sane world would
+                // otherwise overflow the int32 conversion, which is UB
+                // and would corrupt the ranges rather than just place a
+                // node in an odd cell.
+                const float kCellClamp = 1.0e6f;
+                for (size_t i = 0; i < tile_node_n; ++i) {
+                    const glm::vec4& sp = object_->mesh_node_sphere_[i];
+                    const float kx = sp.x * inv_cell;
+                    const float kz = sp.z * inv_cell;
+                    keys[i].cx = (int32_t)std::floor(
+                        (kx > -kCellClamp && kx < kCellClamp) ? kx : 0.0f);
+                    keys[i].cz = (int32_t)std::floor(
+                        (kz > -kCellClamp && kz < kCellClamp) ? kz : 0.0f);
+                    const int32_t ni = object_->mesh_node_flat_[i];
+                    keys[i].mesh =
+                        (uint32_t)object_->nodes_[ni].mesh_idx_;
+                    keys[i].src = (uint32_t)i;
+                }
+                std::sort(keys.begin(), keys.end(),
+                          [](const TileKey& a, const TileKey& b) {
+                              if (a.cz != b.cz) return a.cz < b.cz;
+                              if (a.cx != b.cx) return a.cx < b.cx;
+                              if (a.mesh != b.mesh) return a.mesh < b.mesh;
+                              return a.src < b.src;
+                          });
+                std::vector<int32_t>   flat_sorted(tile_node_n);
+                std::vector<glm::vec4> sphere_sorted(tile_node_n);
+                for (size_t i = 0; i < tile_node_n; ++i) {
+                    const uint32_t sidx = keys[i].src;
+                    flat_sorted[i] = object_->mesh_node_flat_[sidx];
+                    sphere_sorted[i] = object_->mesh_node_sphere_[sidx];
+                }
+                object_->mesh_node_flat_.swap(flat_sorted);
+                object_->mesh_node_sphere_.swap(sphere_sorted);
+
+                size_t run_start = 0;
+                for (size_t i = 1; i <= tile_node_n; ++i) {
+                    const bool boundary =
+                        (i == tile_node_n) ||
+                        keys[i].cx != keys[run_start].cx ||
+                        keys[i].cz != keys[run_start].cz;
+                    if (!boundary) continue;
+                    DrawableData::NodeCell cell;
+                    cell.first = (uint32_t)run_start;
+                    cell.count = (uint32_t)(i - run_start);
+                    glm::vec3 bmin(std::numeric_limits<float>::max());
+                    glm::vec3 bmax(std::numeric_limits<float>::lowest());
+                    float maxr = 0.0f;
+                    for (size_t j = run_start; j < i; ++j) {
+                        const glm::vec4& sp =
+                            object_->mesh_node_sphere_[j];
+                        const glm::vec3 c(sp.x, sp.y, sp.z);
+                        const glm::vec3 r(sp.w);
+                        bmin = glm::min(bmin, c - r);
+                        bmax = glm::max(bmax, c + r);
+                        if (sp.w > maxr) maxr = sp.w;
+                    }
+                    cell.bmin = bmin;
+                    cell.bmax = bmax;
+                    cell.maxr = maxr;
+                    object_->mesh_node_cells_.push_back(cell);
+                    run_start = i;
+                }
+                // One cell spans everything, so its test can only ever
+                // cost — drop the grid and let the plain flat loop run.
+                if (object_->mesh_node_cells_.size() < 2) {
+                    object_->mesh_node_cells_.clear();
+                }
+            }
             object_->mesh_node_flat_built_ = true;
         }
         // Pre-stage rejection with the cached spheres: same predicates
@@ -9118,6 +9268,14 @@ void DrawableObject::draw(
         // backwards would silently drop shadow casters, so it is
         // replicated rather than simplified.  drawNodeMesh keeps its
         // own copy of the test; this only stops nodes reaching it.
+        // Shadow-caster cull: depth-only passes reject against the
+        // armed shadow cull volume, not the camera frustum (see
+        // setShadowCullVolume).  drawable_static for the same reason
+        // pre_frustum needs it — the cached spheres bake
+        // node.cached_matrix_ at build time, so they are only valid for
+        // drawables whose node transforms never move.
+        const bool pre_shadow =
+            depth_only && s_shadow_cull_active && drawable_static;
         const bool pre_lod = object_->has_plant_lod_;
         const size_t lod_fade_n = object_->lod_node_fade_.size();
         const size_t lod_vis_n = object_->lod_node_visible_.size();
@@ -9129,20 +9287,79 @@ void DrawableObject::draw(
                      glm::length(glm::vec3(iw[2]))));
         const size_t flat_n = object_->mesh_node_flat_.size();
         s_draw_stats.nodes += flat_n;
-        for (size_t fi = 0; fi < flat_n; ++fi) {
+        // ── LOD SURVIVOR LIST ────────────────────────────────────────
+        // The band table is the test that actually rejects — 2,215,770
+        // of 2,228,507 nodes on the measured scene, 99.4%.  Applying it
+        // per node per pass costs one scattered byte load 2.2M times,
+        // five passes a frame: ~13 ns each, ~29 ms a pass, and that was
+        // the entire CSM and forward recording cost.
+        //
+        // But the answer only changes when selectPlantLodBands
+        // recomputes.  So compact it once per change (see
+        // DrawableData::lod_tables_version_) and let every pass in
+        // between iterate the ~12k survivors instead of the 2.2M
+        // candidates.  Both predicates are built in the same scan: the
+        // depth passes use the single-owner test, the colour passes the
+        // cross-fade visibility test, and the asymmetry between them —
+        // an out-of-range OWNER index means hidden while an
+        // out-of-range VISIBLE index means shown — is replicated here
+        // exactly as drawNodeMesh has it.
+        const std::vector<uint32_t>* lod_list = nullptr;
+        if (pre_lod) {
+            if (object_->lod_pass_version_ !=
+                    object_->lod_tables_version_ ||
+                object_->lod_pass_flat_n_ != flat_n) {
+                auto& fwd = object_->lod_pass_fwd_;
+                auto& dep = object_->lod_pass_depth_;
+                fwd.clear();
+                dep.clear();
+                for (size_t fi = 0; fi < flat_n; ++fi) {
+                    const size_t ni =
+                        static_cast<size_t>(object_->mesh_node_flat_[fi]);
+                    const bool has_lod = ni < lod_fade_n;
+                    const bool hid_fwd =
+                        (ni < lod_vis_n &&
+                         object_->lod_node_visible_[ni] == 0);
+                    const bool hid_dep =
+                        has_lod ? (ni >= lod_own_n ||
+                                   object_->lod_node_owner_[ni] == 0)
+                                : hid_fwd;
+                    if (!hid_fwd) fwd.push_back(uint32_t(fi));
+                    if (!hid_dep) dep.push_back(uint32_t(fi));
+                }
+                object_->lod_pass_version_ = object_->lod_tables_version_;
+                object_->lod_pass_flat_n_ = flat_n;
+                ++s_draw_stats.lod_rebuilds;
+            }
+            lod_list = depth_only ? &object_->lod_pass_depth_
+                                  : &object_->lod_pass_fwd_;
+            s_draw_stats.cull_lod += flat_n - lod_list->size();
+        }
+        // Per-node work, shared by both walks below so the survivor
+        // path and the tile path cannot drift apart.
+        auto emit_node = [&](size_t fi) {
             const int32_t node_idx = object_->mesh_node_flat_[fi];
-            if (pre_lod) {
-                const size_t ni = static_cast<size_t>(node_idx);
-                const bool has_lod = ni < lod_fade_n;
-                const bool lod_hidden =
-                    (depth_only && has_lod)
-                        ? (ni >= lod_own_n ||
-                           object_->lod_node_owner_[ni] == 0)
-                        : (ni < lod_vis_n &&
-                           object_->lod_node_visible_[ni] == 0);
-                if (lod_hidden) {
-                    ++s_draw_stats.cull_lod;
-                    continue;
+            if (pre_shadow && fi < object_->mesh_node_sphere_.size()) {
+                // Sphere vs the four side planes of the shadow cull
+                // volume — the same test the camera path runs, against
+                // the light's volume instead of the eye's.
+                // Conservative at the edges, so a node straddling a
+                // boundary survives.
+                const glm::vec4 s = object_->mesh_node_sphere_[fi];
+                const glm::vec3 wc =
+                    glm::vec3(iw * glm::vec4(s.x, s.y, s.z, 1.0f));
+                const float wr = s.w * iw_scale;
+                bool seen = true;
+                for (int q = 0; q < 4; ++q) {
+                    if (glm::dot(glm::vec3(s_shadow_planes[q]), wc) +
+                            s_shadow_planes[q].w < -wr) {
+                        seen = false;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    ++s_draw_stats.cull_shadow;
+                    return;
                 }
             }
             if ((pre_frustum || pre_dist) &&
@@ -9155,7 +9372,7 @@ void DrawableObject::draw(
                     glm::distance(wc, s_viewer_pos_ws) - wr >
                         object_->m_clutter_fade_end_m_) {
                     ++s_draw_stats.cull_dist;
-                    continue;
+                    return;
                 }
                 if (pre_frustum) {
                     bool outside = false;
@@ -9165,7 +9382,10 @@ void DrawableObject::draw(
                             s_frustum_planes[p].w;
                         if (dist < -wr) { outside = true; break; }
                     }
-                    if (outside) { ++s_draw_stats.cull_frustum; continue; }
+                    if (outside) {
+                        ++s_draw_stats.cull_frustum;
+                        return;
+                    }
                 }
             }
             drawNodeMesh(
@@ -9182,6 +9402,150 @@ void DrawableObject::draw(
                 csm_cascade_idx,
                 mesh_shader_csm_mode,
                 mesh_shader_fallback);
+        };
+        if (lod_list != nullptr) {
+            // Survivor walk.  The tile grid is skipped deliberately: the
+            // band table has already thrown away 99% of this drawable,
+            // and a per-cell box test over what is left would cost more
+            // than testing the survivors one at a time.
+            const size_t lod_n = lod_list->size();
+            for (size_t li = 0; li < lod_n; ++li) {
+                emit_node(size_t((*lod_list)[li]));
+            }
+        } else {
+            // ── TILE-FIRST CULL ──────────────────────────────────────────
+            // When the tile grid exists and a spatial test is armed, walk
+            // CELLS instead of nodes: reject a cell against the same volume
+            // the per-node test uses (camera frustum + clutter distance on
+            // colour passes, the cascade light frusta on depth-only passes)
+            // and skip its whole node range on a miss.  Survivors fall
+            // through to the identical per-node tests, so nothing is culled
+            // that was not culled before — this only removes the cost of
+            // asking, which is the entire point when the list is two million
+            // nodes long.  With no grid, or with nothing armed, the outer
+            // loop runs once over the whole list and the inner loop is
+            // exactly what it was.
+            const size_t cell_n = object_->mesh_node_cells_.size();
+            const bool use_cells =
+                cell_n > 0 && (pre_frustum || pre_dist || pre_shadow);
+            const size_t outer_n = use_cells ? cell_n : 1;
+            for (size_t ci = 0; ci < outer_n; ++ci) {
+                size_t fi_begin = 0;
+                size_t fi_end = flat_n;
+                if (use_cells) {
+                    const DrawableData::NodeCell& cell =
+                        object_->mesh_node_cells_[ci];
+                    fi_begin = size_t(cell.first);
+                    fi_end = size_t(cell.first) + size_t(cell.count);
+                    if (fi_end > flat_n) fi_end = flat_n;
+                    if (fi_begin >= fi_end) continue;
+                    ++s_draw_stats.tiles;
+                    // Cell AABB (drawable space) into world space.  The
+                    // instance transform can rotate, so this takes the AABB
+                    // OF THE EIGHT TRANSFORMED CORNERS, not the transformed
+                    // AABB — the latter is not a bound under rotation.
+                    glm::vec3 cw_min(std::numeric_limits<float>::max());
+                    glm::vec3 cw_max(std::numeric_limits<float>::lowest());
+                    for (int k = 0; k < 8; ++k) {
+                        const glm::vec3 corner(
+                            (k & 1) ? cell.bmax.x : cell.bmin.x,
+                            (k & 2) ? cell.bmax.y : cell.bmin.y,
+                            (k & 4) ? cell.bmax.z : cell.bmin.z);
+                        const glm::vec3 wp =
+                            glm::vec3(iw * glm::vec4(corner, 1.0f));
+                        cw_min = glm::min(cw_min, wp);
+                        cw_max = glm::max(cw_max, wp);
+                    }
+                    // Pad by the largest member radius, scaled the same way
+                    // the per-node test scales its radius.  Without this the
+                    // cell box bounds the members' TRUE geometry but not the
+                    // conservative spheres the per-node test builds from it:
+                    // under a non-uniform instance scale a node's inflated
+                    // sphere can poke outside the exactly-transformed box,
+                    // and the cell would reject something the per-node test
+                    // would have kept.  Every node centre lies inside the
+                    // transformed box, so one max-radius of padding closes
+                    // the gap for good — and against a 128 m cell it costs
+                    // nothing worth measuring.
+                    {
+                        const glm::vec3 pad(cell.maxr * iw_scale);
+                        cw_min -= pad;
+                        cw_max += pad;
+                    }
+                    bool cell_out = false;
+                    if (pre_shadow) {
+                        // Box vs the shadow cull volume's side planes.
+                        // A tile outside them writes no shadow texel
+                        // into any cascade.
+                        for (int q = 0; q < 4; ++q) {
+                            const glm::vec3 sn(s_shadow_planes[q]);
+                            // Positive vertex: if the corner furthest
+                            // along the normal is still behind the
+                            // plane, the whole box is outside.
+                            const glm::vec3 spv(
+                                sn.x >= 0.0f ? cw_max.x : cw_min.x,
+                                sn.y >= 0.0f ? cw_max.y : cw_min.y,
+                                sn.z >= 0.0f ? cw_max.z : cw_min.z);
+                            if (glm::dot(sn, spv) +
+                                    s_shadow_planes[q].w < 0.0f) {
+                                cell_out = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!cell_out && pre_dist) {
+                        const glm::vec3 nearest =
+                            glm::clamp(s_viewer_pos_ws, cw_min, cw_max);
+                        cell_out =
+                            glm::distance(nearest, s_viewer_pos_ws) >
+                            object_->m_clutter_fade_end_m_;
+                    }
+                    if (!cell_out && pre_frustum) {
+                        for (int p = 0; p < 6; ++p) {
+                            const glm::vec3 n(s_frustum_planes[p]);
+                            // Positive vertex: the corner furthest along the
+                            // plane normal.  If even that one is behind the
+                            // plane, the whole box is outside.
+                            const glm::vec3 pv(
+                                n.x >= 0.0f ? cw_max.x : cw_min.x,
+                                n.y >= 0.0f ? cw_max.y : cw_min.y,
+                                n.z >= 0.0f ? cw_max.z : cw_min.z);
+                            if (glm::dot(n, pv) +
+                                    s_frustum_planes[p].w < 0.0f) {
+                                cell_out = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (cell_out) {
+                        ++s_draw_stats.tiles_culled;
+                        s_draw_stats.cull_tile += (fi_end - fi_begin);
+                        continue;
+                    }
+                }
+                for (size_t fi = fi_begin; fi < fi_end; ++fi) {
+                    if (pre_lod) {
+                        // Unreachable while lod_list is armed for every
+                        // plant-LOD drawable (the survivor walk above owns
+                        // that case).  Kept so this path stays correct on
+                        // its own terms if that ever stops being true.
+                        const size_t ni = static_cast<size_t>(
+                            object_->mesh_node_flat_[fi]);
+                        const bool has_lod = ni < lod_fade_n;
+                        const bool lod_hidden =
+                            (depth_only && has_lod)
+                                ? (ni >= lod_own_n ||
+                                   object_->lod_node_owner_[ni] == 0)
+                                : (ni < lod_vis_n &&
+                                   object_->lod_node_visible_[ni] == 0);
+                        if (lod_hidden) {
+                            ++s_draw_stats.cull_lod;
+                            continue;
+                        }
+                    }
+                    emit_node(fi);
+                }
+            }
         }
     }
 

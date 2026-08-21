@@ -726,6 +726,57 @@ struct DrawableData {
     std::vector<glm::vec4>      mesh_node_sphere_;
     bool                        mesh_node_flat_built_ = false;
 
+    // ── Tile grid over the flat mesh-node list ────────────────────────
+    // The flat list is bucketed into a world-aligned 2D grid sized to
+    // match the 128 m terrain tiles and REORDERED so every cell's nodes
+    // are contiguous.  Each cell keeps its node range and the union AABB
+    // of its members' cull spheres, which lets a pass reject a whole
+    // tile's worth of nodes with one box test instead of one test per
+    // node.  Because instanced nodes' cull bbox already spans all their
+    // instances, a cell's AABB automatically covers the tile AND
+    // everything placed on it.
+    // Built once alongside mesh_node_flat_ / mesh_node_sphere_, from the
+    // same drawable-space spheres, so it is only meaningful for the same
+    // static drawables those are (no skins, no animations).
+    // Empty means "no useful partition" (a single cell, or too few
+    // nodes to be worth it) and the draw path falls back to the plain
+    // flat loop.
+    struct NodeCell {
+        glm::vec3 bmin;    // drawable space, spheres expanded by radius
+        glm::vec3 bmax;
+        float     maxr;    // largest member sphere radius, drawable space
+        uint32_t  first;   // index into mesh_node_flat_
+        uint32_t  count;
+    };
+    std::vector<NodeCell>       mesh_node_cells_;
+
+    // ── LOD SURVIVOR LISTS ────────────────────────────────────────────
+    // The plant-LOD band table rejects ~99.4% of the mesh nodes in a
+    // procedural world (measured: 2,215,770 of 2,228,507).  Testing it
+    // per node per pass is one byte load, but it is one byte load at a
+    // scattered address 2.2 million times, five passes a frame — ~13 ns
+    // each, ~29 ms per pass, and it was the whole of the CSM and forward
+    // recording cost.
+    //
+    // The table only changes when selectPlantLodBands actually
+    // recomputes (the eye or the instance world moved).  So compact it
+    // ONCE per change into two lists of surviving mesh_node_flat_
+    // indices — one per predicate, because the depth passes use the
+    // single-owner test and the colour passes use the cross-fade
+    // visibility test — and let every pass in between iterate ~12k
+    // entries instead of 2.2M.
+    //
+    // lod_tables_version_ is bumped by selectPlantLodBands on every
+    // recompute; lod_pass_version_ / lod_pass_flat_n_ record what the
+    // lists were built from, so a stale pair rebuilds itself.
+    // drawNodeMesh still applies the band test itself, so a list that is
+    // somehow stale can only cost work, never draw something hidden.
+    uint64_t                    lod_tables_version_ = 0;
+    uint64_t                    lod_pass_version_ = ~uint64_t(0);
+    size_t                      lod_pass_flat_n_ = 0;
+    std::vector<uint32_t>       lod_pass_fwd_;    // colour-pass survivors
+    std::vector<uint32_t>       lod_pass_depth_;  // depth-pass survivors
+
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> update_instance_buffer_desc_set_;
 
@@ -1575,6 +1626,50 @@ public:
     // culling was armed for a pass, not just how many nodes it lost.
     static bool frustumCullArmed();
 
+    // ── SHADOW-CASTER CULL (depth-only passes) ───────────────────────
+    // The frustum test above is deliberately skipped on depth_only
+    // passes, and correctly so: a caster BEHIND the camera still throws
+    // a shadow into view, so culling shadow geometry against the MAIN
+    // camera frustum drops real shadows.
+    //
+    // That reasoning does not extend to the LIGHT's own bounds.  A
+    // caster outside every cascade's light frustum cannot write a texel
+    // into any cascade's depth map — there is no view from which its
+    // shadow appears.  Measured: the CSM pass walks the same ~2M mesh
+    // nodes the main passes do, with no rejection whatsoever, and in
+    // "Regular" mode it walks them ONCE PER CASCADE, which is ~28 ms of
+    // the frame on its own.
+    //
+    // So depth-only passes get their own volume: ONE light frustum
+    // fitted to the whole camera frustum out to the last cascade split
+    // — the union volume computeCascadeMatrices already builds for
+    // ClusterRenderer::cullShadow.  Every cascade is a slice of that
+    // same view frustum, so a caster no cascade can see is a caster
+    // this volume cannot see.  Per-cascade volumes would be tighter,
+    // but they buy nothing: the drawable list is walked ONCE for the
+    // layered draw, and six plane sets would be six times the per-node
+    // work for one pass.
+    //
+    // FOUR PLANES, NOT SIX — the side planes only, and this is the
+    // subtle part.  The cascade ortho near plane sits at the nearest
+    // frustum corner, and casters in FRONT of it (between the sun and
+    // the slab) still shadow the slab: they clip to z < 0 and are kept
+    // by depthClampEnable on the shadow pipelines.  Culling against a
+    // near plane would delete exactly those casters — the tall tree
+    // just off the top of the cascade whose shadow falls across it.
+    // Along the light direction the depth clamp already handles both
+    // ends, so the only sound test is the lateral one.
+    //
+    // planes points at 4 world-space Gribb-Hartmann side planes
+    // (left, right, bottom, top), normalised, in the same sign
+    // convention setFrustumCullPlanes uses.  The array is copied, so
+    // the caller may reuse its storage immediately.
+    //
+    // Unarmed (the default, and every non-CSM depth pass) the test is
+    // skipped entirely and behaviour is exactly as before.
+    static void setShadowCullVolume(const glm::vec4 planes[4]);
+    static void clearShadowCull();
+
     // ── CPU RECORDING COST INSTRUMENTATION ───────────────────────────────
     // The GPU renders this scene in ~7 ms while drawScene spends ~76 ms
     // RECORDING it, so the interesting number is not "how long did a pass
@@ -1596,6 +1691,13 @@ public:
         uint64_t cull_frustum = 0;  // ...rejected by the frustum sphere test
         uint64_t cull_dist = 0;     // ...rejected by the clutter-fade test
         uint64_t cull_lod = 0;      // ...rejected by the LOD band table
+        uint64_t cull_shadow = 0;   // ...rejected by the shadow cull volume
+        uint64_t cull_tile = 0;     // ...rejected wholesale with their tile
+        uint64_t tiles = 0;         // tile cells tested
+        uint64_t tiles_culled = 0;  // ...of which rejected whole
+        uint64_t lod_rebuilds = 0;  // LOD survivor-list rebuilds (see
+                                    // lod_tables_version_) — should be at
+                                    // most one per frame, not one per pass
         uint64_t prims = 0;         // drawIndexedIndirect calls recorded
         uint64_t desc_binds = 0;    // bindDescriptorSets calls recorded
     };
@@ -1853,4 +1955,4 @@ private:
 };
 
 } // namespace game_object
-} // namespace engine
+} // namespace engine

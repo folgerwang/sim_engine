@@ -9404,100 +9404,117 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
 // application.cpp).  Both base.frag and cluster_bindless.frag read and
 // dispatch on this value; mode 0 = the normal shaded path.
 void Menu::drawRenderDebugMenuContent() {
+    // ── Layout ──────────────────────────────────────────────────────
+    // This was one flat list of ~35 entries: eighteen view modes, then
+    // path isolation, skeleton states, pipeline, four viewers and the
+    // glass mode, all at the same level with nothing but separators to
+    // group them.  Finding anything meant reading the whole column.
+    //
+    // Now it is five submenus, each of which reports its CURRENT VALUE
+    // in its own label ("View Mode: Albedo", "Pipeline: Deferred").
+    // That matters more than the nesting: the state you usually want
+    // from this menu is "what am I looking at right now", and a plain
+    // submenu arrow hides exactly that behind another click.  Reading
+    // the answer off the parent costs nothing and opens nothing.
+    //
+    // Controls that only apply to ONE mode (the Hi-Z mip slider, the
+    // mesh-category legend) stay at THIS level rather than inside the
+    // View Mode submenu.  They are conditional, so they cost nothing
+    // when their mode is inactive, and when it IS active they sit one
+    // click away instead of two — right where you land after picking
+    // the mode that needs them.
+
     // Modes 0..12 are the original PBR / G-buffer debug overlays baked
     // into base.frag and cluster_bindless.frag.  Mode 13 is the
     // MeshCategory solid-colour overlay (AI-backed material classifier);
     // its value MUST match DEBUG_RENDER_MODE_CATEGORY in
     // global_definition.glsl.h.
+    //
+    // mode_id keeps the shader's numbering and the label keeps it
+    // visible, because these are cross-referenced against
+    // DEBUG_RENDER_MODE_* while reading shader source — the list is
+    // REORDERED into groups but the numbers are untouched, so a
+    // non-contiguous column here is correct, not a typo.  `brief` is
+    // the short form shown on the parent; `group` starts a new section
+    // (nullptr continues the current one).
     struct RenderDebugItem {
         int         mode_id;
         const char* label;
+        const char* brief;
+        const char* group;
     };
     static const RenderDebugItem kRenderDebugItems[] = {
-        {  0, "0: Final shaded"            },
-        {  1, "1: Albedo (baseColor)"      },
-        {  2, "2: Normal (perturbed)"      },
-        {  3, "3: Diffuse term"            },
-        {  4, "4: Specular term"           },
-        {  5, "5: Shadow factor"           },
-        {  6, "6: Roughness (perceptual)"  },
-        {  7, "7: Metallic"                },
-        {  8, "8: Geometric normal"        },
-        {  9, "9: Translucent (alpha mode)"},
-        { 10, "10: Velocity (NDC delta x50)"},
-        { 11, "11: SSAO (raw AO factor)"   },
-        { 12, "12: Hi-Z pyramid (mip)"     },
-        { 13, "13: Mesh category (solid)"  },
-        { 14, "14: Object ID (per mesh)"   },
-        { 15, "15: Weight sum (skin)"      },
-        { 16, "16: Render path (fwd/deferred)"},
+        {  0, "0: Final shaded",             "Final shaded",     nullptr },
+
+        {  1, "1: Albedo (baseColor)",       "Albedo",           "Material / G-buffer" },
+        {  2, "2: Normal (perturbed)",       "Normal",           nullptr },
+        {  8, "8: Geometric normal",         "Geometric normal", nullptr },
+        {  6, "6: Roughness (perceptual)",   "Roughness",        nullptr },
+        {  7, "7: Metallic",                 "Metallic",         nullptr },
+        {  9, "9: Translucent (alpha mode)", "Translucent",      nullptr },
+
+        {  3, "3: Diffuse term",             "Diffuse",          "Lighting" },
+        {  4, "4: Specular term",            "Specular",         nullptr },
+        {  5, "5: Shadow factor",            "Shadow factor",    nullptr },
+        { 11, "11: SSAO (raw AO factor)",    "SSAO",             nullptr },
         // Raw indirect diffuse WITHOUT albedo — separates "no light is
         // arriving" from "the material is dark", which final-shaded
         // pixels cannot distinguish.  Deferred pixels only.
-        { 17, "17: Indirect diffuse (GI)"  },
+        { 17, "17: Indirect diffuse (GI)",   "Indirect diffuse", nullptr },
+
+        { 10, "10: Velocity (NDC delta x50)","Velocity",         "Pipeline / motion" },
+        { 12, "12: Hi-Z pyramid (mip)",      "Hi-Z pyramid",     nullptr },
+        { 16, "16: Render path (fwd/deferred)","Render path",    nullptr },
+
+        { 13, "13: Mesh category (solid)",   "Mesh category",    "Identity" },
+        { 14, "14: Object ID (per mesh)",    "Object ID",        nullptr },
+        { 15, "15: Weight sum (skin)",       "Weight sum",       nullptr },
     };
+
+    // Current mode's short name for the parent label.  Falls back to the
+    // raw id rather than lying with "Final shaded" if a mode ever ships
+    // without a table row.
+    char view_label[96];
+    const char* active_brief = nullptr;
     for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
-        const auto& item = kRenderDebugItems[i];
-        bool selected = (debug_render_mode_ == item.mode_id);
-        if (ImGui::MenuItem(item.label, NULL, selected)) {
-            debug_render_mode_ = item.mode_id;
+        if (debug_render_mode_ == kRenderDebugItems[i].mode_id) {
+            active_brief = kRenderDebugItems[i].brief;
+            break;
         }
     }
-
-    // ── Render-path isolation ───────────────────────────────────────
-    // Mode 16 above TINTS the two paths; these two black one of them out
-    // so the other can be judged on its own real shading (works in every
-    // mode, including 0 / final).  Only the deferred side runs RT GI and
-    // traced sky visibility, so "Forward only" is the quickest way to see
-    // what is still lit by the raw, unoccluded IBL cubes.
-    ImGui::Separator();
-    if (ImGui::MenuItem("Deferred only (hide forward)", NULL,
-                        debug_hide_forward_)) {
-        debug_hide_forward_ = !debug_hide_forward_;
-        // Hiding both leaves nothing but sky, which reads as a bug
-        // rather than a view — so the two are exclusive here.
-        if (debug_hide_forward_) debug_hide_deferred_ = false;
-    }
-    if (ImGui::MenuItem("Forward only (hide deferred)", NULL,
-                        debug_hide_deferred_)) {
-        debug_hide_deferred_ = !debug_hide_deferred_;
-        if (debug_hide_deferred_) debug_hide_forward_ = false;
+    if (active_brief) {
+        snprintf(view_label, sizeof(view_label),
+                 "View Mode: %s", active_brief);
+    } else {
+        snprintf(view_label, sizeof(view_label),
+                 "View Mode: (mode %d)", debug_render_mode_);
     }
 
-    // ── Skeleton view selector ──────────────────────────────────────
-    // Tri-state: character only (default), bones + character (alignment
-    // check), or bones only.  Application reads this each frame and
-    // toggles DrawableObject::setVisible(...) accordingly.
-    ImGui::Separator();
-    ImGui::TextDisabled("Skeleton view");
-    {
-        struct SkelItem {
-            SkeletonDebugMode mode;
-            const char*       label;
-        };
-        static const SkelItem kSkelItems[] = {
-            { SkeletonDebugMode::CharacterOnly,
-              "Character only (default)"                },
-            { SkeletonDebugMode::BoneWithCharacter,
-              "Bones + character (alignment check)"     },
-            { SkeletonDebugMode::BoneOnly,
-              "Bones only (skeleton in isolation)"      },
-        };
-        for (int i = 0; i < IM_ARRAYSIZE(kSkelItems); ++i) {
-            const auto& it = kSkelItems[i];
-            bool sel = (skeleton_debug_mode_ == it.mode);
-            if (ImGui::MenuItem(it.label, NULL, sel)) {
-                skeleton_debug_mode_ = it.mode;
+    if (ImGui::BeginMenu(view_label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kRenderDebugItems); ++i) {
+            const auto& item = kRenderDebugItems[i];
+            if (item.group) {
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", item.group);
+            }
+            bool selected = (debug_render_mode_ == item.mode_id);
+            if (ImGui::MenuItem(item.label, NULL, selected)) {
+                debug_render_mode_ = item.mode_id;
             }
         }
+        ImGui::EndMenu();
     }
 
-    // ── Colour legend for the Mesh-Category mode ────────────────────
-    // Swatch RGBs MUST match categoryColor() in collision_debug.frag and
-    // the DEBUG_RENDER_MODE_CATEGORY branch in cluster_bindless.frag.
-    // Only shown while mode 13 is active.
+    // ── Mode-specific controls (only while their mode is active) ────
+    // Hi-Z mip selector — 4 bits of mip selection in input_features;
+    // the application clamps against the actual pyramid mip count.
+    if (debug_render_mode_ == 12) {
+        ImGui::SliderInt("Hi-Z mip", &hiz_debug_mip_, 0, 15);
+    }
+    // Colour legend for the Mesh-Category mode.  Swatch RGBs MUST match
+    // categoryColor() in collision_debug.frag and the
+    // DEBUG_RENDER_MODE_CATEGORY branch in cluster_bindless.frag.
     if (debug_render_mode_ == 13) {
-        ImGui::Separator();
         ImGui::TextDisabled("Mesh-Category colour key");
         // The G-buffer doesn't carry per-material flag bits, so the
         // deferred resolve can't read the category — application.cpp
@@ -9536,7 +9553,6 @@ void Menu::drawRenderDebugMenuContent() {
         // Per-name inspector window toggle (LLM material/object →
         // category verdicts) — enabled once the classifier snapshot
         // has been pushed from application.cpp.
-        ImGui::Separator();
         if (mesh_category_snapshot_valid_) {
             if (ImGui::MenuItem(
                     "Open Category Inspector",
@@ -9549,50 +9565,92 @@ void Menu::drawRenderDebugMenuContent() {
             ImGui::TextDisabled(
                 "Category Inspector (waiting for LLM)");
         }
-        ImGui::Separator();
     }
-    // Hi-Z mip selector — only meaningful when DEBUG_RENDER_MODE_HIZ is
-    // the active mode (4 bits of mip selection in input_features; the
-    // application clamps against the actual pyramid mip count).
-    if (debug_render_mode_ == 12) {
-        ImGui::Separator();
-        ImGui::SliderInt("Hi-Z mip", &hiz_debug_mip_, 0, 15);
-    }
+
     ImGui::Separator();
 
-    // ── Forward vs Deferred rendering toggle ────────────────────────
+    // ── Pipeline ────────────────────────────────────────────────────
     // The application reads isDeferredRendering() each frame in
     // drawScene to route the cluster opaque pass through the G-buffer +
     // compute resolve (Deferred) or the legacy single-pass bindless
     // pipeline (Forward).  Non-cluster passes are unaffected.
-    if (ImGui::MenuItem(
-            "Pipeline: Deferred", NULL, deferred_rendering_)) {
-        deferred_rendering_ = true;
+    //
+    // Path ISOLATION lives here too rather than beside the view modes:
+    // mode 16 tints the two paths, but these black one of them out, so
+    // they are a property of the pipeline rather than a way of drawing
+    // it — and they work in every mode, including 0 / final.
+    {
+        char pipe_label[64];
+        snprintf(pipe_label, sizeof(pipe_label), "Pipeline: %s",
+                 deferred_rendering_ ? "Deferred" : "Forward");
+        if (ImGui::BeginMenu(pipe_label)) {
+            if (ImGui::MenuItem(
+                    "Deferred", NULL, deferred_rendering_)) {
+                deferred_rendering_ = true;
+            }
+            if (ImGui::MenuItem(
+                    "Forward",  NULL, !deferred_rendering_)) {
+                deferred_rendering_ = false;
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("Isolate a path");
+            // Only the deferred side runs RT GI and traced sky
+            // visibility, so "Forward only" is the quickest way to see
+            // what is still lit by the raw, unoccluded IBL cubes.
+            if (ImGui::MenuItem("Deferred only (hide forward)", NULL,
+                                debug_hide_forward_)) {
+                debug_hide_forward_ = !debug_hide_forward_;
+                // Hiding both leaves nothing but sky, which reads as a
+                // bug rather than a view — so the two are exclusive.
+                if (debug_hide_forward_) debug_hide_deferred_ = false;
+            }
+            if (ImGui::MenuItem("Forward only (hide deferred)", NULL,
+                                debug_hide_deferred_)) {
+                debug_hide_deferred_ = !debug_hide_deferred_;
+                if (debug_hide_deferred_) debug_hide_forward_ = false;
+            }
+            ImGui::EndMenu();
+        }
     }
-    if (ImGui::MenuItem(
-            "Pipeline: Forward",  NULL, !deferred_rendering_)) {
-        deferred_rendering_ = false;
-    }
-    ImGui::Separator();
-    // Camera-positioned dynamic reflection cubemap face viewer.
-    if (ImGui::MenuItem(
-            "Dynamic Cubemap Viewer", NULL, show_dynamic_cube_debug_)) {
-        show_dynamic_cube_debug_ = !show_dynamic_cube_debug_;
-    }
-    // Hi-Z pyramid (last-frame depth) mip-strip viewer.
-    if (ImGui::MenuItem(
-            "Hi-Z Pyramid Viewer", NULL, show_hiz_debug_)) {
-        show_hiz_debug_ = !show_hiz_debug_;
-    }
-    // VT pool viewer — the four 4096² layer pool textures.
-    if (ImGui::MenuItem(
-            "VT Pool Viewer", NULL, show_vt_pool_debug_)) {
-        show_vt_pool_debug_ = !show_vt_pool_debug_;
-    }
-    // In-scene probe icospheres (pending probes draw solid red).
-    if (ImGui::MenuItem(
-            "Show Probes (in scene)", NULL, show_probe_debug_)) {
-        show_probe_debug_ = !show_probe_debug_;
+
+    // ── Skeleton view selector ──────────────────────────────────────
+    // Tri-state: character only (default), bones + character (alignment
+    // check), or bones only.  Application reads this each frame and
+    // toggles DrawableObject::setVisible(...) accordingly.
+    {
+        struct SkelItem {
+            SkeletonDebugMode mode;
+            const char*       label;
+            const char*       brief;
+        };
+        static const SkelItem kSkelItems[] = {
+            { SkeletonDebugMode::CharacterOnly,
+              "Character only (default)",            "Character" },
+            { SkeletonDebugMode::BoneWithCharacter,
+              "Bones + character (alignment check)", "Bones + character" },
+            { SkeletonDebugMode::BoneOnly,
+              "Bones only (skeleton in isolation)",  "Bones only" },
+        };
+        const char* skel_brief = kSkelItems[0].brief;
+        for (int i = 0; i < IM_ARRAYSIZE(kSkelItems); ++i) {
+            if (skeleton_debug_mode_ == kSkelItems[i].mode) {
+                skel_brief = kSkelItems[i].brief;
+                break;
+            }
+        }
+        char skel_label[96];
+        snprintf(skel_label, sizeof(skel_label), "Skeleton: %s",
+                 skel_brief);
+        if (ImGui::BeginMenu(skel_label)) {
+            for (int i = 0; i < IM_ARRAYSIZE(kSkelItems); ++i) {
+                const auto& it = kSkelItems[i];
+                bool sel = (skeleton_debug_mode_ == it.mode);
+                if (ImGui::MenuItem(it.label, NULL, sel)) {
+                    skeleton_debug_mode_ = it.mode;
+                }
+            }
+            ImGui::EndMenu();
+        }
     }
 
     // ── Glass / translucent rendering mode ──────────────────────────
@@ -9600,22 +9658,58 @@ void Menu::drawRenderDebugMenuContent() {
     // dispatch reads this and calls drawTranslucentForward
     // (ALPHA_BLEND) or drawTranslucentOit (WBOIT).
     if (cluster_renderer_) {
-        ImGui::Separator();
         using TMode = engine::scene_rendering::
             ClusterRenderer::TranslucentMode;
         TMode cur_mode = cluster_renderer_->getTranslucentMode();
-        if (ImGui::MenuItem(
-                "Glass: Alpha Blend (forward)", NULL,
-                cur_mode == TMode::ALPHA_BLEND)) {
-            cluster_renderer_->setTranslucentMode(
-                TMode::ALPHA_BLEND);
+        char glass_label[64];
+        snprintf(glass_label, sizeof(glass_label), "Glass: %s",
+                 cur_mode == TMode::WBOIT ? "WBOIT" : "Alpha Blend");
+        if (ImGui::BeginMenu(glass_label)) {
+            if (ImGui::MenuItem(
+                    "Alpha Blend (forward)", NULL,
+                    cur_mode == TMode::ALPHA_BLEND)) {
+                cluster_renderer_->setTranslucentMode(
+                    TMode::ALPHA_BLEND);
+            }
+            if (ImGui::MenuItem(
+                    "WBOIT (order-independent)", NULL,
+                    cur_mode == TMode::WBOIT)) {
+                cluster_renderer_->setTranslucentMode(
+                    TMode::WBOIT);
+            }
+            ImGui::EndMenu();
         }
+    }
+
+    ImGui::Separator();
+
+    // ── Viewers ─────────────────────────────────────────────────────
+    // Floating inspector windows.  Grouped because they are all the
+    // same KIND of thing — open a window, look at a resource — and
+    // none of them changes how the scene renders.
+    if (ImGui::BeginMenu("Viewers")) {
+        // Camera-positioned dynamic reflection cubemap face viewer.
         if (ImGui::MenuItem(
-                "Glass: WBOIT (order-independent)", NULL,
-                cur_mode == TMode::WBOIT)) {
-            cluster_renderer_->setTranslucentMode(
-                TMode::WBOIT);
+                "Dynamic Cubemap Viewer", NULL,
+                show_dynamic_cube_debug_)) {
+            show_dynamic_cube_debug_ = !show_dynamic_cube_debug_;
         }
+        // Hi-Z pyramid (last-frame depth) mip-strip viewer.
+        if (ImGui::MenuItem(
+                "Hi-Z Pyramid Viewer", NULL, show_hiz_debug_)) {
+            show_hiz_debug_ = !show_hiz_debug_;
+        }
+        // VT pool viewer — the four 4096² layer pool textures.
+        if (ImGui::MenuItem(
+                "VT Pool Viewer", NULL, show_vt_pool_debug_)) {
+            show_vt_pool_debug_ = !show_vt_pool_debug_;
+        }
+        // In-scene probe icospheres (pending probes draw solid red).
+        if (ImGui::MenuItem(
+                "Show Probes (in scene)", NULL, show_probe_debug_)) {
+            show_probe_debug_ = !show_probe_debug_;
+        }
+        ImGui::EndMenu();
     }
 }
 
