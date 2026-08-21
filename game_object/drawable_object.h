@@ -1917,6 +1917,16 @@ public:
     std::vector<uint64_t> queryRadius(const glm::vec3& p, float radius,
                                       int category = -1) const;
 
+    // Every record whose NODE NAME starts with `prefix`, optionally in
+    // one category — "obj_bed" over category 4 is every bed the
+    // placement stage put in the level, at the transform it was placed
+    // at.  Returned BY VALUE: the caller (CitizenSystem, binning
+    // furniture to houses at load) keeps the snapshot, and handing out
+    // pointers into recs_ past the lock would be a lie.  Linear scan
+    // like queryRadius — a load-time query, not a per-frame one.
+    std::vector<PcgInstanceRecord> queryByNodePrefix(
+        const std::string& prefix, int category = -1) const;
+
     // Runtime state.  setTransform re-places the prop (marks it moving);
     // setState(2) hides every bound GPU slot via a zero-scale rewrite,
     // and setState(0|1) after a destroy restores the stored transform.

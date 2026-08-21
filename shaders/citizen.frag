@@ -3,12 +3,12 @@
 #include "global_definition.glsl.h"
 #include "tonemap.glsl.h"
 
-layout(push_constant) uniform CitizenDrawUniformBufferObject {
-    CitizenDrawParams params;
-};
-
+// Colour arrives as a varying now, not a push constant: the whole
+// population is drawn in ONE instanced call, so per-part data has to
+// ride the vertex stream.  See citizen.vert.
 layout(location = 0) in vec3 in_normal_ws;
 layout(location = 1) in vec3 in_position_ws;
+layout(location = 2) in vec4 in_color;
 
 layout(location = 0) out vec4 outColor;
 
@@ -21,7 +21,7 @@ const vec3 kSunDir = normalize(vec3(-0.62, 0.62, -0.48));
 void main() {
     vec3 n = normalize(in_normal_ws);
     float nl = dot(n, kSunDir) * 0.5 + 0.5;          // wrapped
-    vec3 lit = params.color.rgb * (0.35 + 0.85 * nl);
-    lit += params.color.rgb * params.color.a;         // readability lift
+    vec3 lit = in_color.rgb * (0.35 + 0.85 * nl);
+    lit += in_color.rgb * in_color.a;         // readability lift
     outColor = vec4(sceneTonemap(lit), 1.0);
 }

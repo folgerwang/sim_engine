@@ -6800,6 +6800,21 @@ std::vector<uint64_t> PcgInstanceRegistry::queryRadius(
     return out;
 }
 
+std::vector<PcgInstanceRecord> PcgInstanceRegistry::queryByNodePrefix(
+    const std::string& prefix, int category) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<PcgInstanceRecord> out;
+    for (const auto& r : recs_) {
+        if (category >= 0 && r.category != (uint8_t)category) continue;
+        if (r.node >= nodes_.size()) continue;
+        const std::string& nm = nodes_[r.node];
+        if (nm.size() < prefix.size()) continue;
+        if (nm.compare(0, prefix.size(), prefix) != 0) continue;
+        out.push_back(r);
+    }
+    return out;
+}
+
 BakedInstanceXform PcgInstanceRegistry::xformOf(
     const PcgInstanceRecord& r) const {
     // Same convention the bake writes: columns of rotY(yaw) * scale in

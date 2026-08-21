@@ -136,6 +136,14 @@ private:
     };
     struct Building {
         std::string type;
+        // Which HOUSE this building was promoted from, or -1 for a
+        // city-json civic building that is not a house at all.  The
+        // synthesized workplaces, shops and schools ARE houses (see
+        // synthesizeResidents), which is the whole reason a worker at
+        // a desk or a child at a school can be seated on a real chair:
+        // the furniture the placement stage put in that house is the
+        // furniture of that workplace.
+        int house = -1;
         glm::vec2 entrance{0.0f};
         glm::vec2 centre{0.0f};
         float yaw = 0.0f;
@@ -161,6 +169,52 @@ private:
         bool  walking = false;
         bool  inited = false;
     };
+
+    // ── FURNITURE ANCHORS ────────────────────────────────────────────
+    // The placement stage puts REAL furniture inside these houses —
+    // obj_bed*, obj_cooktop*, obj_chair* out of room_decals.glb — and
+    // PcgInstanceRegistry already holds every one of them with the
+    // transform it was placed at.  Harvesting them once at load turns
+    // "at home" from a rosette of standing points around the house
+    // centre into the actual room: the sleeper LIES ON A BED, the cook
+    // stands at the stove, a meal happens on a chair.  Without the
+    // registry (a map placed before it existed) every lookup misses and
+    // the rosette is still there underneath.
+    struct Furniture {
+        glm::vec3 t{0.0f};
+        float yaw = 0.0f;
+        float scale = 1.0f;
+    };
+    // Flat arrays plus one [first, count) slice per house.  A household
+    // resolves its own furniture from its house index alone, so Person
+    // — of which there are 120k+ — grows by nothing at all.
+    std::vector<Furniture>  beds_, stoves_, seats_;
+    std::vector<glm::ivec2> house_beds_, house_stoves_, house_seats_;
+    void harvestFurniture();
+
+    // Where a person AT HOME stands or lies for one activity, and which
+    // way they face there.  kind == 0 (kAnchorNone) means this house
+    // has no such furniture: fall back to the household rosette.
+    struct Anchor {
+        glm::vec3 pos{0.0f};
+        float yaw  = 0.0f;
+        int   kind = 0;
+    };
+    // Where a person doing `activity` at step `s` should stand, sit or
+    // lie, and which way they face.  Resolves the house whose furniture
+    // applies — their own when they are home, the promoted house behind
+    // a workplace/school/shop otherwise — so a schoolchild sits on the
+    // school's chairs rather than in the air above its floor.
+    // kind == 0 (kAnchorNone): no such furniture reachable, and the
+    // CALLER MUST NOT POSE AS IF THERE WERE.
+    Anchor furnitureAnchor(const Person& p, const Step& s,
+                           int activity) const;
+    // ONE definition of "what is this person actually doing" — the
+    // night rule included.  placePos and emitPerson both go through it,
+    // so the spot someone is put on and the pose they are drawn in can
+    // never disagree (a sleeper posed asleep at the STANDING anchor is
+    // exactly the bug this prevents).
+    int resolveActivity(const Step& s) const;
 
     const std::vector<Step>& scheduleOf(const Person& p) const {
         return (isWeekend() && !p.works_weekend && !p.weekend.empty())
@@ -203,9 +257,29 @@ private:
     static std::shared_ptr<renderer::BufferInfo>     s_cube_nrm_;
     static std::shared_ptr<renderer::BufferInfo>     s_cube_idx_;
     static uint32_t                                  s_cube_index_count_;
+    // ── PER-FRAME INSTANCE STREAM ───────────────────────────────────
+    // frame_parts_ uploaded once and drawn with ONE instanced call.
+    // The device is kept because draw() is handed a command buffer and
+    // nothing else, and the buffer has to grow with the crowd.
+    static std::shared_ptr<renderer::Device>         s_device_;
+    static std::shared_ptr<renderer::BufferInfo>     s_inst_buf_;
+    static uint32_t                                  s_inst_capacity_;
 
     bool loaded_ = false;
     std::vector<glm::vec3> houses_;
+    // Pupil SEATS in each house, from the world manifest's
+    // instances.houses.school column: 0 for an ordinary dwelling, and
+    // for a school building the number of classroom chairs terrain_pcg
+    // actually laid out in it.  Empty when the map predates the column,
+    // in which case synthesizeResidents falls back to promoting houses
+    // the way it always did.
+    //
+    // NOT house_seats_ — that name is already taken above by the
+    // furniture slice table for obj_chair, which is a completely
+    // different thing (where the chairs ARE, not how many pupils a
+    // building holds).  The two collided and the compiler resolved the
+    // uses to whichever it saw first.
+    std::vector<int> house_school_seats_;
     std::vector<Building>  buildings_;
     std::vector<Person>    persons_;
     std::vector<SimState>  sim_;       // parallel to persons_
@@ -215,6 +289,19 @@ private:
     float  far_thresh_ = 0.0f;         // adaptive far-tier angular cutoff
                                        // (0 = seed from kMinAngular)
     float  dbg_timer_ = 0.0f;          // [citizen] telemetry cadence
+    // ── POSE CLOCK: REAL seconds, not game minutes ──────────────────
+    // Idle sway, the cooking stir, a child's arm swing — every pose
+    // cycle in emitPerson used to read clock_min_, which is GAME
+    // minutes.  Driven from the world clock at its default 5x speed
+    // that advances ~0.08 per REAL second, so a 1.5 rad/game-minute
+    // sway became 0.12 rad/s: mathematically animated, visually a
+    // statue.  (Near clock_min_'s week-long range, ~10080, float
+    // spacing is ~0.001, so what motion survived was also quantized.)
+    // Poses are BODY motion — they belong to real time and must look
+    // the same whatever rate the world clock runs at.  Wrapped at
+    // kAnimWrap = 8*pi, which is a whole number of cycles for every
+    // half-integer frequency the poses use, so the wrap is seamless.
+    float  anim_t_ = 0.0f;             // real seconds, wrapped at 8*pi
     glm::vec2 district_centre_{0.0f};  // civic-building centroid (log aid)
 
     float clock_min_ = 8.0f * 60.0f + 2.0f * 1440.0f;   // Wed 08:00

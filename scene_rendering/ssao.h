@@ -39,7 +39,16 @@ public:
     float bias      = 0.025f;
     float power     = 1.5f;
     float intensity = 1.0f;
-    float strength  = 1.0f;
+    // 0.6 (was 1.0): the apply pass darkens the COMPOSITED colour, so
+    // its strength is not the ambient-occlusion strength a deferred
+    // renderer would use — it is how hard a screen-space estimate is
+    // allowed to dim a pixel that already had its direct light
+    // shadow-tested.  At 1.0 it was taking a full second bite out of
+    // shadowed ground, which is ambient-only and had nothing to spare.
+    // Raise it toward 1.0 only if the ambient term itself gets a real
+    // sky-visibility factor (RT GI / traced_sky_vis) to divide the work
+    // with.
+    float strength  = 0.6f;
     int   kernel_size = 32;
     bool  enabled   = true;
 

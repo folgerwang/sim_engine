@@ -539,22 +539,23 @@ Menu::Menu(
     device_  = device;
     sampler_ = sampler;
 
-    // Initialise time-of-day from the player's local wall clock so the
-    // sky lighting and the clock overlay both reflect the local time of day.
+    // ── THE WORLD STARTS AT 07:00 ───────────────────────────────────
+    // This used to seed the clock from the player's local wall time, so
+    // launching the game in the evening opened onto a dark, empty town
+    // and launching it at 03:00 opened onto one that was asleep.  The
+    // citizen simulation runs off this same clock (application.cpp feeds
+    // getTimeOfDayHours() into CitizenSystem::setTimeOfDayHours), so the
+    // start hour decides what the town is DOING on the first frame, not
+    // just how the sky looks: at 07:00 the households are awake and the
+    // first commuters are leaving, which is the state worth opening on.
+    //
+    // kStartTimeOfDayHours is the single place to change it; the
+    // Skydome window's slider and its Dawn/Noon/Dusk/Midnight buttons
+    // still move the clock freely once the game is running.
     {
-        std::time_t now = std::time(nullptr);
-        struct tm local_tm{};
-#if defined(_WIN32)
-        localtime_s(&local_tm, &now);
-#else
-        localtime_r(&now, &local_tm);
-#endif
-        const float local_hours =
-            static_cast<float>(local_tm.tm_hour) +
-            static_cast<float>(local_tm.tm_min)  / 60.0f +
-            static_cast<float>(local_tm.tm_sec)  / 3600.0f;
-        tod_hours_      = local_hours;
-        tod_prev_hours_ = local_hours;
+        constexpr float kStartTimeOfDayHours = 7.0f;
+        tod_hours_      = kStartTimeOfDayHours;
+        tod_prev_hours_ = kStartTimeOfDayHours;
     }
 
     // Fantasy aesthetic (deep indigo panels, gold accents) picked up by

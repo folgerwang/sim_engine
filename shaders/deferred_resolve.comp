@@ -2805,7 +2805,25 @@ void main() {
         }
     }
 
-    vec3 ambient = ambient_diffuse +
+    // ── Ground-bounce fill ───────────────────────────────────────────
+    // See groundBounceIrradiance in functions.glsl.h.  Skipped entirely
+    // when RT GI is driving the ambient term: the traced estimate
+    // ALREADY carries the sunlit bounce (that is most of what it is
+    // measuring), so adding this on top would count the same photons
+    // twice.  With GI off it is the only bounce in the frame.
+    //
+    // Occluded by ao * rt_ao like the sky term beside it — a surface
+    // that cannot see the sky mostly cannot see the ground either —
+    // but deliberately NOT by traced_sky_vis, which is a SKY
+    // visibility ratio and would be near zero in exactly the enclosed
+    // places where bounce dominates.
+    vec3 bounce = vec3(0.0);
+    if ((camera_info.input_features & FEATURE_INPUT_RT_GI) == 0u) {
+        bounce = c_diff *
+                 groundBounceIrradiance(N, L, light_col) * (ao * rt_ao);
+    }
+
+    vec3 ambient = ambient_diffuse + bounce +
         getIBLRadianceGGX(N, V, perceptual_rough, f0, kIblMipCount) *
             (ao * rt_ao * traced_sky_vis);
 
@@ -2833,8 +2851,22 @@ void main() {
     // ReSTIR the sun term is reservoir-driven, but the translucency
     // stays sun-only — an approximation, and a stable one, since the
     // sun dominates every outdoor pixel this flag ever touches.
+    // .w encodes both the leaf flag and WHICH SIDE of the leaf this
+    // pixel is (see the G-buffer write in cluster_bindless.frag):
+    // 0 = not foliage, 0.5 = back/abaxial face, 1.0 = front/adaxial.
     vec3 sss = vec3(0.0);
-    if (nr.w > 0.5) {
+    if (nr.w > 0.25) {
+        float leaf_front = nr.w > 0.75 ? 1.0 : 0.0;
+        // REFLECTED lighting was solved above against N, which the
+        // G-buffer already flipped to face the viewer; all that is left
+        // for it here is the side's sheen — the waxy cuticle is glossy,
+        // the underside is not.  ReSTIR owns the diffuse term when it
+        // is active, and it is unaffected either way: sheen is
+        // specular-only.
+        specular *= leafSpecularSide(leaf_front);
+        // TRANSMITTED lighting: the separate problem on the far side of
+        // the slab, gated on light actually landing there (-N), tinted
+        // by the pigment it crossed.  Combined into `color` below.
         sss = foliageTranslucency(N, V, L, albedo, light_col, shad);
     }
 

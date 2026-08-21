@@ -52,7 +52,58 @@ layout(set = PBR_GLOBAL_PARAMS_SET, binding = SCENE_DEPTH_TEX_INDEX) uniform sam
 // blue water and saturated greens that looked correct.  Nothing about
 // loading changed the lighting; the cube simply had not finished
 // climbing to its (far too bright) steady state yet.
-const float kIblIrradianceScale = 0.10;
+// ── 2026-08 REVISION: 0.098 -> 0.28 ─────────────────────────────────
+// The derivation above is still correct about the UNITS.  What it got
+// wrong is what it solved FOR: it measured one sunlit sand pixel and
+// picked the scale that put that pixel at ~0.80 sRGB.  Nothing in it
+// looked at the SHADOW, and the shadow is the only thing this constant
+// actually governs — a shadowed pixel has shad = 0, so the sky term is
+// its ENTIRE light budget, while a sunlit pixel is dominated by the
+// direct term and barely moves when this changes.
+//
+// Measured off a forest frame (grass albedo ~0.15, sun 6.0, hard tree
+// shadows on flat ground), inverting the shared ACES curve back to
+// radiance:
+//
+//   sunlit grass   0.470 sRGB  ->  0.2340 radiance
+//   tree shadow    0.080 sRGB  ->  0.0175 radiance
+//   ratio                                  0.075
+//
+// A clear-sky day puts diffuse sky at ~13-15% of total horizontal
+// illuminance, so 7.5% is roughly half the light a real shadow gets,
+// and the ACES toe then spends that deficit twice: at x = 0.011 the
+// curve's local gain is ~0.39 where at x = 0.13 it is ~1.39, so a
+// factor of two in radiance becomes far more than a factor of two on
+// screen.  That is why it reads as black rather than as dim.
+//
+// Solving the same measurement for the shadow instead of the highlight:
+//
+//   kIbl    shadow   sunlit   shadow/sunlit
+//   0.098    0.080    0.470       17%      <- was here
+//   0.200    0.129    0.491       26%
+//   0.250    0.151    0.500       30%
+//   0.280    0.164    0.506       32%      <- here now
+//   0.350    0.193    0.519       37%
+//
+// Note how little the sunlit column moves: the direct term is untouched
+// and it already sits under the ACES shoulder, so this buys shadow
+// detail almost entirely out of contrast rather than out of highlights.
+// The pale washed-out frame the original note describes came from the
+// ambient being ~10x the SUN; at 0.28 the sky:sun ratio is still about
+// 1:3, which is the clear-day figure that note itself quotes as the
+// target.
+//
+// WHAT THIS COSTS, and it is real: the lambertian cube delivers full
+// open-sky irradiance to every pixel regardless of whether that pixel
+// can see the sky, and cluster geometry writes ao = 1.0 unconditionally
+// — so indoors there is nothing but screen-space AO holding the ambient
+// down, and interiors WILL get brighter by the same 2.9x.  Walk into a
+// house after changing this.  The durable answer is a real sky
+// visibility factor (RT GI's traced_sky_vis, or a baked sky-occlusion
+// channel in the G-buffer); until one exists this constant is a single
+// compromise serving both the open air and the indoors, and it is now
+// biased toward the open air, which is where the camera spends its time.
+const float kIblIrradianceScale = 0.28;
 
 vec3 getIBLRadianceGGX(vec3 n, vec3 v, float perceptualRoughness, vec3 specularColor, float mip_count)
 {

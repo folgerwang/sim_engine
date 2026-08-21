@@ -658,11 +658,15 @@ private:
     std::string hover_object_name_;
 
     // ---- Time-of-day -------------------------------------------------------
-    // Hours in [0, 24) in the player's **local timezone**.  Initialised
-    // at startup from localtime_s / localtime_r so the sun position and
-    // the clock overlay both reflect the player's local time of day.
+    // Hours in [0, 24).  Initialised in the constructor to
+    // kStartTimeOfDayHours = 7.0 — the world always opens at 07:00.  It
+    // used to seed from the player's wall clock, which meant launching
+    // in the evening opened onto a dark town and launching at 03:00
+    // onto a sleeping one; the citizen simulation runs off this same
+    // clock, so the start hour decides what the town is DOING on the
+    // first frame, not just how the sky looks.
     // The hour-angle formula in Skydome::update treats this value as
-    // local solar time, so local noon (12.0) puts the sun at its highest
+    // local solar time, so noon (12.0) puts the sun at its highest
     // point for the configured latitude/longitude.
     //
     // When the user yanks the slider by more than tod_jump_threshold_
@@ -670,8 +674,8 @@ private:
     // button etc.) and the application will reset the sky / IBL mini-
     // buffers so they re-bootstrap instead of EMA-blending toward the
     // new lighting over many seconds.
-    float tod_hours_      = 0.0f;  // overwritten in constructor from local wall clock
-    float tod_prev_hours_ = 0.0f;
+    float tod_hours_      = 7.0f;  // constructor pins it to kStartTimeOfDayHours
+    float tod_prev_hours_ = 7.0f;
     bool  tod_auto_advance_ = true;      // tick forward with real time
     // Speed factor: game time / real time.  5.0 means 1 real-second
     // advances the in-game clock by 5 game-seconds, so a full 24-hour

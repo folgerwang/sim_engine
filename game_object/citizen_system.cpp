@@ -12,6 +12,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp
+#include "drawable_object.h"   // PcgInstanceRegistry (furniture)
 #include "helper/engine_helper.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
@@ -27,6 +28,9 @@ enum Activity {
     kActIdle = 0, kActWalk, kActSit, kActCook, kActBrowse, kActCare,
     kActDeskWork, kActPlay, kActSleepish
 };
+// Which piece of furniture a home anchor resolved to.  kAnchorNone
+// is "this house has none of it" — the caller falls back.
+enum AnchorKind { kAnchorNone = 0, kAnchorBed, kAnchorStove, kAnchorSeat };
 enum Duty {
     kDutyResident = 0, kDutyDoctor, kDutyNurse, kDutyTeacher,
     kDutyOfficial, kDutyPolice, kDutyFire, kDutyChef, kDutyWaiter,
@@ -142,10 +146,38 @@ constexpr float kClockScale = 60.0f;      // 1 real s = 1 game minute
 constexpr float kNearSimRadius = 700.0f;
 constexpr size_t kFarSimPerFrame = 8192;
 constexpr float kDetailRadius = 300.0f;
-constexpr size_t kMaxDetailed = 320;
-constexpr size_t kMaxFarParts = 12000;    // far-tier draw budget
+// ── THE BUDGETS THAT WERE REALLY DRAW-CALL BUDGETS ──────────────────
+// 320 detailed figures and 12000 far parts were sized against a draw
+// path that issued one pushConstants + one drawIndexed PER BOX: 320
+// figures is 2240 calls and the far tier another 12000, which is
+// already an unreasonable number of draws for gameplay markers.  The
+// stream is instanced now — the entire visible population is ONE
+// drawIndexed — so the limits can be what the GEOMETRY can carry
+// rather than what the command buffer could.
+//
+// A box is 12 triangles.  The whole 119k population as far-tier boxes
+// is 1.4 M triangles in one call, which is less than a single tree
+// band, and the per-frame cost is the 80 B/part memcpy into the
+// instance buffer: 9.5 MB for everyone at once, and far less in
+// practice because kShowRadius and the angular test still apply.
+//
+// kMaxFarParts stays as a SAFETY VALVE, not a look decision: the
+// adaptive far_thresh_ below still raises the cutoff if a vantage ever
+// puts more than this in view, so a pathological frame degrades
+// instead of stalling.  At 200k it never engages for this map's
+// population, which is the point — "visible when the ground under them
+// is visible" is the rule now.
+constexpr size_t kMaxDetailed = 4096;
+constexpr size_t kMaxFarParts = 200000;   // far-tier safety valve
 constexpr float kShowRadius = 10000.0f;   // 10 km
-constexpr float kMinAngular = 0.0003f;    // height/dist cutoff (floor)
+// Sub-pixel cutoff, not a budget: 0.0003 rad of height is about a third
+// of a pixel at 1440p, so this only drops people who could not put a
+// fragment on the screen anyway.  It used to be the FLOOR of a
+// threshold the far-part budget kept ratcheting upward, which is what
+// made whole crowds disappear from a hilltop view; with the budget
+// effectively lifted it is once again just the sub-pixel test it reads
+// as.
+constexpr float kMinAngular = 0.0002f;    // height/dist cutoff (floor)
 constexpr float kGroundClampRadius = 400.0f;
 // ...but the exact clamp is a TERRAIN QUERY, the one thing in this
 // tick that does not scale, and a household is 3-5 people now.  In a
@@ -171,6 +203,13 @@ constexpr size_t kNearClampPerFrame = 1536;
 // Full 60x would be teleport-sprinting; 6x reads as "people getting
 // places" while staying watchable up close.
 constexpr float kWalkTimeScale = 6.0f;
+
+// Wrap period for the real-time POSE clock (CitizenSystem::anim_t_).
+// 8*pi seconds: every pose frequency below is a multiple of 0.5 rad/s,
+// and 0.5 * 8*pi = 4*pi is a whole number of cycles — so the wrap
+// never pops a limb.  Wrapping at all is what keeps the sine arguments
+// in a precise part of the float range over a long session.
+constexpr float kAnimWrap = 25.13274123f;   // 8 * pi
 // Staggered height refresh for everyone the near tier did not reach.
 // Sized against the population this system now carries (~4 residents
 // per house): at 1024 a 228k-person town took ~220 frames to come
@@ -199,6 +238,51 @@ constexpr int kHouseholdMax = 5;
 // Rosette radius for a household at home and out in the yard.  Houses
 // generate around a ~8 m footprint, so 2.2 m keeps five people spread
 // but still inside the shell; outdoors they can use the whole garden.
+// ── FURNITURE (see harvestFurniture / furnitureAnchor) ──────────────
+// How far from a house centre a placed object still counts as being
+// INSIDE that house.  Village houses here sit 30-70 m apart and their
+// room decals land within a couple of metres of the shell, so 12 m
+// binds every one of them and never reaches a neighbour's.
+// 25 m, up from 12: 12 m was sized for the distance BETWEEN houses,
+// not for the size of one.  A chair in the far corner of a large
+// promoted workplace is 12-15 m from its own house's centre and was
+// dropped on the floor by the radius test, so that building had no
+// seats and everyone in it sat in mid-air.  Nearest-centre is the real
+// criterion and it is unambiguous at any radius here — village houses
+// stand 30-70 m apart — so the cap only needs to be loose enough to
+// cover one building's own footprint.
+constexpr float kFurnitureBindR = 25.0f;
+// Two to a double bed, offset either side of its centreline.  A
+// household of four in a house with one bed used to be four figures
+// stacked in the same volume; sharing in pairs is both what the
+// geometry can carry and what a bedroom looks like.  Residents past
+// the last bed do not lie down at all — see furnitureAnchor.
+constexpr float kBedShareOffsetM = 0.32f;
+// Mattress top above the bed instance's origin, and half the mattress
+// length.  The sleeper's ROOT goes at the FOOT end: the lying pose in
+// emitPerson tips the whole figure flat about the root, so the body
+// extends from there toward the pillow.
+constexpr float kBedTopY    = 0.55f;
+constexpr float kBedHalfLen = 0.85f;
+// If sleepers come out lying ACROSS their beds instead of along them,
+// the bed model's yaw runs along its WIDTH: put half a turn
+// (1.5707963f) here and every bed in the map lines up.  Nothing else
+// reads this.
+constexpr float kBedYawFix  = 0.0f;
+// Where a cook stands relative to the cooktop: out in front of it by
+// this much, turned back to face it.
+constexpr float kStoveStand = 0.75f;
+// If seated citizens face AWAY from their table, the chair model's yaw
+// points out of the seat rather than into it: put half a turn
+// (3.14159265f) here and every chair in the map turns round.  Same
+// escape hatch as kBedYawFix, same reason — the furniture library's
+// axis convention is not this system's to assume.
+constexpr float kSeatYawFix = 0.0f;
+// The night window.  At home inside it everyone is asleep, whatever
+// their schedule step nominally says — nobody cooks at 03:00.
+constexpr float kNightStartMin = 22.5f * 60.0f;
+constexpr float kNightEndMin   =  6.0f * 60.0f;
+
 constexpr float kHomeSpreadR = 2.2f;
 constexpr float kYardSpreadR = 4.0f;
 
@@ -210,6 +294,9 @@ std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_pos_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_nrm_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_idx_;
 uint32_t                            CitizenSystem::s_cube_index_count_ = 0;
+std::shared_ptr<er::Device>         CitizenSystem::s_device_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_inst_buf_;
+uint32_t                            CitizenSystem::s_inst_capacity_ = 0;
 
 void CitizenSystem::initStaticMembers(
     const std::shared_ptr<er::Device>& device,
@@ -226,8 +313,9 @@ void CitizenSystem::initStaticMembers(
         global_desc_set_layouts, { push_const_range },
         std::source_location::current());
 
-    std::vector<er::VertexInputBindingDescription> bindings(2);
-    std::vector<er::VertexInputAttributeDescription> attribs(2);
+    s_device_ = device;
+    std::vector<er::VertexInputBindingDescription> bindings(3);
+    std::vector<er::VertexInputAttributeDescription> attribs(7);
     bindings[0].binding = 0;
     bindings[0].stride = sizeof(glm::vec3);
     bindings[0].input_rate = er::VertexInputRate::VERTEX;
@@ -242,6 +330,21 @@ void CitizenSystem::initStaticMembers(
     attribs[1].location = VINPUT_NORMAL;
     attribs[1].format = er::Format::R32G32B32_SFLOAT;
     attribs[1].offset = 0;
+    // ── THE INSTANCE STREAM ─────────────────────────────────────────
+    // One PartInstance per box: the four columns of its transform and
+    // its colour, at INSTANCE rate.  This replaces a push constant that
+    // forced one draw call per box — see the note at the top of
+    // citizen.vert.  Locations 10-14 are free here; the VINPUT_* block
+    // only reaches 9.
+    bindings[2].binding = 2;
+    bindings[2].stride = sizeof(PartInstance);
+    bindings[2].input_rate = er::VertexInputRate::INSTANCE;
+    for (int k = 0; k < 5; ++k) {
+        attribs[2 + k].binding = 2;
+        attribs[2 + k].location = uint32_t(10 + k);
+        attribs[2 + k].format = er::Format::R32G32B32A32_SFLOAT;
+        attribs[2 + k].offset = uint32_t(k * sizeof(glm::vec4));
+    }
 
     er::PipelineInputAssemblyStateCreateInfo input_assembly;
     input_assembly.topology = er::PrimitiveTopology::TRIANGLE_LIST;
@@ -309,6 +412,12 @@ void CitizenSystem::destroyStaticMembers(
     s_pipeline_layout_ = nullptr;
     if (s_pipeline_) device->destroyPipeline(s_pipeline_);
     s_pipeline_ = nullptr;
+    if (s_inst_buf_) {
+        s_inst_buf_->destroy(device);
+        s_inst_buf_ = nullptr;
+    }
+    s_inst_capacity_ = 0;
+    s_device_ = nullptr;
     if (s_cube_pos_) s_cube_pos_->destroy(device);
     if (s_cube_nrm_) s_cube_nrm_->destroy(device);
     if (s_cube_idx_) s_cube_idx_->destroy(device);
@@ -320,6 +429,7 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
     using nlohmann::json;
     loaded_ = false;
     houses_.clear();
+    house_school_seats_.clear();
     buildings_.clear();
     persons_.clear();
     sim_.clear();
@@ -365,6 +475,27 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
         for (size_t i = 0; i < n; ++i) {
             houses_.emplace_back(float(t[3 * i]), float(t[3 * i + 1]),
                                  float(t[3 * i + 2]));
+        }
+        // ── REAL SCHOOLS ────────────────────────────────────────────
+        // terrain_pcg picks a campus of house shells per catchment,
+        // furnishes them as classrooms and writes their pupil-seat
+        // count here.  It has to be the pipeline's decision: the
+        // capacity IS the number of chairs the furniture solver managed
+        // to fit, which nothing on this side can know.
+        if (hs.contains("school")) {
+            const auto& sc = hs.at("school");
+            if (sc.size() == n) {
+                house_school_seats_.resize(n, 0);
+                size_t n_sch = 0, n_seat = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const int s = sc[i].get<int>();
+                    house_school_seats_[i] = s;
+                    if (s > 0) { ++n_sch; n_seat += size_t(s); }
+                }
+                std::cout << "[citizen] " << n_sch
+                          << " school building(s) in the manifest, "
+                          << n_seat << " pupil seats" << std::endl;
+            }
         }
         // The whole city-json parse is conditional now.  The body is
         // NOT re-indented so this stays a reviewable diff — it is the
@@ -475,6 +606,12 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
 
         // Houses are the obstacle field for walk steering.
         buildHouseGrid();
+        // ...and, through that same grid, the owner of every bed,
+        // cooktop and chair the placement stage put on the level.
+        // AFTER buildHouseGrid (it uses the grid), BEFORE anyone is
+        // placed.  The registry is loaded at terrain apply, well ahead
+        // of this call.
+        harvestFurniture();
 
         // No city json, or one that yielded nobody (an old export, or a
         // map whose households never got allocated): give every house
@@ -605,6 +742,9 @@ void CitizenSystem::synthesizeResidents() {
         const glm::vec3& h = houses_[house_idx];
         Building b;
         b.type = type;
+        // Remember WHICH house this was promoted from: its furniture is
+        // this workplace's furniture (see Building::house).
+        b.house = house_idx;
         b.centre = {h.x, h.z};
         // INSIDE the building, not on its doorstep.  This anchor is
         // where a person AT work / school / the shop stands all day,
@@ -630,11 +770,32 @@ void CitizenSystem::synthesizeResidents() {
             shop_bi[k].push_back(addBuilding(c.idx[j], "shop"));
         }
     }
-    for (uint64_t k : sortedKeys(school_cells)) {
-        const CellPick& c = school_cells[k];
-        const int n_school = std::min(c.n, kSchoolsPerCell);
-        for (int j = 0; j < n_school; ++j) {
-            school_bi[k].push_back(addBuilding(c.idx[j], "school"));
+    // ── SCHOOLS: THE PIPELINE'S, WHEN THERE ARE ANY ─────────────────
+    // A manifest that carries the school column has REAL school
+    // buildings — houses furnished as classrooms, with a measured seat
+    // count — so use those and do not promote anything.  Promoting
+    // arbitrary cottages is the fallback for maps generated before the
+    // column existed, and it is what put a hundred children in a
+    // living room: it invented four schools per 1680 m cell whatever
+    // the population, with no building behind them.
+    const bool real_schools =
+        house_school_seats_.size() == houses_.size() &&
+        std::any_of(house_school_seats_.begin(), house_school_seats_.end(),
+                    [](int s) { return s > 0; });
+    if (real_schools) {
+        for (size_t i = 0; i < houses_.size(); ++i) {
+            if (house_school_seats_[i] <= 0) continue;
+            const glm::vec3& h = houses_[i];
+            const int bi = addBuilding(int(i), "school");
+            school_bi[cellKey(h.x, h.z, kSchoolCellM)].push_back(bi);
+        }
+    } else {
+        for (uint64_t k : sortedKeys(school_cells)) {
+            const CellPick& c = school_cells[k];
+            const int n_school = std::min(c.n, kSchoolsPerCell);
+            for (int j = 0; j < n_school; ++j) {
+                school_bi[k].push_back(addBuilding(c.idx[j], "school"));
+            }
         }
     }
     // Pick one of a cell's anchors for this resident — spreading the
@@ -653,6 +814,11 @@ void CitizenSystem::synthesizeResidents() {
     const int hh_avg = (kHouseholdMin + kHouseholdMax + 1) / 2;
     persons_.reserve(houses_.size() * size_t(hh_avg));
     for (size_t i = 0; i < houses_.size(); ++i) {
+        // A SCHOOL IS NOT A DWELLING.  Its rooms hold desks, not beds,
+        // so nobody lives here — and letting a household move in would
+        // put four people asleep on a classroom floor and, worse, count
+        // its own children toward the catchment it exists to serve.
+        if (real_schools && house_school_seats_[i] > 0) continue;
         const glm::vec3& home = houses_[i];
         // Household size, drawn per HOUSE and uniform over
         // [kHouseholdMin, kHouseholdMax].
@@ -773,6 +939,26 @@ void CitizenSystem::synthesizeResidents() {
                 wake =  6.50f * 60.0f; leave =  7.60f * 60.0f;
                 ret  = 17.60f * 60.0f; bed   = 22.50f * 60.0f;
             }
+            // ── OVERTIME ─────────────────────────────────────────────
+            // Not everyone comes home at the same hour, and the jitter
+            // on `ret` is symmetric noise — it makes early leavers as
+            // often as late ones, and never a genuinely long day.  A
+            // slice of the employed stay on 1-4 hours past their normal
+            // finish; the rest of the evening slides with them, capped
+            // so a hinge can never land past midnight (a step at
+            // minutes >= 1440 would simply never fire).  Drawn per
+            // PERSON, so who works late is a fact about them rather
+            // than a coin flipped each evening — a village knows who
+            // is never home before dark.
+            const bool ot_duty = (p.duty == kDutyWorker ||
+                                  p.duty == kDutyOffice ||
+                                  p.duty == kDutyShop);
+            float ot = 0.0f;
+            if (ot_duty && h01(hi, 0x0E7u) < 0.28f) {
+                ot = 60.0f + h01(hi, 0x0E8u) * 180.0f;   // 1-4 h
+            }
+            ret = std::min(ret + ot, 1380.0f);           // <= 23:00
+            bed = std::min(bed + ot * 0.35f, 1425.0f);   // <= 23:45
             auto jit = [&](float base_min, float span_min, uint32_t k) {
                 return base_min + (h01(hi, k) - 0.5f) * span_min;
             };
@@ -838,6 +1024,22 @@ void CitizenSystem::synthesizeResidents() {
                 step(jit(19.50f * 60.0f, 120.0f, 0x205u), kActCook,   -1),
                 step(jit(22.50f * 60.0f, 60.0f, 0x206u),  kActSleepish, -1),
             };
+            // Overtime plus jitter can push an evening hinge past
+            // midnight, and a step at minutes >= 1440 never fires at
+            // all (tod is always < 1440) — the person would be stuck on
+            // whatever they were doing at 23:59 until the 00:00 step.
+            // Clamp into the day.  Two hinges landing on the same
+            // clamped minute is harmless: at home after 22:30 the night
+            // rule in resolveActivity puts them to bed regardless of
+            // which one won.
+            auto clamp_day = [](std::vector<Step>& v) {
+                for (Step& s2 : v) {
+                    s2.minutes = std::min(std::max(s2.minutes, 0.0f),
+                                          1439.0f);
+                }
+            };
+            clamp_day(p.weekday);
+            clamp_day(p.weekend);
             // Jitter can reorder two hinges that started close together;
             // currentStep walks the list assuming ascending minutes.
             auto by_time = [](const Step& a, const Step& b) {
@@ -1024,6 +1226,196 @@ glm::vec2 CitizenSystem::steerAroundHouses(const glm::vec2& pos,
     return out / L;
 }
 
+void CitizenSystem::harvestFurniture() {
+    beds_.clear();   stoves_.clear();   seats_.clear();
+    house_beds_.assign(houses_.size(), glm::ivec2(0));
+    house_stoves_.assign(houses_.size(), glm::ivec2(0));
+    house_seats_.assign(houses_.size(), glm::ivec2(0));
+    if (houses_.empty()) return;
+
+    PcgInstanceRegistry& reg = PcgInstanceRegistry::get();
+    if (reg.size() == 0) {
+        // No <map>_pcg_instances.json for this map (or it failed to
+        // parse).  Not an error: the household rosette in placePos is
+        // the same fallback it always was, people just stand rather
+        // than lie down.
+        std::cout << "[citizen] no instance registry — no furniture "
+                     "anchors; home stays the household rosette"
+                  << std::endl;
+        return;
+    }
+    // Nearest house within kFurnitureBindR, through the same 48 m grid
+    // the walk steering uses (buildHouseGrid runs first).  A bed is
+    // metres from its own house and tens of metres from the next, so
+    // nearest-centre is unambiguous — no need to know the footprint.
+    auto nearestHouse = [this](const glm::vec3& p) -> int {
+        const int32_t cx = int32_t(std::floor(p.x / kAvoidCell));
+        const int32_t cz = int32_t(std::floor(p.z / kAvoidCell));
+        int best = -1;
+        float best_d2 = kFurnitureBindR * kFurnitureBindR;
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const uint64_t k =
+                    (uint64_t(uint32_t(cx + dx)) << 32) |
+                    uint32_t(cz + dz);
+                auto it = house_grid_.find(k);
+                if (it == house_grid_.end()) continue;
+                for (int hi : it->second) {
+                    const glm::vec3& h = houses_[size_t(hi)];
+                    const float ddx = h.x - p.x, ddz = h.z - p.z;
+                    const float d2 = ddx * ddx + ddz * ddz;
+                    if (d2 < best_d2) { best_d2 = d2; best = hi; }
+                }
+            }
+        }
+        return best;
+    };
+    // Counting sort into per-house slices: one pass to bin, one prefix
+    // sum, one to fill.  A vector-per-house would be 30k allocations
+    // for a village and three times that for the three prefixes.
+    auto harvest = [&](const char* prefix,
+                       std::vector<Furniture>& out,
+                       std::vector<glm::ivec2>& slice) -> int {
+        const std::vector<PcgInstanceRecord> recs =
+            reg.queryByNodePrefix(prefix, /*category=*/4);
+        std::vector<int> owner(recs.size(), -1);
+        std::vector<int> count(houses_.size(), 0);
+        for (size_t i = 0; i < recs.size(); ++i) {
+            const int hi = nearestHouse(recs[i].t);
+            owner[i] = hi;
+            if (hi >= 0) ++count[size_t(hi)];
+        }
+        int run = 0;
+        for (size_t h = 0; h < houses_.size(); ++h) {
+            slice[h] = glm::ivec2(run, count[h]);
+            run += count[h];
+        }
+        out.assign(size_t(run), Furniture{});
+        std::vector<int> cursor(houses_.size(), 0);
+        for (size_t i = 0; i < recs.size(); ++i) {
+            const int hi = owner[i];
+            if (hi < 0) continue;
+            Furniture f;
+            f.t     = recs[i].t;
+            f.yaw   = recs[i].yaw;
+            f.scale = recs[i].scale;
+            out[size_t(slice[size_t(hi)].x + cursor[size_t(hi)]++)] = f;
+        }
+        return run;
+    };
+    const int nb = harvest("obj_bed",     beds_,   house_beds_);
+    const int ns = harvest("obj_cooktop", stoves_, house_stoves_);
+    const int nc = harvest("obj_chair",   seats_,  house_seats_);
+    std::cout << "[citizen] furniture anchors: " << nb << " bed(s), "
+              << ns << " cooktop(s), " << nc << " chair(s) bound to "
+              << houses_.size() << " house(s)" << std::endl;
+}
+
+int CitizenSystem::resolveActivity(const Step& s) const {
+    if (s.place != -1) return s.activity;
+    const float tod = std::fmod(clock_min_, 1440.0f);
+    // At home, at night: asleep, whatever the step nominally says.  The
+    // rule used to live only in emitPerson, which posed people asleep
+    // while placePos still had them standing at the household rosette.
+    if (s.activity == kActSleepish ||
+        tod < kNightEndMin || tod > kNightStartMin) {
+        return kActSleepish;
+    }
+    return s.activity;
+}
+
+CitizenSystem::Anchor CitizenSystem::furnitureAnchor(
+    const Person& p, const Step& s, int activity) const {
+    Anchor a;
+    // ── WHOSE FURNITURE APPLIES ──────────────────────────────────────
+    // At home it is their own house.  At a workplace, school or shop it
+    // is the house that building was promoted from — which is the fix
+    // for the report this function exists to answer: a child at school
+    // and a worker at a desk are at a `place >= 0`, this used to bail
+    // out on them, and they sat in the air inside a perfectly furnished
+    // room.  A city-json civic building is not a house and still bails.
+    int house = -1;
+    int seat_i = 0;
+    if (s.place == -1) {
+        house = p.house;
+        seat_i = p.hslot;
+    } else if (s.place >= 0 && s.place < int(buildings_.size())) {
+        house = buildings_[size_t(s.place)].house;
+        // Their counted slot AT THIS building — the same index placePos
+        // uses for the arrival scatter, so two people never resolve to
+        // one chair while another stands empty.
+        seat_i = (s.place == p.shop_b) ? p.shop_slot : p.slot;
+    }
+    if (house < 0 || house >= int(houses_.size())) return a;
+    const std::vector<Furniture>*  arr = nullptr;
+    const std::vector<glm::ivec2>* sl  = nullptr;
+    int kind = kAnchorNone;
+    switch (activity) {
+    case kActSleepish: arr = &beds_;   sl = &house_beds_;
+                       kind = kAnchorBed;   break;
+    case kActCook:     arr = &stoves_; sl = &house_stoves_;
+                       kind = kAnchorStove; break;
+    case kActSit:
+    case kActDeskWork: arr = &seats_;  sl = &house_seats_;
+                       kind = kAnchorSeat;  break;
+    default: return a;
+    }
+    if (sl->size() != houses_.size()) return a;
+    const glm::ivec2 sp = (*sl)[size_t(house)];
+    if (sp.y <= 0) return a;
+    // ── ONE PERSON PER PIECE (two to a bed) ──────────────────────────
+    // The modulo this used to do handed the same chair to every fourth
+    // resident and the same mattress to all of them, which is how four
+    // figures ended up inside one another.  Index straight instead, and
+    // when the index runs past what the room actually holds, return
+    // NONE: the caller then leaves them standing rather than posing
+    // them on furniture that is not there.
+    int idx = seat_i;
+    float side = 0.0f;
+    if (kind == kAnchorBed) {
+        idx  = seat_i / 2;                       // two to a double bed
+        side = (seat_i & 1) ? kBedShareOffsetM : -kBedShareOffsetM;
+    }
+    if (idx >= sp.y) return a;
+    const Furniture& f = (*arr)[size_t(sp.x + idx)];
+    a.kind = kind;
+    const float fwd_x = std::sin(f.yaw);
+    const float fwd_z = std::cos(f.yaw);
+    switch (kind) {
+    case kAnchorBed: {
+        // Root at the FOOT of the mattress, on top of it; the lying
+        // pose runs the body from here toward the pillow.  `side`
+        // shifts a bed's second sleeper across its width — the
+        // perpendicular of the same forward axis — so a couple lies
+        // beside each other instead of inside each other.
+        a.yaw = f.yaw + kBedYawFix;
+        const float rgt_x =  fwd_z;      // perpendicular to forward
+        const float rgt_z = -fwd_x;
+        a.pos = glm::vec3(f.t.x + fwd_x * kBedHalfLen * f.scale +
+                              rgt_x * side * f.scale,
+                          f.t.y + kBedTopY * f.scale,
+                          f.t.z + fwd_z * kBedHalfLen * f.scale +
+                              rgt_z * side * f.scale);
+        break;
+    }
+    case kAnchorStove:
+        // In front of the cooktop, facing back into it.
+        a.yaw = f.yaw + 3.14159265f;
+        a.pos = glm::vec3(f.t.x + fwd_x * kStoveStand * f.scale,
+                          f.t.y,
+                          f.t.z + fwd_z * kStoveStand * f.scale);
+        break;
+    default:
+        // On the chair, facing the way it faces.  The sitting pose
+        // already drops the root to seat height off the floor, which is
+        // where the chair's own origin sits.
+        a.yaw = f.yaw + kSeatYawFix;
+        a.pos = f.t;
+        break;
+    }
+    return a;
+}
+
 glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
                                   int pid) const {
     // deterministic per-person jitter so a crowd at one entrance
@@ -1038,8 +1430,17 @@ glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
     const float hsi  = float(p.hslot) + 0.5f;
     const float hth  = hsi * 2.39996323f;       // golden angle (radians)
     if (s.place == -1 || s.place >= int(buildings_.size())) {
-        // Indoors.  kHomeSpreadR keeps the rosette inside the shell so
-        // nobody is packed through a wall.
+        // Indoors.  REAL FURNITURE FIRST: the bed they sleep on, the
+        // cooktop they cook at, the chair they eat on — placed by the
+        // same pipeline that placed the house, so this is the actual
+        // room rather than a guess at where its middle is.
+        {
+            const Anchor an = furnitureAnchor(p, s, resolveActivity(s));
+            if (an.kind != kAnchorNone) return an.pos;
+        }
+        // No such furniture in this house: the household rosette.
+        // kHomeSpreadR keeps it inside the shell so nobody is packed
+        // through a wall.
         const glm::vec3& h = houses_[p.house];
         const float rr = kHomeSpreadR * std::sqrt(hsi / hcap);
         return {h.x + std::cos(hth) * rr + jx * 0.15f,
@@ -1055,6 +1456,15 @@ glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
         return {h.x + 12.0f + std::cos(hth) * rr + jx * 0.5f,
                 h.y,
                 h.z + 12.0f + std::sin(hth) * rr + jz * 0.5f};
+    }
+    // A WORKPLACE, SCHOOL OR SHOP.  These are promoted houses, so they
+    // have real furniture too: seat the person on one of its chairs
+    // before falling back to the arrival scatter.  Sitting at a desk on
+    // nothing, inside a room that has chairs in it, is the report this
+    // answers.
+    {
+        const Anchor an = furnitureAnchor(p, s, resolveActivity(s));
+        if (an.kind != kAnchorNone) return an.pos;
     }
     const Building& b = buildings_[s.place];
     // EVEN PACKING, not a jitter box.  Two independent hashes put six
@@ -1101,6 +1511,10 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                            const GroundQueryFn& ground) {
     if (!loaded_) return;
     ground_ = ground;
+    // Pose clock (see anim_t_ in the header): REAL seconds, advanced
+    // here and nowhere else, deliberately independent of clock_min_
+    // and of whatever multiplier the time-of-day slider is on.
+    anim_t_ = std::fmod(anim_t_ + delta_t, kAnimWrap);
     // kClockScale game-seconds per real second -> minutes here.  Skipped
     // when the application drives the clock (setTimeOfDayHours): two
     // clocks running at different rates is how the sun and the town
@@ -1428,19 +1842,41 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         return;
     }
 
-    const float tod = std::fmod(clock_min_, 1440.0f);
     const auto& sched = scheduleOf(p);
     const Step home_step{};
     const Step& st = a.cur_step >= 0 ? sched[a.cur_step] : home_step;
-    int act = a.walking ? kActWalk : st.activity;
-    if (!a.walking && a.gesture_t > 0.0f && a.gesture_t < 1.2f &&
-        st.place == -1) {
+    // resolveActivity carries the night rule, and it is the SAME call
+    // placePos made when it decided where to put this person — so the
+    // pose and the spot always agree.
+    int act = a.walking ? kActWalk : resolveActivity(st);
+    // Door-open gesture on arrival home — but never in place of going
+    // to bed: at 03:00 an arm reaching for a door handle is not what
+    // anybody is doing.
+    if (!a.walking && act != kActSleepish && a.gesture_t > 0.0f &&
+        a.gesture_t < 1.2f && st.place == -1) {
         act = kActBrowse;              // arm-forward: opening the door
     }
-    // night: everyone home is asleep-ish (idle, no cooking at 03:00)
-    if (!a.walking && st.place == -1 &&
-        (tod < 6.0f * 60.0f || tod > 22.5f * 60.0f)) {
-        act = kActIdle;
+
+    // ── ON THE FURNITURE ─────────────────────────────────────────────
+    // At home, the anchor carries both the spot and the FACING: a bed
+    // decides which way its sleeper lies, a cooktop which way its cook
+    // turns.  The body is drawn at the anchor rather than at a.pos:
+    // walking stops within 0.6 m of the target and the ground clamp
+    // rewrites y every frame, and neither of those belongs on a
+    // mattress.  Costs one array index, and only for the few hundred
+    // figures the detail tier draws.
+    glm::vec3 body_pos = a.pos;
+    float     body_yaw = a.yaw;
+    bool      lying    = false;
+    bool      seated   = false;
+    if (!a.walking) {
+        const Anchor an = furnitureAnchor(p, st, act);
+        if (an.kind != kAnchorNone) {
+            body_pos = an.pos;
+            body_yaw = an.yaw;
+            lying    = (an.kind == kAnchorBed);
+            seated   = (an.kind == kAnchorSeat);
+        }
     }
 
     const float s = p.height / 1.75f;
@@ -1448,7 +1884,13 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
     glm::vec4 col(dutyColor(p.duty), 0.12f);
 
     const float swing = std::sin(a.phase);
-    float root_y = a.pos.y;
+    // Per-person offset on the shared real-time pose clock, so two
+    // neighbours standing in the same doorway are not one puppet
+    // mirrored.  0.7315 is just an irrational-ish stride through the
+    // id space; the offset is scaled by each frequency below, which
+    // keeps the 8*pi wrap seamless for every half-integer rate.
+    const float anim_phase = anim_t_ + float(pid_i) * 0.7315f;
+    float root_y = body_pos.y;
     float torso_pitch = 0.0f;
     float leg_l = -0.0f, leg_r = 0.0f, arm_l = 0.0f, arm_r = 0.0f;
     bool sitting = false;
@@ -1460,14 +1902,47 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         arm_r = swing * 0.45f;
         root_y += std::abs(std::cos(a.phase)) * 0.03f * s;
         break;
+    case kActSleepish:
+        if (lying) {
+            // LYING DOWN.  R below is rotY(yaw) * rotX(pitch) applied
+            // about the ROOT, which sits between the feet — so a
+            // quarter turn of pitch tips the whole figure flat, on its
+            // back, extending from the root toward its head.
+            // furnitureAnchor put the root at the foot of the mattress
+            // exactly this reason.  Limbs stay straight; the shared
+            // breath below is the only motion.
+            torso_pitch = -1.5707963f;
+            arm_l = arm_r = 0.0f;
+            leg_l = leg_r = 0.0f;
+            // The quarter turn also stands the torso's DEPTH on end:
+            // local +Z (half-extent 0.11) becomes world up, so the
+            // body's centreline has to rise by that much or half the
+            // sleeper is inside the mattress.
+            root_y += 0.12f * s;
+        } else {
+            // No bed in this house — dozing upright, the old behaviour.
+            arm_l = arm_r = 0.04f * std::sin(anim_phase * 0.5f);
+        }
+        break;
     case kActSit:
     case kActDeskWork:
-        sitting = true;
-        leg_l = leg_r = -1.45f;        // thighs forward
-        arm_l = arm_r = act == kActDeskWork ? -0.9f : -0.4f;
+        if (seated) {
+            sitting = true;
+            leg_l = leg_r = -1.45f;    // thighs forward
+            arm_l = arm_r = act == kActDeskWork ? -0.9f : -0.4f;
+        } else {
+            // NOTHING TO SIT ON.  The pose used to be unconditional, so
+            // a person whose room had no free chair — or none at all —
+            // was drawn folded into a sitting shape in mid-air, which
+            // is the single most conspicuous thing this system did.  A
+            // figure standing where it should be sitting is a modelling
+            // shortfall; a figure sitting on nothing is a bug, and only
+            // one of the two reads as a mistake.
+            arm_l = arm_r = 0.10f * std::sin(anim_phase * 0.5f);
+        }
         break;
     case kActCook:
-        arm_r = -1.1f + 0.25f * std::sin(clock_min_ * 4.0f +
+        arm_r = -1.1f + 0.25f * std::sin(anim_t_ * 4.0f +
                                          float(pid_i));
         arm_l = -0.5f;
         torso_pitch = 0.12f;
@@ -1478,28 +1953,46 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         break;
     case kActCare:
         // rounds: slow sway + attending arm
-        arm_l = -0.7f + 0.2f * std::sin(clock_min_ * 2.0f);
+        arm_l = -0.7f + 0.2f * std::sin(anim_phase * 2.0f);
         torso_pitch = 0.16f;
         break;
     case kActPlay:
-        arm_l = std::sin(clock_min_ * 5.0f + pid_i) * 0.8f;
-        arm_r = -std::sin(clock_min_ * 5.0f + pid_i) * 0.8f;
+        arm_l = std::sin(anim_t_ * 5.0f + float(pid_i)) * 0.8f;
+        arm_r = -std::sin(anim_t_ * 5.0f + float(pid_i)) * 0.8f;
         break;
-    default:
-        arm_l = arm_r = 0.06f * std::sin(clock_min_ * 1.5f +
-                                         float(pid_i));
+    default: {
+        // STANDING IDLE.  A 0.06 rad arm sway was the whole of it, and
+        // on a box figure that is a 3 cm displacement nobody reads as
+        // motion — hence "they don't move at all" even when the sim is
+        // ticking.  Give it a slow weight shift instead, at an
+        // amplitude that survives being seen from ten metres.
+        arm_l = arm_r = 0.10f * std::sin(anim_phase * 0.5f);
         break;
+    }
+    }
+    // Everyone who is not WALKING still breathes: a small torso pitch
+    // and root rise, ~14 cycles a minute, desynchronized per person so
+    // a street does not inhale in unison.  Without it a seated desk
+    // worker, a browsing shopper and a sleeper are all mannequins —
+    // the walk cycle was the only motion this system had.
+    if (act != kActWalk) {
+        const float br = std::sin(anim_phase * 1.5f);
+        // A sleeper's breath is the RISE only: adding it to the pitch
+        // would rock a flat body end over end about its feet, which at
+        // 1.7 m of lever arm is a visible see-saw rather than a breath.
+        if (!lying) torso_pitch += 0.015f * br;
+        root_y += 0.008f * s * br;
     }
     if (sitting) root_y -= 0.42f * s;
 
     const glm::mat4 R =
-        glm::rotate(glm::mat4(1.0f), a.yaw, glm::vec3(0, 1, 0)) *
+        glm::rotate(glm::mat4(1.0f), body_yaw, glm::vec3(0, 1, 0)) *
         glm::rotate(glm::mat4(1.0f), torso_pitch, glm::vec3(1, 0, 0));
     auto part = [&](glm::vec3 centre, glm::vec3 half, float pivot_rot,
                     glm::vec3 pivot) {
         glm::mat4 M = glm::translate(glm::mat4(1.0f),
-                                     glm::vec3(a.pos.x, root_y,
-                                               a.pos.z)) * R;
+                                     glm::vec3(body_pos.x, root_y,
+                                               body_pos.z)) * R;
         if (pivot_rot != 0.0f) {
             M = M * glm::translate(glm::mat4(1.0f), pivot) *
                 glm::rotate(glm::mat4(1.0f), pivot_rot,
@@ -1545,6 +2038,43 @@ void CitizenSystem::draw(
     const glm::uvec2& buffer_size) {
     if (!loaded_ || frame_parts_.empty() || !s_pipeline_) return;
     if (!color_view || !depth_view) return;
+    if (!s_device_) return;
+    // ── UPLOAD THE INSTANCE STREAM ──────────────────────────────────
+    // Grown in powers of two and never shrunk: the crowd in view swings
+    // frame to frame as the camera turns, and reallocating a
+    // multi-megabyte buffer on every swing would cost more than the
+    // headroom it reclaims.  HOST_VISIBLE | HOST_COHERENT so the fill
+    // is a memcpy with no staging copy and no barrier.
+    {
+        const uint32_t need = uint32_t(frame_parts_.size());
+        if (!s_inst_buf_ || need > s_inst_capacity_) {
+            uint32_t cap = s_inst_capacity_ ? s_inst_capacity_ : 4096u;
+            while (cap < need) cap *= 2u;
+            if (s_inst_buf_) s_inst_buf_->destroy(s_device_);
+            s_inst_buf_ = std::make_shared<er::BufferInfo>();
+            er::Helper::createBuffer(
+                s_device_,
+                SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT,
+                                TRANSFER_DST_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0,
+                s_inst_buf_->buffer,
+                s_inst_buf_->memory,
+                std::source_location::current(),
+                uint64_t(cap) * sizeof(PartInstance),
+                nullptr);
+            s_inst_capacity_ = cap;
+            std::cout << "[citizen] instance buffer -> " << cap
+                      << " parts ("
+                      << (uint64_t(cap) * sizeof(PartInstance)) / 1024
+                      << " KiB)" << std::endl;
+        }
+        s_device_->updateBufferMemory(
+            s_inst_buf_->memory,
+            uint64_t(need) * sizeof(PartInstance),
+            frame_parts_.data());
+    }
     if (!s_pipeline_layout_ || !s_cube_pos_ || !s_cube_nrm_ ||
         !s_cube_idx_) {
         return;
@@ -1605,20 +2135,18 @@ void CitizenSystem::draw(
     cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
                                 s_pipeline_layout_, desc_sets);
     std::vector<std::shared_ptr<er::Buffer>> vbs = {
-        s_cube_pos_->buffer, s_cube_nrm_->buffer};
-    std::vector<uint64_t> offs = {0, 0};
+        s_cube_pos_->buffer, s_cube_nrm_->buffer,
+        s_inst_buf_->buffer};
+    std::vector<uint64_t> offs = {0, 0, 0};
     cmd_buf->bindVertexBuffers(0, vbs, offs);
     cmd_buf->bindIndexBuffer(s_cube_idx_->buffer, 0,
                              er::IndexType::UINT32);
-    for (const auto& part : frame_parts_) {
-        glsl::CitizenDrawParams params{};
-        params.transform = part.xform;
-        params.color = part.color;
-        cmd_buf->pushConstants(
-            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
-            s_pipeline_layout_, &params, sizeof(params));
-        cmd_buf->drawIndexed(s_cube_index_count_);
-    }
+    // ONE CALL FOR THE WHOLE TOWN.  This was a pushConstants and a
+    // drawIndexed per box, which is what actually capped the visible
+    // population: the cost was never the 12 triangles of a box, it was
+    // the draw call in front of them.
+    cmd_buf->drawIndexed(s_cube_index_count_,
+                         uint32_t(frame_parts_.size()));
     cmd_buf->endDynamicRendering();
 }
 

@@ -2,8 +2,34 @@
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
 
-// ─── Apply SSAO to HDR color buffer ───────────────────────────
-// Multiplies the blurred AO texture into the color buffer in-place.
+// ─── Apply SSAO to the scene colour buffer ────────────────────
+// Multiplies the blurred AO texture into the colour buffer in-place.
+//
+// ── TWO CORRECTIONS THIS PASS CARRIES ────────────────────────────────
+// This used to be `color.rgb *= ao`, which is wrong twice over and is
+// most of why shadowed ground read as near-black.
+//
+// 1. AO IS AN AMBIENT-ONLY TERM.  A pixel's direct sunlight is already
+//    occlusion-tested per pixel by the shadow map; darkening it again
+//    with a screen-space occlusion estimate double-counts.  The
+//    deferred resolve knows this — it folds `rt_ao` into the ambient
+//    term alone and only bleeds RT_AO_DIRECT_FRACTION of it into the
+//    direct one.  This pass runs on the composited colour and cannot
+//    separate the two, so it bounds the darkening instead: kAoFloor is
+//    the least a fully-occluded pixel may keep.  A pixel that is
+//    ambient-only (i.e. in shadow) is exactly the one this used to
+//    crush, because there was nothing else in it to survive the
+//    multiply.
+//
+// 2. THE BUFFER IS ALREADY TONEMAPPED.  Every writer calls
+//    sceneTonemap() before it stores, so what is here is a
+//    gamma-encoded display value, not radiance.  Multiplying a
+//    gamma-encoded 0.4 by 0.5 lands at linear 0.03, where the correct
+//    linear-space multiply lands at 0.066 — AO came out roughly twice
+//    as dark as intended, and worst on the dimmest pixels.  Raising ao
+//    to 1/2.2 makes the multiply equivalent to a linear-space one
+//    (exact for the gamma leg; the ACES shoulder above it only ever
+//    makes the remaining error smaller, because it compresses).
 //
 // When debug_mode == DEBUG_RENDER_MODE_SSAO, instead of modulating the
 // existing color we OVERWRITE it with vec3(ao) so the screen shows the
@@ -62,7 +88,16 @@ void main() {
         return;
     }
 
-    ao = mix(1.0, ao, ao_strength);
+    // Least a fully-occluded pixel may keep.  Real ambient occlusion
+    // never removes ALL indirect light — a crevice still sees a slice
+    // of sky — and this pass is darkening the composited colour, so a
+    // hard zero here takes the direct term with it.
+    const float kAoFloor = 0.35;
+
+    ao = mix(1.0, max(ao, kAoFloor), ao_strength);
+    // Linear-space equivalent of the multiply, applied to a
+    // gamma-encoded buffer.  See correction 2 in the header comment.
+    ao = pow(ao, 1.0 / 2.2);
 
     vec4 color = imageLoad(color_buf, coords);
     color.rgb *= ao;

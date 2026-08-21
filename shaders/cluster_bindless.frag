@@ -616,8 +616,27 @@ void main() {
     // frame is oriented correctly for double-sided materials.
     // Backface culling is disabled for the cluster pipeline.
     vec3 N = normalize(v_normal);
-    if ((mat_flags & BINDLESS_MAT_DOUBLE_SIDED) != 0 && !gl_FrontFacing) {
+    // ── WHICH SIDE OF THE LEAF IS THIS? ─────────────────────────────
+    // A leaf is a thin two-sided slab and both of its faces get drawn;
+    // which one a fragment belongs to decides its albedo (waxy top vs
+    // pale underside), how much sheen it carries, and — through the
+    // flipped normal — where the transmitted light has to come from.
+    // FOLIAGE is treated as two-sided whether or not the source marked
+    // the primitive double_sided: a leaf card whose exporter forgot the
+    // flag was shading its back faces with an inward normal, which is
+    // black under a sun that is plainly hitting it.
+    bool is_foliage  = (mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0;
+    float leaf_front = gl_FrontFacing ? 1.0 : 0.0;
+    if (((mat_flags & BINDLESS_MAT_DOUBLE_SIDED) != 0 || is_foliage) &&
+        !gl_FrontFacing) {
         N = -N;
+    }
+    // The abaxial (under) face is paler and less saturated than the
+    // cuticle side.  Applied HERE, before both the G-buffer write and
+    // the forward lighting below, so deferred and forward agree and
+    // neither has to know about leaf sides again.
+    if (is_foliage && leaf_front < 0.5) {
+        albedo = leafBacksideAlbedo(albedo);
     }
     // Stash the un-perturbed (geometric) normal before the normal map below
     // overwrites N.  Used by the GEOMETRIC_NORMAL debug visualisation; if we
@@ -744,9 +763,16 @@ void main() {
     // masonry/bark sits ~0.9+ and these ARE those materials.
     float gbuf_rough = ((mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0)
                            ? 0.95 : 0.92;
+    // .w now carries the leaf SIDE as well as the leaf flag:
+    //   0.0  not foliage
+    //   0.5  foliage, back (abaxial) face
+    //   1.0  foliage, front (adaxial) face
+    // An RGBA8 target stores all three exactly (0 / 128 / 255), and the
+    // resolve tests > 0.25 for "is a leaf" and > 0.75 for "front", so
+    // neither threshold sits on a quantisation boundary.
     out_normal_rough   = vec4(
         octEncodeDir(N), gbuf_rough,
-        (mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0 ? 1.0 : 0.0);
+        is_foliage ? mix(0.5, 1.0, leaf_front) : 0.0);
     // Slot 2 was emissive.rgb + metallic.a, but cluster materials don't
     // author either yet — both default to 0 in the deferred resolve.
     // Repurpose .rg for the octahedral-encoded GEOMETRIC normal so the
@@ -825,6 +851,21 @@ void main() {
     float spec = pow(max(dot(N, H), 0.0), 32.0) * shad;
     vec3  specular = light_col * (0.05 * spec / M_PI);
 
+    // Leaves: the cuticle side carries a sheen, the underside almost
+    // none.  Scaling the reflected specular by the side is the other
+    // half of two-sided shading — without it a canopy seen from below
+    // has the same hot highlight as the one seen from above, which is
+    // what made undersides read as plastic.
+    if (is_foliage) {
+        specular *= leafSpecularSide(leaf_front);
+    }
+
+    // Ground-bounce fill — the same term the deferred resolve adds, so a
+    // freshly placed mesh shades identically before and after its
+    // clusters finalize into the G-buffer path.  No RT-GI gate here:
+    // this branch never runs with GI driving the ambient.
+    ambient += albedo * groundBounceIrradiance(N, L, light_col);
+
     vec3 color = ambient + diffuse + specular;
 
     // Thin-leaf subsurface scattering — sunlight transmitted through
@@ -833,7 +874,12 @@ void main() {
     // and after its clusters finalize into the deferred G-buffer path
     // (deferred_resolve.comp applies the identical term via the
     // normal_rough.w flag).
-    if ((mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0) {
+    // Two lighting problems, combined here: `diffuse`/`specular` above
+    // solved the REFLECTED one against the view-side normal N, and
+    // foliageTranslucency solves the TRANSMITTED one against -N — the
+    // light landing on the face the viewer cannot see, coming through
+    // the slab tinted by the pigment it crossed.
+    if (is_foliage) {
         color += foliageTranslucency(N, V, L, albedo, light_col, shad);
     }
 
