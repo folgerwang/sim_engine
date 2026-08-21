@@ -26,11 +26,17 @@ namespace {
 // ── enums kept as ints in the structs so the header stays light ──────
 enum Activity {
     kActIdle = 0, kActWalk, kActSit, kActCook, kActBrowse, kActCare,
-    kActDeskWork, kActPlay, kActSleepish
+    kActDeskWork, kActPlay, kActSleepish,
+    // Washing up at the kitchen sink.  APPENDED, not inserted: these
+    // values are what activityOf() maps city_sim's schedule strings
+    // onto, and renumbering them would silently re-label every
+    // activity in every existing map.
+    kActWash
 };
 // Which piece of furniture a home anchor resolved to.  kAnchorNone
 // is "this house has none of it" — the caller falls back.
-enum AnchorKind { kAnchorNone = 0, kAnchorBed, kAnchorStove, kAnchorSeat };
+enum AnchorKind { kAnchorNone = 0, kAnchorBed, kAnchorStove, kAnchorSeat,
+                  kAnchorSink };
 enum Duty {
     kDutyResident = 0, kDutyDoctor, kDutyNurse, kDutyTeacher,
     kDutyOfficial, kDutyPolice, kDutyFire, kDutyChef, kDutyWaiter,
@@ -272,6 +278,35 @@ constexpr float kBedYawFix  = 0.0f;
 // Where a cook stands relative to the cooktop: out in front of it by
 // this much, turned back to face it.
 constexpr float kStoveStand = 0.75f;
+// Where someone washing up stands relative to the sink, and which way
+// they face: the same arrangement as the cooktop — out in front of it,
+// turned back into it.
+constexpr float kSinkStand = 0.70f;
+// Above this many buildings, furniture is not binned to buildings at
+// all — see the note in harvestFurniture.  A city-json district is
+// ~15 buildings; the synthesized path promotes ~10k houses and does
+// not need the pass.
+constexpr size_t kCivicScanMax = 512;
+// Rooms per house are single digits; the next-hop matrix is rooms^2
+// int16s, so this bounds it at 512 B per archetype and refuses to build
+// one for anything pathological rather than quietly eating memory.
+constexpr int kNavMaxRooms = 24;
+// How near a waypoint counts as reached.  A doorway is ~0.9 m wide and
+// a box person is 0.4 m across, so half a metre is "through it".
+constexpr float kNavReachM = 0.55f;
+// How far past a doorway the aim point sits — inside the room being
+// ENTERED, so reaching it means having crossed the threshold rather
+// than having arrived at it.
+constexpr float kNavDoorPushM = 0.7f;
+// How far outside its room a walker may stray before its carried route
+// room is dropped and re-derived.  Big enough to absorb a walk that
+// clips a corner or a crowd shove, small enough that a person moved to
+// another building resyncs on the first tick there.
+constexpr float kNavStickM = 1.5f;
+// How far from a civic building's centre a placed object still counts
+// as being inside it.  Sized for the district's largest plate (the
+// 96 x 54 m mall) rather than a house.
+constexpr float kCivicBindR = 70.0f;
 // If seated citizens face AWAY from their table, the chair model's yaw
 // points out of the seat rather than into it: put half a turn
 // (3.14159265f) here and every chair in the map turns round.  Same
@@ -425,11 +460,16 @@ void CitizenSystem::destroyStaticMembers(
 }
 
 bool CitizenSystem::loadCity(const std::string& city_json_path,
-                             const std::string& world_json_path) {
+                             const std::string& world_json_path,
+                             const std::string& indoor_json_path) {
     using nlohmann::json;
     loaded_ = false;
     houses_.clear();
     house_school_seats_.clear();
+    graphs_.clear();
+    house_graph_.clear();
+    house_yaw_.clear();
+    house_scale_.clear();
     buildings_.clear();
     persons_.clear();
     sim_.clear();
@@ -470,11 +510,42 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
         }
         const auto& hs = world.at("instances").at("houses");
         const auto& t = hs.at("t");
-        size_t n = hs.at("yaw").size();
+        const auto& yw = hs.at("yaw");
+        size_t n = yw.size();
         houses_.reserve(n);
+        house_yaw_.reserve(n);
+        house_scale_.reserve(n);
         for (size_t i = 0; i < n; ++i) {
             houses_.emplace_back(float(t[3 * i]), float(t[3 * i + 1]),
                                  float(t[3 * i + 2]));
+            house_yaw_.push_back(float(yw[i]));
+        }
+        // Per-axis scale, needed because the indoor graph is in
+        // ARCHETYPE-local metres and a placed house is stretched to the
+        // footprint it was traced from — routing a stretched house with
+        // unscaled room rectangles walks people into their own walls.
+        if (hs.contains("s") && hs.at("s").size() == n * 3) {
+            const auto& sc = hs.at("s");
+            for (size_t i = 0; i < n; ++i) {
+                house_scale_.emplace_back(float(sc[3 * i]),
+                                          float(sc[3 * i + 2]));
+            }
+        } else {
+            house_scale_.assign(n, glm::vec2(1.0f));
+        }
+        // Which archetype each house is an instance of — the key the
+        // indoor graphs are filed under.
+        std::vector<std::string> node_names;
+        std::vector<int> node_idx;
+        if (hs.contains("nodes") && hs.contains("ni")) {
+            for (const auto& nm : hs.at("nodes")) {
+                node_names.push_back(nm.get<std::string>());
+            }
+            const auto& ni = hs.at("ni");
+            node_idx.reserve(ni.size());
+            for (size_t i = 0; i < ni.size(); ++i) {
+                node_idx.push_back(int(ni[i].get<int>()));
+            }
         }
         // ── REAL SCHOOLS ────────────────────────────────────────────
         // terrain_pcg picks a campus of house shells per catchment,
@@ -604,6 +675,11 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
         }
         }   // if (have_city)
 
+        // Indoor route graphs, if the map has them.  After the houses
+        // (it indexes by house) and before anyone is placed.
+        if (!indoor_json_path.empty()) {
+            loadIndoor(indoor_json_path, node_names, node_idx);
+        }
         // Houses are the obstacle field for walk steering.
         buildHouseGrid();
         // ...and, through that same grid, the owner of every bed,
@@ -818,7 +894,10 @@ void CitizenSystem::synthesizeResidents() {
         // so nobody lives here — and letting a household move in would
         // put four people asleep on a classroom floor and, worse, count
         // its own children toward the catchment it exists to serve.
-        if (real_schools && house_school_seats_[i] > 0) continue;
+        if (real_schools && i < house_school_seats_.size() &&
+                house_school_seats_[i] > 0) {
+            continue;
+        }
         const glm::vec3& home = houses_[i];
         // Household size, drawn per HOUSE and uniform over
         // [kHouseholdMin, kHouseholdMax].
@@ -1009,6 +1088,11 @@ void CitizenSystem::synthesizeResidents() {
                 // cooking from mid-afternoon until bed.
                 step(jit(std::max(ret + 100.0f, 18.5f * 60.0f),
                          60.0f, 0x104u),               kActCook,     -1),
+                // Washing up after dinner.  This is the ONLY thing that
+                // ever sends anyone to a kitchen sink, so without it
+                // those four thousand basins are scenery.
+                step(jit(std::max(ret + 145.0f, 19.25f * 60.0f),
+                         60.0f, 0x106u),               kActWash,     -1),
                 step(jit(bed,    50.0f, 0x105u),        kActSleepish, -1),
             };
             // Weekend: a lie-in, an errand or a stroll, home for the
@@ -1022,6 +1106,7 @@ void CitizenSystem::synthesizeResidents() {
                 step(jit(15.00f * 60.0f, 300.0f, 0x203u), kActWalk,   -2),
                 step(jit(17.50f * 60.0f, 240.0f, 0x204u), home_act,   -1),
                 step(jit(19.50f * 60.0f, 120.0f, 0x205u), kActCook,   -1),
+                step(jit(20.25f * 60.0f, 120.0f, 0x208u), kActWash,   -1),
                 step(jit(22.50f * 60.0f, 60.0f, 0x206u),  kActSleepish, -1),
             };
             // Overtime plus jitter can push an evening hinge past
@@ -1226,11 +1311,371 @@ glm::vec2 CitizenSystem::steerAroundHouses(const glm::vec2& pos,
     return out / L;
 }
 
+bool CitizenSystem::loadIndoor(const std::string& path,
+                               const std::vector<std::string>& house_node,
+                               const std::vector<int>& house_node_idx) {
+    using nlohmann::json;
+    house_graph_.assign(houses_.size(), -1);
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        std::cout << "[citizen] no indoor route graph (" << path
+                  << ") — citizens walk straight lines indoors"
+                  << std::endl;
+        return false;
+    }
+    try {
+        json doc;
+        {
+            std::ifstream f(path);
+            f >> doc;
+        }
+        const auto& arch = doc.at("archetypes");
+        std::unordered_map<std::string, int> by_name;
+        for (auto it = arch.begin(); it != arch.end(); ++it) {
+            IndoorGraph g;
+            for (const auto& r : it.value().at("rooms")) {
+                NavRoom nr;
+                nr.c = glm::vec2(float(r.at("c")[0]), float(r.at("c")[1]));
+                nr.hw = float(r.at("hw"));
+                nr.hd = float(r.at("hd"));
+                nr.yaw = float(r.at("yaw"));
+                nr.storey = int(r.value("storey", 0));
+                g.rooms.push_back(nr);
+            }
+            if (g.rooms.size() > size_t(kNavMaxRooms)) continue;
+            for (const auto& dj : it.value().at("doors")) {
+                NavDoor nd;
+                nd.p = glm::vec2(float(dj.at("p")[0]),
+                                 float(dj.at("p")[1]));
+                nd.storey = int(dj.value("storey", 0));
+                nd.a = int(dj.at("rooms")[0]);
+                nd.b = int(dj.at("rooms")[1]);
+                if (nd.a < 0 || nd.b < 0) {
+                    g.street.push_back(int(g.doors.size()));
+                }
+                g.doors.push_back(nd);
+            }
+            // ── NEXT-HOP MATRIX ─────────────────────────────────────
+            // One BFS per room over the doorway graph, storing only the
+            // FIRST door of each shortest route.  A citizen then never
+            // searches: it looks up next_[here * n + there], walks to
+            // that doorway, and repeats from the room it lands in.  The
+            // route is implicit in the table and cannot go stale.
+            const int nr = int(g.rooms.size());
+            g.next_.assign(size_t(nr) * size_t(nr), int16_t(-1));
+            g.dist_.assign(size_t(nr) * size_t(nr), int16_t(-1));
+            // NOT `adj(size_t(nr))`: `T v(size_t(nr));` is the vexing
+            // parse — `size_t(nr)` reads as a parameter declaration, so
+            // the line declares a FUNCTION and every later subscript of
+            // it fails.  A named size sidesteps it for all three.
+            const size_t nrz = static_cast<size_t>(nr);
+            std::vector<std::vector<glm::ivec2>> adj(nrz);
+            for (size_t di = 0; di < g.doors.size(); ++di) {
+                const NavDoor& nd = g.doors[di];
+                if (nd.a >= 0 && nd.b >= 0 && nd.a < nr && nd.b < nr) {
+                    adj[size_t(nd.a)].push_back(
+                        glm::ivec2(int(di), nd.b));
+                    adj[size_t(nd.b)].push_back(
+                        glm::ivec2(int(di), nd.a));
+                }
+            }
+            std::vector<int> prev_door(nrz);
+            std::vector<int> prev_room(nrz);
+            for (int src = 0; src < nr; ++src) {
+                std::fill(prev_door.begin(), prev_door.end(), -1);
+                std::fill(prev_room.begin(), prev_room.end(), -1);
+                std::vector<int> q{src};
+                std::vector<uint8_t> seen(size_t(nr), 0);
+                std::vector<int> hops(size_t(nr), 0);
+                seen[size_t(src)] = 1;
+                for (size_t qi = 0; qi < q.size(); ++qi) {
+                    const int cur = q[qi];
+                    for (const glm::ivec2& e : adj[size_t(cur)]) {
+                        if (seen[size_t(e.y)]) continue;
+                        seen[size_t(e.y)] = 1;
+                        prev_door[size_t(e.y)] = e.x;
+                        prev_room[size_t(e.y)] = cur;
+                        hops[size_t(e.y)] = hops[size_t(cur)] + 1;
+                        q.push_back(e.y);
+                    }
+                }
+                g.dist_[size_t(src) * size_t(nr) + size_t(src)] = 0;
+                // Walk each destination back to src; the last door on
+                // that walk is the first one to take from src.
+                for (int dst = 0; dst < nr; ++dst) {
+                    if (dst == src || !seen[size_t(dst)]) continue;
+                    g.dist_[size_t(src) * size_t(nr) + size_t(dst)] =
+                        int16_t(hops[size_t(dst)]);
+                    int r = dst, dr = prev_door[size_t(dst)];
+                    while (prev_room[size_t(r)] != src &&
+                           prev_room[size_t(r)] >= 0) {
+                        r = prev_room[size_t(r)];
+                        dr = prev_door[size_t(r)];
+                    }
+                    g.next_[size_t(src) * size_t(nr) + size_t(dst)] =
+                        int16_t(dr);
+                }
+            }
+            by_name[it.key()] = int(graphs_.size());
+            graphs_.push_back(std::move(g));
+        }
+        size_t bound = 0;
+        for (size_t i = 0; i < houses_.size(); ++i) {
+            if (i >= house_node_idx.size()) break;
+            const int ni = house_node_idx[i];
+            if (ni < 0 || ni >= int(house_node.size())) continue;
+            auto bit = by_name.find(house_node[size_t(ni)]);
+            if (bit == by_name.end()) continue;
+            house_graph_[i] = bit->second;
+            ++bound;
+        }
+        std::cout << "[citizen] indoor routes: " << graphs_.size()
+                  << " archetype graph(s), " << bound << " of "
+                  << houses_.size() << " houses bound" << std::endl;
+        return bound > 0;
+    } catch (const std::exception& e) {
+        std::cout << "[citizen] indoor route graph unusable ("
+                  << e.what() << ") — straight lines indoors"
+                  << std::endl;
+        graphs_.clear();
+        house_graph_.assign(houses_.size(), -1);
+        return false;
+    }
+}
+
+glm::vec2 CitizenSystem::worldToLocal(int hi, const glm::vec2& w) const {
+    const glm::vec3& h = houses_[size_t(hi)];
+    const float yaw = house_yaw_[size_t(hi)];
+    const glm::vec2 s = house_scale_[size_t(hi)];
+    const float dx = w.x - h.x, dz = w.y - h.z;
+    // Inverse of localToWorld below.
+    const float ca = std::cos(yaw), sa = std::sin(yaw);
+    const float lx = dx * ca - dz * sa;
+    const float lz = dx * sa + dz * ca;
+    return glm::vec2(lx / std::max(s.x, 1e-3f),
+                     lz / std::max(s.y, 1e-3f));
+}
+
+glm::vec2 CitizenSystem::localToWorld(int hi, const glm::vec2& l) const {
+    const glm::vec3& h = houses_[size_t(hi)];
+    const float yaw = house_yaw_[size_t(hi)];
+    const glm::vec2 s = house_scale_[size_t(hi)];
+    const float sx = l.x * s.x, sz = l.y * s.y;
+    const float ca = std::cos(yaw), sa = std::sin(yaw);
+    return glm::vec2(h.x + sx * ca + sz * sa,
+                     h.z - sx * sa + sz * ca);
+}
+
+int CitizenSystem::roomAt(int hi, const glm::vec2& local,
+                          int storey, int toward) const {
+    if (hi < 0 || hi >= int(house_graph_.size())) return -1;
+    const int gi = house_graph_[size_t(hi)];
+    if (gi < 0) return -1;
+    const IndoorGraph& g = graphs_[size_t(gi)];
+    // ── ROOMS OVERLAP ───────────────────────────────────────────────
+    // Where two wings meet, the floor belongs to both of their room
+    // rectangles, and taking whichever came first in the list gave the
+    // walker a room it was leaving rather than the one it was in — the
+    // aim point past the doorway then landed back in the first room
+    // and the walk stalled on the threshold.  When a destination is
+    // known, the containing room NEARER IT in the doorway graph is the
+    // one that makes the route shorter, and it is the right answer for
+    // both halves of the overlap.  Ties, and the no-destination case,
+    // go to the room the point is deepest inside.
+    const int n = int(g.rooms.size());
+    int best = -1;
+    int best_d = 0;
+    float best_in = 0.0f;
+    for (size_t i = 0; i < g.rooms.size(); ++i) {
+        const NavRoom& r = g.rooms[i];
+        if (r.storey != storey) continue;
+        const float ca = std::cos(-r.yaw), sa = std::sin(-r.yaw);
+        const float ex = local.x - r.c.x, ez = local.y - r.c.y;
+        const float lu = std::abs(ex * ca - ez * sa);
+        const float lv = std::abs(ex * sa + ez * ca);
+        const float inside = std::min(r.hw - lu, r.hd - lv);
+        if (inside < 0.0f) continue;
+        int d = 0;
+        if (toward >= 0 && toward < n && !g.dist_.empty()) {
+            const int16_t h =
+                g.dist_[size_t(i) * size_t(n) + size_t(toward)];
+            d = (h < 0) ? 9999 : int(h);
+        }
+        if (best < 0 || d < best_d || (d == best_d && inside > best_in)) {
+            best = int(i);
+            best_d = d;
+            best_in = inside;
+        }
+    }
+    return best;
+}
+
+int CitizenSystem::anchorHouse(const Person& p, const Step& s) const {
+    if (s.place == -1) return p.house;              // home
+    if (s.place >= 0 && s.place < int(buildings_.size())) {
+        return buildings_[size_t(s.place)].house;   // -1 when civic
+    }
+    return -1;                                      // -2: outdoors
+}
+
+namespace {
+// The aim point for a doorway: the opening itself, pushed into the
+// room being entered.  Aiming AT the threshold is reached while still
+// in the room you are leaving, so the same doorway resolves again and
+// the walk stalls in the door.
+glm::vec2 doorAim(const glm::vec2& dp, const glm::vec2& far_c) {
+    const glm::vec2 fwd = far_c - dp;
+    const float fl = glm::length(fwd);
+    return (fl > 1e-3f) ? (dp + (fwd / fl) * kNavDoorPushM) : dp;
+}
+}  // namespace
+
+bool CitizenSystem::indoorWaypoint(int hi, const glm::vec3& pos_world,
+                                   const glm::vec3& dst_world,
+                                   int16_t& nav_room,
+                                   glm::vec3& out_wp) const {
+    if (hi < 0 || hi >= int(house_graph_.size())) { nav_room = -1;
+                                                    return false; }
+    const int gi = house_graph_[size_t(hi)];
+    if (gi < 0) { nav_room = -1; return false; }
+    const IndoorGraph& g = graphs_[size_t(gi)];
+    if (g.rooms.empty()) { nav_room = -1; return false; }
+    const int n = int(g.rooms.size());
+    const glm::vec2 lp = worldToLocal(hi, glm::vec2(pos_world.x,
+                                                    pos_world.z));
+    const glm::vec2 ld = worldToLocal(hi, glm::vec2(dst_world.x,
+                                                    dst_world.z));
+    // Which storey the destination is on, from its height over the
+    // house base.  Rooms are filed per storey and a ground-floor route
+    // through an upstairs room is nonsense.
+    const float rel_y = dst_world.y - houses_[size_t(hi)].y;
+    const int dst_st = int(std::max(0.0f, rel_y) / 3.0f + 0.5f);
+    const int to = roomAt(hi, ld, dst_st);
+    if (to < 0) { nav_room = -1; return false; }   // target is nowhere
+                                                   // we have a room for
+    // ── THE ROUTE ROOM IS CARRIED, NOT RE-DERIVED ───────────────────
+    // Re-deriving it from the position every tick is what made the
+    // walk flip at every wall: the two rooms either side of a doorway
+    // each aim the walker back through it.  So the room is remembered
+    // and only ever ADVANCES — to the far side of a doorway, once the
+    // walker has actually reached the aim point 0.7 m inside it.  It
+    // is dropped only when the walker is nowhere near it any more,
+    // which is what a change of building or a respawn looks like.
+    if (nav_room >= 0) {
+        if (nav_room >= n || g.rooms[size_t(nav_room)].storey != dst_st) {
+            nav_room = -1;
+        } else {
+            const NavRoom& r = g.rooms[size_t(nav_room)];
+            const float ca = std::cos(-r.yaw), sa = std::sin(-r.yaw);
+            const float ex = lp.x - r.c.x, ez = lp.y - r.c.y;
+            const float gu = std::max(0.0f,
+                                      std::abs(ex * ca - ez * sa) - r.hw);
+            const float gv = std::max(0.0f,
+                                      std::abs(ex * sa + ez * ca) - r.hd);
+            if (gu * gu + gv * gv > kNavStickM * kNavStickM) nav_room = -1;
+        }
+    }
+    if (nav_room < 0) {
+        const int cur = roomAt(hi, lp, dst_st, to);
+        if (cur >= 0) {
+            nav_room = int16_t(cur);
+        } else {
+            // NOT IN A ROOM ON THAT STOREY.  Either outside the house —
+            // in which case the way in is a street door, and heading
+            // for the anchor instead is precisely what walks people
+            // through the wall — or on a DIFFERENT storey, where the
+            // route would need the stair and this pass does not yet
+            // use it.  Distinguish them so an upstairs sleeper is not
+            // marched back out of the front door: only route from
+            // outside.
+            for (const NavRoom& r : g.rooms) {
+                const float ca = std::cos(-r.yaw), sa = std::sin(-r.yaw);
+                const float ex = lp.x - r.c.x, ez = lp.y - r.c.y;
+                if (std::abs(ex * ca - ez * sa) <= r.hw &&
+                    std::abs(ex * sa + ez * ca) <= r.hd) {
+                    return false;        // inside, just not on this storey
+                }
+            }
+            // The nearest street door THAT LEADS ANYWHERE USEFUL.  A
+            // house can have several ways in and the closest one is not
+            // always on a path to the room wanted; preferring a door
+            // whose room can actually reach the target costs one table
+            // lookup and avoids entering by a door that then has to be
+            // left again.
+            float best = std::numeric_limits<float>::max();
+            float best_any = std::numeric_limits<float>::max();
+            int door = -1, any_door = -1;
+            for (int di : g.street) {
+                const NavDoor& sd = g.doors[size_t(di)];
+                const int entry = (sd.a >= 0) ? sd.a : sd.b;
+                if (entry < 0) continue;
+                const float d2 = glm::dot(sd.p - lp, sd.p - lp);
+                if (d2 < best_any) { best_any = d2; any_door = di; }
+                const bool useful =
+                    (entry == to) ||
+                    (g.next_[size_t(entry) * size_t(n) + size_t(to)] >= 0);
+                if (useful && d2 < best) { best = d2; door = di; }
+            }
+            if (door < 0) door = any_door;
+            if (door < 0) return false;
+            const NavDoor& nd = g.doors[size_t(door)];
+            const int entry = (nd.a >= 0) ? nd.a : nd.b;
+            const glm::vec2 wp = localToWorld(
+                hi, doorAim(nd.p, g.rooms[size_t(entry)].c));
+            out_wp = glm::vec3(wp.x, dst_world.y, wp.y);
+            return true;                 // still outdoors: nav_room stays -1
+        }
+    }
+    // AIM THROUGH THE OPENING, INTO THE ROOM BEYOND — not at the
+    // threshold, which is reached while still in the room you started
+    // in, and not at the final target, which on a corner lies back
+    // through the room you came from.
+    for (int guard = 0; guard <= n; ++guard) {
+        if (nav_room == int16_t(to)) return false;   // walk straight at it
+        const int door =
+            int(g.next_[size_t(nav_room) * size_t(n) + size_t(to)]);
+        if (door < 0 || door >= int(g.doors.size())) return false;
+        const NavDoor& nd = g.doors[size_t(door)];
+        const int far = (nd.a == nav_room) ? nd.b : nd.a;
+        if (far < 0 || far >= n) return false;
+        const glm::vec2 aim = doorAim(nd.p, g.rooms[size_t(far)].c);
+        if (glm::dot(aim - lp, aim - lp) <= kNavReachM * kNavReachM) {
+            nav_room = int16_t(far);     // arrived: the route advances
+            continue;
+        }
+        const glm::vec2 wp = localToWorld(hi, aim);
+        out_wp = glm::vec3(wp.x, dst_world.y, wp.y);
+        return true;
+    }
+    return false;
+}
+
 void CitizenSystem::harvestFurniture() {
-    beds_.clear();   stoves_.clear();   seats_.clear();
-    house_beds_.assign(houses_.size(), glm::ivec2(0));
-    house_stoves_.assign(houses_.size(), glm::ivec2(0));
-    house_seats_.assign(houses_.size(), glm::ivec2(0));
+    beds_.clear();   stoves_.clear();   seats_.clear();   sinks_.clear();
+    // ── ONE ANCHOR INDEX SPACE: HOUSES, THEN CIVIC BUILDINGS ────────
+    // [0, houses_.size())            a house
+    // [houses_.size(), + buildings_) a city-json civic building
+    //
+    // The district's mall, towers and hospital are NOT houses — the
+    // business centre evicts every house inside its lot — so binning
+    // their furniture to the nearest house finds nothing within the
+    // radius and their shelves, desks and beds stay scenery.  Giving
+    // buildings their own slot in the same table is what lets a shop
+    // worker stand at a real counter.
+    //
+    // Only the CITY-JSON path reaches this: on the synthesized path
+    // buildings_ is still empty here (synthesizeResidents fills it
+    // afterwards) and its buildings are promoted houses anyway, so the
+    // house half already covers them.  The size guard keeps the linear
+    // scan below honest — a city district is a couple of dozen
+    // buildings, the synthesized path is ten thousand.
+    const size_t n_civic =
+        (buildings_.size() <= kCivicScanMax) ? buildings_.size() : 0;
+    const size_t n_slot = houses_.size() + n_civic;
+    house_beds_.assign(n_slot, glm::ivec2(0));
+    house_stoves_.assign(n_slot, glm::ivec2(0));
+    house_seats_.assign(n_slot, glm::ivec2(0));
+    house_sinks_.assign(n_slot, glm::ivec2(0));
     if (houses_.empty()) return;
 
     PcgInstanceRegistry& reg = PcgInstanceRegistry::get();
@@ -1248,7 +1693,19 @@ void CitizenSystem::harvestFurniture() {
     // the walk steering uses (buildHouseGrid runs first).  A bed is
     // metres from its own house and tens of metres from the next, so
     // nearest-centre is unambiguous — no need to know the footprint.
-    auto nearestHouse = [this](const glm::vec3& p) -> int {
+    auto nearestHouse = [this, n_civic](const glm::vec3& p) -> int {
+        // Civic buildings first and by a WIDER radius: a mall's own
+        // shelving is 40 m from its centre and would otherwise bind to
+        // whichever house happens to sit nearest the district edge.
+        int c_best = -1;
+        float c_d2 = kCivicBindR * kCivicBindR;
+        for (size_t b = 0; b < n_civic; ++b) {
+            const float dx = buildings_[b].centre.x - p.x;
+            const float dz = buildings_[b].centre.y - p.z;
+            const float d2 = dx * dx + dz * dz;
+            if (d2 < c_d2) { c_d2 = d2; c_best = int(b); }
+        }
+        if (c_best >= 0) return int(houses_.size()) + c_best;
         const int32_t cx = int32_t(std::floor(p.x / kAvoidCell));
         const int32_t cz = int32_t(std::floor(p.z / kAvoidCell));
         int best = -1;
@@ -1279,19 +1736,19 @@ void CitizenSystem::harvestFurniture() {
         const std::vector<PcgInstanceRecord> recs =
             reg.queryByNodePrefix(prefix, /*category=*/4);
         std::vector<int> owner(recs.size(), -1);
-        std::vector<int> count(houses_.size(), 0);
+        std::vector<int> count(n_slot, 0);
         for (size_t i = 0; i < recs.size(); ++i) {
             const int hi = nearestHouse(recs[i].t);
             owner[i] = hi;
             if (hi >= 0) ++count[size_t(hi)];
         }
         int run = 0;
-        for (size_t h = 0; h < houses_.size(); ++h) {
+        for (size_t h = 0; h < n_slot; ++h) {
             slice[h] = glm::ivec2(run, count[h]);
             run += count[h];
         }
         out.assign(size_t(run), Furniture{});
-        std::vector<int> cursor(houses_.size(), 0);
+        std::vector<int> cursor(n_slot, 0);
         for (size_t i = 0; i < recs.size(); ++i) {
             const int hi = owner[i];
             if (hi < 0) continue;
@@ -1306,8 +1763,10 @@ void CitizenSystem::harvestFurniture() {
     const int nb = harvest("obj_bed",     beds_,   house_beds_);
     const int ns = harvest("obj_cooktop", stoves_, house_stoves_);
     const int nc = harvest("obj_chair",   seats_,  house_seats_);
+    const int nk = harvest("obj_sink",    sinks_,  house_sinks_);
     std::cout << "[citizen] furniture anchors: " << nb << " bed(s), "
-              << ns << " cooktop(s), " << nc << " chair(s) bound to "
+              << ns << " cooktop(s), " << nc << " chair(s), "
+              << nk << " sink(s) bound to "
               << houses_.size() << " house(s)" << std::endl;
 }
 
@@ -1340,13 +1799,19 @@ CitizenSystem::Anchor CitizenSystem::furnitureAnchor(
         house = p.house;
         seat_i = p.hslot;
     } else if (s.place >= 0 && s.place < int(buildings_.size())) {
+        // A promoted house resolves to that house; a city-json civic
+        // building resolves to its OWN slot past the houses (see the
+        // index-space note in harvestFurniture), which is how a person
+        // in the mall or the tower reaches furniture that belongs to no
+        // house at all.
         house = buildings_[size_t(s.place)].house;
+        if (house < 0) house = int(houses_.size()) + s.place;
         // Their counted slot AT THIS building — the same index placePos
         // uses for the arrival scatter, so two people never resolve to
         // one chair while another stands empty.
         seat_i = (s.place == p.shop_b) ? p.shop_slot : p.slot;
     }
-    if (house < 0 || house >= int(houses_.size())) return a;
+    if (house < 0) return a;
     const std::vector<Furniture>*  arr = nullptr;
     const std::vector<glm::ivec2>* sl  = nullptr;
     int kind = kAnchorNone;
@@ -1355,12 +1820,14 @@ CitizenSystem::Anchor CitizenSystem::furnitureAnchor(
                        kind = kAnchorBed;   break;
     case kActCook:     arr = &stoves_; sl = &house_stoves_;
                        kind = kAnchorStove; break;
+    case kActWash:     arr = &sinks_;  sl = &house_sinks_;
+                       kind = kAnchorSink;  break;
     case kActSit:
     case kActDeskWork: arr = &seats_;  sl = &house_seats_;
                        kind = kAnchorSeat;  break;
     default: return a;
     }
-    if (sl->size() != houses_.size()) return a;
+    if (house >= int(sl->size())) return a;
     const glm::ivec2 sp = (*sl)[size_t(house)];
     if (sp.y <= 0) return a;
     // ── ONE PERSON PER PIECE (two to a bed) ──────────────────────────
@@ -1404,6 +1871,13 @@ CitizenSystem::Anchor CitizenSystem::furnitureAnchor(
         a.pos = glm::vec3(f.t.x + fwd_x * kStoveStand * f.scale,
                           f.t.y,
                           f.t.z + fwd_z * kStoveStand * f.scale);
+        break;
+    case kAnchorSink:
+        // At the basin, same arrangement as the cooktop.
+        a.yaw = f.yaw + 3.14159265f;
+        a.pos = glm::vec3(f.t.x + fwd_x * kSinkStand * f.scale,
+                          f.t.y,
+                          f.t.z + fwd_z * kSinkStand * f.scale);
         break;
     default:
         // On the chair, facing the way it faces.  The sitting pose
@@ -1595,6 +2069,22 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             a.gesture_t = 0.0f;
         }
         glm::vec3 target = placePos(p, st, int(i));
+        // ── INDOOR ROUTING ───────────────────────────────────────────
+        // Replace the destination with the next DOORWAY on the way to
+        // it while one is still needed.  Near tier only, and only when
+        // the map shipped a graph: without it this is a no-op and the
+        // walk is the straight line it always was.
+        if (!graphs_.empty()) {
+            const int nav_h = anchorHouse(p, st);
+            if (nav_h >= 0) {
+                glm::vec3 wp;
+                if (indoorWaypoint(nav_h, a.pos, target, a.nav_room, wp)) {
+                    target = wp;
+                }
+            } else {
+                a.nav_room = -1;         // outdoors — no route room to hold
+            }
+        }
         glm::vec3 d = target - a.pos;
         d.y = 0.0f;
         float dist = glm::length(d);
@@ -1817,8 +2307,32 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         }
         std::cout << " | cam (" << int(camera_pos.x) << ", "
                   << int(camera_pos.z) << ") district "
-                  << int(std::sqrt(ddx * ddx + ddz * ddz)) << "m away"
-                  << std::endl;
+                  << int(std::sqrt(ddx * ddx + ddz * ddz)) << "m away";
+        // ── WHERE IS THE NEAREST SCHOOL ─────────────────────────────
+        // Schools are a couple of percent of the houses on the map, so
+        // walking into one by chance essentially does not happen and
+        // "I never see a classroom" is the expected experience even
+        // when every one of them is furnished correctly.  Print the
+        // nearest one's position so it can be flown to directly.
+        {
+            int best_s = -1;
+            float best_sd2 = std::numeric_limits<float>::max();
+            for (size_t b = 0; b < buildings_.size(); ++b) {
+                if (buildings_[b].type != "school") continue;
+                const float sx = buildings_[b].centre.x - camera_pos.x;
+                const float sz = buildings_[b].centre.y - camera_pos.z;
+                const float d2 = sx * sx + sz * sz;
+                if (d2 < best_sd2) { best_sd2 = d2; best_s = int(b); }
+            }
+            if (best_s >= 0) {
+                std::cout << " | nearest school ("
+                          << int(buildings_[best_s].centre.x) << ", "
+                          << int(buildings_[best_s].centre.y) << ") "
+                          << int(std::sqrt(best_sd2)) << "m, "
+                          << buildings_[best_s].headcount << " pupil(s)";
+            }
+        }
+        std::cout << std::endl;
     }
 }
 
@@ -1950,6 +2464,15 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
     case kActBrowse:
         arm_r = -0.9f;
         torso_pitch = 0.08f;
+        break;
+    case kActWash:
+        // Washing up: both hands down in the basin, a slight lean over
+        // it, and a small scrub off the real-time pose clock.  TWO arms
+        // rather than the cook's one is the whole read — from behind,
+        // one arm out is stirring and two is washing.
+        arm_l = -1.15f + 0.10f * std::sin(anim_phase * 3.0f);
+        arm_r = -1.15f - 0.10f * std::sin(anim_phase * 3.0f);
+        torso_pitch = 0.15f;
         break;
     case kActCare:
         // rounds: slow sway + attending arm

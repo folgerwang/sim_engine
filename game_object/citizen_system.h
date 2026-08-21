@@ -60,7 +60,8 @@ public:
     // change (replaces everything).  Returns false when either file is
     // missing — the system then stays inert.
     bool loadCity(const std::string& city_json_path,
-                  const std::string& world_json_path);
+                  const std::string& world_json_path,
+                  const std::string& indoor_json_path = std::string());
     bool loaded() const { return loaded_; }
 
     // (Re)place EVERY citizen at the anchor their schedule puts them at
@@ -166,6 +167,16 @@ private:
         float phase = 0.0f;            // walk cycle
         float gesture_t = 0.0f;        // door-open timer
         int   cur_step = -1;
+        // WHICH ROOM THE INDOOR ROUTE IS IN, -1 = not routing.
+        // The route room ADVANCES ONLY when the walker reaches the aim
+        // point past a doorway; it is never re-derived from the
+        // position each tick.  Rooms are rectangles that meet at a
+        // wall, and re-deriving means the walker flips between the two
+        // rooms either side of that wall as it crosses — each flip
+        // pointing it back where it came from.  Measured over 480
+        // archetypes: re-deriving stalled 1.2% of routes outright and
+        // left 3.7% ping-ponging; advancing arrives on all of them.
+        int16_t nav_room = -1;
         bool  walking = false;
         bool  inited = false;
     };
@@ -188,8 +199,9 @@ private:
     // Flat arrays plus one [first, count) slice per house.  A household
     // resolves its own furniture from its house index alone, so Person
     // — of which there are 120k+ — grows by nothing at all.
-    std::vector<Furniture>  beds_, stoves_, seats_;
-    std::vector<glm::ivec2> house_beds_, house_stoves_, house_seats_;
+    std::vector<Furniture>  beds_, stoves_, seats_, sinks_;
+    std::vector<glm::ivec2> house_beds_, house_stoves_, house_seats_,
+                            house_sinks_;
     void harvestFurniture();
 
     // Where a person AT HOME stands or lies for one activity, and which
@@ -280,6 +292,70 @@ private:
     // building holds).  The two collided and the compiler resolved the
     // uses to whichever it saw first.
     std::vector<int> house_school_seats_;
+
+    // ── INDOOR ROUTE GRAPHS ─────────────────────────────────────────
+    // <map>_pcg_indoor.json, one graph per ARCHETYPE in house-local
+    // metres (terrain_pcg.build_indoor_graph).  A house names its
+    // archetype in the world manifest, so a graph is shared by every
+    // instance of it and a house costs one index plus the transform it
+    // already had.
+    //
+    // The routing itself is table-driven rather than searched: rooms
+    // per house are few (<= kNavMaxRooms), so a next-hop matrix built
+    // once at load answers "standing in room A, heading for room B,
+    // which doorway next" in one lookup — no per-agent path storage
+    // and no per-frame search for a quarter of a million people.
+    struct NavRoom {
+        glm::vec2 c{0.0f};
+        float hw = 0.0f, hd = 0.0f, yaw = 0.0f;
+        int storey = 0;
+    };
+    struct NavDoor {
+        glm::vec2 p{0.0f};
+        int storey = 0;
+        int a = -1, b = -1;          // rooms joined; -1 == outdoors
+    };
+    struct IndoorGraph {
+        std::vector<NavRoom> rooms;
+        std::vector<NavDoor> doors;
+        std::vector<int>     street;   // door indices reaching outside
+        // next_[from * rooms + to] = door index to head for, or -1
+        std::vector<int16_t> next_;
+        // dist_[from * rooms + to] = doorways still to cross, or -1.
+        // Same BFS, kept because ROOMS OVERLAP: wings share floor, so
+        // a point can be inside two rooms at once and "which room am I
+        // in" has no geometric answer.  The one nearer the destination
+        // in the graph is the useful answer, and this is the table
+        // that says which that is.
+        std::vector<int16_t> dist_;
+    };
+    std::vector<IndoorGraph> graphs_;
+    std::vector<int>   house_graph_;   // -1 = no graph for this house
+    std::vector<float> house_yaw_;
+    std::vector<glm::vec2> house_scale_;   // x/z only
+
+    bool loadIndoor(const std::string& path,
+                    const std::vector<std::string>& house_node,
+                    const std::vector<int>& house_node_idx);
+    // House-local <-> world for house `hi` (yaw + per-axis scale).
+    glm::vec2 worldToLocal(int hi, const glm::vec2& w) const;
+    glm::vec2 localToWorld(int hi, const glm::vec2& l) const;
+    // Which room of house `hi` contains a house-local point, or -1.
+    // `toward` breaks the tie when overlapping rooms both contain it:
+    // the one closer to room `toward` in the doorway graph wins, then
+    // the one the point is deepest inside.  -1 = no destination yet.
+    int roomAt(int hi, const glm::vec2& local, int storey,
+               int toward = -1) const;
+    // The house whose interior step `s` refers to, or -1 for outdoors.
+    int anchorHouse(const Person& p, const Step& s) const;
+    // Next waypoint toward `dst_world` for a person at `pos_world`
+    // heading into house `hi`; false when no routing is needed.
+    // `nav_room` is the walker's own route room, carried between ticks
+    // and advanced here (see SimState::nav_room).
+    bool indoorWaypoint(int hi, const glm::vec3& pos_world,
+                        const glm::vec3& dst_world,
+                        int16_t& nav_room,
+                        glm::vec3& out_wp) const;
     std::vector<Building>  buildings_;
     std::vector<Person>    persons_;
     std::vector<SimState>  sim_;       // parallel to persons_
