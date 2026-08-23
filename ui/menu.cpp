@@ -2316,6 +2316,17 @@ bool Menu::draw(
                     rt_gi_enabled_ = !rt_gi_enabled_;
                 }
 
+                // RT ambient occlusion.  ON replaces the screen-space
+                // SSAO chain with traced hemisphere AO on the deferred
+                // pixels (SSAO pass is skipped).  OFF (default) keeps
+                // SSAO running under the RT shadow techniques exactly
+                // as on the CSM path, so switching technique changes
+                // only the shadow algorithm — not the AO estimator.
+                if (ImGui::MenuItem("RT ambient occlusion", NULL,
+                                    rt_ao_enabled_)) {
+                    rt_ao_enabled_ = !rt_ao_enabled_;
+                }
+
                 // Indirect diffuse estimator.  OFF (default) = the
                 // original one cosine ray per pixel — slower, but the
                 // temporally stable one, so it stays the default.  ON =

@@ -266,11 +266,21 @@ class Menu {
     // GI stays the shipping default and the probe gather is opt-in.
     bool gi_screen_probe_ = false;
     // ── Master switch for RT indirect diffuse ────────────────────────
-    // ON (default): the resolve's ambient diffuse comes from the traced
-    // GI estimate (whichever estimator gi_screen_probe_ selects).  OFF:
-    // it falls back to the flat lambertian IBL cube, exactly what the
-    // CSM path uses — shadows, RT AO and the RT technique itself are
-    // untouched.
+    // ON: the resolve's ambient diffuse comes from the traced GI
+    // estimate (whichever estimator gi_screen_probe_ selects).  OFF
+    // (default): it falls back to the flat lambertian IBL cube, exactly
+    // what the CSM path uses — shadows, RT AO and the RT technique
+    // itself are untouched.
+    //
+    // DEFAULT OFF: selecting an RT shadow technique should change the
+    // shadow algorithm, not silently swap the frame's entire ambient
+    // model at the same time.  The scene's ambient was tuned on the
+    // flat-IBL path (ground-bounce fill + raised sky ambient), and the
+    // traced estimate is not calibrated against the cube (see below),
+    // so with GI riding along the RT frame read as a different-looking
+    // scene — different tone on every DEFERRED pixel while the forward
+    // pixels (terrain/grass) kept the flat ambient.  GI stays one click
+    // away for A/B and for when it is deliberately wanted.
     //
     // This is a DIAGNOSTIC as much as a feature.  The traced estimate
     // and the flat cube are two different estimators of the same
@@ -284,7 +294,17 @@ class Menu {
     // measurement that separates "the ambient changed" from "the shadow
     // or AO changed" when the frame brightness jumps between the CSM and
     // RT paths.
-    bool rt_gi_enabled_ = true;
+    bool rt_gi_enabled_ = false;
+    // ── RT ambient occlusion (replaces the SSAO chain) ───────────────
+    // ON: deferred_resolve traces short hemisphere rays per deferred
+    // pixel (FEATURE_INPUT_RT_AO) and the screen-space SSAO pass is
+    // skipped.  OFF (default): the SSAO gen/blur/apply chain keeps
+    // running in the RT shadow modes exactly as it does on the CSM
+    // path.  Default OFF for the same reason as rt_gi_enabled_ above:
+    // an RT technique should swap the shadow algorithm only, not the
+    // AO estimator with it — and RT AO only covers deferred pixels, so
+    // riding it automatically also split the frame's AO in two.
+    bool rt_ao_enabled_ = false;
     // ── Auto-arm the selected RT technique once its BVH/TLAS is ready ──
     // ON (default, and the historical behaviour): the moment the cluster
     // BVH/TLAS finishes building, the effective shadow path flips from
@@ -2116,6 +2136,12 @@ public:
     // IBL cube (the CSM path's ambient) while leaving the RT shadow and
     // RT AO terms alone.  See the member comment above.
     inline bool isRtGiOn() const { return rt_gi_enabled_; }
+
+    // Rendering > Shadow > "RT ambient occlusion".  ON replaces the
+    // screen-space SSAO chain with traced hemisphere AO on the deferred
+    // pixels; OFF (default) keeps SSAO running in the RT shadow modes.
+    // See the member comment above.
+    inline bool isRtAoOn() const { return rt_ao_enabled_; }
 
     // Rendering > Shadow > "Auto-arm RT when ready".  OFF pins the CSM
     // fallback for the whole session so the shadow technique never

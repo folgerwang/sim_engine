@@ -18,6 +18,21 @@ layout(set = TILE_PARAMS_SET, binding = ORTHER_INFO_LAYER_BUFFER_INDEX) uniform 
 
 #include "tile_detail.glsl.h"
 
+#if defined(WATER_LBM)
+// ── D2Q9 LBM river-surface sim (lbm_water.comp output) ──────────────
+// xyz = ripple normal, w = height DEVIATION in metres.  The WATER_ATTR
+// fragment permutation samples this pair for shading; this vertex
+// permutation samples the SAME set-3 pair so the height deviation
+// drives the water surface MESH itself — ripples and slosh become
+// geometry, not just a normal perturbation.  Bound as set 3, appended
+// after the regular tile sets (see initWaterAttrPipeline).
+layout(set = 3, binding = 0) uniform sampler2D lbm_surface_tex_vs;
+layout(std430, set = 3, binding = 1) readonly buffer LbmRegionBufVs {
+    // xz = patch origin (world m), y = cell size (m), w = grid size
+    vec4 lbm_region_vs;
+};
+#endif
+
 // Snap an edge parameter onto a coarser neighbour's vertex grid so both
 // tiles emit EXACTLY the same edge positions — no T-junction cracks
 // between LODs.  nseg = the neighbour's segment count.
@@ -68,6 +83,22 @@ void main() {
     // Runtime 1 m detail (streamed tiles), fading back to the base map
     // with camera distance.
     float detail_fade = terrainDetailFade(pos_xz_ws, camera_info.position.xyz);
+#if defined(WATER_PASS)
+    // The WATER surface is FLAT at its authored level.  The detail
+    // relief belongs to the GROUND: adding it here made the surface
+    // inherit every bump of the terrain (lumpy mounds of water).
+    detail_fade = 0.0f;
+#elif defined(SOIL_PASS) || defined(SNOW_PASS)
+    // A SUBMERGED bed keeps the smooth base heights too — the water
+    // thickness was solved against the base map, so re-adding metres
+    // of detail relief under a flat surface pushed bed bumps up
+    // through the water.  Fades back in across the shoreline.
+    {
+        float uw_m = texture(soil_water_layer, world_map_uv).y *
+                     SOIL_WATER_LAYER_MAX_THICKNESS;
+        detail_fade *= 1.0f - clamp(uw_m * 2.0f, 0.0f, 1.0f);
+    }
+#endif
     layer_height = terrainDetailHeight(pos_xz_ws, layer_height, detail_fade);
     // Beyond the terrain map: fade to the neutral surround plain instead
     // of stretching the border texels into stripes.
@@ -93,6 +124,28 @@ void main() {
 #endif
 #if defined(SNOW_PASS)
     layer_height += texture(other_info_layer, world_map_uv).y * SNOW_LAYER_MAX_THICKNESS;
+#endif
+
+#if defined(WATER_LBM)
+    // ── LBM-driven water surface displacement ────────────────────────
+    // Wherever the camera-following LBM patch covers this vertex, add
+    // the sim's height deviation to the water surface.  Feathered over
+    // the outer 12% of the patch so the displaced mesh meets the
+    // un-simulated water outside the patch without a step, and scaled
+    // down as the water gets very shallow so ripples never poke the
+    // surface through the river bed at the banks.
+    if (out_data.water_depth > 0.02f && lbm_region_vs.w > 0.0f) {
+        float lbm_span = lbm_region_vs.y * lbm_region_vs.w;
+        vec2 patch_uv = (pos_xz_ws - lbm_region_vs.xz) / lbm_span;
+        if (all(greaterThan(patch_uv, vec2(0.0f))) &&
+            all(lessThan(patch_uv, vec2(1.0f)))) {
+            float dev = texture(lbm_surface_tex_vs, patch_uv).w;
+            vec2  eb  = min(patch_uv, vec2(1.0f) - patch_uv);
+            float feather = smoothstep(0.0f, 0.12f, min(eb.x, eb.y));
+            float shallow = clamp(out_data.water_depth * 4.0f, 0.0f, 1.0f);
+            layer_height += dev * feather * shallow;
+        }
+    }
 #endif
 
     vec4 position_ws = vec4(pos_xz_ws.x, layer_height, pos_xz_ws.y, 1.0);

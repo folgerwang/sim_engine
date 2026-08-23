@@ -553,10 +553,12 @@ void main() {
     // decal separately and compositing — and it is the only way the
     // decal can pick up the traced shadow / RT-AO / RT-GI the ground
     // under it gets.  Drawn forward AFTER the resolve (as it used to
-    // be) the decal had no shadow at all in any RT mode, because
-    // FEATURE_INPUT_SHADOW_DISABLED is raised whenever an RT technique
-    // is armed and nothing else re-lit it: a fully lit ribbon floating
-    // over correctly shadowed terrain.
+    // be) the decal had no shadow at all in any RT mode.  (Historical
+    // note: SHADOW_DISABLED used to be raised whenever an RT technique
+    // armed; nowadays CSM stays alive for the forward writers in the
+    // RT modes and only SSRT / the explicit shadow-off toggle raise it
+    // — the G-buffer route stays the correct one for decals either
+    // way.)
     //
     // The coverage goes in .a, which the pipeline's colour blend reads
     // as SRC_ALPHA.  The ALPHA channel's own blend is ZERO/ONE, so the

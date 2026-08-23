@@ -11,6 +11,14 @@ layout(set = 0, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D heightmap_tex;
 layout(set = 0, binding = ROCK_LAYER_BUFFER_INDEX, r16f) uniform writeonly image2D rock_layer;
 layout(set = 0, binding = SOIL_WATER_LAYER_BUFFER_INDEX, rg16) uniform writeonly image2D soil_water_layer;
 layout(set = 0, binding = ORTHER_INFO_LAYER_BUFFER_INDEX, rgba8) uniform writeonly image2D orther_info_layer;
+// Standing-water surface height (the PCG rivers step's basin fill),
+// same u16/kTerrainHeightAmpMeters encoding as the heightmap.  Bound
+// to a 1x1 ZERO texel when no hydrology sidecar exists — pond == 0,
+// no water, no dig.  (It used to fall back to the heightmap itself;
+// under WATER_SURFACE_STATIC that read pond == ground and the dig
+// below self-flooded every hollow where bilinear pond crossed the
+// bicubic ground by a few centimetres.)
+layout(set = 0, binding = SRC_WATER_LEVEL_TEX_INDEX) uniform sampler2D water_level_tex;
 
 // Catmull-Rom bicubic sample of the heightmap.  The 2048px map covers the
 // whole 16 km world (~8 m per texel); plain bilinear upsampling into the
@@ -71,24 +79,103 @@ void main()
     // is GONE — the runtime 1 m detail tiles (terrain_detail_worker.py)
     // provide the high-frequency relief, and the base rock layer must
     // agree with them at the detail fade boundary.
+    // Underwater DIG (render-side): wherever the authored water
+    // surface stands above the ground, push the bed further down so a
+    // FLAT surface always has real depth beneath it — shallow bumps a
+    // few centimetres under the plane otherwise poke through as dark
+    // mounds.  Feathered: barely-submerged shore ground dips a little,
+    // anything half a metre under goes to the full 2.5 m floor.  Maps
+    // whose PCG dig already ran are simply already below the cap.
     float heightmap_00 = sampleHeightmapSmooth((scoord_0 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
-    imageStore(rock_layer, scoord_0, vec4(heightmap_00));
     float heightmap_10 = sampleHeightmapSmooth((scoord_1 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
-    imageStore(rock_layer, scoord_1, vec4(heightmap_10));
     float heightmap_01 = sampleHeightmapSmooth((scoord_2 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
-    imageStore(rock_layer, scoord_2, vec4(heightmap_01));
     float heightmap_11 = sampleHeightmapSmooth((scoord_3 + 0.5f) * inv_segment_count * 0.5f) * kTerrainHeightAmpMeters;
+#if WATER_SURFACE_STATIC
+    {
+        float pond_c = texture(
+            water_level_tex,
+            (pixel_coords + 0.5f) * inv_segment_count).x *
+            kTerrainHeightAmpMeters + kWaterLevelAdjustM;
+        // Dig ONLY under a surface that stands meaningfully above the
+        // ground (+0.25 m — the water-level maps keep the same floor).
+        // Firing at pond ~= ground turned interpolation noise into
+        // draped 0.4 m water skins on every bump ("tents").
+        if (pond_c > 0.5f) {
+            float dig0 = clamp(0.4f + (pond_c - heightmap_00) * 4.0f,
+                               0.0f, 2.5f);
+            float dig1 = clamp(0.4f + (pond_c - heightmap_10) * 4.0f,
+                               0.0f, 2.5f);
+            float dig2 = clamp(0.4f + (pond_c - heightmap_01) * 4.0f,
+                               0.0f, 2.5f);
+            float dig3 = clamp(0.4f + (pond_c - heightmap_11) * 4.0f,
+                               0.0f, 2.5f);
+            if (pond_c > heightmap_00 + 0.25f)
+                heightmap_00 = min(heightmap_00, pond_c - dig0);
+            if (pond_c > heightmap_10 + 0.25f)
+                heightmap_10 = min(heightmap_10, pond_c - dig1);
+            if (pond_c > heightmap_01 + 0.25f)
+                heightmap_01 = min(heightmap_01, pond_c - dig2);
+            if (pond_c > heightmap_11 + 0.25f)
+                heightmap_11 = min(heightmap_11, pond_c - dig3);
+        }
+    }
+#endif
+    imageStore(rock_layer, scoord_0, vec4(heightmap_00));
+    imageStore(rock_layer, scoord_1, vec4(heightmap_10));
+    imageStore(rock_layer, scoord_2, vec4(heightmap_01));
     imageStore(rock_layer, scoord_3, vec4(heightmap_11));
 
     const float kWaterInitLevel = 1.0f;
     const float kSoilInitLevel = 5.0f;
+
+    // ── Water init: FILL TO THE HYDROLOGY'S SURFACE ──────────────────
+    // The uniform 1 m init spread over a basin the rivers step carved
+    // 5-8 m deep leaves the lake surface far below its banks (the
+    // "water level is too low" report).  Where the basin-fill map says
+    // standing water stands ABOVE the ground, initialize the layer
+    // with exactly the depth that puts the surface AT that level; both
+    // maps share the heightmap's u16/kTerrainHeightAmpMeters encoding,
+    // and the soil layer is a uniform offset on both sides of the
+    // comparison, so pond - rock is the thickness in metres directly.
+    // Clamped to what the rg16 layer can carry.  Under
+    // WATER_SURFACE_STATIC land starts DRY — see the branch below.
+    float h_avg = 0.25f * (heightmap_00 + heightmap_10 +
+                           heightmap_01 + heightmap_11);
+    float pond_m = texture(
+        water_level_tex,
+        (pixel_coords + 0.5f) * inv_segment_count).x *
+        kTerrainHeightAmpMeters + kWaterLevelAdjustM;
+#if WATER_SURFACE_STATIC
+    // STATIC water surface: LAND IS DRY.  The uniform 1 m ambient
+    // existed to feed the drainage sim, which used to carry it
+    // downhill over the first minutes of a session; with the water
+    // column pinned (tile_flow_update) that sheet can never drain,
+    // so it rendered the ENTIRE world as a metre-deep water surface.
+    // Only pixels the water-level map marks hold water now — and only
+    // where the surface stands a real 0.25 m above the (dug) ground,
+    // matching the dig gate above so interpolation noise at the
+    // waterline never seeds stray water.
+    float water_init = 0.0f;
+    if (pond_m > 0.5f && pond_m > h_avg + 0.25f) {
+        water_init = clamp(pond_m - h_avg, 0.35f,
+                           SOIL_WATER_LAYER_MAX_THICKNESS -
+                               kSoilInitLevel - 1.0f);
+    }
+#else
+    float water_init = kWaterInitLevel;
+    if (pond_m > h_avg + 0.05f) {
+        water_init = clamp(pond_m - h_avg, kWaterInitLevel,
+                           SOIL_WATER_LAYER_MAX_THICKNESS -
+                               kSoilInitLevel - 1.0f);
+    }
+#endif
 
     imageStore(
         soil_water_layer,
         pixel_coords,
         vec4(
             kSoilInitLevel / SOIL_WATER_LAYER_MAX_THICKNESS,
-            kWaterInitLevel / SOIL_WATER_LAYER_MAX_THICKNESS,
+            water_init / SOIL_WATER_LAYER_MAX_THICKNESS,
             0, 0));
 
     if (((pixel_coords.x | pixel_coords.y) & 0x01) == 0) {

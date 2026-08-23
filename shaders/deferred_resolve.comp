@@ -1768,12 +1768,14 @@ bool glassWaterOverlay(vec2 uv, ivec2 px_dbg, float opaque_lin_z,
                                      L, sun_col, hit_t);
             }
             // Beer-Lambert toward the water tint over the refracted
-            // travel distance; ~35% extinction per metre keeps a
-            // half-metre shallows readable and a 5 m channel opaque.
+            // travel distance.  0.9/m extinction (matching the forward
+            // water's kWaterExtinction): the first half-metre still
+            // shows the bed, ~2-3 m of travel goes opaque — and the
+            // opaque floor is a DARK body colour, not a bright tint.
             float travel = min(hit_t, 24.0);
-            vec3 absorb = exp(-travel * 0.35 *
+            vec3 absorb = exp(-travel * 0.9 *
                               (vec3(1.05) - clamp(tint, 0.0, 1.0)));
-            trans = mix(tint * 0.25, trans, absorb);
+            trans = mix(tint * 0.08, trans, absorb);
         }
     }
 

@@ -23,6 +23,24 @@ layout(location = 0) in VsPsData {
     float   water_depth;
 } in_data;
 
+#if defined(WATER_ATTR) || defined(WATER_LBM)
+// LBM river-surface sim output (lbm_water.comp): xyz = ripple normal,
+// w = height deviation.  Bound on a DEDICATED set 3 so the existing
+// tile descriptor layouts stay byte-identical for every other pass.
+// Shared by BOTH permutations that see the sim: WATER_ATTR (glass
+// attribute path) and WATER_LBM (the displaced-mesh forward path,
+// which blends the ripple normal into its shading).
+layout(set = 3, binding = 0) uniform sampler2D lbm_surface_tex;
+layout(std430, set = 3, binding = 1) readonly buffer LbmRegionBuf {
+    // xz = patch origin (world m), y = cell size, w = grid size
+    vec4 lbm_region;
+};
+// The sim's GENERATED flowmap: per-cell velocity (m/s, world xz).
+// The LBM authors the flow (from the static surface's gradient);
+// here it advects the procedural surface detail along the current.
+layout(set = 3, binding = 2) uniform sampler2D lbm_flow_tex;
+#endif
+
 #ifdef WATER_ATTR
 // Water attribute permutation (tile_water_attr_frag.spv): river/pond
 // surfaces re-rasterise into the same two GLASS ATTRIBUTE targets the
@@ -35,15 +53,6 @@ layout(location = 0) in VsPsData {
 //   attr1 = water tint rgb, 1.0
 layout(location = 0) out vec4 out_glass_nr;
 layout(location = 1) out vec4 out_glass_tint;
-
-// LBM river-surface sim output (lbm_water.comp): xyz = ripple normal,
-// w = height deviation.  Bound on a DEDICATED set 3 so the existing
-// tile descriptor layouts stay byte-identical for every other pass.
-layout(set = 3, binding = 0) uniform sampler2D lbm_surface_tex;
-layout(std430, set = 3, binding = 1) readonly buffer LbmRegionBuf {
-    // xz = patch origin (world m), y = cell size, w = grid size
-    vec4 lbm_region;
-};
 
 vec2 octEncodeDir(vec3 n) {
     n /= (abs(n.x) + abs(n.y) + abs(n.z));
@@ -58,6 +67,17 @@ vec4 outColor;   // satisfies the dead forward code past our early return
 #else
 layout(location = 0) out vec4 outColor;
 #endif
+
+// Deep-water tint.  ONE definition for both render paths: the traced
+// path hands it to the resolve as the per-metre absorption tint, the
+// forward path runs the same Beer-Lambert against it locally — so the
+// water reads the same colour wherever the two paths hand off.
+const vec3 kWaterTint = vec3(0.12, 0.32, 0.38);
+// Per-metre extinction scale.  0.35 read as glass — the bed stayed
+// visible through metres of water; 0.9 goes opaque by ~2-3 m of
+// optical path while the first half-metre still shows the bottom.
+// KEEP IN SYNC with glassWaterOverlay in deferred_resolve.comp.
+const float kWaterExtinction = 0.9;
 
 vec3  kSunDir = vec3(-0.624695f, 0.468521f, -0.624695f);
 
@@ -90,7 +110,43 @@ void main() {
     vec3 pos = in_data.vertex_position;
     vec3 tnor = terrainNormal(vec2(pos.x, pos.z), 0.00025f, 2000.0f);
 
-    float noise = warpedNoise(pos.xz * 0.04334f);
+    float noise;
+#if defined(WATER_ATTR) || defined(WATER_LBM)
+    // ── LBM patch coverage + its GENERATED flow at this fragment ────
+    // Resolved once here; the ripple-normal blend below reuses it.
+    vec2  lbm_luv    = vec2(-1.0);
+    float lbm_wgt    = 0.0;
+    vec2  lbm_flow_v = vec2(0.0);
+    {
+        float lbm_span = lbm_region.w * lbm_region.y;
+        if (lbm_span > 1.0) {
+            vec2 luv = (pos.xz - lbm_region.xz) / lbm_span;
+            if (all(greaterThan(luv, vec2(0.0))) &&
+                all(lessThan(luv, vec2(1.0)))) {
+                vec2 ef = smoothstep(0.0, 0.15, luv) *
+                          (1.0 - smoothstep(0.85, 1.0, luv));
+                lbm_luv    = luv;
+                lbm_wgt    = ef.x * ef.y;
+                lbm_flow_v = texture(lbm_flow_tex, luv).xy * lbm_wgt;
+            }
+        }
+    }
+    if (dot(lbm_flow_v, lbm_flow_v) > 1e-4) {
+        // Two-phase flowmap scroll: the detail noise is sampled at two
+        // positions advected backwards along the current, cross-faded
+        // so neither phase is ever visibly reset — the standard trick,
+        // but the flow field comes from the LBM itself.
+        float fph = fract(tile_params.time * 0.5);
+        float n1 = warpedNoise(
+            (pos.xz - lbm_flow_v * (fph * 2.0)) * 0.04334f);
+        float n2 = warpedNoise(
+            (pos.xz - lbm_flow_v * ((fph - 1.0) * 2.0)) * 0.04334f);
+        noise = mix(n1, n2, abs(fph * 2.0 - 1.0));
+    } else
+#endif
+    {
+        noise = warpedNoise(pos.xz * 0.04334f);
+    }
     float water_noise = (noise * 2.0f - 1.0f);
 
     vec3 water_normal;
@@ -101,28 +157,20 @@ void main() {
     water_normal.y += water_noise * 0.35;
     water_normal = normalize(water_normal);
 
+#if defined(WATER_ATTR) || defined(WATER_LBM)
+    // Blend the LBM ripple normal in where the camera-following patch
+    // covers this fragment: the D2Q9 sim carries travelling waves,
+    // wakes and rain-rings the procedural noise can't, and it fades
+    // back to the noise normal at the patch edge so the handoff is
+    // invisible.  Coverage/weight were resolved above.
+    if (lbm_wgt > 0.0) {
+        vec3 lbm_n = texture(lbm_surface_tex, lbm_luv).xyz;
+        water_normal = normalize(
+            mix(water_normal, lbm_n, 0.8 * lbm_wgt));
+    }
+#endif // WATER_ATTR || WATER_LBM
 #ifdef WATER_ATTR
     {
-        // Blend the LBM ripple normal in where the camera-following
-        // patch covers this fragment: the D2Q9 sim carries travelling
-        // waves, wakes and rain-rings the procedural noise can't, and
-        // it fades back to the noise normal at the patch edge so the
-        // handoff is invisible.
-        float lbm_cell = lbm_region.y;
-        float lbm_span = lbm_region.w * lbm_cell;
-        if (lbm_span > 1.0) {
-            vec2 luv = (pos.xz - lbm_region.xz) / lbm_span;
-            if (all(greaterThan(luv, vec2(0.0))) &&
-                all(lessThan(luv, vec2(1.0)))) {
-                vec3 lbm_n = texture(lbm_surface_tex, luv).xyz;
-                // edge fade over the outer 15% of the patch
-                vec2 ef = smoothstep(0.0, 0.15, luv) *
-                          (1.0 - smoothstep(0.85, 1.0, luv));
-                float wgt = ef.x * ef.y;
-                water_normal = normalize(
-                    mix(water_normal, lbm_n, 0.8 * wgt));
-            }
-        }
         float water_linz = camera_info.depth_params.y /
                            (camera_info.depth_params.x + gl_FragCoord.z);
         out_glass_nr = vec4(octEncodeDir(water_normal),
@@ -130,7 +178,7 @@ void main() {
                             0.06);          // near-mirror water
         // Absorption tint the resolve applies per metre of refracted
         // travel — deep river water pulls toward blue-green.
-        out_glass_tint = vec4(0.12, 0.32, 0.38, 1.0);
+        out_glass_tint = vec4(kWaterTint, 1.0);
         return;
     }
 #endif // WATER_ATTR
@@ -197,10 +245,29 @@ void main() {
     f_diffuse += getIBLRadianceLambertian(normal, material_info.albedoColor);
     #endif
 
-    vec3 color = f_diffuse + f_specular;
+    // ── Depth-difference blend ───────────────────────────────────────
+    // Two depths drive the look:
+    //  * distorted_water_ray_dist — the refracted OPTICAL path to the
+    //    bed: Beer-Lambert absorption toward the deep tint, with the
+    //    SAME per-metre constants the traced water path in
+    //    deferred_resolve.comp uses, so the forward and traced paths
+    //    agree wherever they hand off.  Shallow bed shows through,
+    //    a few metres of water goes opaque blue-green.
+    //  * water_depth — the vertical column at this fragment: the
+    //    SHORELINE blend.  The old hard 3 cm cutoff drew the water's
+    //    edge as a polygon boundary; fading the surface in over the
+    //    last ~45 cm of depth lands it on the bank as a soft wet line.
+    vec3 absorb = exp(-min(distorted_water_ray_dist, 24.0) *
+                      kWaterExtinction * (vec3(1.05) - kWaterTint));
     // sceneTonemap: same exposure+ACES curve as every other final-colour
     // writer (bg_color is already display-encoded scene colour).
-    color = mix(sceneTonemap(color), bg_color, fade_rate);
+    // The DEEP body colour is mostly what "dark water" is: damp the
+    // diffuse IBL hard (open water swallows skylight) and keep only
+    // the specular sky reflection on top.
+    vec3 deep_col = sceneTonemap(f_diffuse * 0.25 + f_specular * 0.8);
+    vec3 water_col = mix(deep_col, bg_color, absorb);
+    float shore = smoothstep(0.03f, 0.45f, in_data.water_depth);
+    vec3 color = mix(bg_color, water_col, shore);
     outColor = vec4(color, 1.0f);
 /*
 	vec2 uv = gl_FragCoord.xy / vec2(1920, 1080) * 12.0;

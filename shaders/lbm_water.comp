@@ -42,6 +42,19 @@ layout(set = 0, binding = 4, rgba32f) uniform image2D dst_fB;
 layout(set = 0, binding = 5, rgba32f) uniform image2D dst_fC;
 // xyz = surface normal (world space), w = height deviation (m)
 layout(set = 0, binding = 6, rgba16f) uniform image2D dst_surface;
+// STATIC water-surface map (<map stem>_hydro_pondz.png, u16 height /
+// kTerrainHeightAmpMeters — the same map the tile creator fills the
+// water layer from).  The LBM GENERATES its own flow from this: the
+// body force is the surface's downstream gradient, so rivers (whose
+// authored surface descends monotonically) develop real along-channel
+// currents, lakes (flat surface) stay still, and confluences merge —
+// no painted flowmap involved.  level_map_world.w == 0 (map not
+// bound) selects the legacy global flow_dir instead.
+layout(set = 0, binding = 7) uniform sampler2D water_level_tex;
+// GENERATED FLOWMAP: this step's macroscopic velocity u (m/s, world
+// xz) per cell.  The water shading samples it to advect surface
+// detail along the current — the LBM is the flow AUTHOR now.
+layout(set = 0, binding = 8, rg16f) uniform writeonly image2D dst_flow;
 
 // D2Q9 lattice: 0 = rest, 1..4 axis (+x, +y, -x, -y), 5..8 diagonal
 // (+x+y, -x+y, -x-y, +x-y).  "y" here is the patch's Z in world space.
@@ -126,8 +139,37 @@ void main() {
     // Bed-slope body force along the river flow direction + a gentle
     // travelling stir so the surface carries ripples even where the
     // mean flow is slow.  Scaled by dt (force per step).
-    vec2 flow = params.flow_dir.xy;
     vec2 wpos = params.origin_ws.xz + vec2(pc) * params.cell_m;
+    // ── The LBM generates its own flow ───────────────────────────────
+    // Body force from the STATIC water surface's gradient: the
+    // authored river surfaces descend monotonically downstream, so
+    // -grad(surface) points down-channel; a bend turns the force with
+    // the channel, a lake's flat surface produces none.  Cells at the
+    // water's edge (any tap reads "no water") take no force — the
+    // gradient there is bank geometry, not current.
+    vec2 flow;
+    if (params.level_map_world.w > 0.0) {
+        const float step_m = 8.0;   // gradient baseline (2 map texels)
+        vec2 uv = clamp((wpos - params.level_map_world.xy) *
+                        params.level_map_world.z, 0.0, 1.0);
+        vec2 du = vec2(step_m * params.level_map_world.z, 0.0);
+        float zc = texture(water_level_tex, uv).x;
+        float zx = texture(water_level_tex,
+                           clamp(uv + du.xy, 0.0, 1.0)).x;
+        float zy = texture(water_level_tex,
+                           clamp(uv + du.yx, 0.0, 1.0)).x;
+        if (zc > 0.0 && zx > 0.0 && zy > 0.0) {
+            vec2 grad = (vec2(zx, zy) - zc) *
+                        (kTerrainHeightAmpMeters / step_m);
+            flow = -grad * params.level_map_world.w;
+            float fl = length(flow);
+            if (fl > 2.0) flow *= 2.0 / fl;     // physical cap, m/s
+        } else {
+            flow = vec2(0.0);
+        }
+    } else {
+        flow = params.flow_dir.xy;
+    }
     float stir =
         sin(dot(wpos, vec2(0.9, 0.37)) * 1.7 + params.time * 2.6) *
         sin(dot(wpos, vec2(-0.31, 0.83)) * 2.3 + params.time * 1.9);
@@ -185,4 +227,7 @@ void main() {
         1.0,
         -(hup - hd) * amp / (2.0 * params.cell_m)));
     imageStore(dst_surface, pc, vec4(nrm, (h - h0)));
+    // Publish this cell's macroscopic velocity — the GENERATED flowmap
+    // the water shading advects its surface detail by.
+    imageStore(dst_flow, pc, vec4(u, 0.0, 0.0));
 }

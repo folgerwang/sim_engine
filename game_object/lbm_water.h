@@ -27,6 +27,18 @@ class LbmWater {
     renderer::TextureInfo f_tex_[2][3];
     std::shared_ptr<renderer::TextureInfo> surface_tex_;
     renderer::BufferInfo region_buffer_;      // vec4: origin.xz/cell/size
+    // Static water-surface map (binding 7): a 1x1 zero fallback is
+    // bound at construction; setWaterLevelMap swaps in the real
+    // <stem>_hydro_pondz.png once the terrain apply has loaded it.
+    // The sim derives its body force from THIS surface's gradient —
+    // the LBM generates the flow field, nothing paints one for it.
+    std::shared_ptr<renderer::Sampler> flow_sampler_;
+    renderer::TextureInfo flow_fallback_tex_;
+    bool level_map_bound_ = false;
+    // GENERATED FLOWMAP (binding 8): the sim's per-cell macroscopic
+    // velocity (m/s, world xz), written every step.  Sampleable by the
+    // water shading through flowTexture().
+    std::shared_ptr<renderer::TextureInfo> flow_tex_;
 
     glm::vec2 origin_ws_{0.0f};
     glm::vec2 prev_origin_ws_{0.0f};
@@ -48,8 +60,23 @@ public:
         const glm::vec2& flow_dir,
         float delta_t);
 
+    // Bind the STATIC water-surface map (u16 height — the same
+    // <stem>_hydro_pondz.png the tile creator fills the water layer
+    // from; lbm_water.comp binding 7).  Pass null to fall back to the
+    // zero 1x1 (no force — legacy flow_dir drift).  Rewrites live
+    // descriptor sets: only call when the device is idle (the
+    // terrain-apply path is, via waitIdle).
+    void setWaterLevelMap(
+        const std::shared_ptr<renderer::Device>& device,
+        const std::shared_ptr<renderer::ImageView>& level_view);
+
     const std::shared_ptr<renderer::TextureInfo>& surfaceTexture() const {
         return surface_tex_;
+    }
+    // The sim's GENERATED flowmap: per-cell velocity (m/s, world xz)
+    // over the camera-following patch, updated every step.
+    const std::shared_ptr<renderer::TextureInfo>& flowTexture() const {
+        return flow_tex_;
     }
     const renderer::BufferInfo& regionBuffer() const {
         return region_buffer_;

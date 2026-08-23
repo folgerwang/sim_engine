@@ -195,7 +195,16 @@ void main()
     ivec2 src_local_coords = local_coords + 2;
     uvec2 packed_layers = s_terrain_layers[src_local_coords.y][src_local_coords.x];
     vec2 soil_water_layers = unpackUnorm2x16(packed_layers.y);
-    soil_water_layers += layer_adjust.xy / SOIL_WATER_LAYER_MAX_THICKNESS;
+    vec2 layer_delta = layer_adjust.xy / SOIL_WATER_LAYER_MAX_THICKNESS;
+#if WATER_SURFACE_STATIC
+    // The water surface is AUTHORED (terrain water mask + adjusted
+    // level, set once by tile_creator) — the sim may erode soil but
+    // must not move the water column, or the river surface drifts
+    // away from its banks over a session.  The LBM patch supplies all
+    // visible water motion instead (ripples + the generated flow).
+    layer_delta.y = 0.0f;
+#endif
+    soil_water_layers += layer_delta;
     imageStore(dst_soil_water_layer, pixel_coords, vec4(max(soil_water_layers, 0.0f), 0, 0));
     vec2 last_water_flow = imageLoad(dst_water_flow, pixel_coords).xy;
     imageStore(dst_water_flow, pixel_coords, vec4(mix(layer_adjust.zw, last_water_flow, 0.85), 0, 0));

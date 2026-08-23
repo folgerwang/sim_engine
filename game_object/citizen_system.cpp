@@ -594,6 +594,20 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
                          float(b.at("centre")[1])};
             bd.yaw = float(b.at("yaw_rad"));
             bd.base_y = float(b.at("base_y"));
+            // Arrival spread from the building's REAL plate rather
+            // than the 6 m house default — 180 mall workers scattered
+            // over a 6 m box is a human pillar in the doorway.  0.7 of
+            // the shorter side keeps the Vogel fan inside the walls.
+            if (b.contains("size_m") && b["size_m"].size() >= 2) {
+                const float pw = b["size_m"][0].get<float>();
+                const float pd = b["size_m"][1].get<float>();
+                bd.spread = std::max(6.0f, std::min(pw, pd) * 0.7f);
+            }
+            // Jobs as the initial headcount hint; the occupancy count
+            // after the persons parse raises it to who actually comes.
+            if (b.contains("jobs")) {
+                bd.headcount = std::max(1, b["jobs"].get<int>());
+            }
             buildings_.push_back(bd);
         }
         auto bindex = [this](const std::string& place) -> int {
@@ -621,6 +635,23 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
                       [](const Step& a, const Step& b) {
                           return a.minutes < b.minutes;
                       });
+            // ── A DAY ENDS AT HOME ──────────────────────────────────
+            // city_sim writes some evening errands with times PAST the
+            // final home step (e.g. groceries 17:45 after off_work
+            // 17:30); sorted, the errand becomes the LAST step of the
+            // day and the person then stands in the supermarket all
+            // night — the night rule only puts people to sleep at
+            // place == -1.  If the sorted day ends anywhere but home,
+            // append the walk home 45 minutes later, clamped inside
+            // the day (a step at >= 1440 never fires).
+            if (!out.empty() && out.back().place != -1) {
+                Step home;
+                home.minutes = std::min(out.back().minutes + 45.0f,
+                                        1435.0f);
+                home.activity = kActIdle;
+                home.place = -1;
+                out.push_back(home);
+            }
             return out;
         };
         for (const auto& pj : city.at("persons")) {
@@ -664,6 +695,153 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
             for (Person& q : persons_) {
                 q.hslot  = seat[q.house]++;
                 q.hcount = household[q.house];
+            }
+        }
+        // ── COUNTED SLOTS + NEIGHBOURHOOD SCHOOLS (city-json path) ──
+        // Two long-standing gaps against the synthesized path, and
+        // both read as "the routine system doesn't work":
+        //
+        //  1. Every city-json person carried slot 0, so EVERYONE at a
+        //     building resolved to the same chair (furnitureAnchor
+        //     indexes chairs by slot) and the same arrival spot — a
+        //     whole shift stacked inside one figure, nobody visibly
+        //     "sitting on a chair".  Count slots per destination the
+        //     way synthesizeResidents always has.
+        //
+        //  2. Every student attended THE one civic-district school,
+        //     however far away, while the manifest's real campuses
+        //     (houses furnished as classrooms, with measured seats)
+        //     stood empty.  Re-seat each pupil at the nearest campus
+        //     building, preferring ones with seats left.
+        if (!persons_.empty() && !buildings_.empty()) {
+            int civic_school = -1;
+            for (size_t i = 0; i < buildings_.size(); ++i) {
+                if (buildings_[i].type == "school") {
+                    civic_school = int(i);
+                    break;
+                }
+            }
+            std::vector<int> campus_bi;      // building index
+            std::vector<int> campus_left;    // seats remaining
+            if (civic_school >= 0 &&
+                house_school_seats_.size() == houses_.size()) {
+                for (size_t hi = 0; hi < houses_.size(); ++hi) {
+                    if (house_school_seats_[hi] <= 0) continue;
+                    Building cb;
+                    cb.type = "school";
+                    cb.house = int(hi);      // its classroom chairs
+                    cb.centre = {houses_[hi].x, houses_[hi].z};
+                    cb.entrance = cb.centre;
+                    cb.base_y = houses_[hi].y;
+                    cb.headcount =
+                        std::max(1, house_school_seats_[hi]);
+                    campus_bi.push_back(int(buildings_.size()));
+                    campus_left.push_back(house_school_seats_[hi]);
+                    buildings_.push_back(cb);
+                }
+            }
+            if (!campus_bi.empty()) {
+                size_t reseated = 0;
+                for (Person& q : persons_) {
+                    // Only people whose schedule actually visits the
+                    // district school pay the campus scan.
+                    bool attends = false;
+                    for (const Step& st : q.weekday) {
+                        if (st.place == civic_school) {
+                            attends = true;
+                            break;
+                        }
+                    }
+                    if (!attends) {
+                        for (const Step& st : q.weekend) {
+                            if (st.place == civic_school) {
+                                attends = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!attends) continue;
+                    const glm::vec3& hp = houses_[size_t(q.house)];
+                    int pick = -1;
+                    float best = 3.0e38f;
+                    for (size_t c = 0; c < campus_bi.size(); ++c) {
+                        const Building& cb =
+                            buildings_[size_t(campus_bi[c])];
+                        const float dx = cb.centre.x - hp.x;
+                        const float dz = cb.centre.y - hp.z;
+                        float d2 = dx * dx + dz * dz;
+                        // A full campus only loses to an emptier one
+                        // nearby — the seat count is a preference,
+                        // not a wall (better an over-full class than
+                        // a cross-map commute for a child).
+                        if (campus_left[size_t(c)] <= 0) d2 *= 9.0f;
+                        if (d2 < best) { best = d2; pick = int(c); }
+                    }
+                    if (pick < 0) break;
+                    bool used = false;
+                    auto reseat = [&](std::vector<Step>& sched) {
+                        for (Step& st : sched) {
+                            if (st.place == civic_school) {
+                                st.place = campus_bi[size_t(pick)];
+                                used = true;
+                            }
+                        }
+                    };
+                    reseat(q.weekday);
+                    reseat(q.weekend);
+                    if (used) {
+                        --campus_left[size_t(pick)];
+                        ++reseated;
+                    }
+                }
+                std::cout << "[citizen] " << reseated
+                          << " pupil(s) re-seated from the district "
+                             "school to " << campus_bi.size()
+                          << " neighbourhood campus building(s)"
+                          << std::endl;
+            }
+            // Counted slots.  Primary destination = the building whose
+            // steps cover the most weekday minutes; the first OTHER
+            // building visited takes the errand slot (shop_b), for the
+            // same reason synthesizeResidents gives it one — a slot is
+            // only meaningful at the building it was counted at.
+            std::vector<int>   occupancy(buildings_.size(), 0);
+            std::vector<float> mins(buildings_.size(), 0.0f);
+            for (Person& q : persons_) {
+                std::fill(mins.begin(), mins.end(), 0.0f);
+                const std::vector<Step>& wd = q.weekday;
+                for (size_t si = 0; si < wd.size(); ++si) {
+                    const int pl = wd[si].place;
+                    if (pl < 0 || pl >= int(buildings_.size())) {
+                        continue;
+                    }
+                    const float t0 = wd[si].minutes;
+                    const float t1 = (si + 1 < wd.size())
+                                         ? wd[si + 1].minutes
+                                         : 1440.0f;
+                    mins[size_t(pl)] += std::max(0.0f, t1 - t0);
+                }
+                int prim = -1;
+                float pm = 0.0f;
+                for (size_t b = 0; b < mins.size(); ++b) {
+                    if (mins[b] > pm) { pm = mins[b]; prim = int(b); }
+                }
+                if (prim >= 0) {
+                    q.slot = occupancy[size_t(prim)]++;
+                }
+                for (size_t b = 0; b < mins.size(); ++b) {
+                    if (int(b) != prim && mins[b] > 0.0f) {
+                        q.shop_b = int(b);
+                        q.shop_slot = occupancy[b]++;
+                        break;
+                    }
+                }
+            }
+            // Raise each building's headcount to who actually comes,
+            // so the Vogel arrival fan packs evenly at real density.
+            for (size_t b = 0; b < buildings_.size(); ++b) {
+                buildings_[b].headcount =
+                    std::max(buildings_[b].headcount, occupancy[b]);
             }
         }
         } catch (const std::exception& ce) {
@@ -1666,11 +1844,21 @@ void CitizenSystem::harvestFurniture() {
     // Only the CITY-JSON path reaches this: on the synthesized path
     // buildings_ is still empty here (synthesizeResidents fills it
     // afterwards) and its buildings are promoted houses anyway, so the
-    // house half already covers them.  The size guard keeps the linear
-    // scan below honest — a city district is a couple of dozen
-    // buildings, the synthesized path is ten thousand.
+    // house half already covers them.  Count only the LEADING run of
+    // house-less buildings as civic: the neighbourhood school campus
+    // buildings appended after the city-json parse are promoted
+    // houses (house >= 0), already covered by the house half — and
+    // counting them here used to push the total past kCivicScanMax,
+    // which silently zeroed n_civic and unbound the mall's own
+    // shelves and desks.  The size guard keeps the linear scan below
+    // honest — a city district is a couple of dozen buildings.
+    size_t n_civic_raw = 0;
+    while (n_civic_raw < buildings_.size() &&
+           buildings_[n_civic_raw].house < 0) {
+        ++n_civic_raw;
+    }
     const size_t n_civic =
-        (buildings_.size() <= kCivicScanMax) ? buildings_.size() : 0;
+        (n_civic_raw <= kCivicScanMax) ? n_civic_raw : 0;
     const size_t n_slot = houses_.size() + n_civic;
     house_beds_.assign(n_slot, glm::ivec2(0));
     house_stoves_.assign(n_slot, glm::ivec2(0));

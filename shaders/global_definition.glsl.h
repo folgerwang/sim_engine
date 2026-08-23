@@ -133,6 +133,28 @@
 #define SRC_SCATTERING_LUT_INDEX            (TILE_BASE_PARAMS_INDEX + 25) // 32
 #define SRC_SCATTERING_LUT_SUM_INDEX        (TILE_BASE_PARAMS_INDEX + 25) // 32
 
+// The water surface is STATIC: it sits where the terrain's water mask
+// puts it, at the hydrology level plus this adjustment, and nothing
+// moves it afterwards (see WATER_SURFACE_STATIC).  Raise/lower every
+// lake and river together with this one knob.
+#define kWaterLevelAdjustM                      0.0f
+// 1 = the flow/weather sim leaves the WATER column untouched (soil
+// keeps eroding): the surface holds exactly the authored level.  The
+// LBM patch still ripples the surface visually — its height deviation
+// is a render-time displacement, not a change to the water column.
+// 0 = the old behaviour: tile_flow_update redistributes water and the
+// surface height drifts over time.
+#define WATER_SURFACE_STATIC                    1
+
+// Standing-water SURFACE height map (tile creator set only): the
+// rivers step's basin fill (<heightmap stem>_hydro_pondz.png, u16 =
+// surface_m / kTerrainHeightAmpMeters).  Sampled by tile_creator.comp
+// to initialize the water layer so lakes and rivers START at the level
+// the hydrology solved, instead of a uniform 1 m puddle at the bottom
+// of a carved basin.  Bound to the heightmap itself when the sidecar
+// is absent (pond == ground -> ambient init everywhere, old behaviour).
+#define SRC_WATER_LEVEL_TEX_INDEX           (TILE_BASE_PARAMS_INDEX + 40) // 47
+
 #define DETAIL_NOISE_TEXTURE_INDEX          (TILE_BASE_PARAMS_INDEX + 26) // 33
 #define ROUGH_NOISE_TEXTURE_INDEX           (TILE_BASE_PARAMS_INDEX + 27) // 34
 #define PERMUTATION_TEXTURE_INDEX           (TILE_BASE_PARAMS_INDEX + 28) // 35
@@ -505,7 +527,11 @@
 
 #define INDIRECT_DRAW_BUF_OFS                   4
 
-#define SOIL_WATER_LAYER_MAX_THICKNESS          128.0f
+// 256 (was 128): the hydrology basin fill puts up to ~240 m of water
+// over the deepest sea-floor pixels of a generated map, and the water
+// channel saturating at the old cap made the sea surface visibly sag
+// over the deeps.  rg16 UNORM at 256 m is still ~4 mm of precision.
+#define SOIL_WATER_LAYER_MAX_THICKNESS          256.0f
 #define SNOW_LAYER_MAX_THICKNESS                8.0f
 
 #define NO_DEBUG_DRAW                           0
@@ -800,7 +826,16 @@ struct ModelParams {
 struct LbmWaterParams {
     vec4  origin_ws;        // xz = patch corner, world metres
     vec4  prev_origin_ws;
-    vec4  flow_dir;         // xy = mean river flow dir (world xz)
+    vec4  flow_dir;         // xy = mean river flow dir (world xz);
+                            // FALLBACK only — unused while the water
+                            // LEVEL map is bound (see level_map_world.w)
+    // Static water-surface map mapping: xy = world min (x, z) the map
+    // covers, z = 1 / covered size (m), w = the slope→flow gain
+    // (m/s per m/m of surface slope) — 0 means "no map bound, use
+    // flow_dir".  The LBM derives its body force from THIS surface's
+    // downstream gradient and thereby GENERATES the flow field itself;
+    // its per-cell velocity is exported as the runtime flowmap.
+    vec4  level_map_world;
     float cell_m;           // lattice spacing, metres
     float dt;               // step seconds (per frame)
     float rest_depth;       // rest water column, metres
