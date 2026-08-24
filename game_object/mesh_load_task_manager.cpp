@@ -303,16 +303,23 @@ void MeshLoadTaskManager::runPhase2(
                 in_flight_tasks_.push_back(task);
             }
         } else {
-            // Sync fallback: reuse the existing transient command buffer
-            // + blocking submit. We don't track a fence; the transient
-            // path waits internally.
-            auto cmd_buf = device_->setupTransientCommandBuffer();
-            task->cmd_buf = cmd_buf;
+            // Sync fallback (single-queue devices, e.g. MoltenVK/macOS).
+            // Do NOT open the per-thread transient command buffer here:
+            // phase2's loaders perform their GPU uploads through that
+            // same channel themselves (Helper::createBuffer ->
+            // setupTransientCommandBuffer on THIS thread), so an outer
+            // begin here is re-entered — the nested submitAndWait resets
+            // the shared buffer and the outer end then throws
+            // VK_NOT_READY.  The only phase2 implementation deliberately
+            // never records into the passed cmd_buf (it exists to carry
+            // the async path's fence, which the sync path doesn't need),
+            // so pass null and let the nested uploads block internally.
+            task->cmd_buf = nullptr;
 
             std::string err;
             bool ok = false;
             if (task->phase2_fn) {
-                ok = task->phase2_fn(device_, cmd_buf, err);
+                ok = task->phase2_fn(device_, nullptr, err);
             }
 
             if (!ok) {
@@ -320,17 +327,12 @@ void MeshLoadTaskManager::runPhase2(
                     err.empty() ? "phase2_fn returned false" : err;
                 task->status.store(MeshLoadStatus::kError,
                     std::memory_order_release);
-                // endCommandBuffer + submitAndWait are driven by the
-                // transient API; we have to close it out to keep the
-                // shared buffer usable for the next call.
-                device_->submitAndWaitTransientCommandBuffer();
                 std::cerr
                     << "[MESHLOAD] phase2 error for '" << task->filename
                     << "' (sync path): " << task->error_message << std::endl;
                 return;
             }
 
-            device_->submitAndWaitTransientCommandBuffer();
             task->status.store(MeshLoadStatus::kGpuSubmitted,
                 std::memory_order_release);
         }
