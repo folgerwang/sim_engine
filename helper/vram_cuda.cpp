@@ -14,11 +14,14 @@
   #include <windows.h>
 #else
   #include <dlfcn.h>
+  #include <unistd.h>
 #endif
 #if defined(__APPLE__)
   #include <mach/mach.h>
   #include <sys/sysctl.h>
 #endif
+
+#include <cstdio>
 
 #include <cstddef>
 
@@ -174,6 +177,90 @@ bool queryDeviceWideVramBytes(unsigned long long& free_bytes,
     if (tryNvml(free_bytes, total_bytes)) return true;
     if (tryCuda(free_bytes, total_bytes)) return true;
     return false;
+}
+
+// ── System RAM + this process's footprint (HUD RAM meter) ───────────────────
+bool querySystemMemoryBytes(unsigned long long& free_bytes,
+                            unsigned long long& total_bytes) {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return false;
+    total_bytes = ms.ullTotalPhys;
+    free_bytes  = ms.ullAvailPhys;
+    return total_bytes != 0;
+#elif defined(__APPLE__)
+    return tryAppleUnified(free_bytes, total_bytes);
+#else
+    // MemAvailable is the kernel's own "claimable without swapping" estimate
+    // (free + reclaimable page cache + reclaimable slab).
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return false;
+    unsigned long long total_kb = 0, avail_kb = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::sscanf(line, "MemTotal: %llu", &total_kb);
+        std::sscanf(line, "MemAvailable: %llu", &avail_kb);
+    }
+    std::fclose(f);
+    if (total_kb == 0) return false;
+    total_bytes = total_kb * 1024ull;
+    free_bytes  = avail_kb * 1024ull;
+    return true;
+#endif
+}
+
+bool queryProcessMemoryBytes(unsigned long long& rss_bytes) {
+#if defined(_WIN32)
+    // PROCESS_MEMORY_COUNTERS, declared locally and resolved through
+    // kernel32's K32GetProcessMemoryInfo so no psapi.h / psapi.lib
+    // dependency is added.
+    struct ProcMemCounters {
+        DWORD  cb;
+        DWORD  PageFaultCount;
+        SIZE_T PeakWorkingSetSize;
+        SIZE_T WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage;
+        SIZE_T QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage;
+        SIZE_T QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage;
+        SIZE_T PeakPagefileUsage;
+    };
+    using GetMemInfo_t = BOOL (WINAPI*)(HANDLE, ProcMemCounters*, DWORD);
+    static GetMemInfo_t fn = []() -> GetMemInfo_t {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        return k32 ? reinterpret_cast<GetMemInfo_t>(
+                         GetProcAddress(k32, "K32GetProcessMemoryInfo"))
+                   : nullptr;
+    }();
+    if (!fn) return false;
+    ProcMemCounters pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!fn(GetCurrentProcess(), &pmc, sizeof(pmc))) return false;
+    rss_bytes = pmc.WorkingSetSize;
+    return true;
+#elif defined(__APPLE__)
+    task_vm_info_data_t ti{};
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&ti), &cnt) != KERN_SUCCESS)
+        return false;
+    // phys_footprint is what Activity Monitor charges the process —
+    // anonymous + compressed + IOKit (Metal/GPU) memory.
+    rss_bytes = ti.phys_footprint;
+    return true;
+#else
+    FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f) return false;
+    unsigned long long pages_total = 0, pages_rss = 0;
+    const int n = std::fscanf(f, "%llu %llu", &pages_total, &pages_rss);
+    std::fclose(f);
+    if (n != 2) return false;
+    rss_bytes = pages_rss *
+        static_cast<unsigned long long>(sysconf(_SC_PAGESIZE));
+    return true;
+#endif
 }
 
 }  // namespace engine

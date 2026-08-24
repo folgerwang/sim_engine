@@ -3917,6 +3917,9 @@ bool Menu::draw(
     // allocations by this process, ImGui's buffers included (see queryVram).
     if (editor_enabled_) {
         const double now = ImGui::GetTime();
+        static double s_ram_used_mb = 0.0, s_ram_total_mb = 0.0,
+                      s_eng_rss_mb = 0.0;
+        static bool   s_ram_valid  = false;
         if (!vram_valid_ || now - vram_last_poll_ > 0.25) {   // throttle to 4 Hz
             // (1) Vulkan: this process's own VRAM (engine + ImGui).
             const VramQuery q = queryVram(getVkPhysicalDevice(device_));
@@ -3935,63 +3938,111 @@ bool Menu::draw(
             } else {
                 vram_dev_valid_ = false;
             }
+            // (3) System RAM + this process's physical footprint — feeds
+            //     the RAM meter (discrete GPU) / engine callout (unified).
+            {
+                unsigned long long rf = 0, rt = 0, rss = 0;
+                const double MB = 1024.0 * 1024.0;
+                s_ram_valid = engine::querySystemMemoryBytes(rf, rt) && rt != 0;
+                if (s_ram_valid) {
+                    s_ram_total_mb = (double)rt / MB;
+                    s_ram_used_mb  = (double)(rt - rf) / MB;
+                }
+                s_eng_rss_mb = engine::queryProcessMemoryBytes(rss)
+                                   ? (double)rss / MB : 0.0;
+            }
             vram_last_poll_ = now;
         }
 
-        // Prefer the device-wide (CUDA) numbers; fall back to Vulkan-only.
-        const bool   dev    = vram_dev_valid_ && vram_dev_total_mb_ > 0.0;
-        const double cap_mb = dev ? vram_dev_total_mb_ : vram_total_mb_;
-        const double use_mb = dev ? vram_dev_used_mb_  : vram_used_mb_;
-        const double mine_mb = vram_valid_ ? vram_used_mb_ : 0.0;
-        const bool   vram_ok = (dev || vram_valid_) && cap_mb > 0.0;
+        // ── Assemble the memory meters ──────────────────────────────────────
+        // Unified memory (Apple Silicon): RAM and VRAM are ONE pool, so a
+        // single MEM meter shows system usage, with the engine's total
+        // footprint and its GPU (Vulkan) share called out.  Discrete GPU: a
+        // system-RAM meter sits on top of the VRAM meter.
+        struct Meter { char text[128]; double used_mb, cap_mb, mine_mb; };
+        Meter meters[2];
+        int   n_meters = 0;
 
-        // FPS line (always) + VRAM line + bar (when the query succeeded).
+        const bool   dev         = vram_dev_valid_ && vram_dev_total_mb_ > 0.0;
+        const double gpu_mine_mb = vram_valid_ ? vram_used_mb_ : 0.0;
+#ifdef __APPLE__
+        constexpr bool unified = true;
+#else
+        constexpr bool unified = false;
+#endif
+        if (unified) {
+            // The device-wide query IS the mach system-memory query here.
+            const double cap = dev ? vram_dev_total_mb_ : s_ram_total_mb;
+            const double use = dev ? vram_dev_used_mb_  : s_ram_used_mb;
+            if (cap > 0.0) {
+                Meter& m = meters[n_meters++];
+                m.used_mb = use; m.cap_mb = cap; m.mine_mb = s_eng_rss_mb;
+                snprintf(m.text, sizeof(m.text),
+                         "MEM  %.1f / %.0f GB  \xc2\xb7  engine %.1f (gpu %.1f)"
+                         "  \xc2\xb7  %.1f free",
+                         use / 1024.0, cap / 1024.0,
+                         s_eng_rss_mb / 1024.0, gpu_mine_mb / 1024.0,
+                         std::max(0.0, cap - use) / 1024.0);
+            }
+        } else {
+            if (s_ram_valid && s_ram_total_mb > 0.0) {
+                Meter& m = meters[n_meters++];
+                m.used_mb = s_ram_used_mb; m.cap_mb = s_ram_total_mb;
+                m.mine_mb = s_eng_rss_mb;
+                snprintf(m.text, sizeof(m.text),
+                         "RAM  %.1f / %.0f GB  \xc2\xb7  engine %.1f  \xc2\xb7"
+                         "  %.1f free",
+                         s_ram_used_mb / 1024.0, s_ram_total_mb / 1024.0,
+                         s_eng_rss_mb / 1024.0,
+                         std::max(0.0, s_ram_total_mb - s_ram_used_mb) / 1024.0);
+            }
+            const double cap_mb = dev ? vram_dev_total_mb_ : vram_total_mb_;
+            const double use_mb = dev ? vram_dev_used_mb_  : vram_used_mb_;
+            if ((dev || vram_valid_) && cap_mb > 0.0) {
+                Meter& m = meters[n_meters++];
+                m.used_mb = use_mb; m.cap_mb = cap_mb; m.mine_mb = gpu_mine_mb;
+                if (dev && vram_valid_)
+                    snprintf(m.text, sizeof(m.text),
+                             "VRAM %.1f / %.0f GB  \xc2\xb7  engine %.1f  "
+                             "\xc2\xb7  %.1f free",
+                             use_mb / 1024.0, cap_mb / 1024.0,
+                             gpu_mine_mb / 1024.0,
+                             std::max(0.0, cap_mb - use_mb) / 1024.0);
+                else
+                    snprintf(m.text, sizeof(m.text),
+                             "VRAM %.1f / %.0f GB  \xc2\xb7  %.1f free%s",
+                             use_mb / 1024.0, cap_mb / 1024.0,
+                             std::max(0.0, cap_mb - use_mb) / 1024.0,
+                             dev ? "" : "  (engine only)");
+            }
+        }
+        const bool vram_ok = n_meters > 0;
+
+        // FPS line (always) + one text line + bar per meter.
         char fbuf[48];
         snprintf(fbuf, sizeof(fbuf), "FPS  %.0f", ImGui::GetIO().Framerate);
-        char vbuf[128] = {0};
-        if (vram_ok) {
-            const double free_mb = std::max(0.0, cap_mb - use_mb);
-            // On Apple Silicon VRAM IS the unified system RAM (the device-wide
-            // numbers come from mach statistics) — label it accordingly so
-            // "used" reading as whole-system memory is not a surprise.
-#ifdef __APPLE__
-            const char* mem_lbl = "MEM ";
-#else
-            const char* mem_lbl = "VRAM";
-#endif
-            if (dev && vram_valid_)
-                snprintf(vbuf, sizeof(vbuf),
-                         "%s %.1f / %.0f GB  ·  engine %.1f  ·  %.1f free",
-                         mem_lbl, use_mb / 1024.0, cap_mb / 1024.0,
-                         mine_mb / 1024.0, free_mb / 1024.0);
-            else
-                snprintf(vbuf, sizeof(vbuf),
-                         "%s %.1f / %.0f GB  ·  %.1f free%s",
-                         mem_lbl, use_mb / 1024.0, cap_mb / 1024.0,
-                         free_mb / 1024.0,
-                         dev ? "" : "  (engine only)");
-        }
 
         // Effective shadow path (pushed by the app each frame): the
         // permanent answer to "is it actually raytracing?".
         const char* sbuf = effective_shadow_note_;
         const bool  shadow_line = (sbuf != nullptr && sbuf[0] != '\0');
 
-        // ── Tidy HUD panel: FPS on top, then (optional) VRAM text + bar ─────
+        // ── Tidy HUD panel: FPS on top, then the meter(s) ───────────────────
         ImVec2 vp_pos, vp_size, vp_c;
         getViewportScreenRect(vp_pos, vp_size, vp_c);
         const float kMenuH = ImGui::GetFrameHeight();
         const float inpad = 7.0f, gap = 5.0f, bar_h = 9.0f, line_gap = 2.0f;
         const float txt_h = ImGui::GetTextLineHeight();
         const ImVec2 fps_ts  = ImGui::CalcTextSize(fbuf);
-        const ImVec2 vram_ts = vram_ok ? ImGui::CalcTextSize(vbuf) : ImVec2(0, 0);
         const ImVec2 sh_ts = shadow_line ? ImGui::CalcTextSize(sbuf)
                                          : ImVec2(0, 0);
-        const float cont_w = std::max({fps_ts.x, vram_ts.x, sh_ts.x,
-                                       vram_ok ? 210.0f : 70.0f});
+        float cont_w = std::max({fps_ts.x, sh_ts.x,
+                                 vram_ok ? 210.0f : 70.0f});
+        for (int i = 0; i < n_meters; ++i)
+            cont_w = std::max(cont_w, ImGui::CalcTextSize(meters[i].text).x);
         const float panel_w = cont_w + inpad * 2.0f;
         float panel_h = inpad * 2.0f + txt_h;                 // FPS line
-        if (vram_ok) panel_h += line_gap + txt_h + gap + bar_h;
+        panel_h += n_meters * (line_gap + txt_h + gap + bar_h);
         if (shadow_line) panel_h += line_gap + txt_h;
         const float margin = 10.0f;
         const float right  = vp_pos.x + vp_size.x;
@@ -4009,38 +4060,39 @@ bool Menu::draw(
         dl->AddText(ImVec2(fp.x + 1.0f, fp.y + 1.0f), IM_COL32(0, 0, 0, 190), fbuf);
         dl->AddText(fp, IM_COL32(232, 232, 240, 245), fbuf);
 
-        if (vram_ok) {
-            const ImVec2 tp(p0.x + inpad, fp.y + txt_h + line_gap);
+        float cy = fp.y + txt_h;                              // layout cursor
+        for (int i = 0; i < n_meters; ++i) {
+            const Meter& m = meters[i];
+            const ImVec2 tp(p0.x + inpad, cy + line_gap);
             dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f),
-                        IM_COL32(0, 0, 0, 190), vbuf);          // shadow
-            dl->AddText(tp, IM_COL32(232, 232, 240, 245), vbuf);
+                        IM_COL32(0, 0, 0, 190), m.text);      // shadow
+            dl->AddText(tp, IM_COL32(232, 232, 240, 245), m.text);
 
             const ImVec2 b0(p0.x + inpad, tp.y + txt_h + gap);
             const ImVec2 b1(p1.x - inpad, b0.y + bar_h);
             const float  bw = b1.x - b0.x;
             dl->AddRectFilled(b0, b1, IM_COL32(40, 40, 48, 220), 2.0f);
 
-            const float fu = (float)std::min(1.0, std::max(0.0, use_mb / cap_mb));
+            const float fu = (float)std::min(1.0,
+                std::max(0.0, m.used_mb / m.cap_mb));
             const ImU32  used_col = fu < 0.70f ? IM_COL32( 90, 200, 120, 240)
                                   : fu < 0.90f ? IM_COL32(235, 190,  70, 240)
                                                : IM_COL32(235,  90,  80, 240);
             dl->AddRectFilled(b0, ImVec2(b0.x + bw * fu, b1.y), used_col, 2.0f);
 
-            // Engine's own Vulkan share overlaid in blue.
-            if (dev && mine_mb > 0.0) {
-                const float fm = (float)std::min((double)fu, mine_mb / cap_mb);
+            // Engine's own share overlaid in blue.
+            if (m.mine_mb > 0.0) {
+                const float fm = (float)std::min((double)fu,
+                                                 m.mine_mb / m.cap_mb);
                 dl->AddRectFilled(b0, ImVec2(b0.x + bw * fm, b1.y),
                                   IM_COL32(80, 160, 245, 245), 2.0f);
             }
             dl->AddRect(b0, b1, IM_COL32(0, 0, 0, 140), 2.0f);
+            cy = b1.y;
         }
 
         if (shadow_line) {
-            // Below the VRAM bar (or the FPS line when VRAM is absent).
-            const float sy = vram_ok
-                ? (fp.y + txt_h + line_gap + txt_h + gap + bar_h + line_gap)
-                : (fp.y + txt_h + line_gap);
-            const ImVec2 sp(p0.x + inpad, sy);
+            const ImVec2 sp(p0.x + inpad, cy + line_gap);
             const ImU32 col = effective_shadow_warn_
                 ? IM_COL32(240, 185, 80, 245)     // fallback: orange
                 : IM_COL32(140, 225, 150, 245);   // as selected: green

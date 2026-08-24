@@ -22,4 +22,15 @@ namespace engine {
 bool queryDeviceWideVramBytes(unsigned long long& free_bytes,
                               unsigned long long& total_bytes);
 
+// System RAM: total physical memory and currently-available (reclaimable)
+// memory.  Windows: GlobalMemoryStatusEx; Linux: /proc/meminfo MemAvailable;
+// macOS: mach host statistics (the same pool the unified-memory GPU query
+// reports).
+bool querySystemMemoryBytes(unsigned long long& free_bytes,
+                            unsigned long long& total_bytes);
+
+// This process's physical-memory footprint (working set / RSS; on macOS the
+// phys_footprint Activity Monitor charges the process, Metal memory included).
+bool queryProcessMemoryBytes(unsigned long long& rss_bytes);
+
 }  // namespace engine
