@@ -3951,15 +3951,24 @@ bool Menu::draw(
         char vbuf[128] = {0};
         if (vram_ok) {
             const double free_mb = std::max(0.0, cap_mb - use_mb);
+            // On Apple Silicon VRAM IS the unified system RAM (the device-wide
+            // numbers come from mach statistics) — label it accordingly so
+            // "used" reading as whole-system memory is not a surprise.
+#ifdef __APPLE__
+            const char* mem_lbl = "MEM ";
+#else
+            const char* mem_lbl = "VRAM";
+#endif
             if (dev && vram_valid_)
                 snprintf(vbuf, sizeof(vbuf),
-                         "VRAM %.1f / %.0f GB  ·  engine %.1f  ·  %.1f free",
-                         use_mb / 1024.0, cap_mb / 1024.0,
+                         "%s %.1f / %.0f GB  ·  engine %.1f  ·  %.1f free",
+                         mem_lbl, use_mb / 1024.0, cap_mb / 1024.0,
                          mine_mb / 1024.0, free_mb / 1024.0);
             else
                 snprintf(vbuf, sizeof(vbuf),
-                         "VRAM %.1f / %.0f GB  ·  %.1f free%s",
-                         use_mb / 1024.0, cap_mb / 1024.0, free_mb / 1024.0,
+                         "%s %.1f / %.0f GB  ·  %.1f free%s",
+                         mem_lbl, use_mb / 1024.0, cap_mb / 1024.0,
+                         free_mb / 1024.0,
                          dev ? "" : "  (engine only)");
         }
 

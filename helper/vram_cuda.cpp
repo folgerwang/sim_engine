@@ -15,6 +15,10 @@
 #else
   #include <dlfcn.h>
 #endif
+#if defined(__APPLE__)
+  #include <mach/mach.h>
+  #include <sys/sysctl.h>
+#endif
 
 #include <cstddef>
 
@@ -124,10 +128,48 @@ bool tryCuda(unsigned long long& free_b, unsigned long long& total_b) {
     return true;
 }
 
+#if defined(__APPLE__)
+// ── Apple Silicon: unified memory — "device-wide VRAM" IS system RAM ────────
+// The GPU shares one pool with the CPU/OS, so the honest device-wide numbers
+// are total physical memory and how much of it the system currently holds.
+// "Used" mirrors Activity Monitor's Memory Used (active + wired + compressed);
+// inactive/speculative/purgeable pages are reclaimable on demand and count as
+// free — that is the memory the GPU could actually get.
+bool tryAppleUnified(unsigned long long& free_b, unsigned long long& total_b) {
+    uint64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) != 0 ||
+        memsize == 0)
+        return false;
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS)
+        return false;
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS || page == 0)
+        page = 16384;
+    const unsigned long long used =
+        (static_cast<unsigned long long>(vm.active_count) +
+         static_cast<unsigned long long>(vm.wire_count) +
+         static_cast<unsigned long long>(vm.compressor_page_count)) *
+        static_cast<unsigned long long>(page);
+    total_b = memsize;
+    free_b  = used < memsize ? memsize - used : 0;
+    return true;
+}
+#endif
+
 }  // namespace
 
 bool queryDeviceWideVramBytes(unsigned long long& free_bytes,
                               unsigned long long& total_bytes) {
+#if defined(__APPLE__)
+    // Unified memory: NVML/CUDA never exist here; mach statistics are the
+    // device-wide truth.
+    if (tryAppleUnified(free_bytes, total_bytes)) return true;
+#endif
     // NVML first (true cross-process), then CUDA as a fallback.
     if (tryNvml(free_bytes, total_bytes)) return true;
     if (tryCuda(free_bytes, total_bytes)) return true;
