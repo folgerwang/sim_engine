@@ -7924,7 +7924,8 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
         };
 
     task_manager.submit(
-        file_name, std::move(phase2_fn), std::move(phase3_fn));
+        file_name, std::move(phase2_fn), std::move(phase3_fn),
+        /*phase2_records_into_cmd_buf=*/false);
 
     return obj;
 }

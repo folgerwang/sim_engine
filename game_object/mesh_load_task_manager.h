@@ -76,6 +76,17 @@ struct MeshLoadTask {
 
     Phase2Fn phase2_fn;
     Phase3Fn phase3_fn;
+
+    // Whether phase2_fn records commands into the cmd_buf it is handed
+    // (e.g. the terrain detail streamer's copies), as opposed to ignoring
+    // it and uploading through the device's per-thread transient channel
+    // itself (the drawable loaders).  The single-queue SYNC fallback needs
+    // to know: a recording phase2 gets the shared transient buffer wrapped
+    // around it (it never touches that channel internally), while a
+    // transient-channel phase2 must NOT be wrapped — the nested
+    // submitAndWait would reset the shared buffer under the outer end
+    // (VK_NOT_READY on MoltenVK).
+    bool phase2_records_into_cmd_buf = true;
 };
 
 // Manages a single worker thread that drains a task queue. One manager
@@ -98,7 +109,8 @@ public:
     std::shared_ptr<MeshLoadTask> submit(
         const std::string&          filename,
         MeshLoadTask::Phase2Fn      phase2_fn,
-        MeshLoadTask::Phase3Fn      phase3_fn);
+        MeshLoadTask::Phase3Fn      phase3_fn,
+        bool                        phase2_records_into_cmd_buf = true);
 
     // Main-thread tick. Runs phase3_fn for any in-flight tasks whose
     // fence has signaled. Cheap when nothing is ready.

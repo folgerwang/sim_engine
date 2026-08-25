@@ -56,12 +56,14 @@ MeshLoadTaskManager::~MeshLoadTaskManager() {
 std::shared_ptr<MeshLoadTask> MeshLoadTaskManager::submit(
     const std::string&          filename,
     MeshLoadTask::Phase2Fn      phase2_fn,
-    MeshLoadTask::Phase3Fn      phase3_fn) {
+    MeshLoadTask::Phase3Fn      phase3_fn,
+    bool                        phase2_records_into_cmd_buf) {
 
     auto task       = std::make_shared<MeshLoadTask>();
     task->filename  = filename;
     task->phase2_fn = std::move(phase2_fn);
     task->phase3_fn = std::move(phase3_fn);
+    task->phase2_records_into_cmd_buf = phase2_records_into_cmd_buf;
 
     if (!async_enabled_) {
         // Single-queue hardware path: do everything right here. Matches
@@ -302,18 +304,45 @@ void MeshLoadTaskManager::runPhase2(
                 std::lock_guard<std::mutex> lock(in_flight_mutex_);
                 in_flight_tasks_.push_back(task);
             }
+        } else if (task->phase2_records_into_cmd_buf) {
+            // Sync fallback, RECORDING phase2 (e.g. the terrain detail
+            // streamer): it records copies into the buffer we hand it and
+            // never touches the transient channel internally, so wrap it
+            // in the shared transient command buffer + blocking submit.
+            auto cmd_buf = device_->setupTransientCommandBuffer();
+            task->cmd_buf = cmd_buf;
+
+            std::string err;
+            bool ok = false;
+            if (task->phase2_fn) {
+                ok = task->phase2_fn(device_, cmd_buf, err);
+            }
+
+            // Close the shared buffer out either way so it stays usable
+            // for the next caller.
+            device_->submitAndWaitTransientCommandBuffer();
+
+            if (!ok) {
+                task->error_message =
+                    err.empty() ? "phase2_fn returned false" : err;
+                task->status.store(MeshLoadStatus::kError,
+                    std::memory_order_release);
+                std::cerr
+                    << "[MESHLOAD] phase2 error for '" << task->filename
+                    << "' (sync path): " << task->error_message << std::endl;
+                return;
+            }
+
+            task->status.store(MeshLoadStatus::kGpuSubmitted,
+                std::memory_order_release);
         } else {
-            // Sync fallback (single-queue devices, e.g. MoltenVK/macOS).
-            // Do NOT open the per-thread transient command buffer here:
-            // phase2's loaders perform their GPU uploads through that
-            // same channel themselves (Helper::createBuffer ->
-            // setupTransientCommandBuffer on THIS thread), so an outer
-            // begin here is re-entered — the nested submitAndWait resets
-            // the shared buffer and the outer end then throws
-            // VK_NOT_READY.  The only phase2 implementation deliberately
-            // never records into the passed cmd_buf (it exists to carry
-            // the async path's fence, which the sync path doesn't need),
-            // so pass null and let the nested uploads block internally.
+            // Sync fallback, TRANSIENT-CHANNEL phase2 (the drawable
+            // loaders): they ignore the passed cmd_buf and upload through
+            // the per-thread transient channel themselves — wrapping them
+            // in that same shared buffer re-enters it (the nested
+            // submitAndWait resets it and the outer end throws
+            // VK_NOT_READY on MoltenVK).  No outer buffer at all; the
+            // nested uploads block internally.
             task->cmd_buf = nullptr;
 
             std::string err;
