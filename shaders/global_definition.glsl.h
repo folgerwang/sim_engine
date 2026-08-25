@@ -11,7 +11,14 @@
 //#define MATERIAL_UNLIT
 
 #define VINPUT_VERTEX_BINDING_POINT         30
-#define VINPUT_INSTANCE_BINDING_POINT       31
+// 29, not 31: Metal exposes 31 vertex-stage buffer slots and MoltenVK maps
+// Vulkan vertex binding b to Metal buffer index (30 - b), so binding 31
+// resolved to -1 and Metal asserted at pipeline creation
+// ("bufferIndex(4294967295) must be < 31").  Vertex bindings are API-side
+// IDs only (shaders address attributes by location), so the value is
+// otherwise arbitrary; mesh attribute bindings count up from 0 and are
+// asserted to stay below this.
+#define VINPUT_INSTANCE_BINDING_POINT       29
 
 // Vertex input attribute location.
 #define VINPUT_POSITION             0
