@@ -427,6 +427,11 @@ public:
     // MoltenVK/macOS).  Valid after initRayTracingProperties has run.
     static bool isRayTracingSupported();
 
+    // False when the device lacks geometry shaders / task+mesh shaders
+    // (e.g. MoltenVK/macOS).  Valid after device creation.
+    static bool isGeometryShaderSupported();
+    static bool isMeshShaderSupported();
+
     static void createSwapChain(
         GLFWwindow* window,
         const std::shared_ptr<Device>& device,

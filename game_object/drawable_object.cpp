@@ -6025,6 +6025,12 @@ static std::shared_ptr<renderer::Pipeline> createDrawableCsmLayeredPipeline(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const ego::PrimitiveInfo& primitive,
     bool is_opaque) {
+    // No geometry stage on this device (MoltenVK/macOS): the layered
+    // single-pass CSM path can't exist.  Cache a null pipeline; the CSM
+    // draw mode is clamped to kRegular (per-cascade) on such devices.
+    if (!renderer::Helper::isGeometryShaderSupported()) {
+        return nullptr;
+    }
     return createDrawableShadowPipelineInternal(
         device, renderbuffer_formats, pipeline_layout,
         graphic_pipeline_info, primitive, /*csm_layered*/ true, is_opaque);
@@ -6069,6 +6075,11 @@ static std::shared_ptr<renderer::Pipeline> createDrawableCsmMeshShaderPipeline(
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const ego::PrimitiveInfo& primitive) {
+    // No task/mesh stages on this device (MoltenVK/macOS): cache a null
+    // pipeline; the CSM draw mode is clamped to kRegular there.
+    if (!renderer::Helper::isMeshShaderSupported()) {
+        return nullptr;
+    }
 
     renderer::ShaderModuleList shader_modules(2);
     shader_modules[0] = renderer::helper::loadShaderModule(

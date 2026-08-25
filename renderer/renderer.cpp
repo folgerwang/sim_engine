@@ -202,6 +202,14 @@ bool Helper::isRayTracingSupported() {
     return vk::helper::isRayTracingSupported();
 }
 
+bool Helper::isGeometryShaderSupported() {
+    return vk::helper::isGeometryShaderSupported();
+}
+
+bool Helper::isMeshShaderSupported() {
+    return vk::helper::isMeshShaderSupported();
+}
+
 void Helper::createSwapChain(
     GLFWwindow* window,
     const std::shared_ptr<Device>& device,

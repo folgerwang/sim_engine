@@ -2042,6 +2042,21 @@ std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
     return picked_device;
 }
 
+// Geometry / task+mesh shader availability, recorded while the requested
+// features and extensions are filtered against the driver in
+// createLogicalDevice below.  True on drivers where nothing is filtered
+// (Windows/Linux request them unconditionally); false on MoltenVK/macOS.
+static bool s_geometry_shader_supported = true;
+static bool s_mesh_shader_supported = true;
+
+bool isGeometryShaderSupported() {
+    return s_geometry_shader_supported;
+}
+
+bool isMeshShaderSupported() {
+    return s_mesh_shader_supported;
+}
+
 std::shared_ptr<renderer::Device> createLogicalDevice(
     const std::shared_ptr<renderer::PhysicalDevice>& physical_device,
     const std::shared_ptr<renderer::Surface>& surface,
@@ -2166,6 +2181,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
             enabled(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
             enabled(VK_KHR_RAY_QUERY_EXTENSION_NAME);
         has_mesh_ext = enabled(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        s_mesh_shader_supported = has_mesh_ext;
     }
 #endif
     create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_device_extensions.size());
@@ -2311,6 +2327,7 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
             }
         };
         mask(device_features.geometryShader,      sup2.features.geometryShader,      "geometryShader");
+        s_geometry_shader_supported = (device_features.geometryShader == VK_TRUE);
         mask(device_features.shaderInt16,         sup2.features.shaderInt16,         "shaderInt16");
         mask(device_features.multiDrawIndirect,   sup2.features.multiDrawIndirect,   "multiDrawIndirect");
         mask(device_features.drawIndirectFirstInstance, sup2.features.drawIndirectFirstInstance, "drawIndirectFirstInstance");

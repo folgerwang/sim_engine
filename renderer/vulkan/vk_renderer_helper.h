@@ -174,6 +174,13 @@ void initRayTracingProperties(
 // pointers fetched by initRayTracingProperties are null otherwise).
 bool isRayTracingSupported();
 
+// False when the device lacks geometry shaders / VK_EXT_mesh_shader (e.g.
+// MoltenVK/macOS, where the feature and extension are filtered at device
+// creation).  Valid after createLogicalDevice has run; pipelines using
+// those stages must check before creating.
+bool isGeometryShaderSupported();
+bool isMeshShaderSupported();
+
 VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& available_formats);
 
 renderer::PresentMode chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes);

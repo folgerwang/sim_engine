@@ -4031,15 +4031,18 @@ void ClusterRenderer::initBindlessShadowPipeline(
     // (cluster, cascade) pairs.  Mesh shader then emits triangles
     // without any further cull.  See cluster_bindless_shadow.task and
     // .mesh for the per-stage rationale.
-    er::ShaderModuleList shader_modules(2);
-    shader_modules[0] = er::helper::loadShaderModule(
-        device_, "cluster_bindless_shadow_task.spv",
-        er::ShaderStageFlagBits::TASK_BIT_EXT,
-        std::source_location::current());
-    shader_modules[1] = er::helper::loadShaderModule(
-        device_, "cluster_bindless_shadow_mesh.spv",
-        er::ShaderStageFlagBits::MESH_BIT_EXT,
-        std::source_location::current());
+    er::ShaderModuleList shader_modules;
+    if (er::Helper::isMeshShaderSupported()) {
+        shader_modules.resize(2);
+        shader_modules[0] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_shadow_task.spv",
+            er::ShaderStageFlagBits::TASK_BIT_EXT,
+            std::source_location::current());
+        shader_modules[1] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_shadow_mesh.spv",
+            er::ShaderStageFlagBits::MESH_BIT_EXT,
+            std::source_location::current());
+    }
 
     // ── Framebuffer format ──────────────────────────────────────────
     // No colour attachments; single depth-array attachment.
@@ -4050,7 +4053,12 @@ void ClusterRenderer::initBindlessShadowPipeline(
     shadow_fmt.color_formats = {};
     shadow_fmt.depth_format  = shadow_depth_format;
 
-    bindless_shadow_pipeline_ = device_->createPipeline(
+    // Null on devices without task+mesh shaders (MoltenVK/macOS); every
+    // draw site already null-checks and the CSM mode is clamped to
+    // kRegular there.
+    bindless_shadow_pipeline_ = shader_modules.empty()
+        ? nullptr
+        : device_->createPipeline(
         bindless_shadow_pipeline_layout_,
         binding_descs,
         attrib_descs,
@@ -4099,7 +4107,10 @@ void ClusterRenderer::initBindlessShadowPipeline(
     // VS passes world position; GS broadcasts each tri to all 6 layers
     // applying lights_params.light_view_proj[cascade] per emit.  Layered
     // FB (CSM_CASCADE_COUNT) — same as the mesh-shader pipeline.
-    {
+    if (er::Helper::isGeometryShaderSupported()) {
+        // Skipped wholesale on devices without geometry shaders
+        // (MoltenVK/macOS): the pipeline stays null and the GS draw
+        // site's null-check keeps it inert.
         bindless_shadow_gs_pipeline_layout_ = device_->createPipelineLayout(
             aux_layouts, {}, std::source_location::current());
 
@@ -4236,7 +4247,11 @@ void ClusterRenderer::initCsmSilhouettePrepassPipeline(
     info.blend_state_info   = blend_state;
     info.depth_stencil_info = silhouette_depth_stencil;
 
-    // Single mesh shader stage.
+    // Single mesh shader stage.  No mesh shaders on this device: leave
+    // the prepass pipeline null (drawCsmSilhouettePrepass null-checks).
+    if (!er::Helper::isMeshShaderSupported()) {
+        return;
+    }
     er::ShaderModuleList shader_modules(1);
     shader_modules[0] = er::helper::loadShaderModule(
         device_, "csm_silhouette_prepass_mesh.spv",
