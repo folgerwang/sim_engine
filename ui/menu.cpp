@@ -4198,8 +4198,10 @@ void Menu::drawEditorDockSpace() {
     if (!editor_layout_built_) {
         editor_layout_built_ = true;
         ImGui::DockBuilderRemoveNode(dock_id);
+        // DockSpace lives in the private flags enum; OR through the int
+        // typedef so C++20 doesn't flag the mixed-enum arithmetic.
         ImGui::DockBuilderAddNode(dock_id,
-            ImGuiDockNodeFlags_DockSpace |
+            static_cast<ImGuiDockNodeFlags>(ImGuiDockNodeFlags_DockSpace) |
             ImGuiDockNodeFlags_PassthruCentralNode);
         ImGui::DockBuilderSetNodeSize(dock_id, vp->WorkSize);
 

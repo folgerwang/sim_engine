@@ -12,7 +12,7 @@ namespace vk {
 
 const char* VkResultToString(VkResult result);
 
-class VulkanDevice : public Device {
+class VulkanDevice final : public Device {
     VkDevice        device_;
     const std::shared_ptr<PhysicalDevice>& physical_device_;
     std::shared_ptr<CommandPool> transient_cmd_pool_;
