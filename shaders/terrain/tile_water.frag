@@ -230,116 +230,124 @@ float warpedNoise(vec2 p) {
 }
 
 
-// ── Wind waves — SHADING ONLY ───────────────────────────────────────
-// A small sum of directional wave trains, evaluated for its SLOPE and
-// nothing else.  No vertex moves, the water height field is untouched
-// and the LBM sim is not consulted: collision, buoyancy, the depth test
-// at the top of main() and every gameplay query still see exactly the
-// flat surface they saw before.  Only the normal shading uses changes.
+// ── Wind waves — SHADING ONLY, FBM-driven ───────────────────────────
+// The water GEOMETRY is flat and stays flat: no vertex moves, the
+// height field is untouched, and collision, buoyancy, the depth test at
+// the top of main() and every gameplay query still see the flat
+// surface.  Only the shading normal is perturbed.
 //
-// Each train contributes an analytic d(height)/d(world xz), so the cost
-// is one sin/cos per train rather than a finite difference of the very
-// expensive warped noise.  Deep-water dispersion (w = sqrt(g*k)) ties a
-// train's speed to its wavelength, which is what keeps the stack from
-// sliding across the surface as one rigid sheet.
-// FALLBACK wind only.  The wave trains below take their direction and
-// strength from windAt() (weather/wind_field.glsl.h) once the wind
-// field is bound; this literal is what they fall back to before the
-// patch is live, and it is the reason the waves currently blow the
-// same way over the whole map regardless of weather.  See the
-// WIND_FIELD block in main().
-const vec2  kWindDir     = vec2(0.8575f, 0.5145f);  // normalised
-const float kWaveLen0_M  = 46.0f;   // longest train's wavelength
-const float kWaveAmp0_M  = 0.42f;   // and its amplitude
-const float kWaveLenFall = 0.44f;   // wavelength ratio between trains
-const float kWaveAmpFall = 0.55f;   // amplitude ratio between trains
-const float kWaveFan     = 1.07f;   // rad each train is fanned off the wind
-const float kWaveGain    = 1.15f;   // overall steepness trim
-const int   kWaveTrains  = 5;
+// WHY FBM AND NOT WAVE TRAINS.  The previous version summed five
+// directional sinusoid trains (Gerstner-style, with hashed fans, a
+// domain warp and a gust field to break the repeat).  A sinusoid's
+// crests are still parallel lines however much their phase is
+// scrambled, and at a grazing view across a wide body the eye
+// integrates along the crest direction — the scrambles average out and
+// the parallel banding comes straight back.  That is the "weird
+// stretched lines" this replaced.  Fractal noise has no axis: its
+// isolines are closed blobs at every octave, so there is no direction
+// for the eye to integrate along and nothing to band.
+//
+// The slope comes from CENTRAL DIFFERENCES of a small value-noise FBM,
+// in world metres, with the finite-difference step tied to the
+// fragment's footprint — a far pixel differentiates across its own
+// width, which pre-filters the field instead of aliasing it.  Octaves
+// the footprint has swallowed retire into `out_micro` and come back as
+// roughness, same contract as before.
+const vec2  kWindDir     = vec2(0.8575f, 0.5145f);  // fallback wind
+const float kWaveGain    = 1.0f;    // overall slope trim
+const float kFbmLen0_M   = 34.0f;   // longest octave's wavelength
+// STEEPNESS per octave — dimensionless slope, the Gerstner ka.  This is
+// deliberately NOT a height amplitude: slope is height/wavelength, so a
+// height parametrised across a 34 m -> 1.5 m octave stack gives the
+// long octaves ~amp/34 of tilt — a near-perfect mirror, which at a
+// grazing view reflects the sky at Fresnel ~1 and makes the whole lake
+// render sky-coloured ("all the water gone").  Steepness is what the
+// eye reads; height never appears in the shading at all.
+const float kFbmSteep0   = 0.17f;   // longest octave's slope
+const float kFbmLenFall  = 0.46f;   // wavelength ratio octave -> octave
+const float kFbmSteepFall= 0.68f;   // steepness ratio octave -> octave
+const int   kFbmOctaves  = 5;       // 34 / 15.6 / 7.2 / 3.3 / 1.5 m
+// Fraction of the deep-water phase speed each octave advects at.  Full
+// dispersion looks frantic at this amplitude; slower reads calmer while
+// long waves still outrun short ones, which is what keeps the stack
+// from sliding across the surface as one rigid sheet.
+const float kFbmDriftK   = 0.55f;
 
-// ── Randomisation ───────────────────────────────────────────────────
-// Evenly fanned trains of harmonic wavelength interfere into a regular
-// crosshatch: it moves, but it reads as a TEXTURE rather than as water,
-// and the repeat is obvious the moment you look across a wide river.
-// Three independent scrambles break it, none of them per-frame random
-// (everything is a function of world position and time, so the surface
-// is stable and identical on every machine):
-//
-//   * PER-TRAIN HASH — irregular fan angles, non-harmonic wavelengths
-//     and random starting phases, so no two trains ever line up into
-//     a moire.
-//   * DOMAIN WARP — a slow low-frequency offset of the sample point, so
-//     crests meander instead of running dead straight bank to bank.
-//   * GUST FIELD — a coarse noise patch drifting downwind that scales
-//     the whole stack, so the surface is choppy in places and nearly
-//     glassy between them.  Real wind leaves exactly these cat's-paws,
-//     and the varying amplitude is what stops the eye finding a period.
-//
-// The warp and gust use single-octave smoothNoise, not the 4-octave
-// warpedNoise above: they are 200-600 m features, so the extra octaves
-// would cost four times as much to say the same thing.
-const float kWaveSpread  = 0.85f;   // rad of random slop on the fan
+// ── Spatial variation ───────────────────────────────────────────────
+// GUST FIELD: a coarse noise patch drifting downwind scales the whole
+// stack, so the surface is choppy in places and near-glassy between
+// them — real wind leaves exactly these cat's-paws, and the varying
+// amplitude is what stops the eye finding any period.
+// DOMAIN WARP: a slow offset of the sample point, so the noise field's
+// own low-frequency structure meanders instead of sitting still.
 const float kWarpScale   = 0.0045f; // domain-warp frequency (1/m)
-const float kWarpAmp_M   = 9.0f;    // how far crests meander
+const float kWarpAmp_M   = 9.0f;    // how far the field meanders
 const float kGustScale   = 0.0016f; // gust-patch frequency (1/m) ~625 m
 const float kGustDrift   = 0.9f;    // m/s the gust field slides downwind
 const float kGustFloor   = 0.35f;   // amplitude in a lull
 const float kGustRange   = 1.25f;   // extra amplitude in a gust
-const float kWindTurn    = 0.35f;   // rad the LOCAL wind swings
 // smoothNoise hashes on (x + 27*y), so its lattice repeats along one
-// diagonal.  Sampling the three fields in ROTATED domains puts each
-// one's repeat on a different axis, and they stop reinforcing into a
-// visible tiling.
+// diagonal.  Rotating the domain a little every octave puts each
+// octave's repeat on a different axis, so they never reinforce into a
+// visible tiling — the same trick the old trains used, kept.
 const mat2  kDecorr      = mat2(0.936f, 0.352f, -0.352f, 0.936f);
 
-// Returns the surface slope (dh/dx, dh/dz).  `footprint` is the world
-// span this fragment covers: a train whose wavelength approaches the
-// pixel can no longer be drawn, so instead of aliasing into shimmer it
-// retires into `out_micro` and comes back as roughness.
+// One octave's height at a warped, advected, rotated sample point.
+float fbmWaveOctave(vec2 q, float inv_len) {
+    return smoothNoise(q * inv_len) * 2.0f - 1.0f;
+}
+
+// Returns the surface slope (dh/dx, dh/dz) in world units.  `footprint`
+// is the world span this fragment covers; `jitter` decorrelates
+// neighbouring fragments' advection slightly so the field never reads
+// as one rigid sheet even where the octaves agree.
 vec2 windWaveSlope(vec2 p, float t, float footprint, float jitter,
                    vec2 wind_dir, float wind_gain,
                    out float out_micro) {
-    // ── the three scrambles, resolved once for this fragment ────────
+    // Gust + warp, resolved once for this fragment.
     vec2  gp   = (p - wind_dir * (t * kGustDrift)) * kGustScale;
     float gust = kGustFloor + kGustRange * smoothNoise(gp);
-    float turn = kWindTurn *
-                 (smoothNoise(kDecorr * gp * 0.5f + 11.3f) * 2.0f - 1.0f);
     vec2  w0   = p * kWarpScale;
     vec2  wp   = p + kWarpAmp_M *
                  (vec2(smoothNoise(w0),
                        smoothNoise(kDecorr * w0 + 37.2f)) * 2.0f - 1.0f);
-    float cw = cos(turn), sw = sin(turn);
-    vec2  wind = vec2(wind_dir.x * cw - wind_dir.y * sw,
-                      wind_dir.x * sw + wind_dir.y * cw);
 
     vec2  slope = vec2(0.0f);
     float micro = 0.0f;
-    float len   = kWaveLen0_M;
-    float amp   = kWaveAmp0_M;
-    for (int i = 0; i < kWaveTrains; ++i) {
-        vec2  h   = hash2D(vec2(float(i) * 17.13f + 4.7f, 91.7f));
-        float ang = kWaveFan * float(i) + (h.x - 0.5f) * kWaveSpread;
-        float ca = cos(ang), sa = sin(ang);
-        vec2  dir = vec2(wind.x * ca - wind.y * sa,
-                         wind.x * sa + wind.y * ca);
-        float tl = len * (0.82f + 0.36f * h.y);     // off the harmonic
-        float k  = 6.28318530718f / tl;
-        float w  = sqrt(9.81f * k);                 // deep-water dispersion
-        // random start phase + a wander from the warped noise, so even
-        // two trains of similar length never beat against each other
-        float ph = k * dot(dir, wp) - w * t
-                 + h.x * 6.28318530718f
-                 + jitter * float(i + 1) * 0.35f;
-        // h = amp * sharp^2 with sharp = 0.5 + 0.5*sin: a flatter
-        // trough and a tighter crest than a plain sine, which is the
-        // shape wind actually pushes water into.
-        float sharp = 0.5f + 0.5f * sin(ph);
-        float dh    = amp * k * sharp * cos(ph);    // dh/d(dot(dir,wp))
-        float vis   = smoothstep(1.5f, 4.0f, tl / footprint);
-        slope += dir * (dh * vis);
-        micro += amp * k * (1.0f - vis);
-        len *= kWaveLenFall;
-        amp *= kWaveAmpFall;
+    float len   = kFbmLen0_M;
+    float stp   = kFbmSteep0;
+    vec2  q     = wp + jitter * 0.4f;
+    for (int i = 0; i < kFbmOctaves; ++i) {
+        float inv_len = 1.0f / len;
+        // Deep-water-ish phase speed, damped: long octaves travel,
+        // short chop mostly shimmers in place.
+        float c = kFbmDriftK * sqrt(1.5613f * len);   // sqrt(g*len/2pi)
+        vec2  sp = q - wind_dir * (t * c);
+        // Finite-difference step: half the pixel footprint, floored at
+        // a small fraction of the octave's own wavelength.  Sampling
+        // the derivative across the pixel IS the low-pass filter that
+        // keeps the far field from shimmering.
+        float e  = max(0.5f * footprint, 0.03f * len);
+        float hx = fbmWaveOctave(sp + vec2(e, 0.0f), inv_len)
+                 - fbmWaveOctave(sp - vec2(e, 0.0f), inv_len);
+        float hz = fbmWaveOctave(sp + vec2(0.0f, e), inv_len)
+                 - fbmWaveOctave(sp - vec2(0.0f, e), inv_len);
+        // Octaves the footprint has swallowed retire into roughness
+        // instead of aliasing into sparkle.
+        float vis = smoothstep(1.5f, 4.0f, len / footprint);
+        // Normalise the central difference to the octave's own scale:
+        // hx / (2e * inv_len) is the noise derivative in NOISE space,
+        // O(1) whatever the wavelength — then steepness scales it.
+        // (Dividing by e alone is what made the first version a
+        // mirror: it left a stray 1/len in the contribution.)
+        vec2 dn = vec2(hx, hz) / (2.0f * e * inv_len);
+        slope += dn * (stp * vis);
+        micro += stp * (1.0f - vis);
+        // Rotate the domain between octaves so the value-noise lattice
+        // never lines up with itself.
+        q   = kDecorr * q;
+        len *= kFbmLenFall;
+        stp *= kFbmSteepFall;
     }
     out_micro = micro * gust * wind_gain;
     return slope * (kWaveGain * gust * wind_gain);
@@ -416,19 +424,19 @@ void main() {
     }
     float water_noise = (noise * 2.0f - 1.0f);
 
-    vec3 water_normal;
-    water_normal.xz = texture(water_normal_tex, in_data.world_map_uv).xy;
-    vec2 water_flow = texture(water_flow_tex, in_data.world_map_uv).xy;
-    water_normal.y = sqrt(1.0f - dot(water_normal.xz, water_normal.xz));
-    water_normal.xz += water_flow * 0.5;
-    water_normal.y += water_noise * 0.35;
-    // ── Wind waves into the normal ──────────────────────────────────
+    // ── Base normal: FLAT ───────────────────────────────────────────
+    // The sim textures are deliberately NOT consulted any more.  Both
+    // are world-map resolution (~8 m/texel over the whole 32 km), and
+    // bilinear interpolation of texels that coarse cannot draw a wave —
+    // it draws its own lattice: water_normal_tex's banding was the
+    // broad dark stripes across open water, and the flow map's texel
+    // chain was the dotted "footprint" trail down the current line.
+    // Those two were most of the "weird lines".  The surface starts
+    // flat and EVERY tilt on it now comes from the FBM below (plus the
+    // LBM patch near the camera), which has no lattice to show.
+    vec3 water_normal = vec3(0.0f, 1.0f, 0.0f);
     // A height field's normal is (-dh/dx, 1, -dh/dz), so the wave
-    // slopes have to STEER the normal in xz.  The line above only ever
-    // scaled y, which changes how far the normal is tilted but never
-    // which way it faces — no amount of it can draw a crest, which is
-    // why the surface read as glass.  The trains ride on top of the
-    // flow-map tilt, so a river's current still shapes them.
+    // slopes STEER the normal in xz.
     // Waves shoal out at the bank: full height in open water, flat by
     // the time the column is a few tens of cm, so the surface still
     // meets the shore as the same soft wet line.
