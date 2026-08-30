@@ -2193,9 +2193,71 @@ bool Menu::draw(
                                     turn_off_water_pass_)) {
                     turn_off_water_pass_ = !turn_off_water_pass_;
                 }
+                // ── Water blend ─────────────────────────────────────
+                // Lives HERE, beside the pass toggle it explains, not
+                // in the Weather window: these shape how the water
+                // SURFACE composites (tile_water.frag), while Weather
+                // owns the water SIMULATION (flow, moisture).  "bed
+                // visibility" is the one to reach for first -- the
+                // ceiling on how much river bed shows through, so 0 is
+                // the fully opaque sheet and 1 is glass; the rest is
+                // how depth and the waterline modulate that.
+                if (ImGui::BeginMenu("Water blend")) {
+                    ImGui::SliderFloat("bed visibility (max clarity)",
+                                       &water_max_clarity_, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("surface opacity",
+                                       &water_opacity_, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("extinction / m",
+                                       &water_extinction_, 0.0f, 4.0f, "%.2f");
+                    ImGui::SliderFloat("depth scale",
+                                       &water_depth_scale_, 0.1f, 20.0f, "%.2f");
+                    ImGui::ColorEdit3("deep tint", water_tint_);
+                    ImGui::SliderFloat("deep sky diffuse",
+                                       &water_deep_diffuse_, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("shore edge (m)",
+                                       &water_shore_edge_m_, 0.0f, 1.0f, "%.3f");
+                    ImGui::SliderFloat("shore fade scale",
+                                       &water_shore_fade_scale_, 0.0f, 8.0f, "%.2f");
+                    ImGui::SliderFloat("shore fade max (m)",
+                                       &water_shore_fade_max_m_, 0.05f, 2.0f, "%.2f");
+                    // Mirrors the field initializers in menu.h (the
+                    // hand-tuned 2026-08 look) -- keep the two in sync.
+                    if (ImGui::Button("Reset water blend")) {
+                        water_max_clarity_      = 0.28f;
+                        water_extinction_       = 1.69f;
+                        water_depth_scale_      = 4.73f;
+                        water_opacity_          = 0.61f;
+                        water_tint_[0]          = 0.12f;
+                        water_tint_[1]          = 0.32f;
+                        water_tint_[2]          = 0.38f;
+                        water_deep_diffuse_     = 0.44f;
+                        water_shore_edge_m_     = 0.584f;
+                        water_shore_fade_scale_ = 6.89f;
+                        water_shore_fade_max_m_ = 1.29f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Opaque")) {
+                        // What the water looked like before it blended
+                        // with the bed at all -- one click, to compare.
+                        water_max_clarity_ = 0.0f;
+                        water_opacity_     = 1.0f;
+                    }
+                    ImGui::EndMenu();
+                }
                 if (ImGui::MenuItem("Turn off grass pass", NULL,
                                     turn_off_grass_pass_)) {
                     turn_off_grass_pass_ = !turn_off_grass_pass_;
+                }
+                // Placed PCG layers rather than terrain passes, but this
+                // is the menu people reach for to strip the world back,
+                // so they live beside the two tile passes.
+                if (ImGui::MenuItem("Turn off plant pass", NULL,
+                                    turn_off_plant_pass_)) {
+                    turn_off_plant_pass_ = !turn_off_plant_pass_;
+                }
+                if (ImGui::MenuItem("Turn off house pass", NULL,
+                                    turn_off_house_pass_)) {
+                    turn_off_house_pass_ = !turn_off_house_pass_;
                 }
                 ImGui::EndMenu();
             }

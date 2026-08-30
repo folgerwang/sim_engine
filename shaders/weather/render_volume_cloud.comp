@@ -107,6 +107,21 @@ void main()
     float cos_theta = dot(view_dir, normalize(params.sun_pos));
     float phase = henyeyGreensteinPhaseFunc(params.g, cos_theta);
 
+    // ── Day-night scaling for the cloud/fog LIGHT terms ─────────────
+    // phase_intensity / ambient_intensity / fog_* are authored
+    // constants, and with nothing scaling them this pass lit its haze
+    // at NOON strength around the clock: at 3 AM the sky behind was
+    // correctly dark and a daylight-bright fog layer composited over
+    // the whole frame anyway — the flat grey-blue night sky bug.  The
+    // sun-driven terms follow the sun through the same civil-twilight
+    // ramp the sky's night floor uses (cube_skybox_mini.comp), so sky,
+    // clouds and fog darken TOGETHER; ambient keeps a moonlit fraction
+    // rather than reaching zero, for the same IBL-floor reason.
+    float sun_elev = normalize(params.sun_pos).y;
+    float day_w = smoothstep(-0.14, 0.035, sun_elev);
+    const float kNightAmbientFrac = 0.07;
+    float amb_w = mix(kNightAmbientFrac, 1.0, day_w);
+
     vec3 fg_color = vec3(0);
     float final_alpha = 1.0f;
     float last_dist = cast_dist_per_sample * (num_samples + noise.x);
@@ -129,7 +144,9 @@ void main()
         float extinct = thickness * max(cur_moisture - saturate_vapor_moisture, 0.0f) * params.view_ext_factor * max(noise_value, 0.0f);
         float cloud_shadow = texture(src_cloud_shadow, uvw).x;
 
-        vec3 cloud_lighting = (vec3(params.phase_intensity) * phase + vec3(params.ambient_intensity)) * cloud_shadow;
+        vec3 cloud_lighting =
+            (vec3(params.phase_intensity) * phase * day_w +
+             vec3(params.ambient_intensity) * amb_w) * cloud_shadow;
 
         float cur_alpha = exp2(-pow(extinct, params.view_ext_exponent));
         fg_color = mix(cloud_lighting, fg_color, cur_alpha);
@@ -154,8 +171,9 @@ void main()
                 float fog_phase =
                     henyeyGreensteinPhaseFunc(params.fog_g, cos_theta);
                 vec3 fog_light =
-                    vec3(params.fog_sun_intensity) * fog_phase * sun_vis +
-                    vec3(params.fog_ambient_intensity);
+                    vec3(params.fog_sun_intensity) * fog_phase * sun_vis *
+                        day_w +
+                    vec3(params.fog_ambient_intensity) * amb_w;
                 float fog_alpha = exp(-fog_ext);
                 fg_color = mix(fog_light, fg_color, fog_alpha);
                 final_alpha *= fog_alpha;

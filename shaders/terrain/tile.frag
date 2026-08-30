@@ -806,6 +806,31 @@ void main() {
     // with sky=False for exactly this reason), so the two are different
     // stacking effects, not two estimates of one thing.
     float surf_ao = mix(macro_ao * mix(1.0f, det_ao, det_w), 1.0f, sfade);
+    // ── Occlusion FLOOR ──────────────────────────────────────────────
+    // macro_ao is the raw R channel of the authored/baked ORM map and
+    // det_ao the detail tile's cavity alpha; NEITHER was bounded, so a
+    // texel that baked to 0 (deep valley floors, gully bottoms, the
+    // inside of a basin — anywhere the sky-visibility bake saturates)
+    // multiplied the ambient term to EXACTLY ZERO.
+    //
+    // That is what the pure-black terrain patches are.  Ambient is the
+    // ONLY light the forward branch below has (there is no sun term
+    // there), so surf_ao = 0 renders literal vec3(0) — a hard-edged
+    // black blob wherever the bake saturated, with grass, trees and
+    // water still drawn correctly on top of it because those are
+    // separate forward writers that never touch surf_ao.  The same
+    // texels also drive the G-buffer alpha below, so the deferred path
+    // lands on the forward/deferred sentinel edge at the same time (see
+    // there).  Both symptoms have this one cause.
+    //
+    // No real surface receives zero skylight: a fully enclosed cavity
+    // still gets inter-reflected bounce, and a baked 0 on open terrain
+    // means "the bake saturated here", not "sealed from the sky".  So
+    // authored occlusion ATTENUATES the ambient down to a floor instead
+    // of annihilating it.  0.35 is the darkest a shadowed hollow should
+    // read relative to open ground under this sky.
+    const float kTerrainAoFloor = 0.35f;
+    surf_ao = mix(kTerrainAoFloor, 1.0f, clamp(surf_ao, 0.0f, 1.0f));
 
     if (surf_nrm_w > 0.0f) {
         // Tangent frame of the terrain surface: the height field is
@@ -863,7 +888,16 @@ void main() {
     // albedo_ao.a doubles as the resolve's "G-buffer written" sentinel
     // (< 0.5 means forward pixel, leave its colour alone), so terrain AO
     // is compressed into [0.5, 1.0] instead of risking a skipped pixel.
-    out_albedo_ao      = vec4(albedo, clamp(surf_ao, 0.5f, 1.0f));
+    // The floor is 129/255, NOT 0.5.  This attachment is R8G8B8A8_UNORM,
+    // so alpha is quantised to 8 bits: 0.5 encodes as 127.5/255, sits
+    // exactly on the rounding tie, and rounding DOWN yields 127/255 =
+    // 0.498039 — which is < 0.5 and therefore reads to the resolve as
+    // "no G-buffer fragment here, this is a forward pixel, leave its
+    // colour alone".  Terrain that lands on the clamp floor then keeps
+    // whatever the forward branch left, and never gets lit.  129/255 =
+    // 0.50588 is a full quantisation step clear of the boundary, so the
+    // sentinel cannot misfire whichever way the hardware rounds.
+    out_albedo_ao      = vec4(albedo, clamp(surf_ao, 129.0f / 255.0f, 1.0f));
     out_normal_rough   = vec4(octEncodeDir(normal), mat_rough, 0.0f);
     vec2 oct_geom      = octEncodeDir(geom_normal);
     out_emissive_metal = vec4(oct_geom, 0.0f, 0.0f);

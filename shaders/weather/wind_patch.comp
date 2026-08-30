@@ -1,0 +1,213 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "..\global_definition.glsl.h"
+#include "weather_common.glsl.h"
+#include "..\terrain\tile_common.glsl.h"
+
+// ── D2Q9 local wind patch — the FINE tier of the wind LOD ────────────
+// Nine distribution functions on a square lattice, BGK single-
+// relaxation-time collision against the incompressible equilibrium
+//
+//   f_eq_i = w_i * rho * (1 + 3 e_i.u + 4.5 (e_i.u)^2 - 1.5 u.u)
+//
+// in lattice units.  Structured deliberately like lbm_water.comp — same
+// pull-streaming, same camera-following window shift, same ping-pong —
+// because that sim is proven and a second, differently-shaped lattice
+// in the same engine is a second set of bugs to find.
+//
+// WHAT THIS TIER IS FOR.  The coarse airflow field is kilometre-scale:
+// it knows a front is crossing the map, it cannot know that this gust
+// is curling around that ridge.  This patch solves the metre-scale
+// structure — gust fronts, terrain deflection, the wake behind high
+// ground — over the 512 m the viewer can actually resolve, and hands
+// it to every consumer through windAt() in wind_field.glsl.h.
+//
+// INFLOW, NOT INVENTION.  Every cell is relaxed toward the coarse
+// field's velocity at its own world position (inflow_gain per step).
+// That is what keeps the two tiers agreeing: the patch cannot drift
+// into its own private weather, so when a consumer crosses the patch
+// rim the blend has almost nothing to reconcile.  Without it the fine
+// tier slowly becomes a different wind and the feather at the edge
+// turns into a visible shear line.
+//
+// TERRAIN BLOCKS.  Cells whose ground stands obstacle_margin_m above
+// the solved slice are solid: standard halfway bounce-back reflects
+// each incoming distribution back where it came from, so wind piles up
+// on the windward side of a hill and separates on the lee, which is
+// the whole reason to run a lattice here rather than blur some noise.
+
+layout(push_constant) uniform WindPatchPush {
+    WindPatchParams params;
+};
+
+layout(set = 0, binding = 0, rgba32f) uniform image2D src_fA;   // f0..f3
+layout(set = 0, binding = 1, rgba32f) uniform image2D src_fB;   // f4..f7
+layout(set = 0, binding = 2, rgba32f) uniform image2D src_fC;   // f8 in .r
+layout(set = 0, binding = 3, rgba32f) uniform image2D dst_fA;
+layout(set = 0, binding = 4, rgba32f) uniform image2D dst_fB;
+layout(set = 0, binding = 5, rgba32f) uniform image2D dst_fC;
+// THE OUTPUT every consumer reads: per-cell wind velocity, m/s, world
+// xz.  rg16f matches what sampleWindFine() expects.
+layout(set = 0, binding = 6, rg16f) uniform writeonly image2D dst_wind;
+// Coarse tier: the world airflow field (rgba8, packed dir + strength).
+layout(set = 0, binding = 7) uniform sampler3D src_airflow;
+// Ground height, for the obstacle test.
+layout(set = 0, binding = 8) uniform sampler2D rock_layer;
+
+// D2Q9: 0 = rest, 1..4 axis (+x, +z, -x, -z), 5..8 diagonal.  "y" on
+// the lattice is world Z, exactly as in lbm_water.comp.
+const ivec2 kE[9] = ivec2[9](
+    ivec2(0, 0),
+    ivec2(1, 0), ivec2(0, 1), ivec2(-1, 0), ivec2(0, -1),
+    ivec2(1, 1), ivec2(-1, 1), ivec2(-1, -1), ivec2(1, -1));
+const float kW[9] = float[9](
+    4.0 / 9.0,
+    1.0 / 9.0,  1.0 / 9.0,  1.0 / 9.0,  1.0 / 9.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0);
+// Index of the distribution pointing the opposite way, for bounce-back.
+const int kOpp[9] = int[9](0, 3, 4, 1, 2, 7, 8, 5, 6);
+
+float loadF(int i, ivec2 p) {
+    if (i < 4)  return imageLoad(src_fA, p)[i];
+    if (i < 8)  return imageLoad(src_fB, p)[i - 4];
+    return imageLoad(src_fC, p).r;
+}
+
+float wp_h21(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+// World xz of a lattice cell centre.
+vec2 cellWorld(ivec2 pc) {
+    return params.origin_ws.xz + (vec2(pc) + 0.5) * params.cell_m;
+}
+
+// Ground height (m) from the DUG render heightfield, so carved
+// riverbeds read as the open channels they are rather than as walls.
+float groundAt(vec2 world_xz) {
+    vec2 uv = (world_xz - params.world_min.xz) /
+              max(params.world_range.xz, vec2(1e-3));
+    return texture(rock_layer, clamp(uv, 0.0, 1.0)).x *
+           kTerrainHeightAmpMeters;
+}
+
+// The coarse field's horizontal velocity at a cell, in m/s.
+vec2 coarseWindAt(vec2 world_xz, float height_m) {
+    vec3 p = vec3(world_xz.x, height_m, world_xz.y);
+    vec3 uvw = (p - params.world_min.xyz) /
+               max(params.world_range.xyz, vec3(1e-3));
+    uvw = clamp(uvw, vec3(0.0), vec3(1.0));
+    vec4 texel = texture(src_airflow, uvw);
+    vec3 dir = texel.xyz * 2.0 - 1.0;
+    float l2 = dot(dir, dir);
+    if (l2 < 1e-8) return vec2(0.0);
+    vec3 v = (dir * inversesqrt(l2)) * getPackedVectorLength(texel.w);
+    return v.xz;
+}
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    int N = int(params.grid_size);
+    if (pc.x >= N || pc.y >= N) return;
+
+    // Lattice speed: one cell per step.  With 1 m cells at 60 fps that
+    // is 60 m/s, comfortably above any wind the field produces, so the
+    // Mach number stays low and BGK stays in its stable regime.
+    const float e     = params.cell_m / max(params.dt, 1e-4);
+    const float inv_e = 1.0 / e;
+    const float tau   = 0.62;             // BGK relaxation (stable > 0.5)
+
+    vec2 world_xz = cellWorld(pc);
+
+    // Window shift in cells since last frame — the pull below reads
+    // last frame's grid offset by it, so each distribution stays glued
+    // to its WORLD cell while the patch slides with the camera.
+    ivec2 shift = ivec2(round(
+        (params.origin_ws.xz - params.prev_origin_ws.xz) / params.cell_m));
+
+    // Target: the coarse field here, in lattice units.
+    vec2 u_in = coarseWindAt(world_xz, params.sample_height_m) * inv_e;
+
+    float f[9];
+    bool fresh = (params.reset != 0u);
+    for (int i = 0; i < 9; ++i) {
+        ivec2 src = pc + shift - kE[i];
+        if (src.x < 0 || src.y < 0 || src.x >= N || src.y >= N) {
+            f[i] = -1.0;                  // scrolled in from outside
+        } else {
+            f[i] = loadF(i, src);
+        }
+    }
+
+    // Fresh / scrolled-in cells start AT THE INFLOW, not at rest: a
+    // rest-filled cell entering the window would be a hole of dead air
+    // sliding across the world behind the camera.
+    for (int i = 0; i < 9; ++i) {
+        if (fresh || f[i] < 0.0) {
+            float eu = dot(vec2(kE[i]), u_in);
+            f[i] = kW[i] * (1.0 + 3.0 * eu + 4.5 * eu * eu -
+                            1.5 * dot(u_in, u_in));
+        }
+    }
+
+    // ── Macroscopic moments ─────────────────────────────────────────
+    float rho = 0.0;
+    vec2  u   = vec2(0.0);
+    for (int i = 0; i < 9; ++i) {
+        rho += f[i];
+        u   += f[i] * vec2(kE[i]);
+    }
+    rho = max(rho, 1e-4);
+    u /= rho;
+
+    // ── Obstacle test ───────────────────────────────────────────────
+    // The slice is ONE horizontal plane, so its altitude has to come
+    // from a single reference — the ground under the patch centre —
+    // not from each cell's own ground.  Deriving it per cell would put
+    // the plane at a constant height above the terrain, i.e. draped
+    // over every hill, and then nothing is ever above it: the test
+    // reduces to `-margin > sample_height`, always false, and no
+    // obstacle in the world would ever deflect the wind.
+    float ref_ground = groundAt(
+        params.origin_ws.xz + vec2(0.5 * params.cell_m * float(N)));
+    float slice_alt = ref_ground + params.sample_height_m;
+    float ground = groundAt(world_xz);
+    bool solid = ground > (slice_alt + params.obstacle_margin_m);
+
+    if (solid) {
+        // Halfway bounce-back: every distribution goes back the way it
+        // came, which is a no-slip wall to second order.
+        float b[9];
+        for (int i = 0; i < 9; ++i) b[i] = f[kOpp[i]];
+        for (int i = 0; i < 9; ++i) f[i] = b[i];
+        u = vec2(0.0);
+    } else {
+        // ── Forcing, then BGK collision ─────────────────────────────
+        // (a) relax toward the coarse field so the tiers agree;
+        // (b) a slow procedural gust so the patch is never uniform.
+        float gust_ang = 6.2831853 * wp_h21(
+            floor(world_xz * 0.004) + floor(params.time * 0.05));
+        vec2 gust = vec2(cos(gust_ang), sin(gust_ang)) *
+                    params.gust_scale * inv_e;
+        vec2 u_target = mix(u, u_in + gust,
+                            clamp(params.inflow_gain, 0.0, 1.0));
+
+        for (int i = 0; i < 9; ++i) {
+            float eu = dot(vec2(kE[i]), u_target);
+            float feq = kW[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu -
+                                       1.5 * dot(u_target, u_target));
+            f[i] += (feq - f[i]) / tau;
+        }
+        u = u_target;
+    }
+
+    imageStore(dst_fA, pc, vec4(f[0], f[1], f[2], f[3]));
+    imageStore(dst_fB, pc, vec4(f[4], f[5], f[6], f[7]));
+    imageStore(dst_fC, pc, vec4(f[8], 0.0, 0.0, 0.0));
+    // Back to m/s for the consumers.
+    imageStore(dst_wind, pc, vec4(u * e, 0.0, 0.0));
+}

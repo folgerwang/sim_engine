@@ -528,6 +528,8 @@ struct DrawableData {
     // setClutterFade.
     float m_clutter_fade_start_m_ = 0.0f;
     float m_clutter_fade_end_m_ = 0.0f;
+    // Staged copy of DrawableObject::vegetation_sway_ (see there).
+    bool  m_vegetation_sway_ = false;
     // Force-override the root node's local scale when > 0.  Wired by
     // setRootNodeTransform so the override travels through every
     // subsequent applyPose call from PlayerController without needing
@@ -950,6 +952,10 @@ class DrawableObject {
     // same reason instance_root_* does — see setClutterFade.
     float                       clutter_fade_start_m_ = 0.0f;
     float                       clutter_fade_end_m_ = 0.0f;
+    // Per-wrapper vegetation flag: base.vert bends this drawable in the
+    // procedural wind (MODEL_FLAG_VEGETATION_SWAY).  Same staging
+    // contract as the clutter fade above.
+    bool                        vegetation_sway_ = false;
 
     // Per-wrapper visibility gate.  When false, DrawableObject::draw()
     // early-returns BEFORE doing any work (no instance buffer bind, no
@@ -1372,6 +1378,11 @@ public:
     }
     float getClutterFadeStart() const { return clutter_fade_start_m_; }
     float getClutterFadeEnd() const { return clutter_fade_end_m_; }
+
+    // Vegetation wind sway (trees / bushes / ground clutter).  Wrapper-
+    // owned for the same dedup reason as setClutterFade.
+    void setVegetationSway(bool on) { vegetation_sway_ = on; }
+    bool getVegetationSway() const { return vegetation_sway_; }
 
     // ── Debug giant-size override ────────────────────────────────────
     // Force-overrides the root node's scale to (s, s, s) on every

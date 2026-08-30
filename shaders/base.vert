@@ -1,6 +1,7 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
+#include "veg_sway.glsl.h"
 
 layout(push_constant) uniform ModelUniformBufferObject {
     ModelParams model_params;
@@ -185,6 +186,20 @@ void main() {
         vec3(in_loc_rot_mat_0.w,
              in_loc_rot_mat_1.w,
              in_loc_rot_mat_2.w);
+    // ── Vegetation wind sway ────────────────────────────────────────
+    // Flagged per draw (bit 3, set only for the _pcg_trees /
+    // _pcg_clutter groups), so the branch is uniform across the draw
+    // and costs nothing where it is off.  Displacement in WORLD space
+    // after the instance transform; the bend height is the LOCAL
+    // (pre-instance) height, so a rotated or scaled instance still
+    // bends from its own roots.  Same function runs in
+    // base_depthonly.vert — shadows track the canopy.
+    if ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) {
+        vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
+                           in_loc_rot_mat_2.w);
+        position_ws += vegSwayOffset(inst_t, position_ls.y,
+                                     camera_info.time_s);
+    }
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
 

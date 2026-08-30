@@ -5063,7 +5063,11 @@ static void drawNodeMesh(
                 // bit 2: interior geometry — base.frag scales its IBL
                 // ambient by kInteriorSkyAmbient (the forward path has
                 // no ray tracer to occlude the sky for it).
-                (node.interior_ ? 0x04 : 0x00);
+                (node.interior_ ? 0x04 : 0x00) |
+                // bit 3: vegetation — base.vert / base_depthonly.vert
+                // bend this draw in the wind (MODEL_FLAG_VEGETATION_SWAY).
+                (drawable_object->m_vegetation_sway_
+                     ? MODEL_FLAG_VEGETATION_SWAY : 0x00u);
             // Only consumed by the _CSMCASC vertex-shader permutation
             // (DrawMode::kCsmPerCascade pipelines).  Other pipelines
             // ignore this field — it sits in former-pad bytes.
@@ -8969,6 +8973,7 @@ void DrawableObject::draw(
         // written once.
         object_->m_clutter_fade_start_m_ = clutter_fade_start_m_;
         object_->m_clutter_fade_end_m_ = clutter_fade_end_m_;
+        object_->m_vegetation_sway_ = vegetation_sway_;
     }
 
     // Skip while the async load is still in flight. The menu spinner

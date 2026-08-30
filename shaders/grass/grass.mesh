@@ -3,6 +3,8 @@
 #include "..\global_definition.glsl.h"
 #include "..\terrain\tile_common.glsl.h"
 #include "..\noise.glsl.h"
+#include "..\weather\wind_field.glsl.h"
+#include "grass_common.glsl.h"
 
 out gl_MeshPerVertexEXT {
     vec4  gl_Position;
@@ -18,68 +20,101 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
+// Local wind patch — the same two tile-res bindings the water waves and
+// grass.vert read.  The sway used to exist ONLY in grass.vert, which is
+// the pre-mesh-shader fallback path: with USE_MESH_SHADER on (it is),
+// nothing ever bent a blade, and perfectly still grass is one of the
+// loudest tells that a field is not real.
+layout(set = TILE_PARAMS_SET, binding = WIND_TEX_INDEX) uniform sampler2D wind_patch_tex;
+layout(std430, set = TILE_PARAMS_SET, binding = WIND_REGION_BUFFER_INDEX) readonly buffer WindRegionBuf {
+    vec4 wind_region;
+};
 
-layout(location = 0) out VsPsData {
-    vec2 tex_coord;
+layout(location = 0) out GrassVsPsData {
+    vec4 pos_ws_v;   // xyz = world position, w = height fraction (0 root, 1 tip)
+    vec4 nrm_hash;   // xyz = world normal,   w = per-blade hash
+    vec4 attribs;    // x = dryness, y = signed edge coord, z = blade height, w = unused
 } out_data[];
 
 layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
 layout(triangles, max_vertices=256, max_primitives=256) out;
 void main()
 {
-    uint grass_idx = gl_GlobalInvocationID.x;
+    uint blade_idx = gl_GlobalInvocationID.x;
     uint local_idx = gl_LocalInvocationID.x;
-    vec4 hash_values = clamp(hash43(vec3(tile_params.min, grass_idx)), 0.0f, 1.0f);
 
-    const uint num_vertex = 16 * 16;
-    const uint num_primitive = 16 * 14;
+    const uint num_vertex    = 16 * uint(kGrassBladeVerts);
+    const uint num_primitive = 16 * uint(kGrassBladeTris);
     SetMeshOutputsEXT(num_vertex, num_primitive);
 
-    // tile world position.
-    vec2 pos_xz_ws = tile_params.min + hash_values.xy * tile_params.range;
+    // Two independent draws: one per TUFT (shared root) and one per
+    // BLADE (its own size, facing, lean and phase within the tuft).
+    uint tuft_idx = uint(float(blade_idx) * (1.0f / kGrassTuftBlades));
+    vec4 h_tuft  = clamp(hash43(vec3(tile_params.min, float(tuft_idx))),
+                         0.0f, 1.0f);
+    vec4 h_blade = clamp(hash43(vec3(tile_params.min + vec2(17.13f, 41.77f),
+                                     float(blade_idx))), 0.0f, 1.0f);
 
-    // convert tile world position to uv coordinate.
-    vec2 world_map_uv = (pos_xz_ws - tile_params.world_min) * tile_params.inv_world_range;
+    vec2 root_xz = grassRootXZ(tile_params.min, tile_params.range,
+                               h_tuft, h_blade);
 
+    // Ground height under THIS blade (not the tuft centre) so a clump on
+    // a slope plants every blade in the dirt instead of leaving the
+    // downhill ones hovering.
+    vec2 world_map_uv = (root_xz - tile_params.world_min) *
+                        tile_params.inv_world_range;
     float ground_height = texture(rock_layer, world_map_uv).x;
-    vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+    vec2  soil_water_thickness =
+        texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
     ground_height += soil_water_thickness.x;
 
-    vec3 grass_root_pos = vec3(pos_xz_ws.x, ground_height, pos_xz_ws.y);
+    float dry = grassDryField(root_xz);
+    GrassBlade blade = grassMakeBlade(root_xz, h_blade, dry);
+    blade.root_ws.y = ground_height - 0.01f;   // sink the sheath slightly
 
-    float root_angle = hash_values.w * 2.0 * 3.1415926;
-    float top_angle = root_angle + (hash_values.z * 2.0 - 1.0) * 3.1415926 * 0.5;
-
-    vec2 vert_info[] = {
-        vec2(0.034, 0.0f),
-        vec2(0.05, 0.3f),
-        vec2(0.06, 0.4f),
-        vec2(0.064, 0.5f),
-        vec2(0.06, 0.6f),
-        vec2(0.05, 0.7f),
-        vec2(0.02, 0.9f),
-        vec2(0.002, 1.0f)
-    };
-
-    for (int i_vert = 0; i_vert < 8; i_vert++) {
-        float angle = mix(root_angle, top_angle, vert_info[i_vert].y);
-        vec2 sincos_xy = vec2(sin(angle), cos(angle));
-        vec3 vert_ofs_0 = vec3(sincos_xy.x, 1.0f, sincos_xy.y) * vert_info[i_vert].xyx;
-        vec3 vert_ofs_1 = vec3(-sincos_xy.x, 1.0f, -sincos_xy.y) * vert_info[i_vert].xyx;
-        uint v_idx = local_idx * 16 + i_vert * 2;
-        gl_MeshVerticesEXT[v_idx].gl_Position =
-            camera_info.view_proj * vec4(grass_root_pos + vert_ofs_0, 1.0);
-        out_data[v_idx].tex_coord = vec2(0.5 + vert_info[i_vert].x, vert_info[i_vert].y);
-        gl_MeshVerticesEXT[v_idx+1].gl_Position =
-            camera_info.view_proj * vec4(grass_root_pos + vert_ofs_1, 1.0);
-        out_data[v_idx+1].tex_coord = vec2(0.5 - vert_info[i_vert].x, vert_info[i_vert].y);
+    // ── Wind sway ───────────────────────────────────────────────────
+    // Quadratic in height (the root is planted, the tip carries the
+    // travel) — that is already how grassBladeVertex spends `arc`, so
+    // the wind simply adds to it.  A small flutter at the blade's own
+    // hashed phase keeps a field from swaying in lockstep.  Outside the
+    // patch (weight 0) grass stands still: the coarse tier is
+    // kilometre-scale weather and has nothing to say about one blade.
+    {
+        float wf_w;
+        vec2  wv = sampleWindFine(wind_patch_tex, wind_region, root_xz, wf_w);
+        float spd = length(wv);
+        if (wf_w * spd > 1e-3f) {
+            vec2  dir  = wv / max(spd, 1e-4f);
+            float lean = min(spd * 0.055f, 0.40f) * blade.height;
+            float flutter = 0.05f * min(spd, 8.0f) * blade.height *
+                sin(tile_params.time * (3.0f + 2.0f * h_blade.w) +
+                    h_blade.z * 6.2831853f);
+            blade.arc += vec3(dir.x, 0.0f, dir.y) * ((lean + flutter) * wf_w);
+        }
     }
 
-    for (int i_poly = 0; i_poly < 14; i_poly++) {
-        gl_PrimitiveTriangleIndicesEXT[local_idx * 14 + i_poly] =
-            uvec3(local_idx * 16 + i_poly,
-                  local_idx * 16 + i_poly + 1,
-                  local_idx * 16 + i_poly + 2);
+    for (int i_ring = 0; i_ring < kGrassRings; i_ring++) {
+        uint v_idx = local_idx * uint(kGrassBladeVerts) + uint(i_ring) * 2u;
+        for (int i_side = 0; i_side < 2; i_side++) {
+            float side_sign = (i_side == 0) ? 1.0f : -1.0f;
+            vec3  p_ws; vec3 n_ws; float v;
+            grassBladeVertex(blade, i_ring, side_sign, p_ws, n_ws, v);
+
+            uint o = v_idx + uint(i_side);
+            gl_MeshVerticesEXT[o].gl_Position =
+                camera_info.view_proj * vec4(p_ws, 1.0f);
+            out_data[o].pos_ws_v = vec4(p_ws, v);
+            out_data[o].nrm_hash = vec4(n_ws, blade.hash);
+            out_data[o].attribs  =
+                vec4(dry, side_sign * kGrassProfile[i_ring].x,
+                     blade.height, 0.0f);
+        }
+    }
+
+    for (int i_poly = 0; i_poly < kGrassBladeTris; i_poly++) {
+        gl_PrimitiveTriangleIndicesEXT[local_idx * uint(kGrassBladeTris) + uint(i_poly)] =
+            uvec3(local_idx * uint(kGrassBladeVerts) + uint(i_poly),
+                  local_idx * uint(kGrassBladeVerts) + uint(i_poly) + 1u,
+                  local_idx * uint(kGrassBladeVerts) + uint(i_poly) + 2u);
     }
 }
-    

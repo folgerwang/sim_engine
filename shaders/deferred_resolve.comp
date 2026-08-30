@@ -1683,8 +1683,36 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
 // Both rays shade through the same estimator the GI bounce uses
 // (albedo x sun with a real occlusion ray + sky leak; sky on miss), so
 // what a window reflects agrees with how the world lights.
+// True when a ray-traced technique is actually armed this frame.  The
+// overlay below only has rays to trace in that case -- see the guard at
+// the top of it for why untraced water must NOT come through here.
+bool rtWaterTraceable() {
+    return (camera_info.input_features &
+            (FEATURE_INPUT_RT_SHADOW | FEATURE_INPUT_HW_RT_SHADOW |
+             FEATURE_INPUT_RESTIR)) != 0u;
+}
+
 bool glassWaterOverlay(vec2 uv, ivec2 px_dbg, float opaque_lin_z,
                        out vec3 out_color) {
+    // ── Untraced frames hand water back to the forward pass ──────────
+    // The transmission ray is traced against the CLUSTER BVH: trees,
+    // houses, props.  The terrain heightfield is not in it, so the ray
+    // that should hit the river BED hits nothing, hit_t comes back as a
+    // miss, Beer-Lambert over that distance saturates, and trans
+    // collapses to tint * 0.08 -- the deep body colour.  Every water
+    // pixel then renders the same flat dark sheet: no bed through the
+    // shallows, no shallow-to-deep gradient, and a hard polygon
+    // waterline (this overlay has no shoreline fade at all).
+    //
+    // With no RT armed there is nothing to gain by that, and something
+    // to lose: TerrainSceneView::drawWaterInto draws the river after
+    // this resolve using real screen-space refraction against the
+    // finished image, with the shore fade and depth absorption
+    // tile_water.frag implements.  Standing down here is what lets that
+    // reach the screen.  The attribute pass still runs and still clears
+    // its targets, so nothing stale survives the switch either way.
+    if (!rtWaterTraceable()) return false;
+
     vec4 g0 = texture(gbuf_glass_nr, uv);
     vec4 g1 = texture(gbuf_glass_tint, uv);
     float kind = g1.a;
@@ -1768,12 +1796,16 @@ bool glassWaterOverlay(vec2 uv, ivec2 px_dbg, float opaque_lin_z,
                                      L, sun_col, hit_t);
             }
             // Beer-Lambert toward the water tint over the refracted
-            // travel distance.  0.9/m extinction (matching the forward
-            // water's kWaterExtinction): the first half-metre still
-            // shows the bed, ~2-3 m of travel goes opaque — and the
+            // travel distance.  0.55/m extinction, matching the forward
+            // water's kWaterExtinction: the first metre or so still
+            // shows the bed, ~4-5 m of travel goes opaque — and the
             // opaque floor is a DARK body colour, not a bright tint.
+            // (Was 0.9/m.  The forward path needed the softer curve to
+            // show a shallow-to-deep gradient at all once its optical
+            // path was capped to the water column; the two must agree,
+            // or water changes colour as the traced path takes over.)
             float travel = min(hit_t, 24.0);
-            vec3 absorb = exp(-travel * 0.9 *
+            vec3 absorb = exp(-travel * 0.55 *
                               (vec3(1.05) - clamp(tint, 0.0, 1.0)));
             trans = mix(tint * 0.08, trans, absorb);
         }

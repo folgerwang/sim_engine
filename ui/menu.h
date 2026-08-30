@@ -241,7 +241,18 @@ class Menu {
     FootIkParams foot_ik_params_;
     float        foot_ik_pelvis_drop_live_ = 0.0f;  // read-only readout
     bool turn_off_water_pass_ = false;
-    bool turn_off_grass_pass_ = false;
+    // Defaults to ON (checked) because the tile grass pass was hard-off
+    // for a long time: TerrainSceneView::m_b_render_grass_ was a literal
+    // `false` with no setter, so the pass never ran.  Now that the menu
+    // actually drives that flag, the item has to START in the state the
+    // engine is really in, or launching would silently turn a pass on
+    // that nobody asked for.  Uncheck it to grow tile grass.
+    bool turn_off_grass_pass_ = true;
+    // Placed PCG layers, matched by their asset path suffix:
+    //   _pcg_trees / _pcg_clutter*  -> plants
+    //   _pcg_houses                 -> houses
+    bool turn_off_plant_pass_ = false;
+    bool turn_off_house_pass_ = false;
     bool turn_off_ray_tracing_ = false;
     bool turn_off_volume_moist_ = false;
     bool turn_off_shadow_pass_ = false;
@@ -441,6 +452,26 @@ private:
     bool deferred_rendering_ = true;
     float air_flow_strength_ = 50.0f;
     float water_flow_strength_ = 1.0f;
+    // ── River / lake blend (Settings > Water) ────────────────────────
+    // Defaults are tile_water.frag's shipped constants; see
+    // ego::WaterBlendSettings for what each one does.  These existed
+    // only as shader consts before, which is why the water pass toggle
+    // read as inert: at 0.72 clarity the surface is largely the bed
+    // showing through a tint, so removing it barely changes the frame.
+    // Defaults are the hand-tuned look (2026-08, picked in-engine on the
+    // new-world lake), not tile_water.frag's shipped constants -- those
+    // remain in the shader as the fallback for draw paths that never
+    // push the block.  Clear, gently-absorbing water read deeper than
+    // modelled (depth scale), with a wide soft waterline.
+    float water_max_clarity_      = 0.28f;
+    float water_extinction_       = 1.69f;
+    float water_depth_scale_      = 4.73f;
+    float water_opacity_          = 0.61f;
+    float water_tint_[3]          = { 0.12f, 0.32f, 0.38f };
+    float water_deep_diffuse_     = 0.44f;
+    float water_shore_edge_m_     = 0.584f;
+    float water_shore_fade_scale_ = 6.89f;
+    float water_shore_fade_max_m_ = 1.29f;
     float light_ext_factor_ = 0.004f;
     float view_ext_factor_ = 0.10f;
     float view_ext_exponent_ = 1.0f;
@@ -2197,6 +2228,14 @@ public:
         return turn_off_grass_pass_;
     }
 
+    inline bool isPlantPassTurnOff() {
+        return turn_off_plant_pass_;
+    }
+
+    inline bool isHousePassTurnOff() {
+        return turn_off_house_pass_;
+    }
+
     inline bool isRayTracingTurnOff() {
         return turn_off_ray_tracing_;
     }
@@ -2257,6 +2296,16 @@ public:
     inline float getAirFlowStrength() {
         return air_flow_strength_;
     }
+
+    inline float getWaterMaxClarity()     { return water_max_clarity_; }
+    inline float getWaterExtinction()     { return water_extinction_; }
+    inline float getWaterDepthScale()     { return water_depth_scale_; }
+    inline float getWaterOpacity()        { return water_opacity_; }
+    inline const float* getWaterTint()    { return water_tint_; }
+    inline float getWaterDeepDiffuse()    { return water_deep_diffuse_; }
+    inline float getWaterShoreEdgeM()     { return water_shore_edge_m_; }
+    inline float getWaterShoreFadeScale() { return water_shore_fade_scale_; }
+    inline float getWaterShoreFadeMaxM()  { return water_shore_fade_max_m_; }
 
     inline float getWaterFlowStrength() {
         return water_flow_strength_;

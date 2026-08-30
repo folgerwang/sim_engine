@@ -1,6 +1,7 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
+#include "veg_sway.glsl.h"
 
 layout(push_constant) uniform ModelUniformBufferObject {
     ModelParams model_params;
@@ -93,6 +94,14 @@ void main() {
         vec3(in_loc_rot_mat_0.w,
              in_loc_rot_mat_1.w,
              in_loc_rot_mat_2.w);
+    // Vegetation wind sway — SAME function and SAME inputs as
+    // base.vert, so the shadow of a swaying tree stays under the tree.
+    if ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) {
+        vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
+                           in_loc_rot_mat_2.w);
+        position_ws += vegSwayOffset(inst_t, position_ls.y,
+                                     camera_info.time_s);
+    }
 #ifdef CSM_PER_CASCADE
     // Per-cascade VP picked by model_params.cascade_idx (written by
     // drawMesh before each cascade pass).  The host has already uploaded

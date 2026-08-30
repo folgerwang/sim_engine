@@ -316,6 +316,12 @@ void ViewCamera::updateViewCameraInfo(
     // becomes meaningful from frame 1 onward.
     const bool first_vp_capture =
         glm::determinant(m_camera_info_.view_proj) == 0.0f;
+    // Scene clock for vertex animation (vegetation sway et al).  The
+    // camera UBO carries it because every vertex shader already binds
+    // this buffer; accumulating here (rather than pushing a time from
+    // the app) keeps the field correct on every code path that updates
+    // the camera.
+    m_camera_info_.time_s += view_camera_params.delta_t;
     // A window resize changes the aspect ratio, which rebuilds proj (and thus
     // view_proj) for EVERY pixel.  Leaving prev_view_proj at the old-aspect VP
     // makes the velocity attachment (curNDC - prevNDC, consumed by the cluster

@@ -10,8 +10,14 @@
 
 //#define MATERIAL_UNLIT
 
-#define VINPUT_VERTEX_BINDING_POINT         30
-#define VINPUT_INSTANCE_BINDING_POINT       31
+// Metal ceiling: the per-stage vertex buffer table has 31 slots
+// (indices 0..30), and MoltenVK translates high Vulkan bindings to the
+// top of that table — binding 31 came out as Metal bufferIndex -1
+// (0xFFFFFFFF) and aborted pipeline creation on macOS.  Mesh attribute
+// bindings count up sequentially from 0 (~10 max), so 24/25 are far
+// clear of them and safely inside Metal's range on every backend.
+#define VINPUT_VERTEX_BINDING_POINT         24
+#define VINPUT_INSTANCE_BINDING_POINT       25
 
 // Vertex input attribute location.
 #define VINPUT_POSITION             0
@@ -132,6 +138,12 @@
 #define DST_SCATTERING_LUT_SUM_INDEX        (TILE_BASE_PARAMS_INDEX + 24) // 31
 #define SRC_SCATTERING_LUT_INDEX            (TILE_BASE_PARAMS_INDEX + 25) // 32
 #define SRC_SCATTERING_LUT_SUM_INDEX        (TILE_BASE_PARAMS_INDEX + 25) // 32
+// Local wind patch (WindField / wind_patch.comp): per-cell wind m/s +
+// the region vec4 consumers pass to sampleWindFine().  On the TILE
+// RESOURCE set so every tile shader — water waves, grass sway — reads
+// the SAME wind without its own descriptor plumbing.
+#define WIND_TEX_INDEX                      (TILE_BASE_PARAMS_INDEX + 26) // 33
+#define WIND_REGION_BUFFER_INDEX            (TILE_BASE_PARAMS_INDEX + 27) // 34
 
 // The water surface is STATIC: it sits where the terrain's water mask
 // puts it, at the hydrology level plus this adjustment, and nothing
@@ -731,6 +743,13 @@ struct ViewParams {
 // windowless room receives the SAME full-sky irradiance as open ground
 // (see the block comment at kInteriorSkyAmbient in base.frag).
 #define MODEL_FLAG_INTERIOR 0x04u
+// bit 3 of ModelParams::flip_uv_coord: this drawable is VEGETATION —
+// base.vert / base_depthonly.vert bend it in the procedural wind (see
+// the sway block in base.vert).  Set per drawable from the asset path
+// (_pcg_trees / _pcg_clutter*), exactly like the clutter fade: houses
+// and rocks never carry it, so the shared pipeline cannot bend a
+// building.
+#define MODEL_FLAG_VEGETATION_SWAY 0x08u
 
 struct ModelParams {
     mat4 model_mat;
@@ -844,6 +863,39 @@ struct LbmWaterParams {
     float normal_amp;       // visual ripple amplification
     uint  grid_size;        // cells per side
     uint  reset;            // 1 = reinitialise every cell to rest
+};
+
+// ── Local wind patch (wind_patch.comp) ──────────────────────────────
+// The FINE tier of the two-level wind LOD; the coarse tier is the
+// world-wide airflow field weather_system advances.  A camera-
+// following D2Q9 lattice, grid_size cells at cell_m, solving the
+// horizontal wind on ONE horizontal slice at sample_height_m above the
+// ground — plants and the river surface both live within a few metres
+// of the terrain, so a full 3D patch would spend most of its cells on
+// air nothing samples.
+struct WindPatchParams {
+    vec4  origin_ws;        // xz = patch corner, world metres
+    vec4  prev_origin_ws;
+    // The coarse airflow field's extent, so the patch can read its own
+    // inflow from it — the fine tier INHERITS the weather rather than
+    // inventing a second, disagreeing one.
+    vec4  world_min;
+    vec4  world_range;
+    float cell_m;           // lattice spacing, metres
+    float dt;               // step seconds (per frame)
+    float sample_height_m;  // altitude of the solved slice
+    float time;             // scene seconds, for the gust term
+    // How hard each cell is pulled toward the coarse field per step.
+    // 0 = the patch free-runs and drifts away from the weather; 1 =
+    // it is the coarse field with extra steps and no local structure.
+    float inflow_gain;
+    float gust_scale;       // amplitude of the procedural gust forcing
+    float obstacle_margin_m;// terrain this far above the slice blocks
+    uint  grid_size;        // cells per side
+    uint  reset;            // 1 = reinitialise every cell to inflow
+    uint  pad_0;
+    uint  pad_1;
+    uint  pad_2;
 };
 
 struct PrtLightParams {
@@ -994,6 +1046,37 @@ struct CloudShadowParams {
     float           pad4;
 };
 
+// ── Runtime-tweakable river/lake blend (Settings > Water) ────────────
+// These were compile-time consts in tile_water.frag, which meant the
+// only way to answer "how much of the bed should show" was an edit and
+// a shader rebuild -- and made the water pass toggle nearly invisible,
+// because at the shipped clarity the surface is mostly just the bed
+// with a tint over it.  Packed as three vec4s so the block stays
+// 16-byte aligned and TileParams lands on exactly 128 bytes, the
+// guaranteed Vulkan push-constant minimum.
+//
+// Defaults (see kWater* in tile_water.frag, which document WHY each
+// number is what it is) are applied CPU-side in TileObject, so a
+// zero-initialised TileParams never reaches the water shader.
+struct WaterBlendParams {
+    // x = max clarity   : ceiling on how much river bed shows through.
+    //                     0 = fully opaque water, 1 = glass.
+    // y = extinction /m : how fast depth closes that window.
+    // z = depth scale   : multiplies the water COLUMN before absorption
+    //                     -- the lever for a map whose water is modelled
+    //                     shallower than it should read.
+    // w = surface opacity: final mix of the shaded surface over the
+    //                     scene behind it. 1 = the shader's own
+    //                     shoreline fade alone decides.
+    vec4            blend;
+    // xyz = deep body tint, w = how much sky diffuse the deep colour
+    // keeps (open water swallows most of it).
+    vec4            tint;
+    // x = shoreline edge (m), y = fade width scale (screen-derivative
+    // multiplier), z = fade ceiling (m), w = unused.
+    vec4            shore;
+};
+
 struct TileParams {
     vec2            world_min;
     vec2            inv_world_range;
@@ -1021,6 +1104,9 @@ struct TileParams {
     // material happens to own those physical slots.
     uint            vt_normal_id;
     uint            vt_mr_ao_id;
+    // 16-byte aligned here (the scalars above end at offset 80), so the
+    // three vec4s take this struct to exactly 128 bytes.
+    WaterBlendParams water;
 };
 
 struct DebugDrawParams {
@@ -1719,6 +1805,13 @@ struct ViewCameraInfo {
     // Trailing scalar in an std430 buffer (4-byte aligned, packs right
     // after input_features) so the C++/GLSL layouts stay in lockstep.
     uint            debug_isolate_material;
+    // Scene seconds, accumulated by ViewCamera from ViewCameraParams::
+    // delta_t.  Trailing scalar (std430: packs after the uint above)
+    // so every existing field keeps its offset.  Exists because vertex
+    // animation (vegetation sway) needs a clock and ModelParams is
+    // packed full — and the camera UBO is the one buffer every vertex
+    // shader in the engine already binds.
+    float           time_s;
 };
 
 struct RuntimeLightsParams {
