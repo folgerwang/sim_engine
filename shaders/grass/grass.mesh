@@ -72,6 +72,18 @@ void main()
     GrassBlade blade = grassMakeBlade(root_xz, h_blade, dry);
     blade.root_ws.y = ground_height - 0.01f;   // sink the sheath slightly
 
+    // ── View-distance fade (see grass_common.glsl.h) ────────────────
+    // Sub-pixel blades alias into full dark specks; shrink to nothing
+    // across the fade band instead.  Scaling BOTH dimensions keeps the
+    // taper shape while it goes.
+    {
+        float cam_dist = distance(camera_info.position.xz, root_xz);
+        float k = 1.0f - smoothstep(kGrassViewFadeStartM,
+                                    kGrassViewFadeEndM, cam_dist);
+        blade.height *= k;
+        blade.width  *= k;
+    }
+
     // ── Wind sway ───────────────────────────────────────────────────
     // Quadratic in height (the root is planted, the tip carries the
     // travel) — that is already how grassBladeVertex spends `arc`, so

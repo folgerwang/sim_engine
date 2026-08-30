@@ -400,6 +400,34 @@ void ShadowViewCameraObject::computeCascadeMatrices(
         *out_union_vp = lp * lv;
     }
 
+    // Light-space BASIS (pure rotation) shared by every cascade — built
+    // once, anchored at the origin.  The per-cascade lookAt below used to
+    // re-anchor at each frame's frustum centre, which combined with the
+    // tight AABB refit meant the ortho window moved and RESIZED a little
+    // with every camera motion: the shadow map's texel grid slid under
+    // the world, every shadow edge re-rasterised differently each frame,
+    // and the result was the shimmering/"one frame behind" shadows this
+    // rewrite removes.  Two standard stabilisations fix it:
+    //
+    //   * SPHERE FIT — each cascade's window is sized to the bounding
+    //     sphere of its sub-frustum.  The sphere's radius depends only
+    //     on the splits, fov and aspect, NOT on where the camera looks,
+    //     so the window size is constant frame to frame (an AABB of the
+    //     corners changes size as the frustum rotates through light
+    //     space — that is the size-pumping half of the shimmer).
+    //   * TEXEL SNAP — the window's centre is quantised to whole shadow-
+    //     map texels in light space, so the window translates in exact
+    //     texel steps and a world position always lands on the same
+    //     texel centre while it is inside the cascade (that is the
+    //     crawling half).
+    //
+    // The snap needs the shadow map resolution; keep in sync with
+    // kCsmSize in application.cpp (createCsmShadowResources).
+    constexpr float kShadowMapRes = 2048.0f;
+    const glm::mat4 light_basis =
+        glm::lookAt(glm::vec3(0.0f), light_dir, up);
+    const glm::mat4 inv_light_basis = glm::inverse(light_basis);
+
     for (int k = 0; k < CSM_CASCADE_COUNT; ++k) {
         const float cn = (k == 0) ? z_near_vs : cascade_far_vs[k - 1];
         const float cf = cascade_far_vs[k];
@@ -432,27 +460,55 @@ void ShadowViewCameraObject::computeCascadeMatrices(
             }
         }
 
+        // ── Rotation-invariant radius ────────────────────────────────
+        // Distance from the averaged centre to the farthest corner, in
+        // VIEW space — identical in any rotated frame, so the window
+        // below cannot change size as the camera turns.
+        float radius = 0.0f;
+        {
+            glm::vec3 vs_centre(0.0f);
+            for (int i = 0; i < 8; ++i) vs_centre += vs_corners[i];
+            vs_centre /= 8.0f;
+            for (int i = 0; i < 8; ++i)
+                radius = std::max(radius,
+                                  glm::length(vs_corners[i] - vs_centre));
+        }
+        // Small padding to avoid acne at cascade boundaries (was kPad on
+        // the AABB); folded into the radius so the texel size below sees
+        // the true window extent.
+        radius += 1.0f;
+
+        // ── Texel snap ───────────────────────────────────────────────
+        // Window centre in the SHARED light basis, quantised to whole
+        // texels of this cascade's map.  Snapping in the shared basis
+        // (rather than per-cascade lookAt space) is what makes the
+        // quantisation stable — the basis never moves, so the grid
+        // never moves.
+        const float texel_ws = (2.0f * radius) / kShadowMapRes;
+        glm::vec3 c_ls = glm::vec3(light_basis * glm::vec4(ws_centre, 1.0f));
+        c_ls.x = std::floor(c_ls.x / texel_ws) * texel_ws;
+        c_ls.y = std::floor(c_ls.y / texel_ws) * texel_ws;
+        const glm::vec3 snapped_centre =
+            glm::vec3(inv_light_basis * glm::vec4(c_ls, 1.0f));
+
         // Position the light eye far enough behind the centre so all scene
         // geometry (shadow casters) is in front of the camera.
         // We use a 200 m pull-back which is generous for typical scenes.
         constexpr float kPullBack = 200.0f;
-        const glm::vec3 light_eye = ws_centre - light_dir * kPullBack;
-        const glm::mat4 lv = glm::lookAt(light_eye, ws_centre, up);
+        const glm::vec3 light_eye = snapped_centre - light_dir * kPullBack;
+        const glm::mat4 lv = glm::lookAt(light_eye, snapped_centre, up);
 
-        // Compute the tight AABB of the 8 corners in this light view space.
-        glm::vec3 ls_min( 1e30f);
-        glm::vec3 ls_max(-1e30f);
+        // Fixed square window from the sphere; Z range still fitted to
+        // the actual corners (Z pumping cannot make texels crawl in XY,
+        // and the tight slab is what keeps D16 depth precision usable).
+        glm::vec3 ls_min(-radius, -radius,  1e30f);
+        glm::vec3 ls_max( radius,  radius, -1e30f);
         for (int i = 0; i < 8; ++i) {
             glm::vec4 ws = inv_main_view * glm::vec4(vs_corners[i], 1.0f);
             glm::vec3 ls = glm::vec3(lv * ws);
-            ls_min = glm::min(ls_min, ls);
-            ls_max = glm::max(ls_max, ls);
+            ls_min.z = std::min(ls_min.z, ls.z);
+            ls_max.z = std::max(ls_max.z, ls.z);
         }
-
-        // Small XY padding to avoid shadow acne at cascade boundaries.
-        constexpr float kPad = 1.0f;
-        ls_min.x -= kPad;  ls_max.x += kPad;
-        ls_min.y -= kPad;  ls_max.y += kPad;
 
         // ── Tight orthographic Z range ────────────────────────────────
         // Auto-scaled: the depth slab covers EXACTLY the cascade's

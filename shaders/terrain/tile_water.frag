@@ -98,7 +98,7 @@ const float kMaxClarity = 0.72;
 // COVERS becomes legible — extent, silhouette, where it laps onto the
 // bank, which channels exist at all — none of which you can judge
 // through a transmission term that hides the thin ones.
-#define WATER_DEBUG_OPAQUE                  0
+#define WATER_DEBUG_OPAQUE                  1
 // 1 = paint the water by COLUMN DEPTH instead of shading it, as a
 // stepped ramp (implies the opaque mode above).  Reads directly as the
 // bathymetry: black at the waterline, then blue / cyan / green /

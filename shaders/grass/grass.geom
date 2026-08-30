@@ -31,6 +31,16 @@ void main() {
     blade.root_ws = in_seed[0].root_dry.xyz;
     blade.arc     = in_seed[0].arc.xyz;
 
+    // View-distance fade — same as grass.mesh (see grass_common.glsl.h).
+    {
+        float cam_dist = distance(camera_info.position.xz,
+                                  blade.root_ws.xz);
+        float k = 1.0f - smoothstep(kGrassViewFadeStartM,
+                                    kGrassViewFadeEndM, cam_dist);
+        blade.height *= k;
+        blade.width  *= k;
+    }
+
     for (int i_ring = 0; i_ring < kGrassRings; i_ring++) {
         for (int i_side = 0; i_side < 2; i_side++) {
             float side_sign = (i_side == 0) ? 1.0f : -1.0f;

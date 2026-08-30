@@ -28,6 +28,21 @@ const int   kGrassBladeVerts = 16;  // 2 per ring
 const int   kGrassBladeTris  = 14;  // one strip
 
 const float kGrassTuftBlades = 5.0f;    // blades per root clump
+
+// ── View-distance fade ───────────────────────────────────────────────
+// A blade is 1-2 cm wide: at 300 m that is a hundredth of a pixel, and
+// a rasteriser given sub-pixel geometry does not render it faint — it
+// snaps whole pixels, so every distant blade lands as one full dark
+// speck.  Against pale ground (the snow mountains especially, which
+// blow out to nearly the sky's white) those specks read as debris
+// floating in the air.  Blades therefore SHRINK to nothing across this
+// band; a zero-size blade rasterises no fragments, and the perceived
+// cover handoff to the terrain's own grass-green albedo underneath is
+// exactly what happens in reality at that range.  KEEP IN SYNC with
+// TileObject::drawGrass, which skips the dispatch entirely for tiles
+// wholly past the fade end.
+const float kGrassViewFadeStartM = 140.0f;
+const float kGrassViewFadeEndM   = 260.0f;
 const float kGrassTuftRadius = 0.14f;   // m, spread of a clump
 const float kGrassHeightMin  = 0.19f;   // m
 const float kGrassHeightMax  = 0.54f;   // m
