@@ -120,13 +120,29 @@ void main()
         }
     }
 #endif
+    const float kWaterInitLevel = 1.0f;
+    const float kSoilInitLevel = 5.0f;
+
+    // ── Rock layer ───────────────────────────────────────────────────
+    // NOTE (2026-08-30): tile.vert draws the terrain tile as SOIL_PASS,
+    // so the rendered vertex is rock + soil.x, and this seeds soil at
+    // kSoilInitLevel.  Read statically that says the ground draws 5 m
+    // above the authored heightmap, which would explain placed objects
+    // sitting low -- and subtracting the seed here was tried on exactly
+    // that reasoning.  IT IS WRONG: in a live session every placed
+    // object (trees especially, whose trunks are unmistakable) then
+    // floated ~5 m clear of the ground, which is direct evidence that
+    // the soil thickness the renderer actually samples is nowhere near
+    // the 5 m seeded here -- tile_update / tile_flow_update rewrite the
+    // layer before it is ever drawn.
+    //
+    // So: rock is the authored heightmap, and anything chasing a
+    // vertical mismatch has to MEASURE the runtime soil layer rather
+    // than reason from this constant.
     imageStore(rock_layer, scoord_0, vec4(heightmap_00));
     imageStore(rock_layer, scoord_1, vec4(heightmap_10));
     imageStore(rock_layer, scoord_2, vec4(heightmap_01));
     imageStore(rock_layer, scoord_3, vec4(heightmap_11));
-
-    const float kWaterInitLevel = 1.0f;
-    const float kSoilInitLevel = 5.0f;
 
     // ── Water init: FILL TO THE HYDROLOGY'S SURFACE ──────────────────
     // The uniform 1 m init spread over a basin the rivers step carved

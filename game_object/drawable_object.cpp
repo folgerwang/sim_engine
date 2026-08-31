@@ -18,6 +18,7 @@
 #include <map>            // ordered map, so that key needs no hash
 #include <set>
 #include <filesystem>
+#include "scene_rendering/bc7_encoder.h"  // BC7 for imported glTF textures
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -898,6 +899,87 @@ static void setupMeshState(
         }
     }
 
+    // ── BC7 upload for embedded glTF textures ────────────────────────
+    // These textures were going up as R8G8B8A8_UNORM with a full mip
+    // chain: 5.33 bytes/texel.  For a PCG scene the imported set (house
+    // walls/roofs, tree cards, props) is the single largest VRAM class,
+    // and every one of them is a plain sampled colour/ORM/normal map —
+    // exactly what block compression is for.  BC7 at 1 byte/texel cuts
+    // the class 4x with quality that is visually transparent for this
+    // content, and the engine already ships the encoder (the RVT albedo
+    // pool has been BC7 all along).
+    //
+    // Mips are box-filtered on the CPU and each level encoded
+    // separately, packed DDS-style (mip 0..n, 16-byte 4x4 blocks) —
+    // the same layout vk::helper::copyBufferToImage already walks for
+    // DDS assets, so the upload path is the existing packed-mips
+    // overload of create2DTextureImage.  (Blit-generated mips are not
+    // an option for BC formats: the GPU cannot render INTO a
+    // block-compressed image.)
+    auto upload_bc7_with_mips =
+        [&](const uint8_t* rgba, uint32_t w, uint32_t h,
+            std::shared_ptr<renderer::Image>& out_image,
+            std::shared_ptr<renderer::DeviceMemory>& out_memory)
+            -> uint32_t {
+        uint32_t mips = 1;
+        {
+            uint32_t m = std::max(w, h);
+            while (m > 1) { m >>= 1; ++mips; }
+        }
+        auto blocks_of = [](uint32_t d) { return (d + 3u) / 4u; };
+        // Total packed size first, so the buffer never reallocates.
+        size_t total = 0;
+        for (uint32_t i = 0; i < mips; ++i) {
+            uint32_t mw = std::max(w >> i, 1u), mh = std::max(h >> i, 1u);
+            total += size_t(blocks_of(mw)) * blocks_of(mh) * 16u;
+        }
+        std::vector<uint8_t> packed(total);
+        std::vector<uint8_t> cur(rgba, rgba + size_t(w) * h * 4u);
+        std::vector<uint8_t> next;
+        size_t offset = 0;
+        uint32_t mw = w, mh = h;
+        for (uint32_t i = 0; i < mips; ++i) {
+            engine::scene_rendering::encodeBC7Mode6(
+                cur.data(), mw, mh, packed.data() + offset);
+            offset += size_t(blocks_of(mw)) * blocks_of(mh) * 16u;
+            if (i + 1 == mips) break;
+            // 2x box downsample with edge clamp — the same filter the
+            // old blit chain effectively applied.
+            uint32_t nw = std::max(mw >> 1, 1u), nh = std::max(mh >> 1, 1u);
+            next.assign(size_t(nw) * nh * 4u, 0);
+            for (uint32_t y = 0; y < nh; ++y) {
+                const uint32_t y0 = std::min(y * 2u,     mh - 1u);
+                const uint32_t y1 = std::min(y * 2u + 1u, mh - 1u);
+                for (uint32_t x = 0; x < nw; ++x) {
+                    const uint32_t x0 = std::min(x * 2u,     mw - 1u);
+                    const uint32_t x1 = std::min(x * 2u + 1u, mw - 1u);
+                    const uint8_t* p00 = &cur[(size_t(y0) * mw + x0) * 4u];
+                    const uint8_t* p01 = &cur[(size_t(y0) * mw + x1) * 4u];
+                    const uint8_t* p10 = &cur[(size_t(y1) * mw + x0) * 4u];
+                    const uint8_t* p11 = &cur[(size_t(y1) * mw + x1) * 4u];
+                    uint8_t* d = &next[(size_t(y) * nw + x) * 4u];
+                    for (int c = 0; c < 4; ++c) {
+                        d[c] = uint8_t((uint32_t(p00[c]) + p01[c] +
+                                        p10[c] + p11[c] + 2u) / 4u);
+                    }
+                }
+            }
+            cur.swap(next);
+            mw = nw; mh = nh;
+        }
+        renderer::Helper::create2DTextureImage(
+            device,
+            renderer::Format::BC7_UNORM_BLOCK,
+            int(w), int(h),
+            int(mips),
+            packed.size(),
+            packed.data(),
+            out_image,
+            out_memory,
+            std::source_location::current());
+        return mips;
+    };
+
     // Texture
     {
         for (size_t i_tex = 0; i_tex < model.textures.size(); i_tex++) {
@@ -912,17 +994,34 @@ static void setupMeshState(
             // along one screen axis and aliases along the other,
             // which is the striped/stretched-wall artifact.  DDS
             // assets ship baked chains and never showed it.
+            //
+            // BC7 whenever the image is big enough to matter (see
+            // upload_bc7_with_mips above); tiny images stay RGBA8 —
+            // a 4x8 swatch saves nothing and the encoder's edge
+            // clamping would be most of its texels.
             uint32_t tex_mips = 1;
-            renderer::Helper::create2DTextureImageWithMips(
-                device,
-                format,
-                src_img.width,
-                src_img.height,
-                src_img.image.data(),
-                dst_tex.image,
-                dst_tex.memory,
-                tex_mips,
-                std::source_location::current());
+            const bool use_bc7 =
+                src_img.width >= 16 && src_img.height >= 16;
+            if (use_bc7) {
+                format = renderer::Format::BC7_UNORM_BLOCK;
+                tex_mips = upload_bc7_with_mips(
+                    src_img.image.data(),
+                    uint32_t(src_img.width),
+                    uint32_t(src_img.height),
+                    dst_tex.image,
+                    dst_tex.memory);
+            } else {
+                renderer::Helper::create2DTextureImageWithMips(
+                    device,
+                    format,
+                    src_img.width,
+                    src_img.height,
+                    src_img.image.data(),
+                    dst_tex.image,
+                    dst_tex.memory,
+                    tex_mips,
+                    std::source_location::current());
+            }
             dst_tex.mip_levels = tex_mips;
 
             // Populate dst_tex.size — the glTF loader had been

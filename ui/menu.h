@@ -247,12 +247,24 @@ class Menu {
     // actually drives that flag, the item has to START in the state the
     // engine is really in, or launching would silently turn a pass on
     // that nobody asked for.  Uncheck it to grow tile grass.
-    bool turn_off_grass_pass_ = true;
+    // Default flipped to OFF-the-toggle (grass VISIBLE): the pass is
+    // long since real — blades, wind, deferred lighting — and the old
+    // opt-in default meant every fresh launch silently hid it until
+    // someone re-found the menu item, which read as "the grass
+    // disappeared" every time.
+    bool turn_off_grass_pass_ = false;
     // Placed PCG layers, matched by their asset path suffix:
     //   _pcg_trees / _pcg_clutter*  -> plants
     //   _pcg_houses                 -> houses
     bool turn_off_plant_pass_ = false;
     bool turn_off_house_pass_ = false;
+    // Master RT switch (Rendering > Raytracing > "Turn off ray
+    // tracing"), read by the app's shadow-arming block.  Default OFF
+    // (ray tracing allowed): the selected RT technique auto-arms when
+    // its BVH/TLAS is ready, exactly as before.  Checking the item
+    // stands every RT technique down to the CSM fallback on the spot;
+    // the BVH/TLAS keeps being built either way, so the switch can be
+    // flipped live to A/B the two looks.
     bool turn_off_ray_tracing_ = false;
     bool turn_off_volume_moist_ = false;
     bool turn_off_shadow_pass_ = false;
@@ -425,7 +437,13 @@ public:
     };
 
 private:
-    CsmDrawMode csm_draw_mode_ = CsmDrawMode::kMeshShader;
+    // Default switched kMeshShader -> kRegular: the per-cascade loop is
+    // the one mode the far-cascade depth cache can work with (a layered
+    // draw repaints all six layers every frame by construction), and
+    // with the cache on, per-cascade regular is the cheaper path by a
+    // wide margin — the far cascades hold most of the caster load and
+    // now re-render every 2-4 frames instead of every frame.
+    CsmDrawMode csm_draw_mode_ = CsmDrawMode::kRegular;
     bool turn_on_airflow_ = false;
     uint32_t debug_draw_type_ = 0;
     // PBR / forward-pass debug visualisation; values match
@@ -466,7 +484,7 @@ private:
     float water_max_clarity_      = 0.28f;
     float water_extinction_       = 1.69f;
     float water_depth_scale_      = 4.73f;
-    float water_opacity_          = 0.61f;
+    float water_opacity_          = 0.76f;
     float water_tint_[3]          = { 0.12f, 0.32f, 0.38f };
     float water_deep_diffuse_     = 0.44f;
     float water_shore_edge_m_     = 0.584f;

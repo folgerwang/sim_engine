@@ -41,8 +41,63 @@ const float kGrassTuftBlades = 5.0f;    // blades per root clump
 // exactly what happens in reality at that range.  KEEP IN SYNC with
 // TileObject::drawGrass, which skips the dispatch entirely for tiles
 // wholly past the fade end.
-const float kGrassViewFadeStartM = 140.0f;
-const float kGrassViewFadeEndM   = 260.0f;
+// 300/500 rather than the 140/260 this shipped with: the first numbers
+// were tuned at an eye-level camera and, combined with the C++ cull,
+// deleted every blade in an AERIAL editor view (a camera a few hundred
+// metres up is a few hundred metres from ALL grass).  The mid-band is
+// kept renderable instead by WIDENING blades with distance (below), so
+// they stay near pixel width instead of collapsing under it.
+const float kGrassViewFadeStartM = 300.0f;
+const float kGrassViewFadeEndM   = 500.0f;
+// Distance-proportional width boost: from kGrassWidenStartM a blade's
+// width grows up to kGrassWidenMax x so it keeps covering ~a pixel
+// instead of aliasing into on/off specks — the same trade the terrain
+// makes when it retires noise octaves into roughness.  Height is NOT
+// boosted; far grass reads as a low sward, not a picket fence.
+const float kGrassWidenStartM = 60.0f;
+const float kGrassWidenMax    = 3.0f;
+// ── Waterline ────────────────────────────────────────────────────────
+// The scatter is a pure XZ hash and never asked whether the root was
+// under a river; blades sprouted from the bed and poked speckles
+// through the surface.  A blade shrinks to nothing as the water column
+// over its root passes through this band — the band (rather than a
+// hard cut) leaves a fringe of shoreline grass standing in ankle-deep
+// water, which is what a real bank looks like.
+// Tightened 0.01/0.05 -> 0.005/0.02 after the flooded-flat screenshot:
+// a broad shallow sheet carries only a few cm of column, which the
+// first band read as "shoreline" and kept fully grassed.  2 cm of
+// standing water is the ceiling now.
+const float kGrassWaterFadeStartM = 0.005f;  // column where fade begins
+const float kGrassWaterFadeEndM   = 0.02f;   // fully gone by here
+// A wet tuft is not deleted, it is RE-SEATED: up to this many re-hashed
+// tuft positions are tried before giving up and shrinking the blade,
+// so the blade budget a river would have swallowed lands on dry ground
+// instead — the density moves to where plants grow rather than
+// thinning the whole tile.  Every blade of a tuft runs the identical
+// retry sequence (the salt depends only on tuft index and attempt), so
+// tufts relocate WHOLE instead of scattering into loose blades.
+const int kGrassWaterRelocates = 3;
+
+// ── Built ground ────────────────────────────────────────────────────
+// The same rejection, keyed on the PCG's flatten mask instead of the
+// water column: 1 where the terrain was GRADED for a house pad or a
+// road slab, 0 on natural ground (TERRAIN_FLAT_MASK_INDEX).  Grass had
+// no idea buildings existed -- the scatter is a pure XZ hash over the
+// terrain and a house is a separate mesh standing on top of it -- so
+// blades sprouted through floors and rose between the furniture.
+//
+// The mask already carries its own margins (2.5 m of skirt around a
+// pad, 3.5 m of verge along a road).  These thresholds sit LOW on top
+// of that: the mask is 4 m per texel, so a bilinear reading of 0.35 is
+// about 1.4 m outside the graded edge, and stopping there keeps the
+// last blade from clipping into a wall's base rather than ending
+// exactly at it.  A tuft that lands on built ground RELOCATES first,
+// on the same retry budget and the same whole-tuft salt as the
+// waterline rejection above, so a village green keeps its blade budget
+// instead of the town going bald.
+const float kGrassBuiltRelocate  = 0.05f;  // any hint of it: try again
+const float kGrassBuiltFadeStart = 0.05f;  // survivor starts shrinking
+const float kGrassBuiltFadeEnd   = 0.35f;  // fully gone by here
 const float kGrassTuftRadius = 0.14f;   // m, spread of a clump
 const float kGrassHeightMin  = 0.19f;   // m
 const float kGrassHeightMax  = 0.54f;   // m

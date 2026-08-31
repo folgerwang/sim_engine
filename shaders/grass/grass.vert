@@ -20,6 +20,15 @@ layout(push_constant) uniform TileUniformBufferObject {
 
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
+layout(set = TILE_PARAMS_SET, binding = TERRAIN_FLAT_MASK_INDEX) uniform sampler2D terrain_flat_mask;
+// The camera is what the 1 m detail fade is measured against.  The
+// mesh path already had it (for the view fade); this stage did not,
+// because grass.geom owns the view fade on this path -- but the ROOT
+// HEIGHT needs it too, and the root is resolved here.
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+	ViewCameraInfo camera_info;
+};
+#include "..\terrain\tile_detail.glsl.h"
 layout(set = TILE_PARAMS_SET, binding = WIND_TEX_INDEX) uniform sampler2D wind_patch_tex;
 layout(std430, set = TILE_PARAMS_SET, binding = WIND_REGION_BUFFER_INDEX) readonly buffer WindRegionBuf {
     vec4 wind_region;
@@ -36,6 +45,39 @@ layout(location = 0) out GrassSeed {
     vec4 arc;        // xyz = total horizontal tip travel (lean + wind)
 } out_seed;
 
+
+// ── The RENDERED surface height ─────────────────────────────────────
+// Same as grass.mesh: heights are evaluated at the tile's LOD-grid
+// vertices (the grid tile.vert actually draws; drawGrass pushes the
+// tile's real per-LOD segment count) and bilinearly interpolated, so a
+// blade roots on the drawn mesh instead of on height-field features
+// the mesh grid cannot carry -- which is what left blades floating in
+// mid-air over every crest the coarser grids cut under.
+float grassVertexHeight(vec2 pos_ws) {
+    vec2 uv = (pos_ws - tile_params.world_min) * tile_params.inv_world_range;
+    float h = texture(rock_layer, uv).x;
+    vec2 sw = texture(soil_water_layer, uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+    float fade = terrainDetailFade(pos_ws, camera_info.position.xyz);
+    fade *= 1.0f - clamp(sw.y * 2.0f, 0.0f, 1.0f);
+    return terrainDetailHeight(pos_ws, h, fade) + sw.x;
+}
+
+float grassGroundHeight(vec2 root_xz) {
+    float seg = float(tile_params.segment_count);
+    vec2 cell = tile_params.range * tile_params.inv_segment_count;
+    vec2 grid = clamp((root_xz - tile_params.min) / tile_params.range,
+                      0.0f, 1.0f) * seg;
+    vec2 g0 = min(floor(grid), vec2(seg - 1.0f));
+    vec2 gf = grid - g0;
+    vec2 p00 = tile_params.min + g0 * cell;
+    float h00 = grassVertexHeight(p00);
+    float h10 = grassVertexHeight(p00 + vec2(cell.x, 0.0f));
+    float h01 = grassVertexHeight(p00 + vec2(0.0f, cell.y));
+    float h11 = grassVertexHeight(p00 + cell);
+    return mix(mix(h00, h10, gf.x), mix(h01, h11, gf.x), gf.y)
+           - 0.02f * cell.x;
+}
+
 void main() {
     uint blade_idx = uint(gl_InstanceIndex);
     uint tuft_idx  = uint(float(blade_idx) * (1.0f / kGrassTuftBlades));
@@ -45,15 +87,44 @@ void main() {
     vec4 h_blade = clamp(hash43(vec3(tile_params.min + vec2(17.13f, 41.77f),
                                      float(blade_idx))), 0.0f, 1.0f);
 
-    vec2 root_xz = grassRootXZ(tile_params.min, tile_params.range,
-                               h_tuft, h_blade);
-
-    vec2 world_map_uv = (root_xz - tile_params.world_min) *
-                        tile_params.inv_world_range;
-    float ground_height = texture(rock_layer, world_map_uv).x;
-    vec2  soil_water_thickness =
-        texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
-    ground_height += soil_water_thickness.x;
+    // Root placement with waterline rejection — same retry loop as
+    // grass.mesh (see there / grass_common.glsl.h for the reasoning).
+    vec2  root_xz;
+    vec2  world_map_uv;
+    vec2  soil_water_thickness;
+    float built;
+    for (int attempt = 0; ; ++attempt) {
+        root_xz = grassRootXZ(tile_params.min, tile_params.range,
+                              h_tuft, h_blade);
+        world_map_uv = (root_xz - tile_params.world_min) *
+                       tile_params.inv_world_range;
+        soil_water_thickness =
+            texture(soil_water_layer, world_map_uv).xy *
+            SOIL_WATER_LAYER_MAX_THICKNESS;
+        built = texture(terrain_flat_mask, world_map_uv).x;
+        bool rejected = soil_water_thickness.y > kGrassWaterFadeStartM ||
+                        built > kGrassBuiltRelocate;
+        if (!rejected || attempt >= kGrassWaterRelocates) {
+            break;
+        }
+        h_tuft = clamp(hash43(vec3(
+            tile_params.min + vec2(7.31f, -3.77f) * float(attempt + 1),
+            float(tuft_idx))), 0.0f, 1.0f);
+    }
+    // Same rendered-surface height tile.vert's SOIL_PASS produces —
+    // base rock mixed toward the streamed 1 m detail relief, with the
+    // submerged-bed suppression.  See grass.mesh for why sampling the
+    // base map alone left the blades hanging in the air.
+    float ground_height = grassGroundHeight(root_xz);
+    // Waterline cull factor — rides the seed's spare lane (arc.w)
+    // because the geometry stage that expands this blade has no
+    // soil-water binding of its own.  The built-ground cull rides the
+    // same lane for the same reason.
+    float water_k = 1.0f - smoothstep(kGrassWaterFadeStartM,
+                                      kGrassWaterFadeEndM,
+                                      soil_water_thickness.y);
+    water_k *= 1.0f - smoothstep(kGrassBuiltFadeStart,
+                                 kGrassBuiltFadeEnd, built);
 
     float dry = grassDryField(root_xz);
     GrassBlade blade = grassMakeBlade(root_xz, h_blade, dry);
@@ -74,5 +145,5 @@ void main() {
 
     out_seed.root_dry = vec4(root_xz.x, ground_height - 0.01f, root_xz.y, dry);
     out_seed.h_blade  = h_blade;
-    out_seed.arc      = vec4(blade.arc, 0.0f);
+    out_seed.arc      = vec4(blade.arc, water_k);
 }

@@ -1686,10 +1686,22 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
 // True when a ray-traced technique is actually armed this frame.  The
 // overlay below only has rays to trace in that case -- see the guard at
 // the top of it for why untraced water must NOT come through here.
+//
+// HELD AT FALSE FOR NOW, RT armed or not: the transmission ray traces
+// the CLUSTER BVH, and the terrain heightfield is not in it, so the ray
+// that should find the river BED finds nothing even when RT is fully
+// armed -- Beer-Lambert over a miss collapses every water pixel to the
+// flat dark body colour.  The post-resolve forward pass
+// (TerrainSceneView::drawWaterInto: real screen-space refraction,
+// shoreline fade, depth absorption) is simply the better water on every
+// path until terrain geometry joins the BVH.  When it does, restore the
+// feature-bit test below and remove the matching !rt gate comment at
+// the drawWaterInto call site.
 bool rtWaterTraceable() {
-    return (camera_info.input_features &
-            (FEATURE_INPUT_RT_SHADOW | FEATURE_INPUT_HW_RT_SHADOW |
-             FEATURE_INPUT_RESTIR)) != 0u;
+    return false;
+    // return (camera_info.input_features &
+    //         (FEATURE_INPUT_RT_SHADOW | FEATURE_INPUT_HW_RT_SHADOW |
+    //          FEATURE_INPUT_RESTIR)) != 0u;
 }
 
 bool glassWaterOverlay(vec2 uv, ivec2 px_dbg, float opaque_lin_z,
@@ -2573,6 +2585,24 @@ void main() {
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
                    : hwRtShadowFactor(world_pos, N_geom, vec2(px));
+        // UNION WITH CSM.  The TLAS only holds what reached the cluster
+        // pipeline -- on a fully-PCG map that can be a handful of props
+        // while the instanced forest and the terrain never enter it, so
+        // the traced term alone leaves the entire ground UNSHADOWED the
+        // moment RT arms (the "clutter decals read as laid-on carpets"
+        // report: tree shadows vanish, the ground blows out, and the
+        // tone-matched cards pop against it).  The CSM cascades are
+        // still rendered in every RT mode for the forward writers, so
+        // fold them in: min() of two visibility estimates of the same
+        // sun is the union of the two occluder sets.  Where the BVH is
+        // complete the traced term is the darker, crisper one and wins;
+        // where it is blind, CSM keeps the frame matching the raster
+        // look.  Remove when the instanced vegetation + terrain
+        // heightfield join the BVH (same milestone rtWaterTraceable
+        // waits on).
+        if (shad > 0.0) {
+            shad = min(shad, shadowFactor(world_pos, N_geom, vec2(px)));
+        }
     } else
 #endif
     if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
@@ -2585,6 +2615,12 @@ void main() {
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
                    : rtShadowFactor(world_pos, N_geom, vec2(px));
+        // Same CSM union as the hardware branch above -- the software
+        // BVH is built from the same cluster staging arrays and is
+        // blind to the same instanced/terrain geometry.
+        if (shad > 0.0) {
+            shad = min(shad, shadowFactor(world_pos, N_geom, vec2(px)));
+        }
     } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
         // Software screen-space raytraced shadows — checked BEFORE the
         // disabled flag: the app sets SHADOW_DISABLED alongside SSRT to

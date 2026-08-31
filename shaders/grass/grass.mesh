@@ -20,6 +20,13 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
+// Built-ground (flatten) mask: 1 on graded house pads and road slabs,
+// 0 on natural ground.  See kGrassBuiltRelocate in grass_common.glsl.h.
+layout(set = TILE_PARAMS_SET, binding = TERRAIN_FLAT_MASK_INDEX) uniform sampler2D terrain_flat_mask;
+// Runtime 1 m detail relief.  Declares detail_height_tiles +
+// detail_slot_map and must follow the two samplers above, exactly as
+// tile.vert includes it after its own layer bindings.
+#include "..\terrain\tile_detail.glsl.h"
 // Local wind patch — the same two tile-res bindings the water waves and
 // grass.vert read.  The sway used to exist ONLY in grass.vert, which is
 // the pre-mesh-shader fallback path: with USE_MESH_SHADER on (it is),
@@ -38,6 +45,52 @@ layout(location = 0) out GrassVsPsData {
 
 layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
 layout(triangles, max_vertices=256, max_primitives=256) out;
+
+// ── The RENDERED surface height at one point ────────────────────────
+// The same terms tile.vert's SOIL_PASS evaluates at a mesh vertex:
+// base rock mixed toward the streamed 1 m detail (with the
+// submerged-bed suppression), plus the soil layer.  Called for GRID
+// VERTICES only -- see grassGroundHeight below for why blades never
+// sample it directly at their own root.
+float grassVertexHeight(vec2 pos_ws) {
+    vec2 uv = (pos_ws - tile_params.world_min) * tile_params.inv_world_range;
+    float h = texture(rock_layer, uv).x;
+    vec2 sw = texture(soil_water_layer, uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
+    float fade = terrainDetailFade(pos_ws, camera_info.position.xyz);
+    fade *= 1.0f - clamp(sw.y * 2.0f, 0.0f, 1.0f);
+    return terrainDetailHeight(pos_ws, h, fade) + sw.x;
+}
+
+// Root height = the surface the terrain MESH actually draws, not the
+// raw height field.  tile.vert evaluates heights only at this tile's
+// LOD-grid vertices (drawGrass pushes the tile's REAL per-LOD segment
+// count) and the rasteriser interpolates linearly between them, so a
+// blade that samples the height field AT ITS OWN ROOT reintroduces
+// every feature the mesh grid cannot carry.  Over the 1 m detail
+// relief and the carved river banks that error is METRES on the 4-8 m
+// grids, and it is signed: blades hovering in mid-air on every knoll
+// and crest -- against the open sky wherever the crest is a skyline --
+// and buried to the tip in every gully.  Evaluating the 4 surrounding
+// grid vertices and bilerping reproduces the drawn surface (the
+// quad's triangle split and coarser-neighbour edge snapping can still
+// differ by centimetres; the root sinks a little extra per grid cell
+// to keep that residue underground).
+float grassGroundHeight(vec2 root_xz) {
+    float seg = float(tile_params.segment_count);
+    vec2 cell = tile_params.range * tile_params.inv_segment_count;
+    vec2 grid = clamp((root_xz - tile_params.min) / tile_params.range,
+                      0.0f, 1.0f) * seg;
+    vec2 g0 = min(floor(grid), vec2(seg - 1.0f));
+    vec2 gf = grid - g0;
+    vec2 p00 = tile_params.min + g0 * cell;
+    float h00 = grassVertexHeight(p00);
+    float h10 = grassVertexHeight(p00 + vec2(cell.x, 0.0f));
+    float h01 = grassVertexHeight(p00 + vec2(0.0f, cell.y));
+    float h11 = grassVertexHeight(p00 + cell);
+    return mix(mix(h00, h10, gf.x), mix(h01, h11, gf.x), gf.y)
+           - 0.02f * cell.x;
+}
+
 void main()
 {
     uint blade_idx = gl_GlobalInvocationID.x;
@@ -55,29 +108,82 @@ void main()
     vec4 h_blade = clamp(hash43(vec3(tile_params.min + vec2(17.13f, 41.77f),
                                      float(blade_idx))), 0.0f, 1.0f);
 
-    vec2 root_xz = grassRootXZ(tile_params.min, tile_params.range,
-                               h_tuft, h_blade);
+    // ── Root placement with waterline rejection ─────────────────────
+    // .y of the soil-water layer is the WATER column standing over the
+    // root — the same value tile_water.frag culls its surface by.  A
+    // wet tuft re-hashes its position (kGrassWaterRelocates tries)
+    // before it is allowed to give up, so river beds shed their grass
+    // onto the surrounding banks instead of just going bald (see
+    // grass_common.glsl.h).
+    // Built ground is rejected on the SAME budget and the same salt: a
+    // tuft that lands on a house pad or a road is re-seated onto the
+    // grass beside it, and only a tuft that is still on graded ground
+    // after the last retry is shrunk away.
+    vec2  root_xz;
+    vec2  world_map_uv;
+    vec2  soil_water_thickness;
+    float built;
+    for (int attempt = 0; ; ++attempt) {
+        root_xz = grassRootXZ(tile_params.min, tile_params.range,
+                              h_tuft, h_blade);
+        world_map_uv = (root_xz - tile_params.world_min) *
+                       tile_params.inv_world_range;
+        soil_water_thickness =
+            texture(soil_water_layer, world_map_uv).xy *
+            SOIL_WATER_LAYER_MAX_THICKNESS;
+        built = texture(terrain_flat_mask, world_map_uv).x;
+        bool rejected = soil_water_thickness.y > kGrassWaterFadeStartM ||
+                        built > kGrassBuiltRelocate;
+        if (!rejected || attempt >= kGrassWaterRelocates) {
+            break;
+        }
+        // Same salt for every blade of the tuft — the clump moves whole.
+        h_tuft = clamp(hash43(vec3(
+            tile_params.min + vec2(7.31f, -3.77f) * float(attempt + 1),
+            float(tuft_idx))), 0.0f, 1.0f);
+    }
 
     // Ground height under THIS blade (not the tuft centre) so a clump on
     // a slope plants every blade in the dirt instead of leaving the
     // downhill ones hovering.
-    vec2 world_map_uv = (root_xz - tile_params.world_min) *
-                        tile_params.inv_world_range;
-    float ground_height = texture(rock_layer, world_map_uv).x;
-    vec2  soil_water_thickness =
-        texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
-    ground_height += soil_water_thickness.x;
+    // MUST match tile.vert's SOIL_PASS height exactly, term for term.
+    // The terrain is drawn as base rock MIXED TOWARD the streamed 1 m
+    // detail relief (terrainDetailHeight replaces the height, it does
+    // not offset it) over kDetailFadeStart/EndMeters of camera
+    // distance.  Sampling the base map alone -- which is all this did
+    // -- left every blade rooted on a surface the terrain no longer
+    // occupied anywhere inside the detail ring, i.e. across the whole
+    // range where grass is drawn at all: metres of error at the
+    // camera, fading to zero only out where the blades already have.
+    // That is the grass standing in mid-air, and the same error with
+    // the opposite sign is grass buried to the tip.
+    float ground_height = grassGroundHeight(root_xz);
+    // Still wet after every retry (mid-lake tiles): shrink to nothing.
+    float water_k = 1.0f - smoothstep(kGrassWaterFadeStartM,
+                                      kGrassWaterFadeEndM,
+                                      soil_water_thickness.y);
+    // Still on graded ground after every retry (deep inside a town):
+    // same treatment.  Multiplied into the same height/width pair, so
+    // a blade that is both wet and paved cannot come back.
+    water_k *= 1.0f - smoothstep(kGrassBuiltFadeStart,
+                                 kGrassBuiltFadeEnd, built);
 
     float dry = grassDryField(root_xz);
     GrassBlade blade = grassMakeBlade(root_xz, h_blade, dry);
     blade.root_ws.y = ground_height - 0.01f;   // sink the sheath slightly
+    blade.height *= water_k;
+    blade.width  *= water_k;
 
-    // ── View-distance fade (see grass_common.glsl.h) ────────────────
-    // Sub-pixel blades alias into full dark specks; shrink to nothing
-    // across the fade band instead.  Scaling BOTH dimensions keeps the
-    // taper shape while it goes.
+    // ── View-distance fade + widen (see grass_common.glsl.h) ────────
+    // TRUE 3D distance, not XZ: projected size is what decides whether
+    // a blade can be drawn, and from an aerial camera the altitude IS
+    // most of the distance — an XZ metric told a camera 400 m straight
+    // up that the grass below it was at arm's length.
     {
-        float cam_dist = distance(camera_info.position.xz, root_xz);
+        float cam_dist = distance(camera_info.position, blade.root_ws);
+        // Widen toward ~pixel coverage first, then fade everything out.
+        blade.width *= 1.0f + (kGrassWidenMax - 1.0f) *
+            smoothstep(kGrassWidenStartM, kGrassViewFadeStartM, cam_dist);
         float k = 1.0f - smoothstep(kGrassViewFadeStartM,
                                     kGrassViewFadeEndM, cam_dist);
         blade.height *= k;

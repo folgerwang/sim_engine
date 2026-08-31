@@ -99,8 +99,12 @@ void main() {
     if ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) {
         vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
                            in_loc_rot_mat_2.w);
+        // Instance up axis: gates out the deadfall trunks that lie
+        // pitched ~90 deg on the ground (see kVegFallenCos).
         position_ws += vegSwayOffset(inst_t, position_ls.y,
-                                     camera_info.time_s);
+                                     camera_info.time_s,
+                                     local_world_rot_mat * vec3(0.0f, 1.0f,
+                                                                0.0f));
     }
 #ifdef CSM_PER_CASCADE
     // Per-cascade VP picked by model_params.cascade_idx (written by

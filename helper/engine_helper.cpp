@@ -149,6 +149,25 @@ void createTextureImage(
                     STBI_grey);
             void_pixels = pixels;
         }
+        // SINGLE-CHANNEL 8-BIT.  Without this branch an R8_UNORM
+        // request fell through to the RGBA8 path below and was
+        // SILENTLY WRONG rather than failing: stb expanded the grey
+        // PNG to 4 channels, create2DTextureImage sized the upload at
+        // 1 byte per texel from the format (it derives the stride, it
+        // does not assume 4), and the image ended up holding the first
+        // quarter of the buffer reinterpreted as R,G,B,A,R,G,B,A...
+        // No throw, no assert -- just a scrambled mask.  Mirrors the
+        // R16 branch above; STBI_grey is the whole fix.
+        else if (format == engine::renderer::Format::R8_UNORM) {
+            stbi_uc* pixels =
+                stbi_load(
+                    file_name.c_str(),
+                    &tex_width,
+                    &tex_height,
+                    &tex_channels,
+                    STBI_grey);
+            void_pixels = pixels;
+        }
         else {
             stbi_uc* pixels =
                 stbi_load(
@@ -221,9 +240,13 @@ void createTextureImage(
         // Stash a CPU-side copy of the just-decoded RGBA8 pixels so
         // the Virtual Texture manager can build its bordered tile
         // pyramid without a GPU readback.  Only meaningful for the
-        // RGBA8 (4 bytes/texel) path — R16 textures aren't sliced
-        // into VT tiles, so skip the copy.
-        if (format != engine::renderer::Format::R16_UNORM) {
+        // RGBA8 (4 bytes/texel) path — R16 and R8 textures aren't
+        // sliced into VT tiles, so skip the copy.  R8 MUST be excluded
+        // here and not merely left to work by accident: its decoded
+        // buffer is w*h*1, so the w*h*4 read below would run three
+        // buffer-lengths past the end of the allocation.
+        if (format != engine::renderer::Format::R16_UNORM &&
+            format != engine::renderer::Format::R8_UNORM) {
             const size_t bytes = size_t(tex_width) * size_t(tex_height) * 4u;
             const uint8_t* src = static_cast<const uint8_t*>(void_pixels);
             texture.cpu_pixels = std::make_shared<std::vector<uint8_t>>(

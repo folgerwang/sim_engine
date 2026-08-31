@@ -30,11 +30,18 @@ void main() {
         grassMakeBlade(in_seed[0].root_dry.xz, in_seed[0].h_blade, dry);
     blade.root_ws = in_seed[0].root_dry.xyz;
     blade.arc     = in_seed[0].arc.xyz;
+    // Waterline cull factor from the vertex stage (arc.w) — this stage
+    // has no soil-water binding to compute it itself.
+    blade.height *= in_seed[0].arc.w;
+    blade.width  *= in_seed[0].arc.w;
 
-    // View-distance fade — same as grass.mesh (see grass_common.glsl.h).
+    // View-distance fade + widen — same as grass.mesh (see
+    // grass_common.glsl.h; 3D distance, because projected size is what
+    // matters and altitude is most of it from an aerial camera).
     {
-        float cam_dist = distance(camera_info.position.xz,
-                                  blade.root_ws.xz);
+        float cam_dist = distance(camera_info.position, blade.root_ws);
+        blade.width *= 1.0f + (kGrassWidenMax - 1.0f) *
+            smoothstep(kGrassWidenStartM, kGrassViewFadeStartM, cam_dist);
         float k = 1.0f - smoothstep(kGrassViewFadeStartM,
                                     kGrassViewFadeEndM, cam_dist);
         blade.height *= k;

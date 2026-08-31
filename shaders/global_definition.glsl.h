@@ -175,6 +175,21 @@
 // Runtime 1 m terrain detail streaming (TerrainDetailStream).
 #define TERRAIN_DETAIL_HEIGHT_INDEX         (TILE_BASE_PARAMS_INDEX + 31) // 38: R16 2049^2 array
 #define TERRAIN_DETAIL_TABLE_INDEX          (TILE_BASE_PARAMS_INDEX + 32) // 39: int slot_map[256] SSBO
+// ── Built-ground (flatten) mask ──────────────────────────────────────
+// <heightmap stem>_flat.png: the PCG's detail-flatten mask, u8, 1 where
+// the ground was GRADED for something built on it -- house pads (plus
+// _FLAT_PAD_MARGIN_M = 2.5 m of skirt) and road slabs (plus
+// _FLAT_ROAD_MARGIN_M = 3.5 m of verge) -- and 0 on natural ground.
+// terrain_pcg.py writes it and terrain_detail_worker.py already uses it
+// to hold the 1 m detail relief flat over those surfaces; this binding
+// puts the same mask on the GPU so the GRASS can honour it too.
+//
+// Exact by construction rather than inferred: measured over this world
+// it is 1.0 on 100.0% of house footprints and covers 9.9% of the map,
+// where the nearest available proxy -- greenness of the 1 m detail
+// albedo -- still passed 12.7% of built ground and would have grown
+// grass through the floor of one room in eight.
+#define TERRAIN_FLAT_MASK_INDEX             (TILE_BASE_PARAMS_INDEX + 42) // 49
 // Virtual-textured terrain albedo (shared VirtualTextureManager pools).
 #define TERRAIN_VT_POOL_ALBEDO_INDEX        (TILE_BASE_PARAMS_INDEX + 33) // 40
 #define TERRAIN_VT_POOL_NORMAL_INDEX        (TILE_BASE_PARAMS_INDEX + 34) // 41

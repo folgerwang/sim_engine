@@ -2226,7 +2226,7 @@ bool Menu::draw(
                         water_max_clarity_      = 0.28f;
                         water_extinction_       = 1.69f;
                         water_depth_scale_      = 4.73f;
-                        water_opacity_          = 0.61f;
+                        water_opacity_          = 0.76f;
                         water_tint_[0]          = 0.12f;
                         water_tint_[1]          = 0.32f;
                         water_tint_[2]          = 0.38f;
