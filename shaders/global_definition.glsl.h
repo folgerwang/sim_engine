@@ -421,6 +421,13 @@
 // Sky is left alone by both, so the horizon stays readable.
 #define FEATURE_INPUT_HIDE_FORWARD              0x00000800
 #define FEATURE_INPUT_HIDE_DEFERRED             0x00001000
+// The deferred G-buffer re-rasterise + resolve WILL run this frame.
+// Raised by the application alongside its per-frame flag push, mirroring
+// the exact gate that guards the deferred block in drawScene.  base.frag's
+// forward branch pairs it with MODEL_FLAG_DEFERRED_RELIGHT (per-draw) to
+// skip the full IBL+punctual stack for pixels deferred_resolve.comp is
+// about to overwrite anyway.
+#define FEATURE_INPUT_DEFERRED_RELIGHT          0x00008000
 
 #define FEATURE_INPUT_DEBUG_MODE_SHIFT          16
 #define FEATURE_INPUT_DEBUG_MODE_MASK           0x00FF0000
@@ -765,6 +772,15 @@ struct ViewParams {
 // and rocks never carry it, so the shared pipeline cannot bend a
 // building.
 #define MODEL_FLAG_VEGETATION_SWAY 0x08u
+// bit 4 of ModelParams::flip_uv_coord: this draw is one the deferred
+// G-buffer re-rasterise covers this frame, so any colour base.frag's
+// forward branch produces for it is overwritten by deferred_resolve.comp.
+// Set by drawNodeMesh only while the application has armed the deferred
+// relight (see setDeferredRelightArmed) and only on NON-skinned nodes —
+// skinned layouts have no _GBUF permutation and stay forward-lit.
+// base.frag additionally requires FEATURE_INPUT_DEFERRED_RELIGHT, so a
+// stale bit in a pass that does not relight is inert.
+#define MODEL_FLAG_DEFERRED_RELIGHT 0x10u
 
 struct ModelParams {
     mat4 model_mat;

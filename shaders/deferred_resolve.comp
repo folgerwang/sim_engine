@@ -2585,24 +2585,12 @@ void main() {
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
                    : hwRtShadowFactor(world_pos, N_geom, vec2(px));
-        // UNION WITH CSM.  The TLAS only holds what reached the cluster
-        // pipeline -- on a fully-PCG map that can be a handful of props
-        // while the instanced forest and the terrain never enter it, so
-        // the traced term alone leaves the entire ground UNSHADOWED the
-        // moment RT arms (the "clutter decals read as laid-on carpets"
-        // report: tree shadows vanish, the ground blows out, and the
-        // tone-matched cards pop against it).  The CSM cascades are
-        // still rendered in every RT mode for the forward writers, so
-        // fold them in: min() of two visibility estimates of the same
-        // sun is the union of the two occluder sets.  Where the BVH is
-        // complete the traced term is the darker, crisper one and wins;
-        // where it is blind, CSM keeps the frame matching the raster
-        // look.  Remove when the instanced vegetation + terrain
-        // heightfield join the BVH (same milestone rtWaterTraceable
-        // waits on).
-        if (shad > 0.0) {
-            shad = min(shad, shadowFactor(world_pos, N_geom, vec2(px)));
-        }
+        // NO CSM union any more: the app stops rendering the
+        // cascades entirely while an RT technique is armed (design
+        // decision -- one shadow algorithm at a time), so sampling
+        // them here would read stale depth.  Until the instanced
+        // vegetation + terrain heightfield join the BVH, the traced
+        // term alone IS the sun visibility in this mode.
     } else
 #endif
     if ((camera_info.input_features & FEATURE_INPUT_RT_SHADOW) != 0u) {
@@ -2615,12 +2603,7 @@ void main() {
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
                    : rtShadowFactor(world_pos, N_geom, vec2(px));
-        // Same CSM union as the hardware branch above -- the software
-        // BVH is built from the same cluster staging arrays and is
-        // blind to the same instanced/terrain geometry.
-        if (shad > 0.0) {
-            shad = min(shad, shadowFactor(world_pos, N_geom, vec2(px)));
-        }
+        // Traced term only -- see the hardware branch's note above.
     } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
         // Software screen-space raytraced shadows — checked BEFORE the
         // disabled flag: the app sets SHADOW_DISABLED alongside SSRT to

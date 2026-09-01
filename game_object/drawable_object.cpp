@@ -48,11 +48,13 @@ static uint32_t num_draw_meshes = 0;
 // ── Per-frame frustum cull state (set by application.cpp) ──────────────
 static bool     s_frustum_cull_active = false;
 // Shadow-caster cull volume for depth-only passes — see
-// DrawableObject::setShadowCullVolume.  The four SIDE planes of the
-// union light frustum; near/far are deliberately absent (depth clamp
-// owns the light axis).
+// DrawableObject::setShadowCullVolume.  Up to 8 planes of the camera
+// cascade slab swept toward the sun (see the construction in
+// application.cpp); the sweep filter guarantees no plane can cull a
+// caster that lies sunward of the receivers.
 static bool      s_shadow_cull_active = false;
-static glm::vec4 s_shadow_planes[4];
+static glm::vec4 s_shadow_planes[8];
+static uint32_t  s_shadow_plane_count = 0;
 // CPU recording counters — see the DrawStats comment in the header.
 // Defined here rather than beside its accessors because drawMesh (far
 // earlier in this file) increments it.
@@ -77,6 +79,30 @@ static glm::vec3 s_viewer_pos_ws = glm::vec3(0.0f);
 // above so the filter reaches drawMesh without widening four
 // signatures; every draw() sets it, so it can never go stale.
 static int       s_material_filter = 0;
+
+// ── Depth-prepass pass flag ──────────────────────────────────────────
+// True while DrawableObject::draw records DrawMode::kDepthPrepass.
+// Read by drawMesh (selects the material-aware depth-only pipeline
+// HASH while keeping the forward pass's culling) and by drawNodeMesh
+// (skips nodes whose forward coverage depends on base.frag's
+// screen-door dissolve).  Same pattern as s_material_filter: a static
+// set by every draw() beats widening four call signatures.
+static bool      s_depth_prepass_pass = false;
+
+// ── Deferred-relight armed (see setDeferredRelightArmed) ─────────────
+// Application-set, once per frame, mirroring the gate that guards the
+// deferred G-buffer + resolve block in drawScene.
+static bool      s_deferred_relight_armed = false;
+
+// ── Main-forward covered-prim skip (see setMainForwardCoveredSkip) ───
+// s_fwd_covered_window: application-scoped arm around the ONE main
+// forward ObjectSceneView::draw.  s_forward_covered_skip_active: set by
+// every DrawableObject::draw from the window AND the draw mode, so only
+// kForward draws inside the window skip anything — the G-buffer pass
+// (which must draw exactly these prims) and the shadow/CSM/decal/glass
+// modes are untouched by construction.
+static bool      s_fwd_covered_window = false;
+static bool      s_forward_covered_skip_active = false;
 
 // ── Eye position for plant LOD LOD selection ──────────────────────────
 // Separate from s_viewer_pos_ws and never cleared; see the doc-comment on
@@ -4717,6 +4743,47 @@ static void drawMesh(
             if (s_material_filter == 1 && prim_is_blend) continue;
             if (s_material_filter == 2 && !prim_is_blend) continue;
         }
+        // ── Depth prepass: OPAQUE ONLY ───────────────────────────────
+        // As specified: "only render opaque object".  The first version
+        // also drew alpha-MASK prims through the discard-capable depth
+        // frag; in a forest the leaf sprays are the majority of all
+        // recorded prims, they are poor occluders (mostly hole), and
+        // each costs a texture fetch per fragment.  They now sit the
+        // prepass out entirely — their depth and coverage come from the
+        // forward pass exactly as before the prepass existed, which the
+        // covered-prim skip below respects by never skipping them.
+        // (effective_opaque Mask materials — no real cutout alpha —
+        // count as opaque here AND below, so the two stay consistent.)
+        if (s_depth_prepass_pass &&
+            !isPrimitiveOpaque(prim, drawable_object->materials_)) {
+            continue;
+        }
+        // ── Deferred-covered prim skip (main forward pass only) ──────
+        // See setMainForwardCoveredSkip.  MODEL_FLAG_DEFERRED_RELIGHT
+        // already encodes "relight armed AND node not skinned"; the two
+        // model fields below are the node's dissolve state — a node
+        // mid-cross-fade (lod_fade != 0) or on a per-instance band
+        // (ilod bits in model_params_pad0) must keep drawing forward,
+        // because the prepass skipped its depth and its screen-door
+        // coverage only exists in base.frag/base.vert.  Skinned or
+        // material-less prims inside an otherwise covered node also
+        // keep drawing — the G-buffer has no permutation for them.
+        if (s_forward_covered_skip_active &&
+            (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
+            prim.material_idx_ >= 0 &&
+            !prim.tag_.has_skin_set_0 &&
+            // Only prims the OPAQUE-ONLY prepass actually stamped depth
+            // for.  Masked foliage keeps drawing forward (its depth and
+            // screen-door coverage live there); the relight fast path
+            // in base.frag keeps that draw cheap.
+            isPrimitiveOpaque(prim, drawable_object->materials_)) {
+            uint32_t ilod_bits = 0u;
+            std::memcpy(&ilod_bits, &model_params.model_params_pad0,
+                        sizeof(ilod_bits));
+            if (model_params.lod_fade == 0.0f && ilod_bits == 0u) {
+                continue;
+            }
+        }
         const auto& attrib_list = prim.attribute_descs_;
         if (!depth_only &&
             (drawable_object->m_debug_force_red_ ||
@@ -4730,7 +4797,10 @@ static void drawMesh(
         // variant has the discard-capable one).  Forward pass keeps
         // the plain hash since the forward pipelines branch on alpha
         // mode inside the shader, not at pipeline level.
-        auto cur_hash = depth_only
+        // The depth PREPASS binds the depth-only pipeline shape (and so
+        // the material-aware depth-only hash) while keeping the forward
+        // pass's culling and LOD — s_depth_prepass_pass is the marker.
+        auto cur_hash = (depth_only || s_depth_prepass_pass)
             ? getDepthonlyHashForMaterial(prim, drawable_object->materials_)
             : prim.getHash();
 
@@ -5143,7 +5213,21 @@ static void drawNodeMesh(
                 drawable_object->lod_node_owner_[node_idx] == 0;
             lod_fade = 1.0f;
         }
-        if (node.mesh_idx_ >= 0 && !node_filtered && !lod_hidden) {
+        // ── Depth-prepass coverage guard ─────────────────────────────
+        // Opaque prepass prims carry no fragment shader, so the prepass
+        // cannot reproduce base.frag's screen-door dissolve: a tile
+        // mid-cross-fade, or a per-instance-band clutter node, would
+        // stamp FULL depth where the forward pass then discards half
+        // its fragments — and each such pixel becomes a hole, because
+        // the fragment that should show through now fails the depth
+        // test against prepass depth.  Those nodes sit the prepass out
+        // and rely on the forward pass's own depth write, as before.
+        const bool prepass_skips_node =
+            s_depth_prepass_pass && has_lod &&
+            (node.lod_per_instance_ != 0 ||
+             glm::abs(lod_fade) < 0.999f);
+        if (node.mesh_idx_ >= 0 && !node_filtered && !lod_hidden &&
+            !prepass_skips_node) {
             if (!depth_only &&
                 (drawable_object->m_debug_force_red_ ||
                  drawable_object->m_debug_log_draws_)) {
@@ -5166,7 +5250,14 @@ static void drawNodeMesh(
                 // bit 3: vegetation — base.vert / base_depthonly.vert
                 // bend this draw in the wind (MODEL_FLAG_VEGETATION_SWAY).
                 (drawable_object->m_vegetation_sway_
-                     ? MODEL_FLAG_VEGETATION_SWAY : 0x00u);
+                     ? MODEL_FLAG_VEGETATION_SWAY : 0x00u) |
+                // bit 4: this node's forward colour is overwritten by
+                // the deferred re-rasterise + resolve this frame, so
+                // base.frag may take its cheap branch.  Never on
+                // skinned nodes — no _GBUF permutation exists for
+                // them; they stay fully forward-lit.
+                ((s_deferred_relight_armed && node.skin_idx_ < 0)
+                     ? MODEL_FLAG_DEFERRED_RELIGHT : 0x00u);
             // Only consumed by the _CSMCASC vertex-shader permutation
             // (DrawMode::kCsmPerCascade pipelines).  Other pipelines
             // ignore this field — it sits in former-pad bytes.
@@ -6005,7 +6096,12 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     const ego::PrimitiveInfo& primitive,
     bool csm_layered,
     bool is_opaque,
-    bool csm_per_cascade = false) {
+    bool csm_per_cascade = false,
+    // Depth clamp suits the SHADOW passes (clamp casters into the light
+    // volume).  The main-view depth prepass must clip at the near/far
+    // planes exactly like the forward pass it primes, so it passes
+    // false here.
+    bool depth_clamp = true) {
     auto shader_modules = getDrawableDepthonlyShaderModules(
         device,
         primitive.tag_.has_texcoord_0,
@@ -6080,7 +6176,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     attribute_descs.push_back(attr);
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_depth_clamp_enable = true;
-    rasterization_state_override.depth_clamp_enable = true;
+    rasterization_state_override.depth_clamp_enable = depth_clamp;
     // ── Sidedness for the SHADOW pass ──────────────────────────────
     // Always respect the asset's authored double_sided flag — no more
     // is_opaque-vs-mask defensive override.  Asset bugs (single-sided
@@ -6117,6 +6213,25 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipeline(
     return createDrawableShadowPipelineInternal(
         device, renderbuffer_formats, pipeline_layout,
         graphic_pipeline_info, primitive, /*csm_layered*/ false, is_opaque);
+}
+
+// Main-view depth-prepass pipeline (DrawMode::kDepthPrepass): the same
+// depth-only shader set as the shadow pipelines — the non-CSM VS path
+// transforms by VIEW_PARAMS_SET's view_proj, which the prepass binds to
+// the MAIN camera — but built against the forward depth buffer's format
+// (RenderPasses::kDepthOnly) and WITHOUT depth clamp, so geometry
+// outside the near/far planes clips exactly as the forward pass will.
+static std::shared_ptr<renderer::Pipeline> createDrawableDepthPrepassPipeline(
+    const std::shared_ptr<renderer::Device>& device,
+    const renderer::PipelineRenderbufferFormats& renderbuffer_formats,
+    const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const ego::PrimitiveInfo& primitive,
+    bool is_opaque) {
+    return createDrawableShadowPipelineInternal(
+        device, renderbuffer_formats, pipeline_layout,
+        graphic_pipeline_info, primitive, /*csm_layered*/ false, is_opaque,
+        /*csm_per_cascade*/ false, /*depth_clamp*/ false);
 }
 
 // All-cascade (layered GS) shadow pipeline — used for the single-pass CSM path.
@@ -6679,6 +6794,11 @@ const std::vector<float>& plantLodBands(const std::string& category) {
 
 uint32_t plantLodBandGeneration() { return plantLodGenMutable(); }
 
+void setDeferredRelightArmed(bool armed) { s_deferred_relight_armed = armed; }
+bool deferredRelightArmed() { return s_deferred_relight_armed; }
+
+void setMainForwardCoveredSkip(bool armed) { s_fwd_covered_window = armed; }
+
 void setInteriorGateRadiusM(float m) {
     interiorGateMutable() = m;
     ++plantLodGenMutable();       // gates are re-applied by the same pass
@@ -7117,6 +7237,7 @@ std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::
 renderer::PipelineRenderbufferFormats DrawableObject::glass_renderbuffer_formats_;
 bool DrawableObject::glass_formats_valid_ = false;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_shadow_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_depth_prepass_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_layered_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_per_cascade_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_mesh_shader_pipeline_list_;
@@ -7546,6 +7667,22 @@ DrawableObject::DrawableObject(
                                 primitive,
                                 is_opaque);
                     }
+                    // Main-view depth-prepass sibling (DrawMode::kDepthPrepass):
+                    // same hash and is_opaque rules, FORWARD depth format
+                    // (kDepthOnly slot), no depth clamp.  Kept beside every
+                    // shadow-pipeline creation site so the two lists always
+                    // cover the same primitives.
+                    if (drawable_depth_prepass_pipeline_list_.find(hash_value) ==
+                        drawable_depth_prepass_pipeline_list_.end()) {
+                        drawable_depth_prepass_pipeline_list_[hash_value] =
+                            createDrawableDepthPrepassPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kDepthOnly)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive,
+                                is_opaque);
+                    }
                 }
 
                 {
@@ -7925,6 +8062,22 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                                     primitive,
                                     is_opaque);
                         }
+                        // Main-view depth-prepass sibling (DrawMode::kDepthPrepass):
+                        // same hash and is_opaque rules, FORWARD depth format
+                        // (kDepthOnly slot), no depth clamp.  Kept beside every
+                        // shadow-pipeline creation site so the two lists always
+                        // cover the same primitives.
+                        if (drawable_depth_prepass_pipeline_list_.find(hash_value) ==
+                            drawable_depth_prepass_pipeline_list_.end()) {
+                            drawable_depth_prepass_pipeline_list_[hash_value] =
+                                createDrawableDepthPrepassPipeline(
+                                    device,
+                                    renderbuffer_formats[int(renderer::RenderPasses::kDepthOnly)],
+                                    drawable_pipeline_layout_,
+                                    graphic_pipeline_info,
+                                    primitive,
+                                    is_opaque);
+                        }
                     }
                     {
                         const bool is_opaque =
@@ -8114,14 +8267,17 @@ bool DrawableObject::frustumCullArmed() {
     return s_frustum_cull_active;
 }
 
-void DrawableObject::setShadowCullVolume(const glm::vec4 planes[4]) {
-    if (planes == nullptr) {
+void DrawableObject::setShadowCullVolume(const glm::vec4* planes,
+                                         uint32_t count) {
+    if (planes == nullptr || count == 0u) {
         // Treated as a disarm rather than an error: a caller with no
-        // valid cascade fit yet must not end up culling everything.
+        // valid volume yet must not end up culling everything.
         s_shadow_cull_active = false;
+        s_shadow_plane_count = 0;
         return;
     }
-    for (int i = 0; i < 4; ++i) {
+    s_shadow_plane_count = std::min<uint32_t>(count, 8u);
+    for (uint32_t i = 0; i < s_shadow_plane_count; ++i) {
         s_shadow_planes[i] = planes[i];
     }
     s_shadow_cull_active = true;
@@ -8156,7 +8312,26 @@ void DrawableObject::clearViewerWorldPos() {
 }
 
 void DrawableObject::setPlantLodEye(const glm::vec3& pos) {
-    s_plant_lod_eye_ws = pos;
+    // ── EYE QUANTIZATION — the fix for the double band recompute ─────
+    // selectPlantLodBands memoises on EXACT eye equality, and the main
+    // camera buffer updates BETWEEN the shadow pass and the main-camera
+    // passes.  So on any frame the camera moved at all, the CSM walk
+    // recomputed the whole per-node band selection at the OLD eye and
+    // the depth prepass recomputed it AGAIN at the new one — lodrb=3 on
+    // BOTH [cpu] rows, ~10-15 ms each, every frame in motion.  The
+    // comment on selectPlantLodBands promised "the cascades ride on the
+    // forward pass's work"; exact-equality memoing quietly broke that
+    // promise the moment the eye was sampled twice per frame.
+    //
+    // Snap the published eye to a 2 m grid.  Every pass in a frame then
+    // publishes the SAME key while the camera is inside one cell, so
+    // the selection recomputes once per 2 m of travel instead of twice
+    // per frame.  2 m against band edges 100-2600 m out moves a
+    // transition by at most 2 m — invisible — and the GPU-side
+    // per-instance band tests already tolerate a mid-frame eye newer
+    // than the CPU tables, which is a larger discrepancy than this.
+    constexpr float kEyeQuantumM = 2.0f;
+    s_plant_lod_eye_ws = glm::floor(pos / kEyeQuantumM) * kEyeQuantumM;
     s_plant_lod_eye_valid = true;
 }
 
@@ -8491,6 +8666,11 @@ void DrawableObject::recreateStaticMembers(
     }
     drawable_shadow_pipeline_list_.clear();
 
+    for (auto& pipeline : drawable_depth_prepass_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_depth_prepass_pipeline_list_.clear();
+
     for (auto& pipeline : drawable_csm_layered_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -8522,6 +8702,22 @@ void DrawableObject::recreateStaticMembers(
                             createDrawableShadowPipeline(
                                 device,
                                 renderbuffer_formats[int(renderer::RenderPasses::kShadow)],
+                                drawable_pipeline_layout_,
+                                graphic_pipeline_info,
+                                primitive,
+                                is_opaque);
+                    }
+                    // Main-view depth-prepass sibling (DrawMode::kDepthPrepass):
+                    // same hash and is_opaque rules, FORWARD depth format
+                    // (kDepthOnly slot), no depth clamp.  Kept beside every
+                    // shadow-pipeline creation site so the two lists always
+                    // cover the same primitives.
+                    if (drawable_depth_prepass_pipeline_list_.find(hash_value) ==
+                        drawable_depth_prepass_pipeline_list_.end()) {
+                        drawable_depth_prepass_pipeline_list_[hash_value] =
+                            createDrawableDepthPrepassPipeline(
+                                device,
+                                renderbuffer_formats[int(renderer::RenderPasses::kDepthOnly)],
                                 drawable_pipeline_layout_,
                                 graphic_pipeline_info,
                                 primitive,
@@ -8632,6 +8828,11 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_shadow_pipeline_list_.clear();
+
+    for (auto& pipeline : drawable_depth_prepass_pipeline_list_) {
+        device->destroyPipeline(pipeline.second);
+    }
+    drawable_depth_prepass_pipeline_list_.clear();
     for (auto& pipeline : drawable_csm_layered_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -8975,7 +9176,8 @@ void DrawableObject::draw(
     // shadows into view), and the app only arms this hint around the
     // main forward pass anyway (cleared right after, so probe passes
     // never observe it).
-    if (ecs_culled_hint_ && draw_mode == DrawMode::kForward) return;
+    if (ecs_culled_hint_ && (draw_mode == DrawMode::kForward ||
+                             draw_mode == DrawMode::kDepthPrepass)) return;
 
     // Reset per-call debug counter BEFORE the isReady() guard so that
     // a not-ready drawable also prints "0 draws" rather than carrying
@@ -9102,7 +9304,11 @@ void DrawableObject::draw(
     // kDecal is tested BEFORE depth_only so a stray depth_only=true from
     // a caller cannot silently demote a decal draw into the shadow list;
     // the decal pass never wants a depth-only pipeline.
+    s_depth_prepass_pass = (draw_mode == DrawMode::kDepthPrepass);
+    s_forward_covered_skip_active =
+        s_fwd_covered_window && (draw_mode == DrawMode::kForward);
     auto& pipeline_list =
+        (draw_mode == DrawMode::kDepthPrepass)  ? drawable_depth_prepass_pipeline_list_   :
         (draw_mode == DrawMode::kCsmLayered)    ? drawable_csm_layered_pipeline_list_     :
         (draw_mode == DrawMode::kCsmPerCascade) ? drawable_csm_per_cascade_pipeline_list_ :
         (draw_mode == DrawMode::kCsmMeshShader) ? drawable_csm_mesh_shader_pipeline_list_ :
@@ -9469,7 +9675,7 @@ void DrawableObject::draw(
                     glm::vec3(iw * glm::vec4(s.x, s.y, s.z, 1.0f));
                 const float wr = s.w * iw_scale;
                 bool seen = true;
-                for (int q = 0; q < 4; ++q) {
+                for (uint32_t q = 0; q < s_shadow_plane_count; ++q) {
                     if (glm::dot(glm::vec3(s_shadow_planes[q]), wc) +
                             s_shadow_planes[q].w < -wr) {
                         seen = false;
@@ -9528,8 +9734,43 @@ void DrawableObject::draw(
             // and a per-cell box test over what is left would cost more
             // than testing the survivors one at a time.
             const size_t lod_n = lod_list->size();
-            for (size_t li = 0; li < lod_n; ++li) {
-                emit_node(size_t((*lod_list)[li]));
+            if (s_depth_prepass_pass && s_plant_lod_eye_valid &&
+                !object_->mesh_node_sphere_.empty()) {
+                // ── NEAR TO FAR ──────────────────────────────────────
+                // The prepass's whole value is early-Z, and early-Z only
+                // rejects a fragment when something nearer was recorded
+                // FIRST.  Storage order is tile order — effectively
+                // random against the camera — so sort the survivors by
+                // node-sphere distance before emitting.  ~10-15k
+                // entries, a fraction of a ms, repaid in the forward and
+                // G-buffer passes this depth gates.
+                struct ZOrd { float d2; uint32_t fi; };
+                std::vector<ZOrd> zord;
+                zord.reserve(lod_n);
+                const size_t sph_n = object_->mesh_node_sphere_.size();
+                for (size_t li = 0; li < lod_n; ++li) {
+                    const uint32_t fi = (*lod_list)[li];
+                    float d2 = std::numeric_limits<float>::max();
+                    if (size_t(fi) < sph_n) {
+                        const glm::vec4 sp = object_->mesh_node_sphere_[fi];
+                        const glm::vec3 wc = glm::vec3(
+                            iw * glm::vec4(sp.x, sp.y, sp.z, 1.0f));
+                        const glm::vec3 dv = wc - s_plant_lod_eye_ws;
+                        d2 = glm::dot(dv, dv);
+                    }
+                    zord.push_back({d2, fi});
+                }
+                std::sort(zord.begin(), zord.end(),
+                          [](const ZOrd& a, const ZOrd& b) {
+                              return a.d2 < b.d2;
+                          });
+                for (const ZOrd& z : zord) {
+                    emit_node(size_t(z.fi));
+                }
+            } else {
+                for (size_t li = 0; li < lod_n; ++li) {
+                    emit_node(size_t((*lod_list)[li]));
+                }
             }
         } else {
             // ── TILE-FIRST CULL ──────────────────────────────────────────
@@ -9596,7 +9837,8 @@ void DrawableObject::draw(
                         // Box vs the shadow cull volume's side planes.
                         // A tile outside them writes no shadow texel
                         // into any cascade.
-                        for (int q = 0; q < 4; ++q) {
+                        for (uint32_t q = 0; q < s_shadow_plane_count;
+                             ++q) {
                             const glm::vec3 sn(s_shadow_planes[q]);
                             // Positive vertex: if the corner furthest
                             // along the normal is still behind the

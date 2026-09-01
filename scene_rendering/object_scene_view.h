@@ -89,6 +89,19 @@ public:
     //
     // The caller must have written this view's depth copy into
     // SCENE_DEPTH_TEX_INDEX of the set-0 descriptor passed in desc_sets.
+    // Main-view Z-prepass: every registered drawable's opaque + masked
+    // primitives, DEPTH ONLY, into this view's depth buffer (CLEAR),
+    // drawables sorted near-to-far so early-Z starts rejecting occluded
+    // fragments inside the prepass itself.  Call immediately before
+    // draw() and pass preserve_depth=true there, so the forward pass
+    // LOADs this depth instead of clearing it — every opaque fragment
+    // then runs its full forward shading at most once, whatever the
+    // overdraw.  Nodes mid-LOD-dissolve and per-instance-band clutter
+    // are skipped inside DrawableObject (see DrawMode::kDepthPrepass).
+    void drawDepthPrepass(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_sets);
+
     // Deferred re-rasterise: draw every registered drawable into the
     // cluster G-buffer (4 RTs + the depth this view's forward pass
     // stamped earlier this frame, all LOAD).  DrawMode::kGBuffer

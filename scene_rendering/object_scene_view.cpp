@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <string>
 #include <sstream>
 #include <unordered_map>
@@ -121,6 +122,90 @@ void ObjectSceneView::duplicateDepthBuffer(
         SET_FLAG_BIT(ImageAspect, DEPTH_BIT),
         m_depth_buffer_->size,
         m_depth_buffer_copy_->size);
+}
+
+void ObjectSceneView::drawDepthPrepass(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+    const renderer::DescriptorSetList& desc_sets) {
+
+    if (m_drawable_objects_.empty() || !m_depth_buffer_) {
+        return;
+    }
+
+    renderer::DescriptorSetList desc_set_list = desc_sets;
+    desc_set_list[VIEW_PARAMS_SET] =
+        m_camera_object_->getViewCameraDescriptorSet();
+
+    // Same eye publish as draw(): the prepass must select the same LOD
+    // band per tile as the forward pass right after it, or the depth it
+    // primes belongs to a tree the forward pass is not drawing.
+    ego::DrawableObject::setPlantLodEye(
+        m_camera_object_->getCameraViewInfo().position);
+
+    {
+        er::RenderingAttachmentInfo depth_attachment_info;
+        depth_attachment_info.image_view = m_depth_buffer_->view;
+        depth_attachment_info.image_layout =
+            er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+        depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
+        depth_attachment_info.clear_value.depth_stencil = { 1.0f, 0 };
+
+        er::RenderingInfo renderingInfo = {};
+        renderingInfo.render_area_offset = { 0, 0 };
+        renderingInfo.render_area_extent = { m_buffer_size_.x, m_buffer_size_.y };
+        renderingInfo.layer_count = 1;
+        renderingInfo.view_mask = 0;
+        renderingInfo.color_attachments = {};
+        renderingInfo.depth_attachments = { depth_attachment_info };
+        renderingInfo.stencil_attachments = {};
+
+        cmd_buf->beginDynamicRendering(renderingInfo);
+    }
+
+    std::vector<er::Viewport> viewports(1);
+    std::vector<er::Scissor> scissors(1);
+    viewports[0].x = 0;
+    viewports[0].y = 0;
+    viewports[0].width = float(m_buffer_size_.x);
+    viewports[0].height = float(m_buffer_size_.y);
+    viewports[0].min_depth = 0.0f;
+    viewports[0].max_depth = 1.0f;
+    scissors[0].offset = glm::ivec2(0);
+    scissors[0].extent = m_buffer_size_;
+
+    // NEAR TO FAR.  Early-Z inside the prepass only rejects a fragment
+    // when something nearer was recorded FIRST, so the order is most of
+    // the benefit.  Coarse per-drawable ordering by world translation is
+    // enough — the point is the houses before the forest behind them,
+    // not exact per-triangle order — and a stable sort keeps equal-
+    // distance drawables in registration order for cache locality.
+    const glm::vec3 eye = m_camera_object_->getCameraViewInfo().position;
+    std::vector<ego::DrawableObject*> order;
+    order.reserve(m_drawable_objects_.size());
+    for (auto& d : m_drawable_objects_) {
+        order.push_back(d.get());
+    }
+    std::stable_sort(
+        order.begin(), order.end(),
+        [&eye](const ego::DrawableObject* a, const ego::DrawableObject* b) {
+            const glm::vec3 da = a->getSortWorldPos() - eye;
+            const glm::vec3 db = b->getSortWorldPos() - eye;
+            return glm::dot(da, da) < glm::dot(db, db);
+        });
+
+    for (auto* drawable_obj : order) {
+        drawable_obj->draw(
+            cmd_buf,
+            desc_set_list,
+            viewports,
+            scissors,
+            false,
+            ego::DrawableObject::DrawMode::kDepthPrepass,
+            0u);
+    }
+
+    cmd_buf->endDynamicRendering();
 }
 
 void ObjectSceneView::drawGbuffer(

@@ -92,6 +92,18 @@ const vec3 kLeafDry   = vec3(0.252f, 0.206f, 0.094f);
 const vec3 kLeafShade = vec3(0.042f, 0.062f, 0.028f);
 
 void main() {
+#ifndef GBUFFER_OUTPUT
+    // ── Deferred-relight early-out ───────────────────────────────────
+    // Mirror of tile.frag's: the grass G-buffer pass re-draws every
+    // blade (same dispatch, same camera, same blades) and the resolve
+    // lights those pixels, so the forward branch's terrain-albedo
+    // sampling, translucency and sun terms are computed only to be
+    // overwritten.  Depth still writes, so blades keep occluding.
+    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u) {
+        outColor = vec4(0.32f, 0.42f, 0.22f, 1.0f);
+        return;
+    }
+#endif  // !GBUFFER_OUTPUT
     vec3  P = in_data.pos_ws_v.xyz;
     float v = clamp(in_data.pos_ws_v.w, 0.0f, 1.0f);
     float dry_patch = in_data.attribs.x;

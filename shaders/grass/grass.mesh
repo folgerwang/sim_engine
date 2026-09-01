@@ -61,6 +61,42 @@ float grassVertexHeight(vec2 pos_ws) {
     return terrainDetailHeight(pos_ws, h, fade) + sw.x;
 }
 
+// Snap an edge parameter onto a coarser neighbour's vertex grid.
+// VERBATIM the same function tile.vert applies to its edge vertices --
+// if the two ever disagree the blades along that edge sit on a surface
+// the terrain does not draw.
+float grassSnapToGrid(float t, float nseg) {
+    return floor(t * nseg + 0.5f) / nseg;
+}
+
+// World XZ of terrain grid vertex (gx, gy), INCLUDING the LOD edge
+// stitch.  tile.vert moves any vertex on an edge shared with a COARSER
+// neighbour onto that neighbour's grid, which turns the edge into a
+// chord across the coarse cell.  Reconstructing the unsnapped fine grid
+// instead left a one-cell band of blades along every LOD boundary
+// standing on a surface with the full sagitta of the terrain under it.
+// Needs tile_params.offset, which drawGrass must now push (it used to
+// send 0).
+vec2 grassGridPos(vec2 g, float seg) {
+    vec2 f = g * (1.0f / seg);
+    uint elods = tile_params.offset;
+    if (g.x == 0.0f) {
+        float ns = float(elods & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.y = grassSnapToGrid(f.y, ns);
+    } else if (g.x == seg) {
+        float ns = float((elods >> 8) & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.y = grassSnapToGrid(f.y, ns);
+    }
+    if (g.y == 0.0f) {
+        float ns = float((elods >> 16) & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.x = grassSnapToGrid(f.x, ns);
+    } else if (g.y == seg) {
+        float ns = float((elods >> 24) & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.x = grassSnapToGrid(f.x, ns);
+    }
+    return tile_params.min + f * tile_params.range;
+}
+
 // Root height = the surface the terrain MESH actually draws, not the
 // raw height field.  tile.vert evaluates heights only at this tile's
 // LOD-grid vertices (drawGrass pushes the tile's REAL per-LOD segment
@@ -70,25 +106,46 @@ float grassVertexHeight(vec2 pos_ws) {
 // relief and the carved river banks that error is METRES on the 4-8 m
 // grids, and it is signed: blades hovering in mid-air on every knoll
 // and crest -- against the open sky wherever the crest is a skyline --
-// and buried to the tip in every gully.  Evaluating the 4 surrounding
-// grid vertices and bilerping reproduces the drawn surface (the
-// quad's triangle split and coarser-neighbour edge snapping can still
-// differ by centimetres; the root sinks a little extra per grid cell
-// to keep that residue underground).
+// and buried to the tip in every gully.
+//
+// The first version of this evaluated the 4 surrounding grid vertices
+// and BILERPED them, which is still not the drawn surface: a quad is
+// rasterised as TWO TRIANGLES, and a bilinear patch differs from that
+// pair by the quad's twist term, fx*fy*(h00-h10-h01+h11), signed and
+// up to a quarter of the twist at the cell centre.  On the 4 m and 8 m
+// LOD grids the twist over 1 m detail relief is metres, so half of
+// every quad -- the half on the low side of the split -- still had its
+// blades hanging up to ~0.5 m off the ground, in triangular patches.
+// generateTileMeshIndex emits (i00,i10,i01) and (i10,i11,i01), i.e. the
+// diagonal runs from (x,y+1) to (x+1,y): the split is fx + fy = 1.
+// Evaluate the plane of whichever triangle the root actually lands in
+// and the reconstruction is EXACT except for the interpolation of the
+// snapped edge quads, which are no longer axis aligned.
 float grassGroundHeight(vec2 root_xz) {
     float seg = float(tile_params.segment_count);
-    vec2 cell = tile_params.range * tile_params.inv_segment_count;
     vec2 grid = clamp((root_xz - tile_params.min) / tile_params.range,
                       0.0f, 1.0f) * seg;
     vec2 g0 = min(floor(grid), vec2(seg - 1.0f));
     vec2 gf = grid - g0;
-    vec2 p00 = tile_params.min + g0 * cell;
-    float h00 = grassVertexHeight(p00);
-    float h10 = grassVertexHeight(p00 + vec2(cell.x, 0.0f));
-    float h01 = grassVertexHeight(p00 + vec2(0.0f, cell.y));
-    float h11 = grassVertexHeight(p00 + cell);
-    return mix(mix(h00, h10, gf.x), mix(h01, h11, gf.x), gf.y)
-           - 0.02f * cell.x;
+
+    float h00 = grassVertexHeight(grassGridPos(g0,                    seg));
+    float h10 = grassVertexHeight(grassGridPos(g0 + vec2(1.0f, 0.0f), seg));
+    float h01 = grassVertexHeight(grassGridPos(g0 + vec2(0.0f, 1.0f), seg));
+    float h11 = grassVertexHeight(grassGridPos(g0 + vec2(1.0f, 1.0f), seg));
+
+    float h;
+    if (gf.x + gf.y <= 1.0f) {
+        // Triangle (h00, h01, h10).
+        h = h00 + (h10 - h00) * gf.x + (h01 - h00) * gf.y;
+    } else {
+        // Triangle (h01, h11, h10).
+        h = h11 + (h01 - h11) * (1.0f - gf.x)
+                + (h10 - h11) * (1.0f - gf.y);
+    }
+    // Residue sink: the snapped edge quads above, and the fact that
+    // tile.vert's SNOW/WATER permutations add terms this does not.
+    vec2 cell = tile_params.range * tile_params.inv_segment_count;
+    return h - 0.02f * cell.x;
 }
 
 void main()

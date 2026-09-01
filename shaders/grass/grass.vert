@@ -62,20 +62,54 @@ float grassVertexHeight(vec2 pos_ws) {
     return terrainDetailHeight(pos_ws, h, fade) + sw.x;
 }
 
+// KEEP IN SYNC with grass.mesh, which carries the full rationale: the
+// edge stitch must be reproduced (tile_params.offset) and the drawn
+// surface is TWO TRIANGLES per quad, not a bilinear patch.
+float grassSnapToGrid(float t, float nseg) {
+    return floor(t * nseg + 0.5f) / nseg;
+}
+
+vec2 grassGridPos(vec2 g, float seg) {
+    vec2 f = g * (1.0f / seg);
+    uint elods = tile_params.offset;
+    if (g.x == 0.0f) {
+        float ns = float(elods & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.y = grassSnapToGrid(f.y, ns);
+    } else if (g.x == seg) {
+        float ns = float((elods >> 8) & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.y = grassSnapToGrid(f.y, ns);
+    }
+    if (g.y == 0.0f) {
+        float ns = float((elods >> 16) & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.x = grassSnapToGrid(f.x, ns);
+    } else if (g.y == seg) {
+        float ns = float((elods >> 24) & 0xFFu);
+        if (ns > 0.0f && ns < seg) f.x = grassSnapToGrid(f.x, ns);
+    }
+    return tile_params.min + f * tile_params.range;
+}
+
 float grassGroundHeight(vec2 root_xz) {
     float seg = float(tile_params.segment_count);
-    vec2 cell = tile_params.range * tile_params.inv_segment_count;
     vec2 grid = clamp((root_xz - tile_params.min) / tile_params.range,
                       0.0f, 1.0f) * seg;
     vec2 g0 = min(floor(grid), vec2(seg - 1.0f));
     vec2 gf = grid - g0;
-    vec2 p00 = tile_params.min + g0 * cell;
-    float h00 = grassVertexHeight(p00);
-    float h10 = grassVertexHeight(p00 + vec2(cell.x, 0.0f));
-    float h01 = grassVertexHeight(p00 + vec2(0.0f, cell.y));
-    float h11 = grassVertexHeight(p00 + cell);
-    return mix(mix(h00, h10, gf.x), mix(h01, h11, gf.x), gf.y)
-           - 0.02f * cell.x;
+
+    float h00 = grassVertexHeight(grassGridPos(g0,                    seg));
+    float h10 = grassVertexHeight(grassGridPos(g0 + vec2(1.0f, 0.0f), seg));
+    float h01 = grassVertexHeight(grassGridPos(g0 + vec2(0.0f, 1.0f), seg));
+    float h11 = grassVertexHeight(grassGridPos(g0 + vec2(1.0f, 1.0f), seg));
+
+    float h;
+    if (gf.x + gf.y <= 1.0f) {
+        h = h00 + (h10 - h00) * gf.x + (h01 - h00) * gf.y;
+    } else {
+        h = h11 + (h01 - h11) * (1.0f - gf.x)
+                + (h10 - h11) * (1.0f - gf.y);
+    }
+    vec2 cell = tile_params.range * tile_params.inv_segment_count;
+    return h - 0.02f * cell.x;
 }
 
 void main() {

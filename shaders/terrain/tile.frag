@@ -525,6 +525,24 @@ vec3 terrainSurfaceNormal(vec3 n, vec4 w, vec3 grad) {
 }
 
 void main() {
+#ifndef GBUFFER_OUTPUT
+    // ── Deferred-relight early-out ───────────────────────────────────
+    // When the deferred re-rasterise + resolve is armed, every visible
+    // terrain pixel is re-drawn by drawTilesGbuffer over the SAME tile
+    // set and lit by deferred_resolve.comp — so everything this forward
+    // permutation computes (the ~800 lines of material synthesis above
+    // the lighting split) is thrown away.  It was the whole 16 ms of
+    // the forward "Terrain Tiles" bar.  Depth still writes fixed-
+    // function, so grass / water / citizens keep their occlusion; the
+    // constant below is never displayed on a terrain pixel (the resolve
+    // overwrites it) and only exists so the attachment holds something
+    // defined.  The WATER permutations live in tile_water.frag and are
+    // untouched — water stays genuinely forward.
+    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u) {
+        outColor = vec4(0.23f, 0.24f, 0.20f, 1.0f);
+        return;
+    }
+#endif  // !GBUFFER_OUTPUT
     vec3 pos = in_data.vertex_position;
     // Shading normal from the ACTUAL rendered heightfield: base rock
     // layer blended with the streamed 1 m detail tiles (the same field

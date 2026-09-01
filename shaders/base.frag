@@ -622,6 +622,39 @@ void main() {
     return;
 #endif // GBUFFER_OUTPUT
 
+#if !defined(GLASS_ATTR) && !defined(DECAL)
+    // ── Deferred-relight fast path ───────────────────────────────────
+    // When the deferred G-buffer re-rasterise + resolve is armed this
+    // frame (FEATURE_INPUT_DEFERRED_RELIGHT) and THIS draw is one the
+    // re-rasterise covers (MODEL_FLAG_DEFERRED_RELIGHT — CPU-set, never
+    // on skinned nodes, which have no _GBUF permutation), every colour
+    // this branch could produce is overwritten by deferred_resolve.comp.
+    // Running the full IBL + punctual stack here was the largest slice
+    // of the forward pass, shading pixels whose lighting was then thrown
+    // away.  Emit a cheap flat approximation instead.  Depth, the LOD
+    // dissolve discards at the top of main(), and the cutout discard all
+    // still run, so depth and coverage stay bit-identical to the full
+    // path — only the doomed colour is cheapened.
+    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u &&
+        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u) {
+#if defined(ALPHAMODE_MASK)
+        // Same late cutout discard as the full path below.
+        if (baseColor.a < material.alpha_cutoff) {
+            discard;
+        }
+#endif // ALPHAMODE_MASK
+        float fast_nl = 0.5f;
+#ifdef USE_PUNCTUAL
+        fast_nl = max(dot(normal_info.n,
+                          normalize(-runtime_lights.lights[0].direction)),
+                      0.0f);
+#endif // USE_PUNCTUAL
+        outColor = vec4(
+            linearTosRGB(baseColor.rgb * (0.25f + 0.5f * fast_nl)), 1.0f);
+        return;
+    }
+#endif // !GLASS_ATTR && !DECAL
+
     // Skip shadow sampling when the pass is disabled (avoids stale/zero CSM
     // texture reads that would incorrectly shadow the whole scene).
     float shadow = 1.0;

@@ -898,6 +898,29 @@ float interiorGateRadiusM();
 // rewrite over every node happens on change, not every frame.
 uint32_t plantLodBandGeneration();
 
+// ── Deferred-relight arming ──────────────────────────────────────────
+// Set once per frame by the application when the deferred G-buffer
+// re-rasterise + resolve WILL run: drawNodeMesh then tags every
+// non-skinned node's ModelParams with MODEL_FLAG_DEFERRED_RELIGHT so
+// base.frag's forward branch can skip the full lighting stack for
+// pixels the resolve is about to overwrite.  Cleared (false) whenever
+// the deferred block is gated off, so forward-only frames light fully.
+void  setDeferredRelightArmed(bool armed);
+bool  deferredRelightArmed();
+
+// ── Main-forward covered-prim skip window ────────────────────────────
+// Armed by the application STRICTLY around the main forward
+// ObjectSceneView::draw (never probes / cubemaps / captures, which have
+// no G-buffer or resolve behind them).  While armed, kForward draws
+// SKIP every primitive the deferred path fully covers — non-skinned,
+// materialed prims of nodes that are neither mid-LOD-dissolve nor
+// per-instance-banded: their depth comes from the depth prepass, their
+// attributes from the G-buffer re-rasterise, their colour from
+// deferred_resolve.comp, so the forward raster of them did nothing.
+// Everything deferred can't cover still draws forward: skinned and
+// material-less prims, dissolving nodes, per-instance-band clutter.
+void  setMainForwardCoveredSkip(bool armed);
+
 class DrawableObject {
     enum {
         kMaxNumObjects = 10240
@@ -1030,6 +1053,11 @@ private:
     static std::shared_ptr<renderer::PipelineLayout> drawable_pipeline_layout_;
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_pipeline_list_;
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_shadow_pipeline_list_;
+    // Main-view depth-prepass pipelines (DrawMode::kDepthPrepass): the
+    // depth-only shader set built against the FORWARD depth format
+    // (RenderPasses::kDepthOnly) with depth clamp OFF.  Keyed by the
+    // same material-aware depth-only hash as the shadow list.
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_depth_prepass_pipeline_list_;
     // Single-pass CSM shadow pipeline — geometry shader broadcasts to all layers.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_layered_pipeline_list_;
     // Per-cascade CSM shadow pipeline (no GS, no mesh shader).  The host
@@ -1243,6 +1271,13 @@ public:
     // panel and scene serialization.  Meaningful once setInstanceRootTransform
     // has run (hasInstanceRoot() == true).
     const glm::vec3& getInstanceRootTranslation() const { return instance_root_t_; }
+    // World translation for coarse near-to-far ordering (the depth
+    // prepass sorts drawables by it).  The per-instance override wins
+    // when set; otherwise the wrapper's location_ translation column.
+    glm::vec3 getSortWorldPos() const {
+        return instance_root_valid_ ? instance_root_t_
+                                    : glm::vec3(location_[3]);
+    }
     const glm::quat& getInstanceRootRotation()    const { return instance_root_r_; }
     const glm::vec3& getInstanceRootScale()       const { return instance_root_s_; }
     bool             hasInstanceRoot()            const { return instance_root_valid_; }
@@ -1500,6 +1535,20 @@ public:
     enum class DrawMode {
         kForward,       // regular lit forward pass
         kShadow,        // per-cascade depth-only pass (legacy, 4 separate draws)
+        kDepthPrepass,  // main-view Z-prepass: opaque + masked prims,
+                        // DEPTH ONLY, into the forward depth buffer with
+                        // the MAIN camera bound (base_depthonly.vert's
+                        // non-CSM path reads VIEW_PARAMS_SET view_proj,
+                        // so the shadow shader set serves unchanged).
+                        // Unlike the CSM modes it keeps the FORWARD
+                        // pass's frustum cull and plant-LOD dissolve
+                        // selection; nodes mid-dissolve and per-instance
+                        // -band clutter are skipped outright — opaque
+                        // prepass prims have no fragment shader, so they
+                        // cannot reproduce base.frag's screen-door
+                        // coverage, and a wrong prepass depth is a hole
+                        // in the frame, not a soft artifact.  Uses
+                        // drawable_depth_prepass_pipeline_list_.
         kCsmLayered,    // single-pass depth-only with GS broadcasting to all CSM layers
         kCsmPerCascade, // per-cascade depth-only pass; VS reads
                         // light_view_proj[ModelParams.cascade_idx] from
@@ -1678,7 +1727,12 @@ public:
     //
     // Unarmed (the default, and every non-CSM depth pass) the test is
     // skipped entirely and behaviour is exactly as before.
-    static void setShadowCullVolume(const glm::vec4 planes[4]);
+    // Up to 8 world-space planes (inward normals, normalized).  The
+    // volume is the camera frustum slab swept toward the sun — see the
+    // construction in application.cpp: a plane survives the sweep only
+    // if the sweep direction cannot exit through it, so the set varies
+    // with sun direction (typically 3-5 planes).  count == 0 disarms.
+    static void setShadowCullVolume(const glm::vec4* planes, uint32_t count);
     static void clearShadowCull();
 
     // ── CPU RECORDING COST INSTRUMENTATION ───────────────────────────────
