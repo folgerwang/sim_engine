@@ -1,0 +1,105 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ── Depth of field (gather bokeh) ───────────────────────────────────
+// Single full-resolution gather pass over the composited frame (after
+// TAA when TAA is on — DOF wants a stable image under it, or the bokeh
+// discs would shimmer with the jitter).  Per pixel: a circle of
+// confusion from linear depth against the focus plane (optionally
+// autofocused on the screen-centre depth), then a Poisson-disk gather
+// scaled by that CoC.  Each tap is weighted by ITS OWN CoC reach —
+// scatter-as-gather: a tap only bleeds onto this pixel if its blur
+// disc is large enough to arrive here — which keeps in-focus subjects
+// crisp against blurred backgrounds instead of eroding at the rim.
+// Known v1 limit: an OUT-OF-FOCUS foreground does not bloom over an
+// in-focus background (true scatter); acceptable until proven not.
+
+layout(push_constant) uniform DofPushUniforms {
+    uvec2 screen_size;
+    float focus_dist_m;    // ignored when autofocus != 0
+    float focus_range_m;   // in-focus deadband around the focus plane
+    float max_coc_px;      // blur radius ceiling
+    uint  autofocus;       // 1 = focus at screen-centre depth
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2D src_color;
+layout(set = 0, binding = 1) uniform sampler2D depth_tex;
+layout(set = 0, binding = 2, r11f_g11f_b10f)
+    uniform writeonly image2D out_color;
+
+layout(std430, set = 1, binding = VIEW_CAMERA_BUFFER_INDEX)
+    readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float linearDepth(float z) {
+    // Same linearisation the deferred resolve uses (depth_params holds
+    // proj[2].z / proj[3].z).
+    return camera_info.depth_params.y / (camera_info.depth_params.x + z);
+}
+
+float cocPx(float d, float focus) {
+    const float b = abs(d - focus);
+    // Physical-ish: CoC grows with |1 - focus/d|, capped at the ceiling;
+    // the smoothstep deadband keeps a band around the focus plane
+    // perfectly sharp so slight autofocus wobble never softens the
+    // subject.
+    const float k = smoothstep(0.0f, max(pc.focus_range_m, 0.01f), b);
+    return min(pc.max_coc_px * b / max(d, 0.05f), pc.max_coc_px) * k;
+}
+
+const vec2 kTaps[16] = vec2[16](
+    vec2(-0.94201624f, -0.39906216f), vec2( 0.94558609f, -0.76890725f),
+    vec2(-0.09418410f, -0.92938870f), vec2( 0.34495938f,  0.29387760f),
+    vec2(-0.91588581f,  0.45771432f), vec2(-0.81544232f, -0.87912464f),
+    vec2(-0.38277543f,  0.27676845f), vec2( 0.97484398f,  0.75648379f),
+    vec2( 0.44323325f, -0.97511554f), vec2( 0.53742981f, -0.47373420f),
+    vec2(-0.26496911f, -0.41893023f), vec2( 0.79197514f,  0.19090188f),
+    vec2(-0.24188840f,  0.99706507f), vec2(-0.81409955f,  0.91437590f),
+    vec2( 0.19984126f,  0.78641367f), vec2( 0.14383161f, -0.14100790f));
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.screen_size.x) || px.y >= int(pc.screen_size.y)) {
+        return;
+    }
+    const ivec2 lim = ivec2(pc.screen_size) - 1;
+    const vec3 cur = texelFetch(src_color, px, 0).rgb;
+
+    float focus = pc.focus_dist_m;
+    if (pc.autofocus != 0u) {
+        const float zc = texelFetch(depth_tex,
+                                    ivec2(pc.screen_size) / 2, 0).r;
+        // Centre on sky would throw the whole ground out of focus —
+        // clamp the autofocus plane to a sane band.
+        focus = clamp(linearDepth(zc), 2.0f, 300.0f);
+    }
+
+    const float d0 = linearDepth(texelFetch(depth_tex, px, 0).r);
+    const float coc0 = cocPx(d0, focus);
+    // Even an in-focus pixel runs the (1 px radius) gather: blurred
+    // neighbours whose discs reach it must bleed a little, or blurred
+    // backgrounds show a sharp one-pixel halo around focused
+    // silhouettes.  Where the whole neighbourhood is sharp the weights
+    // collapse to ~0 and the pixel passes through unchanged.
+
+    vec3  acc   = cur;
+    float total = 1.0f;
+    for (int i = 0; i < 16; ++i) {
+        const vec2  ofs_px   = kTaps[i] * max(coc0, 1.0f);
+        const float tap_dist = length(ofs_px);
+        const ivec2 tpx = clamp(px + ivec2(round(ofs_px)), ivec2(0), lim);
+        const float dt   = linearDepth(texelFetch(depth_tex, tpx, 0).r);
+        const float coct = cocPx(dt, focus);
+        // Scatter-as-gather: the tap contributes only if its own disc
+        // reaches this pixel.
+        const float w = clamp(min(coct, coc0) - tap_dist + 1.0f,
+                              0.0f, 1.0f);
+        acc   += texelFetch(src_color, tpx, 0).rgb * w;
+        total += w;
+    }
+    imageStore(out_color, px, vec4(acc / total, 1.0f));
+}

@@ -38,6 +38,14 @@ class ViewCamera {
     // the whole screen into offset "ghost copies" during a drag-resize.
     // -1 = unset (first frame).
     float m_last_vp_aspect_ = -1.0f;
+    // ── TAA projection jitter ────────────────────────────────────────
+    // s_proj_jitter_ndc_ is the frame's sub-pixel NDC offset, set once
+    // per frame by the application (Halton 2/3 over the pixel).  Only
+    // cameras that opt in via m_apply_proj_jitter_ fold it into their
+    // projection — the MAIN camera does; shadow/ortho/probe/capture
+    // cameras never should (a jittered shadow map swims).
+    bool m_apply_proj_jitter_ = false;
+    static glm::vec2 s_proj_jitter_ndc_;
 
 public:
     ViewCamera() = delete;
@@ -84,6 +92,13 @@ public:
 
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
+
+    // TAA jitter controls — see the members above.
+    void setApplyProjJitter(bool apply) { m_apply_proj_jitter_ = apply; }
+    static void setProjJitter(const glm::vec2& ndc_jitter) {
+        s_proj_jitter_ndc_ = ndc_jitter;
+    }
+    static const glm::vec2& projJitter() { return s_proj_jitter_ndc_; }
 
     void updateViewCameraInfo(
         const glsl::ViewCameraParams& view_camera_params,

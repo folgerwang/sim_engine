@@ -1,0 +1,160 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ── Temporal antialiasing resolve ───────────────────────────────────
+// The Uncharted-style whole-image smoother: the projection matrix is
+// jittered by a sub-pixel Halton offset every frame (see
+// ViewCamera::setProjJitter), so consecutive frames sample different
+// positions inside every pixel; this pass reprojects last frame's
+// accumulated result to the current frame and blends a small fraction
+// of the new frame in.  Over ~8 frames a static image converges to a
+// supersampled one, and everything that shimmered — masked foliage,
+// thin branches, grass blades, the LOD screen-door dissolves — is
+// averaged smooth.
+//
+// History rectification is a 3x3 neighborhood min/max clamp: the
+// reprojected history is clamped into the current frame's local colour
+// range, which is what kills ghosting when the reprojection is wrong
+// (disocclusion, moving objects) without needing a validity mask.
+//
+// Runs on the COMPOSITED colour buffer (after the resolve, sky, glass,
+// clouds), writing into a ping-pong pair that doubles as the history.
+// The final blit sources this pass's output.
+
+layout(push_constant) uniform TaaPushUniforms {
+    vec2  jitter_cur;     // NDC jitter applied to THIS frame's proj
+    vec2  jitter_prev;    // NDC jitter applied to LAST frame's proj
+    uvec2 screen_size;
+    uint  history_valid;  // 0 on the first frame / after a resize
+    float blend;          // fraction of the CURRENT frame kept (~0.1)
+} pc;
+
+layout(set = 0, binding = 0, r11f_g11f_b10f)
+    uniform readonly image2D src_color;
+layout(set = 0, binding = 1) uniform sampler2D history_color;
+layout(set = 0, binding = 2) uniform sampler2D depth_tex;
+layout(set = 0, binding = 3) uniform sampler2D velocity_tex;
+layout(set = 0, binding = 4, r11f_g11f_b10f)
+    uniform writeonly image2D out_color;
+
+layout(std430, set = 1, binding = VIEW_CAMERA_BUFFER_INDEX)
+    readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.screen_size.x) || px.y >= int(pc.screen_size.y)) {
+        return;
+    }
+    const vec3 cur = imageLoad(src_color, px).rgb;
+    if (pc.history_valid == 0u) {
+        imageStore(out_color, px, vec4(cur, 1.0f));
+        return;
+    }
+
+    // ── Where was this surface last frame? ───────────────────────────
+    // The G-buffer velocity (curNDC - prevNDC, BOTH matrices jittered)
+    // covers every deferred-covered pixel; pixels it was never written
+    // for (sky, water, citizens — the attachment clears to zero and a
+    // zero velocity is also what a static surface produces under a
+    // static camera) reconstruct the same quantity from depth through
+    // the same jittered matrices, so the two paths agree by
+    // construction.  The history is last frame's CONVERGED (effectively
+    // unjittered) output, so jitter_prev is subtracted once at the end.
+    const vec2 uv = (vec2(px) + 0.5f) / vec2(pc.screen_size);
+    vec2 prev_ndc;
+    const vec2 vel = texelFetch(velocity_tex, px, 0).rg;
+    if (abs(vel.x) + abs(vel.y) > 1e-8f) {
+        prev_ndc = (uv * 2.0f - 1.0f) - vel;
+    } else {
+        const float z = texelFetch(depth_tex, px, 0).r;
+        vec4 world = camera_info.inv_view_proj *
+                     vec4(uv * 2.0f - 1.0f, z, 1.0f);
+        if (abs(world.w) < 1e-9f) {
+            imageStore(out_color, px, vec4(cur, 1.0f));
+            return;
+        }
+        world /= world.w;
+        vec4 pclip = camera_info.prev_view_proj * vec4(world.xyz, 1.0f);
+        if (pclip.w <= 1e-6f) {
+            imageStore(out_color, px, vec4(cur, 1.0f));
+            return;
+        }
+        prev_ndc = pclip.xy / pclip.w;
+    }
+    // Sample the history AT prev_ndc — no jitter un-correction.  The
+    // history texels live on the previous frame's (jittered) raster
+    // grid: a surface point's accumulated colour sits at the pixel it
+    // rasterised to under THAT frame's jitter, so subtracting
+    // jitter_prev here re-offsets every fetch by up to a pixel, blurs
+    // the history through the bilinear tap, and keeps the accumulator
+    // from ever converging — which showed up as the whole terrain
+    // shimmering at the 8-frame jitter cycle.
+    const vec2 prev_uv = prev_ndc * 0.5f + 0.5f;
+    if (any(lessThan(prev_uv, vec2(0.0f))) ||
+        any(greaterThan(prev_uv, vec2(1.0f)))) {
+        imageStore(out_color, px, vec4(cur, 1.0f));
+        return;
+    }
+
+    // ── Variance clipping (Salvi) instead of min/max clamp ───────────
+    // Min/max is exactly wrong for sparkle-prone content: one bright
+    // outlier in the 3x3 (a traced water-reflection firefly, a snow
+    // texel catching the jittered sample) stretches the box to include
+    // it, so the oscillation passes through the clamp untouched — which
+    // is the open-water / snow-band flicker.  The mean +- gamma*sigma
+    // ellipsoid ignores outliers: a lone firefly barely moves sigma and
+    // the history stays anchored, while a REAL change (disocclusion,
+    // moving edge) shifts the whole neighborhood and still rejects
+    // stale history immediately.
+    vec3 m1 = cur;
+    vec3 m2 = cur * cur;
+    const ivec2 lim = ivec2(pc.screen_size) - 1;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            const vec3 c = imageLoad(
+                src_color,
+                clamp(px + ivec2(dx, dy), ivec2(0), lim)).rgb;
+            m1 += c;
+            m2 += c * c;
+        }
+    }
+    const float inv_n = 1.0f / 9.0f;
+    const vec3 mu    = m1 * inv_n;
+    const vec3 sigma = sqrt(max(m2 * inv_n - mu * mu, vec3(0.0f)));
+    const float kClipGamma = 1.15f;
+    const vec3 ext = kClipGamma * sigma + vec3(1e-4f);
+
+    vec3 hist = texture(history_color, prev_uv).rgb;
+    // A NaN in history poisons the accumulator forever — scrub it.
+    if (any(isnan(hist))) hist = cur;
+    // Clip TOWARD the mean (direction-preserving), not per-channel
+    // clamp — per-channel clamping shifts hue at the box corners.
+    {
+        const vec3 d = hist - mu;
+        const vec3 t3 = abs(d) / ext;
+        const float t = max(t3.x, max(t3.y, t3.z));
+        if (t > 1.0f) {
+            hist = mu + d / t;
+        }
+    }
+
+    // ── Luminance-weighted (Karis) blend ─────────────────────────────
+    // A plain lerp lets one bright frame drag the accumulator far
+    // upward and the next dark frame drag it back — the visible
+    // "boiling".  Weighting both terms by 1/(1+luma) means bright
+    // outliers buy proportionally LESS influence, which is the
+    // firefly killer every shipping TAA uses.
+    const float a  = clamp(pc.blend, 0.02f, 1.0f);
+    const float wc = a /
+        (1.0f + max(cur.r,  max(cur.g,  cur.b)));
+    const float wh = (1.0f - a) /
+        (1.0f + max(hist.r, max(hist.g, hist.b)));
+    const vec3 result = (cur * wc + hist * wh) / max(wc + wh, 1e-6f);
+    imageStore(out_color, px, vec4(result, 1.0f));
+}

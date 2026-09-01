@@ -103,6 +103,13 @@ public:
         return m_view_camera_->getViewCameraBuffer();
     }
 
+    // TAA: opt this camera's projection into the per-frame sub-pixel
+    // jitter (ViewCamera::setProjJitter).  Only the MAIN camera should —
+    // shadow / probe / capture cameras must stay unjittered.
+    void setApplyProjJitter(bool apply) {
+        m_view_camera_->setApplyProjJitter(apply);
+    }
+
     virtual glm::mat4 getViewProjMatrix() {
         return m_view_camera_->getCameraInfo().view_proj;
     }

@@ -267,6 +267,15 @@ class Menu {
     // flipped live to A/B the two looks.
     bool turn_off_ray_tracing_ = false;
     bool turn_off_volume_moist_ = false;
+    // TAA default OFF: with the current resolve the water / snow-band
+    // content still flickers more with it on than off (user-verified);
+    // the toggle stays for A/B while it gets tuned.
+    bool  taa_on_ = false;
+    bool  dof_on_ = true;
+    bool  dof_autofocus_ = true;
+    float dof_focus_dist_m_ = 20.0f;
+    float dof_focus_range_m_ = 4.0f;
+    float dof_max_coc_px_ = 10.0f;
     bool turn_off_shadow_pass_ = false;
     // CSM silhouette prepass — fills each cascade's in-camera-frustum
     // region with depth=1 over a 0-cleared depth buffer so out-of-frustum
@@ -2191,6 +2200,16 @@ public:
     // pixels; OFF (default) keeps SSAO running in the RT shadow modes.
     // See the member comment above.
     inline bool isRtAoOn() const { return rt_ao_enabled_; }
+    // TAA master toggle (Rendering panel).  Live-flippable: the app
+    // zeroes the projection jitter and invalidates the TAA history the
+    // frame this goes false, so A/B-ing flicker needs no rebuild.
+    inline bool isTaaOn() const { return taa_on_; }
+    // DOF (Rendering > Smart Mesh panel, next to the TAA toggle).
+    inline bool  isDofOn() const { return dof_on_; }
+    inline bool  isDofAutofocus() const { return dof_autofocus_; }
+    inline float getDofFocusDistM() const { return dof_focus_dist_m_; }
+    inline float getDofFocusRangeM() const { return dof_focus_range_m_; }
+    inline float getDofMaxCocPx() const { return dof_max_coc_px_; }
 
     // Rendering > Shadow > "Auto-arm RT when ready".  OFF pins the CSM
     // fallback for the whole session so the shadow technique never

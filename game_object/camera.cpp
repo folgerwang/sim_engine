@@ -300,6 +300,8 @@ void ViewCamera::updateViewCameraBuffer(
         m_view_camera_buffer_->buffer->getSize());
 }
 
+glm::vec2 ViewCamera::s_proj_jitter_ndc_ = glm::vec2(0.0f);
+
 void ViewCamera::updateViewCameraInfo(
     const glsl::ViewCameraParams& view_camera_params,
     std::shared_ptr<glm::vec3> input_camera_pos,
@@ -486,6 +488,23 @@ void ViewCamera::updateViewCameraInfo(
             double(view_camera_params.z_near),
             double(view_camera_params.z_far));
         proj_d[1][1] *= -1.0;
+        // ── TAA sub-pixel jitter ─────────────────────────────────────
+        // A translation in NDC applied AFTER the projection: clip.x +=
+        // jx * clip.w.  Everything derived below (view_proj, inverses,
+        // the relative VP) inherits it, so every raster pass, the
+        // deferred resolve's world reconstruction and the RT ray setup
+        // stay mutually consistent within the frame — the whole frame
+        // simply looks through a sub-pixel-shifted lens, which is
+        // exactly what the TAA resolve averages back out.
+        // depth_params is untouched: the jitter lands in column entries
+        // whose perspective terms are zero for [0][0]/[1][1] and rows
+        // 2/3 are not modified.
+        if (m_apply_proj_jitter_) {
+            glm::dmat4 jm(1.0);
+            jm[3][0] = double(s_proj_jitter_ndc_.x);
+            jm[3][1] = double(s_proj_jitter_ndc_.y);
+            proj_d = jm * proj_d;
+        }
         const glm::dmat4 view_proj_d = proj_d * view_d;
 
         m_camera_info_.view          = glm::mat4(view_d);

@@ -2484,6 +2484,32 @@ bool Menu::draw(
             }
             // Render Debug — debug visualisation modes, pipeline toggle,
             // viewers, glass mode (see drawRenderDebugMenuContent()).
+            if (ImGui::BeginMenu("Post Processing")) {
+                // TAA — see application initTaa / taa_resolve.comp.
+                // Live toggle: unchecking zeroes the projection jitter
+                // and drops the history next frame.  OFF by default
+                // (see taa_on_).
+                ImGui::Checkbox("TAA (temporal AA)", &taa_on_);
+                ImGui::Separator();
+                // DOF — dof_resolve.comp, dispatched after TAA (or
+                // directly on the composited frame when TAA is off).
+                ImGui::Checkbox("Depth of Field", &dof_on_);
+                if (dof_on_) {
+                    ImGui::Checkbox("DOF autofocus (screen centre)",
+                                    &dof_autofocus_);
+                    if (!dof_autofocus_) {
+                        ImGui::SliderFloat("DOF focus (m)",
+                                           &dof_focus_dist_m_,
+                                           0.5f, 500.0f, "%.1f",
+                                           ImGuiSliderFlags_Logarithmic);
+                    }
+                    ImGui::SliderFloat("DOF in-focus range (m)",
+                                       &dof_focus_range_m_, 0.5f, 50.0f);
+                    ImGui::SliderFloat("DOF max blur (px)",
+                                       &dof_max_coc_px_, 1.0f, 24.0f);
+                }
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Render Debug")) {
                 drawRenderDebugMenuContent();
                 ImGui::EndMenu();
@@ -2837,6 +2863,11 @@ bool Menu::draw(
             if (ImGui::Checkbox("Hi-Z Occlusion Cull", &hiz_cull)) {
                 cluster_renderer_->getUseHiZOcclusionCull() = hiz_cull;
             }
+            // TAA — see application initTaa/taa_resolve.comp.  Live
+            // toggle: unchecking zeroes the projection jitter and drops
+            // the history next frame, so flicker suspects can be A/B'd
+            // without a rebuild.
+            // (TAA / DOF moved to Rendering > Post Processing.)
             ImGui::Separator();
             // Runtime geometry-LOD override: 0 = full detail (the
             // default), 1..5 = the baked decimated levels carried by
