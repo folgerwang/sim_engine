@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <map>
@@ -218,7 +219,17 @@ VulkanDevice::VulkanDevice(
     // prefer it here. Current path works on any family with >= 2 queues.
     const auto& family_info =
         queue_list.getQueueInfo(compute_queue_index);
-    if (family_info.queue_count_ >= 2 &&
+    // REALWORLD_NO_ASYNC_LOADER=1 forces the synchronous upload path
+    // (bisect knob for cross-queue sync problems / DEVICE_LOST).
+    const char* no_async_env = std::getenv("REALWORLD_NO_ASYNC_LOADER");
+    const bool async_loader_disabled =
+        no_async_env && std::atoi(no_async_env) != 0;
+    if (async_loader_disabled) {
+        std::cout << "[LOADER] async loader disabled by REALWORLD_NO_ASYNC_LOADER"
+                  << std::endl;
+    }
+    if (!async_loader_disabled &&
+        family_info.queue_count_ >= 2 &&
         transit_queue_index >= 1) {
         loader_queue_family_index_ = compute_queue_index;
         const uint32_t loader_index = transit_queue_index - 1;
@@ -2190,6 +2201,13 @@ void VulkanDevice::waitForFences(const std::vector<std::shared_ptr<Fence>>& fenc
             UINT64_MAX);
 
     if (result != VK_SUCCESS) {
+        if (result == VK_ERROR_DEVICE_LOST) {
+            std::cerr << "[vk_device] DEVICE_LOST while waiting on "
+                      << vk_fences.size() << " fence(s). Check the "
+                      "'[vk_device] picked :' line at startup - on multi-GPU "
+                      "machines set REALWORLD_GPU_INDEX=<n> to force the dGPU."
+                      << std::endl;
+        }
         throw std::runtime_error(
             std::string("wait for fence error : ") +
                 VkResultToString(result));

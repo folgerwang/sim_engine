@@ -69,6 +69,18 @@ static bool s_enable_validation_layers = true;
 #endif
 
 bool hasEnabledValidationLayers() {
+    // Env override so a Release build can run with validation when chasing a
+    // DEVICE_LOST: REALWORLD_VALIDATION=1 forces on, =0 forces off.
+    static bool s_env_checked = false;
+    if (!s_env_checked) {
+        s_env_checked = true;
+        if (const char* env = std::getenv("REALWORLD_VALIDATION")) {
+            s_enable_validation_layers = (std::atoi(env) != 0);
+            std::cout << "[vk_device] validation layers "
+                      << (s_enable_validation_layers ? "FORCED ON" : "FORCED OFF")
+                      << " by REALWORLD_VALIDATION" << std::endl;
+        }
+    }
     return s_enable_validation_layers;
 }
 
@@ -1604,7 +1616,7 @@ VkResult CreateDebugUtilsMessengerEXT(
 void populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& create_info) {
     create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
-    create_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    create_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;  // VERBOSE floods the log
     create_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
     create_info.pfnUserCallback = debugCallback;
 }
@@ -1967,6 +1979,8 @@ bool isDeviceSuitable(
     return list.isComplete() && extensions_supported && swap_chain_adequate && supported_features.samplerAnisotropy;
 }
 
+int rateDeviceSuitability(const VkPhysicalDevice& device);
+
 std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
     const renderer::PhysicalDeviceList& physical_devices,
     const std::shared_ptr<renderer::Surface>& surface) {
@@ -1989,23 +2003,72 @@ std::shared_ptr<renderer::PhysicalDevice> pickPhysicalDevice(
         throw std::runtime_error("failed to find a suitable GPU!");
     }
 #else
+    // Pick the best suitable device instead of the first one that passes.
+    // On machines with two GPUs (e.g. AMD iGPU + NVIDIA dGPU) the iGPU can
+    // be enumerated first and still advertise RT/mesh-shader extensions, so
+    // "first suitable" lands on the wrong card and dies with DEVICE_LOST.
+    // Override with env REALWORLD_GPU_INDEX=<n> to force a device.
+    int forced_idx = -1;
+    if (const char* env = std::getenv("REALWORLD_GPU_INDEX")) {
+        forced_idx = std::atoi(env);
+    }
+
     uint32_t idx = 0;
+    int best_score = -1;
     for (const auto& device : physical_devices) {
         const auto& vk_physical_device =
             RENDER_TYPE_CAST(PhysicalDevice, device)->get();
         VkPhysicalDeviceProperties deviceProperties;
         vkGetPhysicalDeviceProperties(vk_physical_device, &deviceProperties);
-        std::cout << "Physical Device, id : " << idx << ", name : " << deviceProperties.deviceName << std::endl;
 
-        if (isDeviceSuitable(device, surface)) {
+        const bool suitable = isDeviceSuitable(device, surface);
+        int score = suitable ? rateDeviceSuitability(vk_physical_device) : 0;
+
+        const char* type_name = "other";
+        switch (deviceProperties.deviceType) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   type_name = "discrete";   break;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: type_name = "integrated"; break;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    type_name = "virtual";    break;
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:            type_name = "cpu";        break;
+        default: break;
+        }
+        std::cout << "[vk_device] Physical Device, id : " << idx
+                  << ", name : " << deviceProperties.deviceName
+                  << ", type : " << type_name
+                  << ", vendor : 0x" << std::hex << deviceProperties.vendorID << std::dec
+                  << ", driver : " << deviceProperties.driverVersion
+                  << ", api : " << VK_API_VERSION_MAJOR(deviceProperties.apiVersion)
+                  << "." << VK_API_VERSION_MINOR(deviceProperties.apiVersion)
+                  << "." << VK_API_VERSION_PATCH(deviceProperties.apiVersion)
+                  << ", suitable : " << (suitable ? "yes" : "no")
+                  << ", score : " << score << std::endl;
+
+        if (forced_idx >= 0) {
+            if (static_cast<int>(idx) == forced_idx) {
+                if (!suitable) {
+                    std::cout << "[vk_device] WARNING: REALWORLD_GPU_INDEX=" << forced_idx
+                              << " is not suitable, using it anyway" << std::endl;
+                }
+                picked_device = device;
+            }
+        } else if (suitable && score > best_score) {
+            best_score = score;
             picked_device = device;
-            break;
         }
         idx ++;
     }
 
     if (picked_device == VK_NULL_HANDLE) {
         throw std::runtime_error("failed to find a suitable GPU!");
+    }
+
+    {
+        VkPhysicalDeviceProperties picked_props;
+        vkGetPhysicalDeviceProperties(
+            RENDER_TYPE_CAST(PhysicalDevice, picked_device)->get(), &picked_props);
+        std::cout << "[vk_device] picked : " << picked_props.deviceName
+                  << (forced_idx >= 0 ? " (forced by REALWORLD_GPU_INDEX)" : "")
+                  << std::endl;
     }
 #endif
 

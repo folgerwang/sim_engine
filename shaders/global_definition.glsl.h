@@ -142,8 +142,16 @@
 // the region vec4 consumers pass to sampleWindFine().  On the TILE
 // RESOURCE set so every tile shader — water waves, grass sway — reads
 // the SAME wind without its own descriptor plumbing.
-#define WIND_TEX_INDEX                      (TILE_BASE_PARAMS_INDEX + 26) // 33
-#define WIND_REGION_BUFFER_INDEX            (TILE_BASE_PARAMS_INDEX + 27) // 34
+// NOTE: these used to be +26/+27 (33/34), which COLLIDED with
+// DETAIL_NOISE_TEXTURE_INDEX / ROUGH_NOISE_TEXTURE_INDEX in the same
+// tile layout.  Duplicate binding numbers in one VkDescriptorSetLayout
+// are invalid; some drivers happened to resolve them the way the
+// shaders expected, others (RTX 5090 / 591.xx) bound the 3D noise
+// texture as wind_patch_tex and died with VK_ERROR_DEVICE_LOST on the
+// first terrain frame.  50/51 are the first free slots above
+// TERRAIN_FLAT_MASK_INDEX (49).
+#define WIND_TEX_INDEX                      (TILE_BASE_PARAMS_INDEX + 43) // 50
+#define WIND_REGION_BUFFER_INDEX            (TILE_BASE_PARAMS_INDEX + 44) // 51
 
 // The water surface is STATIC: it sits where the terrain's water mask
 // puts it, at the hydrology level plus this adjustment, and nothing
