@@ -27,6 +27,7 @@
 #include <array>
 #include <vector>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,17 @@ namespace scene_rendering {
 
 class ClusterRenderer {
 public:
+    // ── Per-mesh BLAS instanced RT caster (see setRtCasterInstances) ──
+    // Declared up here for the same positional-lookup reason as the
+    // translucent mode enum below.
+    struct RtCasterInstance {
+        glm::mat4 world;      // full instance world transform
+        uint32_t  slot;       // from ensureRtMeshSlot
+        // beyond rt_masked_opaque_dist_m_: all-opaque BLAS.  (Not `far`:
+        // windef.h still #defines that legacy keyword to nothing.)
+        bool      far_lod;
+    };
+
     // ── Translucent (glass) rendering mode ─────────────────────────────
     // Declared here at the top so private fields below can name it
     // at declaration time (C++ data-member type lookup is positional).
@@ -496,9 +508,90 @@ private:
     renderer::AccelerationStructure hw_rt_tlas_handle_{};
     uint64_t hw_rt_static_blas_address_ = 0;   // cached for TLAS rebuilds
     bool hw_rt_shadow_ready_ = false;
+    bool build_sw_rt_bvh_ = true;
+    bool rt_sw_bvh_valid_ = false;
+    // ── Far alpha-masked clusters become OPAQUE in the hardware AS ────
+    // 84 % of the placed world's BLAS triangles are leaf cards
+    // (alpha-masked): every ray-query candidate hit on one returns to
+    // the shader to sample the base-colour texture.  Beyond
+    // rt_masked_opaque_dist_m_ from the eye the build put the AS
+    // together for, the cutout detail of a leaf card is far below a
+    // shadow texel, so those clusters are emitted into the OPAQUE
+    // geometry (hardware-committed hits, no any-hit traffic).  0
+    // disables the demotion.  The eye is the RT-staging build eye the
+    // app selects casters around (rebuilt every kRtInstRebuildMoveM m),
+    // so the threshold is kept comfortably above that walk distance.
+    glm::vec3 rt_build_eye_ = glm::vec3(0.0f);
+    bool      rt_build_eye_valid_ = false;
+    float     rt_masked_opaque_dist_m_ = 150.0f;
+    uint32_t  rt_masked_demoted_tris_ = 0;
     std::shared_ptr<renderer::DescriptorSetLayout> hw_rt_desc_set_layout_;
     std::shared_ptr<renderer::DescriptorSet>       hw_rt_desc_set_;
     void buildHwRtShadowAs();  // called from buildRtShadowBvh
+    // Shared by buildHwRtShadowAs (finalize) and updateRtSkeletons (per
+    // frame): writes [static, skeleton?, casters...] into
+    // hw_rt_instance_buffer_ and returns the instance count.
+    uint32_t writeRtTlasInstances(bool include_skeleton, bool deferrable);
+    // One staging material entry for (drawable, mesh, primitive) — see
+    // the definition.  Callers cache per primitive.
+    uint32_t registerClusterMaterial(
+        const game_object::DrawableData& drawable_data,
+        uint32_t mesh_idx,
+        uint32_t prim_idx,
+        const std::string& mesh_object_name);
+
+    // ── Per-mesh BLAS state (see the public block) ────────────────────
+    struct RtMeshSlot {
+        std::weak_ptr<const helper::Mesh> source;   // liveness guard
+        const game_object::DrawableData*  drawable = nullptr;
+        uint32_t mesh_idx = 0;
+        uint32_t vertex_ofs = 0;      // into rt_mesh_pos_uv_cpu_
+        uint32_t index_ofs = 0;       // into rt_mesh_indices_cpu_ ([opaque | masked] tris)
+        uint32_t opaque_tris = 0;
+        uint32_t masked_tris = 0;
+        uint32_t mat_ofs = 0;         // into rt_mesh_tri_mat_cpu_ (same tri order)
+        uint32_t vertex_count = 0;
+        renderer::BufferInfo blas_near_buf;
+        renderer::BufferInfo blas_far_buf;
+        renderer::AccelerationStructure blas_near{};
+        renderer::AccelerationStructure blas_far{};
+        uint64_t addr_near = 0;
+        uint64_t addr_far = 0;
+        bool built = false;
+        uint32_t mat_epoch = 0;       // rt_material_epoch_ its tri mats were written for
+    };
+    // Bumped by resetToBaseUploads: every staging material id handed out
+    // before it is dead, so slots re-register before their next use.
+    uint32_t rt_material_epoch_ = 1;
+    std::vector<RtMeshSlot> rt_mesh_slots_;
+    std::unordered_map<const void*, uint32_t> rt_mesh_slot_by_source_;
+    std::vector<uint32_t> rt_mesh_build_queue_;      // slots awaiting BLAS build
+    // Object-space pools shared by every slot (CPU authoritative, GPU
+    // copies refreshed by flushRtMeshBuilds / buildHwRtShadowAs).
+    std::vector<glm::vec4> rt_mesh_pos_uv_cpu_;      // pos.xyz + packHalf2x16(uv)
+    std::vector<uint32_t>  rt_mesh_indices_cpu_;     // mesh-local vertex ids
+    std::vector<uint32_t>  rt_mesh_tri_prim_cpu_;    // per tri: mesh primitive index
+    std::vector<uint32_t>  rt_mesh_tri_mat_cpu_;     // per tri: staging material id
+    std::vector<glsl::RtMeshInfo> rt_mesh_infos_cpu_;
+    renderer::BufferInfo rt_mesh_pos_uv_buf_;
+    renderer::BufferInfo rt_mesh_index_buf_;
+    renderer::BufferInfo rt_mesh_tri_mat_buf_;
+    renderer::BufferInfo rt_mesh_info_buf_;
+    uint32_t rt_mesh_gpu_pos_count_ = 0;    // elements the GPU copies hold
+    uint32_t rt_mesh_gpu_index_count_ = 0;
+    uint32_t rt_mesh_gpu_tri_count_ = 0;
+    uint32_t rt_mesh_gpu_info_count_ = 0;
+    bool     rt_mesh_pools_dirty_ = false;  // CPU pools changed since upload
+    bool     rt_materials_pending_ = false;
+    bool     rt_per_mesh_blas_ = true;
+    bool     rt_tlas_dirty_ = false;
+    std::vector<RtCasterInstance> rt_caster_instances_;
+    // (drawable, mesh) → per-primitive staging material ids, rebuilt by
+    // registerRtMeshMaterials on every sync.
+    std::map<std::pair<const void*, uint32_t>, std::vector<uint32_t>>
+        rt_mesh_prim_materials_;
+    void writeRtMeshDescriptors();   // hw_rt_desc_set_ bindings 5..8
+    void destroyRtMeshSlots();
 
     // ── RT-shadow skeletons (skinned characters, both RT modes) ────────
     // Characters deform every frame, so they can't live in the static
@@ -544,7 +637,12 @@ private:
     void flushRetiredBuffers(bool force = false);
     renderer::AccelerationStructure hw_rt_skel_blas_handle_{};
     uint32_t hw_rt_skel_blas_tri_cap_ = 0;  // BLAS sized for this many tris
-    renderer::BufferInfo hw_rt_frame_instance_buffer_;  // TLAS rebuild input
+    // (hw_rt_instance_buffer_ now serves both the finalize-time and the
+    // per-frame TLAS builds — sized for 2 + kRtCasterMaxInstances.)
+    bool rt_skel_last_has_skels_ = false;   // what the last TLAS carried
+    void recordRtTlasRebuild(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        bool include_skeleton);
     void writeRtSkeletonDescriptors();  // rewrite RT-set bindings 8..11
     // Change detection for updateRtSkeletons: pose = model matrix +
     // joint matrices, cached per input slot.  When every skeleton's
@@ -627,6 +725,11 @@ private:
 
     // Global stats for debug UI.
     uint32_t total_clusters_all_meshes_ = 0;
+    // Hidden-cluster bookkeeping for allClustersHidden(): per global
+    // mesh hidden flag (so repeated hide/show calls do not double count)
+    // and the running total of hidden clusters.  Reset by finalizeUploads.
+    std::vector<uint8_t> mesh_hidden_flags_;
+    uint64_t             hidden_cluster_count_ = 0;
     uint32_t rt_instance_count_ = 0;   // RT-only instanced casters staged
     uint32_t total_visible_all_meshes_ = 0;
 
@@ -712,6 +815,67 @@ public:
         const std::vector<uint32_t>& cluster_prim_map,
         const glm::mat4& model_transform);
 
+    // ── Per-mesh BLAS instanced RT casters ────────────────────────────
+    // The instanced placed world (EXT_mesh_gpu_instancing groups: trees,
+    // rocks, bushes) used to reach the hardware AS as world-space COPIES
+    // merged into the cluster staging — one copy per instance, a ~100 MB
+    // BLAS rebuilt (waitIdle + full re-merge) every kRtInstRebuildMoveM
+    // metres of walking.  This path builds ONE object-space BLAS pair
+    // per unique mesh (once, cached by the cluster mesh's source
+    // geometry) and puts the instances into the TLAS as instance
+    // transforms, so a caster-set change is a TLAS rebuild on the frame
+    // command buffer (~16k instances, well under a millisecond) instead
+    // of a hitch.  Hit shading reads per-mesh pools (pos+uv, indices,
+    // per-triangle material) through the instance custom index:
+    //     custom = 2 + (slot << 1 | far)
+    // where `far` selects the all-opaque BLAS variant (the far masked→
+    // opaque demotion, per INSTANCE now) and 0 / 1 stay the merged
+    // static geometry / the skeleton BLAS.
+    void setRtPerMeshBlasEnabled(bool on) { rt_per_mesh_blas_ = on; }
+    bool rtPerMeshBlasEnabled() const { return rt_per_mesh_blas_; }
+    // Slot of a cluster mesh's BLAS pair, building it on first use (the
+    // build itself is batched — see flushRtMeshBuilds).  -1 when the mesh
+    // has no CPU geometry to build from.
+    int32_t ensureRtMeshSlot(
+        const helper::ClusterMesh& cluster_mesh,
+        const game_object::DrawableData& drawable_data,
+        uint32_t mesh_idx,
+        const std::vector<uint32_t>& cluster_prim_map);
+    // Builds every BLAS queued by ensureRtMeshSlot in one submit-and-wait
+    // and refreshes the per-mesh pools + descriptors (waitIdle when a
+    // pool had to grow).  Returns the number of BLASes built.
+    uint32_t flushRtMeshBuilds();
+    // Replaces the caster instance set; the TLAS picks it up on the next
+    // updateRtSkeletons (forced through rt_tlas_dirty_) or finalize.
+    void setRtCasterInstances(std::vector<RtCasterInstance>&& instances);
+    uint32_t rtCasterInstanceCount() const {
+        return static_cast<uint32_t>(rt_caster_instances_.size());
+    }
+    uint32_t rtMeshSlotCount() const {
+        return static_cast<uint32_t>(rt_mesh_slots_.size());
+    }
+    // Re-registers (into the CURRENT staging material table) the material
+    // of every primitive every slot of this drawable's meshes references.
+    // Must run on every sync after resetToBaseUploads, because material
+    // ids are indices into that table.  Slots created later look their
+    // materials up here as well.
+    void registerRtMeshMaterials(const game_object::DrawableData& drawable_data);
+    // True when a slot registered materials outside a sync — the app
+    // then forces a finalize so the GPU material table catches up.
+    bool rtMaterialsPendingUpload() const { return rt_materials_pending_; }
+    static constexpr uint32_t kRtCasterMaxInstances = 16384u;
+    // Instanced-only worlds (every caster is a TLAS instance, nothing
+    // merged): stage ONE degenerate, far-away triangle so finalizeUploads
+    // still builds the merged-side buffers, the RT descriptor sets (the
+    // material table + the alpha-test texture array the caster hits
+    // shade with) and the TLAS the ray-query resolve binds.  Without it
+    // a zero-cluster finalize returns early and hwRtShadowReady() can
+    // never turn true for such a world.  No-op once anything is staged.
+    void stageRtSentinelCluster();
+    uint32_t stagedClusterCount() const {
+        return static_cast<uint32_t>(staging_cull_infos_.size());
+    }
+
     // ── VT cache warm-up (editor placed-object flow) ──────────────────
     // registerMaterial BC7-encodes every tile of every mip of a texture
     // on the CPU — doing that for dozens of textures inside ONE
@@ -764,6 +928,14 @@ public:
     // values back.  The unsynchronised write can race the in-flight cull
     // dispatch — worst case one cluster flickers for a single frame.
     void setMeshClustersHidden(uint32_t global_mesh_idx, bool hidden);
+    // True when every uploaded cluster is currently hidden (the usual
+    // state once the RT-only staging has hidden all placed casters from
+    // the raster cull): the app skips the per-frame cull dispatches
+    // then instead of walking ~450k clusters to draw nothing.
+    bool allClustersHidden() const {
+        return total_clusters_all_meshes_ > 0 &&
+               hidden_cluster_count_ >= total_clusters_all_meshes_;
+    }
 
     // Patch the per-material flags SSBO with MeshCategory bits taken
     // from the supplied LLM-backed classifier.  Walks
@@ -1182,6 +1354,26 @@ public:
     // ran with geometry present) — the app gates FEATURE_INPUT_RT_SHADOW
     // on this so the resolve shader never traverses an empty tree.
     bool rtShadowReady() const { return rt_shadow_ready_; }
+    // Software cluster BVH policy.  The SW BVH (98–136 ms per rebuild on
+    // the placed world) is only consumed by the software RT shadow /
+    // ReSTIR-fallback paths; when the hardware ray-query technique is
+    // selected the rebuild used to pay for it anyway.  With the flag off
+    // buildRtShadowBvh keeps the geometry SSBOs + descriptor set (the HW
+    // path reads rt_pos_uv / rt_materials from them) but binds a one-node
+    // empty BVH and reports swRtBvhValid() == false, so the app never
+    // arms a technique that would traverse it.
+    void setBuildSoftwareRtBvh(bool b) { build_sw_rt_bvh_ = b; }
+    // See rt_masked_opaque_dist_m_: eye the next AS build classifies far
+    // masked clusters against, and the distance threshold (0 = off).
+    void setRtBuildEye(const glm::vec3& eye) {
+        rt_build_eye_ = eye;
+        rt_build_eye_valid_ = true;
+    }
+    void setRtMaskedOpaqueDistance(float m) { rt_masked_opaque_dist_m_ = m; }
+    float rtMaskedOpaqueDistance() const { return rt_masked_opaque_dist_m_; }
+    uint32_t getRtMaskedDemotedTris() const { return rt_masked_demoted_tris_; }
+    bool buildSoftwareRtBvh() const { return build_sw_rt_bvh_; }
+    bool swRtBvhValid() const { return rt_shadow_ready_ && rt_sw_bvh_valid_; }
     const std::shared_ptr<renderer::DescriptorSet>& getRtShadowDescSet() const {
         return rt_shadow_desc_set_;
     }

@@ -174,6 +174,10 @@ struct BufferViewInfo {
 };
 
 struct DrawableData;
+// GPU node-table draw path state (defined in drawable_object.cpp — it
+// holds glsl:: structs the header does not include).  See
+// DrawableObject::ntBeginPass.
+struct NodeTableGpu;
 struct AnimChannelInfo {
     enum AnimChannelType {
         kTranslation,
@@ -348,6 +352,21 @@ struct NodeInfo {
     // instanced" and the drawable's single identity slot 0 is used.
     uint32_t                    inst_offset_ = 0;
     uint32_t                    inst_count_ = 0;
+    // ── THIS NODE'S OWN INSTANCE-RANGE BOUNDS ────────────────────────
+    // Union of the mesh vertex bbox transformed by ONLY the instances in
+    // [inst_offset_, inst_offset_ + inst_count_), in the same (post-
+    // instance, pre-node) space MeshInfo::inst_bbox_* uses.  The mesh-
+    // level inst bbox is the union over EVERY instance of the mesh, so
+    // for a library mesh shared by hundreds of placements it spans the
+    // whole map and the per-node cull sphere built from it rejects
+    // nothing (measured: 4 of 39.5k survivors culled by the frustum, 0
+    // by the cascade volumes).  The per-node range is the box the node
+    // actually draws.  Filled by loadRwInstanced; has_node_inst_bbox_
+    // stays false for every node of every other loader, which then keep
+    // the mesh-level box byte-for-byte.
+    glm::vec3                   node_inst_bbox_min_ = glm::vec3(std::numeric_limits<float>::max());
+    glm::vec3                   node_inst_bbox_max_ = glm::vec3(std::numeric_limits<float>::lowest());
+    bool                        has_node_inst_bbox_ = false;
     // ── THIS NODE'S INDIRECT COMMANDS ────────────────────────────────
     // Byte offset of the first of this node's draw commands, one per
     // primitive of its mesh, contiguous.  -1 = this drawable still uses
@@ -686,6 +705,30 @@ struct DrawableData {
     // Largest far_ over all LOD nodes, i.e. which band is the outermost.
     // Only read by the no-eye-yet fallback, which draws that band alone.
     float                       lod_far_max_ = 0.0f;
+    // ── Compact per-node LOD table (structure of arrays) ──────────────
+    // Everything selectPlantLodBands reads per node, 40 bytes each,
+    // contiguous.  NodeInfo is ~300 bytes and the recompute touched
+    // five cache lines of it per node for six floats — this is what
+    // makes the 2 m-of-travel recompute stream 55 MB instead of 400 MB.
+    // Invalidated (lod_soa_valid_ = false) whenever a node's band
+    // distances, gate or rect inputs are rewritten: applyPlantLodBands
+    // (band retune), parsePlantLodBands (load) and the instance-world
+    // change path inside selectPlantLodBands itself.
+    struct LodSoa {
+        float   wx0, wx1, wz0, wz1;   // world-XZ rect of the LOD tile
+        float   near_m, far_m;        // band edges
+        float   gate_x, gate_z, gate_r;
+        uint8_t flags;                // kLodSoa* bits
+        uint8_t pad_[3];
+    };
+    enum : uint8_t {
+        kLodSoaIsLod          = 0x1,  // lod_tile_m_ > 0
+        kLodSoaPerInstance    = 0x2,  // lod_per_instance_
+        kLodSoaHasGate        = 0x4,  // gate_r_ > 0
+        kLodSoaGateModeInside = 0x8,  // gate_mode_ != 0
+    };
+    std::vector<LodSoa>         lod_soa_;
+    bool                        lod_soa_valid_ = false;
     // Per chain: its category name, and the (near, far) pairs it
     // authored in rung order.  Kept so a runtime override can be
     // reverted, and so a chain with more rungs than its override table
@@ -778,9 +821,41 @@ struct DrawableData {
     size_t                      lod_pass_flat_n_ = 0;
     std::vector<uint32_t>       lod_pass_fwd_;    // colour-pass survivors
     std::vector<uint32_t>       lod_pass_depth_;  // depth-pass survivors
+    // ── Per-pass survivor subsets (empty-pass elimination) ────────────
+    // Two more lists built in the same scan, so the passes that draw
+    // almost nothing stop walking the full survivor list:
+    //   lod_pass_fwd_uncov_: colour survivors the MAIN FORWARD pass must
+    //     still record while the deferred re-rasterise covers the rest —
+    //     a node in cross-fade (|fade| < 0.999), a per-instance-band
+    //     node, or one whose mesh has a primitive the G-buffer path
+    //     cannot take (blend / non-opaque / skinned / no material).
+    //     Measured before this list: 39.5k walked for 443 draws, 2.4 ms.
+    //   lod_pass_glass_: colour survivors whose mesh carries a Blend
+    //     primitive — the only nodes the translucent glass pass can draw.
+    //     Measured before: 39.5k walked for 0 draws, 2.2 ms.
+    std::vector<uint32_t>       lod_pass_fwd_uncov_;
+    std::vector<uint32_t>       lod_pass_glass_;
+    // Per-mesh pass flags, built with the flat node list (materials are
+    // final by then): bit 0 = mesh has a Blend primitive, bit 1 = mesh has
+    // a primitive the deferred G-buffer path cannot cover.
+    enum : uint8_t { kMeshHasBlend = 0x1, kMeshHasUncoverable = 0x2 };
+    std::vector<uint8_t>        mesh_pass_flags_;
+    bool                        mesh_pass_flags_built_ = false;
+    bool                        any_blend_prims_ = false;
+    bool                        any_uncoverable_prims_ = false;
 
     std::shared_ptr<renderer::DescriptorSet> indirect_draw_cmd_buffer_desc_set_;
     std::shared_ptr<renderer::DescriptorSet> update_instance_buffer_desc_set_;
+    // Pool the shared descriptor sets above came from, kept so the GPU
+    // node-table path can allocate its own sets lazily on first use.
+    std::shared_ptr<renderer::DescriptorPool> shared_descriptor_pool_;
+
+    // ── GPU node-table draw path (DrawableObject::ntBeginPass) ────────
+    // Per-drawable GPU tables + scratch for the compute-culled,
+    // drawIndexedIndirectCount-driven draw of the LOD survivor lists.
+    // Created lazily on the first eligible pass; null for every drawable
+    // the path never touches (non plant-LOD files).
+    std::shared_ptr<NodeTableGpu> nt_;
 
     // Set true on the main thread at the end of async phase3, after
     // descriptor-set / pipeline / instance-buffer creation. The render
@@ -1073,6 +1148,39 @@ private:
     // <=256 verts/tris; everything else falls back to the GS pipeline
     // inside drawMesh.
     static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> drawable_csm_mesh_shader_pipeline_list_;
+    // ── GPU node-table draw path (see ntBeginPass) ───────────────────
+    // The _NT vertex permutations read their per-node ModelParams from a
+    // record table indexed by gl_DrawIDARB instead of the push constant,
+    // so every pass mode needs its own pipeline list against the same
+    // hashes the classic lists use.  Built lazily by ntDraw from the
+    // formats / pipeline info captured at the first population site.
+    enum NtPassMode : uint32_t {
+        kNtPassForward = 0,
+        kNtPassGBuffer,
+        kNtPassGlass,
+        kNtPassDepthPrepass,
+        kNtPassShadow,
+        kNtPassCsmLayered,
+        kNtPassCsmPerCascade,
+        kNtPassCount
+    };
+    static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> nt_pipeline_lists_[kNtPassCount];
+    static std::shared_ptr<renderer::DescriptorSetLayout> node_table_desc_set_layout_;   // VS set (records + slots)
+    static std::shared_ptr<renderer::DescriptorSetLayout> nt_cull_desc_set_layout_;      // node_table_cull.comp set 0
+    static std::shared_ptr<renderer::PipelineLayout>      nt_cull_pipeline_layout_;
+    static std::shared_ptr<renderer::Pipeline>            nt_cull_pipeline_;
+    static renderer::PipelineRenderbufferFormats nt_formats_forward_;
+    static renderer::PipelineRenderbufferFormats nt_formats_shadow_;
+    static renderer::PipelineRenderbufferFormats nt_formats_depth_only_;
+    static renderer::GraphicPipelineInfo         nt_graphic_pipeline_info_;
+    static bool     nt_formats_valid_;
+    static bool     nt_enabled_;
+    static uint64_t nt_frame_serial_;
+    // The device the node-table path allocates/uploads with.  NOT
+    // DrawableData::device_: that member is a reference bound at
+    // construction, and for async-loaded files it refers to the loader
+    // lambda's captured copy, which is gone by the time anything draws.
+    static std::shared_ptr<renderer::Device> nt_device_;
     // Ground-decal forward pipeline.  Same vertex layout, same layout
     // object and the same forward renderbuffer formats as
     // drawable_pipeline_list_; what differs is the fragment permutation
@@ -1765,6 +1873,8 @@ public:
                                     // most one per frame, not one per pass
         uint64_t prims = 0;         // drawIndexedIndirect calls recorded
         uint64_t desc_binds = 0;    // bindDescriptorSets calls recorded
+        uint64_t nt_draws = 0;      // drawIndexedIndirectCount buckets (GPU node-table path)
+        uint64_t nt_records = 0;    // survivor records the node-table cull dispatched
     };
     static void resetDrawStats();
     static const DrawStats& drawStats();
@@ -1792,6 +1902,61 @@ public:
     // Published by ObjectSceneView::draw (all passes) and mirrored from
     // setViewerWorldPos so the decal path keeps it warm too.
     static void setPlantLodEye(const glm::vec3& pos);
+
+    // ── GPU node-table draw path ─────────────────────────────────────
+    // Moves the per-node work of the placed-drawable passes to the GPU.
+    // For every eligible drawable (static, plant-LOD banded, no debug
+    // filters) the LOD survivor lists are uploaded as records once per
+    // change, and each pass runs node_table_cull.comp over them —
+    // frustum / shadow-volume cull plus the pass's node and primitive
+    // filters — appending the surviving nodes' indirect commands into
+    // one bucket per primitive.  draw() then issues ONE
+    // drawIndexedIndirectCount per bucket instead of a push + draw per
+    // node, and the _NT vertex permutations fetch the node's
+    // ModelParams by gl_DrawIDARB.
+    //
+    // ntBeginPass must run OUTSIDE the pass's rendering scope (compute
+    // dispatches are illegal inside vkCmdBeginRendering): ObjectSceneView
+    // calls it right before beginDynamicRendering with the same mode /
+    // cascade its draw loop is about to use, after publishing the eye.
+    // A drawable the hook did not prepare simply takes the CPU path in
+    // draw(), so the two can never disagree about what is on screen.
+    static void ntBeginPass(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const std::vector<std::shared_ptr<DrawableObject>>& drawables,
+        DrawMode draw_mode,
+        bool depth_only,
+        uint32_t csm_cascade_idx);
+    // Menu toggle.  Off = every drawable records through the classic
+    // per-node path exactly as before.
+    static void setNodeTableEnabled(bool on) { nt_enabled_ = on; }
+    static bool nodeTableEnabled() { return nt_enabled_; }
+    // Frame serial (monotonic, once per frame from the application):
+    // picks the parity of the double-buffered record tables and expires
+    // retired scratch buffers three frames after their last use.
+    static void setFrameSerial(uint64_t serial) { nt_frame_serial_ = serial; }
+
+private:
+    // Copies the wrapper-owned per-draw state (instance world, sub-object
+    // filter, clutter fade, sway) into the shared DrawableData — the
+    // staging draw() always did at its top, split out so ntBeginPass can
+    // stage the same values before the cull dispatch.
+    void stagePerDrawState();
+    // Node-table internals — see ntBeginPass.
+    bool ntEligible(DrawMode draw_mode) const;
+    void ntPrepare(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        DrawMode draw_mode,
+        bool depth_only,
+        uint32_t csm_cascade_idx);
+    void ntDraw(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_set_list,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors,
+        DrawMode draw_mode,
+        uint32_t csm_cascade_idx);
+public:
 
     static void initGameObjectBuffer(
         const std::shared_ptr<renderer::Device>& device);

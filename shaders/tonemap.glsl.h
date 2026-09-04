@@ -50,4 +50,22 @@ vec3 sceneTonemap(vec3 hdr)
     return pow(sceneAcesFilm(hdr * kSceneExposure), vec3(1.0 / 2.2));
 }
 
+// ── Physical-camera exposure ────────────────────────────────────────────
+// The same curve with the per-frame exposure scale the camera UBO
+// carries (ViewCameraInfo::exposure_scale — shutter / f-stop / ISO from
+// the Camera & Lens panel, relative to the calibrated default).  Every
+// final-colour writer that binds the camera buffer passes
+// sceneExposureScaleOf(camera_info.exposure_scale); a writer without
+// the camera buffer keeps sceneTonemap() (scale 1).
+float sceneExposureScaleOf(float v)
+{
+    return (v > 0.0) ? v : 1.0;
+}
+
+vec3 sceneTonemapExposed(vec3 hdr, float exposure_scale)
+{
+    return pow(sceneAcesFilm(hdr * (kSceneExposure * exposure_scale)),
+               vec3(1.0 / 2.2));
+}
+
 #endif  // TONEMAP_GLSL_H

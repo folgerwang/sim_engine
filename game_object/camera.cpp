@@ -336,7 +336,13 @@ void ViewCamera::updateViewCameraInfo(
     const bool aspect_changed =
         m_last_vp_aspect_ >= 0.0f &&
         (aspect_delta_ > 1e-6f || aspect_delta_ < -1e-6f);
-    const bool zero_velocity_this_frame = first_vp_capture || aspect_changed;
+    // A focal-length (zoom) change rebuilds proj the same way.
+    const float fov_delta_ = view_camera_params.fov - m_last_vp_fov_;
+    const bool fov_changed =
+        m_last_vp_fov_ >= 0.0f &&
+        (fov_delta_ > 1e-6f || fov_delta_ < -1e-6f);
+    const bool zero_velocity_this_frame =
+        first_vp_capture || aspect_changed || fov_changed;
     if (!zero_velocity_this_frame) {
         m_camera_info_.prev_view_proj = m_camera_info_.view_proj;
     }
@@ -534,6 +540,7 @@ void ViewCamera::updateViewCameraInfo(
         m_camera_info_.prev_view_proj = m_camera_info_.view_proj;
     }
     m_last_vp_aspect_ = view_camera_params.aspect;
+    m_last_vp_fov_    = view_camera_params.fov;
 
     // deferrable — AND THIS ONE MATTERS MOST OF ALL.  The view camera UBO
     // carries view_proj / prev_view_proj / position / input_features and

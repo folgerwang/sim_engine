@@ -119,6 +119,15 @@ public:
     void setAspect(float aspect) {
         if (aspect > 0.0f) m_view_camera_params_.aspect = aspect;
     }
+    // Vertical field of view in RADIANS (what glm::perspective and
+    // update_camera.comp consume).  The Camera & Lens panel derives it
+    // from focal length and sensor height: 2 * atan(h / (2 f)).
+    void setFovY(float fov_rad) {
+        if (fov_rad > 0.01f && fov_rad < 3.1f) m_view_camera_params_.fov = fov_rad;
+    }
+    float getFovY() const { return m_view_camera_params_.fov; }
+    // Camera & Lens exposure scale — see ViewCameraInfo::exposure_scale.
+    void setExposureScale(float s) { m_view_camera_->setExposureScale(s); }
 
     virtual glm::vec3 getCameraPos() {
         return m_view_camera_->getCameraInfo().position;

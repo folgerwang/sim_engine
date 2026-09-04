@@ -1,0 +1,144 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+// ── rt_temporal.comp — temporal accumulation of the traced shadow/AO ──
+// Runs AFTER the à-trous chain and BEFORE the resolve's APPLY dispatch:
+//   GEN (trace, raw) → rt_filter ×3 (raw ⇄ filtered, result in
+//   filtered) → THIS (filtered[px] ⊕ history → filtered[px]) → APPLY.
+// Reprojects last frame's accumulated (shadow, ao) pair, rejects it on
+// disocclusion (view-depth mismatch against what the history pixel
+// recorded) and clamps it to the 3×3 RAW neighbourhood so moving
+// shadows do not ghost, then blends with an exponential window of
+// ~max_history frames.  Reading the neighbourhood from the RAW image
+// (which nobody writes in this pass) and only the pixel's own value
+// from the filtered image keeps the in-place write race-free.
+//
+// This is what lets the resolve trace 2 cone samples per pixel instead
+// of 8: the à-trous chain borrows the neighbourhood and this pass
+// borrows the last ~16 frames, so the effective sample count per pixel
+// is higher than the old single-frame 8.
+//
+// History layout (rgba16f): r = shadow, g = ao, b = view depth (clip w
+// of the pixel when it was written), a = accumulated frame count.
+#include "global_definition.glsl.h"
+
+layout(push_constant) uniform RtTemporalPC {
+    uvec2 screen_size;
+    uint  history_valid;   // 0 on the first frame / after a resize
+    uint  max_history;     // frames in the exponential window (~16)
+} pc;
+
+layout(set = 0, binding = 0, rg16f)   uniform image2D filtered_io;
+layout(set = 0, binding = 1, rg16f)   uniform readonly image2D raw_in;
+layout(set = 0, binding = 2)          uniform sampler2D hist_in;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D hist_out;
+layout(set = 0, binding = 4)          uniform sampler2D velocity_tex;
+layout(set = 0, binding = 5)          uniform sampler2D depth_tex;
+
+layout(std430, set = 1, binding = VIEW_CAMERA_BUFFER_INDEX)
+    readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.screen_size.x) || px.y >= int(pc.screen_size.y)) {
+        return;
+    }
+    const vec2 cur = imageLoad(filtered_io, px).rg;
+    // "No measurement" sentinel from the GEN pass (sky / forward pixels):
+    // pass it through and keep no history for the pixel.
+    if (cur.r < 0.0) {
+        imageStore(hist_out, px, vec4(cur, 0.0, 0.0));
+        return;
+    }
+    const float z = texelFetch(depth_tex, px, 0).r;
+    if (pc.history_valid == 0u || z >= 1.0) {
+        imageStore(hist_out, px, vec4(cur, 0.0, 1.0));
+        return;
+    }
+
+    // ── Reproject: world position of this pixel, then last frame's uv ─
+    const vec2 uv  = (vec2(px) + 0.5) / vec2(pc.screen_size);
+    const vec2 ndc = uv * 2.0 - 1.0;
+    vec4 world = camera_info.inv_view_proj * vec4(ndc, z, 1.0);
+    if (abs(world.w) < 1e-9) {
+        imageStore(hist_out, px, vec4(cur, 0.0, 1.0));
+        return;
+    }
+    world /= world.w;
+    const vec4 pclip = camera_info.prev_view_proj * vec4(world.xyz, 1.0);
+    const vec4 cclip = camera_info.view_proj      * vec4(world.xyz, 1.0);
+    if (pclip.w <= 1e-6 || cclip.w <= 1e-6) {
+        imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
+        return;
+    }
+    vec2 prev_ndc = pclip.xy / pclip.w;
+    // Per-object motion (velocity written by the G-buffer pass) wins
+    // over the camera-only reprojection where present.
+    const vec2 vel = texelFetch(velocity_tex, px, 0).rg;
+    if (abs(vel.x) + abs(vel.y) > 1e-8) {
+        prev_ndc = ndc - vel;
+    }
+    const vec2 prev_uv = prev_ndc * 0.5 + 0.5;
+    if (any(lessThan(prev_uv, vec2(0.0))) ||
+        any(greaterThan(prev_uv, vec2(1.0)))) {
+        imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
+        return;
+    }
+
+    // ── Disocclusion: the history pixel must have been (about) this
+    //    far from the previous camera ────────────────────────────────
+    vec4 hist = texture(hist_in, prev_uv);
+    if (any(isnan(hist)) || hist.r < 0.0 || hist.a < 0.5) {
+        imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
+        return;
+    }
+    const float depth_tol = 0.04 * pclip.w + 0.15;   // 4 % + 15 cm
+    if (abs(hist.b - pclip.w) > depth_tol) {
+        imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
+        return;
+    }
+
+    // ── Neighbourhood clamp against ghosting: variance clipping over
+    //    the 5×5 RAW window ─────────────────────────────────────────────
+    // A min/max box over a few 2-ray samples (values quantised to
+    // {0, .5, 1}) changes shape every frame with the sample jitter, and a
+    // converged penumbra value kept getting evicted by it — visible as
+    // shimmer in every soft shadow.  The mean ± k·σ of 25 samples is a
+    // far steadier estimate of what the pixel may legitimately hold,
+    // while a real change (a shadow that moved) still shifts the whole
+    // window within a frame or two.
+    vec2 m1 = vec2(0.0), m2 = vec2(0.0);
+    float cnt = 0.0;
+    const ivec2 lim = ivec2(pc.screen_size) - 1;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const vec2 n = imageLoad(
+                raw_in, clamp(px + ivec2(dx, dy), ivec2(0), lim)).rg;
+            if (n.r < 0.0) continue;         // sentinel neighbour
+            m1 += n;
+            m2 += n * n;
+            cnt += 1.0;
+        }
+    }
+    vec2 h = hist.rg;
+    if (cnt > 0.0) {
+        const vec2 mean  = m1 / cnt;
+        const vec2 sigma = sqrt(max(m2 / cnt - mean * mean, vec2(0.0)));
+        // Floor on the half-width: two rays cannot resolve anything
+        // finer than a quarter step, and the filtered current value is
+        // always inside the window.
+        const vec2 half_w = max(1.5 * sigma, vec2(0.12));
+        const vec2 lo = min(mean - half_w, cur);
+        const vec2 hi = max(mean + half_w, cur);
+        h = clamp(hist.rg, lo, hi);
+    }
+
+    const float n_hist = min(hist.a, float(max(pc.max_history, 1u)));
+    const float alpha  = 1.0 / (n_hist + 1.0);
+    const vec2  acc    = clamp(mix(h, cur, alpha), 0.0, 1.0);
+    imageStore(filtered_io, px, vec4(acc, 0.0, 0.0));
+    imageStore(hist_out, px, vec4(acc, cclip.w, n_hist + 1.0));
+}

@@ -16,6 +16,8 @@
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	ViewCameraInfo camera_info;
 };
+// Camera & Lens exposure for pbr_lighting.glsl.h's toneMap (see there).
+#define SCENE_EXPOSURE_SCALE_EXPR sceneExposureScaleOf(camera_info.exposure_scale)
 
 // Push constant — shared with base.vert.  We only read debug_force_red
 // here; the vertex shader is the canonical reader of the matrix +
@@ -458,7 +460,11 @@ void main() {
     // reuses lodFadeDiscards' complementary screen-door — both bands
     // derive w from the same shared instance translation, so their
     // kept pixels partition exactly.  Node-tile mode is unchanged.
-    if (floatBitsToUint(model_params.model_params_pad0) != 0u) {
+    // The node-table path (MODEL_FLAG_NODE_TABLE) always carries its
+    // dissolve weight in the varying: the push constant's lod_fade is
+    // the bucket base slot there, not a weight.
+    if (floatBitsToUint(model_params.model_params_pad0) != 0u ||
+        (model_params.flip_uv_coord & MODEL_FLAG_NODE_TABLE) != 0u) {
         float w_ci = ps_in_data.vertex_ilod_fade;
         if (abs(w_ci) < 0.001) discard;
         if (lodFadeDiscards(w_ci)) discard;
@@ -693,7 +699,8 @@ void main() {
     // Interior sky occlusion — see kInteriorSkyAmbient.  Applied HERE,
     // between the IBL and punctual calls, so it scales only the
     // environment term: the sun (and its shadow) is untouched.
-    if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u) {
+    if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u ||
+        ps_in_data.vertex_node_flags > 0.5) {
         back_color_info.f_specular  *= kInteriorSkyAmbient;
         back_color_info.f_diffuse   *= kInteriorSkyAmbient;
         back_color_info.f_clearcoat *= kInteriorSkyAmbient;
@@ -728,7 +735,8 @@ void main() {
         material_info,
         normal_info, v);
     // Interior sky occlusion — see kInteriorSkyAmbient.
-    if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u) {
+    if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u ||
+        ps_in_data.vertex_node_flags > 0.5) {
         color_info.f_specular  *= kInteriorSkyAmbient;
         color_info.f_diffuse   *= kInteriorSkyAmbient;
         color_info.f_clearcoat *= kInteriorSkyAmbient;

@@ -584,6 +584,255 @@ ClusterRenderer::ClusterRenderer(
 
 // ─── Upload mesh clusters (CPU staging only) ──────────────────────
 
+// ─── registerClusterMaterial ────────────────────────────────────────────
+// One staging material entry for (drawable, mesh, primitive): base colour,
+// bindless texture slots, VT registration, alpha/translucent/double-sided/
+// foliage flags, and the (material, object) name pair for the classifier.
+// Split out of uploadMeshClusters so the per-mesh RT BLAS path (which
+// never uploads clusters) can register the same materials — callers keep
+// their own prim→index cache.
+uint32_t ClusterRenderer::registerClusterMaterial(
+    const game_object::DrawableData& drawable_data,
+    uint32_t mesh_idx,
+    uint32_t prim_idx,
+    const std::string& mesh_object_name) {
+    const auto& meshes = drawable_data.meshes_;
+    glm::vec4 base_color(1.0f);  // white default
+    glsl::BindlessMaterialParams mp{};
+    mp.base_color_tex_idx = -1;
+    mp.normal_tex_idx     = -1;
+    // VT IDs default to INVALID until registerMaterial assigns
+    // one (per layer that actually had a source image).  Shader
+    // checks against kInvalidVtId to fall back to the legacy
+    // bindless path when VT registration was skipped (pool full,
+    // manager not wired, layer had no source image, etc.).
+    mp.albedo_vt_id   = 0xFFFFFFFFu;
+    mp.normal_vt_id   = 0xFFFFFFFFu;
+    mp.mr_ao_vt_id    = 0xFFFFFFFFu;
+    mp.emissive_vt_id = 0xFFFFFFFFu;
+
+    if (mesh_idx < meshes.size()) {
+        const auto& prims = meshes[mesh_idx].primitives_;
+        if (prim_idx < prims.size()) {
+            int32_t mat_idx = prims[prim_idx].material_idx_;
+            if (mat_idx >= 0 &&
+                static_cast<size_t>(mat_idx) < drawable_data.materials_.size()) {
+                const auto& mat = drawable_data.materials_[mat_idx];
+                // uniform_buffer_ is HOST_VISIBLE|HOST_COHERENT — map, read, unmap.
+                if (mat.uniform_buffer_.memory) {
+                    constexpr uint64_t kVec4Size = sizeof(glm::vec4);
+                    void* ptr = device_->mapMemory(
+                        mat.uniform_buffer_.memory, kVec4Size, 0);
+                    if (ptr) {
+                        std::memcpy(&base_color, ptr, kVec4Size);
+                        device_->unmapMemory(mat.uniform_buffer_.memory);
+                    }
+                }
+                // Stage the base-color texture (binding 2).
+                int32_t tex_idx = mat.base_color_idx_;
+                // Resolve albedo TextureInfo and add to legacy
+                // bindless array (parallel path, see VT block
+                // below).  Capture for the combined VT
+                // registration call.
+                const renderer::TextureInfo* albedo_tex = nullptr;
+                if (tex_idx >= 0 &&
+                    static_cast<size_t>(tex_idx) < drawable_data.textures_.size()) {
+                    albedo_tex = &drawable_data.textures_[tex_idx];
+                    if (albedo_tex->view) {
+                        auto tex_it = staging_tex_slot_map_.find(albedo_tex->view.get());
+                        if (tex_it != staging_tex_slot_map_.end()) {
+                            mp.base_color_tex_idx = tex_it->second;
+                        } else if (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
+                            int slot = static_cast<int>(staging_tex_views_.size());
+                            staging_tex_slot_map_[albedo_tex->view.get()] = slot;
+                            staging_tex_views_.push_back(albedo_tex->view);
+                            mp.base_color_tex_idx = slot;
+                        }
+                        // else: over MAX_CLUSTER_TEXTURES — idx stays -1
+                    }
+                }
+                // Stage the normal-map texture (binding 3).
+                int32_t norm_idx = mat.normal_idx_;
+                const renderer::TextureInfo* normal_tex = nullptr;
+                if (norm_idx >= 0 &&
+                    static_cast<size_t>(norm_idx) < drawable_data.textures_.size()) {
+                    normal_tex = &drawable_data.textures_[norm_idx];
+                    if (normal_tex->view) {
+                        auto n_it = staging_normal_slot_map_.find(normal_tex->view.get());
+                        if (n_it != staging_normal_slot_map_.end()) {
+                            mp.normal_tex_idx = n_it->second;
+                        } else if (staging_normal_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
+                            int slot = static_cast<int>(staging_normal_tex_views_.size());
+                            staging_normal_slot_map_[normal_tex->view.get()] = slot;
+                            staging_normal_tex_views_.push_back(normal_tex->view);
+                            mp.normal_tex_idx = slot;
+                        }
+                    }
+                }
+                // ── Unified VT registration (per-material) ────
+                // Single registerMaterial call uploads albedo +
+                // (optionally) normal into the matching layer
+                // pools at IDENTICAL physical slot positions.
+                // The same vt_id then resolves correctly across
+                // both layers in cluster_bindless.frag — slot N
+                // in vt_pool_albedo is material X's albedo, slot
+                // N in vt_pool_normal is material X's normal.
+                //
+                // Cache by albedo Image* — Bistro materials that
+                // share an albedo image typically share the rest
+                // too, so this de-dupes successfully.  If a
+                // future asset reuses an albedo with a different
+                // normal, the cache would return the FIRST
+                // material's normal data; revisit with a
+                // tuple-keyed cache when that case appears.
+                // VT-only baked textures carry CPU pixels and/or a
+                // bake-time pre-encoded BC7 tile blob but NO GPU
+                // image — registerMaterial handles all three
+                // sources.  Cache key = image pointer when present,
+                // else the shared cpu_pixels / blob pointer.
+                const bool albedo_has_cpu =
+                    albedo_tex && albedo_tex->cpu_pixels &&
+                    !albedo_tex->cpu_pixels->empty();
+                const bool albedo_has_blob =
+                    albedo_tex && albedo_tex->vt_bc7_tiles &&
+                    !albedo_tex->vt_bc7_tiles->empty();
+                if (vt_manager_ && albedo_tex &&
+                    (albedo_tex->image || albedo_has_cpu ||
+                     albedo_has_blob) &&
+                    albedo_tex->size.x > 0 && albedo_tex->size.y > 0) {
+                    const void* vt_key = albedo_tex->image
+                        ? static_cast<const void*>(albedo_tex->image.get())
+                        : albedo_tex->cpu_pixels
+                            ? static_cast<const void*>(albedo_tex->cpu_pixels.get())
+                            : static_cast<const void*>(albedo_tex->vt_bc7_tiles.get());
+                    auto vt_it = vt_albedo_id_cache_.find(vt_key);
+                    uint32_t vid = kInvalidVtId;
+                    if (vt_it != vt_albedo_id_cache_.end()) {
+                        vid = vt_it->second;
+                    } else {
+                        const auto& nrm_img =
+                            (normal_tex && normal_tex->image)
+                                ? normal_tex->image
+                                : std::shared_ptr<renderer::Image>();
+                        // Prefer CPU pixels when the loader stashed them
+                        // (glTF + non-DDS engine_helper paths).  Fall
+                        // back to the GPU image — registerMaterial does
+                        // a one-time blit-decode + readback for BC-only
+                        // sources to materialise RGBA8.
+                        const uint8_t* px = albedo_has_cpu
+                            ? albedo_tex->cpu_pixels->data()
+                            : nullptr;
+                        vid = vt_manager_->registerMaterial(
+                            px,
+                            albedo_tex->image,
+                            nrm_img,
+                            /*mr_ao*/   nullptr,
+                            /*emissive*/nullptr,
+                            albedo_tex->size.x,
+                            albedo_tex->size.y,
+                            albedo_tex->vt_bc7_tiles);
+                        if (vid != kInvalidVtId) {
+                            vt_albedo_id_cache_[vt_key] = vid;
+                            if (nrm_img) {
+                                vt_normal_id_cache_[nrm_img.get()] = vid;
+                            }
+                        }
+                    }
+                    if (vid != kInvalidVtId) {
+                        mp.albedo_vt_id = vid;
+                        if (normal_tex && normal_tex->image) {
+                            mp.normal_vt_id = vid;
+                        }
+                    }
+                }
+                // Alpha mask — discard fragments below cutoff.
+                if (mat.alpha_mask_ && mat.alpha_cutoff_ > 0.0f) {
+                    mp.alpha_cutoff = mat.alpha_cutoff_;
+                    mp.flags |= BINDLESS_MAT_ALPHA_MASK;
+                }
+                // Translucent (glass / windows / asset-authored Blend).
+                // The cluster pipeline currently still draws these as
+                // opaque (no separate translucent pass yet), but we
+                // flag them so the "Translucent" render-debug
+                // visualisation can highlight them, and so the data
+                // is in place when a real translucent pass is added.
+                if (mat.alpha_mode_ == game_object::AlphaMode::Blend) {
+                    mp.flags |= BINDLESS_MAT_TRANSLUCENT;
+                }
+            }
+            // Double-sided — primitive property, not material-level.
+            if (prims[prim_idx].tag_.double_sided) {
+                mp.flags |= BINDLESS_MAT_DOUBLE_SIDED;
+            }
+            // Foliage subsurface scattering — thin-leaf translucency
+            // in cluster_bindless.frag (forward) / deferred_resolve
+            // (via the normal_rough.w G-buffer flag).  Tagged by
+            // material NAME because that is the one signal every
+            // leaf source shares: terrain_pcg's instanced trees
+            // ship "tree_<species>_leaf", its props/bush foliage
+            // "tree_leafN", and stock assets follow the same
+            // convention ("leaf" / "foliage" substrings).  Wood,
+            // trunk and bark materials never match, which is the
+            // point — translucency on a trunk reads as glow.
+            {
+                int32_t mat_idx = prims[prim_idx].material_idx_;
+                if (mat_idx >= 0 &&
+                    static_cast<size_t>(mat_idx) <
+                        drawable_data.materials_.size()) {
+                    std::string lname =
+                        drawable_data.materials_[mat_idx].name_;
+                    std::transform(lname.begin(), lname.end(),
+                                   lname.begin(), [](unsigned char c) {
+                                       return std::tolower(c);
+                                   });
+                    if (lname.find("leaf") != std::string::npos ||
+                        lname.find("foliage") != std::string::npos ||
+                        // Keep in lockstep with the drawable-path
+                        // tagging in drawable_object.cpp so a mesh
+                        // shades identically before and after its
+                        // clusters finalize.
+                        lname.find("clutter_grass") != std::string::npos ||
+                        lname.find("clutter_flower") != std::string::npos ||
+                        lname.find("spray") != std::string::npos ||
+                        lname.find("sward") != std::string::npos ||
+                        lname.find("forb") != std::string::npos ||
+                        lname.find("blossom") != std::string::npos ||
+                        lname.find("petal") != std::string::npos) {
+                        mp.flags |= BINDLESS_MAT_FOLIAGE_SSS;
+                    }
+                }
+            }
+        }
+    }
+
+    mp.base_color_factor = base_color;
+    uint32_t idx = static_cast<uint32_t>(staging_material_params_.size());
+    staging_material_params_.push_back(mp);
+
+    // Capture (material_name, object_name) alongside the params
+    // entry so applyMaterialCategories() can later look up the
+    // category from the LLM classifier without re-walking the
+    // drawable data.  Material name comes from MaterialInfo; the
+    // object name is the first owning-node's name resolved above.
+    std::string material_name;
+    if (mesh_idx < meshes.size()) {
+        const auto& prims = meshes[mesh_idx].primitives_;
+        if (prim_idx < prims.size()) {
+            const int32_t mat_idx = prims[prim_idx].material_idx_;
+            if (mat_idx >= 0 &&
+                static_cast<size_t>(mat_idx) <
+                    drawable_data.materials_.size()) {
+                material_name =
+                    drawable_data.materials_[mat_idx].name_;
+            }
+        }
+    }
+    staging_material_names_.emplace_back(
+        std::move(material_name), mesh_object_name);
+
+    return idx;
+}
+
 void ClusterRenderer::uploadMeshClusters(
     const helper::ClusterMesh& cluster_mesh,
     const game_object::DrawableData& drawable_data,
@@ -669,240 +918,8 @@ void ClusterRenderer::uploadMeshClusters(
     auto getMaterialIdx = [&](uint32_t prim_idx) -> uint32_t {
         auto cache_it = prim_to_mat_idx.find(prim_idx);
         if (cache_it != prim_to_mat_idx.end()) return cache_it->second;
-
-        glm::vec4 base_color(1.0f);  // white default
-        glsl::BindlessMaterialParams mp{};
-        mp.base_color_tex_idx = -1;
-        mp.normal_tex_idx     = -1;
-        // VT IDs default to INVALID until registerMaterial assigns
-        // one (per layer that actually had a source image).  Shader
-        // checks against kInvalidVtId to fall back to the legacy
-        // bindless path when VT registration was skipped (pool full,
-        // manager not wired, layer had no source image, etc.).
-        mp.albedo_vt_id   = 0xFFFFFFFFu;
-        mp.normal_vt_id   = 0xFFFFFFFFu;
-        mp.mr_ao_vt_id    = 0xFFFFFFFFu;
-        mp.emissive_vt_id = 0xFFFFFFFFu;
-
-        if (mesh_idx < meshes.size()) {
-            const auto& prims = meshes[mesh_idx].primitives_;
-            if (prim_idx < prims.size()) {
-                int32_t mat_idx = prims[prim_idx].material_idx_;
-                if (mat_idx >= 0 &&
-                    static_cast<size_t>(mat_idx) < drawable_data.materials_.size()) {
-                    const auto& mat = drawable_data.materials_[mat_idx];
-                    // uniform_buffer_ is HOST_VISIBLE|HOST_COHERENT — map, read, unmap.
-                    if (mat.uniform_buffer_.memory) {
-                        constexpr uint64_t kVec4Size = sizeof(glm::vec4);
-                        void* ptr = device_->mapMemory(
-                            mat.uniform_buffer_.memory, kVec4Size, 0);
-                        if (ptr) {
-                            std::memcpy(&base_color, ptr, kVec4Size);
-                            device_->unmapMemory(mat.uniform_buffer_.memory);
-                        }
-                    }
-                    // Stage the base-color texture (binding 2).
-                    int32_t tex_idx = mat.base_color_idx_;
-                    // Resolve albedo TextureInfo and add to legacy
-                    // bindless array (parallel path, see VT block
-                    // below).  Capture for the combined VT
-                    // registration call.
-                    const renderer::TextureInfo* albedo_tex = nullptr;
-                    if (tex_idx >= 0 &&
-                        static_cast<size_t>(tex_idx) < drawable_data.textures_.size()) {
-                        albedo_tex = &drawable_data.textures_[tex_idx];
-                        if (albedo_tex->view) {
-                            auto tex_it = staging_tex_slot_map_.find(albedo_tex->view.get());
-                            if (tex_it != staging_tex_slot_map_.end()) {
-                                mp.base_color_tex_idx = tex_it->second;
-                            } else if (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
-                                int slot = static_cast<int>(staging_tex_views_.size());
-                                staging_tex_slot_map_[albedo_tex->view.get()] = slot;
-                                staging_tex_views_.push_back(albedo_tex->view);
-                                mp.base_color_tex_idx = slot;
-                            }
-                            // else: over MAX_CLUSTER_TEXTURES — idx stays -1
-                        }
-                    }
-                    // Stage the normal-map texture (binding 3).
-                    int32_t norm_idx = mat.normal_idx_;
-                    const renderer::TextureInfo* normal_tex = nullptr;
-                    if (norm_idx >= 0 &&
-                        static_cast<size_t>(norm_idx) < drawable_data.textures_.size()) {
-                        normal_tex = &drawable_data.textures_[norm_idx];
-                        if (normal_tex->view) {
-                            auto n_it = staging_normal_slot_map_.find(normal_tex->view.get());
-                            if (n_it != staging_normal_slot_map_.end()) {
-                                mp.normal_tex_idx = n_it->second;
-                            } else if (staging_normal_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
-                                int slot = static_cast<int>(staging_normal_tex_views_.size());
-                                staging_normal_slot_map_[normal_tex->view.get()] = slot;
-                                staging_normal_tex_views_.push_back(normal_tex->view);
-                                mp.normal_tex_idx = slot;
-                            }
-                        }
-                    }
-                    // ── Unified VT registration (per-material) ────
-                    // Single registerMaterial call uploads albedo +
-                    // (optionally) normal into the matching layer
-                    // pools at IDENTICAL physical slot positions.
-                    // The same vt_id then resolves correctly across
-                    // both layers in cluster_bindless.frag — slot N
-                    // in vt_pool_albedo is material X's albedo, slot
-                    // N in vt_pool_normal is material X's normal.
-                    //
-                    // Cache by albedo Image* — Bistro materials that
-                    // share an albedo image typically share the rest
-                    // too, so this de-dupes successfully.  If a
-                    // future asset reuses an albedo with a different
-                    // normal, the cache would return the FIRST
-                    // material's normal data; revisit with a
-                    // tuple-keyed cache when that case appears.
-                    // VT-only baked textures carry CPU pixels and/or a
-                    // bake-time pre-encoded BC7 tile blob but NO GPU
-                    // image — registerMaterial handles all three
-                    // sources.  Cache key = image pointer when present,
-                    // else the shared cpu_pixels / blob pointer.
-                    const bool albedo_has_cpu =
-                        albedo_tex && albedo_tex->cpu_pixels &&
-                        !albedo_tex->cpu_pixels->empty();
-                    const bool albedo_has_blob =
-                        albedo_tex && albedo_tex->vt_bc7_tiles &&
-                        !albedo_tex->vt_bc7_tiles->empty();
-                    if (vt_manager_ && albedo_tex &&
-                        (albedo_tex->image || albedo_has_cpu ||
-                         albedo_has_blob) &&
-                        albedo_tex->size.x > 0 && albedo_tex->size.y > 0) {
-                        const void* vt_key = albedo_tex->image
-                            ? static_cast<const void*>(albedo_tex->image.get())
-                            : albedo_tex->cpu_pixels
-                                ? static_cast<const void*>(albedo_tex->cpu_pixels.get())
-                                : static_cast<const void*>(albedo_tex->vt_bc7_tiles.get());
-                        auto vt_it = vt_albedo_id_cache_.find(vt_key);
-                        uint32_t vid = kInvalidVtId;
-                        if (vt_it != vt_albedo_id_cache_.end()) {
-                            vid = vt_it->second;
-                        } else {
-                            const auto& nrm_img =
-                                (normal_tex && normal_tex->image)
-                                    ? normal_tex->image
-                                    : std::shared_ptr<renderer::Image>();
-                            // Prefer CPU pixels when the loader stashed them
-                            // (glTF + non-DDS engine_helper paths).  Fall
-                            // back to the GPU image — registerMaterial does
-                            // a one-time blit-decode + readback for BC-only
-                            // sources to materialise RGBA8.
-                            const uint8_t* px = albedo_has_cpu
-                                ? albedo_tex->cpu_pixels->data()
-                                : nullptr;
-                            vid = vt_manager_->registerMaterial(
-                                px,
-                                albedo_tex->image,
-                                nrm_img,
-                                /*mr_ao*/   nullptr,
-                                /*emissive*/nullptr,
-                                albedo_tex->size.x,
-                                albedo_tex->size.y,
-                                albedo_tex->vt_bc7_tiles);
-                            if (vid != kInvalidVtId) {
-                                vt_albedo_id_cache_[vt_key] = vid;
-                                if (nrm_img) {
-                                    vt_normal_id_cache_[nrm_img.get()] = vid;
-                                }
-                            }
-                        }
-                        if (vid != kInvalidVtId) {
-                            mp.albedo_vt_id = vid;
-                            if (normal_tex && normal_tex->image) {
-                                mp.normal_vt_id = vid;
-                            }
-                        }
-                    }
-                    // Alpha mask — discard fragments below cutoff.
-                    if (mat.alpha_mask_ && mat.alpha_cutoff_ > 0.0f) {
-                        mp.alpha_cutoff = mat.alpha_cutoff_;
-                        mp.flags |= BINDLESS_MAT_ALPHA_MASK;
-                    }
-                    // Translucent (glass / windows / asset-authored Blend).
-                    // The cluster pipeline currently still draws these as
-                    // opaque (no separate translucent pass yet), but we
-                    // flag them so the "Translucent" render-debug
-                    // visualisation can highlight them, and so the data
-                    // is in place when a real translucent pass is added.
-                    if (mat.alpha_mode_ == game_object::AlphaMode::Blend) {
-                        mp.flags |= BINDLESS_MAT_TRANSLUCENT;
-                    }
-                }
-                // Double-sided — primitive property, not material-level.
-                if (prims[prim_idx].tag_.double_sided) {
-                    mp.flags |= BINDLESS_MAT_DOUBLE_SIDED;
-                }
-                // Foliage subsurface scattering — thin-leaf translucency
-                // in cluster_bindless.frag (forward) / deferred_resolve
-                // (via the normal_rough.w G-buffer flag).  Tagged by
-                // material NAME because that is the one signal every
-                // leaf source shares: terrain_pcg's instanced trees
-                // ship "tree_<species>_leaf", its props/bush foliage
-                // "tree_leafN", and stock assets follow the same
-                // convention ("leaf" / "foliage" substrings).  Wood,
-                // trunk and bark materials never match, which is the
-                // point — translucency on a trunk reads as glow.
-                {
-                    int32_t mat_idx = prims[prim_idx].material_idx_;
-                    if (mat_idx >= 0 &&
-                        static_cast<size_t>(mat_idx) <
-                            drawable_data.materials_.size()) {
-                        std::string lname =
-                            drawable_data.materials_[mat_idx].name_;
-                        std::transform(lname.begin(), lname.end(),
-                                       lname.begin(), [](unsigned char c) {
-                                           return std::tolower(c);
-                                       });
-                        if (lname.find("leaf") != std::string::npos ||
-                            lname.find("foliage") != std::string::npos ||
-                            // Keep in lockstep with the drawable-path
-                            // tagging in drawable_object.cpp so a mesh
-                            // shades identically before and after its
-                            // clusters finalize.
-                            lname.find("clutter_grass") != std::string::npos ||
-                            lname.find("clutter_flower") != std::string::npos ||
-                            lname.find("spray") != std::string::npos ||
-                            lname.find("sward") != std::string::npos ||
-                            lname.find("forb") != std::string::npos ||
-                            lname.find("blossom") != std::string::npos ||
-                            lname.find("petal") != std::string::npos) {
-                            mp.flags |= BINDLESS_MAT_FOLIAGE_SSS;
-                        }
-                    }
-                }
-            }
-        }
-
-        mp.base_color_factor = base_color;
-        uint32_t idx = static_cast<uint32_t>(staging_material_params_.size());
-        staging_material_params_.push_back(mp);
-
-        // Capture (material_name, object_name) alongside the params
-        // entry so applyMaterialCategories() can later look up the
-        // category from the LLM classifier without re-walking the
-        // drawable data.  Material name comes from MaterialInfo; the
-        // object name is the first owning-node's name resolved above.
-        std::string material_name;
-        if (mesh_idx < meshes.size()) {
-            const auto& prims = meshes[mesh_idx].primitives_;
-            if (prim_idx < prims.size()) {
-                const int32_t mat_idx = prims[prim_idx].material_idx_;
-                if (mat_idx >= 0 &&
-                    static_cast<size_t>(mat_idx) <
-                        drawable_data.materials_.size()) {
-                    material_name =
-                        drawable_data.materials_[mat_idx].name_;
-                }
-            }
-        }
-        staging_material_names_.emplace_back(
-            std::move(material_name), mesh_object_name);
-
+        const uint32_t idx = registerClusterMaterial(
+            drawable_data, mesh_idx, prim_idx, mesh_object_name);
         prim_to_mat_idx[prim_idx] = idx;
         return idx;
     };
@@ -1279,6 +1296,11 @@ int ClusterRenderer::countPendingVtMaterials(
 void ClusterRenderer::finalizeUploads() {
     total_clusters_all_meshes_ =
         static_cast<uint32_t>(staging_cull_infos_.size());
+    // Every cluster is visible again after a (re)finalize: the cull
+    // infos are rewritten from staging below, so the hidden bookkeeping
+    // starts from zero and the app re-applies its hides afterwards.
+    mesh_hidden_flags_.assign(mesh_cluster_ranges_.size(), 0);
+    hidden_cluster_count_ = 0;
 
     // ── Re-finalize support (editor incremental uploads) ──────────────
     // When merged buffers from a previous finalize exist, drain the GPU
@@ -1920,6 +1942,11 @@ void ClusterRenderer::resetToBaseUploads() {
     staging_draw_infos_.resize(base_cluster_count_);
     staging_material_params_.resize(base_material_count_);
     staging_material_names_.resize(base_material_count_);
+    // Per-mesh RT caster materials were indices into the tail just cut:
+    // invalidate them (registerRtMeshMaterials / ensureRtMeshSlot
+    // re-register against the new table).
+    ++rt_material_epoch_;
+    rt_mesh_prim_materials_.clear();
     staging_vertices_.resize(base_vertex_count_);
     staging_indices_.resize(base_index_count_);
     mesh_cluster_ranges_.resize(base_mesh_count_);
@@ -1968,6 +1995,18 @@ void ClusterRenderer::setMeshClustersHidden(
     if (global_mesh_idx >= mesh_cluster_ranges_.size()) return;
     const auto& r = mesh_cluster_ranges_[global_mesh_idx];
     if (r.cluster_count == 0) return;
+    // allClustersHidden() bookkeeping — counted once per mesh transition.
+    if (mesh_hidden_flags_.size() < mesh_cluster_ranges_.size()) {
+        mesh_hidden_flags_.resize(mesh_cluster_ranges_.size(), 0);
+    }
+    if (hidden && !mesh_hidden_flags_[global_mesh_idx]) {
+        mesh_hidden_flags_[global_mesh_idx] = 1;
+        hidden_cluster_count_ += r.cluster_count;
+    } else if (!hidden && mesh_hidden_flags_[global_mesh_idx]) {
+        mesh_hidden_flags_[global_mesh_idx] = 0;
+        hidden_cluster_count_ -= std::min<uint64_t>(
+            hidden_cluster_count_, r.cluster_count);
+    }
     const uint64_t total_sz =
         total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo);
     if ((r.cluster_start + r.cluster_count) > total_clusters_all_meshes_)
@@ -4908,15 +4947,23 @@ static void ensureDeviceSSBO(const std::shared_ptr<er::Device>& device,
 
 void ClusterRenderer::buildRtShadowBvh() {
     rt_shadow_ready_ = false;
+    rt_sw_bvh_valid_ = false;
     if (staging_cull_infos_.empty() || total_clusters_all_meshes_ == 0) {
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
     constexpr uint32_t kRtBvhLeafSize = 4u;
 
-    const uint32_t n =
-        std::min<uint32_t>(total_clusters_all_meshes_,
-                           (uint32_t)staging_cull_infos_.size());
+    // See setBuildSoftwareRtBvh: with the software traversal not
+    // selected, skip the O(n log n) node build and bind a single empty
+    // root instead (prim_count 0 → the traversal pops it and reports
+    // "visible").  Everything else below — the position/uv, cull/draw
+    // info and material SSBOs plus the descriptor set — is still built
+    // because the hardware ray-query resolve reads it.
+    const uint32_t n = build_sw_rt_bvh_
+        ? std::min<uint32_t>(total_clusters_all_meshes_,
+                             (uint32_t)staging_cull_infos_.size())
+        : 0u;
 
     // Per-cluster AABB (sphere-derived) + centroid.
     struct Prim { glm::vec3 mn, mx, c; uint32_t idx; };
@@ -4992,6 +5039,20 @@ void ClusterRenderer::buildRtShadowBvh() {
         stack.push_back({left + 1u, it.first + half, it.count - half});
     }
 
+    if (n == 0) {
+        // Stub BVH for the skipped software build (see above): keep one
+        // leaf index so the SSBO has a legal non-zero size.
+        // Inverted box: rtRayAabb's slab test can never pass it, so a
+        // traversal that somehow reaches this root pops it and exits
+        // instead of re-pushing children 0/1 forever.
+        nodes.resize(1);
+        nodes[0].aabb_min   = glm::vec3( 1.0e30f);
+        nodes[0].aabb_max   = glm::vec3(-1.0e30f);
+        nodes[0].left_first = 0u;
+        nodes[0].prim_count = 0u;
+        leaf_indices.assign(1, 0u);
+    }
+    rt_sw_bvh_valid_ = (n > 0);
     rt_bvh_node_count_    = (uint32_t)nodes.size();
     ensureDeviceSSBO(device_, rt_bvh_nodes_buffer_,
                      nodes.size() * sizeof(glsl::RtBvhNode), nodes.data());
@@ -5218,6 +5279,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
     // committed hit (albedo + sun bounce), so unlike the shadow-only
     // query it needs materials for the opaque geometry too.
     std::vector<uint32_t> opaque_tri_mat;
+    uint32_t demoted_tris = 0;
     opaque_idx.reserve(staging_indices_.size());
     opaque_tri_mat.reserve(staging_indices_.size() / 3u);
     for (uint32_t ci = 0; ci < total_clusters_all_meshes_; ++ci) {
@@ -5233,6 +5295,18 @@ void ClusterRenderer::buildHwRtShadowAs() {
             // Texture-less cutout: constant alpha decides once.
             if (m.base_color_factor.a < m.alpha_cutoff) continue;
             masked = false;
+        }
+        // Far masked clusters are emitted as opaque — see
+        // rt_masked_opaque_dist_m_ in the header.
+        if (masked && rt_build_eye_valid_ && rt_masked_opaque_dist_m_ > 0.0f &&
+            ci < staging_cull_infos_.size()) {
+            const glm::vec4 bs = staging_cull_infos_[ci].bounds_sphere;
+            const float dist =
+                glm::distance(glm::vec3(bs), rt_build_eye_) - glm::max(bs.w, 0.0f);
+            if (dist > rt_masked_opaque_dist_m_) {
+                masked = false;
+                demoted_tris += draw.index_count / 3u;
+            }
         }
         std::vector<uint32_t>& dst = masked ? masked_idx : opaque_idx;
         for (uint32_t k = 0; k < draw.index_count; ++k) {
@@ -5369,52 +5443,29 @@ void ClusterRenderer::buildHwRtShadowAs() {
     const auto blas_addr =
         device_->getAccelerationStructureDeviceAddress(hw_rt_blas_handle_);
 
-    // ── 3. TLAS: single identity instance ────────────────────────────
-    er::AccelerationStructureInstance instance{};
-    instance.transform = { 1.0f, 0.0f, 0.0f, 0.0f,
-                           0.0f, 1.0f, 0.0f, 0.0f,
-                           0.0f, 0.0f, 1.0f, 0.0f };
-    instance.instance_custom_index = 0;
-    instance.mask = 0xFF;
-    instance.instance_shader_binding_table_record_offset = 0;
-    instance.flags =
-        SET_FLAG_BIT(GeometryInstance, TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
-    instance.acceleration_structure_reference = blas_addr;
-
-    // Reuse across rebuilds (fixed 64 B): recreating it every camera-
-    // move rebuild orphaned one buffer + one vkAllocateMemory object
-    // per rebuild.  The REFRESH is required either way — blas_addr
-    // changes whenever the BLAS backing store was recreated.
-    if (hw_rt_instance_buffer_.buffer) {
-        device_->updateBufferMemory(hw_rt_instance_buffer_.memory,
-                                    sizeof(instance), &instance);
-    } else {
-    er::Helper::createBuffer(
-        device_,
-        SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-        SET_FLAG_BIT(BufferUsage,
-            ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
-        SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
-        SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
-        SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
-        hw_rt_instance_buffer_.buffer,
-        hw_rt_instance_buffer_.memory,
-        std::source_location::current(),
-        sizeof(instance),
-        &instance);
-    }
-
+    // ── 3. TLAS: static instance + per-mesh caster instances ─────────
     // Cache the static instance's BLAS address — the per-frame skeleton
     // path (updateRtSkeletons) rebuilds the TLAS with static + skeleton
-    // instances and needs it.
+    // + caster instances and needs it.
     hw_rt_static_blas_address_ = blas_addr;
+    // Any per-mesh caster BLAS still queued (a sync can land between the
+    // app's caster scan and this finalize) is built now so the TLAS can
+    // reference it; this also uploads the per-mesh pools after the
+    // material re-registration of this sync.
+    flushRtMeshBuilds();
+    rt_materials_pending_ = false;
+    // Synchronous (transient) build below: the instance array is written
+    // immediately — nothing in flight reads it after finalize's waitIdle.
+    const uint32_t tlas_inst_count =
+        writeRtTlasInstances(/*include_skeleton*/ false, /*deferrable*/ false);
 
     auto tlas_geom = std::make_shared<er::AccelerationStructureGeometry>();
     tlas_geom->geometry_type = er::GeometryType::INSTANCES_KHR;
     tlas_geom->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
-    // Sized for TWO instances (static clusters + the skeleton BLAS) so
-    // the per-frame rebuild fits without recreating the TLAS buffers.
-    tlas_geom->max_primitive_count = 2;
+    // Sized for the static instance + the skeleton BLAS + every per-mesh
+    // caster instance, so the per-frame rebuild fits without recreating
+    // the TLAS buffers.
+    tlas_geom->max_primitive_count = 2u + kRtCasterMaxInstances;
     tlas_geom->geometry.instances.struct_type = er::StructureType::
         ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
     tlas_geom->geometry.instances.p_next = nullptr;
@@ -5473,7 +5524,7 @@ void ClusterRenderer::buildHwRtShadowAs() {
         hw_rt_tlas_scratch_buffer_.buffer->getDeviceAddress();
     {
         std::vector<er::AccelerationStructureBuildRangeInfo> tlas_ranges = {
-            {1u, 0u, 0u, 0u} };
+            {tlas_inst_count, 0u, 0u, 0u} };
         auto cmd_buf = device_->setupTransientCommandBuffer();
         cmd_buf->buildAccelerationStructures({tlas_info}, tlas_ranges);
         device_->submitAndWaitTransientCommandBuffer();
@@ -5484,14 +5535,16 @@ void ClusterRenderer::buildHwRtShadowAs() {
     // initDeferredResolve (the app builds the HW resolve pipeline layout
     // before the first finalize).
     if (!hw_rt_desc_set_layout_) {
-        std::vector<er::DescriptorSetLayoutBinding> b(5);
+        std::vector<er::DescriptorSetLayoutBinding> b(9);
         b[0] = er::helper::getBufferDescriptionSetLayoutBinding(
             0, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             er::DescriptorType::ACCELERATION_STRUCTURE_KHR);
         // 1/2 = masked indices + per-masked-tri material (shadow alpha
         // test); 3/4 = opaque indices + per-opaque-tri material (GI
-        // closest-hit shading).
-        for (int i = 1; i < 5; ++i) {
+        // closest-hit shading); 5..8 = per-mesh caster pools (mesh
+        // infos, object-space pos+uv, indices, per-tri material) —
+        // see ensureRtMeshSlot.
+        for (int i = 1; i < 9; ++i) {
             b[i] = er::helper::getBufferDescriptionSetLayoutBinding(
                 i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                 er::DescriptorType::STORAGE_BUFFER);
@@ -5524,6 +5577,8 @@ void ClusterRenderer::buildHwRtShadowAs() {
         hw_rt_opaque_tri_mat_buffer_.buffer,
         static_cast<uint32_t>(opaque_tri_mat.size() * sizeof(uint32_t)));
     device_->updateDescriptorSets(hw_writes);
+    // Bindings 5..8: per-mesh caster pools (placeholder until a slot exists).
+    writeRtMeshDescriptors();
 
     hw_rt_shadow_ready_ = true;
     // The TLAS just rebuilt static-only — force the next updateRtSkeletons
@@ -5531,11 +5586,687 @@ void ClusterRenderer::buildHwRtShadowAs() {
     rt_skel_have_gpu_state_ = false;
     const double hw_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
+    rt_masked_demoted_tris_ = demoted_tris;
     clog_printf(
         "[CLUSTER_RENDERER] HW RT shadow AS: %u opaque + %u masked tris "
-        "(%.1f ms build, BLAS %.1f MB)\n",
-        opaque_tris, masked_tris, hw_ms,
-        blas_sizes.as_size / (1024.0 * 1024.0));
+        "(%u masked tris beyond %.0f m demoted to opaque; %.1f ms build, "
+        "BLAS %.1f MB)\n",
+        opaque_tris, masked_tris, demoted_tris, rt_masked_opaque_dist_m_,
+        hw_ms, blas_sizes.as_size / (1024.0 * 1024.0));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// PER-MESH BLAS INSTANCED RT CASTERS — see the public block in the header
+// ═════════════════════════════════════════════════════════════════════
+
+void ClusterRenderer::stageRtSentinelCluster() {
+    if (!staging_cull_infos_.empty()) return;
+    // A far-below-the-world point, zero area: the frustum cull never
+    // sees it, the rasterizer emits no fragment for it and no ray can
+    // hit it — it exists only so the merged-side buffers are non-empty.
+    const glm::vec3 p(0.0f, -65536.0f, 0.0f);
+    const uint32_t vbase = static_cast<uint32_t>(staging_vertices_.size());
+    const uint32_t ibase = static_cast<uint32_t>(staging_indices_.size());
+    for (int k = 0; k < 3; ++k) {
+        BindlessVertex bv;
+        bv.position       = p;
+        bv.packed_normal  = packOctSnorm2x16(glm::vec3(0.0f, 1.0f, 0.0f));
+        bv.packed_uv      = glm::packHalf2x16(glm::vec2(0.0f));
+        bv.packed_tangent =
+            packOctTangentWithSign(glm::vec3(1.0f, 0.0f, 0.0f), 1.0f);
+        staging_vertices_.push_back(bv);
+    }
+    staging_indices_.push_back(vbase);
+    staging_indices_.push_back(vbase + 1u);
+    staging_indices_.push_back(vbase + 2u);
+    // Its own opaque, texture-less material (the HW AS partition skips
+    // clusters whose material id is out of range, and an empty partition
+    // means "not ready"; a borrowed masked material would put the
+    // sentinel in the alpha-tested geometry for nothing).  The names
+    // table is parallel to the params table — keep them in step.
+    const uint32_t sentinel_mat =
+        static_cast<uint32_t>(staging_material_params_.size());
+    {
+        glsl::BindlessMaterialParams m;
+        std::memset(&m, 0, sizeof(m));
+        m.base_color_factor = glm::vec4(1.0f);
+        m.base_color_tex_idx = -1;
+        m.normal_tex_idx     = -1;
+        m.alpha_cutoff       = 0.5f;
+        m.albedo_vt_id   = 0xFFFFFFFFu;
+        m.normal_vt_id   = 0xFFFFFFFFu;
+        m.mr_ao_vt_id    = 0xFFFFFFFFu;
+        m.emissive_vt_id = 0xFFFFFFFFu;
+        staging_material_params_.push_back(m);
+        staging_material_names_.emplace_back(std::string("rt_sentinel"),
+                                             std::string("rt_sentinel"));
+    }
+    glsl::ClusterCullInfo ci;
+    ci.bounds_sphere    = glm::vec4(p, 0.01f);
+    ci.cone_axis_cutoff = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
+    ci.aabb_min_pad     = glm::vec4(p - glm::vec3(0.01f), 0.0f);
+    ci.aabb_max_pad     = glm::vec4(p + glm::vec3(0.01f), 0.0f);
+    staging_cull_infos_.push_back(ci);
+    glsl::ClusterDrawInfo di{};
+    di.index_offset  = ibase;
+    di.index_count   = 3u;
+    di.vertex_offset = 0u;
+    di.material_idx  = sentinel_mat;
+    di.object_idx    = uploaded_mesh_count_;
+    staging_draw_infos_.push_back(di);
+    mesh_cluster_ranges_.push_back({
+        static_cast<uint32_t>(staging_cull_infos_.size() - 1u), 1u });
+    if (mesh_prim_material_.size() <= uploaded_mesh_count_)
+        mesh_prim_material_.resize(uploaded_mesh_count_ + 1);
+    mesh_prim_material_[uploaded_mesh_count_].clear();
+    ++uploaded_mesh_count_;
+    clog_printf("[CLUSTER_RENDERER] instanced-only world: sentinel cluster "
+                "staged so the RT descriptor sets / TLAS can be built\n");
+}
+
+void ClusterRenderer::registerRtMeshMaterials(
+    const game_object::DrawableData& drawable_data) {
+    const auto& meshes = drawable_data.meshes_;
+    for (uint32_t mi = 0; mi < meshes.size(); ++mi) {
+        // Only meshes that carry a cluster sidecar can ever become a
+        // caster slot; skip the rest so the staging material table does
+        // not grow with entries nothing references.
+        if (meshes[mi].cluster_mesh_.empty()) continue;
+        std::string mesh_object_name;
+        for (const auto& node : drawable_data.nodes_) {
+            if (node.mesh_idx_ == static_cast<int32_t>(mi)) {
+                mesh_object_name = node.name_;
+                break;
+            }
+        }
+        const auto key = std::make_pair(
+            static_cast<const void*>(&drawable_data), mi);
+        auto& mats = rt_mesh_prim_materials_[key];
+        mats.clear();
+        const auto& prims = meshes[mi].primitives_;
+        mats.reserve(prims.size());
+        for (uint32_t p = 0; p < prims.size(); ++p) {
+            mats.push_back(registerClusterMaterial(
+                drawable_data, mi, p, mesh_object_name));
+        }
+    }
+    // Existing slots of this drawable: rewrite their per-triangle
+    // material ids against the fresh table.
+    for (auto& slot : rt_mesh_slots_) {
+        if (slot.drawable != &drawable_data || slot.source.expired()) continue;
+        const auto key = std::make_pair(
+            static_cast<const void*>(&drawable_data), slot.mesh_idx);
+        auto it = rt_mesh_prim_materials_.find(key);
+        if (it == rt_mesh_prim_materials_.end()) continue;
+        const auto& mats = it->second;
+        const uint32_t tri_n = slot.opaque_tris + slot.masked_tris;
+        for (uint32_t t = 0; t < tri_n; ++t) {
+            const uint32_t prim = rt_mesh_tri_prim_cpu_[slot.mat_ofs + t];
+            rt_mesh_tri_mat_cpu_[slot.mat_ofs + t] =
+                (prim < mats.size()) ? mats[prim] : 0u;
+        }
+        slot.mat_epoch = rt_material_epoch_;
+        rt_mesh_pools_dirty_ = true;
+    }
+}
+
+int32_t ClusterRenderer::ensureRtMeshSlot(
+    const helper::ClusterMesh& cluster_mesh,
+    const game_object::DrawableData& drawable_data,
+    uint32_t mesh_idx,
+    const std::vector<uint32_t>& cluster_prim_map) {
+    if (cluster_mesh.empty() || !cluster_mesh.source) return -1;
+    const void* key = cluster_mesh.source.get();
+    auto found = rt_mesh_slot_by_source_.find(key);
+    if (found != rt_mesh_slot_by_source_.end()) {
+        RtMeshSlot& s = rt_mesh_slots_[found->second];
+        if (s.source.lock() == cluster_mesh.source) {
+            if (s.mat_epoch != rt_material_epoch_) {
+                // The staging table was reset since this slot's material
+                // ids were written (a sync that did not visit its
+                // drawable, e.g. with RT off): re-register now — the app
+                // forces the finalize that uploads the new entries.
+                std::string name;
+                for (const auto& node : drawable_data.nodes_) {
+                    if (node.mesh_idx_ == static_cast<int32_t>(mesh_idx)) {
+                        name = node.name_;
+                        break;
+                    }
+                }
+                const auto mkey = std::make_pair(
+                    static_cast<const void*>(&drawable_data), mesh_idx);
+                auto mit = rt_mesh_prim_materials_.find(mkey);
+                if (mit == rt_mesh_prim_materials_.end()) {
+                    std::vector<uint32_t> mats;
+                    if (mesh_idx < drawable_data.meshes_.size()) {
+                        const auto& prims =
+                            drawable_data.meshes_[mesh_idx].primitives_;
+                        mats.reserve(prims.size());
+                        for (uint32_t p = 0; p < prims.size(); ++p) {
+                            mats.push_back(registerClusterMaterial(
+                                drawable_data, mesh_idx, p, name));
+                        }
+                    }
+                    rt_materials_pending_ = true;
+                    mit = rt_mesh_prim_materials_.emplace(
+                        mkey, std::move(mats)).first;
+                }
+                const auto& mats = mit->second;
+                const uint32_t tri_n = s.opaque_tris + s.masked_tris;
+                for (uint32_t t = 0; t < tri_n; ++t) {
+                    const uint32_t prim = rt_mesh_tri_prim_cpu_[s.mat_ofs + t];
+                    rt_mesh_tri_mat_cpu_[s.mat_ofs + t] =
+                        (prim < mats.size()) ? mats[prim] : 0u;
+                }
+                s.mat_epoch = rt_material_epoch_;
+                rt_mesh_pools_dirty_ = true;
+            }
+            return static_cast<int32_t>(found->second);
+        }
+        // A freed source reallocated at the same address: the old slot
+        // keeps its pool range (never reclaimed) but must not be reused.
+        rt_mesh_slot_by_source_.erase(found);
+    }
+    const auto& src = *cluster_mesh.source;
+    if (!src.vertex_data_ptr || !src.faces_ptr ||
+        src.vertex_data_ptr->empty() || src.faces_ptr->empty()) {
+        return -1;
+    }
+    if (rt_mesh_slots_.size() >= (1u << 22)) return -1;   // custom index budget
+
+    std::string mesh_object_name;
+    for (const auto& node : drawable_data.nodes_) {
+        if (node.mesh_idx_ == static_cast<int32_t>(mesh_idx)) {
+            mesh_object_name = node.name_;
+            break;
+        }
+    }
+    // Per-primitive staging material ids of (drawable, mesh).  A mesh no
+    // sync has seen yet registers them on the fly; the app then forces a
+    // finalize so the GPU material table catches up
+    // (rtMaterialsPendingUpload).
+    const auto mat_key = std::make_pair(
+        static_cast<const void*>(&drawable_data), mesh_idx);
+    auto mat_it = rt_mesh_prim_materials_.find(mat_key);
+    if (mat_it == rt_mesh_prim_materials_.end()) {
+        std::vector<uint32_t> mats;
+        if (mesh_idx < drawable_data.meshes_.size()) {
+            const auto& prims = drawable_data.meshes_[mesh_idx].primitives_;
+            mats.reserve(prims.size());
+            for (uint32_t p = 0; p < prims.size(); ++p) {
+                mats.push_back(registerClusterMaterial(
+                    drawable_data, mesh_idx, p, mesh_object_name));
+            }
+        }
+        rt_materials_pending_ = true;
+        mat_it = rt_mesh_prim_materials_.emplace(mat_key, std::move(mats)).first;
+    }
+    const std::vector<uint32_t>& prim_mats = mat_it->second;
+
+    // ── Vertex pool: every source vertex, object space ────────────────
+    const auto& src_verts = *src.vertex_data_ptr;
+    const auto& src_faces = *src.faces_ptr;
+    const uint32_t vcount = static_cast<uint32_t>(src_verts.size());
+    RtMeshSlot slot;
+    slot.source = cluster_mesh.source;
+    slot.drawable = &drawable_data;
+    slot.mesh_idx = mesh_idx;
+    slot.vertex_ofs = static_cast<uint32_t>(rt_mesh_pos_uv_cpu_.size());
+    slot.vertex_count = vcount;
+    rt_mesh_pos_uv_cpu_.reserve(rt_mesh_pos_uv_cpu_.size() + vcount);
+    for (const auto& sv : src_verts) {
+        glm::vec2 uv = sv.uv;
+        // Same flips uploadMeshClusters applies (base.vert's
+        // model_params.flip_uv_coord), so the alpha-cutoff hit test
+        // samples the texel the raster path shows.
+        if (drawable_data.m_flip_u_) uv.x = 1.0f - uv.x;
+        if (drawable_data.m_flip_v_) uv.y = 1.0f - uv.y;
+        rt_mesh_pos_uv_cpu_.push_back(glm::vec4(
+            sv.position, glm::uintBitsToFloat(glm::packHalf2x16(uv))));
+    }
+
+    // ── Triangles by material class: [opaque | masked] ────────────────
+    // Same policy as buildHwRtShadowAs: translucent never occludes,
+    // texture-less cutouts decide once by constant alpha.
+    struct Tri { uint32_t v[3]; uint32_t prim; uint32_t mat; };
+    std::vector<Tri> opaque_tris, masked_tris;
+    opaque_tris.reserve(src_faces.size());
+    const uint32_t num_clusters =
+        static_cast<uint32_t>(cluster_mesh.clusters.size());
+    for (uint32_t c = 0; c < num_clusters; ++c) {
+        const uint32_t prim = (c < cluster_prim_map.size())
+            ? cluster_prim_map[c] : 0u;
+        const uint32_t mat = (prim < prim_mats.size()) ? prim_mats[prim] : 0u;
+        if (mat >= staging_material_params_.size()) continue;
+        const glsl::BindlessMaterialParams& m = staging_material_params_[mat];
+        const uint32_t flags = static_cast<uint32_t>(m.flags);
+        if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u;
+        if (masked && m.base_color_tex_idx < 0) {
+            if (m.base_color_factor.a < m.alpha_cutoff) continue;
+            masked = false;
+        }
+        std::vector<Tri>& dst = masked ? masked_tris : opaque_tris;
+        for (uint32_t fi : cluster_mesh.clusters[c].face_indices) {
+            if (fi >= src_faces.size()) continue;
+            const auto& f = src_faces[fi];
+            if (f.v_indices[0] >= vcount || f.v_indices[1] >= vcount ||
+                f.v_indices[2] >= vcount) continue;
+            dst.push_back({{f.v_indices[0], f.v_indices[1], f.v_indices[2]},
+                           prim, mat});
+        }
+    }
+    if (opaque_tris.empty() && masked_tris.empty()) {
+        rt_mesh_pos_uv_cpu_.resize(slot.vertex_ofs);   // drop the orphaned vertices
+        return -1;
+    }
+
+    slot.index_ofs = static_cast<uint32_t>(rt_mesh_indices_cpu_.size());
+    slot.mat_ofs = static_cast<uint32_t>(rt_mesh_tri_mat_cpu_.size());
+    slot.opaque_tris = static_cast<uint32_t>(opaque_tris.size());
+    slot.masked_tris = static_cast<uint32_t>(masked_tris.size());
+    slot.mat_epoch = rt_material_epoch_;
+    auto emit = [&](const std::vector<Tri>& tris) {
+        for (const Tri& t : tris) {
+            rt_mesh_indices_cpu_.push_back(t.v[0]);
+            rt_mesh_indices_cpu_.push_back(t.v[1]);
+            rt_mesh_indices_cpu_.push_back(t.v[2]);
+            rt_mesh_tri_prim_cpu_.push_back(t.prim);
+            rt_mesh_tri_mat_cpu_.push_back(t.mat);
+        }
+    };
+    emit(opaque_tris);
+    emit(masked_tris);
+
+    glsl::RtMeshInfo info{};
+    info.vertex_ofs  = slot.vertex_ofs;
+    info.index_ofs   = slot.index_ofs;
+    info.opaque_tris = slot.opaque_tris;
+    info.masked_tris = slot.masked_tris;
+    info.mat_ofs     = slot.mat_ofs;
+    rt_mesh_infos_cpu_.push_back(info);
+
+    const uint32_t slot_idx = static_cast<uint32_t>(rt_mesh_slots_.size());
+    rt_mesh_slots_.push_back(std::move(slot));
+    rt_mesh_slot_by_source_[key] = slot_idx;
+    rt_mesh_build_queue_.push_back(slot_idx);
+    rt_mesh_pools_dirty_ = true;
+    return static_cast<int32_t>(slot_idx);
+}
+
+uint32_t ClusterRenderer::flushRtMeshBuilds() {
+    uint32_t built = 0;
+    if (!rt_mesh_build_queue_.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        // Temporary host-visible build inputs (one per queued slot):
+        // the BLAS is self-contained once built, so they go away with
+        // the scratch right after the submit-and-wait.
+        struct Pending {
+            uint32_t slot;
+            renderer::BufferInfo pos, idx;
+            renderer::BufferInfo scratch_near, scratch_far;
+            std::shared_ptr<er::AccelerationStructureGeometry> g_opaque, g_masked, g_all;
+            er::AccelerationStructureBuildGeometryInfo near_info{}, far_info{};
+            std::vector<er::AccelerationStructureBuildRangeInfo> near_ranges, far_ranges;
+            bool has_far = false;
+        };
+        std::vector<Pending> pend;
+        pend.reserve(rt_mesh_build_queue_.size());
+        std::vector<er::AccelerationStructureBuildGeometryInfo> infos;
+        std::vector<er::AccelerationStructureBuildRangeInfo> ranges;
+        uint64_t total_tris = 0;
+
+        auto makeInput = [&](const void* data, uint64_t bytes) {
+            renderer::BufferInfo b;
+            er::Helper::createBuffer(
+                device_,
+                SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
+                SET_FLAG_BIT(BufferUsage,
+                    ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+                b.buffer, b.memory,
+                std::source_location::current(),
+                bytes, data);
+            return b;
+        };
+        auto makeAsBuffer = [&](uint64_t bytes) {
+            renderer::BufferInfo b;
+            device_->createBuffer(
+                bytes,
+                SET_FLAG_BIT(BufferUsage, ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
+                SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+                SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+                b.buffer, b.memory,
+                std::source_location::current());
+            return b;
+        };
+        auto makeScratch = [&](uint64_t bytes) {
+            renderer::BufferInfo b;
+            device_->createBuffer(
+                std::max<uint64_t>(bytes, 256u),
+                SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
+                SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+                SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+                b.buffer, b.memory,
+                std::source_location::current());
+            return b;
+        };
+        auto makeTriGeom = [&](uint64_t vertex_addr, uint32_t max_vertex,
+                               uint64_t index_addr, uint32_t tri_count,
+                               bool opaque) {
+            auto g = std::make_shared<er::AccelerationStructureGeometry>();
+            g->geometry_type = er::GeometryType::TRIANGLES_KHR;
+            g->flags = opaque ? SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR) : 0;
+            g->max_primitive_count = tri_count;
+            auto& tri = g->geometry.triangles;
+            tri.struct_type = er::StructureType::
+                ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            tri.p_next        = nullptr;
+            tri.vertex_format = er::Format::R32G32B32_SFLOAT;
+            tri.vertex_data.device_address = vertex_addr;
+            tri.vertex_stride = sizeof(glm::vec4);
+            tri.max_vertex    = max_vertex;
+            tri.index_type    = er::IndexType::UINT32;
+            tri.index_data.device_address = index_addr;
+            tri.transform_data.device_address = 0;
+            return g;
+        };
+
+        for (uint32_t si : rt_mesh_build_queue_) {
+            if (si >= rt_mesh_slots_.size()) continue;
+            RtMeshSlot& s = rt_mesh_slots_[si];
+            if (s.built || s.vertex_count == 0) continue;
+            const uint32_t tri_n = s.opaque_tris + s.masked_tris;
+            if (tri_n == 0) continue;
+            Pending p;
+            p.slot = si;
+            p.pos = makeInput(&rt_mesh_pos_uv_cpu_[s.vertex_ofs],
+                              uint64_t(s.vertex_count) * sizeof(glm::vec4));
+            p.idx = makeInput(&rt_mesh_indices_cpu_[s.index_ofs],
+                              uint64_t(tri_n) * 3u * sizeof(uint32_t));
+            const uint64_t vaddr = p.pos.buffer->getDeviceAddress();
+            const uint64_t iaddr = p.idx.buffer->getDeviceAddress();
+            const uint32_t max_v = s.vertex_count - 1u;
+
+            // NEAR variant: geometry 0 opaque, geometry 1 masked.
+            er::AccelerationStructureGeometryList near_geoms;
+            if (s.opaque_tris > 0) {
+                p.g_opaque = makeTriGeom(vaddr, max_v, iaddr, s.opaque_tris, true);
+                near_geoms.push_back(p.g_opaque);
+                p.near_ranges.push_back({s.opaque_tris, 0u, 0u, 0u});
+            }
+            if (s.masked_tris > 0) {
+                p.g_masked = makeTriGeom(
+                    vaddr, max_v,
+                    iaddr + uint64_t(s.opaque_tris) * 3u * sizeof(uint32_t),
+                    s.masked_tris, false);
+                near_geoms.push_back(p.g_masked);
+                p.near_ranges.push_back({s.masked_tris, 0u, 0u, 0u});
+            }
+            // The shader decodes geometry 1 as "masked": with no opaque
+            // triangles the masked geometry would land at index 0, so
+            // keep an explicit (empty-safe) ordering by requiring both
+            // or treating a masked-only mesh's single geometry as masked
+            // through opaque_tris == 0 (tri = 0 + prim) — which the
+            // formula already yields.  Nothing to do here.
+            p.near_info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
+            p.near_info.flags =
+                SET_FLAG_BIT(BuildAccelerationStructure, PREFER_FAST_TRACE_BIT_KHR);
+            p.near_info.geometries = near_geoms;
+            er::AccelerationStructureBuildSizesInfo near_sz{};
+            near_sz.struct_type = er::StructureType::
+                ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+            device_->getAccelerationStructureBuildSizes(
+                er::AccelerationStructureBuildType::DEVICE_KHR,
+                p.near_info, near_sz);
+            s.blas_near_buf = makeAsBuffer(near_sz.as_size);
+            s.blas_near = device_->createAccelerationStructure(
+                s.blas_near_buf.buffer,
+                er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
+            p.scratch_near = makeScratch(near_sz.build_scratch_size);
+            p.near_info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+            p.near_info.dst_as = s.blas_near;
+            p.near_info.scratch_data.device_address =
+                p.scratch_near.buffer->getDeviceAddress();
+
+            // FAR variant: one all-opaque geometry over the whole range.
+            // A mesh without masked triangles shares the near BLAS.
+            p.has_far = (s.masked_tris > 0);
+            if (p.has_far) {
+                p.g_all = makeTriGeom(vaddr, max_v, iaddr, tri_n, true);
+                p.far_info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
+                p.far_info.flags = SET_FLAG_BIT(
+                    BuildAccelerationStructure, PREFER_FAST_TRACE_BIT_KHR);
+                p.far_info.geometries = { p.g_all };
+                p.far_ranges.push_back({tri_n, 0u, 0u, 0u});
+                er::AccelerationStructureBuildSizesInfo far_sz{};
+                far_sz.struct_type = er::StructureType::
+                    ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+                device_->getAccelerationStructureBuildSizes(
+                    er::AccelerationStructureBuildType::DEVICE_KHR,
+                    p.far_info, far_sz);
+                s.blas_far_buf = makeAsBuffer(far_sz.as_size);
+                s.blas_far = device_->createAccelerationStructure(
+                    s.blas_far_buf.buffer,
+                    er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
+                p.scratch_far = makeScratch(far_sz.build_scratch_size);
+                p.far_info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+                p.far_info.dst_as = s.blas_far;
+                p.far_info.scratch_data.device_address =
+                    p.scratch_far.buffer->getDeviceAddress();
+            }
+            total_tris += tri_n;
+            pend.push_back(std::move(p));
+        }
+        rt_mesh_build_queue_.clear();
+
+        if (!pend.empty()) {
+            // One command buffer per build call keeps the per-build
+            // range arrays unambiguous (the renderer's wrapper pairs one
+            // range list with one geometry-info list).
+            auto cmd_buf = device_->setupTransientCommandBuffer();
+            for (auto& p : pend) {
+                cmd_buf->buildAccelerationStructures({p.near_info}, p.near_ranges);
+                if (p.has_far) {
+                    cmd_buf->buildAccelerationStructures({p.far_info}, p.far_ranges);
+                }
+            }
+            device_->submitAndWaitTransientCommandBuffer();
+            for (auto& p : pend) {
+                RtMeshSlot& s = rt_mesh_slots_[p.slot];
+                s.addr_near = device_->getAccelerationStructureDeviceAddress(s.blas_near);
+                s.addr_far = p.has_far
+                    ? device_->getAccelerationStructureDeviceAddress(s.blas_far)
+                    : s.addr_near;
+                s.built = true;
+                p.pos.destroy(device_);
+                p.idx.destroy(device_);
+                p.scratch_near.destroy(device_);
+                p.scratch_far.destroy(device_);
+                ++built;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            clog_printf(
+                "[CLUSTER_RENDERER] per-mesh RT BLAS: built %u mesh slot(s), "
+                "%llu tris, %.1f ms (total slots %zu)\n",
+                built, (unsigned long long)total_tris, ms,
+                rt_mesh_slots_.size());
+        }
+    }
+
+    // ── Pools → GPU (grow-only; a rewrite of bound buffers needs idle) ─
+    if (rt_mesh_pools_dirty_ && !rt_mesh_slots_.empty()) {
+        // The resolve of the in-flight frame may be reading these pools
+        // and the descriptor set that names them: drain before touching
+        // either.  Rare — only when a new unique mesh joined the caster
+        // set (or a sync re-registered materials).
+        device_->waitIdle();
+        ensureDeviceSSBO(device_, rt_mesh_pos_uv_buf_,
+                         rt_mesh_pos_uv_cpu_.size() * sizeof(glm::vec4),
+                         rt_mesh_pos_uv_cpu_.data());
+        ensureDeviceSSBO(device_, rt_mesh_index_buf_,
+                         rt_mesh_indices_cpu_.size() * sizeof(uint32_t),
+                         rt_mesh_indices_cpu_.data());
+        ensureDeviceSSBO(device_, rt_mesh_tri_mat_buf_,
+                         rt_mesh_tri_mat_cpu_.size() * sizeof(uint32_t),
+                         rt_mesh_tri_mat_cpu_.data());
+        ensureDeviceSSBO(device_, rt_mesh_info_buf_,
+                         rt_mesh_infos_cpu_.size() * sizeof(glsl::RtMeshInfo),
+                         rt_mesh_infos_cpu_.data());
+        rt_mesh_gpu_pos_count_   = static_cast<uint32_t>(rt_mesh_pos_uv_cpu_.size());
+        rt_mesh_gpu_index_count_ = static_cast<uint32_t>(rt_mesh_indices_cpu_.size());
+        rt_mesh_gpu_tri_count_   = static_cast<uint32_t>(rt_mesh_tri_mat_cpu_.size());
+        rt_mesh_gpu_info_count_  = static_cast<uint32_t>(rt_mesh_infos_cpu_.size());
+        rt_mesh_pools_dirty_ = false;
+        writeRtMeshDescriptors();
+    }
+    return built;
+}
+
+void ClusterRenderer::setRtCasterInstances(
+    std::vector<RtCasterInstance>&& instances) {
+    rt_caster_instances_ = std::move(instances);
+    if (rt_caster_instances_.size() > kRtCasterMaxInstances) {
+        rt_caster_instances_.resize(kRtCasterMaxInstances);
+    }
+    rt_tlas_dirty_ = true;
+}
+
+// hw_rt_desc_set_ bindings 5..8: per-mesh pools (or the opaque index
+// buffer as a legal placeholder while no slot exists).
+void ClusterRenderer::writeRtMeshDescriptors() {
+    if (!hw_rt_desc_set_) return;
+    const bool have = rt_mesh_info_buf_.buffer && rt_mesh_pos_uv_buf_.buffer &&
+                      rt_mesh_index_buf_.buffer && rt_mesh_tri_mat_buf_.buffer &&
+                      rt_mesh_gpu_info_count_ > 0;
+    const renderer::BufferInfo& fallback = hw_rt_opaque_index_buffer_;
+    if (!have && !fallback.buffer) return;
+    er::WriteDescriptorList w;
+    w.reserve(4);
+    auto add = [&](uint32_t binding, const renderer::BufferInfo& b, uint32_t bytes) {
+        er::Helper::addOneBuffer(w, hw_rt_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, binding,
+            (have ? b : fallback).buffer,
+            have ? bytes : fallback.buffer->getSize());
+    };
+    add(5, rt_mesh_info_buf_,
+        static_cast<uint32_t>(rt_mesh_gpu_info_count_ * sizeof(glsl::RtMeshInfo)));
+    add(6, rt_mesh_pos_uv_buf_,
+        static_cast<uint32_t>(rt_mesh_gpu_pos_count_ * sizeof(glm::vec4)));
+    add(7, rt_mesh_index_buf_,
+        static_cast<uint32_t>(rt_mesh_gpu_index_count_ * sizeof(uint32_t)));
+    add(8, rt_mesh_tri_mat_buf_,
+        static_cast<uint32_t>(rt_mesh_gpu_tri_count_ * sizeof(uint32_t)));
+    device_->updateDescriptorSets(w);
+}
+
+// [static merged geometry, skeleton?, casters...] → hw_rt_instance_buffer_.
+uint32_t ClusterRenderer::writeRtTlasInstances(bool include_skeleton,
+                                               bool deferrable) {
+    static std::vector<er::AccelerationStructureInstance> s_insts;
+    s_insts.clear();
+    s_insts.reserve(2 + rt_caster_instances_.size());
+    const er::TransformMatrix identity = { 1.0f, 0.0f, 0.0f, 0.0f,
+                                           0.0f, 1.0f, 0.0f, 0.0f,
+                                           0.0f, 0.0f, 1.0f, 0.0f };
+    er::AccelerationStructureInstance base{};
+    base.transform = identity;
+    base.instance_custom_index = 0;
+    base.mask = 0xFF;
+    base.instance_shader_binding_table_record_offset = 0;
+    base.flags = SET_FLAG_BIT(
+        GeometryInstance, TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
+    base.acceleration_structure_reference = hw_rt_static_blas_address_;
+    if (hw_rt_static_blas_address_ != 0) {
+        s_insts.push_back(base);
+    }
+    if (include_skeleton && hw_rt_skel_blas_handle_) {
+        er::AccelerationStructureInstance sk = base;
+        sk.instance_custom_index = 1;
+        sk.acceleration_structure_reference =
+            device_->getAccelerationStructureDeviceAddress(hw_rt_skel_blas_handle_);
+        s_insts.push_back(sk);
+    }
+    if (rt_per_mesh_blas_) {
+        for (const RtCasterInstance& ci : rt_caster_instances_) {
+            if (ci.slot >= rt_mesh_slots_.size()) continue;
+            const RtMeshSlot& s = rt_mesh_slots_[ci.slot];
+            if (!s.built) continue;
+            er::AccelerationStructureInstance in = base;
+            // glm is column-major; the AS transform is 3 rows × 4 cols.
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    in.transform.matrix[r][c] = ci.world[c][r];
+                }
+            }
+            in.instance_custom_index =
+                (2u + ((ci.slot << 1) | (ci.far_lod ? 1u : 0u))) & 0xFFFFFFu;
+            in.acceleration_structure_reference = ci.far_lod ? s.addr_far : s.addr_near;
+            s_insts.push_back(in);
+            if (s_insts.size() >= 2u + kRtCasterMaxInstances) break;
+        }
+    }
+    const uint64_t cap_bytes =
+        uint64_t(2u + kRtCasterMaxInstances) * sizeof(er::AccelerationStructureInstance);
+    if (!hw_rt_instance_buffer_.buffer ||
+        hw_rt_instance_buffer_.buffer->getSize() < cap_bytes) {
+        retireBuffer(hw_rt_instance_buffer_);
+        er::Helper::createBuffer(
+            device_,
+            SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
+            SET_FLAG_BIT(BufferUsage,
+                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+            SET_FLAG_BIT(MemoryProperty, HOST_VISIBLE_BIT) |
+            SET_FLAG_BIT(MemoryProperty, HOST_COHERENT_BIT),
+            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
+            hw_rt_instance_buffer_.buffer,
+            hw_rt_instance_buffer_.memory,
+            std::source_location::current(),
+            cap_bytes, nullptr);
+    }
+    device_->updateBufferMemory(
+        hw_rt_instance_buffer_.memory,
+        s_insts.size() * sizeof(er::AccelerationStructureInstance),
+        s_insts.data(), 0, deferrable);
+    rt_tlas_dirty_ = false;
+    return static_cast<uint32_t>(s_insts.size());
+}
+
+void ClusterRenderer::destroyRtMeshSlots() {
+    for (auto& s : rt_mesh_slots_) {
+        if (s.blas_near) {
+            device_->destroyAccelerationStructure(s.blas_near);
+            s.blas_near = {};
+        }
+        if (s.blas_far) {
+            device_->destroyAccelerationStructure(s.blas_far);
+            s.blas_far = {};
+        }
+        s.blas_near_buf.destroy(device_);
+        s.blas_far_buf.destroy(device_);
+    }
+    rt_mesh_slots_.clear();
+    rt_mesh_slot_by_source_.clear();
+    rt_mesh_build_queue_.clear();
+    rt_mesh_pos_uv_cpu_.clear();
+    rt_mesh_indices_cpu_.clear();
+    rt_mesh_tri_prim_cpu_.clear();
+    rt_mesh_tri_mat_cpu_.clear();
+    rt_mesh_infos_cpu_.clear();
+    rt_mesh_pos_uv_buf_.destroy(device_);
+    rt_mesh_index_buf_.destroy(device_);
+    rt_mesh_tri_mat_buf_.destroy(device_);
+    rt_mesh_info_buf_.destroy(device_);
+    rt_mesh_gpu_pos_count_ = rt_mesh_gpu_index_count_ = 0;
+    rt_mesh_gpu_tri_count_ = rt_mesh_gpu_info_count_ = 0;
+    rt_caster_instances_.clear();
+    rt_mesh_prim_materials_.clear();
+    rt_mesh_pools_dirty_ = false;
 }
 
 // ─── RT-shadow skeletons ──────────────────────────────────────────────────
@@ -5659,7 +6390,14 @@ void ClusterRenderer::updateRtSkeletons(
                 }
             }
         }
-        if (same) return;
+        if (same) {
+            // Same pose, but the caster instance set changed: refresh
+            // the TLAS only (the skeleton BLAS is still valid).
+            if (rt_tlas_dirty_ && hw_rt_shadow_ready_ && cmd_buf) {
+                recordRtTlasRebuild(cmd_buf, rt_skel_last_has_skels_);
+            }
+            return;
+        }
         rt_skel_cache_.resize(skeletons.size());
         for (size_t i = 0; i < skeletons.size(); ++i) {
             rt_skel_cache_[i].model = skeletons[i].model;
@@ -5933,22 +6671,6 @@ void ClusterRenderer::updateRtSkeletons(
         hw_rt_skel_blas_tri_cap_ = tri_cap;
     }
 
-    // Per-frame TLAS instance buffer (static + skeleton).
-    if (!hw_rt_frame_instance_buffer_.buffer) {
-        er::Helper::createBuffer(
-            device_,
-            SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-            SET_FLAG_BIT(BufferUsage,
-                ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
-            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
-                            HOST_COHERENT_BIT),
-            SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
-            hw_rt_frame_instance_buffer_.buffer,
-            hw_rt_frame_instance_buffer_.memory,
-            std::source_location::current(),
-            2 * sizeof(er::AccelerationStructureInstance), nullptr);
-    }
-
     // Barriers: previous frame's resolve reads (compute ray query) must
     // finish before this frame's AS builds overwrite BLAS/TLAS memory,
     // and the host-written vertex data must be visible to the build.
@@ -5962,8 +6684,6 @@ void ClusterRenderer::updateRtSkeletons(
         cmd_buf->addBufferBarrier(
             hw_rt_skel_blas_buffer_.buffer, as_read_compute, as_write_build);
     }
-    cmd_buf->addBufferBarrier(
-        hw_rt_tlas_buffer_.buffer, as_read_compute, as_write_build);
 
     // Skeleton BLAS rebuild (positions changed this frame).
     if (has_skels) {
@@ -6009,68 +6729,77 @@ void ClusterRenderer::updateRtSkeletons(
             hw_rt_skel_blas_buffer_.buffer, as_write_build, as_read_build);
     }
 
-    // TLAS rebuild: static instance + (when present) skeleton instance.
-    const uint32_t inst_count = has_skels ? 2u : 1u;
-    {
-        er::AccelerationStructureInstance insts[2] = {};
-        er::TransformMatrix identity = { 1.0f, 0.0f, 0.0f, 0.0f,
-                                         0.0f, 1.0f, 0.0f, 0.0f,
-                                         0.0f, 0.0f, 1.0f, 0.0f };
-        insts[0].transform = identity;
-        insts[0].instance_custom_index = 0;
-        insts[0].mask = 0xFF;
-        insts[0].instance_shader_binding_table_record_offset = 0;
-        insts[0].flags = SET_FLAG_BIT(
-            GeometryInstance, TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
-        insts[0].acceleration_structure_reference =
-            hw_rt_static_blas_address_;
-        if (has_skels) {
-            insts[1] = insts[0];
-            insts[1].instance_custom_index = 1;
-            insts[1].acceleration_structure_reference =
-                device_->getAccelerationStructureDeviceAddress(
-                    hw_rt_skel_blas_handle_);
-        }
-        // deferrable: the TLAS instance array for THIS frame's rebuild,
-        // which is recorded into the frame command buffer (not a transient
-        // submit), so the flush before submit lands in time.
-        device_->updateBufferMemory(hw_rt_frame_instance_buffer_.memory,
-                                    sizeof(insts), insts, 0, true);
+    // TLAS rebuild: static instance + (when present) skeleton instance
+    // + the per-mesh caster instances.
+    rt_skel_last_has_skels_ = has_skels;
+    recordRtTlasRebuild(cmd_buf, has_skels);
+}
 
-        auto tlas_geom =
-            std::make_shared<er::AccelerationStructureGeometry>();
-        tlas_geom->geometry_type = er::GeometryType::INSTANCES_KHR;
-        tlas_geom->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
-        tlas_geom->max_primitive_count = 2;
-        tlas_geom->geometry.instances.struct_type = er::StructureType::
-            ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-        tlas_geom->geometry.instances.p_next = nullptr;
-        tlas_geom->geometry.instances.array_of_pointers = 0;
-        tlas_geom->geometry.instances.data.device_address =
-            hw_rt_frame_instance_buffer_.buffer->getDeviceAddress();
+// TLAS rebuild on the frame command buffer: [static, skeleton?, casters].
+// Shared by the skeleton update and the caster-set-only refresh (an
+// unchanged pose with a new caster set, see rt_tlas_dirty_).
+void ClusterRenderer::recordRtTlasRebuild(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    bool include_skeleton) {
+    if (!hw_rt_shadow_ready_ || !cmd_buf || !hw_rt_tlas_handle_) return;
+    er::BufferResourceInfo as_read_compute = {
+        SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_READ_BIT_KHR),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    er::BufferResourceInfo as_write_build = {
+        SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_WRITE_BIT_KHR),
+        SET_FLAG_BIT(PipelineStage, ACCELERATION_STRUCTURE_BUILD_BIT_KHR) };
+    cmd_buf->addBufferBarrier(
+        hw_rt_tlas_buffer_.buffer, as_read_compute, as_write_build);
 
-        er::AccelerationStructureBuildGeometryInfo info{};
-        info.type = er::AccelerationStructureType::TOP_LEVEL_KHR;
-        info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
-                                  PREFER_FAST_TRACE_BIT_KHR);
-        info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
-        info.dst_as = hw_rt_tlas_handle_;
-        info.geometries = { tlas_geom };
-        info.scratch_data.device_address =
-            hw_rt_tlas_scratch_buffer_.buffer->getDeviceAddress();
-        std::vector<er::AccelerationStructureBuildRangeInfo> ranges = {
-            { inst_count, 0u, 0u, 0u } };
-        cmd_buf->buildAccelerationStructures({ info }, ranges);
-    }
+    // deferrable: the instance array is read by THIS frame's build, which
+    // is recorded into the frame command buffer (not a transient submit),
+    // so the flush before submit lands in time — and the previous frame's
+    // build may still be reading the same single-buffered array.
+    const uint32_t inst_count =
+        writeRtTlasInstances(include_skeleton, /*deferrable*/ true);
+
+    auto tlas_geom =
+        std::make_shared<er::AccelerationStructureGeometry>();
+    tlas_geom->geometry_type = er::GeometryType::INSTANCES_KHR;
+    tlas_geom->flags = SET_FLAG_BIT(Geometry, OPAQUE_BIT_KHR);
+    tlas_geom->max_primitive_count = 2u + kRtCasterMaxInstances;
+    tlas_geom->geometry.instances.struct_type = er::StructureType::
+        ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlas_geom->geometry.instances.p_next = nullptr;
+    tlas_geom->geometry.instances.array_of_pointers = 0;
+    tlas_geom->geometry.instances.data.device_address =
+        hw_rt_instance_buffer_.buffer->getDeviceAddress();
+
+    er::AccelerationStructureBuildGeometryInfo info{};
+    info.type = er::AccelerationStructureType::TOP_LEVEL_KHR;
+    info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
+                              PREFER_FAST_TRACE_BIT_KHR);
+    info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+    info.dst_as = hw_rt_tlas_handle_;
+    info.geometries = { tlas_geom };
+    info.scratch_data.device_address =
+        hw_rt_tlas_scratch_buffer_.buffer->getDeviceAddress();
+    std::vector<er::AccelerationStructureBuildRangeInfo> ranges = {
+        { inst_count, 0u, 0u, 0u } };
+    cmd_buf->buildAccelerationStructures({ info }, ranges);
 
     // TLAS write → resolve compute read.
     cmd_buf->addBufferBarrier(
         hw_rt_tlas_buffer_.buffer, as_write_build, as_read_compute);
+    // Heartbeat: caster instance count, every ~5 s at 60 fps.
+    static int s_frame = 0;
+    if ((s_frame++ % 300) == 0 && !rt_caster_instances_.empty()) {
+        clog_printf("[RT_TLAS] rebuild: %u instance(s) (%zu per-mesh casters, "
+                    "%zu mesh slots)\n",
+                    inst_count, rt_caster_instances_.size(),
+                    rt_mesh_slots_.size());
+    }
 }
 
 void ClusterRenderer::destroy() {
     // Drain the deferred-retirement list before member teardown.
     flushRetiredBuffers(/*force*/ true);
+    destroyRtMeshSlots();
     bindless_pipeline_.reset();
     bindless_translucent_pipeline_.reset();
     bindless_translucent_oit_pipeline_.reset();

@@ -112,7 +112,18 @@ void main() {
     }
     // Outer-ring depth bias (cm, see TileObject::draw): coarse distant
     // tiles sit just below the fine terrain where they overlap.
+#if defined(WATER_PASS)
+    // The outer-ring bias exists to sink the coarse TERRAIN under the
+    // fine tiles where they overlap.  Applied to the water surface it
+    // sank every river beyond the inner region 1.5-8 m under its own
+    // bed: the surface stopped dead along the inner-region edge and
+    // the far half of a river showed bare (dark) bed.  Keep 2 cm on
+    // the ring so the inner tile still wins the depth test where both
+    // draw, invisible at the >800 m the ring starts at.
+    layer_height -= min(float(tile_params.pad_0), 2.0f) * 0.01f;
+#else
     layer_height -= float(tile_params.pad_0) * 0.01f;
+#endif
     out_data.water_depth = 0.0f;
 #if defined(SOIL_PASS) || defined(WATER_PASS) || defined(SNOW_PASS)
     vec2 soil_water_thickness = texture(soil_water_layer, world_map_uv).xy * SOIL_WATER_LAYER_MAX_THICKNESS;
@@ -140,6 +151,10 @@ void main() {
         if (all(greaterThan(patch_uv, vec2(0.0f))) &&
             all(lessThan(patch_uv, vec2(1.0f)))) {
             float dev = texture(lbm_surface_tex_vs, patch_uv).w;
+            // Ripples are centimetres; anything beyond a decimetre is
+            // sim drift or a blow-up, and must never move the surface
+            // out of its channel (see lbm_water.comp's mean restore).
+            dev = (dev == dev) ? clamp(dev, -0.12f, 0.12f) : 0.0f;
             vec2  eb  = min(patch_uv, vec2(1.0f) - patch_uv);
             float feather = smoothstep(0.0f, 0.12f, min(eb.x, eb.y));
             float shallow = clamp(out_data.water_depth * 4.0f, 0.0f, 1.0f);

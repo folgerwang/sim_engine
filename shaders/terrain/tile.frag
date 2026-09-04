@@ -48,6 +48,22 @@ vec2 octEncodeDir(vec3 n) {
 layout(set = TILE_PARAMS_SET, binding = SRC_COLOR_TEX_INDEX) uniform sampler2D src_tex;
 layout(set = TILE_PARAMS_SET, binding = SRC_DEPTH_TEX_INDEX) uniform sampler2D src_depth;
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
+// Debug overlay only (Rendering > Terrain > "Show water column on
+// terrain"): the runtime soil/water layer, read to tint the ground
+// where the engine holds a water column.
+layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_dbg;
+// shore.w = 3 from packWaterBlend (1 = normal, 2 = water-only opaque).
+bool waterColumnOverlay() { return tile_params.water.shore.w > 2.5f; }
+vec3 waterColumnTint(vec3 albedo) {
+    if (!waterColumnOverlay()) return albedo;
+    float col = texture(soil_water_dbg, in_data.world_map_uv).y *
+                SOIL_WATER_LAYER_MAX_THICKNESS;
+    // magenta = column >= 0.35 m (a seeded water body), yellow = a
+    // thin sheet (0.5 cm .. 0.35 m), untouched = dry.
+    if (col > 0.35f)  return mix(albedo, vec3(1.0f, 0.0f, 1.0f), 0.75f);
+    if (col > 0.005f) return mix(albedo, vec3(1.0f, 0.9f, 0.0f), 0.75f);
+    return albedo;
+}
 
 #include "tile_detail.glsl.h"
 
@@ -483,31 +499,68 @@ vec3 terrainSurfaceShade(vec4 w, float f, out float roughness) {
 // relief matches the colour exactly), and the leaf / twig masks for
 // tinting.  Offsets keep every octave's hash1 origin-cross far outside
 // the map (see kGroundOrigin).
+// noised() on a ROTATED, scaled domain, gradient returned in p space
+// (chain rule through the rotation: grad_p = R^T grad_q).  Value noise
+// is a lattice: sampled axis-aligned and then THRESHOLDED into patches,
+// its blobs sit on the lattice points with seams along the lattice
+// lines, which read as bricks / paving at walking distance.  Rotating
+// each layer differently and warping the domain hides the lattice.
+vec3 litterNoiseRot(vec2 p, float ang, float inv_scale) {
+    float c = cos(ang), s = sin(ang);
+    vec2 q = vec2(c * p.x - s * p.y, s * p.x + c * p.y) * inv_scale;
+    vec3 n = noised(q);
+    vec2 gq = n.yz * inv_scale;
+    return vec3(n.x, c * gq.x + s * gq.y, -s * gq.x + c * gq.y);
+}
+
+// One twig layer: anisotropic ridges (2.1 m along its own axis, 0.17 m
+// across) folded by abs() and thresholded to thin streaks.  Returns the
+// mask and its p-space gradient.
+vec3 litterTwigLayer(vec2 p, float ang, vec2 off) {
+    float c = cos(ang), s = sin(ang);
+    vec2 pp = p + off;
+    vec2 q = vec2(c * pp.x - s * pp.y, s * pp.x + c * pp.y);
+    vec3 n = noised(vec2(q.x * (1.0f / 2.1f), q.y * (1.0f / 0.17f)));
+    vec2 gq = vec2(n.y * (1.0f / 2.1f), n.z * (1.0f / 0.17f));
+    vec2 gp = vec2(c * gq.x + s * gq.y, -s * gq.x + c * gq.y);
+    float r  = 1.0f - abs(n.x);
+    float t3 = clamp((r - 0.62f) / 0.30f, 0.0f, 1.0f);
+    float tw = t3 * t3 * (3.0f - 2.0f * t3);
+    vec2 d = (6.0f * t3 * (1.0f - t3) / 0.30f) * (-sign(n.x)) * gp;
+    return vec3(tw, d);
+}
+
 float terrainLitterField(vec2 p, out vec2 grad,
                          out float leaf, out float twig) {
-    // Leaf clumps: ~0.45 m value-noise blobs, sharpened into patches.
-    vec3 n1 = noised((p + kGroundOrigin + vec2( 337.7f,  911.3f))
-                     * (1.0f / 0.45f));
-    vec2 g1 = n1.yz * (1.0f / 0.45f);
-    float t1 = clamp((n1.x + 0.15f) / 0.70f, 0.0f, 1.0f);
+    vec2 pw = p + kGroundOrigin;
+
+    // Domain warp (~1.7 m field, +-0.22 m) so no layer below sees a
+    // straight lattice line.  Its own gradient is small against the
+    // layers it feeds and is left out of the chain rule.
+    vec2 warp = vec2(litterNoiseRot(pw + vec2( 53.1f,  77.9f),  0.90f, 1.0f / 1.7f).x,
+                     litterNoiseRot(pw + vec2(-91.3f,  12.7f), -0.40f, 1.0f / 1.7f).x) * 0.22f;
+
+    // Leaf clumps: two rotated blob octaves (0.45 m and 0.31 m), then
+    // sharpened into patches.  Neither octave shares an axis with the
+    // world or with the other, so the patches fall where they may.
+    vec3 a1 = litterNoiseRot(pw + warp        + vec2( 337.7f,  911.3f),  0.62f, 1.0f / 0.45f);
+    vec3 a2 = litterNoiseRot(pw + warp * 0.7f + vec2(-512.3f,  265.1f), -1.13f, 1.0f / 0.31f);
+    float v  = a1.x * 0.65f + a2.x * 0.35f;
+    vec2  gv = a1.yz * 0.65f + a2.yz * 0.35f;
+    float t1 = clamp((v + 0.12f) / 0.70f, 0.0f, 1.0f);
     leaf = t1 * t1 * (3.0f - 2.0f * t1);
-    vec2 dleaf = (6.0f * t1 * (1.0f - t1) / 0.70f) * g1;
+    vec2 dleaf = (6.0f * t1 * (1.0f - t1) / 0.70f) * gv;
 
-    // Fine grit / soil crumb: ~0.13 m, used raw.
-    vec3 n2 = noised((p + kGroundOrigin + vec2(1191.2f, 1553.8f))
-                     * (1.0f / 0.13f));
-    vec2 g2 = n2.yz * (1.0f / 0.13f);
+    // Fine grit / soil crumb: ~0.13 m, used raw (rotated as well).
+    vec3 n2 = litterNoiseRot(pw + vec2(1191.2f, 1553.8f), 0.37f, 1.0f / 0.13f);
+    vec2 g2 = n2.yz;
 
-    // Twigs: strongly anisotropic ridges (2.1 m along x, 0.17 m across z)
-    // thresholded to thin streaks.  abs() folds the noise into ridges.
-    vec3 n3 = noised(vec2((p.x + kGroundOrigin.x + 217.9f) * (1.0f / 2.1f),
-                          (p.y + kGroundOrigin.y + 471.1f) * (1.0f / 0.17f)));
-    vec2 g3 = vec2(n3.y * (1.0f / 2.1f), n3.z * (1.0f / 0.17f));
-    float r  = 1.0f - abs(n3.x);
-    float t3 = clamp((r - 0.62f) / 0.30f, 0.0f, 1.0f);
-    twig = t3 * t3 * (3.0f - 2.0f * t3);
-    vec2 dtwig = (6.0f * t3 * (1.0f - t3) / 0.30f)
-               * (-sign(n3.x)) * g3;
+    // Twigs lie every which way: two layers at unrelated angles,
+    // combined as a union so crossings stay thin streaks.
+    vec3 tA = litterTwigLayer(pw + warp * 0.5f,  0.50f, vec2( 217.9f,  471.1f));
+    vec3 tB = litterTwigLayer(pw + warp * 0.5f, -1.20f, vec2(-644.7f, -138.3f));
+    twig = 1.0f - (1.0f - tA.x) * (1.0f - tB.x);
+    vec2 dtwig = tA.yz * (1.0f - tB.x) + tB.yz * (1.0f - tA.x);
 
     grad = dleaf * 0.62f + g2 * 0.25f + dtwig * 0.13f;
     return leaf * 0.62f + n2.x * 0.25f + twig * 0.13f - 0.30f;
@@ -915,7 +968,7 @@ void main() {
     // whatever the forward branch left, and never gets lit.  129/255 =
     // 0.50588 is a full quantisation step clear of the boundary, so the
     // sentinel cannot misfire whichever way the hardware rounds.
-    out_albedo_ao      = vec4(albedo, clamp(surf_ao, 129.0f / 255.0f, 1.0f));
+    out_albedo_ao      = vec4(waterColumnTint(albedo), clamp(surf_ao, 129.0f / 255.0f, 1.0f));
     out_normal_rough   = vec4(octEncodeDir(normal), mat_rough, 0.0f);
     vec2 oct_geom      = octEncodeDir(geom_normal);
     out_emissive_metal = vec4(oct_geom, 0.0f, 0.0f);
@@ -983,7 +1036,11 @@ void main() {
     // Shared scene tonemap — keeps the forward terrain branch on the same
     // curve as the deferred resolve (which lights this same terrain when
     // GBUFFER_OUTPUT is active).
-    outColor = vec4(sceneTonemap(color), alpha);
+    outColor = vec4(sceneTonemapExposed(color,
+        sceneExposureScaleOf(camera_info.exposure_scale)), alpha);
+    if (waterColumnOverlay()) {
+        outColor.rgb = waterColumnTint(outColor.rgb);
+    }
 
     // ── Runtime render-debug override ────────────────────────────────
     // The forward terrain branch had NO debug-mode dispatch at all,

@@ -142,6 +142,13 @@ void ObjectSceneView::drawDepthPrepass(
     ego::DrawableObject::setPlantLodEye(
         m_camera_object_->getCameraViewInfo().position);
 
+    // GPU node-table cull for this pass — must precede the rendering
+    // scope (compute dispatches are illegal inside it).
+    ego::DrawableObject::ntBeginPass(
+        cmd_buf, m_drawable_objects_,
+        ego::DrawableObject::DrawMode::kDepthPrepass,
+        /*depth_only*/ false, 0u);
+
     {
         er::RenderingAttachmentInfo depth_attachment_info;
         depth_attachment_info.image_view = m_depth_buffer_->view;
@@ -222,6 +229,15 @@ void ObjectSceneView::drawGbuffer(
     renderer::DescriptorSetList desc_set_list = desc_sets;
     desc_set_list[VIEW_PARAMS_SET] =
         m_camera_object_->getViewCameraDescriptorSet();
+
+    // Eye publish + GPU node-table cull BEFORE the rendering scope (the
+    // publish below is repeated for the classic path's benefit).
+    ego::DrawableObject::setPlantLodEye(
+        m_camera_object_->getCameraViewInfo().position);
+    ego::DrawableObject::ntBeginPass(
+        cmd_buf, m_drawable_objects_,
+        ego::DrawableObject::DrawMode::kGBuffer,
+        /*depth_only*/ false, 0u);
 
     {
         // LOAD everything: the cluster phases and the terrain G-buffer
@@ -419,6 +435,14 @@ void ObjectSceneView::drawGlassForward(
     renderer::DescriptorSetList desc_set_list = desc_sets;
     desc_set_list[VIEW_PARAMS_SET] =
         m_camera_object_->getViewCameraDescriptorSet();
+
+    // Eye publish + GPU node-table cull BEFORE the rendering scope.
+    ego::DrawableObject::setPlantLodEye(
+        m_camera_object_->getCameraViewInfo().position);
+    ego::DrawableObject::ntBeginPass(
+        cmd_buf, m_drawable_objects_,
+        ego::DrawableObject::DrawMode::kGlassAttr,
+        /*depth_only*/ false, 0u);
 
     {
         // LOAD both: the whole point is to blend onto the finished
@@ -632,6 +656,21 @@ void ObjectSceneView::draw(
     desc_set_list[VIEW_PARAMS_SET] =
         m_camera_object_->getViewCameraDescriptorSet();
 
+    const auto draw_mode =
+        csm_per_cascade ? ego::DrawableObject::DrawMode::kCsmPerCascade :
+        csm_mesh_shader ? ego::DrawableObject::DrawMode::kCsmMeshShader :
+        csm_layered     ? ego::DrawableObject::DrawMode::kCsmLayered :
+        depth_only      ? ego::DrawableObject::DrawMode::kShadow
+                        : ego::DrawableObject::DrawMode::kForward;
+
+    const uint32_t cascade_idx_arg =
+        csm_per_cascade ? uint32_t(csm_cascade_idx) : 0u;
+
+    // GPU node-table cull for this pass (frustum or the armed shadow
+    // volume) — must precede the rendering scope.
+    ego::DrawableObject::ntBeginPass(
+        cmd_buf, m_drawable_objects_, draw_mode, depth_only, cascade_idx_arg);
+
     {
         std::vector<er::RenderingAttachmentInfo> color_attachment_infos;
         color_attachment_infos.reserve(1);
@@ -682,16 +721,6 @@ void ObjectSceneView::draw(
     viewports[0].max_depth = 1.0f;
     scissors[0].offset = glm::ivec2(0);
     scissors[0].extent = m_buffer_size_;
-
-    const auto draw_mode =
-        csm_per_cascade ? ego::DrawableObject::DrawMode::kCsmPerCascade :
-        csm_mesh_shader ? ego::DrawableObject::DrawMode::kCsmMeshShader :
-        csm_layered     ? ego::DrawableObject::DrawMode::kCsmLayered :
-        depth_only      ? ego::DrawableObject::DrawMode::kShadow
-                        : ego::DrawableObject::DrawMode::kForward;
-
-    const uint32_t cascade_idx_arg =
-        csm_per_cascade ? uint32_t(csm_cascade_idx) : 0u;
 
     for (auto& drawable_obj : m_drawable_objects_) {
         drawable_obj->draw(

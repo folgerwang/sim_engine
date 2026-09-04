@@ -1024,7 +1024,8 @@ void main() {
     // pass blend equation.  For opaque materials albedo4.a ≈ 1.0, so the
     // translucent pipeline (drawn second) is a no-op for them — the cull
     // shader filters them out anyway.
-    vec4 final_color = vec4(sceneTonemap(color), albedo4.a);
+    vec4 final_color = vec4(sceneTonemapExposed(color,
+        sceneExposureScaleOf(camera_info.exposure_scale)), albedo4.a);
 
 #if defined(GBUFFER_OUTPUT)
     // The GBUFFER_OUTPUT branch already wrote out_albedo_ao /

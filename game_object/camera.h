@@ -38,6 +38,7 @@ class ViewCamera {
     // the whole screen into offset "ghost copies" during a drag-resize.
     // -1 = unset (first frame).
     float m_last_vp_aspect_ = -1.0f;
+    float m_last_vp_fov_    = -1.0f;   // same zero-velocity treatment for a lens zoom
     // ── TAA projection jitter ────────────────────────────────────────
     // s_proj_jitter_ndc_ is the frame's sub-pixel NDC offset, set once
     // per frame by the application (Halton 2/3 over the pixel).  Only
@@ -95,6 +96,9 @@ public:
 
     // TAA jitter controls — see the members above.
     void setApplyProjJitter(bool apply) { m_apply_proj_jitter_ = apply; }
+    // Camera & Lens exposure (ViewCameraInfo::exposure_scale); uploaded
+    // with the rest of the struct by the next updateViewCameraInfo.
+    void setExposureScale(float s) { m_camera_info_.exposure_scale = s; }
     static void setProjJitter(const glm::vec2& ndc_jitter) {
         s_proj_jitter_ndc_ = ndc_jitter;
     }

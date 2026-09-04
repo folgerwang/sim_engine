@@ -173,6 +173,11 @@ const float kShoreCullMinM = 0.005;
 bool waterParamsPushed() {
     return tile_params.water.shore.w > 0.5f;
 }
+// Runtime twin of WATER_DEBUG_OPAQUE (Rendering > Terrain > "Water
+// surface only"): shore.w = 2 from packWaterBlend.
+bool waterDebugOpaque() {
+    return tile_params.water.shore.w > 1.5f && tile_params.water.shore.w < 2.5f;
+}
 float waterMaxClarity() {
     return waterParamsPushed()
         ? clamp(tile_params.water.blend.x, 0.0f, 1.0f) : kMaxClarity;
@@ -364,21 +369,27 @@ void main() {
     // is always culled — see kShoreCullMinM.
     float shore_cull = max(waterShoreEdgeM() - shore_fade, kShoreCullMinM);
 #if WATER_DEBUG_OPAQUE || WATER_DEBUG_DEPTH_RAMP
-    // Debug: keep every fragment the water layer actually covers, so
-    // the extent is not trimmed by the same threshold being judged.
-    if (ps_depth < 0.002f) {
-        discard;
-    }
+    const bool debug_opaque = true;
 #else
-    // Cull a fade-width BELOW the waterline, not at it: those fragments
-    // carry the outer half of the blend, and discarding them would put
-    // a hard step back exactly where the fade was supposed to be.  They
-    // cost almost nothing — shore lands at 0 there, so the shader
-    // writes the background colour it already sampled.
-    if (ps_depth < shore_cull) {
-        discard;
-    }
+    const bool debug_opaque = waterDebugOpaque();
 #endif
+    if (debug_opaque) {
+        // Debug: keep every fragment the water layer actually covers, so
+        // the extent is not trimmed by the same threshold being judged.
+        if (ps_depth < 0.002f) {
+            discard;
+        }
+    } else {
+        // Cull a fade-width BELOW the waterline, not at it: those
+        // fragments carry the outer half of the blend, and discarding
+        // them would put a hard step back exactly where the fade was
+        // supposed to be.  They cost almost nothing — shore lands at 0
+        // there, so the shader writes the background colour it already
+        // sampled.
+        if (ps_depth < shore_cull) {
+            discard;
+        }
+    }
 
     float transparent_factor = clamp((in_data.water_depth - 0.03f) / 0.03f, 0.0f, 1.0f);
 
@@ -680,12 +691,15 @@ void main() {
     // The DEEP body colour is mostly what "dark water" is: damp the
     // diffuse IBL hard (open water swallows skylight) and keep only
     // the specular sky reflection on top.
-    vec3 deep_col = sceneTonemap(f_diffuse * waterDeepDiffuse() + f_specular * 0.8);
-#if WATER_DEBUG_OPAQUE || WATER_DEBUG_DEPTH_RAMP
-    // Nothing of the bed comes through and the waterline does not fade:
-    // the surface is drawn wherever it exists, at full strength.
-    absorb = vec3(0.0f);
-#endif
+    vec3 deep_col = sceneTonemapExposed(
+        f_diffuse * waterDeepDiffuse() + f_specular * 0.8,
+        sceneExposureScaleOf(camera_info.exposure_scale));
+    if (debug_opaque) {
+        // Nothing of the bed comes through and the waterline does not
+        // fade: the surface is drawn wherever it exists, at full
+        // strength.
+        absorb = vec3(0.0f);
+    }
     vec3 water_col = mix(deep_col, bg_color, absorb);
     // Anchored to the cull, not to (edge - fade): when the clamp above
     // bites, those two differ, and a ramp that started below the cull
@@ -693,9 +707,7 @@ void main() {
     // fragment — the hard edge, back again.
     float shore = smoothstep(shore_cull,
                              shore_cull + 2.0f * shore_fade, ps_depth);
-#if WATER_DEBUG_OPAQUE || WATER_DEBUG_DEPTH_RAMP
-    shore = 1.0f;
-#endif
+    if (debug_opaque) shore = 1.0f;
 #if WATER_DEBUG_DEPTH_RAMP
     {
         // Stepped, not smooth: a continuous ramp makes a flat bed and a
@@ -716,7 +728,8 @@ void main() {
     // shore is the WATERLINE fade (centimetres of column); opacity is the
     // master "how present is this surface at all" control.  Multiplying
     // rather than replacing keeps the soft edge at every setting.
-    vec3 color = mix(bg_color, water_col, shore * waterOpacity());
+    vec3 color = mix(bg_color, water_col,
+                     debug_opaque ? 1.0f : shore * waterOpacity());
     outColor = vec4(color, 1.0f);
 /*
 	vec2 uv = gl_FragCoord.xy / vec2(1920, 1080) * 12.0;

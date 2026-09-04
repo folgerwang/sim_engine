@@ -46,6 +46,36 @@ layout(location = 0) out GrassVsPsData {
 layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
 layout(triangles, max_vertices=256, max_primitives=256) out;
 
+// ── Workgroup frustum cull ───────────────────────────────────────────
+// Every blade of the tile used to be built and emitted whether or not
+// it was in view — a 128 m tile under the camera is 400k roots at the
+// near boost, and the half behind the camera cost exactly as much as
+// the half in front.  Each invocation tests its own root against the
+// camera frustum (a sphere padded by the blade height); a workgroup
+// whose 16 blades are all outside emits nothing, and an invisible blade
+// inside a visible workgroup collapses to a degenerate (zero-size)
+// strip so it rasterises no fragments.
+shared uint s_wg_visible;
+
+bool grassRootVisible(vec3 root_ws, float radius_m) {
+    const mat4 vp = camera_info.view_proj;
+    vec4 planes[6];
+    planes[0] = vec4(vp[0][3] + vp[0][0], vp[1][3] + vp[1][0], vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]);
+    planes[1] = vec4(vp[0][3] - vp[0][0], vp[1][3] - vp[1][0], vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]);
+    planes[2] = vec4(vp[0][3] + vp[0][1], vp[1][3] + vp[1][1], vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]);
+    planes[3] = vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1], vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]);
+    planes[4] = vec4(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
+    planes[5] = vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2], vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]);
+    for (int i = 0; i < 6; ++i) {
+        float len = length(planes[i].xyz);
+        if (len > 1e-6f) planes[i] /= len;
+        if (dot(planes[i].xyz, root_ws) + planes[i].w < -radius_m) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── The RENDERED surface height at one point ────────────────────────
 // The same terms tile.vert's SOIL_PASS evaluates at a mesh vertex:
 // base rock mixed toward the streamed 1 m detail (with the
@@ -155,7 +185,10 @@ void main()
 
     const uint num_vertex    = 16 * uint(kGrassBladeVerts);
     const uint num_primitive = 16 * uint(kGrassBladeTris);
-    SetMeshOutputsEXT(num_vertex, num_primitive);
+    // SetMeshOutputsEXT is deferred until the workgroup cull below has
+    // decided whether this group emits anything at all.
+    if (local_idx == 0u) s_wg_visible = 0u;
+    barrier();
 
     // Two independent draws: one per TUFT (shared root) and one per
     // BLADE (its own size, facing, lean and phase within the tuft).
@@ -245,6 +278,27 @@ void main()
                                     kGrassViewFadeEndM, cam_dist);
         blade.height *= k;
         blade.width  *= k;
+    }
+    // ── Workgroup frustum cull (see s_wg_visible) ─────────────────────
+    // Wind lean + flutter can push the tip up to ~0.45 x height sideways
+    // and the widening can grow the blade to 3x, so pad the test sphere
+    // by the full height plus a metre.
+    const bool blade_visible =
+        blade.height > 0.0f && blade.width > 0.0f &&
+        grassRootVisible(blade.root_ws + vec3(0.0f, 0.5f * blade.height, 0.0f),
+                         blade.height + 1.0f);
+    if (blade_visible) atomicOr(s_wg_visible, 1u);
+    barrier();
+    if (s_wg_visible == 0u) {
+        SetMeshOutputsEXT(0u, 0u);
+        return;
+    }
+    SetMeshOutputsEXT(num_vertex, num_primitive);
+    if (!blade_visible) {
+        // Degenerate strip: still emitted (the workgroup's output
+        // counts are uniform) but covers no pixels.
+        blade.height = 0.0f;
+        blade.width  = 0.0f;
     }
 
     // ── Wind sway ───────────────────────────────────────────────────

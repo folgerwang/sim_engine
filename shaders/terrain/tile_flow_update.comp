@@ -198,11 +198,19 @@ void main()
     vec2 layer_delta = layer_adjust.xy / SOIL_WATER_LAYER_MAX_THICKNESS;
 #if WATER_SURFACE_STATIC
     // The water surface is AUTHORED (terrain water mask + adjusted
-    // level, set once by tile_creator) — the sim may erode soil but
-    // must not move the water column, or the river surface drifts
-    // away from its banks over a session.  The LBM patch supplies all
-    // visible water motion instead (ripples + the generated flow).
+    // level, set once by tile_creator) — the sim must not move the
+    // water column, or the river surface drifts away from its banks
+    // over a session.  The LBM patch supplies all visible water motion
+    // instead (ripples + the generated flow).
     layer_delta.y = 0.0f;
+#endif
+#if SOIL_LAYER_STATIC
+    // Same for the soil: the rendered ground is rock + soil, and every
+    // placed object was seated against the seeded thickness.  Eroding
+    // it pulled the ground out from under the whole placed world (see
+    // the define in global_definition.glsl.h).  The flow-vector output
+    // below is still computed so the water shading keeps its field.
+    layer_delta.x = 0.0f;
 #endif
     soil_water_layers += layer_delta;
     imageStore(dst_soil_water_layer, pixel_coords, vec4(max(soil_water_layers, 0.0f), 0, 0));

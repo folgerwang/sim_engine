@@ -12,6 +12,13 @@ layout(location = 2) in vec4 in_color;
 
 layout(location = 0) out vec4 outColor;
 
+// Camera UBO (the vertex stage binds the same set): only the exposure
+// scale is read here, so citizens follow the Camera & Lens exposure.
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
+    readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
 // Simple wrapped-lambert + ambient: citizens are gameplay markers first
 // and PBR objects second, so a stable readable shade beats a full BRDF.
 // Finished through the shared scene tonemap so they sit in the same
@@ -23,5 +30,6 @@ void main() {
     float nl = dot(n, kSunDir) * 0.5 + 0.5;          // wrapped
     vec3 lit = in_color.rgb * (0.35 + 0.85 * nl);
     lit += in_color.rgb * in_color.a;         // readability lift
-    outColor = vec4(sceneTonemap(lit), 1.0);
+    outColor = vec4(sceneTonemapExposed(lit,
+        sceneExposureScaleOf(camera_info.exposure_scale)), 1.0);
 }

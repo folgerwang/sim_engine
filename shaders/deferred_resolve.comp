@@ -158,6 +158,17 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 11)
 // pass_mode 0:         legacy single dispatch (trace + shade, no filter).
 layout(push_constant) uniform ResolvePC {
     uint pass_mode;
+    // Hardware ray-query sample budget per pixel (menu "RT shadow
+    // rays/px", 1..8).  With the temporal accumulation pass armed the
+    // default is 2: the à-trous chain borrows the neighbourhood and the
+    // accumulator borrows the last ~16 frames, so 8 rays of the same
+    // cone per frame were paying 4x for nothing visible.
+    uint rt_samples;
+    // Frame counter for the per-frame jitter of the cone directions
+    // (golden-ratio rotation of the IGN phase) so successive frames
+    // sample different cone positions for the accumulator to average.
+    uint frame_idx;
+    uint temporal_on;
 } rpc;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 9, rg16f)
     uniform writeonly image2D rt_raw_out;
@@ -255,6 +266,71 @@ layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 4)
     readonly buffer HwRtOpaqueTriMats {
     uint hw_rt_opaque_tri_mat[];
 };
+//   5..8  per-mesh BLAS caster pools (ClusterRenderer::ensureRtMeshSlot):
+//         instance custom index >= 2 decodes as slot = (custom-2) >> 1,
+//         far = (custom-2) & 1.  Pools are OBJECT space, indices are
+//         mesh-local (+ vertex_ofs), triangles ordered [opaque | masked].
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 5)
+    readonly buffer RtMeshInfos {
+    RtMeshInfo rt_mesh_infos[];
+};
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 6)
+    readonly buffer RtMeshPosUv {
+    vec4 rt_mesh_pos_uv[];
+};
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 7)
+    readonly buffer RtMeshIndices {
+    uint rt_mesh_indices[];
+};
+layout(std430, set = HW_RT_SHADOW_DATA_SET, binding = 8)
+    readonly buffer RtMeshTriMats {
+    uint rt_mesh_tri_mat[];
+};
+
+// Resolves a ray-query hit (instance custom index, geometry index,
+// primitive index) to the triangle's vertex ids and material.  custom 0
+// is the merged cluster geometry (global ids into rt_pos_uv), custom 1
+// the skeleton BLAS (no streams — callers special-case it), custom >= 2
+// a per-mesh caster slot (ids into rt_mesh_pos_uv).
+struct HwRtTri {
+    uint i0, i1, i2;
+    uint mat_id;
+    bool per_mesh;
+};
+HwRtTri hwRtResolveTri(int custom, int geom, int prim) {
+    HwRtTri t;
+    if (custom >= 2) {
+        const uint code = uint(custom) - 2u;
+        const RtMeshInfo mi = rt_mesh_infos[code >> 1];
+        const bool far = (code & 1u) != 0u;
+        const uint tri = (far || geom == 0) ? uint(prim)
+                                            : (mi.opaque_tris + uint(prim));
+        const uint b = mi.index_ofs + 3u * tri;
+        t.i0 = rt_mesh_indices[b + 0u] + mi.vertex_ofs;
+        t.i1 = rt_mesh_indices[b + 1u] + mi.vertex_ofs;
+        t.i2 = rt_mesh_indices[b + 2u] + mi.vertex_ofs;
+        t.mat_id = rt_mesh_tri_mat[mi.mat_ofs + tri];
+        t.per_mesh = true;
+    } else {
+        const bool masked = (geom != 0);
+        t.i0 = masked ? hw_rt_masked_indices[3 * prim + 0]
+                      : hw_rt_opaque_indices[3 * prim + 0];
+        t.i1 = masked ? hw_rt_masked_indices[3 * prim + 1]
+                      : hw_rt_opaque_indices[3 * prim + 1];
+        t.i2 = masked ? hw_rt_masked_indices[3 * prim + 2]
+                      : hw_rt_opaque_indices[3 * prim + 2];
+        t.mat_id = masked ? hw_rt_masked_tri_mat[prim]
+                          : hw_rt_opaque_tri_mat[prim];
+        t.per_mesh = false;
+    }
+    // A slot registered between two finalizes can name a material the
+    // GPU table does not hold yet — clamp rather than read past it.
+    if (t.mat_id >= uint(rt_materials.length())) t.mat_id = 0u;
+    return t;
+}
+vec4 hwRtVertex(bool per_mesh, uint i) {
+    return per_mesh ? rt_mesh_pos_uv[i] : rt_pos_uv[i];
+}
 #endif
 
 // Octahedral decode — companion of the encode in cluster_bindless.frag
@@ -322,6 +398,18 @@ vec2 csmVogelDisk(int i, int n, float phi) {
 float csmIGN(vec2 pixel) {
     return fract(52.9829189 *
                  fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+// Per-frame rotation of the IGN phase for the ray-traced terms:
+// golden-ratio steps on both axes so a pixel's cone / hemisphere
+// samples walk their domain over the temporal accumulator's window
+// (rt_temporal.comp) instead of re-testing the same directions every
+// frame.  Identity while the accumulator is off, so the single-frame
+// look is unchanged.
+vec2 rtFrameJitter(vec2 xi) {
+    if (rpc.temporal_on == 0u) return xi;
+    const float f = float(rpc.frame_idx & 63u);
+    return fract(xi + vec2(0.618033989, 0.381966011) * f);
 }
 
 // ── CSM coverage helpers (out-of-range handling) ─────────────────────
@@ -414,7 +502,7 @@ const float RT_SUN_TAN_RADIUS      = 0.006;  // was 0.01 — tighter cone, less 
 // dither rather than animated noise.  Doubled from 4/2: more rays = more
 // discrete visibility levels per pixel, which the à-trous smooth pass
 // then blends into clean penumbra ramps (fewer levels = residual bands).
-const int   RT_SOFT_SAMPLES_HW     = 8;   // hardware ray query — cheap rays
+const int   RT_SOFT_SAMPLES_HW     = 8;   // hardware ray query — MAX; live count is rpc.rt_samples
 const int   RT_SOFT_SAMPLES_SW     = 4;   // software BVH walk — pricey rays
 
 // Random direction in the sun cone: xi in [0,1)^2, concentric disk via
@@ -1128,10 +1216,10 @@ float rtShadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
               L * RT_SHADOW_BIAS;
     float lit = 0.0;
     for (int i = 0; i < RT_SOFT_SAMPLES_SW; ++i) {
-        vec2 xi = vec2(
+        vec2 xi = rtFrameJitter(vec2(
             csmIGN(screen_pixel + vec2(17.0 * float(i), 31.0 * float(i))),
             csmIGN(screen_pixel.yx +
-                   vec2(47.0 + 13.0 * float(i), 5.0 + 7.0 * float(i))));
+                   vec2(47.0 + 13.0 * float(i), 5.0 + 7.0 * float(i)))));
         lit += rtShadowRayVisible(ro, rtSunConeDir(L, xi),
                                   RT_SHADOW_MAX_DIST);
     }
@@ -1451,20 +1539,20 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
         ro, RT_SHADOW_BIAS, rd, t_max);
 
     while (rayQueryProceedEXT(rq)) {
-        // Only non-opaque (masked) triangle candidates reach here.
+        // Only non-opaque (masked) triangle candidates reach here —
+        // from the merged geometry's masked stream (custom 0, geometry
+        // 1) or a per-mesh caster's masked geometry (custom >= 2).
         if (rayQueryGetIntersectionTypeEXT(rq, false) ==
             gl_RayQueryCandidateIntersectionTriangleEXT) {
-            const int prim =
-                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-            const uint mat_id = hw_rt_masked_tri_mat[prim];
-            BindlessMaterialParams m = rt_materials[mat_id];
+            const HwRtTri t = hwRtResolveTri(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+                rayQueryGetIntersectionGeometryIndexEXT(rq, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+            BindlessMaterialParams m = rt_materials[t.mat_id];
 
-            uint i0 = hw_rt_masked_indices[3 * prim + 0];
-            uint i1 = hw_rt_masked_indices[3 * prim + 1];
-            uint i2 = hw_rt_masked_indices[3 * prim + 2];
-            vec2 uv0 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i0].w));
-            vec2 uv1 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i1].w));
-            vec2 uv2 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i2].w));
+            vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
+            vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
+            vec2 uv2 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i2).w));
             vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
             vec2 huv = uv0 * (1.0 - bary.x - bary.y)
                      + uv1 * bary.x + uv2 * bary.y;
@@ -1493,33 +1581,38 @@ float hwRtShadowFactor(vec3 world_pos, vec3 world_normal,
     vec3 ro = world_pos +
               world_normal * (RT_SHADOW_BIAS * (1.0 + 3.0 * slope)) +
               L * RT_SHADOW_BIAS;
+    const int n_samples = int(clamp(rpc.rt_samples, 1u,
+                                    uint(RT_SOFT_SAMPLES_HW)));
     float lit = 0.0;
-    for (int i = 0; i < RT_SOFT_SAMPLES_HW; ++i) {
-        vec2 xi = vec2(
+    for (int i = 0; i < n_samples; ++i) {
+        vec2 xi = rtFrameJitter(vec2(
             csmIGN(screen_pixel + vec2(17.0 * float(i), 31.0 * float(i))),
             csmIGN(screen_pixel.yx +
-                   vec2(47.0 + 13.0 * float(i), 5.0 + 7.0 * float(i))));
+                   vec2(47.0 + 13.0 * float(i), 5.0 + 7.0 * float(i)))));
         lit += hwRtShadowRayVisible(ro, rtSunConeDir(L, xi),
                                     RT_SHADOW_MAX_DIST);
     }
-    return lit / float(RT_SOFT_SAMPLES_HW);
+    return lit / float(n_samples);
 }
 
 // Hardware ray-traced AO: short cosine-hemisphere ray queries.
 float hwRtAoFactor(vec3 world_pos, vec3 world_normal,
                    vec2 screen_pixel) {
     vec3 ro = world_pos + world_normal * RT_SHADOW_BIAS;
+    // AO rides the same budget knob: half the shadow count, at least one.
+    const int n_ao = int(clamp(rpc.rt_samples / 2u, 1u,
+                               uint(RT_AO_SAMPLES_HW)));
     float open = 0.0;
-    for (int i = 0; i < RT_AO_SAMPLES_HW; ++i) {
-        vec2 xi = vec2(
+    for (int i = 0; i < n_ao; ++i) {
+        vec2 xi = rtFrameJitter(vec2(
             csmIGN(screen_pixel + vec2(23.0 * float(i) + 3.0,
                                        29.0 * float(i) + 11.0)),
             csmIGN(screen_pixel.yx + vec2(53.0 + 19.0 * float(i),
-                                          2.0 + 41.0 * float(i))));
+                                          2.0 + 41.0 * float(i)))));
         open += hwRtShadowRayVisible(
             ro, rtCosHemisphereDir(world_normal, xi), RT_AO_RADIUS);
     }
-    return open / float(RT_AO_SAMPLES_HW);
+    return open / float(n_ao);
 }
 
 // ─── Hardware 1-bounce GI ray (closest hit vs the cluster TLAS) ──────
@@ -1547,17 +1640,15 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         // Only non-opaque (masked) triangle candidates reach here.
         if (rayQueryGetIntersectionTypeEXT(rq, false) ==
             gl_RayQueryCandidateIntersectionTriangleEXT) {
-            const int prim =
-                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-            const uint mat_id = hw_rt_masked_tri_mat[prim];
-            BindlessMaterialParams m = rt_materials[mat_id];
+            const HwRtTri t = hwRtResolveTri(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+                rayQueryGetIntersectionGeometryIndexEXT(rq, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+            BindlessMaterialParams m = rt_materials[t.mat_id];
 
-            uint i0 = hw_rt_masked_indices[3 * prim + 0];
-            uint i1 = hw_rt_masked_indices[3 * prim + 1];
-            uint i2 = hw_rt_masked_indices[3 * prim + 2];
-            vec2 uv0 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i0].w));
-            vec2 uv1 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i1].w));
-            vec2 uv2 = unpackHalf2x16(floatBitsToUint(rt_pos_uv[i2].w));
+            vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
+            vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
+            vec2 uv2 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i2).w));
             vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
             vec2 huv = uv0 * (1.0 - bary.x - bary.y)
                      + uv1 * bary.x + uv2 * bary.y;
@@ -1595,7 +1686,7 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
     // characters entirely (they're not in its BVH); here the hardware
     // walk finds them anyway, so shade a neutral matte bounce instead of
     // reading cluster streams the skeleton BLAS has no entries in.
-    if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) != 0) {
+    if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) == 1) {
         vec3 amb;
         if (giSecondBounce(hp, -rd, amb)) {
             amb *= RT_GI_BOUNCE_GAIN;
@@ -1610,23 +1701,24 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         return vec3(0.35) * amb;
     }
 
-    const int  geom = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
-    const int  prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-    const bool masked = (geom != 0);
+    const HwRtTri t = hwRtResolveTri(
+        rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true),
+        rayQueryGetIntersectionGeometryIndexEXT(rq, true),
+        rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+    BindlessMaterialParams m = rt_materials[t.mat_id];
 
-    uint i0 = masked ? hw_rt_masked_indices[3 * prim + 0]
-                     : hw_rt_opaque_indices[3 * prim + 0];
-    uint i1 = masked ? hw_rt_masked_indices[3 * prim + 1]
-                     : hw_rt_opaque_indices[3 * prim + 1];
-    uint i2 = masked ? hw_rt_masked_indices[3 * prim + 2]
-                     : hw_rt_opaque_indices[3 * prim + 2];
-    const uint mat_id = masked ? hw_rt_masked_tri_mat[prim]
-                               : hw_rt_opaque_tri_mat[prim];
-    BindlessMaterialParams m = rt_materials[mat_id];
-
-    vec4 p0 = rt_pos_uv[i0];
-    vec4 p1 = rt_pos_uv[i1];
-    vec4 p2 = rt_pos_uv[i2];
+    vec4 p0 = hwRtVertex(t.per_mesh, t.i0);
+    vec4 p1 = hwRtVertex(t.per_mesh, t.i1);
+    vec4 p2 = hwRtVertex(t.per_mesh, t.i2);
+    if (t.per_mesh) {
+        // Per-mesh pools are OBJECT space: bring the triangle into the
+        // world through the instance transform (positions only — the
+        // packed UV in .w is untouched).
+        const mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        p0.xyz = o2w * vec4(p0.xyz, 1.0);
+        p1.xyz = o2w * vec4(p1.xyz, 1.0);
+        p2.xyz = o2w * vec4(p2.xyz, 1.0);
+    }
 
     vec4 texel = vec4(1.0);
     if (m.base_color_tex_idx >= 0) {
@@ -2474,7 +2566,8 @@ void main() {
         {
             vec3 gcol;
             if (glassWaterOverlay(uv, px, -1.0, gcol)) {
-                imageStore(hdr_out, px, vec4(sceneTonemap(gcol), 1.0));
+                imageStore(hdr_out, px, vec4(sceneTonemapExposed(gcol,
+                    sceneExposureScaleOf(camera_info.exposure_scale)), 1.0));
             }
         }
         return;
@@ -2505,7 +2598,8 @@ void main() {
                               (camera_info.depth_params.x + z);
             vec3 gcol;
             if (glassWaterOverlay(uv, px, fwd_lin_z * 1.02, gcol)) {
-                imageStore(hdr_out, px, vec4(sceneTonemap(gcol), 1.0));
+                imageStore(hdr_out, px, vec4(sceneTonemapExposed(gcol,
+                    sceneExposureScaleOf(camera_info.exposure_scale)), 1.0));
             }
         }
         return;
@@ -2853,7 +2947,8 @@ void main() {
             (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
                 >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
         if (dbg_gi == DEBUG_RENDER_MODE_INDIRECT && rpc.pass_mode != 1u) {
-            imageStore(hdr_out, px, vec4(sceneTonemap(gi_debug_E), 1.0));
+            imageStore(hdr_out, px, vec4(sceneTonemapExposed(gi_debug_E,
+                sceneExposureScaleOf(camera_info.exposure_scale)), 1.0));
             return;
         }
     }
@@ -3002,9 +3097,11 @@ void main() {
         vec3 gcol;
         if (rpc.pass_mode != 1u &&
             glassWaterOverlay(uv, px, opq_lin_z, gcol)) {
-            imageStore(hdr_out, px, vec4(sceneTonemap(gcol), 1.0));
+            imageStore(hdr_out, px, vec4(sceneTonemapExposed(gcol,
+                sceneExposureScaleOf(camera_info.exposure_scale)), 1.0));
         } else {
-            imageStore(hdr_out, px, vec4(sceneTonemap(color), 1.0));
+            imageStore(hdr_out, px, vec4(sceneTonemapExposed(color,
+                sceneExposureScaleOf(camera_info.exposure_scale)), 1.0));
         }
     } else {
         imageStore(hdr_out, px, vec4(linearTosRGB(color), 1.0));

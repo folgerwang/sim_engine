@@ -86,5 +86,6 @@ void main() {
     // 22).  This used to be written RAW to the LDR target — no tonemap, no
     // sRGB — so most of the sky clipped to flat white.  Same shared curve
     // as every other final-colour writer.
-    outColor = vec4(sceneTonemap(color/*textureLod(skybox_tex, view_dir, 0).xyz*/), 1.0);
+    outColor = vec4(sceneTonemapExposed(color,
+        sceneExposureScaleOf(camera_info.exposure_scale)), 1.0);
 }

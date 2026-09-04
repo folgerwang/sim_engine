@@ -43,6 +43,14 @@
 #define SKIN_PARAMS_SET             (PBR_MATERIAL_PARAMS_SET + 1)
 #define RUNTIME_LIGHTS_PARAMS_SET   (SKIN_PARAMS_SET + 1)
 #define MAX_NUM_PARAMS_SETS         (RUNTIME_LIGHTS_PARAMS_SET + 1)
+// GPU node-table draw path (drawable_object.cpp, DrawableObject::
+// drawNodeTable): one extra set on the drawable pipeline layout, bound
+// only by the _NT vertex-shader permutations.  Sits AFTER every
+// classic set so the classic pipelines and their bind lists are
+// unaffected.
+#define NODE_TABLE_PARAMS_SET       MAX_NUM_PARAMS_SETS
+#define NODE_TABLE_PARAMS_BINDING   0   // ModelParams per LOD-survivor record
+#define NODE_TABLE_SLOTS_BINDING    1   // record index per bucket slot
 
 #define RUNTIME_LIGHTS_CONSTANT_INDEX     0
 
@@ -165,6 +173,19 @@
 // 0 = the old behaviour: tile_flow_update redistributes water and the
 // surface height drifts over time.
 #define WATER_SURFACE_STATIC                    1
+// 1 = the SOIL layer is static too.  tile_flow_update's erosion moved
+// soil downhill at up to ~2 mm per FRAME per 4 m texel (0.1 m/s at 60
+// fps, bounded only by the 5 m seed), so the rendered ground -- rock +
+// soil -- kept sinking on every slope and rising in every hollow for
+// minutes after load.  Nothing else in the engine tracks that drift:
+// the PCG placed trees, houses, ground clutter and decals against the
+// authored height + kSoilInitLevel (the tile_creator seed), the camera
+// snap and the RT caster bake assume the same, and only the procedural
+// grass (which samples the live layer) followed the ground.  That is
+// the "grass / clutter flying in the air, then slowly landing" report:
+// the meshes never moved, the ground did.  With this on the ground is
+// exactly detail height + kSoilInitLevel, forever.
+#define SOIL_LAYER_STATIC                       1
 
 // Standing-water SURFACE height map (tile creator set only): the
 // rivers step's basin fill (<heightmap stem>_hydro_pondz.png, u16 =
@@ -789,6 +810,14 @@ struct ViewParams {
 // base.frag additionally requires FEATURE_INPUT_DEFERRED_RELIGHT, so a
 // stale bit in a pass that does not relight is inert.
 #define MODEL_FLAG_DEFERRED_RELIGHT 0x10u
+// bit 5: this draw comes from the GPU node-table path (drawIndexed-
+// IndirectCount over a compute-culled bucket).  The VERTEX shader then
+// takes its per-node ModelParams from the node table instead of the
+// push constant (which only carries the per-drawable / per-pass
+// fields), and the FRAGMENT shader takes the LOD dissolve weight from
+// the vertex_ilod_fade varying and the interior flag from
+// vertex_node_flags — see base.vert / base.frag.
+#define MODEL_FLAG_NODE_TABLE       0x20u
 
 struct ModelParams {
     mat4 model_mat;
@@ -1682,6 +1711,12 @@ struct ObjectVsPsData {
     // additionally means "instance entirely outside its band" and
     // base.frag drops the fragment whole.
     float vertex_ilod_fade;
+    // Per-node flags forwarded by the node-table vertex permutation
+    // (MODEL_FLAG_NODE_TABLE): 1.0 when the node is interior geometry
+    // (base.frag scales the IBL ambient), 0.0 otherwise.  Always 0.0 on
+    // the classic push-constant path, where the interior bit travels in
+    // model_params.flip_uv_coord.
+    float vertex_node_flags;
 #ifdef HAS_NORMALS
     vec3 vertex_normal;
 #ifdef HAS_TANGENT
@@ -1851,6 +1886,13 @@ struct ViewCameraInfo {
     // packed full — and the camera UBO is the one buffer every vertex
     // shader in the engine already binds.
     float           time_s;
+    // Physical-camera exposure, relative to the engine's calibrated look
+    // (kSceneExposure): 2^(EV100(default lens) - EV100(current lens)),
+    // from the menu's shutter / f-stop / ISO.  Trailing scalar again.
+    // 0 (a camera whose update path never sets it, e.g. the GPU compute
+    // update) means "no scaling" — every reader goes through
+    // sceneExposureScaleOf(), which maps <= 0 to 1.
+    float           exposure_scale;
 };
 
 struct RuntimeLightsParams {
@@ -1892,6 +1934,87 @@ struct RtBvhNode {
     uint    left_first;
     vec3    aabb_max;
     uint    prim_count;
+};
+
+// ── GPU node-table draw path (node_table_cull.comp) ──────────────────────
+// One entry per LOD-SURVIVOR RECORD of a placed drawable (the CPU's
+// lod_pass_fwd_ / lod_pass_depth_ lists, packed [fwd | depth] and
+// re-uploaded only when those lists change).  A parallel ModelParams
+// table carries the node's push-constant image for the _NT vertex
+// permutation.  sphere is in drawable space (pre instance-world);
+// cmd_ofs_u32 is the node's first indirect command as a uint index into
+// the drawable's indirect_draw_cmd_ buffer (byte offset / 4); prim_first
+// / prim_count locate its mesh's primitives in the drawable-global
+// primitive numbering (the bucket ids).
+#define NT_NODE_PER_INSTANCE_BAND  0x1u   // lod_per_instance_ (skips the prepass)
+#define NT_NODE_FADING             0x2u   // mid cross-fade, |fade| < 0.999
+struct NtCullInfo {
+    vec4    sphere;
+    uint    cmd_ofs_u32;
+    uint    prim_first;
+    uint    prim_count;
+    uint    flags;
+};
+// Per drawable-global primitive: bit 0 = coverable by the deferred
+// G-buffer (opaque, material, no skin), bit 1 = opaque for the depth
+// prepass, bit 2 = Blend (glass pass only).
+#define NT_PRIM_COVERABLE  0x1u
+#define NT_PRIM_OPAQUE     0x2u
+#define NT_PRIM_BLEND      0x4u
+// Cull pass modes (NtCullPushConstants.mode).
+#define NT_MODE_OPAQUE       0u   // G-buffer / shadow / CSM: every node, non-blend prims
+#define NT_MODE_PREPASS      1u   // opaque prims of steady, non per-instance nodes
+#define NT_MODE_FWD_COVERED  2u   // fading / per-instance nodes, or uncoverable prims
+#define NT_MODE_GLASS        3u   // blend prims only
+// 128 bytes — the guaranteed push-constant minimum.  The cull planes are
+// pre-transformed into DRAWABLE space on the host (transpose(inst_world)
+// * plane), so the shader tests the stored sphere directly; only the
+// radius needs the instance-world scale.
+struct NtCullPushConstants {
+    vec4    planes[6];        // cull half-spaces (drawable space), normals inward
+    uint    plane_count;      // 0 = no spatial cull
+    uint    record_first;     // first record of this pass's survivor class
+    uint    record_count;
+    uint    mode;             // NT_MODE_*
+    float   iw_scale;         // world radius = sphere.w * iw_scale
+    uint    pad0;
+    uint    pad1;
+    uint    pad2;
+};
+
+// ── Per-mesh BLAS instanced RT casters (ClusterRenderer::ensureRtMeshSlot)
+// One entry per mesh SLOT.  A TLAS instance whose custom index is >= 2
+// decodes as slot = (custom - 2) >> 1, far = (custom - 2) & 1.  The slot's
+// triangles live in shared object-space pools laid out
+// [opaque tris | masked tris]: the NEAR BLAS variant exposes them as two
+// geometries (0 = opaque, 1 = masked, in that order), the FAR variant as
+// one all-opaque geometry over the whole range, so a hit's pool triangle
+// is   tri = (far || geom == 0) ? prim : opaque_tris + prim.
+// ── Depth of field (dof_resolve.comp) push constants ─────────────────────
+// physical != 0: the circle of confusion comes from the thin-lens
+// formula with the menu's focal length / f-stop / sensor height (the
+// "Camera & Lens" panel) instead of the max_coc_px * |d-f|/d heuristic.
+struct DofPushConstants {
+    uvec2   screen_size;
+    float   focus_dist_m;     // ignored when autofocus != 0
+    float   focus_range_m;    // in-focus deadband around the focus plane
+    float   max_coc_px;       // blur RADIUS ceiling (gather kernel reach)
+    uint    autofocus;        // 1 = focus at the screen-centre depth
+    float   focal_mm;         // lens focal length
+    float   fstop;            // aperture N (f/N)
+    float   sensor_h_mm;      // film / sensor height (24 = full frame)
+    uint    physical;         // 1 = thin-lens CoC, 0 = legacy heuristic
+};
+
+struct RtMeshInfo {
+    uint    vertex_ofs;       // + mesh-local vertex id → rt_mesh_pos_uv[]
+    uint    index_ofs;        // first index of the slot's tri range
+    uint    opaque_tris;
+    uint    masked_tris;
+    uint    mat_ofs;          // per-tri material id base (same tri order)
+    uint    pad0;
+    uint    pad1;
+    uint    pad2;
 };
 
 // ── ReSTIR direct lighting (deferred_resolve.comp) ───────────────────────

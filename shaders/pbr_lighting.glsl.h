@@ -573,7 +573,13 @@ vec3 toneMap(in PbrMaterialParams in_mat, vec3 color)
     // the deferred resolve writes, so they must share its curve or every
     // live-edited / skinned object shades visibly brighter than the
     // clustered world around it.
+#ifdef SCENE_EXPOSURE_SCALE_EXPR
+    // Camera & Lens exposure — the includer declared the camera buffer
+    // and named the expression that reads its scale (base.frag).
+    return sceneTonemapExposed(color, SCENE_EXPOSURE_SCALE_EXPR);
+#else
     return sceneTonemap(color);
+#endif
 }
 
 #ifndef NO_MTL

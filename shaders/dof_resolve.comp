@@ -15,13 +15,10 @@
 // Known v1 limit: an OUT-OF-FOCUS foreground does not bloom over an
 // in-focus background (true scatter); acceptable until proven not.
 
+// See DofPushConstants in global_definition.glsl.h (shared with the app).
 layout(push_constant) uniform DofPushUniforms {
-    uvec2 screen_size;
-    float focus_dist_m;    // ignored when autofocus != 0
-    float focus_range_m;   // in-focus deadband around the focus plane
-    float max_coc_px;      // blur radius ceiling
-    uint  autofocus;       // 1 = focus at screen-centre depth
-} pc;
+    DofPushConstants pc;
+};
 
 layout(set = 0, binding = 0) uniform sampler2D src_color;
 layout(set = 0, binding = 1) uniform sampler2D depth_tex;
@@ -43,11 +40,32 @@ float linearDepth(float z) {
 
 float cocPx(float d, float focus) {
     const float b = abs(d - focus);
-    // Physical-ish: CoC grows with |1 - focus/d|, capped at the ceiling;
-    // the smoothstep deadband keeps a band around the focus plane
+    // The smoothstep deadband keeps a band around the focus plane
     // perfectly sharp so slight autofocus wobble never softens the
     // subject.
     const float k = smoothstep(0.0f, max(pc.focus_range_m, 0.01f), b);
+    if (pc.physical != 0u) {
+        // Thin lens (Camera & Lens panel): the circle of confusion on the
+        // sensor for a point at distance d with the lens focused at S is
+        //   c = (f / N) * f * |d - S| / (d * (S - f))      (f, d, S in mm)
+        // where f/N is the aperture diameter.  Scaled from sensor
+        // millimetres to screen pixels through the sensor HEIGHT (the
+        // vertical FOV is what the focal length sets), halved because
+        // the gather kernel works in radius.  Wide open at f/1.4 on a
+        // long lens this grows fast, so the ceiling still applies — the
+        // 16-tap gather cannot resolve a disc much wider than that.
+        const float f_mm  = max(pc.focal_mm, 1.0f);
+        const float N     = max(pc.fstop, 0.5f);
+        const float d_mm  = max(d, 0.05f) * 1000.0f;
+        const float S_mm  = max(focus * 1000.0f, f_mm + 1.0f);
+        const float c_mm  = (f_mm * f_mm / N) * abs(d_mm - S_mm) /
+                            (d_mm * (S_mm - f_mm));
+        const float px_per_mm = float(pc.screen_size.y) /
+                                max(pc.sensor_h_mm, 1.0f);
+        return min(0.5f * c_mm * px_per_mm, pc.max_coc_px) * k;
+    }
+    // Legacy heuristic: CoC grows with |1 - focus/d|, capped at the
+    // ceiling.
     return min(pc.max_coc_px * b / max(d, 0.05f), pc.max_coc_px) * k;
 }
 

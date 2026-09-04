@@ -2193,6 +2193,22 @@ bool Menu::draw(
                                     turn_off_water_pass_)) {
                     turn_off_water_pass_ = !turn_off_water_pass_;
                 }
+                // Debug view: hide the tiles + grass and paint the water
+                // surface opaque wherever the layer holds ANY column --
+                // the pass's raw output, with nothing to hide it.
+                if (ImGui::MenuItem("Water surface only (debug)", NULL,
+                                    water_surface_only_)) {
+                    water_surface_only_ = !water_surface_only_;
+                }
+                // Magenta = the layer holds a water body here (>= 0.35 m
+                // column), yellow = a thin sheet, untinted = dry.  This
+                // is the runtime water column the pass draws from --
+                // painted-blue ground with no tint has no water in the
+                // engine at all.
+                if (ImGui::MenuItem("Show water column on terrain (debug)", NULL,
+                                    water_column_overlay_)) {
+                    water_column_overlay_ = !water_column_overlay_;
+                }
                 // ── Water blend ─────────────────────────────────────
                 // Lives HERE, beside the pass toggle it explains, not
                 // in the Weather window: these shape how the water
@@ -2338,6 +2354,15 @@ bool Menu::draw(
                                     rt_smoothing_)) {
                     rt_smoothing_ = !rt_smoothing_;
                 }
+                // Temporal accumulation of the traced terms (needs the
+                // smooth pass: it runs inside that chain) and the
+                // per-pixel ray budget it makes affordable.
+                if (ImGui::MenuItem("Temporal RT shadow/AO", NULL,
+                                    rt_temporal_)) {
+                    rt_temporal_ = !rt_temporal_;
+                }
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::SliderInt("RT rays/px", &rt_samples_per_px_, 1, 8);
 
                 // Directional-sun radiance, live.  This is the knob that
                 // decides whether a sunlit surface of ordinary albedo
@@ -2426,6 +2451,40 @@ bool Menu::draw(
                     csm_silhouette_prepass_enabled_ =
                         !csm_silhouette_prepass_enabled_;
                 }
+                // GPU-driven draw lists for the placed world (prepass,
+                // G-buffer, forward, glass and every cascade) — see
+                // DrawableObject::ntBeginPass.  Off = classic per-node
+                // recording, for A/B timing.
+                if (ImGui::MenuItem("GPU node-table draws (placed world)", NULL,
+                                     gpu_node_table_enabled_)) {
+                    gpu_node_table_enabled_ = !gpu_node_table_enabled_;
+                }
+                // Instanced RT casters as TLAS instances over one BLAS
+                // per unique mesh (see updateRtInstancedCasters).  Off =
+                // legacy world-space copy bake with its walk hitch.
+                if (ImGui::MenuItem("Per-mesh RT BLAS (instanced casters)", NULL,
+                                     rt_per_mesh_blas_enabled_)) {
+                    rt_per_mesh_blas_enabled_ = !rt_per_mesh_blas_enabled_;
+                }
+                // How far around the eye instanced casters are kept in
+                // the TLAS.  The window slides with the walk (re-selected
+                // every 32 m), so shadows are guaranteed out to roughly
+                // radius - 32 m in every direction; the budget is spent by
+                // apparent size, so trees and buildings reach the full
+                // radius before small clutter does.  The coverage line
+                // below is measured from the last selection.
+                ImGui::SetNextItemWidth(160.0f);
+                ImGui::SliderFloat("RT caster radius", &rt_caster_radius_m_,
+                                   128.0f, 1024.0f, "%.0f m");
+                if (rt_caster_count_ > 0) {
+                    ImGui::TextDisabled(
+                        "  casters: %u  all kept to %.0f m, large to %.0f m%s",
+                        rt_caster_count_, rt_caster_full_m_,
+                        rt_caster_large_m_,
+                        rt_caster_budget_hit_ ? "  (budget hit)" : "");
+                } else {
+                    ImGui::TextDisabled("  casters: none selected yet");
+                }
 
                 // CSM drawable-shadow draw mode — three mutually-exclusive
                 // picks for how the drawable shadow path amplifies geometry
@@ -2482,8 +2541,80 @@ bool Menu::draw(
                                 show_smart_mesh_window_)) {
                 show_smart_mesh_window_ = !show_smart_mesh_window_;
             }
-            // Render Debug — debug visualisation modes, pipeline toggle,
-            // viewers, glass mode (see drawRenderDebugMenuContent()).
+            if (ImGui::BeginMenu("Camera & Lens")) {
+                // Physical camera — see the cam_* block in menu.h.  The
+                // application pushes the FOV into the main camera and
+                // the exposure scale into the camera UBO every frame;
+                // dof_resolve.comp reads focal length / f-stop / sensor
+                // height through its push constants.
+                ImGui::Checkbox("Physical camera (lens sets FOV, DOF, exposure)",
+                                &cam_physical_);
+                struct SensorPreset { const char* name; float w, h; };
+                static const SensorPreset kSensors[] = {
+                    { "Full frame 36 x 24 mm",   36.0f, 24.0f },
+                    { "APS-C 23.6 x 15.6 mm",    23.6f, 15.6f },
+                    { "Micro 4/3 17.3 x 13 mm",  17.3f, 13.0f },
+                    { "1-inch 13.2 x 8.8 mm",    13.2f,  8.8f },
+                    { "Super 35 24.9 x 18.7 mm", 24.9f, 18.7f },
+                    { "Custom",                   0.0f,  0.0f },
+                };
+                constexpr int kSensorCount = int(sizeof(kSensors) / sizeof(kSensors[0]));
+                if (ImGui::BeginCombo("Film / sensor size",
+                                      kSensors[cam_sensor_preset_].name)) {
+                    for (int i = 0; i < kSensorCount; ++i) {
+                        const bool sel = (i == cam_sensor_preset_);
+                        if (ImGui::Selectable(kSensors[i].name, sel)) {
+                            cam_sensor_preset_ = i;
+                            if (kSensors[i].w > 0.0f) {
+                                cam_sensor_w_mm_ = kSensors[i].w;
+                                cam_sensor_h_mm_ = kSensors[i].h;
+                            }
+                        }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                if (kSensors[cam_sensor_preset_].w <= 0.0f) {
+                    ImGui::SliderFloat("Sensor width (mm)", &cam_sensor_w_mm_,
+                                       4.0f, 70.0f, "%.1f");
+                    ImGui::SliderFloat("Sensor height (mm)", &cam_sensor_h_mm_,
+                                       3.0f, 60.0f, "%.1f");
+                }
+                ImGui::SliderFloat("Focal length / zoom (mm)", &cam_focal_mm_,
+                                   8.0f, 400.0f, "%.1f",
+                                   ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Aperture f/", &cam_fstop_, 0.95f, 22.0f,
+                                   "%.1f", ImGuiSliderFlags_Logarithmic);
+                {
+                    const float fov_deg =
+                        2.0f * std::atan(cam_sensor_h_mm_ /
+                                         (2.0f * std::max(cam_focal_mm_, 1.0f))) *
+                        57.2957795f;
+                    ImGui::Text("Vertical FOV %.1f deg  (35 mm-equiv. %.0f mm)",
+                                fov_deg,
+                                cam_focal_mm_ * 24.0f / std::max(cam_sensor_h_mm_, 1.0f));
+                    // Hyperfocal: focus there and everything from half
+                    // that distance to infinity is inside the CoC used
+                    // for the sensor (0.03 mm full-frame scaled by height).
+                    const float coc_mm = 0.03f * cam_sensor_h_mm_ / 24.0f;
+                    const float hyper_m =
+                        (cam_focal_mm_ * cam_focal_mm_ /
+                         (std::max(cam_fstop_, 0.5f) * coc_mm) + cam_focal_mm_) * 0.001f;
+                    ImGui::Text("Hyperfocal %.1f m at f/%.1f", hyper_m, cam_fstop_);
+                }
+                ImGui::Separator();
+                ImGui::Checkbox("Exposure from shutter / aperture / ISO",
+                                &cam_exposure_on_);
+                ImGui::SliderFloat("Shutter 1/x s", &cam_shutter_inv_, 1.0f, 8000.0f,
+                                   "%.0f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("ISO", &cam_iso_, 25.0f, 25600.0f, "%.0f",
+                                   ImGuiSliderFlags_Logarithmic);
+                ImGui::Text("EV100 %.1f  ->  exposure x%.2f (default f/5.6, 1/125 s, ISO 100)",
+                            camEv100(cam_fstop_, cam_shutter_inv_, cam_iso_),
+                            getCamExposureScale());
+                ImGui::TextDisabled("Depth of field: focus distance / autofocus / blur ceiling are under Post Processing");
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Post Processing")) {
                 // TAA — see application initTaa / taa_resolve.comp.
                 // Live toggle: unchecking zeroes the projection jitter
@@ -2507,9 +2638,14 @@ bool Menu::draw(
                                        &dof_focus_range_m_, 0.5f, 50.0f);
                     ImGui::SliderFloat("DOF max blur (px)",
                                        &dof_max_coc_px_, 1.0f, 24.0f);
+                    if (cam_physical_) {
+                        ImGui::TextDisabled("Blur amount comes from the lens (Camera & Lens: focal length, f/, sensor)");
+                    }
                 }
                 ImGui::EndMenu();
             }
+            // Render Debug — debug visualisation modes, pipeline toggle,
+            // viewers, glass mode (see drawRenderDebugMenuContent()).
             if (ImGui::BeginMenu("Render Debug")) {
                 drawRenderDebugMenuContent();
                 ImGui::EndMenu();

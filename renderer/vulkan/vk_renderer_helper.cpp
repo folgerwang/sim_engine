@@ -2213,6 +2213,11 @@ std::shared_ptr<renderer::Device> createLogicalDevice(
     // through a single execution thread per primitive group.  See
     // cluster_bindless_shadow.vert for the consumer side.
     enabled_vulkan11_features.multiview                           = VK_TRUE;
+    // shaderDrawParameters: gl_DrawIDARB in the GPU node-table vertex
+    // permutations (base_vert*_NT — one drawIndexedIndirectCount per
+    // primitive bucket, the draw index selects the node's ModelParams).
+    // Core in Vulkan 1.1 and universally supported on desktop.
+    enabled_vulkan11_features.shaderDrawParameters                = VK_TRUE;
     enabled_vulkan11_features.pNext = &enabled_mesh_shader_features;
 
     // Vulkan 1.2: enable non-uniform indexing of sampler arrays.

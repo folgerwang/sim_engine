@@ -1,11 +1,52 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
+#ifdef GPU_NODE_TABLE
+#extension GL_ARB_shader_draw_parameters : require
+#endif
 #include "global_definition.glsl.h"
 #include "veg_sway.glsl.h"
 
+#ifdef GPU_NODE_TABLE
+// ── GPU node-table permutation (MODEL_FLAG_NODE_TABLE) ───────────────
+// The push constant only carries the per-drawable / per-pass fields;
+// the per-node ModelParams (model matrix, interior / per-instance-band
+// bits, LOD dissolve weight) come from the record table, addressed by
+// gl_DrawIDARB: node_table_cull.comp wrote one indirect command per
+// surviving node into this primitive's bucket, and slots[bucket_base +
+// draw_id] names the record that command belongs to.  The bucket base
+// slot travels in pc_params.lod_fade (as uint bits).
+layout(push_constant) uniform ModelUniformBufferObject {
+    ModelParams pc_params;
+};
+layout(std430, set = NODE_TABLE_PARAMS_SET, binding = NODE_TABLE_PARAMS_BINDING) readonly buffer NodeParamsBuf {
+    ModelParams node_params[];
+};
+layout(std430, set = NODE_TABLE_PARAMS_SET, binding = NODE_TABLE_SLOTS_BINDING) readonly buffer NodeSlotBuf {
+    uint node_slots[];
+};
+ModelParams model_params;
+void ntLoadModelParams() {
+    const uint slot = floatBitsToUint(pc_params.lod_fade) + uint(gl_DrawIDARB);
+    model_params = node_params[node_slots[slot]];
+    // Per-drawable / per-pass fields always come from the push constant;
+    // the record keeps the node's own bits (flips, interior) and its
+    // dissolve weight (0 = steady; per-instance bands carry theirs in
+    // model_params_pad0 and a 0 here, exactly as drawNodeMesh stages).
+    model_params.flip_uv_coord |=
+        (pc_params.flip_uv_coord &
+         (MODEL_FLAG_VEGETATION_SWAY | MODEL_FLAG_DEFERRED_RELIGHT |
+          MODEL_FLAG_NODE_TABLE));
+    model_params.cascade_idx = pc_params.cascade_idx;
+    model_params.debug_force_red = pc_params.debug_force_red;
+    model_params.debug_skip_skinning = pc_params.debug_skip_skinning;
+    model_params.clutter_fade_start_m = pc_params.clutter_fade_start_m;
+    model_params.clutter_fade_end_m = pc_params.clutter_fade_end_m;
+}
+#else
 layout(push_constant) uniform ModelUniformBufferObject {
     ModelParams model_params;
 };
+#endif
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	ViewCameraInfo camera_info;
@@ -131,6 +172,9 @@ vec3 getTangent()
 #endif
 
 void main() {
+#ifdef GPU_NODE_TABLE
+    ntLoadModelParams();
+#endif
 	// Calculate skinned matrix from weights and joint indices of the current vertex
     mat4 matrix_ls = model_params.model_mat;
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
@@ -215,6 +259,17 @@ void main() {
     // screen-door halves partition every pixel: clumps swap band by
     // their own camera distance, not by 256 m tile.
     out_data.vertex_ilod_fade = 1.0;
+    out_data.vertex_node_flags = 0.0;
+#ifdef GPU_NODE_TABLE
+    // Node-table path: the fragment shader cannot read the per-node
+    // dissolve weight from the push constant, so it travels in the
+    // varying (1.0 = steady, same signed convention otherwise).  The
+    // per-instance block below overrides it for dense ground cover.
+    out_data.vertex_ilod_fade =
+        (model_params.lod_fade == 0.0) ? 1.0 : model_params.lod_fade;
+    out_data.vertex_node_flags =
+        ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u) ? 1.0 : 0.0;
+#endif
     {
         uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
         if (ilod_bits != 0u) {

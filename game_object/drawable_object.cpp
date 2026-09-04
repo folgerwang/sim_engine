@@ -112,6 +112,10 @@ static bool      s_forward_covered_skip_active = false;
 // same LOD for the same tile within a frame.
 static bool      s_plant_lod_eye_valid = false;
 static glm::vec3 s_plant_lod_eye_ws = glm::vec3(0.0f);
+// Set while a GPU node-table (_NT) pipeline is being built: the shader
+// module loaders then append "_NT" to the VERTEX shader name, selecting
+// the GPU_NODE_TABLE permutation (see getDrawableShaderModules).
+static bool      s_shader_nt_variant = false;
 
 // Box-downscale a baked .rwtex RGBA8 preview for the forward-path
 // stopgap image (see the "Forward-path preview image" blocks below).
@@ -3166,6 +3170,9 @@ static void selectPlantLodBands(
         // from the visibility tables is stale even if the eye did not
         // move (see lod_tables_version_).
         ++drawable_object->lod_tables_version_;
+        drawable_object->lod_soa_valid_ = false;   // band edges / gates moved
+        // Force the recompute below even if the eye memo matches.
+        drawable_object->lod_eye_valid_ = !s_plant_lod_eye_valid;
     }
 
     if (!drawable_object->has_plant_lod_) {
@@ -3198,52 +3205,97 @@ static void selectPlantLodBands(
         owner.assign(drawable_object->nodes_.size(), uint8_t(1));
     }
 
+    // ── SoA scan (see DrawableData::lod_soa_) ────────────────────────
+    // The per-node test below reads six floats and a couple of flags,
+    // but NodeInfo is ~300 bytes (name, child list, two mat4s), so the
+    // old loop streamed ~5 cache lines per node — ~400 MB per recompute
+    // on a 1.37M-node world, 10–15 ms every 2 m of travel.  The compact
+    // table is built once (and refreshed on an instance-world change,
+    // which is the only time the rects move) so the recompute streams
+    // 40 B per node instead.
+    auto& soa = drawable_object->lod_soa_;
+    const size_t node_n = drawable_object->nodes_.size();
+    if (!drawable_object->lod_soa_valid_ || soa.size() != node_n ||
+        rebuild_rects) {
+        soa.resize(node_n);
+        for (size_t i = 0; i < node_n; ++i) {
+            auto& node = drawable_object->nodes_[i];
+            ego::DrawableData::LodSoa& e = soa[i];
+            uint8_t flags = 0;
+            if (node.lod_tile_m_ > 0.0f) {
+                flags |= ego::DrawableData::kLodSoaIsLod;
+                if (rebuild_rects || !drawable_object->lod_soa_valid_) {
+                    // The rectangle through the node's full world
+                    // transform.  All four corners, then the XZ extent
+                    // of the result: for the identity and translation
+                    // cases (which is what the tree GLB actually uses)
+                    // this is exact, and for a rotated wrapper it is the
+                    // rect's axis-aligned hull, which can only make the
+                    // measured distance SMALLER — i.e. err toward more
+                    // detail, never toward a hole.
+                    const glm::mat4 m = instance_world * node.cached_matrix_;
+                    const float x0 = node.lod_lx0_;
+                    const float z0 = node.lod_lz0_;
+                    const float x1 = x0 + node.lod_tile_m_;
+                    const float z1 = z0 + node.lod_tile_m_;
+                    const glm::vec3 c[4] = {
+                        glm::vec3(m * glm::vec4(x0, 0.0f, z0, 1.0f)),
+                        glm::vec3(m * glm::vec4(x1, 0.0f, z0, 1.0f)),
+                        glm::vec3(m * glm::vec4(x0, 0.0f, z1, 1.0f)),
+                        glm::vec3(m * glm::vec4(x1, 0.0f, z1, 1.0f)),
+                    };
+                    node.lod_wx0_ = glm::min(glm::min(c[0].x, c[1].x),
+                                             glm::min(c[2].x, c[3].x));
+                    node.lod_wx1_ = glm::max(glm::max(c[0].x, c[1].x),
+                                             glm::max(c[2].x, c[3].x));
+                    node.lod_wz0_ = glm::min(glm::min(c[0].z, c[1].z),
+                                             glm::min(c[2].z, c[3].z));
+                    node.lod_wz1_ = glm::max(glm::max(c[0].z, c[1].z),
+                                             glm::max(c[2].z, c[3].z));
+                }
+            }
+            if (node.lod_per_instance_) flags |= ego::DrawableData::kLodSoaPerInstance;
+            if (node.gate_r_ > 0.0f)    flags |= ego::DrawableData::kLodSoaHasGate;
+            if (node.gate_mode_ != 0)   flags |= ego::DrawableData::kLodSoaGateModeInside;
+            e.wx0 = node.lod_wx0_;
+            e.wx1 = node.lod_wx1_;
+            e.wz0 = node.lod_wz0_;
+            e.wz1 = node.lod_wz1_;
+            e.near_m = node.lod_near_m_;
+            e.far_m  = node.lod_far_m_;
+            e.gate_x = node.gate_x_;
+            e.gate_z = node.gate_z_;
+            e.gate_r = node.gate_r_;
+            e.flags  = flags;
+        }
+        drawable_object->lod_soa_valid_ = true;
+    }
+
+    const float far_max = drawable_object->lod_far_max_;
     uint32_t drawn = 0;
-    for (size_t i = 0; i < drawable_object->nodes_.size(); ++i) {
-        auto& node = drawable_object->nodes_[i];
-        if (node.lod_tile_m_ <= 0.0f) {
+    // Far-band visibility census (one line every ~10 s, see the
+    // original note: how many far-band nodes pass the exact test).
+    static uint64_t s_census_calls = 0;
+    static uint32_t s_far_pass = 0, s_far_total = 0;
+    for (size_t i = 0; i < node_n; ++i) {
+        const ego::DrawableData::LodSoa& e = soa[i];
+        const bool has_gate = (e.flags & ego::DrawableData::kLodSoaHasGate) != 0;
+        const bool gate_inside_mode =
+            (e.flags & ego::DrawableData::kLodSoaGateModeInside) != 0;
+        if ((e.flags & ego::DrawableData::kLodSoaIsLod) == 0) {
             uint8_t v = 1;                  // not a LOD node
-            if (node.gate_r_ > 0.0f && eye_valid) {
-                const float gdx = eye.x - node.gate_x_;
-                const float gdz = eye.z - node.gate_z_;
+            if (has_gate && eye_valid) {
+                const float gdx = eye.x - e.gate_x;
+                const float gdz = eye.z - e.gate_z;
                 const bool inside =
-                    gdx * gdx + gdz * gdz <=
-                    node.gate_r_ * node.gate_r_;
-                if (node.gate_mode_ == 0 ? !inside : inside) v = 0;
+                    gdx * gdx + gdz * gdz <= e.gate_r * e.gate_r;
+                if (!gate_inside_mode ? !inside : inside) v = 0;
             }
             vis[i] = v;
             fade[i] = 1.0f;
             owner[i] = v;
             drawn += v;
             continue;
-        }
-        if (rebuild_rects) {
-            // The rectangle through the node's full world transform.  All
-            // four corners, then the XZ extent of the result: for the
-            // identity and translation cases (which is what the tree GLB
-            // actually uses) this is exact, and for a rotated wrapper it
-            // is the rect's axis-aligned hull, which can only make the
-            // measured distance SMALLER — i.e. err toward more detail,
-            // never toward a hole.
-            const glm::mat4 m = instance_world * node.cached_matrix_;
-            const float x0 = node.lod_lx0_;
-            const float z0 = node.lod_lz0_;
-            const float x1 = x0 + node.lod_tile_m_;
-            const float z1 = z0 + node.lod_tile_m_;
-            const glm::vec3 c[4] = {
-                glm::vec3(m * glm::vec4(x0, 0.0f, z0, 1.0f)),
-                glm::vec3(m * glm::vec4(x1, 0.0f, z0, 1.0f)),
-                glm::vec3(m * glm::vec4(x0, 0.0f, z1, 1.0f)),
-                glm::vec3(m * glm::vec4(x1, 0.0f, z1, 1.0f)),
-            };
-            node.lod_wx0_ = glm::min(glm::min(c[0].x, c[1].x),
-                                     glm::min(c[2].x, c[3].x));
-            node.lod_wx1_ = glm::max(glm::max(c[0].x, c[1].x),
-                                     glm::max(c[2].x, c[3].x));
-            node.lod_wz0_ = glm::min(glm::min(c[0].z, c[1].z),
-                                     glm::min(c[2].z, c[3].z));
-            node.lod_wz1_ = glm::max(glm::max(c[0].z, c[1].z),
-                                     glm::max(c[2].z, c[3].z));
         }
 
         if (!eye_valid) {
@@ -3254,8 +3306,7 @@ static void selectPlantLodBands(
             // and at four triangles a tree it cannot stall the frame the
             // way selecting the near LOD for the whole map would.  The
             // next frame has an eye and corrects itself.
-            vis[i] = (node.lod_far_m_ >= drawable_object->lod_far_max_)
-                     ? uint8_t(1) : uint8_t(0);
+            vis[i] = (e.far_m >= far_max) ? uint8_t(1) : uint8_t(0);
             fade[i] = 1.0f;
             owner[i] = vis[i];
             drawn += vis[i];
@@ -3268,13 +3319,13 @@ static void selectPlantLodBands(
         // meshes for cards because of that reads as the forest below
         // you dissolving when you climb.  Ground distance is what the
         // eye judges tree detail by.
-        const float dx = glm::max(glm::max(node.lod_wx0_ - eye.x, 0.0f),
-                                  eye.x - node.lod_wx1_);
-        const float dz = glm::max(glm::max(node.lod_wz0_ - eye.z, 0.0f),
-                                  eye.z - node.lod_wz1_);
+        const float dx = glm::max(glm::max(e.wx0 - eye.x, 0.0f),
+                                  eye.x - e.wx1);
+        const float dz = glm::max(glm::max(e.wz0 - eye.z, 0.0f),
+                                  eye.z - e.wz1);
         const float d = glm::sqrt(dx * dx + dz * dz);
 
-        if (node.lod_per_instance_) {
+        if ((e.flags & ego::DrawableData::kLodSoaPerInstance) != 0) {
             // Per-instance banding: the vertex shader resolves the band
             // per clump (see lod_per_instance_), so the node level only
             // CONSERVATIVELY culls tiles that cannot hold a live
@@ -3282,18 +3333,16 @@ static void selectPlantLodBands(
             // farthest corner still short of near-fade.  fade stays 1
             // (the dissolve is per instance) and owner mirrors vis (the
             // depth passes hard-pick per instance in the shader).
-            const float k_out_ci =
-                glm::clamp(node.lod_far_m_ * 0.05f, 2.0f, 24.0f);
-            const float k_in_ci =
-                glm::clamp(node.lod_near_m_ * 0.05f, 2.0f, 24.0f);
-            const float dxm = glm::max(glm::abs(eye.x - node.lod_wx0_),
-                                       glm::abs(eye.x - node.lod_wx1_));
-            const float dzm = glm::max(glm::abs(eye.z - node.lod_wz0_),
-                                       glm::abs(eye.z - node.lod_wz1_));
+            const float k_out_ci = glm::clamp(e.far_m * 0.05f, 2.0f, 24.0f);
+            const float k_in_ci  = glm::clamp(e.near_m * 0.05f, 2.0f, 24.0f);
+            const float dxm = glm::max(glm::abs(eye.x - e.wx0),
+                                       glm::abs(eye.x - e.wx1));
+            const float dzm = glm::max(glm::abs(eye.z - e.wz0),
+                                       glm::abs(eye.z - e.wz1));
             const float d_max = glm::sqrt(dxm * dxm + dzm * dzm);
             const uint8_t v_ci =
-                (d < node.lod_far_m_ + k_out_ci &&
-                 d_max >= node.lod_near_m_ - k_in_ci) ? 1 : 0;
+                (d < e.far_m + k_out_ci && d_max >= e.near_m - k_in_ci)
+                    ? 1 : 0;
             vis[i] = v_ci;
             fade[i] = 1.0f;
             owner[i] = v_ci;
@@ -3302,66 +3351,33 @@ static void selectPlantLodBands(
         }
 
         // ── Band selection with a CROSS-FADE transition ──────────────
-        // The old test was a hard `d in [near, far)`: the instant the
-        // eye crossed a boundary an entire 128 m tile swapped one mesh
-        // set for another, and because the bands differ a lot in
-        // character (full trees vs cards, dense grass vs none) the swap
-        // read as a square patch of the world changing in one frame —
-        // the tile-shaped LOD pop.  Now each boundary gets a transition
-        // zone of half-width kLodFadeM in which BOTH neighbouring bands
-        // are drawn, dissolving into each other with complementary
-        // screen-door thresholds (see DrawableData::lod_node_fade_), so
-        // the swap happens per-pixel over several metres of travel
-        // instead of per-tile in one frame.
-        //
-        // The half-width is anchored to the EDGE DISTANCE, not the
-        // band's own width.  The two bands meeting at one boundary have
-        // different widths (ext 220 m wide hands off to a 2380 m far
-        // band), so a width-derived zone gave each side a different
-        // half-width and the complementary dither halves stopped being
-        // complements: pixels discarded by BOTH sides opened dithered
-        // holes on one flank of the boundary and double-drew on the
-        // other.  Anchoring on the edge value makes the fade-out side
-        // (far edge D) and the fade-in side (near edge D) of the SAME
-        // boundary derive the SAME half-width, restoring the exact
-        // pixel partition — and scales the zone with distance, which
-        // is roughly constant angular width to the eye.
-        const float k_fade_out =
-            glm::clamp(node.lod_far_m_ * 0.05f, 2.0f, 24.0f);
-        const float k_fade_in =
-            glm::clamp(node.lod_near_m_ * 0.05f, 2.0f, 24.0f);
-
-        // Fade IN across the near edge, OUT across the far edge.  The
-        // outermost band has no neighbour beyond it, so it holds solid
-        // to its far edge rather than dissolving into nothing; likewise
-        // the innermost band (near == 0) has no inner neighbour.
-        const bool has_inner = node.lod_near_m_ > 0.01f;
-        const bool has_outer =
-            node.lod_far_m_ < drawable_object->lod_far_max_ - 0.01f;
+        // Each boundary gets a transition zone (half-width anchored to
+        // the EDGE distance so both sides of one boundary derive the
+        // same half-width and the complementary dither halves stay
+        // complements) in which both neighbouring bands are drawn,
+        // dissolving with complementary screen-door thresholds — see
+        // DrawableData::lod_node_fade_ and the original notes.
+        const float k_fade_out = glm::clamp(e.far_m * 0.05f, 2.0f, 24.0f);
+        const float k_fade_in  = glm::clamp(e.near_m * 0.05f, 2.0f, 24.0f);
+        const bool has_inner = e.near_m > 0.01f;
+        const bool has_outer = e.far_m < far_max - 0.01f;
 
         float w_out = 1.0f;      // 1 inside, ramps to 0 past the far edge
         if (has_outer) {
-            w_out = glm::clamp(
-                (node.lod_far_m_ + k_fade_out - d) /
-                    (2.0f * k_fade_out),
-                0.0f, 1.0f);
+            w_out = glm::clamp((e.far_m + k_fade_out - d) /
+                                   (2.0f * k_fade_out),
+                               0.0f, 1.0f);
         } else {
-            w_out = (d < node.lod_far_m_) ? 1.0f : 0.0f;
+            w_out = (d < e.far_m) ? 1.0f : 0.0f;
         }
         float w_in = 1.0f;       // 1 inside, ramps to 0 before the near edge
         if (has_inner) {
-            w_in = glm::clamp(
-                (d - (node.lod_near_m_ - k_fade_in)) /
-                    (2.0f * k_fade_in),
-                0.0f, 1.0f);
+            w_in = glm::clamp((d - (e.near_m - k_fade_in)) /
+                                  (2.0f * k_fade_in),
+                              0.0f, 1.0f);
         } else {
-            w_in = (d >= node.lod_near_m_ - 1e-3f) ? 1.0f : 0.0f;
+            w_in = (d >= e.near_m - 1e-3f) ? 1.0f : 0.0f;
         }
-
-        // Signed weight: which edge this tile is dissolving across
-        // decides which half of the complementary dither it uses.  A
-        // tile straddling both (a very narrow band) takes the tighter
-        // one; being in only one transition at a time is the norm.
         float w;
         if (w_in < w_out) {
             w = -w_in;           // fading IN across its near edge
@@ -3372,38 +3388,27 @@ static void selectPlantLodBands(
         fade[i] = v ? w : 0.0f;
         // Stable single-owner test for the depth passes (see
         // lod_node_owner_): the pre-cross-fade rule, unchanged.
-        owner[i] = (d >= node.lod_near_m_ && d < node.lod_far_m_)
-                   ? uint8_t(1) : uint8_t(0);
-        // ── Far-band visibility census ─────────────────────────────
-        // The house envelope band (near_m > 0) baked 20k nodes and
-        // 311 _far meshes yet the horizon shows nothing — every layer
-        // of the bake checks out, so the truth has to come from HERE:
-        // how many far-band nodes pass this exact test each frame.
-        // One line every ~10 s; delete once the pop-in is solved.
-        {
-            static uint64_t s_calls = 0;
-            static uint32_t s_far_pass = 0, s_far_total = 0;
-            if (node.lod_near_m_ > 0.0f) {
-                ++s_far_total;
-                s_far_pass += v;
-            }
-            if ((++s_calls & 0xFFFFF) == 0 && s_far_total) {
-                std::cout << "[lod] far-band census: " << s_far_pass
-                          << " of " << s_far_total
-                          << " far-band node tests passed since last "
-                             "census (eye "
-                          << (eye_valid ? "valid" : "INVALID") << ")"
-                          << std::endl;
-                s_far_pass = s_far_total = 0;
-            }
+        owner[i] = (d >= e.near_m && d < e.far_m) ? uint8_t(1) : uint8_t(0);
+        if (e.near_m > 0.0f) {
+            ++s_far_total;
+            s_far_pass += v;
+        }
+        if ((++s_census_calls & 0xFFFFF) == 0 && s_far_total) {
+            std::cout << "[lod] far-band census: " << s_far_pass
+                      << " of " << s_far_total
+                      << " far-band node tests passed since last "
+                         "census (eye "
+                      << (eye_valid ? "valid" : "INVALID") << ")"
+                      << std::endl;
+            s_far_pass = s_far_total = 0;
         }
         // Proximity gate applies on top of the LOD test.
-        if (v != 0 && node.gate_r_ > 0.0f) {
-            const float gdx = eye.x - node.gate_x_;
-            const float gdz = eye.z - node.gate_z_;
+        if (v != 0 && has_gate) {
+            const float gdx = eye.x - e.gate_x;
+            const float gdz = eye.z - e.gate_z;
             const bool inside =
-                gdx * gdx + gdz * gdz <= node.gate_r_ * node.gate_r_;
-            if (node.gate_mode_ == 0 ? !inside : inside) v = 0;
+                gdx * gdx + gdz * gdz <= e.gate_r * e.gate_r;
+            if (!gate_inside_mode ? !inside : inside) v = 0;
         }
         vis[i] = v;
         if (v == 0) { fade[i] = 0.0f; owner[i] = 0; }
@@ -5443,7 +5448,12 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
     const std::shared_ptr<renderer::DescriptorSetLayout>& material_desc_set_layout,
-    const std::shared_ptr<renderer::DescriptorSetLayout>& skin_desc_set_layout) {
+    const std::shared_ptr<renderer::DescriptorSetLayout>& skin_desc_set_layout,
+    // GPU node-table set (NODE_TABLE_PARAMS_SET, one past the classic
+    // sets): the _NT vertex permutations read their per-node ModelParams
+    // from it.  Every drawable pipeline shares this layout, so the extra
+    // set is simply left unbound / unused by the classic permutations.
+    const std::shared_ptr<renderer::DescriptorSetLayout>& node_table_desc_set_layout) {
     renderer::PushConstantRange push_const_range{};
     // base.frag reads model_params.debug_force_red (and declares the
     // full ModelParams block to keep layouts identical across stages),
@@ -5458,9 +5468,10 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
     push_const_range.size = sizeof(glsl::ModelParams);
 
     renderer::DescriptorSetLayoutList desc_set_layouts = global_desc_set_layouts;
-    desc_set_layouts.resize(MAX_NUM_PARAMS_SETS);
+    desc_set_layouts.resize(MAX_NUM_PARAMS_SETS + 1);
     desc_set_layouts[PBR_MATERIAL_PARAMS_SET] = material_desc_set_layout;
     desc_set_layouts[SKIN_PARAMS_SET] = skin_desc_set_layout;
+    desc_set_layouts[NODE_TABLE_PARAMS_SET] = node_table_desc_set_layout;
 
     // Fill any remaining null slots with an empty descriptor set layout so that
     // the Vulkan pipeline layout has valid handles at every index.
@@ -5507,6 +5518,12 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     if (has_skin_set_0) {
         // _SKIN8 = both skin sets bound (8-bone debug); _SKIN = set 0 only.
         vert_feature_str += has_skin_set_1 ? "_SKIN8" : "_SKIN";
+    }
+    // GPU node-table permutation (vertex stage only; the fragment
+    // stages are shared with the classic path).  Registered in
+    // CompileShaders.cmake as base_vert<layout>_NT.spv.
+    if (s_shader_nt_variant) {
+        vert_feature_str += "_NT";
     }
     if (has_double_sided) {
         frag_feature_str += "_DS";
@@ -5597,6 +5614,10 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     // no NOMTL).  See shaders-compile.cfg / CompileShaders.cmake.
     if (csm_per_cascade) {
         vert_feature_str += "_CSMCASC";
+    }
+    // GPU node-table permutation — base_depthonly_vert<layout>[_CSMCASC]_NT.
+    if (s_shader_nt_variant) {
+        vert_feature_str += "_NT";
     }
 
     shader_modules[0] =
@@ -7243,6 +7264,19 @@ std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_csm_mesh_shader_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_decal_pipeline_list_;
 std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::drawable_decal_gbuffer_pipeline_list_;
+std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> DrawableObject::nt_pipeline_lists_[DrawableObject::kNtPassCount];
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::node_table_desc_set_layout_;
+std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::nt_cull_desc_set_layout_;
+std::shared_ptr<renderer::PipelineLayout>      DrawableObject::nt_cull_pipeline_layout_;
+std::shared_ptr<renderer::Pipeline>            DrawableObject::nt_cull_pipeline_;
+renderer::PipelineRenderbufferFormats DrawableObject::nt_formats_forward_;
+renderer::PipelineRenderbufferFormats DrawableObject::nt_formats_shadow_;
+renderer::PipelineRenderbufferFormats DrawableObject::nt_formats_depth_only_;
+renderer::GraphicPipelineInfo         DrawableObject::nt_graphic_pipeline_info_;
+bool     DrawableObject::nt_formats_valid_ = false;
+bool     DrawableObject::nt_enabled_ = true;
+uint64_t DrawableObject::nt_frame_serial_ = 0;
+std::shared_ptr<renderer::Device> DrawableObject::nt_device_;
 std::shared_ptr<renderer::DescriptorSetLayout> DrawableObject::mesh_shader_shadow_desc_set_layout_;
 std::shared_ptr<renderer::PipelineLayout>      DrawableObject::mesh_shader_shadow_pipeline_layout_;
 std::unordered_map<std::string, std::shared_ptr<DrawableData>> DrawableObject::drawable_object_list_;
@@ -7302,6 +7336,598 @@ void PrimitiveInfo::generateHash() {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// GPU NODE-TABLE DRAW PATH (DrawableObject::ntBeginPass / ntDraw)
+// ═════════════════════════════════════════════════════════════════════
+// The placed world is ~40k surviving mesh nodes per pass after the LOD
+// band tables have done their work, and every one of them used to cost
+// a ModelParams staging, a push constant and a drawIndexedIndirect —
+// per pass, so the prepass, the G-buffer pass, the forward pass and up
+// to six cascades each re-recorded the same list.  That recording was
+// the CPU frame, and the ~200k tiny draws it produced were most of the
+// GPU frame's command-processor time.
+//
+// This path keeps the CPU's LOD selection (it is cheap and memoised)
+// and moves everything after it to the GPU:
+//   1. When the survivor lists change (the eye moved a couple of
+//      metres), the union of the forward and depth survivors is packed
+//      into a RECORD table — the exact ModelParams drawNodeMesh would
+//      have pushed for the node — plus a cull sphere / command-offset
+//      sidecar (glsl::NtCullInfo), and uploaded to a host-visible
+//      buffer.  Double-buffered by frame parity: frame N-2 is fence-
+//      waited by the time frame N records, so the buffer it read is
+//      free to rewrite.
+//   2. Before each pass, node_table_cull.comp runs over that pass's
+//      class of survivors: sphere-vs-planes cull (camera frustum or the
+//      cascade's swept sun volume), the pass's node filters (prepass
+//      skips dissolving nodes) and primitive filters (blend only in the
+//      glass pass, coverable prims skipped under the deferred cover),
+//      and appends each surviving node's indirect command into a bucket
+//      per PRIMITIVE.
+//   3. draw() issues one vkCmdDrawIndexedIndirectCount per bucket.  The
+//      _NT vertex permutations fetch the node's ModelParams from the
+//      record table through slots[bucket_base + gl_DrawIDARB].
+//
+// Everything here lives on the shared DrawableData (it is a pure
+// function of the node table, the instance world and the eye, like the
+// survivor lists), and the classic per-node path stays intact: a
+// drawable the hook did not prepare, a debug filter, a skinned file, a
+// disabled menu toggle — all simply fall back to it.
+struct NodeTableGpu {
+    // ── Static per drawable-global primitive ("gp") ──────────────────
+    // gp numbering: meshes in order, primitives in mesh order.  Every
+    // bucket, count and flag below is indexed by it.
+    uint32_t              num_gprims = 0;
+    std::vector<uint32_t> mesh_prim_first;    // mesh -> first gp
+    std::vector<uint32_t> gp_mesh;            // gp -> mesh
+    std::vector<uint32_t> gp_local;           // gp -> primitive index in mesh
+    std::vector<uint32_t> gp_flags;           // NT_PRIM_*
+    std::vector<uint32_t> gp_order;           // issue order: opaque, mask, blend
+    renderer::BufferInfo  prim_flags_buf;     // gp_flags, host visible (written once)
+    bool                  tables_built = false;
+    bool                  usable = false;     // node-owned command blocks everywhere
+
+    // ── Survivor records (CPU staging, rebuilt when the lists change) ─
+    // records / infos: one per node of lod_pass_fwd_ ∪ lod_pass_depth_
+    // in ascending flat order.  class_idx: [fwd survivors | depth
+    // survivors], each entry a record index.  prim_bases: per gp, the
+    // bucket's first slot and its capacity = max(fwd refs, depth refs).
+    std::vector<glsl::ModelParams> stage_records;
+    std::vector<glsl::NtCullInfo>  stage_infos;
+    std::vector<uint32_t>          stage_class_idx;
+    std::vector<glm::uvec2>        stage_prim_bases;
+    std::vector<uint32_t>          cnt_fwd;   // per gp: fwd-class references
+    std::vector<uint32_t>          cnt_dep;   // per gp: depth-class references
+    uint32_t  fwd_count = 0;
+    uint32_t  depth_count = 0;
+    uint32_t  record_count = 0;
+    uint32_t  total_slots = 0;
+    uint64_t  staged_version = ~uint64_t(0);  // lod_pass_version_ staged from
+    glm::mat4 staged_iw = glm::mat4(0.0f);    // instance world baked in
+
+    // ── GPU copies, double-buffered by frame parity ───────────────────
+    renderer::BufferInfo records[2];
+    renderer::BufferInfo infos[2];
+    renderer::BufferInfo class_idx[2];
+    renderer::BufferInfo prim_bases[2];
+    uint64_t uploaded_version[2] = { ~uint64_t(0), ~uint64_t(0) };
+    uint32_t record_capacity = 0;             // entries in records[] / infos[]
+    uint32_t class_capacity = 0;              // entries in class_idx[]
+
+    // ── Scratch rebuilt by every cull dispatch ─────────────────────────
+    renderer::BufferInfo cmds;                // slot_capacity × 5 uints
+    renderer::BufferInfo slots;               // slot_capacity × record index
+    renderer::BufferInfo counts;              // num_gprims × uint
+    uint32_t slot_capacity = 0;
+
+    // Descriptor sets per parity, rewritten (on that parity's frame)
+    // whenever any buffer they reference moved.
+    std::shared_ptr<renderer::DescriptorSet> cull_desc_sets[2];
+    std::shared_ptr<renderer::DescriptorSet> vs_desc_sets[2];
+    bool desc_dirty[2] = { true, true };
+
+    // Buffers replaced by larger ones, freed once no in-flight frame can
+    // still reference them (frame serial + 3).
+    std::vector<std::pair<uint64_t, renderer::BufferInfo>> retired;
+
+    // ── What the last ntBeginPass prepared for draw() ─────────────────
+    bool     pass_ready = false;
+    uint32_t pass_parity = 0;
+    uint32_t pass_mode = 0;
+    bool     pass_depth_class = false;
+    int      pass_draw_mode = -1;
+    uint32_t pass_cascade = 0;
+
+    // Diagnostics for the per-second print.
+    uint32_t stat_uploads = 0;
+    uint32_t stat_dispatches = 0;
+    uint32_t stat_draws = 0;
+    uint32_t stat_records = 0;
+    uint32_t stat_grow = 0;
+};
+
+// VS side: the record table + the bucket slot table (NODE_TABLE_PARAMS_SET).
+static std::shared_ptr<renderer::DescriptorSetLayout> createNodeTableDescSetLayout(
+    const std::shared_ptr<renderer::Device>& device) {
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(2);
+    bindings[0] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        NODE_TABLE_PARAMS_BINDING,
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
+    bindings[1] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        NODE_TABLE_SLOTS_BINDING,
+        SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
+    return device->createDescriptorSetLayout(bindings);
+}
+
+// Cull side (node_table_cull.comp set 0): 0 infos, 1 cmd_src, 2 prim_bases,
+// 3 cmd_dst, 4 slots, 5 counts, 6 prim_flags, 7 class_idx.
+static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
+    const std::shared_ptr<renderer::Device>& device) {
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(8);
+    for (uint32_t i = 0; i < 8; ++i) {
+        bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+            i,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            renderer::DescriptorType::STORAGE_BUFFER);
+    }
+    return device->createDescriptorSetLayout(bindings);
+}
+
+static renderer::BufferInfo ntCreateHostBuffer(
+    const std::shared_ptr<renderer::Device>& device,
+    uint64_t size) {
+    renderer::BufferInfo info;
+    renderer::Helper::createBuffer(
+        device,
+        SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+        SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+        0,
+        info.buffer,
+        info.memory,
+        std::source_location::current(),
+        size);
+    return info;
+}
+
+static renderer::BufferInfo ntCreateDeviceBuffer(
+    const std::shared_ptr<renderer::Device>& device,
+    uint64_t size,
+    const renderer::BufferUsageFlags& usage,
+    const void* data = nullptr) {
+    renderer::BufferInfo info;
+    renderer::Helper::createBuffer(
+        device,
+        usage,
+        SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+        0,
+        info.buffer,
+        info.memory,
+        std::source_location::current(),
+        size,
+        data);
+    return info;
+}
+
+// Park a buffer that a still-in-flight frame may reference.
+static void ntRetire(NodeTableGpu& nt, renderer::BufferInfo& info, uint64_t serial) {
+    if (info.buffer) {
+        nt.retired.emplace_back(serial, info);
+    }
+    info = renderer::BufferInfo{};
+}
+
+static void ntExpireRetired(
+    const std::shared_ptr<renderer::Device>& device,
+    NodeTableGpu& nt,
+    uint64_t serial) {
+    for (auto it = nt.retired.begin(); it != nt.retired.end();) {
+        if (it->first + 3 <= serial) {
+            it->second.destroy(device);
+            it = nt.retired.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static void ntReleaseGpu(
+    const std::shared_ptr<renderer::Device>& device,
+    NodeTableGpu& nt) {
+    for (int p = 0; p < 2; ++p) {
+        nt.records[p].destroy(device);
+        nt.infos[p].destroy(device);
+        nt.class_idx[p].destroy(device);
+        nt.prim_bases[p].destroy(device);
+        nt.cull_desc_sets[p].reset();
+        nt.vs_desc_sets[p].reset();
+    }
+    nt.prim_flags_buf.destroy(device);
+    nt.cmds.destroy(device);
+    nt.slots.destroy(device);
+    nt.counts.destroy(device);
+    for (auto& r : nt.retired) {
+        r.second.destroy(device);
+    }
+    nt.retired.clear();
+    nt.record_capacity = 0;
+    nt.class_capacity = 0;
+    nt.slot_capacity = 0;
+    nt.pass_ready = false;
+}
+
+// ── Static tables: gp numbering, primitive flags, issue order ─────────
+static void ntBuildTables(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<ego::DrawableData>& object_,
+    NodeTableGpu& nt) {
+    if (nt.tables_built) return;
+    nt.tables_built = true;
+    nt.usable = false;
+
+    const auto& meshes = object_->meshes_;
+    nt.mesh_prim_first.assign(meshes.size(), 0u);
+    nt.gp_mesh.clear();
+    nt.gp_local.clear();
+    nt.gp_flags.clear();
+    for (size_t mi = 0; mi < meshes.size(); ++mi) {
+        nt.mesh_prim_first[mi] = uint32_t(nt.gp_mesh.size());
+        for (size_t pi = 0; pi < meshes[mi].primitives_.size(); ++pi) {
+            const auto& prim = meshes[mi].primitives_[pi];
+            const bool has_mat =
+                prim.material_idx_ >= 0 &&
+                prim.material_idx_ < int(object_->materials_.size());
+            const bool is_blend =
+                has_mat &&
+                object_->materials_[prim.material_idx_].alpha_mode_ ==
+                    ego::AlphaMode::Blend;
+            const bool opaque = isPrimitiveOpaque(prim, object_->materials_);
+            uint32_t f = 0u;
+            if (is_blend) f |= NT_PRIM_BLEND;
+            if (opaque) f |= NT_PRIM_OPAQUE;
+            // Mirrors drawMesh's covered-prim predicate: opaque,
+            // non-skinned, with a material.
+            if (has_mat && !prim.tag_.has_skin_set_0 && opaque) {
+                f |= NT_PRIM_COVERABLE;
+            }
+            nt.gp_mesh.push_back(uint32_t(mi));
+            nt.gp_local.push_back(uint32_t(pi));
+            nt.gp_flags.push_back(f);
+        }
+    }
+    nt.num_gprims = uint32_t(nt.gp_mesh.size());
+    if (nt.num_gprims == 0u) return;
+
+    // The cull shader copies `node.cmd_ofs + p` for every primitive of
+    // the node's mesh, i.e. it needs the node-owned contiguous command
+    // block (NodeInfo::indirect_cmd_ofs_).  Files that keep their
+    // commands on the primitive stay on the classic path.
+    for (int32_t ni : object_->mesh_node_flat_) {
+        if (ni < 0 || ni >= int32_t(object_->nodes_.size())) return;
+        const auto& node = object_->nodes_[ni];
+        if (node.indirect_cmd_ofs_ < 0 || (node.indirect_cmd_ofs_ % 4) != 0) {
+            return;
+        }
+    }
+
+    // Issue order: opaque, then mask, then blend — the same alpha-mode
+    // ordering drawMesh applies inside a mesh, here across the whole
+    // drawable (buckets are per primitive, not per node).
+    nt.gp_order.resize(nt.num_gprims);
+    for (uint32_t gp = 0; gp < nt.num_gprims; ++gp) nt.gp_order[gp] = gp;
+    auto alpha_bucket = [&](uint32_t gp) -> int {
+        const uint32_t f = nt.gp_flags[gp];
+        if (f & NT_PRIM_BLEND) return 2;
+        if (f & NT_PRIM_OPAQUE) return 0;
+        return 1;
+    };
+    std::stable_sort(nt.gp_order.begin(), nt.gp_order.end(),
+                     [&](uint32_t a, uint32_t b) {
+                         return alpha_bucket(a) < alpha_bucket(b);
+                     });
+
+    // Host-visible on purpose: a device-local fill would go through a
+    // synchronous transient upload in the middle of frame recording.
+    nt.prim_flags_buf = ntCreateHostBuffer(
+        device, uint64_t(nt.num_gprims) * sizeof(uint32_t));
+    device->updateBufferMemory(
+        nt.prim_flags_buf.memory,
+        uint64_t(nt.num_gprims) * sizeof(uint32_t),
+        nt.gp_flags.data());
+    nt.cnt_fwd.assign(nt.num_gprims, 0u);
+    nt.cnt_dep.assign(nt.num_gprims, 0u);
+    nt.usable = true;
+}
+
+// ── Survivor records: pack lod_pass_fwd_ ∪ lod_pass_depth_ ─────────────
+// Both lists are ascending in flat index (rebuildLodSurvivorLists walks
+// the flat list once), so the union is a two-pointer merge.  A record is
+// the ModelParams drawNodeMesh would have pushed for the node on the
+// COLOUR path; the depth pipelines never read lod_fade, and the depth
+// class's cull mode ignores the fading flag, so one record serves both.
+static void ntStageRecords(
+    const std::shared_ptr<ego::DrawableData>& object_,
+    NodeTableGpu& nt) {
+    const glm::mat4 iw = object_->m_current_instance_world_;
+    if (nt.staged_version == object_->lod_pass_version_ &&
+        std::memcmp(&nt.staged_iw, &iw, sizeof(glm::mat4)) == 0) {
+        return;
+    }
+    nt.staged_version = object_->lod_pass_version_;
+    nt.staged_iw = iw;
+    // Every GPU copy is now stale.
+    nt.uploaded_version[0] = ~uint64_t(0);
+    nt.uploaded_version[1] = ~uint64_t(0);
+
+    const auto& fwd = object_->lod_pass_fwd_;
+    const auto& dep = object_->lod_pass_depth_;
+    const size_t flat_n = object_->mesh_node_flat_.size();
+    const size_t sph_n = object_->mesh_node_sphere_.size();
+    const size_t lod_fade_n = object_->lod_node_fade_.size();
+    const float lod_far_max = object_->lod_far_max_;
+    const uint32_t base_flags =
+        (object_->m_flip_u_ ? 0x01u : 0x00u) |
+        (object_->m_flip_v_ ? 0x02u : 0x00u);
+
+    nt.stage_records.clear();
+    nt.stage_infos.clear();
+    nt.stage_class_idx.clear();
+    nt.stage_records.reserve(fwd.size() + dep.size() / 8u + 16u);
+    nt.stage_infos.reserve(fwd.size() + dep.size() / 8u + 16u);
+    nt.stage_class_idx.reserve(fwd.size() + dep.size());
+    std::fill(nt.cnt_fwd.begin(), nt.cnt_fwd.end(), 0u);
+    std::fill(nt.cnt_dep.begin(), nt.cnt_dep.end(), 0u);
+    // class_idx layout: [fwd | depth]; the depth half is appended after
+    // the merge from a scratch list so both halves stay ascending.
+    static thread_local std::vector<uint32_t> s_dep_idx;
+    s_dep_idx.clear();
+    s_dep_idx.reserve(dep.size());
+
+    auto add_record = [&](uint32_t fi, bool in_fwd) -> uint32_t {
+        const int32_t ni = object_->mesh_node_flat_[fi];
+        const auto& node = object_->nodes_[ni];
+        const size_t mesh_idx = size_t(node.mesh_idx_);
+        const bool has_lod = size_t(ni) < lod_fade_n;
+        const float fade_v = has_lod ? object_->lod_node_fade_[ni] : 1.0f;
+        const bool per_inst = has_lod && node.lod_per_instance_ != 0;
+
+        glsl::ModelParams r{};
+        r.model_mat = iw * node.cached_matrix_;
+        r.flip_uv_coord =
+            base_flags | (node.interior_ ? MODEL_FLAG_INTERIOR : 0x00u);
+        r.cascade_idx = 0u;
+        r.debug_force_red = 0u;
+        r.debug_skip_skinning = 0u;
+        r.clutter_fade_start_m = 0.0f;
+        r.clutter_fade_end_m = 0.0f;
+        // Colour-path dissolve weight: ZERO = steady (see drawNodeMesh).
+        // A node only in the depth class carries 0 as well.
+        r.lod_fade =
+            (in_fwd && glm::abs(fade_v) < 0.999f) ? fade_v : 0.0f;
+        uint32_t flags = 0u;
+        if (per_inst) {
+            uint32_t ilod_bits =
+                ((uint32_t(glm::clamp(node.lod_near_m_ * 4.0f,
+                                      0.0f, 32767.0f)) & 0x7FFFu) << 16) |
+                (uint32_t(glm::clamp(node.lod_far_m_ * 4.0f,
+                                     0.0f, 65535.0f)) & 0xFFFFu);
+            if (node.lod_far_m_ < lod_far_max - 0.01f) {
+                ilod_bits |= 0x80000000u;
+            }
+            std::memcpy(&r.model_params_pad0, &ilod_bits, sizeof(ilod_bits));
+            r.lod_fade = 0.0f;
+            flags |= NT_NODE_PER_INSTANCE_BAND;
+        }
+        if (in_fwd && has_lod && glm::abs(fade_v) < 0.999f) {
+            flags |= NT_NODE_FADING;
+        }
+
+        glsl::NtCullInfo ci{};
+        ci.sphere = (size_t(fi) < sph_n)
+            ? object_->mesh_node_sphere_[fi]
+            : glm::vec4(0.0f, 0.0f, 0.0f, 1.0e30f);   // no sphere: never culled
+        ci.cmd_ofs_u32 = uint32_t(node.indirect_cmd_ofs_) / 4u;
+        ci.prim_first = nt.mesh_prim_first[mesh_idx];
+        ci.prim_count = uint32_t(object_->meshes_[mesh_idx].primitives_.size());
+        ci.flags = flags;
+
+        nt.stage_records.push_back(r);
+        nt.stage_infos.push_back(ci);
+        return uint32_t(nt.stage_records.size() - 1);
+    };
+    auto count_prims = [&](uint32_t fi, std::vector<uint32_t>& cnt) {
+        const auto& node = object_->nodes_[object_->mesh_node_flat_[fi]];
+        const uint32_t first = nt.mesh_prim_first[size_t(node.mesh_idx_)];
+        const uint32_t n =
+            uint32_t(object_->meshes_[size_t(node.mesh_idx_)].primitives_.size());
+        for (uint32_t p = 0; p < n; ++p) ++cnt[first + p];
+    };
+
+    size_t a = 0, b = 0;
+    while (a < fwd.size() || b < dep.size()) {
+        uint32_t fi;
+        bool in_fwd = false, in_dep = false;
+        if (b >= dep.size() || (a < fwd.size() && fwd[a] < dep[b])) {
+            fi = fwd[a++]; in_fwd = true;
+        } else if (a >= fwd.size() || dep[b] < fwd[a]) {
+            fi = dep[b++]; in_dep = true;
+        } else {
+            fi = fwd[a++]; ++b; in_fwd = true; in_dep = true;
+        }
+        if (size_t(fi) >= flat_n) continue;
+        const uint32_t rec = add_record(fi, in_fwd);
+        if (in_fwd) {
+            nt.stage_class_idx.push_back(rec);
+            count_prims(fi, nt.cnt_fwd);
+        }
+        if (in_dep) {
+            s_dep_idx.push_back(rec);
+            count_prims(fi, nt.cnt_dep);
+        }
+    }
+    nt.fwd_count = uint32_t(nt.stage_class_idx.size());
+    nt.depth_count = uint32_t(s_dep_idx.size());
+    nt.stage_class_idx.insert(nt.stage_class_idx.end(),
+                              s_dep_idx.begin(), s_dep_idx.end());
+    nt.record_count = uint32_t(nt.stage_records.size());
+
+    // Bucket bases: capacity = the larger class's reference count, so
+    // one table serves both classes.
+    nt.stage_prim_bases.resize(nt.num_gprims);
+    uint32_t base = 0;
+    for (uint32_t gp = 0; gp < nt.num_gprims; ++gp) {
+        const uint32_t cap = std::max(nt.cnt_fwd[gp], nt.cnt_dep[gp]);
+        nt.stage_prim_bases[gp] = glm::uvec2(base, cap);
+        base += cap;
+    }
+    nt.total_slots = base;
+}
+
+// ── GPU buffers: grow-only, retire the outgrown ones ──────────────────
+static void ntEnsureBuffers(
+    const std::shared_ptr<renderer::Device>& device,
+    NodeTableGpu& nt,
+    uint64_t serial) {
+    // Record tables (both parities are resized together so a parity
+    // never lags behind the staging it must hold).
+    if (nt.record_count > nt.record_capacity || !nt.records[0].buffer) {
+        const uint32_t cap = std::max(
+            nt.record_count + nt.record_count / 2u + 1024u, 4096u);
+        for (int p = 0; p < 2; ++p) {
+            ntRetire(nt, nt.records[p], serial);
+            ntRetire(nt, nt.infos[p], serial);
+            nt.records[p] = ntCreateHostBuffer(
+                device, uint64_t(cap) * sizeof(glsl::ModelParams));
+            nt.infos[p] = ntCreateHostBuffer(
+                device, uint64_t(cap) * sizeof(glsl::NtCullInfo));
+            nt.uploaded_version[p] = ~uint64_t(0);
+            nt.desc_dirty[p] = true;
+        }
+        nt.record_capacity = cap;
+        ++nt.stat_grow;
+    }
+    const uint32_t class_n = nt.fwd_count + nt.depth_count;
+    if (class_n > nt.class_capacity || !nt.class_idx[0].buffer) {
+        const uint32_t cap = std::max(class_n + class_n / 2u + 2048u, 8192u);
+        for (int p = 0; p < 2; ++p) {
+            ntRetire(nt, nt.class_idx[p], serial);
+            nt.class_idx[p] = ntCreateHostBuffer(
+                device, uint64_t(cap) * sizeof(uint32_t));
+            nt.uploaded_version[p] = ~uint64_t(0);
+            nt.desc_dirty[p] = true;
+        }
+        nt.class_capacity = cap;
+    }
+    if (!nt.prim_bases[0].buffer) {
+        for (int p = 0; p < 2; ++p) {
+            nt.prim_bases[p] = ntCreateHostBuffer(
+                device, uint64_t(nt.num_gprims) * sizeof(glm::uvec2));
+            nt.uploaded_version[p] = ~uint64_t(0);
+            nt.desc_dirty[p] = true;
+        }
+    }
+    if (!nt.counts.buffer) {
+        nt.counts = ntCreateDeviceBuffer(
+            device,
+            uint64_t(nt.num_gprims) * sizeof(uint32_t),
+            SET_3_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT,
+                            INDIRECT_BUFFER_BIT, TRANSFER_DST_BIT));
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+    }
+    if (nt.total_slots > nt.slot_capacity || !nt.cmds.buffer) {
+        const uint32_t cap = std::max(
+            nt.total_slots + nt.total_slots / 2u + 1024u, 4096u);
+        ntRetire(nt, nt.cmds, serial);
+        ntRetire(nt, nt.slots, serial);
+        nt.cmds = ntCreateDeviceBuffer(
+            device,
+            uint64_t(cap) * sizeof(renderer::DrawIndexedIndirectCommand),
+            SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT,
+                            INDIRECT_BUFFER_BIT));
+        nt.slots = ntCreateDeviceBuffer(
+            device,
+            uint64_t(cap) * sizeof(uint32_t),
+            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT));
+        nt.slot_capacity = cap;
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+        ++nt.stat_grow;
+    }
+}
+
+// Host → parity buffers, only when that parity's copy is stale.
+static void ntUploadParity(
+    const std::shared_ptr<renderer::Device>& device,
+    NodeTableGpu& nt,
+    uint32_t parity) {
+    if (nt.uploaded_version[parity] == nt.staged_version) return;
+    if (nt.record_count > 0u) {
+        device->updateBufferMemory(
+            nt.records[parity].memory,
+            uint64_t(nt.record_count) * sizeof(glsl::ModelParams),
+            nt.stage_records.data());
+        device->updateBufferMemory(
+            nt.infos[parity].memory,
+            uint64_t(nt.record_count) * sizeof(glsl::NtCullInfo),
+            nt.stage_infos.data());
+    }
+    if (!nt.stage_class_idx.empty()) {
+        device->updateBufferMemory(
+            nt.class_idx[parity].memory,
+            uint64_t(nt.stage_class_idx.size()) * sizeof(uint32_t),
+            nt.stage_class_idx.data());
+    }
+    device->updateBufferMemory(
+        nt.prim_bases[parity].memory,
+        uint64_t(nt.num_gprims) * sizeof(glm::uvec2),
+        nt.stage_prim_bases.data());
+    nt.uploaded_version[parity] = nt.staged_version;
+    ++nt.stat_uploads;
+}
+
+// (Re)write one parity's descriptor sets.  Only ever called on that
+// parity's own frame, when the set's previous reader (frame N-2) has
+// been fence-waited.
+static void ntWriteDescriptorSets(
+    const std::shared_ptr<renderer::Device>& device,
+    const std::shared_ptr<renderer::DescriptorPool>& pool,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& cull_layout,
+    const std::shared_ptr<renderer::DescriptorSetLayout>& vs_layout,
+    const std::shared_ptr<ego::DrawableData>& object_,
+    NodeTableGpu& nt,
+    uint32_t parity) {
+    if (!nt.desc_dirty[parity]) return;
+    if (!nt.cull_desc_sets[parity]) {
+        nt.cull_desc_sets[parity] =
+            device->createDescriptorSets(pool, cull_layout, 1)[0];
+    }
+    if (!nt.vs_desc_sets[parity]) {
+        nt.vs_desc_sets[parity] =
+            device->createDescriptorSets(pool, vs_layout, 1)[0];
+    }
+    renderer::WriteDescriptorList writes;
+    writes.reserve(10);
+    const auto& cs = nt.cull_desc_sets[parity];
+    auto add = [&](const std::shared_ptr<renderer::DescriptorSet>& set,
+                   uint32_t binding, const renderer::BufferInfo& buf) {
+        renderer::Helper::addOneBuffer(
+            writes, set, renderer::DescriptorType::STORAGE_BUFFER,
+            binding, buf.buffer, buf.buffer->getSize());
+    };
+    add(cs, 0, nt.infos[parity]);
+    add(cs, 1, object_->indirect_draw_cmd_);
+    add(cs, 2, nt.prim_bases[parity]);
+    add(cs, 3, nt.cmds);
+    add(cs, 4, nt.slots);
+    add(cs, 5, nt.counts);
+    add(cs, 6, nt.prim_flags_buf);
+    add(cs, 7, nt.class_idx[parity]);
+    add(nt.vs_desc_sets[parity], NODE_TABLE_PARAMS_BINDING, nt.records[parity]);
+    add(nt.vs_desc_sets[parity], NODE_TABLE_SLOTS_BINDING, nt.slots);
+    device->updateDescriptorSets(writes);
+    nt.desc_dirty[parity] = false;
+}
+
 void DrawableData::destroy(
     const std::shared_ptr<renderer::Device>& device) {
     for (auto& texture : textures_) {
@@ -7322,6 +7948,10 @@ void DrawableData::destroy(
 
     indirect_draw_cmd_.destroy(device);
     instance_buffer_.destroy(device);
+    if (nt_) {
+        ntReleaseGpu(device, *nt_);
+        nt_.reset();
+    }
 }
 
 struct compare {
@@ -7544,6 +8174,19 @@ DrawableObject::DrawableObject(
             texture_sampler,
             thin_film_lut_tex);
 
+        // GPU node-table path: remember the formats / pipeline info the
+        // classic lists are built with, so ntDraw can build its _NT
+        // pipelines lazily against the very same state.
+        if (!nt_formats_valid_) {
+            nt_formats_forward_ =
+                renderbuffer_formats[int(renderer::RenderPasses::kForward)];
+            nt_formats_shadow_ =
+                renderbuffer_formats[int(renderer::RenderPasses::kShadow)];
+            nt_formats_depth_only_ =
+                renderbuffer_formats[int(renderer::RenderPasses::kDepthOnly)];
+            nt_graphic_pipeline_info_ = graphic_pipeline_info;
+            nt_formats_valid_ = true;
+        }
         for (int i_mesh = 0; i_mesh < object_->meshes_.size(); i_mesh++) {
             for (int i_prim = 0; i_prim < object_->meshes_[i_mesh].primitives_.size(); i_prim++) {
                 const auto& primitive = object_->meshes_[i_mesh].primitives_[i_prim];
@@ -7951,6 +8594,19 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
             // Pipeline creation (the per-primitive hashing + pipeline-cache
             // lookups match the sync ctor above — duplicated deliberately
             // to keep the two paths easy to diff).
+            // GPU node-table path: remember the formats / pipeline info the
+            // classic lists are built with, so ntDraw can build its _NT
+            // pipelines lazily against the very same state.
+            if (!nt_formats_valid_) {
+                nt_formats_forward_ =
+                    renderbuffer_formats[int(renderer::RenderPasses::kForward)];
+                nt_formats_shadow_ =
+                    renderbuffer_formats[int(renderer::RenderPasses::kShadow)];
+                nt_formats_depth_only_ =
+                    renderbuffer_formats[int(renderer::RenderPasses::kDepthOnly)];
+                nt_graphic_pipeline_info_ = graphic_pipeline_info;
+                nt_formats_valid_ = true;
+            }
             for (int i_mesh = 0;
                  i_mesh < static_cast<int>(data->meshes_.size());
                  i_mesh++) {
@@ -8192,6 +8848,9 @@ void DrawableData::generateSharedDescriptorSet(
     const std::shared_ptr<renderer::DescriptorSetLayout>& update_instance_buffer_desc_set_layout,
     const std::shared_ptr<renderer::BufferInfo>& game_objects_buffer) {
 
+    // Kept for the GPU node-table path's lazy descriptor allocation.
+    shared_descriptor_pool_ = descriptor_pool;
+
     // create indirect draw buffer set.
     indirect_draw_cmd_buffer_desc_set_ = device->createDescriptorSets(
         descriptor_pool, drawable_indirect_draw_desc_set_layout, 1)[0];
@@ -8413,6 +9072,42 @@ void DrawableObject::createStaticMembers(
             drawable_pipeline_layout_ = nullptr;
         }
 
+        // GPU node-table layouts: created once (the descriptor set
+        // layouts never change), the drawable pipeline layout below
+        // references the VS set.
+        nt_device_ = device;
+        if (node_table_desc_set_layout_ == nullptr) {
+            node_table_desc_set_layout_ =
+                createNodeTableDescSetLayout(device);
+        }
+        if (nt_cull_desc_set_layout_ == nullptr) {
+            nt_cull_desc_set_layout_ =
+                createNtCullDescSetLayout(device);
+        }
+        if (nt_cull_pipeline_layout_ == nullptr) {
+            nt_cull_pipeline_layout_ =
+                renderer::helper::createComputePipelineLayout(
+                    device,
+                    { nt_cull_desc_set_layout_ },
+                    sizeof(glsl::NtCullPushConstants));
+        }
+        if (nt_cull_pipeline_ == nullptr) {
+            try {
+                nt_cull_pipeline_ =
+                    renderer::helper::createComputePipeline(
+                        device,
+                        nt_cull_pipeline_layout_,
+                        "node_table_cull_comp.spv",
+                        std::source_location::current());
+            } catch (const std::exception& e) {
+                std::cout << "[drawable.nt] node_table_cull_comp.spv unavailable ("
+                          << e.what()
+                          << ") -- GPU node-table path disabled" << std::endl;
+                nt_cull_pipeline_ = nullptr;
+                nt_enabled_ = false;
+            }
+        }
+
         if (drawable_pipeline_layout_ == nullptr) {
             assert(material_desc_set_layout_);
             assert(skin_desc_set_layout_);
@@ -8421,7 +9116,8 @@ void DrawableObject::createStaticMembers(
                     device,
                     global_desc_set_layouts,
                     material_desc_set_layout_,
-                    skin_desc_set_layout_);
+                    skin_desc_set_layout_,
+                    node_table_desc_set_layout_);
         }
     }
 
@@ -8555,6 +9251,23 @@ void DrawableObject::recreateStaticMembers(
     const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
 
     createStaticMembers(device, global_desc_set_layouts);
+
+    // GPU node-table pipelines: rebuilt lazily by ntDraw against the
+    // refreshed formats / pipeline layout.
+    for (auto& list : nt_pipeline_lists_) {
+        for (auto& pipeline : list) {
+            if (pipeline.second) device->destroyPipeline(pipeline.second);
+        }
+        list.clear();
+    }
+    nt_formats_forward_ =
+        renderbuffer_formats[int(renderer::RenderPasses::kForward)];
+    nt_formats_shadow_ =
+        renderbuffer_formats[int(renderer::RenderPasses::kShadow)];
+    nt_formats_depth_only_ =
+        renderbuffer_formats[int(renderer::RenderPasses::kDepthOnly)];
+    nt_graphic_pipeline_info_ = graphic_pipeline_info;
+    nt_formats_valid_ = true;
 
     for (auto& pipeline : drawable_glass_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
@@ -8845,6 +9558,29 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_csm_mesh_shader_pipeline_list_.clear();
+    for (auto& list : nt_pipeline_lists_) {
+        for (auto& pipeline : list) {
+            if (pipeline.second) device->destroyPipeline(pipeline.second);
+        }
+        list.clear();
+    }
+    if (nt_cull_pipeline_) {
+        device->destroyPipeline(nt_cull_pipeline_);
+        nt_cull_pipeline_ = nullptr;
+    }
+    if (nt_cull_pipeline_layout_) {
+        device->destroyPipelineLayout(nt_cull_pipeline_layout_);
+        nt_cull_pipeline_layout_ = nullptr;
+    }
+    nt_device_.reset();
+    if (nt_cull_desc_set_layout_) {
+        device->destroyDescriptorSetLayout(nt_cull_desc_set_layout_);
+        nt_cull_desc_set_layout_ = nullptr;
+    }
+    if (node_table_desc_set_layout_) {
+        device->destroyDescriptorSetLayout(node_table_desc_set_layout_);
+        node_table_desc_set_layout_ = nullptr;
+    }
     if (mesh_shader_shadow_pipeline_layout_) {
         device->destroyPipelineLayout(mesh_shader_shadow_pipeline_layout_);
         mesh_shader_shadow_pipeline_layout_ = nullptr;
@@ -9154,6 +9890,350 @@ void DrawableObject::updateBuffers(
     updateIndirectDrawBuffer(cmd_buf);
 }
 
+// ── Flat mesh-node list build (draw-path fast lane) ──────────────────
+// Split out of DrawableObject::draw so the GPU node-table hook
+// (ntBeginPass) can build it before the first draw of a drawable.  The
+// body is the original block, byte for byte.
+static void buildMeshNodeFlatList(
+    const std::shared_ptr<ego::DrawableData>& object_,
+    int32_t root_node) {
+    if (object_->mesh_node_flat_built_) return;
+    // ── Per-mesh pass flags (see DrawableData::mesh_pass_flags_) ─
+    // Materials are final once the drawable is ready, so this is
+    // the earliest point the flags can be trusted.
+    {
+        auto& mpf = object_->mesh_pass_flags_;
+        mpf.assign(object_->meshes_.size(), uint8_t(0));
+        object_->any_blend_prims_ = false;
+        object_->any_uncoverable_prims_ = false;
+        for (size_t mi_i = 0; mi_i < object_->meshes_.size(); ++mi_i) {
+            uint8_t f = 0;
+            for (const auto& prim :
+                 object_->meshes_[mi_i].primitives_) {
+                const bool has_mat =
+                    prim.material_idx_ >= 0 &&
+                    prim.material_idx_ <
+                        int(object_->materials_.size());
+                const bool is_blend =
+                    has_mat &&
+                    object_->materials_[prim.material_idx_]
+                            .alpha_mode_ == ego::AlphaMode::Blend;
+                if (is_blend) f |= DrawableData::kMeshHasBlend;
+                // Mirrors drawMesh's covered-prim predicate:
+                // opaque, non-skinned, with a material.
+                const bool coverable =
+                    has_mat && !prim.tag_.has_skin_set_0 &&
+                    isPrimitiveOpaque(prim, object_->materials_);
+                if (!coverable) f |= DrawableData::kMeshHasUncoverable;
+            }
+            mpf[mi_i] = f;
+            if (f & DrawableData::kMeshHasBlend)
+                object_->any_blend_prims_ = true;
+            if (f & DrawableData::kMeshHasUncoverable)
+                object_->any_uncoverable_prims_ = true;
+        }
+        object_->mesh_pass_flags_built_ = true;
+    }
+    object_->mesh_node_flat_.clear();
+    object_->mesh_node_sphere_.clear();
+    std::vector<int32_t> dfs;
+    const auto& roots = object_->scenes_[root_node].nodes_;
+    for (auto it = roots.rbegin(); it != roots.rend(); ++it) {
+        dfs.push_back(*it);
+    }
+    while (!dfs.empty()) {
+        const int32_t ni = dfs.back();
+        dfs.pop_back();
+        if (ni < 0 ||
+            ni >= (int32_t)object_->nodes_.size()) continue;
+        const auto& node = object_->nodes_[ni];
+        if (node.mesh_idx_ >= 0) {
+            object_->mesh_node_flat_.push_back(ni);
+            // Cull sphere in drawable space: local AABB sphere
+            // through cached_matrix_ with a conservative
+            // max-axis-scale radius (see the member comment).
+            const auto& mi = object_->meshes_[node.mesh_idx_];
+            glm::vec3 bb_min = mi.cullBboxMin();
+            glm::vec3 bb_max = mi.cullBboxMax();
+            // Instanced node: bound ONLY its own instance
+            // range, not every placement of the mesh (see
+            // NodeInfo::node_inst_bbox_*).  Guarded on a
+            // non-inverted box so a node whose range produced
+            // no valid corner keeps the mesh-level fallback.
+            if (node.has_node_inst_bbox_ &&
+                node.node_inst_bbox_min_.x <= node.node_inst_bbox_max_.x &&
+                node.node_inst_bbox_min_.y <= node.node_inst_bbox_max_.y &&
+                node.node_inst_bbox_min_.z <= node.node_inst_bbox_max_.z) {
+                bb_min = node.node_inst_bbox_min_;
+                bb_max = node.node_inst_bbox_max_;
+            }
+            glm::vec3 lc = (bb_min + bb_max) * 0.5f;
+            float lr = glm::length((bb_max - bb_min) * 0.5f);
+            const glm::mat4& cm = node.cached_matrix_;
+            glm::vec3 wc = glm::vec3(cm * glm::vec4(lc, 1.0f));
+            float ms = glm::max(
+                glm::length(glm::vec3(cm[0])),
+                glm::max(glm::length(glm::vec3(cm[1])),
+                         glm::length(glm::vec3(cm[2]))));
+            object_->mesh_node_sphere_.push_back(
+                glm::vec4(wc, lr * ms));
+        }
+        for (auto cit = node.child_idx_.rbegin();
+             cit != node.child_idx_.rend(); ++cit) {
+            dfs.push_back(*cit);
+        }
+    }
+
+    // ── TILE GRID ────────────────────────────────────────────
+    // "Cull by tile first."  Bucket the flat list into a 2D grid
+    // whose cells are the size of a terrain tile, REORDER the
+    // list so each cell's nodes are contiguous, and record each
+    // cell's node range plus the union AABB of its members' cull
+    // spheres.  One box test per cell then throws away a whole
+    // tile's worth of nodes, and the per-node tests below only
+    // ever run inside cells that survived.
+    //
+    // The spheres are in drawable space, so the cells are too;
+    // the size is chosen so a cell is ~kTileSizeM metres across
+    // once the instance world transform is applied.  If that
+    // transform later changes, the grid is still a valid
+    // partition (only its size in metres drifts), so nothing
+    // depends on the estimate being exact.
+    //
+    // Sorted by (cell, mesh index): cell so the ranges exist at
+    // all, mesh within the cell so consecutive draws keep
+    // sharing a pipeline and descriptor set the way DFS order
+    // did.  Reordering is safe because no drawable pass
+    // depth-sorts across nodes — the translucent sort lives
+    // inside a single mesh's primitive list.
+    //
+    // Instanced nodes' cull bbox already spans every instance,
+    // so a cell's AABB covers the tile AND everything attached
+    // to it without any extra bookkeeping.
+    object_->mesh_node_cells_.clear();
+    const size_t tile_node_n = object_->mesh_node_flat_.size();
+    if (tile_node_n > 1 &&
+        object_->mesh_node_sphere_.size() == tile_node_n) {
+        const glm::mat4& bw = object_->m_current_instance_world_;
+        const float bw_scale = glm::max(
+            glm::length(glm::vec3(bw[0])),
+            glm::max(glm::length(glm::vec3(bw[1])),
+                     glm::length(glm::vec3(bw[2]))));
+        const float kTileSizeM = 128.0f;
+        const float cell_size =
+            kTileSizeM / glm::max(bw_scale, 1e-6f);
+        const float inv_cell = 1.0f / cell_size;
+        struct TileKey {
+            int32_t  cx;
+            int32_t  cz;
+            uint32_t mesh;
+            uint32_t src;
+        };
+        std::vector<TileKey> keys(tile_node_n);
+        // Cell indices are clamped before the cast: a stray
+        // NaN or a coordinate far outside any sane world would
+        // otherwise overflow the int32 conversion, which is UB
+        // and would corrupt the ranges rather than just place a
+        // node in an odd cell.
+        const float kCellClamp = 1.0e6f;
+        for (size_t i = 0; i < tile_node_n; ++i) {
+            const glm::vec4& sp = object_->mesh_node_sphere_[i];
+            const float kx = sp.x * inv_cell;
+            const float kz = sp.z * inv_cell;
+            keys[i].cx = (int32_t)std::floor(
+                (kx > -kCellClamp && kx < kCellClamp) ? kx : 0.0f);
+            keys[i].cz = (int32_t)std::floor(
+                (kz > -kCellClamp && kz < kCellClamp) ? kz : 0.0f);
+            const int32_t ni = object_->mesh_node_flat_[i];
+            keys[i].mesh =
+                (uint32_t)object_->nodes_[ni].mesh_idx_;
+            keys[i].src = (uint32_t)i;
+        }
+        std::sort(keys.begin(), keys.end(),
+                  [](const TileKey& a, const TileKey& b) {
+                      if (a.cz != b.cz) return a.cz < b.cz;
+                      if (a.cx != b.cx) return a.cx < b.cx;
+                      if (a.mesh != b.mesh) return a.mesh < b.mesh;
+                      return a.src < b.src;
+                  });
+        std::vector<int32_t>   flat_sorted(tile_node_n);
+        std::vector<glm::vec4> sphere_sorted(tile_node_n);
+        for (size_t i = 0; i < tile_node_n; ++i) {
+            const uint32_t sidx = keys[i].src;
+            flat_sorted[i] = object_->mesh_node_flat_[sidx];
+            sphere_sorted[i] = object_->mesh_node_sphere_[sidx];
+        }
+        object_->mesh_node_flat_.swap(flat_sorted);
+        object_->mesh_node_sphere_.swap(sphere_sorted);
+
+        size_t run_start = 0;
+        for (size_t i = 1; i <= tile_node_n; ++i) {
+            const bool boundary =
+                (i == tile_node_n) ||
+                keys[i].cx != keys[run_start].cx ||
+                keys[i].cz != keys[run_start].cz;
+            if (!boundary) continue;
+            DrawableData::NodeCell cell;
+            cell.first = (uint32_t)run_start;
+            cell.count = (uint32_t)(i - run_start);
+            glm::vec3 bmin(std::numeric_limits<float>::max());
+            glm::vec3 bmax(std::numeric_limits<float>::lowest());
+            float maxr = 0.0f;
+            for (size_t j = run_start; j < i; ++j) {
+                const glm::vec4& sp =
+                    object_->mesh_node_sphere_[j];
+                const glm::vec3 c(sp.x, sp.y, sp.z);
+                const glm::vec3 r(sp.w);
+                bmin = glm::min(bmin, c - r);
+                bmax = glm::max(bmax, c + r);
+                if (sp.w > maxr) maxr = sp.w;
+            }
+            cell.bmin = bmin;
+            cell.bmax = bmax;
+            cell.maxr = maxr;
+            object_->mesh_node_cells_.push_back(cell);
+            run_start = i;
+        }
+        // One cell spans everything, so its test can only ever
+        // cost — drop the grid and let the plain flat loop run.
+        if (object_->mesh_node_cells_.size() < 2) {
+            object_->mesh_node_cells_.clear();
+        }
+    }
+    object_->mesh_node_flat_built_ = true;
+}
+
+// ── LOD survivor list rebuild ────────────────────────────────────────
+// Compacts the plant-LOD band tables into the per-pass survivor lists
+// (see DrawableData::lod_pass_fwd_ and friends).  Also split out of
+// DrawableObject::draw for the node-table hook; the body is unchanged.
+// Returns true when the lists were rebuilt.
+static bool rebuildLodSurvivorLists(
+    const std::shared_ptr<ego::DrawableData>& object_) {
+    const size_t flat_n = object_->mesh_node_flat_.size();
+    if (object_->lod_pass_version_ == object_->lod_tables_version_ &&
+        object_->lod_pass_flat_n_ == flat_n) {
+        return false;
+    }
+    const size_t lod_fade_n = object_->lod_node_fade_.size();
+    const size_t lod_vis_n = object_->lod_node_visible_.size();
+    const size_t lod_own_n = object_->lod_node_owner_.size();
+    auto& fwd = object_->lod_pass_fwd_;
+    auto& dep = object_->lod_pass_depth_;
+    auto& unc = object_->lod_pass_fwd_uncov_;
+    auto& gls = object_->lod_pass_glass_;
+    fwd.clear();
+    dep.clear();
+    unc.clear();
+    gls.clear();
+    const auto& mpf = object_->mesh_pass_flags_;
+    for (size_t fi = 0; fi < flat_n; ++fi) {
+        const size_t ni =
+            static_cast<size_t>(object_->mesh_node_flat_[fi]);
+        const bool has_lod = ni < lod_fade_n;
+        const bool hid_fwd =
+            (ni < lod_vis_n &&
+             object_->lod_node_visible_[ni] == 0);
+        const bool hid_dep =
+            has_lod ? (ni >= lod_own_n ||
+                       object_->lod_node_owner_[ni] == 0)
+                    : hid_fwd;
+        if (!hid_fwd) {
+            fwd.push_back(uint32_t(fi));
+            const auto& nd = object_->nodes_[ni];
+            const uint8_t mf =
+                (nd.mesh_idx_ >= 0 &&
+                 size_t(nd.mesh_idx_) < mpf.size())
+                    ? mpf[nd.mesh_idx_] : uint8_t(0xFF);
+            // Forward-under-cover: the node must still be
+            // recorded by the main forward pass when it is
+            // mid cross-fade, per-instance banded, or its
+            // mesh has a primitive the G-buffer cannot take.
+            // Same predicate drawMesh applies per primitive.
+            const float fade_v =
+                has_lod ? object_->lod_node_fade_[ni] : 1.0f;
+            const bool fading =
+                has_lod && glm::abs(fade_v) < 0.999f;
+            const bool per_inst =
+                has_lod && nd.lod_per_instance_ != 0;
+            if (fading || per_inst ||
+                (mf & DrawableData::kMeshHasUncoverable) != 0) {
+                unc.push_back(uint32_t(fi));
+            }
+            if ((mf & DrawableData::kMeshHasBlend) != 0) {
+                gls.push_back(uint32_t(fi));
+            }
+        }
+        if (!hid_dep) dep.push_back(uint32_t(fi));
+    }
+    object_->lod_pass_version_ = object_->lod_tables_version_;
+    object_->lod_pass_flat_n_ = flat_n;
+    ++s_draw_stats.lod_rebuilds;
+    return true;
+}
+
+void DrawableObject::stagePerDrawState() {
+    if (!object_) return;
+    if (instance_root_valid_) {
+        glm::mat4 m =
+            glm::translate(glm::mat4(1.0f), instance_root_t_) *
+            glm::mat4_cast(instance_root_r_) *
+            glm::scale(glm::mat4(1.0f), instance_root_s_);
+        // Fold m_debug_scale_ in here for shared-instance drawables.
+        // setRootNodeTransform writes the debug scale into the root
+        // node's scale_, but shared instances DON'T call it (would
+        // clobber siblings), so the per-instance world has to carry
+        // the scale instead.  Non-shared drawables (player rig, etc.)
+        // keep getting scale via the node path unchanged.  Composing
+        // this AFTER instance_root_s_ means link sticks can size
+        // themselves in "(length/debug, thin/debug, thin/debug)" units
+        // and end up at (length, thin, thin) on screen.
+        if (object_->m_debug_scale_ > 0.0f) {
+            m = m * glm::scale(
+                glm::mat4(1.0f),
+                glm::vec3(object_->m_debug_scale_));
+        }
+        object_->m_current_instance_world_ = m;
+    } else {
+        object_->m_current_instance_world_ = glm::mat4(1.0f);
+    }
+
+    // ── Stage the per-wrapper sub-object filter for this draw call ──
+    // Lazily resolve the ordinal ("k-th node with a mesh", the order the
+    // Outliner / Content Browser use) to a nodes_ index now that the
+    // node table exists, then stage it into the SHARED DrawableData the
+    // same way the instance world is staged — so sibling wrappers that
+    // dedup onto one DrawableData can each render a different node.
+    if (only_render_ordinal_ >= 0 && only_render_node_ < 0 && isReady()) {
+        int k = 0;
+        for (int ni = 0; ni < (int)object_->nodes_.size(); ++ni) {
+            if (object_->nodes_[ni].mesh_idx_ < 0) continue;
+            if (k == only_render_ordinal_) {
+                only_render_node_ = ni;
+                break;
+            }
+            ++k;
+        }
+        if (only_render_node_ < 0) {
+            // Out-of-range ordinal — render nothing rather than
+            // silently showing the whole file (no node has this index).
+            only_render_node_ = 0x7fffffff;
+        }
+    }
+    object_->m_only_render_node_ =
+        (only_render_ordinal_ >= 0) ? only_render_node_ : -1;
+
+    // ── Stage the ground-clutter fade for this draw call ────────────
+    // Same staging contract as the two above: the values are owned by
+    // this wrapper (they are set at import time, before object_ even
+    // exists), and DrawableData may be shared with other wrappers of
+    // the same file, so they are copied down per draw rather than
+    // written once.
+    object_->m_clutter_fade_start_m_ = clutter_fade_start_m_;
+    object_->m_clutter_fade_end_m_ = clutter_fade_end_m_;
+    object_->m_vegetation_sway_ = vegetation_sway_;
+}
+
 void DrawableObject::draw(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     const renderer::DescriptorSetList& desc_set_list,
@@ -9216,66 +10296,7 @@ void DrawableObject::draw(
     // every sibling marker would otherwise clobber).  When the wrapper
     // hasn't set an override, identity restores the original behaviour
     // (model_mat == cached_matrix).
-    if (object_) {
-        if (instance_root_valid_) {
-            glm::mat4 m =
-                glm::translate(glm::mat4(1.0f), instance_root_t_) *
-                glm::mat4_cast(instance_root_r_) *
-                glm::scale(glm::mat4(1.0f), instance_root_s_);
-            // Fold m_debug_scale_ in here for shared-instance drawables.
-            // setRootNodeTransform writes the debug scale into the root
-            // node's scale_, but shared instances DON'T call it (would
-            // clobber siblings), so the per-instance world has to carry
-            // the scale instead.  Non-shared drawables (player rig, etc.)
-            // keep getting scale via the node path unchanged.  Composing
-            // this AFTER instance_root_s_ means link sticks can size
-            // themselves in "(length/debug, thin/debug, thin/debug)" units
-            // and end up at (length, thin, thin) on screen.
-            if (object_->m_debug_scale_ > 0.0f) {
-                m = m * glm::scale(
-                    glm::mat4(1.0f),
-                    glm::vec3(object_->m_debug_scale_));
-            }
-            object_->m_current_instance_world_ = m;
-        } else {
-            object_->m_current_instance_world_ = glm::mat4(1.0f);
-        }
-
-        // ── Stage the per-wrapper sub-object filter for this draw call ──
-        // Lazily resolve the ordinal ("k-th node with a mesh", the order the
-        // Outliner / Content Browser use) to a nodes_ index now that the
-        // node table exists, then stage it into the SHARED DrawableData the
-        // same way the instance world is staged — so sibling wrappers that
-        // dedup onto one DrawableData can each render a different node.
-        if (only_render_ordinal_ >= 0 && only_render_node_ < 0 && isReady()) {
-            int k = 0;
-            for (int ni = 0; ni < (int)object_->nodes_.size(); ++ni) {
-                if (object_->nodes_[ni].mesh_idx_ < 0) continue;
-                if (k == only_render_ordinal_) {
-                    only_render_node_ = ni;
-                    break;
-                }
-                ++k;
-            }
-            if (only_render_node_ < 0) {
-                // Out-of-range ordinal — render nothing rather than
-                // silently showing the whole file (no node has this index).
-                only_render_node_ = 0x7fffffff;
-            }
-        }
-        object_->m_only_render_node_ =
-            (only_render_ordinal_ >= 0) ? only_render_node_ : -1;
-
-        // ── Stage the ground-clutter fade for this draw call ────────────
-        // Same staging contract as the two above: the values are owned by
-        // this wrapper (they are set at import time, before object_ even
-        // exists), and DrawableData may be shared with other wrappers of
-        // the same file, so they are copied down per draw rather than
-        // written once.
-        object_->m_clutter_fade_start_m_ = clutter_fade_start_m_;
-        object_->m_clutter_fade_end_m_ = clutter_fade_end_m_;
-        object_->m_vegetation_sway_ = vegetation_sway_;
-    }
+    stagePerDrawState();
 
     // Skip while the async load is still in flight. The menu spinner
     // (see application.cpp HUD wiring) is the user-visible signal; the
@@ -9289,6 +10310,30 @@ void DrawableObject::draw(
     // it would crash in bindVertexBuffers on a null buffer.
     if (!object_->instance_buffer_.buffer) {
         return;
+    }
+
+    // ── Empty-pass elimination (drawable level) ───────────────────────
+    // The per-mesh pass flags exist once the flat node list has been
+    // built (first draw).  Two passes can then be skipped outright:
+    //   * the translucent glass pass on a drawable with no Blend
+    //     primitive at all (every survivor would be filtered per prim);
+    //   * the main forward pass under the deferred cover on a drawable
+    //     with no LOD bands, no skins and no uncoverable primitive —
+    //     every node is steady, so drawMesh would skip every prim.
+    // Plant-LOD drawables take the narrower survivor lists instead (see
+    // lod_pass_fwd_uncov_ / lod_pass_glass_ below).
+    if (object_->mesh_pass_flags_built_) {
+        if (draw_mode == DrawMode::kGlassAttr &&
+            !object_->any_blend_prims_) {
+            return;
+        }
+        if (draw_mode == DrawMode::kForward && s_fwd_covered_window &&
+            s_deferred_relight_armed && !object_->has_plant_lod_ &&
+            object_->skins_.empty() && !object_->any_uncoverable_prims_ &&
+            object_->m_only_render_node_ < 0 &&
+            !object_->m_debug_force_red_ && !object_->m_debug_log_draws_) {
+            return;
+        }
     }
 
     // ── Select the plant LOD LOD for every tile ────────────────────
@@ -9343,6 +10388,22 @@ void DrawableObject::draw(
     size_t last_hash = 0;
     ++s_draw_stats.drawables;
 
+    // ── GPU node-table path ───────────────────────────────────────────
+    // ntBeginPass ran node_table_cull.comp for this exact pass outside
+    // the rendering scope and left the per-primitive buckets in the
+    // drawable's scratch: issue them and skip the per-node walk.  A
+    // drawable the hook did not prepare falls through to the classic
+    // path below, so the two can never disagree.
+    if (object_->nt_ && object_->nt_->pass_ready &&
+        object_->nt_->pass_draw_mode == int(draw_mode) &&
+        object_->nt_->pass_cascade == csm_cascade_idx &&
+        ntEligible(draw_mode)) {
+        object_->nt_->pass_ready = false;
+        ntDraw(cmd_buf, desc_set_list, viewports, scissors,
+               draw_mode, csm_cascade_idx);
+        return;
+    }
+
     // In mesh-shader mode, drawMesh needs the GS pipeline list as a
     // fallback for ineligible primitives (skinned, cutout, UINT16
     // indices, oversized).  Outside mesh-shader mode the fallback is
@@ -9392,163 +10453,7 @@ void DrawableObject::draw(
         // visited every empty grouping node of procedurally generated
         // layouts (~1.5M nodes/pass scene-wide for a few hundred mesh
         // nodes) and dominated CPU command recording.
-        if (!object_->mesh_node_flat_built_) {
-            object_->mesh_node_flat_.clear();
-            object_->mesh_node_sphere_.clear();
-            std::vector<int32_t> dfs;
-            const auto& roots = object_->scenes_[root_node].nodes_;
-            for (auto it = roots.rbegin(); it != roots.rend(); ++it) {
-                dfs.push_back(*it);
-            }
-            while (!dfs.empty()) {
-                const int32_t ni = dfs.back();
-                dfs.pop_back();
-                if (ni < 0 ||
-                    ni >= (int32_t)object_->nodes_.size()) continue;
-                const auto& node = object_->nodes_[ni];
-                if (node.mesh_idx_ >= 0) {
-                    object_->mesh_node_flat_.push_back(ni);
-                    // Cull sphere in drawable space: local AABB sphere
-                    // through cached_matrix_ with a conservative
-                    // max-axis-scale radius (see the member comment).
-                    const auto& mi = object_->meshes_[node.mesh_idx_];
-                    glm::vec3 bb_min = mi.cullBboxMin();
-                    glm::vec3 bb_max = mi.cullBboxMax();
-                    glm::vec3 lc = (bb_min + bb_max) * 0.5f;
-                    float lr = glm::length((bb_max - bb_min) * 0.5f);
-                    const glm::mat4& cm = node.cached_matrix_;
-                    glm::vec3 wc = glm::vec3(cm * glm::vec4(lc, 1.0f));
-                    float ms = glm::max(
-                        glm::length(glm::vec3(cm[0])),
-                        glm::max(glm::length(glm::vec3(cm[1])),
-                                 glm::length(glm::vec3(cm[2]))));
-                    object_->mesh_node_sphere_.push_back(
-                        glm::vec4(wc, lr * ms));
-                }
-                for (auto cit = node.child_idx_.rbegin();
-                     cit != node.child_idx_.rend(); ++cit) {
-                    dfs.push_back(*cit);
-                }
-            }
-
-            // ── TILE GRID ────────────────────────────────────────────
-            // "Cull by tile first."  Bucket the flat list into a 2D grid
-            // whose cells are the size of a terrain tile, REORDER the
-            // list so each cell's nodes are contiguous, and record each
-            // cell's node range plus the union AABB of its members' cull
-            // spheres.  One box test per cell then throws away a whole
-            // tile's worth of nodes, and the per-node tests below only
-            // ever run inside cells that survived.
-            //
-            // The spheres are in drawable space, so the cells are too;
-            // the size is chosen so a cell is ~kTileSizeM metres across
-            // once the instance world transform is applied.  If that
-            // transform later changes, the grid is still a valid
-            // partition (only its size in metres drifts), so nothing
-            // depends on the estimate being exact.
-            //
-            // Sorted by (cell, mesh index): cell so the ranges exist at
-            // all, mesh within the cell so consecutive draws keep
-            // sharing a pipeline and descriptor set the way DFS order
-            // did.  Reordering is safe because no drawable pass
-            // depth-sorts across nodes — the translucent sort lives
-            // inside a single mesh's primitive list.
-            //
-            // Instanced nodes' cull bbox already spans every instance,
-            // so a cell's AABB covers the tile AND everything attached
-            // to it without any extra bookkeeping.
-            object_->mesh_node_cells_.clear();
-            const size_t tile_node_n = object_->mesh_node_flat_.size();
-            if (tile_node_n > 1 &&
-                object_->mesh_node_sphere_.size() == tile_node_n) {
-                const glm::mat4& bw = object_->m_current_instance_world_;
-                const float bw_scale = glm::max(
-                    glm::length(glm::vec3(bw[0])),
-                    glm::max(glm::length(glm::vec3(bw[1])),
-                             glm::length(glm::vec3(bw[2]))));
-                const float kTileSizeM = 128.0f;
-                const float cell_size =
-                    kTileSizeM / glm::max(bw_scale, 1e-6f);
-                const float inv_cell = 1.0f / cell_size;
-                struct TileKey {
-                    int32_t  cx;
-                    int32_t  cz;
-                    uint32_t mesh;
-                    uint32_t src;
-                };
-                std::vector<TileKey> keys(tile_node_n);
-                // Cell indices are clamped before the cast: a stray
-                // NaN or a coordinate far outside any sane world would
-                // otherwise overflow the int32 conversion, which is UB
-                // and would corrupt the ranges rather than just place a
-                // node in an odd cell.
-                const float kCellClamp = 1.0e6f;
-                for (size_t i = 0; i < tile_node_n; ++i) {
-                    const glm::vec4& sp = object_->mesh_node_sphere_[i];
-                    const float kx = sp.x * inv_cell;
-                    const float kz = sp.z * inv_cell;
-                    keys[i].cx = (int32_t)std::floor(
-                        (kx > -kCellClamp && kx < kCellClamp) ? kx : 0.0f);
-                    keys[i].cz = (int32_t)std::floor(
-                        (kz > -kCellClamp && kz < kCellClamp) ? kz : 0.0f);
-                    const int32_t ni = object_->mesh_node_flat_[i];
-                    keys[i].mesh =
-                        (uint32_t)object_->nodes_[ni].mesh_idx_;
-                    keys[i].src = (uint32_t)i;
-                }
-                std::sort(keys.begin(), keys.end(),
-                          [](const TileKey& a, const TileKey& b) {
-                              if (a.cz != b.cz) return a.cz < b.cz;
-                              if (a.cx != b.cx) return a.cx < b.cx;
-                              if (a.mesh != b.mesh) return a.mesh < b.mesh;
-                              return a.src < b.src;
-                          });
-                std::vector<int32_t>   flat_sorted(tile_node_n);
-                std::vector<glm::vec4> sphere_sorted(tile_node_n);
-                for (size_t i = 0; i < tile_node_n; ++i) {
-                    const uint32_t sidx = keys[i].src;
-                    flat_sorted[i] = object_->mesh_node_flat_[sidx];
-                    sphere_sorted[i] = object_->mesh_node_sphere_[sidx];
-                }
-                object_->mesh_node_flat_.swap(flat_sorted);
-                object_->mesh_node_sphere_.swap(sphere_sorted);
-
-                size_t run_start = 0;
-                for (size_t i = 1; i <= tile_node_n; ++i) {
-                    const bool boundary =
-                        (i == tile_node_n) ||
-                        keys[i].cx != keys[run_start].cx ||
-                        keys[i].cz != keys[run_start].cz;
-                    if (!boundary) continue;
-                    DrawableData::NodeCell cell;
-                    cell.first = (uint32_t)run_start;
-                    cell.count = (uint32_t)(i - run_start);
-                    glm::vec3 bmin(std::numeric_limits<float>::max());
-                    glm::vec3 bmax(std::numeric_limits<float>::lowest());
-                    float maxr = 0.0f;
-                    for (size_t j = run_start; j < i; ++j) {
-                        const glm::vec4& sp =
-                            object_->mesh_node_sphere_[j];
-                        const glm::vec3 c(sp.x, sp.y, sp.z);
-                        const glm::vec3 r(sp.w);
-                        bmin = glm::min(bmin, c - r);
-                        bmax = glm::max(bmax, c + r);
-                        if (sp.w > maxr) maxr = sp.w;
-                    }
-                    cell.bmin = bmin;
-                    cell.bmax = bmax;
-                    cell.maxr = maxr;
-                    object_->mesh_node_cells_.push_back(cell);
-                    run_start = i;
-                }
-                // One cell spans everything, so its test can only ever
-                // cost — drop the grid and let the plain flat loop run.
-                if (object_->mesh_node_cells_.size() < 2) {
-                    object_->mesh_node_cells_.clear();
-                }
-            }
-            object_->mesh_node_flat_built_ = true;
-        }
+        buildMeshNodeFlatList(object_, root_node);
         // Pre-stage rejection with the cached spheres: same predicates
         // drawMesh applies (forward-only frustum cull, clutter distance
         // cull), evaluated with one mat4×vec4 per node instead of the
@@ -9631,33 +10536,24 @@ void DrawableObject::draw(
         // exactly as drawNodeMesh has it.
         const std::vector<uint32_t>* lod_list = nullptr;
         if (pre_lod) {
-            if (object_->lod_pass_version_ !=
-                    object_->lod_tables_version_ ||
-                object_->lod_pass_flat_n_ != flat_n) {
-                auto& fwd = object_->lod_pass_fwd_;
-                auto& dep = object_->lod_pass_depth_;
-                fwd.clear();
-                dep.clear();
-                for (size_t fi = 0; fi < flat_n; ++fi) {
-                    const size_t ni =
-                        static_cast<size_t>(object_->mesh_node_flat_[fi]);
-                    const bool has_lod = ni < lod_fade_n;
-                    const bool hid_fwd =
-                        (ni < lod_vis_n &&
-                         object_->lod_node_visible_[ni] == 0);
-                    const bool hid_dep =
-                        has_lod ? (ni >= lod_own_n ||
-                                   object_->lod_node_owner_[ni] == 0)
-                                : hid_fwd;
-                    if (!hid_fwd) fwd.push_back(uint32_t(fi));
-                    if (!hid_dep) dep.push_back(uint32_t(fi));
-                }
-                object_->lod_pass_version_ = object_->lod_tables_version_;
-                object_->lod_pass_flat_n_ = flat_n;
-                ++s_draw_stats.lod_rebuilds;
+            rebuildLodSurvivorLists(object_);
+            // Pick the narrowest list this pass can use.  The glass
+            // pass only ever draws Blend primitives; the main forward
+            // pass under the deferred cover only needs the "uncovered"
+            // subset (see DrawableData::lod_pass_fwd_uncov_).  Both are
+            // subsets of lod_pass_fwd_, so nothing hidden can slip in.
+            if (depth_only) {
+                lod_list = &object_->lod_pass_depth_;
+            } else if (draw_mode == DrawMode::kGlassAttr &&
+                       object_->mesh_pass_flags_built_) {
+                lod_list = &object_->lod_pass_glass_;
+            } else if (s_forward_covered_skip_active &&
+                       s_deferred_relight_armed &&
+                       object_->mesh_pass_flags_built_) {
+                lod_list = &object_->lod_pass_fwd_uncov_;
+            } else {
+                lod_list = &object_->lod_pass_fwd_;
             }
-            lod_list = depth_only ? &object_->lod_pass_depth_
-                                  : &object_->lod_pass_fwd_;
             s_draw_stats.cull_lod += flat_n - lod_list->size();
         }
         // Per-node work, shared by both walks below so the survivor
@@ -9910,6 +10806,477 @@ void DrawableObject::draw(
         }
     }
 
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// GPU NODE-TABLE DRAW PATH — DrawableObject members
+// ═════════════════════════════════════════════════════════════════════
+bool DrawableObject::ntEligible(DrawMode draw_mode) const {
+    if (!nt_enabled_ || !nt_cull_pipeline_ || !nt_formats_valid_) return false;
+    if (!isReady()) return false;
+    const auto& o = *object_;
+    // The path is built for the static placed world: the survivor lists
+    // (and the cached node spheres they rely on) only exist for plant-LOD
+    // banded files, and the cull spheres bake node.cached_matrix_.
+    if (!o.has_plant_lod_) return false;
+    if (!o.skins_.empty() || !o.animations_.empty()) return false;
+    // Debug / editor filters keep the classic path, which honours them.
+    // (m_debug_log_draws_ is NOT one of them: it only drives the
+    // [placed.draw] reach counters, and the application switches it on
+    // for every placed drawable.)
+    if (only_render_ordinal_ >= 0) return false;
+    if (o.m_debug_force_red_ || o.m_debug_skip_skinning_ ||
+        o.m_highlight_node_ != -1) return false;
+    if (clutter_fade_end_m_ > 0.0f) return false;
+    if (!o.shared_descriptor_pool_) return false;
+    switch (draw_mode) {
+        case DrawMode::kForward:
+        case DrawMode::kGlassAttr:
+        case DrawMode::kDepthPrepass:
+        case DrawMode::kShadow:
+        case DrawMode::kCsmLayered:
+        case DrawMode::kCsmPerCascade:
+            return true;
+        case DrawMode::kGBuffer:
+            return gbuffer_formats_valid_;
+        default:
+            // kCsmMeshShader (task/mesh dispatch, no vertex stage to
+            // permute) and the decal modes stay on the classic path.
+            return false;
+    }
+}
+
+void DrawableObject::ntBeginPass(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::vector<std::shared_ptr<DrawableObject>>& drawables,
+    DrawMode draw_mode,
+    bool depth_only,
+    uint32_t csm_cascade_idx) {
+    if (!nt_enabled_ || !cmd_buf) return;
+    // A stale "prepared" flag from an earlier pass must never let draw()
+    // issue buckets the cull did not build for this pass.
+    for (auto& d : drawables) {
+        if (d && d->object_ && d->object_->nt_) d->object_->nt_->pass_ready = false;
+    }
+    for (auto& d : drawables) {
+        if (!d) continue;
+        // Several wrappers can share one DrawableData; the first eligible
+        // one prepares (and, drawing first, consumes) the buckets, the
+        // others take the classic path this pass.
+        if (d->object_ && d->object_->nt_ && d->object_->nt_->pass_ready) continue;
+        if (!d->visible_) continue;
+        if (d->ecs_culled_hint_ && (draw_mode == DrawMode::kForward ||
+                                    draw_mode == DrawMode::kDepthPrepass)) {
+            continue;
+        }
+        if (!d->ntEligible(draw_mode)) continue;
+        d->ntPrepare(cmd_buf, draw_mode, depth_only, csm_cascade_idx);
+    }
+
+    // Once-a-second summary (the forward hook runs exactly once a frame).
+    if (draw_mode == DrawMode::kForward) {
+        static uint32_t s_calls = 0;
+        if (++s_calls % 120u == 0u) {
+            uint32_t n_drawables = 0, dispatches = 0, draws = 0, uploads = 0,
+                     grows = 0, records = 0, slots = 0;
+            for (auto& d : drawables) {
+                if (!d || !d->object_ || !d->object_->nt_) continue;
+                auto& nt = *d->object_->nt_;
+                if (!nt.usable) continue;
+                ++n_drawables;
+                dispatches += nt.stat_dispatches;
+                draws += nt.stat_draws;
+                uploads += nt.stat_uploads;
+                grows += nt.stat_grow;
+                records += nt.record_count;
+                slots += nt.total_slots;
+                nt.stat_dispatches = 0;
+                nt.stat_draws = 0;
+                nt.stat_uploads = 0;
+                nt.stat_grow = 0;
+                nt.stat_records = 0;
+            }
+            if (n_drawables > 0) {
+                std::cout << "[drawable.nt] drawables=" << n_drawables
+                          << " records=" << records
+                          << " bucket_slots=" << slots
+                          << " cull_dispatches/120f=" << dispatches
+                          << " bucket_draws/120f=" << draws
+                          << " uploads/120f=" << uploads
+                          << " grows/120f=" << grows
+                          << std::endl;
+            }
+        }
+    }
+}
+
+void DrawableObject::ntPrepare(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    DrawMode draw_mode,
+    bool depth_only,
+    uint32_t csm_cascade_idx) {
+    stagePerDrawState();
+    if (!isReady() || !object_->instance_buffer_.buffer ||
+        !object_->indirect_draw_cmd_.buffer || !nt_device_) {
+        return;
+    }
+    const auto& device = nt_device_;
+
+    // Same order draw() runs them in: band selection (memoised on the
+    // eye), flat node list, survivor lists.
+    selectPlantLodBands(object_, object_->m_current_instance_world_);
+    const int32_t root_node =
+        object_->default_scene_ >= 0 ? object_->default_scene_ : 0;
+    buildMeshNodeFlatList(object_, root_node);
+    if (!object_->has_plant_lod_) return;
+    rebuildLodSurvivorLists(object_);
+    // draw()'s empty-pass elimination — no point culling for a pass that
+    // would return before issuing anything.
+    if (draw_mode == DrawMode::kGlassAttr && !object_->any_blend_prims_) return;
+
+    if (!object_->nt_) object_->nt_ = std::make_shared<NodeTableGpu>();
+    NodeTableGpu& nt = *object_->nt_;
+    nt.pass_ready = false;
+    ntBuildTables(device, object_, nt);
+    if (!nt.usable) return;
+    ntStageRecords(object_, nt);
+
+    const bool depth_class = depth_only;
+    const uint32_t class_count = depth_class ? nt.depth_count : nt.fwd_count;
+    const uint32_t class_first = depth_class ? nt.fwd_count : 0u;
+    const uint64_t serial = nt_frame_serial_;
+    const uint32_t parity = uint32_t(serial & 1u);
+
+    ntExpireRetired(device, nt, serial);
+    ntEnsureBuffers(device, nt, serial);
+    ntUploadParity(device, nt, parity);
+    ntWriteDescriptorSets(device, object_->shared_descriptor_pool_,
+                          nt_cull_desc_set_layout_, node_table_desc_set_layout_,
+                          object_, nt, parity);
+
+    // ── Pass mode (mirrors draw()'s list choice + drawMesh's filters) ─
+    uint32_t mode = NT_MODE_OPAQUE;
+    if (draw_mode == DrawMode::kDepthPrepass) {
+        mode = NT_MODE_PREPASS;
+    } else if (draw_mode == DrawMode::kGlassAttr) {
+        mode = NT_MODE_GLASS;
+    } else if (draw_mode == DrawMode::kForward && s_fwd_covered_window &&
+               s_deferred_relight_armed) {
+        mode = NT_MODE_FWD_COVERED;
+    }
+
+    // ── Cull volume, in drawable space ────────────────────────────────
+    // plane' = transpose(W) * plane keeps the world signed distance for a
+    // drawable-space point; the sphere radius is scaled by W's largest
+    // axis, exactly as the CPU pre-test does.
+    glsl::NtCullPushConstants pc{};
+    const glm::mat4 iw = object_->m_current_instance_world_;
+    const glm::mat4 iwT = glm::transpose(iw);
+    uint32_t plane_count = 0u;
+    if (!depth_only && s_frustum_cull_active) {
+        for (int p = 0; p < 6; ++p) pc.planes[p] = iwT * s_frustum_planes[p];
+        plane_count = 6u;
+    } else if (depth_only && s_shadow_cull_active) {
+        // At most six of the swept volume's planes fit the push block;
+        // dropping a plane only makes the test more conservative.
+        plane_count = std::min(s_shadow_plane_count, 6u);
+        for (uint32_t p = 0; p < plane_count; ++p) {
+            pc.planes[p] = iwT * s_shadow_planes[p];
+        }
+    }
+    pc.plane_count = plane_count;
+    pc.record_first = class_first;
+    pc.record_count = class_count;
+    pc.mode = mode;
+    pc.iw_scale = glm::max(
+        glm::length(glm::vec3(iw[0])),
+        glm::max(glm::length(glm::vec3(iw[1])),
+                 glm::length(glm::vec3(iw[2]))));
+
+    // ── Record: previous readers → zero counts → cull → readers ───────
+    const renderer::BufferResourceInfo indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+    const renderer::BufferResourceInfo vs_read = {
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, VERTEX_SHADER_BIT) };
+    const renderer::BufferResourceInfo compute_write = {
+        SET_FLAG_BIT(Access, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    const renderer::BufferResourceInfo compute_rw = {
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    const renderer::BufferResourceInfo compute_read = {
+        SET_FLAG_BIT(Access, SHADER_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    const renderer::BufferResourceInfo transfer_write = {
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+    const renderer::BufferResourceInfo host_write = {
+        SET_FLAG_BIT(Access, HOST_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, HOST_BIT) };
+
+    cmd_buf->addBufferBarrier(nt.cmds.buffer, indirect_read, compute_write);
+    cmd_buf->addBufferBarrier(nt.slots.buffer, vs_read, compute_write);
+    cmd_buf->addBufferBarrier(nt.counts.buffer, indirect_read, transfer_write);
+    cmd_buf->fillBuffer(nt.counts.buffer, 0,
+                        uint64_t(nt.num_gprims) * sizeof(uint32_t), 0u);
+    cmd_buf->addBufferBarrier(nt.counts.buffer, transfer_write, compute_rw);
+    // Host-written tables of this parity.
+    cmd_buf->addBufferBarrier(nt.infos[parity].buffer, host_write, compute_read);
+    cmd_buf->addBufferBarrier(nt.class_idx[parity].buffer, host_write, compute_read);
+    cmd_buf->addBufferBarrier(nt.prim_bases[parity].buffer, host_write, compute_read);
+    cmd_buf->addBufferBarrier(nt.prim_flags_buf.buffer, host_write, compute_read);
+    cmd_buf->addBufferBarrier(nt.records[parity].buffer, host_write, vs_read);
+
+    if (class_count > 0u) {
+        cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE,
+                              nt_cull_pipeline_);
+        cmd_buf->bindDescriptorSets(
+            renderer::PipelineBindPoint::COMPUTE,
+            nt_cull_pipeline_layout_,
+            { nt.cull_desc_sets[parity] },
+            0);
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            nt_cull_pipeline_layout_,
+            &pc,
+            sizeof(pc));
+        cmd_buf->dispatch((class_count + 63u) / 64u, 1u, 1u);
+    }
+
+    cmd_buf->addBufferBarrier(nt.cmds.buffer, compute_write, indirect_read);
+    cmd_buf->addBufferBarrier(nt.slots.buffer, compute_write, vs_read);
+    cmd_buf->addBufferBarrier(nt.counts.buffer, compute_rw, indirect_read);
+
+    nt.pass_ready = true;
+    nt.pass_parity = parity;
+    nt.pass_mode = mode;
+    nt.pass_depth_class = depth_class;
+    nt.pass_draw_mode = int(draw_mode);
+    nt.pass_cascade = csm_cascade_idx;
+    ++nt.stat_dispatches;
+    nt.stat_records += class_count;
+    s_draw_stats.nt_records += class_count;
+}
+
+void DrawableObject::ntDraw(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_set_list,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    DrawMode draw_mode,
+    uint32_t csm_cascade_idx) {
+    NodeTableGpu& nt = *object_->nt_;
+    const uint32_t parity = nt.pass_parity;
+    const bool depth_class = nt.pass_depth_class;
+    const uint32_t mode = nt.pass_mode;
+    const auto& device = nt_device_;
+    if (!device) return;
+    const auto& materials = object_->materials_;
+
+    NtPassMode pass = kNtPassForward;
+    switch (draw_mode) {
+        case DrawMode::kForward:       pass = kNtPassForward;       break;
+        case DrawMode::kGBuffer:       pass = kNtPassGBuffer;       break;
+        case DrawMode::kGlassAttr:     pass = kNtPassGlass;         break;
+        case DrawMode::kDepthPrepass:  pass = kNtPassDepthPrepass;  break;
+        case DrawMode::kShadow:        pass = kNtPassShadow;        break;
+        case DrawMode::kCsmLayered:    pass = kNtPassCsmLayered;    break;
+        case DrawMode::kCsmPerCascade: pass = kNtPassCsmPerCascade; break;
+        default: return;
+    }
+    const bool depth_shape = (pass >= kNtPassDepthPrepass);
+    auto& pipelines = nt_pipeline_lists_[pass];
+    const bool cluster_active = engine::helper::clusterIndirectActive();
+
+    // Lazy _NT pipeline: the classic creator for this pass mode, with the
+    // vertex-shader name switched to the GPU_NODE_TABLE permutation.
+    auto create_pipeline = [&](const ego::PrimitiveInfo& prim)
+        -> std::shared_ptr<renderer::Pipeline> {
+        const bool is_opaque = isPrimitiveOpaque(prim, materials);
+        const bool has_mat = prim.material_idx_ >= 0;
+        std::shared_ptr<renderer::Pipeline> p;
+        s_shader_nt_variant = true;
+        try {
+            switch (pass) {
+                case kNtPassForward:
+                    p = createDrawablePipeline(
+                        device, nt_formats_forward_, drawable_pipeline_layout_,
+                        nt_graphic_pipeline_info_, prim);
+                    break;
+                case kNtPassGBuffer:
+                    if (gbuffer_formats_valid_ && has_mat) {
+                        p = createDrawableGbufferPipeline(
+                            device, gbuffer_renderbuffer_formats_,
+                            drawable_pipeline_layout_,
+                            nt_graphic_pipeline_info_, prim);
+                    }
+                    break;
+                case kNtPassGlass:
+                    if (has_mat) {
+                        p = createDrawableGlassPipeline(
+                            device, nt_formats_forward_, drawable_pipeline_layout_,
+                            nt_graphic_pipeline_info_, prim);
+                    }
+                    break;
+                case kNtPassDepthPrepass:
+                    p = createDrawableDepthPrepassPipeline(
+                        device, nt_formats_depth_only_, drawable_pipeline_layout_,
+                        nt_graphic_pipeline_info_, prim, is_opaque);
+                    break;
+                case kNtPassShadow:
+                    p = createDrawableShadowPipeline(
+                        device, nt_formats_shadow_, drawable_pipeline_layout_,
+                        nt_graphic_pipeline_info_, prim, is_opaque);
+                    break;
+                case kNtPassCsmLayered:
+                    p = createDrawableCsmLayeredPipeline(
+                        device, nt_formats_shadow_, drawable_pipeline_layout_,
+                        nt_graphic_pipeline_info_, prim, is_opaque);
+                    break;
+                case kNtPassCsmPerCascade:
+                    p = createDrawableCsmPerCascadePipeline(
+                        device, nt_formats_shadow_, drawable_pipeline_layout_,
+                        nt_graphic_pipeline_info_, prim, is_opaque);
+                    break;
+                default:
+                    break;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "[drawable.nt] _NT pipeline build failed (pass "
+                      << int(pass) << "): " << e.what()
+                      << " -- bucket skipped" << std::endl;
+            p = nullptr;
+        }
+        s_shader_nt_variant = false;
+        return p;
+    };
+
+    // Per-drawable / per-pass push constant image.  The per-node fields
+    // (model matrix, interior bit, dissolve weight, per-instance band
+    // bits) come from the record table; lod_fade carries the bucket's
+    // first slot as uint bits.
+    glsl::ModelParams pc{};
+    pc.model_mat = glm::mat4(1.0f);
+    pc.flip_uv_coord =
+        MODEL_FLAG_NODE_TABLE |
+        (object_->m_vegetation_sway_ ? MODEL_FLAG_VEGETATION_SWAY : 0x00u) |
+        (s_deferred_relight_armed ? MODEL_FLAG_DEFERRED_RELIGHT : 0x00u);
+    pc.cascade_idx = csm_cascade_idx;
+    pc.debug_force_red = 0u;
+    pc.debug_skip_skinning = 0u;
+    pc.clutter_fade_start_m = object_->m_clutter_fade_start_m_;
+    pc.clutter_fade_end_m = object_->m_clutter_fade_end_m_;
+
+    // The record + slot tables of this pass's parity.
+    cmd_buf->bindDescriptorSets(
+        renderer::PipelineBindPoint::GRAPHICS,
+        drawable_pipeline_layout_,
+        { nt.vs_desc_sets[parity] },
+        NODE_TABLE_PARAMS_SET);
+    ++s_draw_stats.desc_binds;
+
+    size_t last_hash = 0;
+    const ego::PrimitiveInfo* bound_prim = nullptr;
+    uint32_t bound_lod = 0xFFFFFFFFu;
+    int32_t bound_mat = -2;
+    static thread_local std::vector<std::shared_ptr<renderer::Buffer>> s_vbufs;
+    static thread_local std::vector<uint64_t> s_voffs;
+    static thread_local renderer::DescriptorSetList s_desc_sets;
+
+    for (uint32_t gp : nt.gp_order) {
+        const glm::uvec2 pb = nt.stage_prim_bases[gp];
+        if (pb.y == 0u) continue;
+        // Buckets no survivor of this class references stay empty on the
+        // GPU too — skip the draw rather than issue a zero-count one.
+        if ((depth_class ? nt.cnt_dep[gp] : nt.cnt_fwd[gp]) == 0u) continue;
+        const uint32_t pf = nt.gp_flags[gp];
+        if (mode == NT_MODE_GLASS) {
+            if ((pf & NT_PRIM_BLEND) == 0u) continue;
+        } else {
+            if ((pf & NT_PRIM_BLEND) != 0u) continue;
+            if (mode == NT_MODE_PREPASS && (pf & NT_PRIM_OPAQUE) == 0u) continue;
+        }
+        const auto& mesh = object_->meshes_[nt.gp_mesh[gp]];
+        // Cluster-owned meshes are drawn by the cluster renderer (same
+        // rule drawMesh applies).
+        if (cluster_active && mesh.cluster_global_mesh_idx_ >= 0) continue;
+        const auto& prim = mesh.primitives_[nt.gp_local[gp]];
+        if (prim.tag_.has_skin_set_0) continue;
+
+        const size_t hash = depth_shape
+            ? getDepthonlyHashForMaterial(prim, materials)
+            : prim.getHash();
+        auto pipe_it = pipelines.find(hash);
+        if (pipe_it == pipelines.end()) {
+            pipe_it = pipelines.emplace(hash, create_pipeline(prim)).first;
+        }
+        if (!pipe_it->second) continue;
+
+        if (hash != last_hash) {
+            cmd_buf->bindPipeline(renderer::PipelineBindPoint::GRAPHICS,
+                                  pipe_it->second);
+            cmd_buf->setViewports(viewports, 0, uint32_t(viewports.size()));
+            cmd_buf->setScissors(scissors, 0, uint32_t(scissors.size()));
+            last_hash = hash;
+        }
+
+        const uint32_t cur_lod = (uint32_t)std::max(
+            0, std::min((int32_t)forced_geo_lod_,
+                        (int32_t)prim.index_desc_.size() - 1));
+        if (bound_prim != &prim || bound_lod != cur_lod) {
+            const auto& attrib_list = prim.attribute_descs_;
+            s_vbufs.resize(attrib_list.size());
+            s_voffs.resize(attrib_list.size());
+            for (size_t i_attrib = 0; i_attrib < attrib_list.size(); ++i_attrib) {
+                const auto& buffer_view =
+                    object_->buffer_views_[attrib_list[i_attrib].buffer_view];
+                s_vbufs[i_attrib] = object_->buffers_[buffer_view.buffer_idx].buffer;
+                s_voffs[i_attrib] = attrib_list[i_attrib].buffer_offset;
+            }
+            cmd_buf->bindVertexBuffers(0, s_vbufs, s_voffs);
+            const auto& index_buffer_view =
+                object_->buffer_views_[prim.index_desc_[cur_lod].buffer_view];
+            cmd_buf->bindIndexBuffer(
+                object_->buffers_[index_buffer_view.buffer_idx].buffer,
+                prim.index_desc_[cur_lod].offset + index_buffer_view.offset,
+                prim.index_desc_[cur_lod].index_type);
+            bound_prim = &prim;
+            bound_lod = cur_lod;
+        }
+        if (bound_mat != prim.material_idx_) {
+            s_desc_sets = desc_set_list;
+            if (prim.material_idx_ >= 0 &&
+                prim.material_idx_ < int32_t(materials.size())) {
+                s_desc_sets[PBR_MATERIAL_PARAMS_SET] =
+                    materials[prim.material_idx_].desc_set_;
+            }
+            cmd_buf->bindDescriptorSets(
+                renderer::PipelineBindPoint::GRAPHICS,
+                drawable_pipeline_layout_,
+                s_desc_sets);
+            ++s_draw_stats.desc_binds;
+            bound_mat = prim.material_idx_;
+        }
+
+        std::memcpy(&pc.lod_fade, &pb.x, sizeof(pc.lod_fade));
+        cmd_buf->pushConstants(
+            SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT),
+            drawable_pipeline_layout_,
+            &pc,
+            sizeof(pc));
+        cmd_buf->drawIndexedIndirectCount(
+            nt.cmds,
+            uint64_t(pb.x) * sizeof(renderer::DrawIndexedIndirectCommand),
+            nt.counts,
+            uint64_t(gp) * sizeof(uint32_t),
+            pb.y,
+            sizeof(renderer::DrawIndexedIndirectCommand));
+        ++s_draw_stats.nt_draws;
+        ++s_draw_stats.prims;
+        ++nt.stat_draws;
+    }
 }
 
 void DrawableObject::update(
@@ -12743,8 +14110,18 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                             glm::min(inst_mesh->inst_bbox_min_, w);
                         inst_mesh->inst_bbox_max_ =
                             glm::max(inst_mesh->inst_bbox_max_, w);
+                        // Per-NODE range bounds (see NodeInfo::
+                        // node_inst_bbox_*): the same corners, but
+                        // accumulated only over this node's own slice
+                        // of the table.  This is what the cull sphere
+                        // in DrawableObject::draw is built from.
+                        node.node_inst_bbox_min_ =
+                            glm::min(node.node_inst_bbox_min_, w);
+                        node.node_inst_bbox_max_ =
+                            glm::max(node.node_inst_bbox_max_, w);
                     }
                     inst_mesh->has_inst_bbox_ = true;
+                    node.has_node_inst_bbox_ = true;
                 }
             }
             if (bake) {

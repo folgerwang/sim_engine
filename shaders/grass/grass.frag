@@ -196,7 +196,8 @@ void main() {
     vec3 f_diffuse  = getIBLRadianceLambertian(N, diffuse_color) * ao;
     vec3 f_specular = getIBLRadianceGGX(N, V, rough, f0, mip_count) * ao;
 
-    outColor = vec4(sceneTonemap(f_diffuse + f_specular), 1.0f);
+    outColor = vec4(sceneTonemapExposed(f_diffuse + f_specular,
+        sceneExposureScaleOf(camera_info.exposure_scale)), 1.0f);
 
     uint dbg_mode =
         (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)

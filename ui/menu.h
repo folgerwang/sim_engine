@@ -241,6 +241,17 @@ class Menu {
     FootIkParams foot_ik_params_;
     float        foot_ik_pelvis_drop_live_ = 0.0f;  // read-only readout
     bool turn_off_water_pass_ = false;
+    // Rendering > Terrain > "Water surface only (debug)": the terrain
+    // tiles and grass are not drawn and the water surface is painted
+    // OPAQUE wherever the water layer says there is any column at all
+    // (no depth-tested bed to hide it, no shoreline fade, no
+    // transmission).  Shows exactly what the water pass produces.
+    bool water_surface_only_ = false;
+    // Rendering > Terrain > "Show water column on terrain": tints the
+    // ground magenta where the engine's layer holds a water body and
+    // yellow where it holds a thin sheet -- where the water PASS would
+    // draw, independent of whether the surface ends up visible.
+    bool water_column_overlay_ = false;
     // Defaults to ON (checked) because the tile grass pass was hard-off
     // for a long time: TerrainSceneView::m_b_render_grass_ was a literal
     // `false` with no setter, so the pass never ran.  Now that the menu
@@ -276,6 +287,26 @@ class Menu {
     float dof_focus_dist_m_ = 20.0f;
     float dof_focus_range_m_ = 4.0f;
     float dof_max_coc_px_ = 10.0f;
+    // ── Camera & Lens (Rendering ▸ Camera & Lens) ──────────────────
+    // A physical camera: focal length + sensor size set the field of
+    // view (lens zoom); focal length + f-stop + focus distance set the
+    // depth of field (dof_resolve.comp's thin-lens circle of confusion);
+    // shutter + f-stop + ISO set the exposure relative to the calibrated
+    // default look (ViewCameraInfo::exposure_scale).  Off = the engine's
+    // historical fixed FOV, the legacy DOF heuristic, no exposure scale.
+    bool  cam_physical_       = true;
+    int   cam_sensor_preset_  = 0;        // index into the preset table in menu.cpp
+    float cam_sensor_w_mm_    = 36.0f;
+    float cam_sensor_h_mm_    = 24.0f;
+    // 21.5 mm on a 24 mm-high sensor reproduces the vertical FOV the
+    // engine has always rendered with (its "45.0f" FOV is consumed as
+    // RADIANS by glm::perspective, which folds to 1.0177 rad = 58.3°).
+    float cam_focal_mm_       = 21.5f;
+    float cam_fstop_          = 5.6f;
+    float cam_shutter_inv_    = 125.0f;   // 1/x s
+    float cam_iso_            = 100.0f;
+    bool  cam_exposure_on_    = false;    // shutter / aperture / ISO drive exposure
+    static constexpr float kCamLegacyFovYRad = 1.0177f;
     bool turn_off_shadow_pass_ = false;
     // CSM silhouette prepass — fills each cascade's in-camera-frustum
     // region with depth=1 over a 0-cleared depth buffer so out-of-frustum
@@ -283,8 +314,40 @@ class Menu {
     // turn off to measure baseline shadow pass cost without the
     // optimization.  See csm_silhouette_prepass.mesh for details.
     bool csm_silhouette_prepass_enabled_ = true;
+    // GPU node-table draws for the placed world (DrawableObject::
+    // ntBeginPass): the LOD survivor lists are culled by a compute pass
+    // and drawn with one drawIndexedIndirectCount per primitive bucket
+    // instead of one push + draw per node per pass.  Off = the classic
+    // per-node recording path, for A/B comparison.
+    bool gpu_node_table_enabled_ = true;
+    // Per-mesh BLAS + TLAS instances for the instanced RT casters
+    // (ClusterRenderer::ensureRtMeshSlot).  Off = the legacy world-space
+    // copy bake merged into the cluster staging (rebuild hitch every
+    // kRtInstRebuildMoveM metres), for A/B comparison.
+    bool rt_per_mesh_blas_enabled_ = true;
+    // Caster window radius around the eye for the per-mesh path
+    // (updateRtInstancedCasters): every instanced caster inside it is a
+    // TLAS candidate, budget permitting.  Wider = shadows reach farther
+    // before the window edge, at a longer TLAS build.
+    float rt_caster_radius_m_ = 512.0f;
+    // Feedback from the last caster selection, for the Shadow menu:
+    // how far the selected set actually reaches (see setRtCasterCoverage).
+    uint32_t rt_caster_count_      = 0;
+    float    rt_caster_full_m_     = 0.0f;   // every caster kept out to here
+    float    rt_caster_large_m_    = 0.0f;   // casters >= 2 m kept out to here
+    bool     rt_caster_budget_hit_ = false;
     // RT shadow/AO bilateral smooth pass (trace → filter → shade).
     bool rt_smoothing_ = true;
+    // Temporal accumulation of the traced shadow/AO (rt_temporal.comp,
+    // runs after the à-trous chain).  ON by default together with the
+    // reduced per-pixel ray budget below; OFF restores single-frame
+    // results (raise the ray count to compensate).
+    bool rt_temporal_ = true;
+    // Hardware ray-query cone samples per pixel for the sun shadow
+    // (1..8).  2 with the accumulator on is visually on par with the old
+    // fixed 8 at a quarter of the trace cost; the AO budget follows at
+    // half this count.
+    int  rt_samples_per_px_ = 2;
     // Screen-probe GI (Lumen-style screen probe gather).  ON: indirect
     // diffuse is traced at ONE probe per 16x16 pixel tile (64
     // hemi-octahedral rays each, SH-projected, bilaterally gathered) —
@@ -1890,6 +1953,13 @@ public:
     // it polls s_mat_classifier_future.
     // Frame cap consumed by RealWorldApplication::mainLoop (0 = uncapped).
     int  fpsCap() const { return fps_cap_; }
+    // Perf run: 0 = uncapped (the cap sleeps the main loop to 60 Hz).
+    void setFpsCap(int cap) { fps_cap_ = std::max(0, cap); }
+    // Perf-run A/B switches (--perf-legacy): the Tier 1/2 render paths.
+    void setGpuNodeTableEnabled(bool on) { gpu_node_table_enabled_ = on; }
+    void setRtPerMeshBlasEnabled(bool on) { rt_per_mesh_blas_enabled_ = on; }
+    void setRtTemporal(bool on) { rt_temporal_ = on; }
+    void setRtSamplesPerPx(int n) { rt_samples_per_px_ = std::max(1, std::min(8, n)); }
     // True while the async material classifier is running — mainLoop clamps
     // the frame cap to 30 for the duration.
     bool classifierBusy() const {
@@ -2150,6 +2220,24 @@ public:
     inline bool isCsmSilhouettePrepassEnabled() const {
         return csm_silhouette_prepass_enabled_;
     }
+    // Rendering > Shadow > "GPU node-table draws (placed world)".
+    inline bool isGpuNodeTableEnabled() const {
+        return gpu_node_table_enabled_;
+    }
+    // Rendering > Shadow > "Per-mesh RT BLAS (instanced casters)".
+    inline bool isRtPerMeshBlasEnabled() const {
+        return rt_per_mesh_blas_enabled_;
+    }
+    // Rendering > Shadow > "RT caster radius".
+    inline float getRtCasterRadiusM() const { return rt_caster_radius_m_; }
+    // Pushed by updateRtInstancedCasters after every selection.
+    inline void setRtCasterCoverage(uint32_t count, float full_m,
+                                    float large_m, bool budget_hit) {
+        rt_caster_count_      = count;
+        rt_caster_full_m_     = full_m;
+        rt_caster_large_m_    = large_m;
+        rt_caster_budget_hit_ = budget_hit;
+    }
     // Shadow technique (Rendering > Shadow).
     inline ShadowTechnique getShadowTechnique() const {
         return shadow_technique_;
@@ -2182,6 +2270,9 @@ public:
     // Shadow > "Smooth RT shadow/AO").  Applies to the software/hardware
     // RT techniques (not ReSTIR — its estimator owns its own noise).
     inline bool isRtSmoothingOn() const { return rt_smoothing_; }
+    // Rendering > Shadow > "Temporal RT shadow/AO" and "RT rays/px".
+    inline bool isRtTemporalOn() const { return rt_temporal_; }
+    inline int  getRtSamplesPerPx() const { return rt_samples_per_px_; }
 
     // Rendering > Shadow > "Screen-probe GI (Lumen-style)".  Selects the
     // screen probe gather over the per-pixel GI ray — see the member
@@ -2210,6 +2301,31 @@ public:
     inline float getDofFocusDistM() const { return dof_focus_dist_m_; }
     inline float getDofFocusRangeM() const { return dof_focus_range_m_; }
     inline float getDofMaxCocPx() const { return dof_max_coc_px_; }
+    // Camera & Lens (Rendering > Camera & Lens).
+    inline bool  isCamPhysical() const { return cam_physical_; }
+    inline float getCamFocalMm() const { return cam_focal_mm_; }
+    inline float getCamFStop() const { return cam_fstop_; }
+    inline float getCamSensorHmm() const { return cam_sensor_h_mm_; }
+    inline float getCamSensorWmm() const { return cam_sensor_w_mm_; }
+    // Vertical FOV in radians from focal length and sensor height.
+    inline float getCamFovYRad() const {
+        return cam_physical_
+            ? 2.0f * std::atan(cam_sensor_h_mm_ /
+                               (2.0f * std::max(cam_focal_mm_, 1.0f)))
+            : kCamLegacyFovYRad;
+    }
+    // EV100 = log2(N^2 / t) - log2(ISO / 100).
+    static inline float camEv100(float fstop, float shutter_inv, float iso) {
+        return std::log2(std::max(fstop * fstop * shutter_inv, 1e-6f)) -
+               std::log2(std::max(iso, 1.0f) / 100.0f);
+    }
+    // Exposure relative to the default lens (f/5.6, 1/125 s, ISO 100):
+    // 2^(EV_default - EV_current).  1 when the lens does not drive it.
+    inline float getCamExposureScale() const {
+        if (!cam_physical_ || !cam_exposure_on_) return 1.0f;
+        return std::exp2(camEv100(5.6f, 125.0f, 100.0f) -
+                         camEv100(cam_fstop_, cam_shutter_inv_, cam_iso_));
+    }
 
     // Rendering > Shadow > "Auto-arm RT when ready".  OFF pins the CSM
     // fallback for the whole session so the shadow technique never
@@ -2260,6 +2376,8 @@ public:
     inline bool isWaterPassTurnOff() {
         return turn_off_water_pass_;
     }
+    inline bool isWaterSurfaceOnly() const { return water_surface_only_; }
+    inline bool isWaterColumnOverlay() const { return water_column_overlay_; }
 
     inline bool isGrassPassTurnOff() {
         return turn_off_grass_pass_;
