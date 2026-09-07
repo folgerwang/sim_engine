@@ -25,9 +25,12 @@ layout(std430, set = NODE_TABLE_PARAMS_SET, binding = NODE_TABLE_SLOTS_BINDING) 
     uint node_slots[];
 };
 ModelParams model_params;
+// Per-node plant extent for the sway (see ModelParams::debug_skip_skinning).
+uint veg_plant_bits = 0u;
 void ntLoadModelParams() {
     const uint slot = floatBitsToUint(pc_params.lod_fade) + uint(gl_DrawIDARB);
     model_params = node_params[node_slots[slot]];
+    veg_plant_bits = model_params.debug_skip_skinning;
     // Per-drawable / per-pass fields always come from the push constant;
     // the record keeps the node's own bits (flips, interior) and its
     // dissolve weight (0 = steady; per-instance bands carry theirs in
@@ -46,6 +49,8 @@ void ntLoadModelParams() {
 layout(push_constant) uniform ModelUniformBufferObject {
     ModelParams model_params;
 };
+// Classic path: the push constant IS the node's record.
+#define veg_plant_bits (model_params.debug_skip_skinning)
 #endif
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
@@ -148,7 +153,8 @@ void main() {
         position_ws += vegSwayOffset(inst_t, position_ls.y,
                                      camera_info.time_s,
                                      local_world_rot_mat * vec3(0.0f, 1.0f,
-                                                                0.0f));
+                                                                0.0f),
+                                     veg_plant_bits);
     }
 #ifdef CSM_PER_CASCADE
     // Per-cascade VP picked by model_params.cascade_idx (written by
@@ -164,6 +170,7 @@ void main() {
     out_data.vertex_position = position_ws;
     out_data.vertex_ilod_fade = 1.0;
     out_data.vertex_node_flags = 0.0;
+    out_data.vertex_sway = 0.0;   // depth-only: nobody reads it
     // ── Per-instance LOD hard pick (depth / shadow passes) ───────────
     // Same packed band window as base.vert, but collapsed to a hard
     // midpoint ownership test — the depth pipelines don't run the

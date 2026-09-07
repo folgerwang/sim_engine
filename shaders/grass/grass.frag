@@ -87,9 +87,15 @@ layout(location = 0) out vec4 outColor;
 //   live  — fresh leaf, green ~0.19, red ~0.13, blue ~0.06
 //   dry   — cured straw, warm and a good deal brighter
 //   shade — deep inside the sward, where almost nothing reaches
+// kLeafDry warmer and brighter (0.252/0.206/0.094 -> 0.300/0.232/
+// 0.082): the cured veld in the reference is a saturated gold, not
+// beige.  kLeafShade lifted (0.042/0.062/0.028 -> 0.050/0.090/0.030):
+// the base of that stand is a bright green under-layer of new leaf,
+// not a black hole -- in the photograph the green shows THROUGH the
+// gold everywhere the stems part.
 const vec3 kLeafLive  = vec3(0.128f, 0.188f, 0.062f);
-const vec3 kLeafDry   = vec3(0.252f, 0.206f, 0.094f);
-const vec3 kLeafShade = vec3(0.042f, 0.062f, 0.028f);
+const vec3 kLeafDry   = vec3(0.300f, 0.232f, 0.082f);
+const vec3 kLeafShade = vec3(0.050f, 0.090f, 0.030f);
 
 void main() {
 #ifndef GBUFFER_OUTPUT
@@ -124,7 +130,9 @@ void main() {
     // offset, so a meadow browns in drifts with individual blades still
     // ahead of or behind their neighbours.
     float d = clamp(dry_patch + (hb - 0.5f) * 0.38f, 0.0f, 1.0f);
-    vec3 leaf = mix(kLeafLive, kLeafDry, d * d);
+    // terrainDryCurve, not d*d: the same curve the turf under this
+    // blade browns with (tile.frag), see tile_common.glsl.h.
+    vec3 leaf = mix(kLeafLive, kLeafDry, terrainDryCurve(d));
 
     // Per-blade value jitter — a field is never one dye lot.
     leaf *= 0.80f + 0.42f * fract(hb * 7.31f);
@@ -135,7 +143,10 @@ void main() {
     // drag the blade away from being a plant.
     vec2 world_map_uv = (P.xz - tile_params.world_min) *
                         tile_params.inv_world_range;
-    vec3 ground = texture(src_map_mask, world_map_uv).rgb;
+    // Graded the same way tile.frag grades the ground it lights, so the
+    // blade hue follows the colour the player actually sees.
+    vec3 ground = terrainGradeAlbedo(
+        texture(src_map_mask, world_map_uv).rgb);
     float g_luma = max(dot(ground, vec3(0.299f, 0.587f, 0.114f)), 1e-4f);
     vec3  g_hue  = ground / g_luma;
     leaf = mix(leaf, leaf * g_hue, 0.30f);
@@ -148,7 +159,10 @@ void main() {
     // continuous mass instead of a bed of separate spikes, and it is
     // baked into albedo rather than into the AO channel because the
     // G-buffer's alpha is spoken for (see out_albedo_ao below).
-    float sward = smoothstep(0.0f, 0.52f, v);
+    // On a cured stem the green base reaches further up the blade
+    // (the leaf sheath stays alive after the stem has cured), so the
+    // straw takes over higher on dry blades than on lush ones.
+    float sward = smoothstep(0.0f, mix(0.40f, 0.60f, terrainDryCurve(d)), v);
     vec3 albedo = mix(kLeafShade, leaf, sward);
     albedo = mix(albedo, mix(albedo, kLeafDry, 0.30f),
                  smoothstep(0.70f, 1.0f, v));
@@ -158,6 +172,27 @@ void main() {
 
     // Cured blades are matte; live ones keep a waxy cuticle sheen.
     float rough = mix(0.52f, 0.82f, d);
+
+    // ── Flower head (grass_common.glsl.h) ────────────────────────────
+    // attribs.w is the flower's palette index + 1, 0 for a blade.  The
+    // head disc carries v >= 0.9 (grassBladeVertex), the stalk below it
+    // shades as a blade.  Petals are matte; the disc's centre (v = 0.9,
+    // ring 6, |edge| ~ 0) is the darker eye, the rim is a little paler.
+    float flower = in_data.attribs.w;
+    if (flower > 0.5f) {
+        const vec3 kPetal[4] = vec3[4](
+            vec3(0.80f, 0.78f, 0.64f),     // white / cream
+            vec3(0.88f, 0.64f, 0.08f),     // yellow
+            vec3(0.38f, 0.20f, 0.60f),     // violet
+            vec3(0.82f, 0.30f, 0.44f));    // pink
+        int   ci   = clamp(int(flower - 0.5f), 0, 3);
+        float head = step(kGrassFlowerHeadV, v);
+        float eye  = (1.0f - smoothstep(0.0f, 0.5f, edge)) * (1.0f - smoothstep(0.90f, 1.0f, v));
+        vec3  petal = kPetal[ci] * (0.90f + 0.20f * smoothstep(0.3f, 1.0f, edge));
+        petal = mix(petal, vec3(0.30f, 0.22f, 0.06f), 0.7f * eye);
+        albedo = mix(albedo, petal, head);
+        rough  = mix(rough, 0.72f, head);
+    }
 
     // Ambient occlusion for the ambient term only: a blade near the
     // ground sees less sky.  Floored well clear of the G-buffer

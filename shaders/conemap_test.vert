@@ -25,6 +25,7 @@ void main() {
     vs_out_data.vertex_position = position_ws;
     vs_out_data.vertex_ilod_fade = 1.0;   // per-instance LOD unused here
     vs_out_data.vertex_node_flags = 0.0;
+    vs_out_data.vertex_sway = 0.0;
     vs_out_data.vertex_tex_coord = vec4(in_tex_coord, 0, 0);
     vs_out_data.vertex_normal =
         (matrix_ws * vec4(in_normal, 0.0f)).xyz;

@@ -16,6 +16,7 @@
 #include "global_definition.glsl.h"
 #include "functions.glsl.h"
 #include "brdf.glsl.h"   // D_GGX / V_GGX / F_Schlick for the PBR resolve
+#include "veg_sway.glsl.h"   // vegSwayVec: RT rays launch from the rest pose
 
 // ─── deferred_resolve.comp ────────────────────────────────────────────────
 // Phase 1 deferred lighting compute.
@@ -39,6 +40,7 @@
 //   set 4 = runtime lights (sun + cascade VPs / splits)
 
 #include "ibl.glsl.h"   // declares set 0 IBL + direct_shadow_sampler
+#include "underwater.glsl.h"   // the eye below the surface (needs ibl)
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     readonly buffer CameraInfoBuffer {
@@ -2621,14 +2623,35 @@ void main() {
     // (roughness in nr.z and metallic in em.a are reserved for the eventual
     // GGX path; the current resolve uses Blinn-Phong to match the legacy
     // forward output 1:1, so they're sampled but not yet consumed here.)
-    // em.b is reserved for emissive intensity once cluster materials
-    // start authoring it; for now treat emissive as zero.
+    // em.b is the vegetation wind-sway travel (base.frag encodes it as
+    // metres / kVegSwayEncodeMaxM); emissive is treated as zero.
     vec3  emissive  = vec3(0.0);
 
     // Reconstruct world position from depth + inv_view_proj.
     vec4 ndc = vec4(uv * 2.0 - 1.0, z, 1.0);
     vec4 world_h = camera_info.inv_view_proj * ndc;
     vec3 world_pos = world_h.xyz / world_h.w;
+
+    // ── Where the RT rays launch from: the UNSWAYED surface ──────────
+    // The BLAS/TLAS hold every tree standing still (per-mesh BLAS built
+    // once, static instance transforms) while the raster pass bends the
+    // canopy in the wind.  A ray launched from the swayed pixel position
+    // tests against the still tree: as the leaf travels it slides in
+    // and out of its own static self-shadow -- lit, dark, lit -- which
+    // is the leaf flicker.  Undoing the sway puts the origin back on the
+    // surface the acceleration structure actually contains, so the
+    // self-shadowing is exact again.  CSM (cascades rendered WITH the
+    // sway) and the screen-space tracer (depth buffer, also swayed)
+    // keep the raster position: they see the same geometry the pixel
+    // came from.  0 for everything that is not vegetation, so this is
+    // a no-op off the trees.
+    vec3 rt_pos = world_pos;
+    {
+        float sway_s = em.b * kVegSwayEncodeMaxM;
+        if (sway_s > 0.0) {
+            rt_pos = world_pos - vegSwayVec(sway_s);
+        }
+    }
 
     vec3 V = normalize(camera_info.position - world_pos);
 
@@ -2670,7 +2693,7 @@ void main() {
         // consumed after the AO block below.
     } else if (restir_active) {
         restir_direct = restirDirectLighting(
-            px, sz, uv, world_pos, N, N_geom, albedo, V, shad);
+            px, sz, uv, rt_pos, N, N_geom, albedo, V, shad);
     } else
 #ifdef HW_RT_SHADOW
     if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
@@ -2678,7 +2701,7 @@ void main() {
         // shadow).  Same facing-away early-out as the software path.
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
-                   : hwRtShadowFactor(world_pos, N_geom, vec2(px));
+                   : hwRtShadowFactor(rt_pos, N_geom, vec2(px));
         // NO CSM union any more: the app stops rendering the
         // cascades entirely while an RT technique is armed (design
         // decision -- one shadow algorithm at a time), so sampling
@@ -2696,7 +2719,7 @@ void main() {
         // pixels at zero visual cost (diffuse/spec are ~0 there anyway).
         shad = (dot(N_geom, L) <= 0.0)
                    ? 0.0
-                   : rtShadowFactor(world_pos, N_geom, vec2(px));
+                   : rtShadowFactor(rt_pos, N_geom, vec2(px));
         // Traced term only -- see the hardware branch's note above.
     } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
         // Software screen-space raytraced shadows — checked BEFORE the
@@ -2725,12 +2748,12 @@ void main() {
 #ifdef HW_RT_SHADOW
         if ((camera_info.input_features &
              FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
-            rt_ao = hwRtAoFactor(world_pos, N_geom, vec2(px));
+            rt_ao = hwRtAoFactor(rt_pos, N_geom, vec2(px));
         } else
 #endif
         if ((camera_info.input_features &
              (FEATURE_INPUT_RT_SHADOW | FEATURE_INPUT_RESTIR)) != 0u) {
-            rt_ao = rtAoFactor(world_pos, N_geom, vec2(px));
+            rt_ao = rtAoFactor(rt_pos, N_geom, vec2(px));
         }
     }
 
@@ -3088,6 +3111,25 @@ void main() {
     // keeps mid-tones in place and gives highlights a proper filmic
     // shoulder.  Debug views (dbg_mode != 0) stay raw linearTosRGB so
     // ROUGHNESS/SHADOW/etc. remain readable data, not display imagery.
+    // ── Underwater (underwater.glsl.h) ───────────────────────────────
+    // The eye is below the surface: this pixel is lit by whatever light
+    // reaches ITS depth, and seen through the water between here and
+    // the eye -- up to the surface, if the ray leaves the water on the
+    // way (the shore seen from below).  The water tiles then draw the
+    // surface itself over those pixels (tile_water.frag, from below).
+    // Linear, before the tonemap, so the fog and the sky it is lit by
+    // share one exposure.  Debug views stay raw.
+    if (dbg_mode == 0u && camera_info.underwater_depth > 0.0) {
+        vec3  eye      = camera_info.position;
+        vec3  to_p     = world_pos - eye;
+        float hit_dist = length(to_p);
+        vec3  dir      = to_p / max(hit_dist, 1e-4);
+        float path     = uwPathLength(eye, dir, hit_dist,
+                                      camera_info.water_level_y);
+        color *= uwDepthDimming(camera_info.water_level_y - world_pos.y);
+        color  = uwFog(color, path, uwInscatter(camera_info.underwater_depth));
+    }
+
     if (dbg_mode == 0u) {
         // Glass/water overlay for pixels whose opaque background this
         // dispatch just shaded: only applies when the tagged surface is

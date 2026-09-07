@@ -12,6 +12,7 @@ layout(location = 0) in GrassSeed {
     vec4 root_dry;
     vec4 h_blade;
     vec4 arc;
+    vec4 h_kind;
 } in_seed[];
 
 layout(location = 0) out GrassVsPsData {
@@ -27,7 +28,8 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readon
 void main() {
     float dry = in_seed[0].root_dry.w;
     GrassBlade blade =
-        grassMakeBlade(in_seed[0].root_dry.xz, in_seed[0].h_blade, dry);
+        grassMakeBlade(in_seed[0].root_dry.xz, in_seed[0].h_blade,
+                       in_seed[0].h_kind, dry);
     blade.root_ws = in_seed[0].root_dry.xyz;
     blade.arc     = in_seed[0].arc.xyz;
     // Waterline cull factor from the vertex stage (arc.w) — this stage
@@ -58,8 +60,8 @@ void main() {
             out_data.pos_ws_v = vec4(p_ws, v);
             out_data.nrm_hash = vec4(n_ws, blade.hash);
             out_data.attribs  =
-                vec4(dry, side_sign * kGrassProfile[i_ring].x,
-                     blade.height, 0.0f);
+                vec4(blade.dry, side_sign * kGrassProfile[i_ring].x,
+                     blade.height, blade.flower);
             EmitVertex();
         }
     }

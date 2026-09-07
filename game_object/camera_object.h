@@ -128,6 +128,10 @@ public:
     float getFovY() const { return m_view_camera_params_.fov; }
     // Camera & Lens exposure scale — see ViewCameraInfo::exposure_scale.
     void setExposureScale(float s) { m_view_camera_->setExposureScale(s); }
+    // Underwater -- see ViewCamera::setUnderwater.
+    void setUnderwater(float depth_m, float level_y) {
+        m_view_camera_->setUnderwater(depth_m, level_y);
+    }
 
     virtual glm::vec3 getCameraPos() {
         return m_view_camera_->getCameraInfo().position;

@@ -44,6 +44,120 @@ enum Duty {
     kDutyRetiree, kDutyCommuter, kDutyChildcare, kDutyWorker
 };
 
+// What citizen.frag paints on a part, from its unit-space position.
+// Kind 0 is a plain box (the far tier, the mid tier, hair, heels).
+enum PartKind {
+    kPartPlain = 0, kPartHead, kPartTorso, kPartPelvis, kPartSleeve,
+    kPartForearm, kPartHand, kPartThigh, kPartShin, kPartShoe
+};
+
+// ── A SKELETON ───────────────────────────────────────────────────────
+// Sixteen joints in a tree.  Each has a REST PIVOT in body space
+// (metres; y up, +z the front, the root between the feet) and a local
+// rotation as Euler angles -- x flexion (the hinge every limb had
+// before), z abduction (an arm held out from the body), y twist (the
+// spine turning against the pelvis, the head looking round).  A part
+// hangs off one joint at an offset from its pivot, so a rotation at
+// the hip carries the thigh, the shin, the foot and the shoe.  The
+// fine tier solves this per person per frame; the seven-cube tier
+// keeps its four flat hinges.  Parents precede children in the enum,
+// so one forward pass solves the tree.
+enum Joint {
+    jPelvis = 0, jSpine, jNeck, jHead,
+    jShoulderL, jElbowL, jWristL, jShoulderR, jElbowR, jWristR,
+    jHipL, jKneeL, jAnkleL, jHipR, jKneeR, jAnkleR, jCount
+};
+static const int kJointParent[jCount] = {
+    -1, jPelvis, jSpine, jNeck,
+    jSpine, jShoulderL, jElbowL, jSpine, jShoulderR, jElbowR,
+    jPelvis, jHipL, jKneeL, jPelvis, jHipR, jKneeR};
+
+struct Skeleton {
+    glm::vec3 pivot[jCount];      // rest pivots, body space
+    glm::vec3 rot[jCount];        // local (x flex, y twist, z abduct)
+    glm::mat4 world[jCount];      // solved: joint space -> world
+};
+
+// twist, then abduction, then flexion (flexion innermost, so a hinge
+// reads the same as before whatever else is set)
+glm::mat4 eulerJoint(const glm::vec3& r) {
+    glm::mat4 M(1.0f);
+    if (r.y != 0.0f) M = glm::rotate(M, r.y, glm::vec3(0, 1, 0));
+    if (r.z != 0.0f) M = glm::rotate(M, r.z, glm::vec3(0, 0, 1));
+    if (r.x != 0.0f) M = glm::rotate(M, r.x, glm::vec3(1, 0, 0));
+    return M;
+}
+
+void solveSkeleton(Skeleton& sk, const glm::mat4& root) {
+    for (int j = 0; j < jCount; ++j) {
+        const int pj = kJointParent[j];
+        const glm::vec3 off =
+            pj < 0 ? sk.pivot[j] : sk.pivot[j] - sk.pivot[pj];
+        const glm::mat4& parent = pj < 0 ? root : sk.world[pj];
+        sk.world[j] = parent * glm::translate(glm::mat4(1.0f), off) *
+                      eulerJoint(sk.rot[j]);
+    }
+}
+
+// ── A LOOK ───────────────────────────────────────────────────────────
+// Skin, hair and an outfit per person, hashed from the person id so it
+// is the same every frame and every session.  The wardrobe is a short
+// list of everyday combinations (the two reference photos first: a
+// grey henley over blue jeans with heels, a white short-sleeve shirt
+// over navy slacks with black shoes) and the uniformed duties override
+// it.  Everything here is a colour or a flag the shader reads; no
+// geometry differs between looks except long hair and heels.
+struct Look {
+    glm::vec3 skin{0.9f, 0.75f, 0.62f};
+    glm::vec3 hair{0.2f, 0.12f, 0.08f};
+    glm::vec3 top{0.6f, 0.6f, 0.62f};
+    glm::vec3 bottom{0.22f, 0.33f, 0.55f};
+    glm::vec3 shoe{0.1f, 0.1f, 0.1f};
+    bool female = false;
+    bool long_sleeve = false;
+    bool long_hair = false;
+    bool heels = false;
+    bool stick = false;        // senior: a walking stick, right hand
+    int  top_style = 0;        // 0 tee, 1 buttoned shirt, 2 henley
+    int  bottom_style = 0;     // 0 jeans, 1 slacks
+};
+
+float lookRand(uint32_t id, uint32_t salt) {
+    uint32_t x = id * 0x9E3779B1u + salt * 0x85EBCA6Bu;
+    x ^= x >> 16; x *= 0x7FEB352Du;
+    x ^= x >> 15; x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return float(x & 0xFFFFFFu) / 16777216.0f;
+}
+
+// rgb (0..1) -> one float the shader unpacks exactly (24 bits < 2^24).
+float packRGB(const glm::vec3& c) {
+    const glm::vec3 q = glm::clamp(c, 0.0f, 1.0f) * 255.0f;
+    return float(int(q.r + 0.5f) * 65536 + int(q.g + 0.5f) * 256 +
+                 int(q.b + 0.5f));
+}
+
+int ageEnum(const std::string& a) {
+    if (a == "child") return 1;
+    if (a == "toddler" || a == "infant") return 2;
+    if (a == "senior") return 3;
+    return 0;
+}
+
+// Who keeps a car (v25): an adult or a senior whose duty takes them out
+// of the house -- about two in three of them.  Decided once, from the
+// person id, so it is the same every session.
+bool wantsCar(int duty, int age, uint32_t pid) {
+    if (age == 1 || age == 2) return false;
+    switch (duty) {
+    case kDutyStudent: case kDutyInfant: case kDutyHomemaker:
+    case kDutyChildcare: case kDutyRetiree:
+        return false;
+    default: break;
+    }
+    return lookRand(pid, 0x0CA2u) < 0.62f;
+}
+
 int dutyEnum(const std::string& d) {
     if (d == "doctor") return kDutyDoctor;
     if (d == "nurse") return kDutyNurse;
@@ -80,6 +194,91 @@ glm::vec3 dutyColor(int duty) {
     if (duty < 0 || duty >= int(sizeof(table) / sizeof(table[0])))
         return table[0];
     return table[duty];
+}
+
+Look lookOf(int pid, int duty, int age) {
+    const uint32_t id = uint32_t(pid);
+    auto r = [&](uint32_t s) { return lookRand(id, s); };
+    Look L;
+    L.female = r(1) < 0.5f;
+    static const glm::vec3 kSkins[4] = {
+        {0.93f, 0.78f, 0.66f}, {0.85f, 0.66f, 0.52f},
+        {0.66f, 0.46f, 0.32f}, {0.42f, 0.28f, 0.20f}};
+    L.skin = kSkins[int(r(2) * 4.0f) & 3];
+    static const glm::vec3 kHairs[5] = {
+        {0.08f, 0.06f, 0.05f}, {0.25f, 0.15f, 0.09f},
+        {0.45f, 0.28f, 0.14f}, {0.72f, 0.55f, 0.30f},
+        {0.50f, 0.20f, 0.10f}};
+    L.hair = kHairs[int(r(3) * 5.0f) % 5];
+    if (age == 3) {                              // senior: grey to white
+        L.hair = glm::mix(glm::vec3(0.62f), glm::vec3(0.88f), r(4));
+    }
+    L.long_hair = L.female ? r(5) < 0.75f : r(5) < 0.08f;
+    L.heels = L.female && age == 0 && r(6) < 0.45f;
+    struct Outfit { glm::vec3 top, bottom, shoe; bool ls; int ts, bs; };
+    static const Outfit kWardrobe[10] = {
+        // grey henley, blue jeans, nude heels (reference photo 1)
+        {{0.62f, 0.62f, 0.64f}, {0.22f, 0.33f, 0.55f}, {0.85f, 0.78f, 0.70f}, true,  2, 0},
+        // white short-sleeve shirt, navy slacks, black shoes (photo 2)
+        {{0.95f, 0.95f, 0.94f}, {0.12f, 0.15f, 0.25f}, {0.06f, 0.06f, 0.06f}, false, 1, 1},
+        {{0.55f, 0.70f, 0.85f}, {0.55f, 0.48f, 0.36f}, {0.30f, 0.20f, 0.12f}, true,  1, 1},
+        {{0.20f, 0.40f, 0.30f}, {0.10f, 0.10f, 0.12f}, {0.08f, 0.08f, 0.08f}, false, 0, 0},
+        {{0.75f, 0.20f, 0.18f}, {0.30f, 0.30f, 0.32f}, {0.10f, 0.10f, 0.10f}, false, 0, 1},
+        {{0.96f, 0.93f, 0.85f}, {0.16f, 0.24f, 0.42f}, {0.35f, 0.22f, 0.14f}, true,  1, 0},
+        {{0.15f, 0.18f, 0.30f}, {0.24f, 0.30f, 0.45f}, {0.90f, 0.90f, 0.90f}, true,  0, 0},
+        {{0.85f, 0.55f, 0.25f}, {0.20f, 0.20f, 0.22f}, {0.15f, 0.12f, 0.10f}, false, 0, 0},
+        {{0.30f, 0.55f, 0.60f}, {0.40f, 0.35f, 0.30f}, {0.20f, 0.15f, 0.10f}, false, 1, 1},
+        {{0.92f, 0.80f, 0.85f}, {0.55f, 0.62f, 0.75f}, {0.90f, 0.85f, 0.80f}, true,  2, 0},
+    };
+    const Outfit& o = kWardrobe[int(r(7) * 10.0f) % 10];
+    L.top = o.top; L.bottom = o.bottom; L.shoe = o.shoe;
+    L.long_sleeve = o.ls; L.top_style = o.ts; L.bottom_style = o.bs;
+    switch (duty) {
+    case kDutyDoctor:                            // white coat
+        L.top = {0.95f, 0.95f, 0.96f}; L.long_sleeve = true;
+        L.top_style = 1; L.bottom = {0.20f, 0.22f, 0.30f};
+        L.bottom_style = 1; break;
+    case kDutyNurse:                             // scrubs
+        L.top = {0.45f, 0.62f, 0.80f}; L.bottom = L.top;
+        L.long_sleeve = false; L.top_style = 0; L.bottom_style = 1;
+        L.shoe = {0.9f, 0.9f, 0.9f}; L.heels = false; break;
+    case kDutyPolice:
+        L.top = {0.12f, 0.16f, 0.30f}; L.bottom = {0.10f, 0.12f, 0.22f};
+        L.long_sleeve = true; L.top_style = 1; L.bottom_style = 1;
+        L.shoe = {0.05f, 0.05f, 0.05f}; L.heels = false; break;
+    case kDutyFire:
+        L.top = {0.60f, 0.15f, 0.12f}; L.bottom = {0.15f, 0.15f, 0.17f};
+        L.long_sleeve = true; L.top_style = 1; L.heels = false; break;
+    case kDutyChef:
+        L.top = {0.95f, 0.95f, 0.95f}; L.bottom = {0.20f, 0.20f, 0.22f};
+        L.long_sleeve = true; L.top_style = 1; L.heels = false; break;
+    case kDutyWaiter:
+        L.top = {0.95f, 0.95f, 0.95f}; L.bottom = {0.08f, 0.08f, 0.09f};
+        L.long_sleeve = true; L.top_style = 1; L.bottom_style = 1;
+        L.shoe = {0.05f, 0.05f, 0.05f}; break;
+    case kDutyOfficial: case kDutyOffice:        // office wear
+        L.top = r(8) < 0.5f ? glm::vec3(0.95f, 0.95f, 0.94f)
+                            : glm::vec3(0.70f, 0.78f, 0.88f);
+        L.bottom = {0.16f, 0.18f, 0.26f}; L.long_sleeve = true;
+        L.top_style = 1; L.bottom_style = 1; L.shoe = {0.08f, 0.06f, 0.05f};
+        break;
+    case kDutyInfant:
+        L.top = {0.95f, 0.75f, 0.35f}; L.bottom = {0.35f, 0.55f, 0.80f};
+        L.long_sleeve = false; L.top_style = 0; L.heels = false; break;
+    default: break;
+    }
+    if (age == 1 || age == 2) {
+        // children: tees, shorts on most, sneakers on half; a toddler
+        // in short sleeves whatever the wardrobe said
+        L.heels = false;
+        L.long_hair = L.female && r(9) < 0.6f;
+        L.top_style = L.top_style == 1 ? 0 : L.top_style;
+        if (r(11) < (age == 2 ? 0.7f : 0.5f)) L.bottom_style = 2;
+        if (age == 2) { L.long_sleeve = false; L.top_style = 0; }
+        if (r(13) < 0.5f) L.shoe = {0.90f, 0.90f, 0.88f};
+    }
+    L.stick = age == 3 && r(12) < 0.4f;
+    return L;
 }
 
 float parseClock(const std::string& hhmm) {
@@ -175,6 +374,18 @@ constexpr float kDetailRadius = 300.0f;
 // is visible" is the rule now.
 constexpr size_t kMaxDetailed = 4096;
 constexpr size_t kMaxFarParts = 200000;   // far-tier safety valve
+// The fine tier (rounded sixteen-part figures with clothes and faces):
+// the nearest kMaxFine persons inside kFineRadius.  800 triangles a
+// part (both windings), ~17 parts a person -- 192 of them is ~2.6 M
+// triangles at the worst, which is what caps it.
+// v3: ~5.6k triangles a figure on the skinned meshes -- 256 of them
+// is ~1.4 M, so the band widens.
+constexpr float  kFineRadius = 90.0f;
+// Driving (v25): a trip longer than this on foot is taken by car when
+// the person's car is parked within kBoardR of them.
+constexpr float  kDriveMinM = 320.0f;
+constexpr float  kBoardR = 60.0f;
+constexpr size_t kMaxFine = 256;
 constexpr float kShowRadius = 10000.0f;   // 10 km
 // Sub-pixel cutoff, not a budget: 0.0003 rad of height is about a third
 // of a pixel at 1440p, so this only drops people who could not put a
@@ -329,6 +540,21 @@ std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_pos_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_nrm_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_idx_;
 uint32_t                            CitizenSystem::s_cube_index_count_ = 0;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_round_pos_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_round_nrm_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_round_idx_;
+uint32_t                            CitizenSystem::s_round_index_count_ = 0;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_tube_pos_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_tube_nrm_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_tube_idx_;
+uint32_t                            CitizenSystem::s_tube_index_count_ = 0;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_ball_pos_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_ball_nrm_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_ball_idx_;
+uint32_t                            CitizenSystem::s_ball_index_count_ = 0;
+std::shared_ptr<er::Pipeline>       CitizenSystem::s_skin_pipeline_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_skin_buf_;
+uint32_t                            CitizenSystem::s_skin_capacity_ = 0;
 std::shared_ptr<er::Device>         CitizenSystem::s_device_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_inst_buf_;
 uint32_t                            CitizenSystem::s_inst_capacity_ = 0;
@@ -350,7 +576,7 @@ void CitizenSystem::initStaticMembers(
 
     s_device_ = device;
     std::vector<er::VertexInputBindingDescription> bindings(3);
-    std::vector<er::VertexInputAttributeDescription> attribs(7);
+    std::vector<er::VertexInputAttributeDescription> attribs(8);
     bindings[0].binding = 0;
     bindings[0].stride = sizeof(glm::vec3);
     bindings[0].input_rate = er::VertexInputRate::VERTEX;
@@ -374,7 +600,9 @@ void CitizenSystem::initStaticMembers(
     bindings[2].binding = 2;
     bindings[2].stride = sizeof(PartInstance);
     bindings[2].input_rate = er::VertexInputRate::INSTANCE;
-    for (int k = 0; k < 5; ++k) {
+    // ...plus the sixth vec4 at location 15: (kind, style, packed
+    // accent colour, seed) for the garment painting in citizen.frag.
+    for (int k = 0; k < 6; ++k) {
         attribs[2 + k].binding = 2;
         attribs[2 + k].location = uint32_t(10 + k);
         attribs[2 + k].format = er::Format::R32G32B32A32_SFLOAT;
@@ -397,6 +625,43 @@ void CitizenSystem::initStaticMembers(
         s_pipeline_layout_, bindings, attribs, input_assembly,
         graphic_pipeline_info, shader_modules, frame_buffer_format,
         raster_override, std::source_location::current());
+
+    // ── THE SKIN PIPELINE (fine tier, v3) ───────────────────────────
+    // Same layout and fragment shader; a 12-vec4 instance stream at
+    // locations 3-14 (three 3x4 transforms, colour, paint record,
+    // -- clear of VINPUT_POSITION 0 and VINPUT_NORMAL 2 --
+    // shape) and citizen_skin.vert, which blends each vertex between
+    // the three transforms by its unit height.  Drawn DOUBLE-SIDED:
+    // the meshes carry one winding, and a skinned surface can fold
+    // its back to the camera on the inside of a sharp bend.
+    {
+        std::vector<er::VertexInputBindingDescription> sb(3);
+        std::vector<er::VertexInputAttributeDescription> sa(2 + 12);
+        sb[0] = bindings[0]; sb[1] = bindings[1];
+        sa[0] = attribs[0];  sa[1] = attribs[1];
+        sb[2].binding = 2;
+        sb[2].stride = sizeof(SkinInstance);
+        sb[2].input_rate = er::VertexInputRate::INSTANCE;
+        for (int k = 0; k < 12; ++k) {
+            sa[2 + k].binding = 2;
+            sa[2 + k].location = uint32_t(3 + k);
+            sa[2 + k].format = er::Format::R32G32B32A32_SFLOAT;
+            sa[2 + k].offset = uint32_t(k * sizeof(glm::vec4));
+        }
+        er::RasterizationStateOverride two_sided;
+        two_sided.override_double_sided = true;
+        two_sided.double_sided = true;
+        er::ShaderModuleList sm(2);
+        sm[0] = er::helper::loadShaderModule(
+            device, "citizen_skin_vert.spv",
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+        sm[1] = shader_modules[1];
+        s_skin_pipeline_ = device->createPipeline(
+            s_pipeline_layout_, sb, sa, input_assembly,
+            graphic_pipeline_info, sm, frame_buffer_format,
+            two_sided, std::source_location::current());
+    }
 
     // Unit cube centred at origin, half-extent 1, 24 verts so every
     // face gets its own flat normal.
@@ -438,6 +703,69 @@ void CitizenSystem::initStaticMembers(
         idx.size() * sizeof(idx[0]), idx.data(),
         std::source_location::current());
     s_cube_index_count_ = uint32_t(idx.size());
+
+    // ── The fine tier's meshes (v3): tube, blob, ball ───────────────
+    // Superellipsoids with the same +-1 extents as the cube, so a part
+    // transform means the same thing on any of them.  e1 shapes the
+    // ends (small = flat with a rounded edge, 1 = a dome), e2 the
+    // cross-section (1 = round, small = a rounded square).  One
+    // winding, counter-clockwise from outside; the skin pipeline draws
+    // them double-sided.  The tube has the most rings along its length
+    // because that is the direction it bends in.
+    auto make_shape = [&](float e1, float e2, int kLat, int kLon,
+                          std::shared_ptr<er::BufferInfo>& pos_b,
+                          std::shared_ptr<er::BufferInfo>& nrm_b,
+                          std::shared_ptr<er::BufferInfo>& idx_b,
+                          uint32_t& count) {
+        std::vector<glm::vec3> rp, rn;
+        std::vector<uint32_t> ri;
+        auto sp = [](float x, float p) {
+            return (x < 0.0f ? -1.0f : 1.0f) * std::pow(std::abs(x), p);
+        };
+        for (int i = 0; i <= kLat; ++i) {
+            const float th = -1.5707963f + 3.14159265f * float(i) / kLat;
+            const float ct = std::cos(th), st = std::sin(th);
+            for (int j = 0; j <= kLon; ++j) {
+                const float ph = 6.2831853f * float(j) / kLon;
+                const float cp = std::cos(ph), sn = std::sin(ph);
+                rp.push_back({sp(ct, e1) * sp(cp, e2), sp(st, e1),
+                              sp(ct, e1) * sp(sn, e2)});
+                glm::vec3 n(sp(ct, 2.0f - e1) * sp(cp, 2.0f - e2),
+                            sp(st, 2.0f - e1),
+                            sp(ct, 2.0f - e1) * sp(sn, 2.0f - e2));
+                const float ln = glm::length(n);
+                rn.push_back(ln > 1e-6f ? n / ln : glm::vec3(0, 1, 0));
+            }
+        }
+        for (int i = 0; i < kLat; ++i) {
+            for (int j = 0; j < kLon; ++j) {
+                const uint32_t a = uint32_t(i * (kLon + 1) + j);
+                const uint32_t b = a + 1;
+                const uint32_t c = a + uint32_t(kLon + 1);
+                const uint32_t d = c + 1;
+                ri.insert(ri.end(), {a, c, b, b, c, d});
+            }
+        }
+        pos_b = helper::createUnifiedMeshBuffer(
+            device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            rp.size() * sizeof(rp[0]), rp.data(),
+            std::source_location::current());
+        nrm_b = helper::createUnifiedMeshBuffer(
+            device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            rn.size() * sizeof(rn[0]), rn.data(),
+            std::source_location::current());
+        idx_b = helper::createUnifiedMeshBuffer(
+            device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+            ri.size() * sizeof(ri[0]), ri.data(),
+            std::source_location::current());
+        count = uint32_t(ri.size());
+    };
+    make_shape(0.50f, 1.00f, 14, 12, s_tube_pos_, s_tube_nrm_, s_tube_idx_,
+               s_tube_index_count_);                       // limbs, neck
+    make_shape(0.55f, 0.70f, 10, 16, s_round_pos_, s_round_nrm_,
+               s_round_idx_, s_round_index_count_);        // torso, pelvis
+    make_shape(0.85f, 0.90f, 10, 16, s_ball_pos_, s_ball_nrm_, s_ball_idx_,
+               s_ball_index_count_);                       // head, hands
 }
 
 void CitizenSystem::destroyStaticMembers(
@@ -457,6 +785,26 @@ void CitizenSystem::destroyStaticMembers(
     if (s_cube_nrm_) s_cube_nrm_->destroy(device);
     if (s_cube_idx_) s_cube_idx_->destroy(device);
     s_cube_pos_ = s_cube_nrm_ = s_cube_idx_ = nullptr;
+    if (s_round_pos_) s_round_pos_->destroy(device);
+    if (s_round_nrm_) s_round_nrm_->destroy(device);
+    if (s_round_idx_) s_round_idx_->destroy(device);
+    s_round_pos_ = s_round_nrm_ = s_round_idx_ = nullptr;
+    s_round_index_count_ = 0;
+    if (s_tube_pos_) s_tube_pos_->destroy(device);
+    if (s_tube_nrm_) s_tube_nrm_->destroy(device);
+    if (s_tube_idx_) s_tube_idx_->destroy(device);
+    s_tube_pos_ = s_tube_nrm_ = s_tube_idx_ = nullptr;
+    s_tube_index_count_ = 0;
+    if (s_ball_pos_) s_ball_pos_->destroy(device);
+    if (s_ball_nrm_) s_ball_nrm_->destroy(device);
+    if (s_ball_idx_) s_ball_idx_->destroy(device);
+    s_ball_pos_ = s_ball_nrm_ = s_ball_idx_ = nullptr;
+    s_ball_index_count_ = 0;
+    if (s_skin_pipeline_) device->destroyPipeline(s_skin_pipeline_);
+    s_skin_pipeline_ = nullptr;
+    if (s_skin_buf_) s_skin_buf_->destroy(device);
+    s_skin_buf_ = nullptr;
+    s_skin_capacity_ = 0;
 }
 
 bool CitizenSystem::loadCity(const std::string& city_json_path,
@@ -672,6 +1020,7 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
                         : st == "heavy" ? 1.1f : 1.35f;
             }
             if (p.duty == kDutyStudent) p.speed = 1.5f;
+            p.age = ageEnum(pj.value("age", std::string("adult")));
             if (pj.contains("schedule")) {
                 const auto& sc = pj["schedule"];
                 p.works_weekend = sc.value("works_weekend", false);
@@ -875,6 +1224,7 @@ bool CitizenSystem::loadCity(const std::string& city_json_path,
             synthesizeResidents();
         }
         loaded_ = !persons_.empty();
+        if (loaded_) addOutings();
         district_centre_ = glm::vec2(0.0f);
         if (!buildings_.empty()) {
             for (const auto& b : buildings_) district_centre_ += b.entrance;
@@ -1376,6 +1726,9 @@ void CitizenSystem::placeAll() {
     // whole spawn-on-Play behaviour, without a second placement path
     // that could disagree with the simulation's own.
     sim_.assign(persons_.size(), SimState{});
+    // every car is re-issued at the next placement
+    car_of_.assign(persons_.size(), -2);
+    if (vehicles_) vehicles_->clearVehicles();
     // Restart the clock-rate measurement: the gap across an edit-mode
     // pause is not a rate sample, and a rate carried over from a
     // faster session would sprint everyone for its first second.
@@ -2078,6 +2431,174 @@ CitizenSystem::Anchor CitizenSystem::furnitureAnchor(
     return a;
 }
 
+glm::vec3 CitizenSystem::yardSpot(const Person& p, int pid, int bi,
+                                  float out_extra) const {
+    // ── OUTSIDE A BUILDING ───────────────────────────────────────────
+    // On the doorstep of building bi: 2-5 m out from its entrance,
+    // spread along the front.
+    if (bi >= 0 && bi < int(buildings_.size())) {
+        const Building& b = buildings_[size_t(bi)];
+        glm::vec2 out = b.entrance - b.centre;
+        const float l = glm::length(out);
+        out = l > 0.2f ? out / l : glm::vec2(0.0f, 1.0f);
+        const glm::vec2 side(out.y, -out.x);
+        const glm::vec2 sp = b.entrance +
+            out * (2.0f + 3.0f * h01(uint32_t(pid), 0x33u)) +
+            side * ((h01(uint32_t(pid), 0x34u) - 0.5f) * 6.0f);
+        return {sp.x, b.base_y, sp.y};
+    }
+    // ── THE FRONT YARD ───────────────────────────────────────────────
+    // In front of the house's own front door when the map shipped the
+    // indoor graph (it knows the street doors and the rooms, so the
+    // house's extent and the door's outward side are both known): 2.4
+    // to 5 m out from the door, up to 2.5 m either side of it.  The
+    // old spot was the house centre + (12, 12) m, which on a fenced
+    // lot with 6 m to the neighbour is the neighbour's living room.
+    const glm::vec3& h = houses_[size_t(p.house)];
+    const int gi = (size_t(p.house) < house_graph_.size())
+                       ? house_graph_[size_t(p.house)] : -1;
+    if (gi >= 0 && gi < int(graphs_.size()) &&
+        !graphs_[size_t(gi)].street.empty()) {
+        const IndoorGraph& g = graphs_[size_t(gi)];
+        float hw = 1.0f, hd = 1.0f;
+        for (const NavRoom& r : g.rooms) {
+            hw = std::max(hw, std::abs(r.c.x) + r.hw);
+            hd = std::max(hd, std::abs(r.c.y) + r.hd);
+        }
+        // the FRONT door: the street door furthest along local +z
+        // (house_gen puts the entrance on the +z long wall)
+        int di = g.street.front();
+        for (int k : g.street) {
+            if (g.doors[size_t(k)].storey == 0 &&
+                g.doors[size_t(k)].p.y > g.doors[size_t(di)].p.y) di = k;
+        }
+        const glm::vec2 dp = g.doors[size_t(di)].p;
+        glm::vec2 out;
+        if (std::abs(dp.y) / hd >= std::abs(dp.x) / hw)
+            out = glm::vec2(0.0f, dp.y >= 0.0f ? 1.0f : -1.0f);
+        else
+            out = glm::vec2(dp.x >= 0.0f ? 1.0f : -1.0f, 0.0f);
+        const glm::vec2 side(out.y, -out.x);
+        const glm::vec2 lp = dp +
+            out * (2.4f + 2.6f * h01(uint32_t(pid), 0x35u) + out_extra) +
+            side * ((h01(uint32_t(pid), 0x36u) - 0.5f) * 5.0f);
+        const glm::vec2 w = localToWorld(p.house, lp);
+        return {w.x, h.y, w.y};
+    }
+    // No graph: the seat-based fan beside the house, at garden spacing.
+    const float jx = (h01(uint32_t(pid), 11u) - 0.5f) * 6.0f;
+    const float jz = (h01(uint32_t(pid), 23u) - 0.5f) * 6.0f;
+    const float hcap = float(std::max(1, p.hcount));
+    const float hsi  = float(p.hslot) + 0.5f;
+    const float hth  = hsi * 2.39996323f;
+    const float rr = kYardSpreadR * std::sqrt(hsi / hcap);
+    return {h.x + 8.0f + std::cos(hth) * rr + jx * 0.5f,
+            h.y,
+            h.z + 8.0f + std::sin(hth) * rr + jz * 0.5f};
+}
+
+void CitizenSystem::emitOccupants(const glm::vec3& camera_pos) {
+    if (!vehicles_ || !vehicles_->loaded()) return;
+    std::vector<VehicleSystem::Occupant> occ;
+    vehicles_->occupants(camera_pos, kDetailRadius, occ);
+    for (const auto& o : occ) {
+        Person tp;
+        const float r = h01(o.seed, 0x51u);
+        // who rides: the school bus carries children behind its driver,
+        // the police cruiser police, the fire engine its crew
+        if (o.type == VehicleSystem::kSchoolBus && o.seat >= 1) {
+            tp.duty = kDutyStudent; tp.age = 1;
+        } else if (o.type == VehicleSystem::kPolice) {
+            tp.duty = kDutyPolice; tp.age = 0;
+        } else if (o.type == VehicleSystem::kFireEngine) {
+            tp.duty = kDutyFire; tp.age = 0;
+        } else if (o.type == VehicleSystem::kAmbulance) {
+            tp.duty = kDutyNurse; tp.age = 0;
+        } else {
+            tp.duty = r < 0.35f ? kDutyWorker : r < 0.6f ? kDutyOffice
+                    : r < 0.8f ? kDutyResident : kDutyShop;
+            tp.age = (o.seat >= 1 && h01(o.seed, 0x55u) < 0.12f) ? 3 : 0;
+        }
+        tp.height = tp.age == 1 ? 1.25f + 0.2f * h01(o.seed, 0x53u)
+                                : 1.60f + 0.24f * h01(o.seed, 0x53u);
+        tp.bulk = 0.88f + 0.28f * h01(o.seed, 0x54u);
+        SimState ta;
+        ta.pos = o.pos;
+        ta.yaw = o.yaw;
+        ta.ride = 2;
+        ta.inited = true;
+        ta.cur_step = -1;
+        const float dx = o.pos.x - camera_pos.x, dz = o.pos.z - camera_pos.z;
+        const bool fine = dx * dx + dz * dz < kFineRadius * kFineRadius;
+        emitPerson(int(0x40000000u | (o.seed & 0x3FFFFFFFu)), ta, tp, true, fine);
+    }
+}
+
+void CitizenSystem::addOutings() {
+    // ── STREET LIFE ──────────────────────────────────────────────────
+    // With city_sim schedules a noon town is a town of closed doors:
+    // everyone is at work or at home, indoors, and the log's nearest
+    // citizen is "idle" 200 m away.  Every resident gets THREE short
+    // spells outdoors a day at hashed hours -- on the doorstep of
+    // wherever the schedule has them (home: the front yard; work,
+    // school, shop: outside that building), then back to what they
+    // were doing.  At any daytime hour a slice of every street is out,
+    // and the walk there and back is a walk.  Both schedule sources
+    // get it (city json and synthesized), applied after either loads.
+    size_t added = 0;
+    auto inject = [&](std::vector<Step>& sched, uint32_t hi, uint32_t salt) {
+        if (sched.empty()) return;
+        // four a day (v30: was three), 20-45 min each -- about a fifth
+        // of any daytime hour spent outdoors, so a street has people
+        // on its doorsteps and not only the strollers passing through
+        const float t0[4]   = {8.75f * 60.0f, 11.0f * 60.0f, 13.75f * 60.0f,
+                               16.75f * 60.0f};
+        const float span[4] = {120.0f, 150.0f, 150.0f, 150.0f};
+        auto at = [&](float t) {
+            int cur = -1;
+            for (size_t i = 0; i < sched.size(); ++i)
+                if (sched[i].minutes <= t) cur = int(i);
+            return cur;
+        };
+        std::vector<Step> add;
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t key = salt + 0x310u + uint32_t(k) * 7u;
+            const float t = t0[k] + (h01(hi, key) - 0.5f) * span[k];
+            const float dur = 20.0f + 25.0f * h01(hi, key + 1u);
+            if (t < 6.5f * 60.0f || t + dur >= 21.0f * 60.0f) continue;
+            const int c0 = at(t), c1 = at(t + dur);
+            if (c0 < 0 || c1 < 0) continue;
+            const Step& s0 = sched[size_t(c0)];
+            const Step& s1 = sched[size_t(c1)];
+            if (s0.activity == kActSleepish || s0.place < -1 ||
+                s1.activity == kActSleepish || s1.place < -1) continue;
+            Step out;
+            out.minutes = t;
+            out.activity = kActIdle;
+            out.place = (s0.place >= 0 && s0.place < int(buildings_.size()))
+                            ? -(100 + s0.place) : -2;
+            Step back = s1;
+            back.minutes = t + dur;
+            add.push_back(out);
+            add.push_back(back);
+        }
+        if (add.empty()) return;
+        sched.insert(sched.end(), add.begin(), add.end());
+        std::sort(sched.begin(), sched.end(),
+                  [](const Step& a, const Step& b) {
+                      return a.minutes < b.minutes;
+                  });
+        added += add.size() / 2;
+    };
+    for (size_t i = 0; i < persons_.size(); ++i) {
+        inject(persons_[i].weekday, uint32_t(i), 0u);
+        inject(persons_[i].weekend, uint32_t(i), 0x40u);
+    }
+    std::cout << "[citizen] street life: " << added
+              << " outdoor spell(s) added across " << persons_.size()
+              << " schedule(s)" << std::endl;
+}
+
 glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
                                   int pid) const {
     // deterministic per-person jitter so a crowd at one entrance
@@ -2110,14 +2631,11 @@ glm::vec3 CitizenSystem::placePos(const Person& p, const Step& s,
                 h.z + std::sin(hth) * rr + jz * 0.15f};
     }
     if (s.place == -2) {
-        // Out in the yard beside the house — same seat-based fan so a
-        // family stepping outside does not stand in a single column,
-        // just at garden spacing rather than room spacing.
-        const glm::vec3& h = houses_[p.house];
-        const float rr = kYardSpreadR * std::sqrt(hsi / hcap);
-        return {h.x + 12.0f + std::cos(hth) * rr + jx * 0.5f,
-                h.y,
-                h.z + 12.0f + std::sin(hth) * rr + jz * 0.5f};
+        return yardSpot(p, pid, -1);
+    }
+    if (s.place <= -100) {
+        // outside a building: its doorstep
+        return yardSpot(p, pid, -s.place - 100);
     }
     // A WORKPLACE, SCHOOL OR SHOP.  These are promoted houses, so they
     // have real furniture too: seat the person on one of its chairs
@@ -2169,6 +2687,269 @@ int CitizenSystem::currentStep(const std::vector<Step>& sched,
     return cur;
 }
 
+
+// ── STROLLERS ────────────────────────────────────────────────────────
+namespace {
+constexpr float kStrollRingMin   = 25.0f;   // spawn ring round the camera
+constexpr float kStrollRingMax   = 480.0f;
+constexpr float kStrollRecycleM  = 640.0f;
+constexpr float kStrollPerHouse  = 1.3f;    // walkers per house in the ring
+constexpr int   kStrollMax       = 320;
+constexpr float kStrollHopMin    = 30.0f;   // house-to-house leg
+constexpr float kStrollHopMax    = 150.0f;
+constexpr float kStrollRoadP     = 0.45f;   // share on the road when one is near
+constexpr float kStrollRoadNearM = 90.0f;
+constexpr float kStrollFenceOutM = 1.6f;    // pause past the fence, not in the garden
+
+float strollRnd(uint32_t& s) {
+    if (s == 0u) s = 0x9E3779B9u;              // xorshift never leaves 0
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return float(s & 0xFFFFFFu) / 16777216.0f;
+}
+}  // namespace
+
+int CitizenSystem::countHousesNear(const glm::vec3& c, float radius) const {
+    if (house_grid_.empty()) return 0;
+    const int r = int(std::ceil(radius / kAvoidCell));
+    const int32_t cx = int32_t(std::floor(c.x / kAvoidCell));
+    const int32_t cz = int32_t(std::floor(c.z / kAvoidCell));
+    const float r2 = radius * radius;
+    int n = 0;
+    for (int dz = -r; dz <= r; ++dz) {
+        for (int dx = -r; dx <= r; ++dx) {
+            const uint64_t k =
+                (uint64_t(uint32_t(cx + dx)) << 32) | uint32_t(cz + dz);
+            auto it = house_grid_.find(k);
+            if (it == house_grid_.end()) continue;
+            for (int hi : it->second) {
+                const glm::vec3& h = houses_[size_t(hi)];
+                const float ddx = h.x - c.x, ddz = h.z - c.z;
+                if (ddx * ddx + ddz * ddz < r2) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+bool CitizenSystem::randomHouseNear(const glm::vec3& c, float min_m,
+                                    float max_m, uint32_t& rng,
+                                    int& out) const {
+    if (house_grid_.empty()) return false;
+    const int r = int(std::ceil(max_m / kAvoidCell));
+    const int32_t cx = int32_t(std::floor(c.x / kAvoidCell));
+    const int32_t cz = int32_t(std::floor(c.z / kAvoidCell));
+    for (int tries = 0; tries < 28; ++tries) {
+        const int dx = int(strollRnd(rng) * float(2 * r + 1)) - r;
+        const int dz = int(strollRnd(rng) * float(2 * r + 1)) - r;
+        const uint64_t k =
+            (uint64_t(uint32_t(cx + dx)) << 32) | uint32_t(cz + dz);
+        auto it = house_grid_.find(k);
+        if (it == house_grid_.end() || it->second.empty()) continue;
+        const int hi = it->second[size_t(int(strollRnd(rng) *
+                                             float(it->second.size())) %
+                                         it->second.size())];
+        const glm::vec3& h = houses_[size_t(hi)];
+        const float ddx = h.x - c.x, ddz = h.z - c.z;
+        const float d2 = ddx * ddx + ddz * ddz;
+        if (d2 < min_m * min_m || d2 > max_m * max_m) continue;
+        out = hi;
+        return true;
+    }
+    return false;
+}
+
+bool CitizenSystem::nextHop(Stroller& w) {
+    int hi;
+    for (int tries = 0; tries < 3; ++tries) {
+        if (!randomHouseNear(w.pos, kStrollHopMin, kStrollHopMax,
+                             stroll_rng_, hi)) continue;
+        if (hi == w.house) continue;
+        Person tp;
+        tp.house = hi;
+        w.house = hi;
+        w.target = yardSpot(tp, int((w.seed ^ uint32_t(hi) * 2654435761u) &
+                                    0x7FFFFFFFu), -1, kStrollFenceOutM);
+        w.walking = true;
+        return true;
+    }
+    return false;
+}
+
+bool CitizenSystem::spawnStroller(const glm::vec3& camera_pos, Stroller& w) {
+    int hi;
+    if (!randomHouseNear(camera_pos, kStrollRingMin, kStrollRingMax,
+                         stroll_rng_, hi))
+        return false;
+    w.seed = mix32(stroll_rng_ += 0x9E3779B9u) | 1u;
+    // ── WHO ──────────────────────────────────────────────────────────
+    // Children out of school hours, seniors by day, the rest a mix of
+    // residents and people on their way somewhere.
+    const float tod = std::fmod(clock_min_, 1440.0f);
+    const bool school_hours = !isWeekend() && tod > 8.5f * 60.0f &&
+                              tod < 15.0f * 60.0f;
+    const float r = h01(w.seed, 0x11u);
+    Person& p = w.look;
+    if (r < (school_hours ? 0.06f : 0.26f)) {
+        p.duty = kDutyStudent; p.age = 1;
+    } else if (r < 0.50f) {
+        p.duty = kDutyResident; p.age = h01(w.seed, 0x12u) < 0.35f ? 3 : 0;
+    } else if (r < 0.62f) {
+        p.duty = kDutyRetiree; p.age = 3;
+    } else if (r < 0.74f) {
+        p.duty = kDutyHomemaker; p.age = 0;
+    } else if (r < 0.88f) {
+        p.duty = kDutyWorker; p.age = 0;
+    } else {
+        p.duty = kDutyOffice; p.age = 0;
+    }
+    p.height = p.age == 1 ? 1.15f + 0.35f * h01(w.seed, 0x13u)
+             : p.age == 3 ? 1.52f + 0.22f * h01(w.seed, 0x13u)
+                          : 1.58f + 0.28f * h01(w.seed, 0x13u);
+    p.bulk  = 0.86f + 0.30f * h01(w.seed, 0x14u);
+    p.speed = (p.age == 3 ? 0.85f : 1.15f) + 0.40f * h01(w.seed, 0x15u);
+    p.house = hi;
+    // one outdoors step, so emitPerson never reaches for a bed or a
+    // chair: standing idle at a pause (a child: playing)
+    Step out;
+    out.minutes = 0.0f;
+    out.activity = (p.age == 1 && h01(w.seed, 0x19u) < 0.6f) ? kActPlay
+                                                              : kActIdle;
+    out.place = -2;
+    p.weekday.assign(1, out);
+    p.weekend.clear();
+    w.life_t = 90.0f + 240.0f * h01(w.seed, 0x16u);
+    w.phase = h01(w.seed, 0x17u) * 6.2831853f;
+    w.wait_t = 0.0f;
+    // ── WHERE ────────────────────────────────────────────────────────
+    // The front yard of the house drawn, then house to house; or the
+    // road by it, when one runs within reach.
+    Person tp;
+    tp.house = hi;
+    w.pos = yardSpot(tp, int(w.seed & 0x7FFFFFFFu), -1, kStrollFenceOutM);
+    w.house = hi;
+    w.kind = 0;
+    if (vehicles_ && vehicles_->loaded() && h01(w.seed, 0x18u) < kStrollRoadP &&
+        vehicles_->strollStartNear(w.pos, kStrollRoadNearM, w.seed, w.road)) {
+        w.kind = 1;
+        w.pos = w.road.pos;
+        w.yaw = w.road.yaw;
+        w.walking = true;
+    } else if (!nextHop(w)) {
+        return false;
+    } else {
+        const glm::vec3 d = w.target - w.pos;
+        w.yaw = std::atan2(d.x, d.z);
+    }
+    if (ground_) {
+        float gy; glm::vec3 gn;
+        if (ground_(w.pos.x, w.pos.z, w.pos.y + 2.0f, gy, gn)) w.pos.y = gy;
+    }
+    return true;
+}
+
+void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale) {
+    const float v = w.look.speed * walk_scale;
+    if (w.kind == 1) {
+        if (!vehicles_ || !vehicles_->strollAdvance(w.road, v * dt, stroll_rng_)) {
+            w.life_t = 0.0f;                        // stale: recycle
+            return;
+        }
+        w.pos.x = w.road.pos.x;
+        w.pos.z = w.road.pos.z;
+        w.pos.y += (w.road.pos.y - w.pos.y) * std::min(1.0f, 4.0f * dt);
+        w.yaw = w.road.yaw;
+        w.phase += dt * v * 1.7f;
+        w.walking = true;
+        return;
+    }
+    if (!w.walking) {
+        w.wait_t -= dt;
+        if (w.wait_t <= 0.0f && !nextHop(w)) w.wait_t = 4.0f;
+        return;
+    }
+    glm::vec3 d = w.target - w.pos;
+    d.y = 0.0f;
+    const float dist = glm::length(d);
+    if (dist < 0.6f) {
+        w.walking = false;
+        w.wait_t = 2.0f + 9.0f * h01(w.seed, 0x21u + uint32_t(w.house));
+        return;
+    }
+    glm::vec3 dir = d / dist;
+    if (dist > kHouseBlockR + 3.0f) {
+        const glm::vec2 sd = steerAroundHouses(
+            glm::vec2(w.pos.x, w.pos.z), glm::vec2(dir.x, dir.z),
+            w.house, -1);
+        dir.x = sd.x;
+        dir.z = sd.y;
+    }
+    w.pos += dir * std::min(v * dt, dist);
+    w.yaw = std::atan2(dir.x, dir.z);
+    w.phase += dt * v * 1.7f;
+    w.pos.y += (w.target.y - w.pos.y) *
+               std::min(1.0f, v * dt / std::max(dist, 1e-3f));
+}
+
+void CitizenSystem::updateStrollers(float delta_t, const glm::vec3& camera_pos,
+                                    float walk_scale) {
+    if (house_grid_.empty() || houses_.empty()) return;
+    // the target follows the houses round the camera, once a second
+    stroll_timer_ -= delta_t;
+    if (stroll_timer_ <= 0.0f) {
+        stroll_timer_ = 1.0f;
+        stroll_houses_ = countHousesNear(camera_pos, kStrollRingMax);
+        stroll_target_ = std::min(kStrollMax,
+                                  int(float(stroll_houses_) * kStrollPerHouse));
+    }
+    // recycle the far and the expired
+    for (size_t i = 0; i < strollers_.size();) {
+        Stroller& w = strollers_[i];
+        const float dx = w.pos.x - camera_pos.x, dz = w.pos.z - camera_pos.z;
+        w.life_t -= delta_t;
+        if (dx * dx + dz * dz > kStrollRecycleM * kStrollRecycleM ||
+            w.life_t <= 0.0f) {
+            if (i + 1 < strollers_.size()) strollers_[i] = std::move(strollers_.back());
+            strollers_.pop_back();
+            continue;
+        }
+        ++i;
+    }
+    // over target (the camera left a town): drop the farthest, a
+    // couple a frame
+    for (int k = 0; k < 2 && int(strollers_.size()) > stroll_target_; ++k) {
+        size_t far_i = 0; float far_d2 = -1.0f;
+        for (size_t i = 0; i < strollers_.size(); ++i) {
+            const float dx = strollers_[i].pos.x - camera_pos.x;
+            const float dz = strollers_[i].pos.z - camera_pos.z;
+            const float d2 = dx * dx + dz * dz;
+            if (d2 > far_d2) { far_d2 = d2; far_i = i; }
+        }
+        if (far_i + 1 < strollers_.size()) strollers_[far_i] = std::move(strollers_.back());
+        strollers_.pop_back();
+    }
+    int budget = 6;
+    while (int(strollers_.size()) < stroll_target_ && budget-- > 0) {
+        Stroller w;
+        if (!spawnStroller(camera_pos, w)) continue;
+        strollers_.push_back(std::move(w));
+    }
+    // tick + ground: every frame inside the clamp radius, every fourth
+    // frame beyond it (a far walker's height is beneath notice)
+    const float clamp2 = kGroundClampRadius * kGroundClampRadius;
+    const uint32_t frame_k = uint32_t(anim_t_ * 60.0f);
+    for (size_t i = 0; i < strollers_.size(); ++i) {
+        Stroller& w = strollers_[i];
+        tickStroller(w, delta_t, walk_scale);
+        if (!ground_) continue;
+        const float dx = w.pos.x - camera_pos.x, dz = w.pos.z - camera_pos.z;
+        if (dx * dx + dz * dz > clamp2 && ((i + frame_k) & 3u) != 0u) continue;
+        float gy; glm::vec3 gn;
+        if (ground_(w.pos.x, w.pos.z, w.pos.y + 1.0f, gy, gn) &&
+            std::abs(gy - w.pos.y) < 6.0f)
+            w.pos.y = gy;
+    }
+}
+
 void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                            const GroundQueryFn& ground) {
     if (!loaded_) return;
@@ -2217,6 +2998,8 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                  std::max(1.0f, kWalkTimeScale * clock_rate_));
 
     if (sim_.size() != persons_.size()) sim_.resize(persons_.size());
+    if (car_of_.size() != persons_.size()) car_of_.assign(persons_.size(), -2);
+    walk_scale_ = walk_scale;
 
     // ── EVERYONE is simulated; only the NEAR ring pays per frame ─────
     // Inside kNearSimRadius: the full walk tick, every frame.  Beyond:
@@ -2276,6 +3059,52 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         glm::vec3 d = target - a.pos;
         d.y = 0.0f;
         float dist = glm::length(d);
+        // ── DRIVING (v25) ────────────────────────────────────────────
+        // A person with a car at hand and a long way to go takes the
+        // car: they vanish into it, the vehicle system drives it to the
+        // curb nearest their destination, and they step out there and
+        // walk the rest.  The car is theirs from their first placement,
+        // parked at the curb by wherever they were then.
+        if (vehicles_ && vehicles_->loaded() && i < car_of_.size()) {
+            int& car = car_of_[i];
+            if (car == -2) {
+                car = wantsCar(p.duty, p.age, uint32_t(i))
+                          ? vehicles_->spawnCar(
+                                uint32_t(i) * 2654435761u + 7u, a.pos)
+                          : -1;
+            }
+            if (car >= 0) {
+                if (a.ride == 2) {
+                    if (vehicles_->parked(car)) {
+                        a.ride = 0;
+                        a.pos = vehicles_->stepOut(car);
+                        d = target - a.pos;
+                        d.y = 0.0f;
+                        dist = glm::length(d);
+                    } else {
+                        // on the driver's seat, facing the car's way:
+                        // emitPerson draws them there, seated
+                        a.pos = vehicles_->seatPos(car, 0);
+                        a.yaw = vehicles_->yaw(car);
+                        a.walking = false;
+                        a.nav_room = -1;
+                        continue;
+                    }
+                } else if (dist > kDriveMinM && vehicles_->parked(car)) {
+                    const glm::vec3 cp = vehicles_->position(car);
+                    const float cdx = cp.x - a.pos.x;
+                    const float cdz = cp.z - a.pos.z;
+                    if (cdx * cdx + cdz * cdz < kBoardR * kBoardR &&
+                        vehicles_->dispatch(car, target)) {
+                        a.ride = 2;
+                        a.pos = cp;
+                        a.walking = false;
+                        a.nav_room = -1;
+                        continue;
+                    }
+                }
+            }
+        }
         a.walking = dist > 0.6f;
         if (a.walking) {
             glm::vec3 dir = d / dist;
@@ -2293,7 +3122,8 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                 const glm::vec2 sd = steerAroundHouses(
                     glm::vec2(a.pos.x, a.pos.z),
                     glm::vec2(dir.x, dir.z),
-                    p.house, st.place);
+                    p.house,
+                    st.place <= -100 ? (-st.place - 100) : st.place);
                 dir.x = sd.x;
                 dir.z = sd.y;
             }
@@ -2372,6 +3202,13 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                 a.pos = placePos(p, st, int(i));
             }
             a.walking = false;
+            // snapped out of a trip: the car comes with them
+            if (a.ride) {
+                a.ride = 0;
+                if (vehicles_ && i < car_of_.size() && car_of_[i] >= 0) {
+                    vehicles_->recall(car_of_[i], a.pos);
+                }
+            }
         }
         sim_cursor_ = (sim_cursor_ + kFarSimPerFrame) % n;
     }
@@ -2389,6 +3226,9 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         }
         clamp_cursor_ = (clamp_cursor_ + kFarClampPerFrame) % n;
     }
+
+    // ── the ambient crowd round the camera ───────────────────────────
+    updateStrollers(delta_t, camera_pos, walk_scale);
 
     // ── RENDER TIERS ─────────────────────────────────────────────────
     // Everyone inside kShowRadius emits; the nearest kMaxDetailed
@@ -2413,6 +3253,23 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
     std::vector<uint8_t>& is_detailed = is_detailed_;
     is_detailed.assign(n, 0);
     for (const auto& [d2, i] : near_ids) is_detailed[i] = 1;
+    // The FINE tier: the nearest kMaxFine of those, inside kFineRadius
+    // (near_ids is sorted nearest first).  Sixteen rounded parts each,
+    // so the count is what keeps the figure budget flat.
+    std::vector<uint8_t>& is_fine = is_fine_;
+    is_fine.assign(n, 0);
+    {
+        size_t n_fine = 0;
+        for (const auto& [d2, i] : near_ids) {
+            if (d2 >= kFineRadius * kFineRadius || n_fine >= kMaxFine)
+                break;
+            is_fine[i] = 1;
+            ++n_fine;
+        }
+    }
+    frame_tube_.clear();
+    frame_blob_.clear();
+    frame_ball_.clear();
 
     if (far_thresh_ < kMinAngular) far_thresh_ = kMinAngular;
     size_t far_emitted = 0;
@@ -2422,8 +3279,10 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         const float dz = sim_[i].pos.z - camera_pos.z;
         const float d2 = dx * dx + dz * dz;
         if (d2 > kShowRadius * kShowRadius) continue;
+        if (sim_[i].ride == 2 && !is_detailed[i]) continue;  // in their car
         if (is_detailed[i]) {
-            emitPerson(int(i), sim_[i], persons_[i], true);
+            emitPerson(int(i), sim_[i], persons_[i], true,
+                       is_fine[i] != 0);
         } else {
             const float dist = std::sqrt(std::max(d2, 1.0f));
             if (persons_[i].height / dist < far_thresh_) continue;
@@ -2431,9 +3290,31 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             // burst-draw the whole town before the controller reacts
             if (far_emitted >= kMaxFarParts + kMaxFarParts / 2) continue;
             ++far_emitted;
-            emitPerson(int(i), sim_[i], persons_[i], false);
+            emitPerson(int(i), sim_[i], persons_[i], false, false);
         }
     }
+    // ── the strollers ────────────────────────────────────────────────
+    // Same tiers by distance; the fine budget is theirs on top of the
+    // residents' (a few dozen at most inside 90 m).
+    for (const Stroller& w : strollers_) {
+        const float dx = w.pos.x - camera_pos.x;
+        const float dz = w.pos.z - camera_pos.z;
+        const float d2 = dx * dx + dz * dz;
+        if (d2 > kShowRadius * kShowRadius) continue;
+        SimState ta;
+        ta.pos = w.pos;
+        ta.yaw = w.yaw;
+        ta.phase = w.phase;
+        ta.walking = w.walking;
+        ta.inited = true;
+        ta.cur_step = 0;
+        const bool detailed = d2 < kDetailRadius * kDetailRadius;
+        const bool fine = d2 < kFineRadius * kFineRadius;
+        emitPerson(int(0x20000000u | (w.seed & 0x1FFFFFFFu)), ta, w.look,
+                   detailed, detailed && fine);
+    }
+    // ── the people in the ambient cars ───────────────────────────────
+    emitOccupants(camera_pos);
     // Far-tier draw budget: a whole town in frame is >100k one-box
     // persons — more push-constant draws than the pass can afford.
     // Nudge the angular cutoff until the emitted count sits inside
@@ -2484,7 +3365,10 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                   << "  <700m " << in_near
                   << "  <10km " << in_show
                   << " | drawn parts " << frame_parts_.size()
-                  << " (far_thresh " << far_thresh_ << ")";
+                  << " (far_thresh " << far_thresh_ << ")"
+                  << " | strollers " << strollers_.size() << "/"
+                  << stroll_target_ << " (" << stroll_houses_
+                  << " houses in " << int(kStrollRingMax) << " m)";
         if (best_i >= 0) {
             std::cout << " | nearest #" << best_i << " at ("
                       << int(sim_[best_i].pos.x) << ", "
@@ -2525,7 +3409,8 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
 }
 
 void CitizenSystem::emitPerson(int pid_i, const SimState& a,
-                               const Person& p, bool detailed) {
+                               const Person& p, bool detailed,
+                               bool fine) {
     if (!detailed) {
         // FAR TIER: one box, person-sized, duty-tinted — a figure at a
         // distance, not a puppet.  Slight walk bob keeps crowds alive.
@@ -2540,7 +3425,8 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
             glm::scale(glm::mat4(1.0f),
                        {0.20f * s * p.bulk, 0.875f * s,
                         0.13f * s * p.bulk});
-        frame_parts_.push_back({M, glm::vec4(dutyColor(p.duty), 0.12f)});
+        frame_parts_.push_back({M, glm::vec4(dutyColor(p.duty), 0.12f),
+                                glm::vec4(0.0f)});
         return;
     }
 
@@ -2581,8 +3467,18 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         }
     }
 
+    if (a.ride == 2) {
+        // IN A CAR: on the seat the vehicle system put them on (a.pos
+        // is the floor point under it), facing the car's heading.
+        body_pos = a.pos;
+        body_yaw = a.yaw;
+        seated   = true;
+        lying    = false;
+        act      = kActSit;
+    }
     const float s = p.height / 1.75f;
     const float bw = p.bulk;
+    const Look look = lookOf(pid_i, p.duty, p.age);
     glm::vec4 col(dutyColor(p.duty), 0.12f);
 
     const float swing = std::sin(a.phase);
@@ -2595,6 +3491,10 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
     float root_y = body_pos.y;
     float torso_pitch = 0.0f;
     float leg_l = -0.0f, leg_r = 0.0f, arm_l = 0.0f, arm_r = 0.0f;
+    // Joint bends for the fine figure: knees (positive = shin swings
+    // back under the thigh) and elbows (negative = forearm comes
+    // forward).  The seven-cube figure ignores them.
+    float knee_l = 0.0f, knee_r = 0.0f, elbow_l = -0.25f, elbow_r = -0.25f;
     bool sitting = false;
     switch (act) {
     case kActWalk:
@@ -2602,6 +3502,15 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         leg_r = -swing * 0.55f;
         arm_l = -swing * 0.45f;
         arm_r = swing * 0.45f;
+        // the knee flexes most while the leg SWINGS THROUGH (moving
+        // forward under the body -- the shin tucks back to clear the
+        // ground) and is near straight at heel strike and push-off
+        {
+            const float cph = std::cos(a.phase);
+            knee_l = 0.12f + 0.80f * std::max(0.0f, -cph);
+            knee_r = 0.12f + 0.80f * std::max(0.0f, cph);
+        }
+        elbow_l = elbow_r = -0.40f;
         root_y += std::abs(std::cos(a.phase)) * 0.03f * s;
         break;
     case kActSleepish:
@@ -2631,7 +3540,9 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         if (seated) {
             sitting = true;
             leg_l = leg_r = -1.45f;    // thighs forward
+            knee_l = knee_r = 1.45f;   // ...shins hang from the seat
             arm_l = arm_r = act == kActDeskWork ? -0.9f : -0.4f;
+            elbow_l = elbow_r = act == kActDeskWork ? -0.6f : -0.9f;
         } else {
             // NOTHING TO SIT ON.  The pose used to be unconditional, so
             // a person whose room had no free chair — or none at all —
@@ -2647,10 +3558,12 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         arm_r = -1.1f + 0.25f * std::sin(anim_t_ * 4.0f +
                                          float(pid_i));
         arm_l = -0.5f;
+        elbow_r = -0.4f; elbow_l = -0.9f;
         torso_pitch = 0.12f;
         break;
     case kActBrowse:
         arm_r = -0.9f;
+        elbow_r = -0.3f;
         torso_pitch = 0.08f;
         break;
     case kActWash:
@@ -2660,16 +3573,19 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         // one arm out is stirring and two is washing.
         arm_l = -1.15f + 0.10f * std::sin(anim_phase * 3.0f);
         arm_r = -1.15f - 0.10f * std::sin(anim_phase * 3.0f);
+        elbow_l = elbow_r = -0.35f;
         torso_pitch = 0.15f;
         break;
     case kActCare:
         // rounds: slow sway + attending arm
         arm_l = -0.7f + 0.2f * std::sin(anim_phase * 2.0f);
+        elbow_l = -0.6f;
         torso_pitch = 0.16f;
         break;
     case kActPlay:
         arm_l = std::sin(anim_t_ * 5.0f + float(pid_i)) * 0.8f;
         arm_r = -std::sin(anim_t_ * 5.0f + float(pid_i)) * 0.8f;
+        elbow_l = elbow_r = -0.5f;
         break;
     default: {
         // STANDING IDLE.  A 0.06 rad arm sway was the whole of it, and
@@ -2696,49 +3612,320 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
     }
     if (sitting) root_y -= 0.42f * s;
 
+    // The head grows on a child: a toddler's is nearer a third of its
+    // height than a fifth.  (The rest of the figure scales with s.)
+    const float hs = p.age == 1 ? 1.15f : p.age == 2 ? 1.30f : 1.0f;
+    // Heels: the foot pitches about its toe (below), which raises the
+    // heel end and the shin on it; the figure rises with it.
+    if (fine && look.heels && !lying) root_y += 0.03f * s;
+
     const glm::mat4 R =
         glm::rotate(glm::mat4(1.0f), body_yaw, glm::vec3(0, 1, 0)) *
         glm::rotate(glm::mat4(1.0f), torso_pitch, glm::vec3(1, 0, 0));
-    auto part = [&](glm::vec3 centre, glm::vec3 half, float pivot_rot,
-                    glm::vec3 pivot) {
-        glm::mat4 M = glm::translate(glm::mat4(1.0f),
-                                     glm::vec3(body_pos.x, root_y,
-                                               body_pos.z)) * R;
-        if (pivot_rot != 0.0f) {
-            M = M * glm::translate(glm::mat4(1.0f), pivot) *
-                glm::rotate(glm::mat4(1.0f), pivot_rot,
-                            glm::vec3(1, 0, 0)) *
-                glm::translate(glm::mat4(1.0f), -pivot);
-        }
-        M = M * glm::translate(glm::mat4(1.0f), centre) *
-            glm::scale(glm::mat4(1.0f), half);
-        frame_parts_.push_back({M, col});
+    const glm::mat4 root =
+        glm::translate(glm::mat4(1.0f),
+                       glm::vec3(body_pos.x, root_y, body_pos.z)) * R;
+    auto hinge = [](const glm::mat4& frame, glm::vec3 pivot, float rot) {
+        if (rot == 0.0f) return frame;
+        return frame * glm::translate(glm::mat4(1.0f), pivot) *
+               glm::rotate(glm::mat4(1.0f), rot, glm::vec3(1, 0, 0)) *
+               glm::translate(glm::mat4(1.0f), -pivot);
     };
+    const glm::vec3 skin = look.skin;
+    const glm::vec3 sleeve_lo = look.long_sleeve ? look.top : skin;
+
+    if (fine) {
+        // ── THE FINE FIGURE: rounded parts on a SKELETON ────────────
+        const float shw = look.female ? 0.92f : 1.0f;   // shoulders
+        const float hpw = look.female ? 1.06f : 1.0f;   // hips
+        const float ax = 0.21f * s * bw * shw;          // shoulder span
+        const float lx = 0.09f * s;                     // hip span
+        Skeleton sk;
+        sk.pivot[jPelvis] = {0.0f, 0.98f * s, 0.0f};
+        sk.pivot[jSpine]  = {0.0f, 1.06f * s, 0.0f};    // the waist
+        sk.pivot[jNeck]   = {0.0f, 1.45f * s, 0.0f};
+        sk.pivot[jHead]   = {0.0f, 1.51f * s, 0.0f};
+        for (int side = 0; side < 2; ++side) {
+            const float sx = side == 0 ? -1.0f : 1.0f;
+            const int sh = side == 0 ? jShoulderL : jShoulderR;
+            sk.pivot[sh]     = {sx * ax, 1.40f * s, 0.0f};
+            sk.pivot[sh + 1] = {sx * ax, 1.13f * s, 0.0f};   // elbow
+            sk.pivot[sh + 2] = {sx * ax, 0.885f * s, 0.0f};  // wrist
+            const int hp = side == 0 ? jHipL : jHipR;
+            sk.pivot[hp]     = {sx * lx, 0.90f * s, 0.0f};
+            sk.pivot[hp + 1] = {sx * lx, 0.47f * s, 0.0f};   // knee
+            sk.pivot[hp + 2] = {sx * lx, 0.07f * s, 0.0f};   // ankle
+        }
+        for (auto& r : sk.rot) r = glm::vec3(0.0f);
+
+        // ── the pose: the activity's hinges first ───────────────────
+        auto& rot = sk.rot;
+        rot[jShoulderL].x = arm_l;   rot[jShoulderR].x = arm_r;
+        rot[jElbowL].x = elbow_l;    rot[jElbowR].x = elbow_r;
+        rot[jHipL].x = leg_l;        rot[jHipR].x = leg_r;
+        rot[jKneeL].x = knee_l;      rot[jKneeR].x = knee_r;
+        rot[jShoulderL].z = -0.08f;  rot[jShoulderR].z = 0.08f;  // clear the torso
+        float lateral = 0.0f;                  // root side-step, body x
+        const bool senior = p.age == 3, toddler = p.age == 2;
+        const float ph = anim_phase;
+
+        // ── ...then the layers ──────────────────────────────────────
+        if (act == kActWalk) {
+            const float sn = std::sin(a.phase);
+            // stride and swing by age
+            const float stride = senior ? 0.70f : toddler ? 0.80f : 1.0f;
+            const float swing_k = senior ? 0.60f : 1.0f;
+            rot[jHipL].x *= stride;      rot[jHipR].x *= stride;
+            rot[jShoulderL].x *= swing_k; rot[jShoulderR].x *= swing_k;
+            // the forward-swinging arm bends more at the elbow
+            rot[jElbowL].x -= 0.15f * std::max(0.0f, sn);
+            rot[jElbowR].x -= 0.15f * std::max(0.0f, -sn);
+            // the pelvis turns with the leading leg, the spine turns
+            // against it and the neck undoes the rest, so the head
+            // faces the way the feet go; a little pelvic roll and a
+            // side-step with it
+            rot[jPelvis].y = 0.06f * sn;
+            rot[jPelvis].z = 0.035f * sn;
+            rot[jSpine].y = -0.10f * sn;
+            rot[jSpine].x = 0.03f;
+            rot[jNeck].y = 0.04f * sn;
+            rot[jHead].x = 0.02f * std::cos(2.0f * a.phase);
+            lateral = 0.012f * s * sn;
+            // the foot: toe down at push-off, lifted while the knee tucks
+            rot[jAnkleL].x = 0.30f * std::max(0.0f, sn) - 0.3f * knee_l;
+            rot[jAnkleR].x = 0.30f * std::max(0.0f, -sn) - 0.3f * knee_r;
+            if (toddler) {          // arms out for balance, wide stance
+                rot[jShoulderL].z = -0.35f; rot[jShoulderR].z = 0.35f;
+                rot[jElbowL].x = rot[jElbowR].x = -0.6f;
+                rot[jHipL].z = -0.10f;      rot[jHipR].z = 0.10f;
+                rot[jPelvis].z = 0.07f * sn;
+            }
+        } else if (!lying) {
+            // standing or seated: a breath in the chest, a slow weight
+            // shift with the legs planted (the hips undo the pelvic
+            // tilt), and the head looking about on its own clock
+            rot[jSpine].x += 0.010f * std::sin(ph * 1.5f);
+            if (!sitting) {
+                const float ws = std::sin(ph * 0.5f);
+                rot[jPelvis].z = 0.025f * ws;
+                rot[jSpine].z = -0.025f * ws;
+                rot[jHipL].z = rot[jHipR].z = -0.025f * ws;
+                lateral = 0.02f * s * ws;
+            }
+            rot[jNeck].y = 0.40f * std::sin(ph * 0.31f) *
+                           std::sin(ph * 0.17f + 1.0f);
+            rot[jHead].x = 0.04f * std::sin(ph * 0.23f);
+        }
+        switch (act) {                     // where the work is
+        case kActDeskWork:
+            rot[jHead].x += 0.18f; rot[jSpine].x += 0.05f;
+            rot[jElbowL].x += 0.05f * std::sin(anim_t_ * 6.0f + float(pid_i));
+            rot[jElbowR].x -= 0.05f * std::sin(anim_t_ * 6.0f + float(pid_i));
+            break;
+        case kActCook:   rot[jHead].x += 0.25f; break;
+        case kActWash:   rot[jHead].x += 0.35f; break;
+        case kActCare:   rot[jHead].x += 0.20f; break;
+        case kActBrowse:
+            rot[jHead].x += 0.12f;
+            rot[jNeck].y = 0.25f * std::sin(ph * 0.5f);
+            break;
+        case kActPlay:
+            rot[jNeck].y = 0.25f * std::sin(anim_t_ * 5.0f + float(pid_i));
+            break;
+        default: break;
+        }
+        if (senior && !lying) {
+            // the stoop: spine forward, neck back to keep the eyes up;
+            // a little give in the knees; the stick hand hardly swings
+            const float stoop = 0.10f + 0.08f * lookRand(uint32_t(pid_i), 0x5Au);
+            rot[jSpine].x += stoop;
+            rot[jNeck].x -= stoop * 0.6f;
+            if (!sitting) { rot[jKneeL].x += 0.08f; rot[jKneeR].x += 0.08f; }
+            if (look.stick && !sitting) {
+                rot[jShoulderR].x = -0.12f + 0.4f * rot[jShoulderR].x;
+                rot[jElbowR].x = -0.30f;
+            }
+        }
+        solveSkeleton(sk, root * glm::translate(glm::mat4(1.0f),
+                                                glm::vec3(lateral, 0.0f, 0.0f)));
+
+        // ── the parts, SKINNED onto the joints (v3) ─────────────────
+        // A part hangs off joint j; its top end skins to joint `up`,
+        // its bottom end to joint `lo` (-1: none).  The three
+        // transforms handed to the shader all map the part's unit box
+        // to the world -- hung off j, off `up`, off `lo` -- and agree
+        // exactly at the pivot the two joints share, so blending
+        // between them around that pivot bends the surface without
+        // opening it.  Adjacent parts overlap past their shared pivot
+        // by about a radius and match cross-sections there (taper),
+        // which closes the seams.  blend: half-width of each blend,
+        // body metres.  mesh: 0 tube, 1 blob, 2 ball.
+        auto rows = [](const glm::mat4& M, glm::vec4* r) {
+            for (int i = 0; i < 3; ++i)
+                r[i] = glm::vec4(M[0][i], M[1][i], M[2][i], M[3][i]);
+        };
+        auto spart = [&](int j, int up, int lo, glm::vec3 centre,
+                        glm::vec3 half, float taper, float blend,
+                        int mesh, int kind, glm::vec3 rgb, float style,
+                        glm::vec3 accent,
+                        glm::vec3 pre_pivot = glm::vec3(0.0f),
+                        float pre_rot = 0.0f) {
+            glm::mat4 L;
+            if (pre_rot != 0.0f) {
+                L = glm::translate(glm::mat4(1.0f), pre_pivot - sk.pivot[j]) *
+                    glm::rotate(glm::mat4(1.0f), pre_rot, glm::vec3(1, 0, 0)) *
+                    glm::translate(glm::mat4(1.0f), centre - pre_pivot);
+            } else {
+                L = glm::translate(glm::mat4(1.0f), centre - sk.pivot[j]);
+            }
+            L = L * glm::scale(glm::mat4(1.0f), half);
+            const glm::mat4 M_self = sk.world[j] * L;
+            auto other = [&](int k) {
+                if (k < 0) return M_self;
+                return sk.world[k] *
+                       glm::translate(glm::mat4(1.0f),
+                                      sk.pivot[j] - sk.pivot[k]) * L;
+            };
+            // the pivot the two joints share is the CHILD's
+            auto meet_y = [&](int k) {
+                return kJointParent[k] == j ? sk.pivot[k].y : sk.pivot[j].y;
+            };
+            const float hy = std::max(half.y, 1e-4f);
+            SkinInstance si;
+            rows(M_self, si.self);
+            rows(other(up), si.up);
+            rows(other(lo), si.lo);
+            si.color = glm::vec4(rgb, 0.10f);
+            si.extra = glm::vec4(float(kind), style, packRGB(accent),
+                                 lookRand(uint32_t(pid_i), 0x51u));
+            si.shape = glm::vec4(
+                up >= 0 ? (meet_y(up) - centre.y) / hy : 10.0f,
+                lo >= 0 ? (meet_y(lo) - centre.y) / hy : -10.0f,
+                blend / hy, taper);
+            (mesh == 0 ? frame_tube_ : mesh == 1 ? frame_blob_
+                                                 : frame_ball_).push_back(si);
+        };
+        const float top_style =
+            float(look.top_style) + (look.long_sleeve ? 4.0f : 0.0f);
+        const float head_style =
+            (look.long_hair ? 1.0f : 0.0f) + (look.female ? 2.0f : 0.0f) +
+            (p.age == 1 || p.age == 2 ? 4.0f : 0.0f);
+        const float bot_style = float(look.bottom_style);
+        const bool shorts = look.bottom_style == 2;
+        const glm::vec3 belt(0.12f, 0.10f, 0.08f);
+        // the widths the parts meet at
+        const float Ww = 0.135f * s * bw;                 // waist
+        const float Wh = 0.165f * s * bw * hpw;           // hips
+        const float Wc = 0.17f * s * bw * shw;            // chest
+        // pelvis: waist at the top, hips at the bottom; torso: chest at
+        // the top, waist at the bottom; the two overlap at the waist
+        spart(jPelvis, jSpine, -1, {0.0f, 0.995f * s, 0.0f},
+             {Ww, 0.135f * s, 0.095f * s * bw}, Wh / Ww, 0.05f * s, 1,
+             kPartPelvis, look.bottom, bot_style, belt);
+        spart(jSpine, -1, jPelvis, {0.0f, 1.225f * s, 0.0f},
+             {Wc, 0.235f * s, 0.105f * s * bw}, Ww / Wc, 0.06f * s, 1,
+             kPartTorso, look.top, top_style, skin);
+        spart(jNeck, jHead, jSpine, {0.0f, 1.48f * s, 0.0f},
+             {0.045f * s, 0.06f * s, 0.045f * s}, 1.0f, 0.03f * s, 0,
+             kPartPlain, skin, 0.0f, skin);
+        const float hy = 1.51f * s + 0.12f * s * hs;      // head centre
+        spart(jHead, -1, jNeck, {0.0f, hy, 0.0f},
+             {0.10f * s * hs, 0.12f * s * hs, 0.105f * s * hs}, 1.0f,
+             0.03f * s, 2, kPartHead, skin, head_style, look.hair);
+        if (look.long_hair) {
+            spart(jHead, -1, -1, {0.0f, hy - 0.11f * s * hs, -0.065f * s * hs},
+                 {0.115f * s * hs, 0.19f * s * hs, 0.055f * s * hs}, 1.0f,
+                 0.0f, 1, kPartPlain, look.hair, 0.0f, look.hair);
+        }
+        // arms: upper arm from inside the shoulder past the elbow,
+        // forearm from inside the elbow past the wrist, the hand
+        for (int side = 0; side < 2; ++side) {
+            const float x = (side == 0 ? -1.0f : 1.0f) * ax;
+            const int sh = side == 0 ? jShoulderL : jShoulderR;
+            spart(sh, jSpine, sh + 1, {x, 1.25f * s, 0.0f},
+                 {0.06f * s, 0.18f * s, 0.06f * s}, 0.83f, 0.05f * s, 0,
+                 kPartSleeve, look.top, top_style, skin);
+            spart(sh + 1, sh, sh + 2, {x, 1.02f * s, 0.0f},
+                 {0.05f * s, 0.17f * s, 0.05f * s}, 0.80f, 0.045f * s, 0,
+                 kPartForearm, sleeve_lo, top_style, skin);
+            spart(sh + 2, sh + 1, -1, {x, 0.835f * s, 0.005f * s},
+                 {0.042f * s, 0.06f * s, 0.03f * s}, 0.85f, 0.03f * s, 2,
+                 kPartHand, skin, 0.0f, skin);
+        }
+        if (senior && look.stick && !sitting && !lying) {
+            // a stick from the right hand to the ground: it hangs off
+            // the wrist but is turned back through the arm's own
+            // flexion (every hinge above it is about x), so it stays
+            // near vertical, leaning a little ahead, and its foot
+            // stays near the ground while the hand moves
+            const glm::vec3 wood(0.36f, 0.24f, 0.13f);
+            const float arm_flex = rot[jShoulderR].x + rot[jElbowR].x +
+                                   rot[jSpine].x + rot[jPelvis].x;
+            spart(jWristR, -1, -1, {ax, 0.845f * s - 0.41f * s, 0.03f * s},
+                 {0.012f * s, 0.41f * s, 0.012f * s}, 1.0f, 0.0f, 1,
+                 kPartPlain, wood, 0.0f, wood,
+                 {ax, 0.845f * s, 0.005f * s}, -arm_flex - 0.08f);
+        }
+        // legs: thigh from inside the pelvis past the knee, shin from
+        // inside the knee past the ankle, the shoe up over the ankle
+        for (int side = 0; side < 2; ++side) {
+            const float x = (side == 0 ? -1.0f : 1.0f) * lx;
+            const int hp = side == 0 ? jHipL : jHipR;
+            spart(hp, jPelvis, hp + 1, {x, 0.685f * s, 0.0f},
+                 {0.085f * s * bw, 0.285f * s, 0.085f * s * bw}, 0.73f,
+                 0.06f * s, 0, kPartThigh, look.bottom, bot_style, skin);
+            spart(hp + 1, hp, hp + 2, {x, 0.285f * s, 0.0f},
+                 {0.062f * s * bw, 0.255f * s, 0.062f * s * bw}, 0.72f,
+                 0.05f * s, 0, kPartShin, shorts ? skin : look.bottom,
+                 bot_style, skin);
+            if (look.heels) {
+                // the foot pitched about its toe: the heel end stands
+                // on a heel block, the toe stays on the ground
+                const glm::vec3 toe(x, 0.0f, 0.13f * s);
+                spart(hp + 2, -1, -1, {x, 0.025f * s, 0.03f * s},
+                     {0.045f * s, 0.025f * s, 0.11f * s}, 1.0f, 0.0f, 1,
+                     kPartShoe, look.shoe, 1.0f, skin, toe, 0.30f);
+                spart(hp + 2, -1, -1, {x, -0.03f * s, -0.06f * s},
+                     {0.016f * s, 0.04f * s, 0.016f * s}, 1.0f, 0.0f, 1,
+                     kPartPlain, look.shoe, 0.0f, look.shoe, toe, 0.30f);
+            } else {
+                spart(hp + 2, hp + 1, -1, {x, 0.04f * s, 0.035f * s},
+                     {0.055f * s, 0.045f * s, 0.12f * s}, 1.0f, 0.03f * s,
+                     1, kPartShoe, look.shoe, 0.0f, skin);
+            }
+        }
+        return;
+    }
+
+    // ── THE SEVEN-CUBE FIGURE (mid tier), wearing the same look ─────
+    auto part = [&](glm::vec3 centre, glm::vec3 half, float pivot_rot,
+                    glm::vec3 pivot, glm::vec3 rgb) {
+        glm::mat4 M = hinge(root, pivot, pivot_rot) *
+            glm::translate(glm::mat4(1.0f), centre) *
+            glm::scale(glm::mat4(1.0f), half);
+        frame_parts_.push_back({M, glm::vec4(rgb, 0.12f),
+                                glm::vec4(0.0f)});
+    };
+    (void)col;
     // torso / head keep the walk-neutral frame
     part({0.0f, 1.18f * s, 0.0f},
-         {0.17f * s * bw, 0.27f * s, 0.11f * s * bw}, 0.0f, {});
-    glm::vec4 head_col = glm::vec4(glm::mix(
-        glm::vec3(0.87f, 0.72f, 0.58f), glm::vec3(col), 0.15f), 0.12f);
-    {
-        glm::vec4 keep = col;
-        col = head_col;
-        part({0.0f, 1.62f * s, 0.0f},
-             {0.105f * s, 0.115f * s, 0.105f * s}, 0.0f, {});
-        col = keep;
-    }
+         {0.17f * s * bw, 0.27f * s, 0.11f * s * bw}, 0.0f, {}, look.top);
+    part({0.0f, 1.505f * s + 0.115f * s * hs, 0.0f},
+         {0.105f * s * hs, 0.115f * s * hs, 0.105f * s * hs}, 0.0f, {},
+         skin);
     // limbs swing about their pivots
     part({-0.235f * s * bw, 1.14f * s, 0.0f},
          {0.05f * s, 0.27f * s, 0.05f * s},
-         arm_l, {-0.235f * s * bw, 1.40f * s, 0.0f});
+         arm_l, {-0.235f * s * bw, 1.40f * s, 0.0f}, sleeve_lo);
     part({0.235f * s * bw, 1.14f * s, 0.0f},
          {0.05f * s, 0.27f * s, 0.05f * s},
-         arm_r, {0.235f * s * bw, 1.40f * s, 0.0f});
+         arm_r, {0.235f * s * bw, 1.40f * s, 0.0f}, sleeve_lo);
     part({-0.09f * s, 0.47f * s, 0.0f},
          {0.07f * s * bw, 0.44f * s, 0.07f * s * bw},
-         leg_l, {-0.09f * s, 0.90f * s, 0.0f});
+         leg_l, {-0.09f * s, 0.90f * s, 0.0f}, look.bottom);
     part({0.09f * s, 0.47f * s, 0.0f},
          {0.07f * s * bw, 0.44f * s, 0.07f * s * bw},
-         leg_r, {0.09f * s, 0.90f * s, 0.0f});
+         leg_r, {0.09f * s, 0.90f * s, 0.0f}, look.bottom);
 }
 
 void CitizenSystem::draw(
@@ -2747,7 +3934,9 @@ void CitizenSystem::draw(
     const std::shared_ptr<er::ImageView>& color_view,
     const std::shared_ptr<er::ImageView>& depth_view,
     const glm::uvec2& buffer_size) {
-    if (!loaded_ || frame_parts_.empty() || !s_pipeline_) return;
+    if (!loaded_ || !s_pipeline_) return;
+    if (frame_parts_.empty() && frame_tube_.empty() &&
+        frame_blob_.empty() && frame_ball_.empty()) return;
     if (!color_view || !depth_view) return;
     if (!s_device_) return;
     // ── UPLOAD THE INSTANCE STREAM ──────────────────────────────────
@@ -2781,10 +3970,52 @@ void CitizenSystem::draw(
                       << (uint64_t(cap) * sizeof(PartInstance)) / 1024
                       << " KiB)" << std::endl;
         }
-        s_device_->updateBufferMemory(
-            s_inst_buf_->memory,
-            uint64_t(need) * sizeof(PartInstance),
-            frame_parts_.data());
+        if (!frame_parts_.empty()) {
+            s_device_->updateBufferMemory(
+                s_inst_buf_->memory,
+                uint64_t(frame_parts_.size()) * sizeof(PartInstance),
+                frame_parts_.data());
+        }
+    }
+    // ── THE SKIN STREAM: tube, blob, ball parts in one buffer ───────
+    const uint32_t n_tube = uint32_t(frame_tube_.size());
+    const uint32_t n_blob = uint32_t(frame_blob_.size());
+    const uint32_t n_ball = uint32_t(frame_ball_.size());
+    {
+        const uint32_t need = n_tube + n_blob + n_ball;
+        if (need && (!s_skin_buf_ || need > s_skin_capacity_)) {
+            uint32_t cap = s_skin_capacity_ ? s_skin_capacity_ : 1024u;
+            while (cap < need) cap *= 2u;
+            if (s_skin_buf_) s_skin_buf_->destroy(s_device_);
+            s_skin_buf_ = std::make_shared<er::BufferInfo>();
+            er::Helper::createBuffer(
+                s_device_,
+                SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT,
+                                TRANSFER_DST_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0,
+                s_skin_buf_->buffer,
+                s_skin_buf_->memory,
+                std::source_location::current(),
+                uint64_t(cap) * sizeof(SkinInstance),
+                nullptr);
+            s_skin_capacity_ = cap;
+            std::cout << "[citizen] skin instance buffer -> " << cap
+                      << " parts ("
+                      << (uint64_t(cap) * sizeof(SkinInstance)) / 1024
+                      << " KiB)" << std::endl;
+        }
+        uint64_t off = 0;
+        for (const auto* v : {&frame_tube_, &frame_blob_, &frame_ball_}) {
+            if (!v->empty()) {
+                s_device_->updateBufferMemory(
+                    s_skin_buf_->memory,
+                    uint64_t(v->size()) * sizeof(SkinInstance),
+                    v->data(), off);
+            }
+            off += uint64_t(v->size()) * sizeof(SkinInstance);
+        }
     }
     if (!s_pipeline_layout_ || !s_cube_pos_ || !s_cube_nrm_ ||
         !s_cube_idx_) {
@@ -2856,8 +4087,38 @@ void CitizenSystem::draw(
     // drawIndexed per box, which is what actually capped the visible
     // population: the cost was never the 12 triangles of a box, it was
     // the draw call in front of them.
-    cmd_buf->drawIndexed(s_cube_index_count_,
-                         uint32_t(frame_parts_.size()));
+    if (!frame_parts_.empty()) {
+        cmd_buf->drawIndexed(s_cube_index_count_,
+                             uint32_t(frame_parts_.size()));
+    }
+    // ...and the SKINNED figures: the skin pipeline, three draws (one
+    // per mesh) over one instance buffer at their offsets.
+    if (n_tube + n_blob + n_ball && s_skin_pipeline_ && s_skin_buf_) {
+        cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS,
+                              s_skin_pipeline_);
+        cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
+                                    s_pipeline_layout_, desc_sets);
+        struct Draw { const std::shared_ptr<er::BufferInfo>* pos;
+                      const std::shared_ptr<er::BufferInfo>* nrm;
+                      const std::shared_ptr<er::BufferInfo>* idx;
+                      uint32_t count; uint32_t n; };
+        const Draw draws[3] = {
+            {&s_tube_pos_, &s_tube_nrm_, &s_tube_idx_, s_tube_index_count_, n_tube},
+            {&s_round_pos_, &s_round_nrm_, &s_round_idx_, s_round_index_count_, n_blob},
+            {&s_ball_pos_, &s_ball_nrm_, &s_ball_idx_, s_ball_index_count_, n_ball}};
+        uint32_t first = 0;
+        for (const auto& d : draws) {
+            if (d.n && *d.pos && *d.nrm && *d.idx) {
+                std::vector<std::shared_ptr<er::Buffer>> vbs2 = {
+                    (*d.pos)->buffer, (*d.nrm)->buffer, s_skin_buf_->buffer};
+                cmd_buf->bindVertexBuffers(0, vbs2, offs);
+                cmd_buf->bindIndexBuffer((*d.idx)->buffer, 0,
+                                         er::IndexType::UINT32);
+                cmd_buf->drawIndexed(d.count, d.n, 0, 0, first);
+            }
+            first += d.n;
+        }
+    }
     cmd_buf->endDynamicRendering();
 }
 
@@ -2866,8 +4127,14 @@ void CitizenSystem::destroy(const std::shared_ptr<er::Device>& device) {
     persons_.clear();
     sim_.clear();
     frame_parts_.clear();
+    for (auto* v : {&frame_tube_, &frame_blob_, &frame_ball_}) {
+        v->clear();
+        v->shrink_to_fit();
+    }
     is_detailed_.clear();
     is_detailed_.shrink_to_fit();
+    is_fine_.clear();
+    is_fine_.shrink_to_fit();
     near_ids_.clear();
     near_ids_.shrink_to_fit();
     loaded_ = false;

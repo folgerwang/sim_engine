@@ -4,6 +4,7 @@
 #include "functions.glsl.h"
 #include "brdf.glsl.h"
 #include "punctual.glsl.h"
+#include "veg_sway.glsl.h"   // kVegSwayEncodeMaxM (G-buffer sway channel)
 
 #define ALPHAMODE_MASK 1
 
@@ -490,6 +491,86 @@ void main() {
     vec3 v = normalize(camera_info.position.xyz - ps_in_data.vertex_position);
     NormalInfo normal_info = getNormalInfo(ps_in_data, material, v, is_front_face);
 
+    // ── Foliage: which side of the leaf, and both sides lit ──────────
+    // A leaf material on the placed-vegetation path = the alpha-masked
+    // (cutout card) materials of a draw that carries the sway flag; the
+    // trunk of the same plant is opaque and stays a normal surface.
+    // The cluster path tags leaf materials by name at upload
+    // (BINDLESS_MAT_FOLIAGE_SSS); this is the drawable path's
+    // equivalent, needing no CPU change and no asset change.
+    //
+    // WHICH SIDE.  terrain_pcg.py writes every leaf triangle in BOTH
+    // windings and leaves the material single-sided, so back-face
+    // culling keeps whichever copy faces the camera and gl_FrontFacing
+    // is TRUE for both -- it says nothing about which side of the LEAF
+    // this is.  The authored normal does: the copy that faces the
+    // camera with its normal pointing AWAY is the underside.  Before
+    // this the underside was shaded with that away-pointing normal (the
+    // resolve face-forwards it, the forward path did not), so from
+    // below and from behind a canopy was dark cards.  A genuinely
+    // double-sided material arrives with is_front_face false and its
+    // normal already flipped by getNormalInfo -- also an underside.
+    // Two ways in: the loader's leaf-name tag (FEATURE_MATERIAL_SUBSURFACE,
+    // drawable_object.cpp -- "leaf", "foliage", "petal", the clutter
+    // cards...), which pbr_lighting.glsl.h only ever honoured inside
+    // its DOUBLE_SIDED permutations, i.e. never for these meshes; or,
+    // for anything the name test misses, a cutout material on a draw
+    // that carries the vegetation sway flag.
+    const bool is_foliage =
+        (material.material_features & FEATURE_MATERIAL_SUBSURFACE) != 0u ||
+        ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u &&
+         (material.material_features & FEATURE_MATERIAL_ALPHA_MASK) != 0u);
+    float leaf_front = 1.0;
+    if (is_foliage) {
+        bool leaf_back = !is_front_face || dot(normal_info.ng, v) < 0.0;
+        if (leaf_back) {
+            leaf_front = 0.0;
+            if (dot(normal_info.ng, v) < 0.0) {
+                // Thin slab: the underside's normal is the top's, negated.
+                normal_info.ng = -normal_info.ng;
+                normal_info.n  = -normal_info.n;
+            }
+            // Paler, matte abaxial face (functions.glsl.h).
+            baseColor.rgb = leafBacksideAlbedo(baseColor.rgb);
+        }
+#ifdef HAS_NORMALS
+        // ── Crown-volume normal, leaves only ─────────────────────────
+        // base.vert hands every vertex of a vegetation draw the
+        // crown-shell normal (vertex_crown_normal); it replaces the
+        // card's own normal HERE, where the material is known, so the
+        // trunk and branches -- opaque, not foliage -- keep their true
+        // cylindrical normals and a radial tangent frame for the bark
+        // bump.  The map's perturbation is carried across so leaf
+        // normal maps still tell.  Same side rule as ng above: the
+        // shell faces the viewer on an underside too.
+        {
+            vec3 crown = normalize(ps_in_data.vertex_crown_normal);
+            if (dot(crown, v) < 0.0) crown = -crown;
+            vec3 bump = normal_info.n - normal_info.ng;
+            normal_info.ng = crown;
+            normal_info.n  = normalize(crown + bump);
+        }
+#endif // HAS_NORMALS
+    }
+
+    // ── Material occlusion (glTF occlusionTexture) ───────────────────
+    // Never applied on this path before: the forward branch's AO was
+    // commented out in getFinalColor and the G-buffer wrote a flat 1.0,
+    // so a furrowed bark, a plank wall or a carved doorway received the
+    // full sky in every crevice and read as plastic under ambient
+    // light.  The generator now bakes cavity AO from its height fields
+    // into the ORM red channel; this is where it lands.  Deferred: the
+    // resolve reads albedo_ao.a as the ambient occlusion (>= 129/255 so
+    // the "G-buffer written" sentinel holds -- see out_albedo_ao).
+    // Forward: a partial multiply on the whole colour, since that
+    // branch does not separate ambient from direct.
+    float mat_ao = 1.0;
+    if ((material.material_features & FEATURE_HAS_OCCLUSION_MAP) != 0u) {
+        float occ = texture(occlusion_tex,
+                            getOcclusionUV(ps_in_data, material)).r;
+        mat_ao = mix(1.0, occ, material.occlusion_strength);
+    }
+
     MaterialInfo material_info =
         setupMaterialInfo(
             ps_in_data,
@@ -599,18 +680,39 @@ void main() {
 
     // .a >= 0.5 is the resolve's "G-buffer written" sentinel — see
     // tile.frag, which compresses its AO into [0.5, 1] for the same
-    // reason.  The drawable path has no baked AO, so a flat 1.0 (the
-    // decal permutation overrides it with its coverage, above).
+    // reason.  The material's occlusion map goes here (mat_ao, above),
+    // floored a quantisation step clear of the sentinel; the decal
+    // permutation overrides it with its coverage instead.
+#ifdef DECAL
     out_albedo_ao = vec4(baseColor.rgb, gbuf_alpha);
-    // flags.w = 0: no foliage-SSS classification on this path (parity
-    // with the forward branch, which never applied foliageTranslucency
-    // to classic drawables either).
+#else
+    out_albedo_ao = vec4(baseColor.rgb,
+                         clamp(mat_ao, 129.0 / 255.0, 1.0) * gbuf_alpha);
+#endif // DECAL
+    // flags.w: the leaf flag + side, in the encoding the resolve and
+    // cluster_bindless.frag share -- 0 not foliage, 0.5 underside, 1.0
+    // top.  deferred_resolve.comp adds foliageTranslucency() and the
+    // per-side sheen for these pixels; until this write the placed
+    // trees and bushes got neither, which is why a backlit canopy
+    // stayed opaque grey while the cluster-path houses beside it were
+    // already shading correctly.  Leaves also sit rougher than the
+    // material's default (a waxy cuticle is not plastic).
     out_normal_rough = vec4(
         octEncodeDir(normal_info.n),
-        material_info.perceptualRoughness, 0.0);
+        is_foliage ? max(material_info.perceptualRoughness, 0.72)
+                   : material_info.perceptualRoughness,
+        is_foliage ? mix(0.5, 1.0, leaf_front) : 0.0);
     vec2 oct_geom_dr = octEncodeDir(normal_info.ng);
+    // .b carries the wind-sway travel (metres / kVegSwayEncodeMaxM, 8-bit
+    // unorm): the ONLY G-buffer channel every writer leaves at 0, and
+    // the one thing deferred_resolve.comp needs to launch RT rays from
+    // the unswayed surface the BLAS holds.  Non-vegetation draws write
+    // 0 here by construction (vertex_sway is 0 off the sway flag).
     out_emissive_metal =
-        vec4(oct_geom_dr.x, oct_geom_dr.y, 0.0, material_info.metallic);
+        vec4(oct_geom_dr.x, oct_geom_dr.y,
+             clamp(ps_in_data.vertex_sway * (1.0 / kVegSwayEncodeMaxM),
+                   0.0, 1.0),
+             material_info.metallic);
     // Static-world velocity from the camera matrices, exactly like
     // tile.frag: this permutation is only built for NON-skinned vertex
     // layouts (see CompileShaders.cmake), so world positions are
@@ -641,8 +743,12 @@ void main() {
     // dissolve discards at the top of main(), and the cutout discard all
     // still run, so depth and coverage stay bit-identical to the full
     // path — only the doomed colour is cheapened.
+    // (A Blend material never takes this path: it is not in the
+    // G-buffer the resolve relights, and its colour -- drawn by the
+    // post-resolve glass pass -- is the one the screen keeps.)
     if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u &&
-        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u) {
+        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
+        (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
 #if defined(ALPHAMODE_MASK)
         // Same late cutout discard as the full path below.
         if (baseColor.a < material.alpha_cutoff) {
@@ -781,6 +887,28 @@ void main() {
             material_info,
             v,
             1.0f);
+    // Material occlusion, forward fallback (see mat_ao above).
+    color *= mix(1.0, mat_ao, 0.7);
+
+#if defined(USE_PUNCTUAL) && !defined(DOUBLE_SIDED)
+    // ── Foliage translucency, forward path ───────────────────────────
+    // (The DOUBLE_SIDED permutations already add pbr_lighting.glsl.h's
+    // subsurface lobe for FEATURE_MATERIAL_SUBSURFACE materials; this
+    // is the same light for the single-sided ones, which is every
+    // double-sided-by-geometry leaf terrain_pcg.py ships.)
+    // Same thin-slab term the deferred resolve adds for this pixel when
+    // the RT/deferred relight is armed, so the plant shades the same in
+    // CSM mode as in RT mode.  Sun only, like the resolve.  The leaf's
+    // reflected lighting above was solved with the viewer-facing
+    // normal; this is the light that comes THROUGH from the far side.
+    if (is_foliage) {
+        vec3 sun_L   = normalize(-runtime_lights.lights[0].direction);
+        vec3 sun_col = runtime_lights.lights[0].color *
+                       runtime_lights.lights[0].intensity;
+        color += foliageTranslucency(normal_info.n, v, sun_L,
+                                     baseColor.rgb, sun_col, shadow);
+    }
+#endif // USE_PUNCTUAL && !DOUBLE_SIDED
 
 
 // A decal is alpha-BLENDED, not alpha-tested: its whole job is to be
@@ -793,7 +921,16 @@ void main() {
     {
         discard;
     }
-    baseColor.a = 1.0;
+    // A BLEND material KEEPS its alpha.  This same permutation is what
+    // the translucent glass pass draws with (ObjectSceneView::
+    // drawGlassForward: "over" blend onto the resolved scene, after the
+    // deferred resolve), and a pane's alpha is its transmission.
+    // Forcing 1.0 here composited every window as an opaque sheet
+    // showing nothing but its own forward shading -- a white diffuse
+    // plus the specular reflection of the environment cube.
+    if ((material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
+        baseColor.a = 1.0;
+    }
 #endif // ALPHAMODE_MASK
 
 #ifdef DECAL

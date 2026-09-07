@@ -76,6 +76,9 @@ float lw_h21(vec2 p) {
     return fract((q.x + q.y) * q.z);
 }
 
+// Absorbing rim, in cells (11% of a 512 patch) -- see the sponge below.
+const float kSpongeCells = 56.0;
+
 layout(local_size_x = 16, local_size_y = 16) in;
 
 void main() {
@@ -100,23 +103,26 @@ void main() {
     for (int i = 0; i < 9; ++i) {
         // Pull streaming: f_i at this cell came from the neighbour one
         // lattice vector upstream — combined with the window shift.
-        ivec2 src = pc + shift - kE[i];
-        if (src.x < 0 || src.y < 0 || src.x >= N || src.y >= N) {
-            // Open boundary / newly scrolled-in cell: rest state.
-            f[i] = -1.0;
-        } else {
-            f[i] = loadF(i, src);
-        }
+        // ZERO-GRADIENT open boundary: a source outside the window
+        // (the patch edge, or the strip a camera move scrolled in)
+        // reads the nearest cell INSIDE it.  It used to read the rest
+        // state, which made the boundary a wall: every cell the window
+        // slid onto was a step of still water against a stirred
+        // interior, and every edge a mirror, so the patch's own rim --
+        // worst at its corners, where two edges meet -- radiated ring
+        // after ring across the near water.
+        ivec2 src = clamp(pc + shift - kE[i], ivec2(0), ivec2(N - 1));
+        f[i] = loadF(i, src);
     }
 
-    // Rest-state equilibrium fill for fresh cells / first frame.
+    // Rest-state equilibrium fill on the first frame / after a reset.
     // (h = h0, u = 0.)
     float gh6 = g * h0 * inv_e2 / 6.0;
     float w_axis_rest = h0 * gh6;
     float w_diag_rest = h0 * gh6 * 0.25;
     float f0_rest = h0 - 4.0 * w_axis_rest - 4.0 * w_diag_rest;
-    for (int i = 0; i < 9; ++i) {
-        if (fresh || f[i] < 0.0) {
+    if (fresh) {
+        for (int i = 0; i < 9; ++i) {
             f[i] = (i == 0) ? f0_rest : (i < 5 ? w_axis_rest : w_diag_rest);
         }
     }
@@ -170,12 +176,35 @@ void main() {
     } else {
         flow = params.flow_dir.xy;
     }
-    float stir =
-        sin(dot(wpos, vec2(0.9, 0.37)) * 1.7 + params.time * 2.6) *
-        sin(dot(wpos, vec2(-0.31, 0.83)) * 2.3 + params.time * 1.9);
-    float drop = (lw_h21(wpos + params.time) > 0.99985) ? 0.03 : 0.0;
+    // ── Stir: broadband, and only where there is a current ─────────
+    // The old stir was ONE product of two sine gratings (3-4 m period)
+    // over the whole patch, pushed along a fixed diagonal: a regular
+    // lattice of ripples, amplified x26 into the normal, which from a
+    // deck reads as ruled lines and, undersampled at range, as the
+    // moire arcs that converged on the patch's far corner.  It ran on
+    // still water too, so a lake's near field carried a ripple field
+    // the wind waves outside the patch do not have -- the patch drew
+    // itself.  Now: six incommensurate travelling components at
+    // 5-20 m on two independent axes (nothing for the eye to lock on
+    // to), gated by the local CURRENT, so a river's surface is worked
+    // and a lake's is left to the wind waves tile_water.frag draws
+    // everywhere.  0.02: the longer components carry less slope per
+    // unit of height than the old 3 m grating did, so the budget is
+    // doubled to keep a river's ripple slopes in the band they were
+    // tuned at (~3% at x26, against the grating's 6%).
+    float t = params.time;
+    float sa = sin(dot(wpos, vec2( 0.74,  0.31)) * 0.53 + t * 1.30)
+             + sin(dot(wpos, vec2(-0.42,  0.65)) * 0.87 + t * 0.90 + 1.7)
+             + sin(dot(wpos, vec2( 0.18, -0.91)) * 1.21 - t * 1.60 + 4.1);
+    float sb = sin(dot(wpos, vec2(-0.83, -0.27)) * 0.35 + t * 0.70 + 2.9)
+             + sin(dot(wpos, vec2( 0.55, -0.60)) * 0.95 - t * 1.10 + 0.6)
+             + sin(dot(wpos, vec2( 0.30,  0.88)) * 1.45 + t * 1.85 + 3.3);
+    float stir_gain = smoothstep(0.03, 0.40, length(flow));
+    // Rain rings: 1.5e-4 per cell per step was ~40 drops a frame on
+    // the patch -- a downpour on a clear day.  A rare touch now.
+    float drop = (lw_h21(wpos + t) > 0.999998) ? 0.03 : 0.0;
     vec2 force = flow * params.flow_strength +
-                 vec2(stir, -stir) * 0.02;
+                 vec2(sa, sb) * (0.02 * stir_gain);
 
     // ── BGK collision against shallow-water equilibrium ─────────────
     float uu = dot(u, u) * inv_e2;
@@ -213,6 +242,27 @@ void main() {
     // ripples (which are deviations AROUND the mean) are unaffected.
     out_f[0] += (h0 - h) * 0.02;
     out_f[0]  = max(out_f[0], 0.0);
+    // ── Sponge rim ──────────────────────────────────────────────────
+    // The outer kSpongeCells of the patch pull their depth toward
+    // rest a little every step: a wave running out of the window is
+    // absorbed across the band instead of reflecting off the edge
+    // back over the near water, and the strip a camera move scrolls
+    // in is eased rather than stepped.  A shallow-water wave crosses
+    // the band in ~350 steps, so 5% a step is total absorption.  The
+    // band lies inside the display feather (tile_water.frag fades the
+    // ripples over the outer 15%), so the damping itself is never
+    // seen.  A mass rescale, so u is untouched and a river's current
+    // still runs out through the rim.
+    {
+        int   edge   = min(min(pc.x, N - 1 - pc.x), min(pc.y, N - 1 - pc.y));
+        float sponge = 1.0 - smoothstep(0.0, kSpongeCells, float(edge));
+        if (sponge > 0.0) {
+            float hn = 0.0;
+            for (int i = 0; i < 9; ++i) hn += out_f[i];
+            float k = 1.0 + (h0 / max(hn, 1e-4) - 1.0) * (0.10 * sponge);
+            for (int i = 0; i < 9; ++i) out_f[i] *= k;
+        }
+    }
 
     imageStore(dst_fA, pc, vec4(out_f[0], out_f[1], out_f[2], out_f[3]));
     imageStore(dst_fB, pc, vec4(out_f[4], out_f[5], out_f[6], out_f[7]));

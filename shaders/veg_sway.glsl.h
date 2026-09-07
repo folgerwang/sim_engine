@@ -101,12 +101,67 @@ const float kVegUprightCos  = 0.72;   // >= this: full sway (~44 deg)
 // (local_world_rot_mat * vec3(0,1,0)) -- taken as the image of the axis
 // under the very matrix that transforms the vertex, so it cannot drift
 // from whatever row/column convention InstanceDataInfo is packed in.
-vec3 vegSwayOffset(vec3 inst_t, float local_h, float t, vec3 up_ws) {
+// ── Sway as ONE SCALAR ───────────────────────────────────────────────
+// Every term above pushes along kVegWindDir and only ever downwind, so
+// the whole displacement of a vertex is a single non-negative travel
+// `s` (metres) plus the arc dip it implies.  That is what lets the
+// G-buffer carry it in one 8-bit channel (see kVegSwayEncodeMaxM) so
+// deferred_resolve.comp can undo it: the RT acceleration structures
+// hold the UNSWAYED mesh (per-mesh BLAS built once, static TLAS
+// transforms), and a shadow ray launched from the swayed raster
+// position tests against a tree that is standing still.  As the canopy
+// leans the leaves slide in and out of their own static self-shadow
+// -- that is the leaf flicker.  Launching from `pos - vegSwayVec(s)`
+// puts the ray back on the surface the BLAS actually contains.
+// Largest travel worth encoding: a 20 m crown in a full gust reaches
+// ~0.8 m of lean plus ~0.09 m of flutter; anything beyond saturates,
+// which only degrades the correction on an already extreme case.
+const float kVegSwayEncodeMaxM = 1.0;
+
+// Travel -> world offset (the arc dip is a function of the travel).
+vec3 vegSwayVec(float s) {
+    vec2 off = kVegWindDir * s;
+    return vec3(off.x, -0.30 * dot(off, off), off.y);
+}
+
+// The travel scalar itself; vegSwayOffset() below is vegSwayVec() of
+// this, kept as the one call site the depth-only pass uses.
+// ── Trunk profile: rigid base, cantilever above ─────────────────────
+// The old profile (kVegBendLinear) let the whole stem take part, root
+// to tip, because a pure h^2 looked frozen below the crown.  Watched on
+// a young tree that reads WRONG: the trunk rocks from the ground up like
+// a reed, while a real trunk is a tapered beam clamped in the soil --
+// its lower third is effectively rigid, and the deflection grows from
+// there toward the tip, faster and faster (a cantilever's deflection
+// goes as the square of the distance above the clamped section).  So:
+// nothing moves below kVegRigidFrac of the plant's height -- not the
+// lean, not the flutter -- and above it the travel rises as u^2 to its
+// full value at the crown.  The crown's full travel scales with the
+// plant's height (a 20 m tree sweeps further than a 2 m bush at the
+// same wind), clamped so a sapling still stirs and a giant does not
+// sweep metres.  Needs the plant's height, which the CPU packs per
+// node (see ModelParams::debug_skip_skinning); a draw that did not
+// pack it (0) falls back to the old profile rather than freezing.
+const float kVegRigidFrac   = 0.34;   // fraction of plant height held rigid
+const float kVegSizeGainMin = 0.20;   // crown travel, in canopy refs, floor
+const float kVegSizeGainMax = 3.60;   // ...and ceiling
+
+float vegPlantHeight(uint bits) {
+    return float(bits & 0xFFFFu) * (1.0 / 256.0);
+}
+float vegPlantRootY(uint bits) {
+    int r = int(bits >> 16u);
+    if (r >= 32768) r -= 65536;
+    return float(r) * (1.0 / 256.0);
+}
+
+float vegSwayTravel(vec3 inst_t, float local_h, float t, vec3 up_ws,
+                    uint plant_bits) {
     // Fallen/steeply-pitched instances: no swing at all.
     float upright = up_ws.y * inversesqrt(max(dot(up_ws, up_ws), 1e-8f));
     float stand = smoothstep(kVegFallenCos, kVegUprightCos, upright);
     if (stand <= 0.0f) {
-        return vec3(0.0f);
+        return 0.0f;
     }
     float ph = dot(inst_t.xz, kVegWindDir) * kVegGustWaveInv;
     // two incommensurate travelling waves so the field never breathes
@@ -117,13 +172,26 @@ vec3 vegSwayOffset(vec3 inst_t, float local_h, float t, vec3 up_ws) {
     // canopy upwind.
     g = max(g, 0.0);
 
-    // Roots planted, canopy carries the travel — but the whole stem
-    // swings, not just the top third (see kVegBendLinear/kVegBendMaxH).
-    // Still monotonically increasing in h and still exactly 0 at the
-    // root, so the plant cannot fold into an S.
-    float h01  = clamp(local_h * (1.0 / kVegCanopyRefM),
-                       0.0, kVegBendMaxH);
-    float bend = h01 * (kVegBendLinear + (1.0 - kVegBendLinear) * h01);
+    // Bend profile along the stem (see kVegRigidFrac).  `fl_gain` is
+    // what the flutter is multiplied by so the rigid section carries
+    // none of it either: "not moving" has to mean not moving.
+    float bend, fl_gain;
+    float plant_h = vegPlantHeight(plant_bits);
+    if (plant_h > 0.05) {
+        float u = clamp(((local_h - vegPlantRootY(plant_bits)) / plant_h
+                         - kVegRigidFrac) / (1.0 - kVegRigidFrac),
+                        0.0, 1.0);
+        bend    = u * u * clamp(plant_h * (1.0 / kVegCanopyRefM),
+                                kVegSizeGainMin, kVegSizeGainMax);
+        fl_gain = u;
+    } else {
+        // Legacy (no extent packed): whole-stem profile, monotonic in
+        // h and exactly 0 at the root, see kVegBendLinear/kVegBendMaxH.
+        float h01 = clamp(local_h * (1.0 / kVegCanopyRefM),
+                          0.0, kVegBendMaxH);
+        bend    = h01 * (kVegBendLinear + (1.0 - kVegBendLinear) * h01);
+        fl_gain = 1.0;
+    }
     float lean = kVegLeanM * g;
 
     // Per-instance flutter phase from the translation itself — no hash
@@ -135,11 +203,45 @@ vec3 vegSwayOffset(vec3 inst_t, float local_h, float t, vec3 up_ws) {
     // gets ~3.6 cm, a canopy ~9 cm on top of its lean).  Rectifying is
     // what guarantees the flutter can only ever ADD downwind travel.
     float fl = 2.0 * kVegFlutterPerM *
-               min(local_h, kVegFlutterCapM) * (0.5 + 0.5 * sin(f_ph));
+               min(local_h, kVegFlutterCapM) * (0.5 + 0.5 * sin(f_ph))
+             * fl_gain;
 
-    vec2 off = kVegWindDir * (lean * bend + fl) * stand;
+    return (lean * bend + fl) * stand;
+}
+
+vec3 vegSwayOffset(vec3 inst_t, float local_h, float t, vec3 up_ws,
+                   uint plant_bits) {
     // the canopy dips slightly as it leans — an arc, not a shear
-    return vec3(off.x, -0.30 * dot(off, off), off.y);
+    return vegSwayVec(vegSwayTravel(inst_t, local_h, t, up_ws, plant_bits));
+}
+
+// ── Crown-volume normal ─────────────────────────────────────────────
+// A leaf card carries the normal of its own little quad, so every card
+// in a crown is lit by its own random orientation: neighbours flip
+// between lit and dark with no relation to where the sun is, and the
+// tree reads as a heap of flat cutouts instead of a body with a lit
+// side and a shaded side.  Real foliage shading is dominated by the
+// crown as a VOLUME -- the sunward half is bright, the far half dark,
+// the top catches the sky -- so the card normal is bent toward the
+// normal of a rounded shell around the trunk axis: radial in xz, tilted
+// up by kVegCrownUpTilt, and straight up on the axis itself (the eps
+// keeps the axis from going degenerate and makes the top of the crown
+// face the sky).  This is the same trick every foliage renderer uses
+// (Speedtree's "normal bending", UE's foliage normal blend), and it is
+// what turns the bush below from grey cards into a green mass.
+// Trunks come through the same path: a cylinder's normal is already
+// radial, so the bend only tilts it a little toward the sky, which is
+// harmless.  The bend is in the instance's LOCAL frame (before the
+// instance rotation), so a yawed or leaning plant keeps its own axis.
+const float kVegCrownBlend   = 0.60;  // 0 = card normal, 1 = pure shell
+const float kVegCrownUpTilt  = 0.55;  // shell tilt: dy per metre of radius
+const float kVegCrownAxisEps = 0.35;  // m of "up" added on the axis
+
+vec3 vegCrownNormal(vec3 p_ls, vec3 n_card_ls) {
+    float r = length(p_ls.xz);
+    vec3 shell = normalize(vec3(p_ls.x, kVegCrownUpTilt * r + kVegCrownAxisEps,
+                                p_ls.z));
+    return normalize(mix(n_card_ls, shell, kVegCrownBlend));
 }
 
 #endif  // VEG_SWAY_GLSL_H_

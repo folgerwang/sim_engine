@@ -44,10 +44,36 @@ vec3 sceneAcesFilm(vec3 x)
     return clamp((x * (A * x + B)) / (x * (C * x + D) + E), 0.0, 1.0);
 }
 
+// ── Display grade ────────────────────────────────────────────────────
+// Applied AFTER the ACES curve, in display (gamma) space, by every
+// final-colour writer through the two entry points below -- one grade
+// for forward and deferred pixels alike, or the seam comes back.
+//
+// WHY.  The generated world reads dull: the colour maps the terrain and
+// its 1 m detail tiles are built from come out pale and desaturated
+// (new-world_color.png measures a median luma of 0.55 and a median
+// saturation of ~15%), the sky IBL fills the shadows to near-flat, and
+// the ACES shoulder parks the whole frame in the middle of the range.
+// A mild S-curve about mid-grey plus a luma-preserving saturation lift
+// is the standard corrective for exactly that look.  Both are 1 = off.
+// Contrast pivots at display 0.5 (~18% linear grey), so mid-tones stay
+// where ACES pinned them and only the spread changes; the saturation
+// mix is about the pixel's own luma, so it never brightens or darkens.
+const float kSceneContrast   = 1.10;
+const float kSceneSaturation = 1.18;
+
+vec3 sceneGrade(vec3 c)
+{
+    c = clamp((c - 0.5) * kSceneContrast + 0.5, 0.0, 1.0);
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return clamp(mix(vec3(l), c, kSceneSaturation), 0.0, 1.0);
+}
+
 vec3 sceneTonemap(vec3 hdr)
 {
     // 1/2.2 gamma matches functions.glsl.h's linearTosRGB exactly.
-    return pow(sceneAcesFilm(hdr * kSceneExposure), vec3(1.0 / 2.2));
+    return sceneGrade(
+        pow(sceneAcesFilm(hdr * kSceneExposure), vec3(1.0 / 2.2)));
 }
 
 // ── Physical-camera exposure ────────────────────────────────────────────
@@ -64,8 +90,9 @@ float sceneExposureScaleOf(float v)
 
 vec3 sceneTonemapExposed(vec3 hdr, float exposure_scale)
 {
-    return pow(sceneAcesFilm(hdr * (kSceneExposure * exposure_scale)),
-               vec3(1.0 / 2.2));
+    return sceneGrade(
+        pow(sceneAcesFilm(hdr * (kSceneExposure * exposure_scale)),
+            vec3(1.0 / 2.2)));
 }
 
 #endif  // TONEMAP_GLSL_H

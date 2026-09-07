@@ -21,6 +21,9 @@ layout(push_constant) uniform TileUniformBufferObject {
 layout(set = TILE_PARAMS_SET, binding = ROCK_LAYER_BUFFER_INDEX) uniform sampler2D rock_layer;
 layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform sampler2D soil_water_layer;
 layout(set = TILE_PARAMS_SET, binding = TERRAIN_FLAT_MASK_INDEX) uniform sampler2D terrain_flat_mask;
+// Macro colour map: the vegetation signal the blade density follows
+// (grassCoverField, same gate as grass.mesh).
+layout(set = TILE_PARAMS_SET, binding = SRC_MAP_MASK_INDEX) uniform sampler2D src_map_mask;
 // The camera is what the 1 m detail fade is measured against.  The
 // mesh path already had it (for the view fade); this stage did not,
 // because grass.geom owns the view fade on this path -- but the ROOT
@@ -40,9 +43,10 @@ layout(location = IINPUT_MAT_ROT_2) in vec3 in_loc_rot_mat_2;
 layout(location = IINPUT_MAT_POS_SCALE) in vec4 in_loc_pos_scale;
 
 layout(location = 0) out GrassSeed {
-    vec4 root_dry;   // xyz = root world position, w = dryness
+    vec4 root_dry;   // xyz = root world position, w = dryness (raw field)
     vec4 h_blade;    // the per-blade hash draw
     vec4 arc;        // xyz = total horizontal tip travel (lean + wind)
+    vec4 h_kind;     // the per-tuft kind / size draw (grassMakeBlade)
 } out_seed;
 
 
@@ -114,12 +118,12 @@ float grassGroundHeight(vec2 root_xz) {
 
 void main() {
     uint blade_idx = uint(gl_InstanceIndex);
-    uint tuft_idx  = uint(float(blade_idx) * (1.0f / kGrassTuftBlades));
+    uint tuft_idx  = blade_idx / uint(kGrassTuftBlades);
 
-    vec4 h_tuft  = clamp(hash43(vec3(tile_params.min, float(tuft_idx))),
-                         0.0f, 1.0f);
-    vec4 h_blade = clamp(hash43(vec3(tile_params.min + vec2(17.13f, 41.77f),
-                                     float(blade_idx))), 0.0f, 1.0f);
+    // Integer hashes, same draws as grass.mesh (grass_common.glsl.h).
+    const uvec2 tile_key = floatBitsToUint(tile_params.min);
+    vec4 h_tuft  = grassHash4(tile_key, tuft_idx, 0u);
+    vec4 h_blade = grassHash4(tile_key, blade_idx, 1u);
 
     // Root placement with waterline rejection — same retry loop as
     // grass.mesh (see there / grass_common.glsl.h for the reasoning).
@@ -127,6 +131,9 @@ void main() {
     vec2  world_map_uv;
     vec2  soil_water_thickness;
     float built;
+    // Distance-driven density: same decision as grass.mesh, on the
+    // tuft's original hash (see grass_common.glsl.h).
+    const float tuft_h = h_tuft.z;
     for (int attempt = 0; ; ++attempt) {
         root_xz = grassRootXZ(tile_params.min, tile_params.range,
                               h_tuft, h_blade);
@@ -141,9 +148,7 @@ void main() {
         if (!rejected || attempt >= kGrassWaterRelocates) {
             break;
         }
-        h_tuft = clamp(hash43(vec3(
-            tile_params.min + vec2(7.31f, -3.77f) * float(attempt + 1),
-            float(tuft_idx))), 0.0f, 1.0f);
+        h_tuft = grassHash4(tile_key, tuft_idx, 16u + uint(attempt));
     }
     // Same rendered-surface height tile.vert's SOIL_PASS produces —
     // base rock mixed toward the streamed 1 m detail relief, with the
@@ -159,9 +164,29 @@ void main() {
                                       soil_water_thickness.y);
     water_k *= 1.0f - smoothstep(kGrassBuiltFadeStart,
                                  kGrassBuiltFadeEnd, built);
+    water_k *= grassDensityKeep(
+        tuft_h, distance(camera_info.position,
+                         vec3(root_xz.x, ground_height, root_xz.y)),
+        grassKeepAtDistance(grassTileMinDist(
+            camera_info.position.xz, tile_params.min, tile_params.range)));
+    // Cover: follow the vegetation map (grass_common.glsl.h).
+    float cover = kGrassCoverFloor;
+    if (water_k > 0.0f) {
+        vec3 macro = textureLod(src_map_mask, world_map_uv, kGrassCoverLod).rgb;
+        cover = grassCoverField(macro, root_xz);
+        water_k *= grassCoverKeep(h_tuft.w, cover);
+    }
 
     float dry = grassDryField(root_xz);
-    GrassBlade blade = grassMakeBlade(root_xz, h_blade, dry);
+    // Slot code in .w -- same rule as grass.mesh.
+    vec4 h_kind = grassHash4(tile_key, tuft_idx, 4u);
+    h_kind.w = 0.0f;
+    if (blade_idx - tuft_idx * uint(kGrassTuftBlades) == kGrassFlowerSlot) {
+        vec4 h_fl = grassHash4(tile_key, tuft_idx, 5u);
+        float code = grassFlowerOf(h_fl.x, cover, dry, h_fl.y);
+        h_kind.w = (code > 0.5f) ? code : -1.0f;
+    }
+    GrassBlade blade = grassMakeBlade(root_xz, h_blade, h_kind, dry);
 
     {
         float wf_w;
@@ -179,5 +204,6 @@ void main() {
 
     out_seed.root_dry = vec4(root_xz.x, ground_height - 0.01f, root_xz.y, dry);
     out_seed.h_blade  = h_blade;
+    out_seed.h_kind   = h_kind;
     out_seed.arc      = vec4(blade.arc, water_k);
 }

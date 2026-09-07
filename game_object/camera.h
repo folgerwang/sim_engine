@@ -99,6 +99,13 @@ public:
     // Camera & Lens exposure (ViewCameraInfo::exposure_scale); uploaded
     // with the rest of the struct by the next updateViewCameraInfo.
     void setExposureScale(float s) { m_camera_info_.exposure_scale = s; }
+    // Underwater (ViewCameraInfo::underwater_depth / water_level_y):
+    // metres of water above the eye (<= 0 in air) and the surface
+    // height at the eye's XZ.  Same upload path as the exposure.
+    void setUnderwater(float depth_m, float level_y) {
+        m_camera_info_.underwater_depth = depth_m;
+        m_camera_info_.water_level_y    = level_y;
+    }
     static void setProjJitter(const glm::vec2& ndc_jitter) {
         s_proj_jitter_ndc_ = ndc_jitter;
     }

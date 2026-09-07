@@ -8,6 +8,7 @@
 #include "..\ibl.glsl.h"
 #include "tile_common.glsl.h"
 #include "..\weather\wind_field.glsl.h"
+#include "..\underwater.glsl.h"   // the surface seen from below
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	ViewCameraInfo camera_info;
@@ -120,6 +121,28 @@ layout(set = TILE_PARAMS_SET, binding = WIND_TEX_INDEX) uniform sampler2D wind_p
 layout(std430, set = TILE_PARAMS_SET, binding = WIND_REGION_BUFFER_INDEX) readonly buffer WindRegionBuf {
     vec4 wind_region;
 };
+
+// ── The wind the waves ride, everywhere ─────────────────────────────
+// sampleWindFine hands back weight 0 outside the patch, and the waves
+// used to fall back to a CONSTANT wind there: a different weather on
+// the two sides of a square that follows the camera, which no feather
+// can hide -- on a calm day the near sea was a dark, still diamond in
+// a choppy one.  The sim's own rim is the best guess for the wind
+// beyond it (the patch is pulled toward the coarse weather field, so
+// its edge already carries that), so outside the patch the wind is
+// read at the nearest point of the patch's fully-weighted core.  Only
+// a dead region (sim not live) falls back to the constant.
+vec2 waterWindAt(vec2 p_xz, out float out_weight) {
+    out_weight = 0.0f;
+    float span = wind_region.z * wind_region.w;
+    if (span <= 1.0f) {
+        return vec2(0.0f);
+    }
+    vec2 uv = (p_xz - wind_region.xy) / span;
+    uv = clamp(uv, vec2(kWindPatchFeather), vec2(1.0f - kWindPatchFeather));
+    out_weight = 1.0f;
+    return texture(wind_patch_tex, uv).xy;
+}
 // The water column, sampled PER PIXEL.  in_data.water_depth is the same
 // quantity interpolated from the vertices, and that is what made the
 // shoreline jagged: across a triangle the interpolation is LINEAR, so
@@ -224,9 +247,20 @@ const float kMaxWaterRayM = 512.0;
 // into itself. Rinse and repeat, etc. Completely made up on the spot, but keeping your 
 // original concept in mind, which involved combining noise layers travelling in opposing
 // directions.
+// ── Surface clock ───────────────────────────────────────────────────
+// One multiplier on every time-driven term of the surface shading --
+// the octave drift (kFbmDriftK), the gust slide (kGustDrift), the detail noise's own
+// drift in warpedNoise -- so the whole surface travels faster or
+// slower as one thing and no relative speed (long waves outrunning
+// short ones, gusts crossing the swell) changes.  1.5: half again as
+// fast as the look was tuned at.  The LBM current advection is
+// physical (m/s from the sim) and does not take this.
+const float kWaterMotionSpeed = 1.5f;
+
 float warpedNoise(vec2 p) {
     
-    vec2 m = vec2(tile_params.time, -tile_params.time)*.25;
+    vec2 m = vec2(tile_params.time, -tile_params.time) *
+             (0.25 * kWaterMotionSpeed);
     float x = fractalNoise(p + m);
     float y = fractalNoise(p + m.yx + x);
     float z = fractalNoise(p - m - x + y);
@@ -396,7 +430,11 @@ void main() {
     vec3 pos = in_data.vertex_position;
     vec3 tnor = terrainNormal(vec2(pos.x, pos.z), 0.00025f, 2000.0f);
 
-    float noise;
+    // The base detail field, everywhere.  The LBM patch below only ever
+    // ADDS to the surface -- a steer of this field along its current,
+    // its ripple slopes on top of the wind waves -- never replaces it,
+    // so a still patch (a lake, the sea) is invisible.
+    float noise = warpedNoise(pos.xz * 0.04334f);
 #if defined(WATER_ATTR) || defined(WATER_LBM)
     // ── LBM patch coverage + its GENERATED flow at this fragment ────
     // Resolved once here; the ripple-normal blend below reuses it.
@@ -417,22 +455,28 @@ void main() {
             }
         }
     }
-    if (dot(lbm_flow_v, lbm_flow_v) > 1e-4) {
-        // Two-phase flowmap scroll: the detail noise is sampled at two
-        // positions advected backwards along the current, cross-faded
-        // so neither phase is ever visibly reset — the standard trick,
-        // but the flow field comes from the LBM itself.
-        float fph = fract(tile_params.time * 0.5);
+    // Where the sim carries a current, the detail field is STEERED
+    // along it: two phases advected backwards along the flow, each
+    // reset while its weight is zero (p2 leads p1 by half a period, so
+    // one resets exactly when the other is fully on -- the old single
+    // phase jumped every period).  Weights are sqrt so the blend
+    // preserves the field's variance instead of halving it at every
+    // crossover, and the whole thing is blended in by the current's
+    // strength: the patch edge, where the feathered flow tails off,
+    // has no threshold to draw a line on.
+    float flow_spd = length(lbm_flow_v);
+    if (flow_spd > 1e-3) {
+        float p1 = fract(tile_params.time * 0.5);
+        float p2 = fract(tile_params.time * 0.5 + 0.5);
+        float w  = abs(p1 * 2.0 - 1.0);
         float n1 = warpedNoise(
-            (pos.xz - lbm_flow_v * (fph * 2.0)) * 0.04334f);
+            (pos.xz - lbm_flow_v * (p1 * 2.0)) * 0.04334f) - 0.5;
         float n2 = warpedNoise(
-            (pos.xz - lbm_flow_v * ((fph - 1.0) * 2.0)) * 0.04334f);
-        noise = mix(n1, n2, abs(fph * 2.0 - 1.0));
-    } else
-#endif
-    {
-        noise = warpedNoise(pos.xz * 0.04334f);
+            (pos.xz - lbm_flow_v * (p2 * 2.0)) * 0.04334f) - 0.5;
+        float adv = 0.5 + n1 * sqrt(1.0 - w) + n2 * sqrt(w);
+        noise = mix(noise, adv, smoothstep(0.0, 0.15, flow_spd));
     }
+#endif
     float water_noise = (noise * 2.0f - 1.0f);
 
     // ── Base normal: FLAT ───────────────────────────────────────────
@@ -462,36 +506,91 @@ void main() {
     // patch's own feathered weight, so the handoff to the constant
     // wind outside the patch is the same invisible seam the LBM
     // ripples already use.
+    // (waterWindAt: the sim's wind inside the patch, its rim's wind
+    // beyond it, the constant only while the sim is not live -- so
+    // there is no square on the water where the weather changes.)
     float wf_w;
-    vec2  wf_v = sampleWindFine(wind_patch_tex, wind_region,
-                                pos.xz, wf_w);
+    vec2  wf_v = waterWindAt(pos.xz, wf_w);
     vec2  wdir; float wspd;
     windDirSpeed(vec3(wf_v.x, 0.0, wf_v.y), wdir, wspd);
     vec2  wind_dir  = normalize(mix(kWindDir, wdir, wf_w));
-    float wind_gain = mix(1.0f, clamp(wspd * (1.0f / 6.0f), 0.15f, 1.8f),
+    // 0.30 floor (was 0.15): a lull still leaves a readable surface.
+    float wind_gain = mix(1.0f, clamp(wspd * (1.0f / 6.0f), 0.30f, 1.8f),
                           wf_w);
-    vec2  wave_slope = windWaveSlope(pos.xz, tile_params.time, footprint,
-                                     water_noise * 2.2f,
+    vec2  wave_slope = windWaveSlope(pos.xz,
+                                     tile_params.time * kWaterMotionSpeed,
+                                     footprint, water_noise * 2.2f,
                                      wind_dir, wind_gain, wave_micro);
-    water_normal.xz -= wave_slope * shore_att;
-    water_normal = normalize(water_normal);
+    // SLOPE ACCUMULATOR.  Every contribution to the surface is a
+    // height-field slope (dh/dx, dh/dz), and independent height fields
+    // ADD — so the slopes are summed here and the normal is built ONCE
+    // from the total, below.  The wind waves are the first term.
+    vec2  surf_slope = wave_slope * shore_att;
     // Trains the footprint retired come back as roughness, so distance
     // dulls the specular into a haze instead of aliasing it into
     // sparkle — the same trade LEAN/Toksvig mapping makes.
     float wave_rough = clamp(wave_micro * shore_att * 0.6f, 0.0f, 0.28f);
 
 #if defined(WATER_ATTR) || defined(WATER_LBM)
-    // Blend the LBM ripple normal in where the camera-following patch
-    // covers this fragment: the D2Q9 sim carries travelling waves,
-    // wakes and rain-rings the procedural noise can't, and it fades
-    // back to the noise normal at the patch edge so the handoff is
-    // invisible.  Coverage/weight were resolved above.
+    // Add the LBM ripples where the camera-following patch covers this
+    // fragment: the D2Q9 sim carries travelling waves, wakes and
+    // rain-rings the procedural noise can't.  Coverage/weight were
+    // resolved above.
+    //
+    // ADDED AS A SLOPE, NOT LERPED AS A NORMAL.  The previous version
+    // did mix(water_normal, lbm_n, 0.8 * lbm_wgt), which REPLACES 80%
+    // of the wind-wave normal with the sim's wherever the patch is —
+    // and the patch is a 128 m square glued to the camera whether or
+    // not the sim has anything to say there.  On a lake or the sea the
+    // level map is flat, the body force is zero and the lattice sits
+    // at rest, so the sim's normal is (0,1,0) plus stir-lattice grain:
+    // the lerp scaled the FBM slopes to 0.2 inside the patch and the
+    // wind waves simply vanished in the near field, then came back
+    // across the 15% feather.  Seen from a deck that is a dark, flat
+    // diamond (the square in perspective) with a soft rim, tracking
+    // the player around the world.  The sim's ripples and the wind
+    // waves are two independent height fields on the same surface, so
+    // their SLOPES add: where the sim is still it contributes nothing
+    // and the wind waves are untouched; where it is active (a river's
+    // current, a wake) its ripples ride on top of the chop.  The 0.8
+    // that used to be the lerp's authority is kept as a plain gain so
+    // rivers keep the ripple amplitude they were tuned at.
     if (lbm_wgt > 0.0) {
         vec3 lbm_n = texture(lbm_surface_tex, lbm_luv).xyz;
-        water_normal = normalize(
-            mix(water_normal, lbm_n, 0.8 * lbm_wgt));
+        // Back the slope out of the sim's normal — lbm_water.comp
+        // writes normalize(-dh/dx, 1, -dh/dz), so slope = -n.xz / n.y.
+        // The y floor guards a degenerate (cleared) texel from blowing
+        // the slope up; a NaN texel (a blown-up lattice before its
+        // reset) contributes nothing rather than poisoning the normal.
+        vec2 lbm_slope = any(isnan(lbm_n))
+                       ? vec2(0.0)
+                       : -lbm_n.xz / max(lbm_n.y, 0.25);
+        // Resolution gate.  The sim's cells are lbm_region.y (0.25 m)
+        // and its surface texture has no mip chain: once a pixel spans
+        // more than a couple of cells the bilinear fetch is sampling a
+        // ripple field it cannot resolve, and what comes back is
+        // moire -- the ruled arcs that converged on the patch's far
+        // corner across the near water.  The ripples retire with the
+        // pixel footprint the way the wind-wave trains do, their
+        // energy joining the roughness, so at range the patch hands
+        // the surface back to the wind waves without a seam.
+        float lbm_cell = max(lbm_region.y, 0.05);
+        float lbm_res  = 1.0 - smoothstep(1.5 * lbm_cell, 5.0 * lbm_cell,
+                                          footprint);
+        // An ADD-ON, never a replacement: whatever the lattice does,
+        // its slope is capped below the wind waves' own steepness
+        // (kFbmSteep0 = 0.17), so the sim can steer and ripple the
+        // surface but cannot out-shout the weather it rides on.
+        const float kLbmSlopeMax = 0.12;
+        float lbm_len = length(lbm_slope);
+        if (lbm_len > kLbmSlopeMax) {
+            lbm_slope *= kLbmSlopeMax / lbm_len;
+        }
+        surf_slope += lbm_slope * (0.8 * lbm_wgt * lbm_res);
     }
 #endif // WATER_ATTR || WATER_LBM
+    water_normal.xz -= surf_slope;
+    water_normal = normalize(water_normal);
 #ifdef WATER_ATTR
     {
         float water_linz = camera_info.depth_params.y /
@@ -507,6 +606,57 @@ void main() {
         return;
     }
 #endif // WATER_ATTR
+
+    // ── The surface seen from BELOW (underwater.glsl.h) ─────────────
+    // The eye is under water and this fragment is above it: the
+    // underside of the surface.  Inside Snell's window (the refracted
+    // ray, water -> air, exists) it shows what is up there -- the
+    // resolved scene where the pixel's own column holds geometry (the
+    // shore, already fogged by the resolve along the eye-to-surface
+    // path), else the sky along the refracted ray -- blended by the
+    // internal Fresnel with the reflection of the water's own gloom;
+    // past the critical angle it is all reflection.  Then the water
+    // between the eye and the surface fogs it, like every opaque pixel
+    // the resolve fogged.  Written in display space like the rest of
+    // this pass (src_tex is already tonemapped).
+    if (camera_info.underwater_depth > 0.0f &&
+        in_data.vertex_position.y > camera_info.position.y + 0.02f) {
+        vec3  eye   = camera_info.position.xyz;
+        vec3  to_s  = in_data.vertex_position - eye;
+        float dist  = length(to_s);
+        vec3  ray   = to_s / max(dist, 1e-4f);
+        vec3  n_up  = water_normal;                // out of the water
+        float expo  = sceneExposureScaleOf(camera_info.exposure_scale);
+        vec3  insc  = uwInscatter(camera_info.underwater_depth);
+        // The reflected side: the water below, seen mirrored -- its own
+        // scattered light, a shade darker than the fog since it looks
+        // down into deeper, dimmer water.
+        vec3  below = insc * 0.55f;
+        // refract() wants the normal on the incident side: below.
+        vec3  t_dir = refract(ray, -n_up, kUwIor);
+        float F     = 1.0f;                        // past the critical angle
+        vec3  col;
+        vec2  suv   = gl_FragCoord.xy * tile_params.inv_screen_size;
+        bool  geom_above = texture(src_depth, suv).r < 1.0f;
+        if (dot(t_dir, t_dir) > 1e-6f) {
+            t_dir = normalize(t_dir);
+            float cos_t = clamp(dot(t_dir, n_up), 0.0f, 1.0f);
+            F = 0.02f + 0.98f * pow(1.0f - cos_t, 5.0f);
+        }
+        if (F < 1.0f && geom_above) {
+            // The shore through the window: the resolve already fogged
+            // it along this ray's underwater length, so only the
+            // reflection is added here.
+            vec3 shore = texture(src_tex, suv).rgb;
+            col = mix(shore, sceneTonemapExposed(uwFog(below, dist, insc), expo), F);
+        } else {
+            vec3 above = (F < 1.0f) ? uwSkyRadiance(t_dir) : vec3(0.0f);
+            vec3 lin   = mix(above, below, F);
+            col = sceneTonemapExposed(uwFog(lin, dist, insc), expo);
+        }
+        outColor = vec4(col, 1.0f);
+        return;
+    }
 
     vec2 screen_uv = gl_FragCoord.xy * tile_params.inv_screen_size;
     float dist_scale = length(vec3((screen_uv * 2.0f - 1.0f) * camera_info.depth_params.zw, 1.0f));

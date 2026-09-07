@@ -58,6 +58,11 @@ static const uint32_t kSecTriplanar = 0x1u;
 // (FEATURE_MATERIAL_SNOW_COVER).  Declared by the material NAME marker
 // "_snowcover", same name-encoding discipline as _triplanar_ above.
 static const uint32_t kSecSnowCover = 0x2u;
+// This section is TRANSLUCENT: its glTF material was alphaMode BLEND
+// (window panes).  The native loaders draw it through the forward glass
+// pass with base_color.a as the transmission; without the flag a baked
+// section can only be Opaque or Mask, and a pane bakes solid.
+static const uint32_t kSecBlend = 0x4u;
 struct ModelPreviewData {
     std::vector<glm::vec3>      positions;
     std::vector<glm::vec3>      normals;   // recomputed when absent

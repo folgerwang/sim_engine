@@ -23,6 +23,10 @@ layout(set = TILE_PARAMS_SET, binding = SOIL_WATER_LAYER_BUFFER_INDEX) uniform s
 // Built-ground (flatten) mask: 1 on graded house pads and road slabs,
 // 0 on natural ground.  See kGrassBuiltRelocate in grass_common.glsl.h.
 layout(set = TILE_PARAMS_SET, binding = TERRAIN_FLAT_MASK_INDEX) uniform sampler2D terrain_flat_mask;
+// Macro colour map -- the vegetation signal the blade density follows
+// (grassCoverField).  The binding's stage flags include the mesh and
+// vertex stages since the cover gate (terrain.cpp, SRC_MAP_MASK_INDEX).
+layout(set = TILE_PARAMS_SET, binding = SRC_MAP_MASK_INDEX) uniform sampler2D src_map_mask;
 // Runtime 1 m detail relief.  Declares detail_height_tiles +
 // detail_slot_map and must follow the two samplers above, exactly as
 // tile.vert includes it after its own layer bindings.
@@ -192,11 +196,17 @@ void main()
 
     // Two independent draws: one per TUFT (shared root) and one per
     // BLADE (its own size, facing, lean and phase within the tuft).
-    uint tuft_idx = uint(float(blade_idx) * (1.0f / kGrassTuftBlades));
-    vec4 h_tuft  = clamp(hash43(vec3(tile_params.min, float(tuft_idx))),
-                         0.0f, 1.0f);
-    vec4 h_blade = clamp(hash43(vec3(tile_params.min + vec2(17.13f, 41.77f),
-                                     float(blade_idx))), 0.0f, 1.0f);
+    // Integer division, not the float multiply this used: at the near
+    // tile's indices float(blade_idx) * (1/6) lands a hair under an
+    // integer often enough to file a blade under the previous tuft.
+    const uint  blades_per_tuft = uint(kGrassTuftBlades);
+    uint tuft_idx  = blade_idx / blades_per_tuft;
+    uint blade_in  = blade_idx - tuft_idx * blades_per_tuft;
+    // Integer hashes (grassHash4) -- see grass_common.glsl.h for why
+    // the float hash43 draws put the near field on a lattice.
+    const uvec2 tile_key = floatBitsToUint(tile_params.min);
+    vec4 h_tuft  = grassHash4(tile_key, tuft_idx, 0u);
+    vec4 h_blade = grassHash4(tile_key, blade_idx, 1u);
 
     // ── Root placement with waterline rejection ─────────────────────
     // .y of the soil-water layer is the WATER column standing over the
@@ -211,8 +221,58 @@ void main()
     // after the last retry is shrunk away.
     vec2  root_xz;
     vec2  world_map_uv;
-    vec2  soil_water_thickness;
-    float built;
+    vec2  soil_water_thickness = vec2(0.0f);
+    float built = 0.0f;
+    // ── Distance-driven density (grass_common.glsl.h) ───────────────
+    // Decided on the tuft's ORIGINAL hash (relocation re-hashes
+    // h_tuft, and the keep decision must not move with it) and, for the
+    // early-out, on the camera's XZ distance to the un-relocated tuft:
+    // XZ <= 3D distance, so a tuft the flat metric already drops is
+    // dropped by the true one too -- the conservative direction.  A
+    // dropped tuft skips the relocation loop and the four ground
+    // samples entirely; it only has to reach the workgroup barrier.
+    const float tuft_h = h_tuft.z;
+    // This tile's share of the distance law (grass_common.glsl.h): the
+    // C++ dispatched it at keep(d_min) of full, the lottery keeps
+    // keep(d) / keep(d_min) of what it dispatched.
+    const float keep_tile = grassKeepAtDistance(grassTileMinDist(
+        camera_info.position.xz, tile_params.min, tile_params.range));
+    float d_root = distance(camera_info.position.xz,
+                            tile_params.min + h_tuft.xy * tile_params.range);
+    float dens_k = grassDensityKeep(tuft_h, d_root, keep_tile);
+    // ── Near-field re-seating (grass_common.glsl.h) ─────────────────
+    // A dropped tuft tries a candidate root inside the near disc; the
+    // candidate's weight fades with the original root's own margin so
+    // the two crossfade instead of popping.  `seat_w` > 0 marks a
+    // re-seated blade: its weight is final and skips the 3D lottery
+    // below (inside the near disc the lottery is 1 anyway).
+    float seat_w = 0.0f;
+    if (dens_k <= 0.0f) {
+        float free_w = clamp((-grassDensityMargin(tuft_h, d_root, keep_tile)
+                              - kGrassDenseSoft) / kGrassDenseSoft,
+                             0.0f, 1.0f);
+        if (free_w > 0.0f) {
+            // Half the tuft per candidate: blades 0,2,4 -> seat 0,
+            // blades 1,3,5 -> seat 1.  Both halves stay whole clumps.
+            uint seat = blade_in % kGrassNearSeats;
+            vec4 h_seat = grassHash4(tile_key, tuft_idx, 2u + seat);
+            float d_seat = distance(
+                camera_info.position.xz,
+                tile_params.min + h_seat.xy * tile_params.range);
+            float band = 1.0f - smoothstep(kGrassNearSeatM - kGrassNearSeatBandM,
+                                           kGrassNearSeatM, d_seat);
+            if (band > 0.0f) {
+                h_tuft = h_seat;
+                seat_w = band * free_w;
+                dens_k = seat_w;
+            }
+        }
+    }
+    if (dens_k <= 0.0f) {
+        root_xz = tile_params.min + h_tuft.xy * tile_params.range;
+        world_map_uv = (root_xz - tile_params.world_min) *
+                       tile_params.inv_world_range;
+    } else
     for (int attempt = 0; ; ++attempt) {
         root_xz = grassRootXZ(tile_params.min, tile_params.range,
                               h_tuft, h_blade);
@@ -228,9 +288,7 @@ void main()
             break;
         }
         // Same salt for every blade of the tuft — the clump moves whole.
-        h_tuft = clamp(hash43(vec3(
-            tile_params.min + vec2(7.31f, -3.77f) * float(attempt + 1),
-            float(tuft_idx))), 0.0f, 1.0f);
+        h_tuft = grassHash4(tile_key, tuft_idx, 16u + uint(attempt));
     }
 
     // Ground height under THIS blade (not the tuft centre) so a clump on
@@ -247,19 +305,52 @@ void main()
     // camera, fading to zero only out where the blades already have.
     // That is the grass standing in mid-air, and the same error with
     // the opposite sign is grass buried to the tip.
-    float ground_height = grassGroundHeight(root_xz);
+    float ground_height = (dens_k > 0.0f) ? grassGroundHeight(root_xz)
+                                          : camera_info.position.y;
     // Still wet after every retry (mid-lake tiles): shrink to nothing.
     float water_k = 1.0f - smoothstep(kGrassWaterFadeStartM,
                                       kGrassWaterFadeEndM,
                                       soil_water_thickness.y);
+    // Distance density, now on the true 3D distance of the planted root
+    // (the XZ test above only ever culled; this one also shrinks the
+    // tufts in the soft band).
+    if (seat_w > 0.0f) {
+        dens_k = seat_w;              // re-seated: weight already final
+    } else if (dens_k > 0.0f) {
+        dens_k = grassDensityKeep(
+            tuft_h, distance(camera_info.position,
+                             vec3(root_xz.x, ground_height, root_xz.y)),
+            keep_tile);
+    }
+    water_k *= dens_k;
     // Still on graded ground after every retry (deep inside a town):
     // same treatment.  Multiplied into the same height/width pair, so
     // a blade that is both wet and paved cannot come back.
     water_k *= 1.0f - smoothstep(kGrassBuiltFadeStart,
                                  kGrassBuiltFadeEnd, built);
+    // ── Cover: follow the vegetation map (grass_common.glsl.h) ──────
+    // At the FINAL root (re-seated or relocated), on the tuft's own
+    // hash lane (.w -- .z is the distance lottery).  Skipped for a
+    // tuft that is already gone.
+    float cover = kGrassCoverFloor;
+    if (water_k > 0.0f) {
+        vec3 macro = textureLod(src_map_mask, world_map_uv, kGrassCoverLod).rgb;
+        cover = grassCoverField(macro, root_xz);
+        water_k *= grassCoverKeep(h_tuft.w, cover);
+    }
 
     float dry = grassDryField(root_xz);
-    GrassBlade blade = grassMakeBlade(root_xz, h_blade, dry);
+    // Kind + size roll, one per tuft (grass_common.glsl.h).  .w is the
+    // SLOT code: 0 for the six blades; for the flower slot, the flower
+    // code on green land or -1 (empty, degenerate) elsewhere.
+    vec4 h_kind = grassHash4(tile_key, tuft_idx, 4u);
+    h_kind.w = 0.0f;
+    if (blade_in == kGrassFlowerSlot) {
+        vec4 h_fl = grassHash4(tile_key, tuft_idx, 5u);
+        float code = grassFlowerOf(h_fl.x, cover, dry, h_fl.y);
+        h_kind.w = (code > 0.5f) ? code : -1.0f;
+    }
+    GrassBlade blade = grassMakeBlade(root_xz, h_blade, h_kind, dry);
     blade.root_ws.y = ground_height - 0.01f;   // sink the sheath slightly
     blade.height *= water_k;
     blade.width  *= water_k;
@@ -335,8 +426,8 @@ void main()
             out_data[o].pos_ws_v = vec4(p_ws, v);
             out_data[o].nrm_hash = vec4(n_ws, blade.hash);
             out_data[o].attribs  =
-                vec4(dry, side_sign * kGrassProfile[i_ring].x,
-                     blade.height, 0.0f);
+                vec4(blade.dry, side_sign * kGrassProfile[i_ring].x,
+                     blade.height, blade.flower);
         }
     }
 

@@ -2955,6 +2955,34 @@ std::string lodCategoryOf(const std::string& node_name) {
     const size_t u = node_name.find('_');
     return (u == std::string::npos) ? node_name : node_name.substr(0, u);
 }
+
+// ── Plant sink ───────────────────────────────────────────────────────
+// How far below its authored ground point a placed plant is seated, in
+// metres, by category.  The PCG seats every instance EXACTLY on the
+// heightmap; drawn against a 1 m mesh on any slope that leaves the
+// downhill side of a trunk's flat base hanging in the air, and a rock
+// resting on the ground with its full silhouette reads as dropped, not
+// grown there.  A small burial hides the base disc and roots the plant:
+// trunks by a bit of trunk radius, bushes and ground cover by their
+// sheath, rocks by a fraction of their own height (up to a cap) so the
+// big ones look bedded and the small ones are not swallowed.  Applied
+// at instance bake, so raster, shadows, RT casters and the physical
+// registry's transform all agree.  `h_m` is the instance's world-space
+// mesh height (bbox extent x scale), 0 if unknown.
+const float kPlantSinkTreeM    = 0.25f;
+const float kPlantSinkBushM    = 0.12f;
+const float kPlantSinkGroundM  = 0.04f;
+const float kPlantSinkRockFrac = 0.18f;
+const float kPlantSinkRockMaxM = 0.45f;
+float plantSinkM(const std::string& node_name, float h_m) {
+    const std::string cat = lodCategoryOf(node_name);
+    if (cat == "tree")   return kPlantSinkTreeM;
+    if (cat == "bush")   return kPlantSinkBushM;
+    if (cat == "ground") return kPlantSinkGroundM;
+    if (cat == "rock")   return std::min(kPlantSinkRockMaxM,
+                                         std::max(0.0f, h_m) * kPlantSinkRockFrac);
+    return 0.0f;
+}
 }  // namespace
 
 // Rewrite every LOD node's near/far from its OWN category's table, by
@@ -3615,7 +3643,7 @@ static void bakeInstanceTransforms(
             inst_mesh->bbox_min_.z <= inst_mesh->bbox_max_.z;
 
         for (size_t i = 0; i < count; ++i) {
-            const glm::vec3 tr =
+            glm::vec3 tr =
                 (has_t && (i + 1) * 3 <= t.size())
                     ? glm::vec3(t[i * 3 + 0], t[i * 3 + 1], t[i * 3 + 2])
                     : glm::vec3(0.0f);
@@ -3632,6 +3660,13 @@ static void bakeInstanceTransforms(
                 (has_s && (i + 1) * 3 <= s.size())
                     ? glm::vec3(s[i * 3 + 0], s[i * 3 + 1], s[i * 3 + 2])
                     : glm::vec3(1.0f);
+
+            // Seat the plant a little into the ground (see plantSinkM).
+            tr.y -= plantSinkM(
+                node.name_,
+                mesh_bbox_valid
+                    ? (inst_mesh->bbox_max_.y - inst_mesh->bbox_min_.y) * sc.y
+                    : 0.0f);
 
             const glm::mat3 basis = glm::mat3_cast(glm::normalize(rot)) *
                                     glm::mat3(sc.x, 0.0f, 0.0f,
@@ -5090,6 +5125,28 @@ static void drawMesh(
     }
 }
 
+// ── Plant extent for the wind sway ──────────────────────────────────
+// veg_sway.glsl.h holds the lower kVegRigidFrac of a plant rigid and
+// bends the rest as a cantilever, which needs the plant's HEIGHT -- a
+// per-mesh fact the vertex shader cannot see.  It rides in
+// ModelParams::debug_skip_skinning on MODEL_FLAG_VEGETATION_SWAY draws
+// (vegetation is never skinned, so the debug use and this one cannot
+// meet): bits 0..15 = mesh height * 256 (m), bits 16..31 = mesh root y
+// * 256 (m, int16), from the mesh's own vertex-data bbox.  0 = unknown,
+// which the shader treats as "use the legacy whole-stem profile".
+static uint32_t packVegPlantExtent(const glm::vec3& bbox_min,
+                                   const glm::vec3& bbox_max) {
+    const float h = bbox_max.y - bbox_min.y;
+    if (!std::isfinite(h) || h <= 0.0f || !std::isfinite(bbox_min.y)) {
+        return 0u;
+    }
+    const uint32_t hb = static_cast<uint32_t>(
+        std::min(65535.0f, std::round(h * 256.0f)));
+    const int32_t ry = static_cast<int32_t>(
+        std::lround(std::clamp(bbox_min.y * 256.0f, -32768.0f, 32767.0f)));
+    return (hb & 0xFFFFu) | ((static_cast<uint32_t>(ry) & 0xFFFFu) << 16);
+}
+
 // Draw the mesh attached to ONE node (no recursion).  Shared by the
 // recursive drawNodes walk (sub-object-filter path) and the flat
 // mesh_node_flat_ iteration in DrawableObject::draw (the common path) —
@@ -5284,8 +5341,14 @@ static void drawNodeMesh(
             // For depth-only / shadow / mesh-shader CSM permutations
             // the field is simply unread (those shaders don't include
             // the skinning branch).
+            // On vegetation the same field carries the node's plant
+            // extent for the sway profile (see packVegPlantExtent).
             model_params.debug_skip_skinning =
-                drawable_object->m_debug_skip_skinning_ ? 1u : 0u;
+                drawable_object->m_vegetation_sway_
+                    ? packVegPlantExtent(
+                          drawable_object->meshes_[node.mesh_idx_].bbox_min_,
+                          drawable_object->meshes_[node.mesh_idx_].bbox_max_)
+                    : (drawable_object->m_debug_skip_skinning_ ? 1u : 0u);
             // Ground-clutter distance fade.  0/0 for every drawable that
             // hasn't called setClutterFade — including the road decal,
             // which shares the DECAL permutation — and base.frag skips
@@ -7698,7 +7761,14 @@ static void ntStageRecords(
             base_flags | (node.interior_ ? MODEL_FLAG_INTERIOR : 0x00u);
         r.cascade_idx = 0u;
         r.debug_force_red = 0u;
-        r.debug_skip_skinning = 0u;
+        // Vegetation: the node's plant extent for the sway profile.  The
+        // shader reads it from the RECORD before the push constant's
+        // (per-drawable, 0) value overwrites the field.
+        r.debug_skip_skinning =
+            object_->m_vegetation_sway_
+                ? packVegPlantExtent(object_->meshes_[mesh_idx].bbox_min_,
+                                     object_->meshes_[mesh_idx].bbox_max_)
+                : 0u;
         r.clutter_fade_start_m = 0.0f;
         r.clutter_fade_end_m = 0.0f;
         // Colour-path dissolve weight: ZERO = steady (see drawNodeMesh).
@@ -12942,6 +13012,19 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             mat.alpha_mask_ = mat_cutout;
             mat.alpha_mode_ = mat_cutout ? ego::AlphaMode::Mask
                                          : ego::AlphaMode::Opaque;
+            // TRANSLUCENT section (kSecBlend: the source material was
+            // glTF alphaMode BLEND -- the house library's window panes).
+            // Routed exactly like the glTF loader's name-forced glass:
+            // Blend goes to the forward glass pass (depth test on, no
+            // depth write, "over" blend) where base_color.a is the
+            // transmission.  The native path had only Opaque/Mask, so
+            // every pane was baked solid and painted the sky's colour.
+            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+                mat.alpha_mode_ = ego::AlphaMode::Blend;
+                mat.glass_forced_ = true;
+                mat.alpha_mask_ = false;
+                mat.alpha_cutoff_ = 0.0f;
+            }
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
                 SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
@@ -12998,6 +13081,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 ubo.triplanar_tile_m = sec.triplanar_tile_m;
             }
             ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+            // Translucent section (kSecBlend, see above): the fragment
+            // shader dispatches on this bit to keep the pane's alpha
+            // through its cutout branch -- same bit the glTF loader
+            // raises for its Blend materials.
+            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+                ubo.material_features |= FEATURE_MATERIAL_BLEND;
+            }
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
             // ECS dedup identity — baked character sections.
@@ -13673,6 +13763,19 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             mat.alpha_mask_ = mat_cutout;
             mat.alpha_mode_ = mat_cutout ? ego::AlphaMode::Mask
                                          : ego::AlphaMode::Opaque;
+            // TRANSLUCENT section (kSecBlend: the source material was
+            // glTF alphaMode BLEND -- the house library's window panes).
+            // Routed exactly like the glTF loader's name-forced glass:
+            // Blend goes to the forward glass pass (depth test on, no
+            // depth write, "over" blend) where base_color.a is the
+            // transmission.  The native path had only Opaque/Mask, so
+            // every pane was baked solid and painted the sky's colour.
+            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+                mat.alpha_mode_ = ego::AlphaMode::Blend;
+                mat.glass_forced_ = true;
+                mat.alpha_mask_ = false;
+                mat.alpha_cutoff_ = 0.0f;
+            }
             device->createBuffer(
                 sizeof(glsl::PbrMaterialParams),
                 SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
@@ -13729,6 +13832,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 ubo.triplanar_tile_m = sec.triplanar_tile_m;
             }
             ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+            // Translucent section (kSecBlend, see above): the fragment
+            // shader dispatches on this bit to keep the pane's alpha
+            // through its cutout branch -- same bit the glTF loader
+            // raises for its Blend materials.
+            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+                ubo.material_features |= FEATURE_MATERIAL_BLEND;
+            }
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
             captureMaterialDesc(
@@ -14070,7 +14180,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 inst_mesh->bbox_min_.z <= inst_mesh->bbox_max_.z;
 
             for (size_t i = 0; i < count; ++i) {
-                const glm::vec3 tr =
+                glm::vec3 tr =
                     (has_t && (i + 1) * 3 <= t.size())
                         ? glm::vec3(t[i * 3], t[i * 3 + 1], t[i * 3 + 2])
                         : glm::vec3(0.0f);
@@ -14083,6 +14193,12 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                     (has_s && (i + 1) * 3 <= s.size())
                         ? glm::vec3(s[i * 3], s[i * 3 + 1], s[i * 3 + 2])
                         : glm::vec3(1.0f);
+                // Seat the plant a little into the ground (see plantSinkM).
+                tr.y -= plantSinkM(
+                    node.name_,
+                    mesh_bbox_valid
+                        ? (inst_mesh->bbox_max_.y - inst_mesh->bbox_min_.y) * sc.y
+                        : 0.0f);
                 const glm::mat3 basis =
                     glm::mat3_cast(glm::normalize(rot)) *
                     glm::mat3(sc.x, 0.0f, 0.0f,

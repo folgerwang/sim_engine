@@ -179,12 +179,13 @@
 // soil -- kept sinking on every slope and rising in every hollow for
 // minutes after load.  Nothing else in the engine tracks that drift:
 // the PCG placed trees, houses, ground clutter and decals against the
-// authored height + kSoilInitLevel (the tile_creator seed), the camera
-// snap and the RT caster bake assume the same, and only the procedural
-// grass (which samples the live layer) followed the ground.  That is
-// the "grass / clutter flying in the air, then slowly landing" report:
-// the meshes never moved, the ground did.  With this on the ground is
-// exactly detail height + kSoilInitLevel, forever.
+// authored heightmap, the camera snap and the RT caster bake assume
+// the same, and only the procedural grass (which samples the live
+// layer) followed the ground.  That is the "grass / clutter flying in
+// the air, then slowly landing" report: the meshes never moved, the
+// ground did.  With this on the ground is exactly the detail height
+// plus kSoilInitLevel -- which is now 0 (see tile_creator.comp: the
+// rendered ground IS the authored heightmap) -- forever.
 #define SOIL_LAYER_STATIC                       1
 
 // Standing-water SURFACE height map (tile creator set only): the
@@ -847,6 +848,14 @@ struct ModelParams {
     // because the skinning math is producing degenerate vertices vs.
     // the draw not running at all.  drawNodes pushes this for every
     // primitive of a drawable that has setDebugSkipSkinning(true).
+    // ALSO, on MODEL_FLAG_VEGETATION_SWAY draws (never skinned, so the
+    // two uses cannot meet): the node's PLANT EXTENT for the wind sway,
+    // packed by DrawableObject as bits 0..15 = mesh height * 256 (m),
+    // bits 16..31 = mesh root y * 256 (m, int16).  Decoded by
+    // vegPlantHeight() / vegPlantRootY() in veg_sway.glsl.h; 0 = not
+    // packed, which selects the legacy height-only profile.  In the
+    // node-table path this is the RECORD's value -- ntLoadModelParams
+    // reads it out before overwriting the field from the push constant.
     uint debug_skip_skinning;
     // ── Ground-clutter distance fade ─────────────────────────────────
     // Consumed ONLY by the DECAL permutation of base.frag.  A grass
@@ -1717,8 +1726,24 @@ struct ObjectVsPsData {
     // the classic push-constant path, where the interior bit travels in
     // model_params.flip_uv_coord.
     float vertex_node_flags;
+    // Wind-sway travel of this vertex along kVegWindDir, metres, >= 0
+    // (veg_sway.glsl.h vegSwayTravel).  Written by base.vert for
+    // MODEL_FLAG_VEGETATION_SWAY draws, 0 everywhere else; base.frag's
+    // G-buffer permutation encodes it so the deferred resolve can
+    // launch its RT rays from the unswayed surface the BLAS holds.
+    float vertex_sway;
 #ifdef HAS_NORMALS
     vec3 vertex_normal;
+    // Crown-shell normal for vegetation draws (veg_sway.glsl.h
+    // vegCrownNormal): world space, already blended with the card
+    // normal; identical to vertex_normal on every other draw.  The
+    // vertex shader cannot tell a bark primitive from a leaf card, so
+    // it computes this for every vertex of a sway-flagged draw and
+    // base.frag swaps it in for LEAF (alpha-masked) materials only.
+    // The trunk keeps vertex_normal: bent as well, as it used to be, it
+    // shaded like a slab facing the sky and its bark bump sat on a
+    // tilted tangent frame.
+    vec3 vertex_crown_normal;
 #ifdef HAS_TANGENT
     vec3 vertex_tangent;
     vec3 vertex_binormal;
@@ -1893,6 +1918,14 @@ struct ViewCameraInfo {
     // update) means "no scaling" — every reader goes through
     // sceneExposureScaleOf(), which maps <= 0 to 1.
     float           exposure_scale;
+    // Underwater (underwater.glsl.h).  Metres of water above the eye,
+    // <= 0 when the eye is in air, and the surface height at the eye's
+    // XZ -- the application samples the hydrology water-level map every
+    // frame (RealWorldApplication::waterLevelAt).  Trailing scalars
+    // again, so every existing field keeps its offset; the GPU camera
+    // update never writes them, which reads as "in air".
+    float           underwater_depth;
+    float           water_level_y;
 };
 
 struct RuntimeLightsParams {

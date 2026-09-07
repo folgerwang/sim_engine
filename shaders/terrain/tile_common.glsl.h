@@ -1,3 +1,7 @@
+// Presence flag: lets a header that MAY be included with or without
+// this one (grass_common.glsl.h) pick the shared definitions below.
+#define TERRAIN_TILE_COMMON_GLSL_H 1
+
 mat3 m3 = mat3(
     0.00f, 0.80f, 0.60f,
     -0.80f, 0.36f, -0.48f,
@@ -234,6 +238,58 @@ float smoothNoise(vec2 p) {
 
     return dot(mat2(fract(sin(vec4(0, 1, 27, 28) + p.x + p.y * 27.) * 1e5)) * vec2(1. - f.y, f.y), vec2(1. - f.x, f.x));
 
+}
+
+// ── Macro colour grade ───────────────────────────────────────────────
+// The colour maps the generator paints -- and the 1 m detail tiles
+// upscaled from them -- come out pale and washed: the current world's
+// map measures a median luma of 0.55 at ~15% saturation, and its town
+// centre is a near-white beige.  0.55 is chalk; grass, soil and leaf
+// litter sit at 0.10-0.30, dry sand at ~0.40.  Lit by a full sky that
+// is most of why the ground reads as a flat white sheet.
+//
+// Gamma > 1 pulls the mid-tones down while leaving white (the snow
+// caps, which terrainMaterialWeights keys on being NEAR-WHITE) and
+// black alone; the saturation lift is luma-preserving, so it colours
+// the ground without brightening it.  Applied to the resolved macro
+// colour in tile.frag AFTER the material layers (so the layer
+// classification still sees the authored map) and to the ground sample
+// grass.frag pulls its blade hue from, so the two agree.  1 / 1 = off.
+#define kMacroGradeGamma   1.15f
+#define kMacroGradeSat     1.30f
+vec3 terrainGradeAlbedo(vec3 a) {
+    a = pow(max(a, vec3(0.0f)), vec3(kMacroGradeGamma));
+    float l = dot(a, vec3(0.2126f, 0.7152f, 0.0722f));
+    return clamp(mix(vec3(l), a, kMacroGradeSat), vec3(0.0f), vec3(1.0f));
+}
+
+// ── Dryness field ────────────────────────────────────────────────────
+// Where the meadow has cured.  Two sin octaves at ~200 m and ~35 m,
+// both far coarser than a blade or a texel, so grass dries in DRIFTS
+// -- the scorched south slope, the lush strip along the water -- and
+// never as salt-and-pepper.  ONE field for the blades and the ground
+// under them: grassDryField() (grass/grass_common.glsl.h) forwards to
+// this wherever tile_common is in scope and carries a verbatim copy for
+// the one stage that includes it alone, and tile.frag tints the turf
+// with it, so a straw tuft never stands on green ground and a green one
+// never on straw.  0 = lush, 1 = fully cured.
+// Baseline 0.64 (was 0.50): the reference is late-season grassland --
+// a golden sea with green only in the hollows and along water -- so
+// the field sits cured by default and the lush drifts are the
+// exception, not the other way round.
+float terrainDryField(vec2 p) {
+    float a = sin(p.x * 0.0312f + 1.7f) * sin(p.y * 0.0271f - 0.4f);
+    float b = sin(p.x * 0.0083f - 2.1f) * sin(p.y * 0.0091f + 1.1f);
+    return clamp(0.64f + 0.30f * a + 0.42f * b, 0.0f, 1.0f);
+}
+
+// Dryness -> "how cured does it LOOK", shared by the blades and the
+// turf under them so the two brown together.  Was d*d in both places,
+// which kept everything below d ~0.7 reading green; a blade is
+// visibly straw well before it is fully dead, so the curve now rises
+// through the middle of the range and saturates at the top.
+float terrainDryCurve(float d) {
+    return smoothstep(0.12f, 0.85f, d);
 }
 
 // Also the same as the original, but with one less layer.

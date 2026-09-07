@@ -90,8 +90,38 @@ vec4 terrainDetailTap(vec2 p) {
                            vec3(uv, float(slot)), 0.0f).rgb, 1.0f);
 }
 
+// Soft tap: (1,2,1) x (1,2,1) / 16 at `sp` metres around p.  The colour
+// tile is 1 m per texel with ONE mip and a bilinear sampler, and up
+// close that is the whole problem: bilinear magnification of a 1 m
+// texel grid reconstructs it as a tent -- a quilt of soft-edged 1 m
+// squares with a crease at every texel centre -- and the tile's own
+// per-texel grain (and the hard 4 m class edges the worker upsampled
+// into it) turn that quilt into the "brick paving" the ground reads as
+// at walking distance.  Nine bilinear taps one texel apart sum the
+// tents into a quadratic B-spline: continuous first derivative, no
+// creases, and the texel grain is gone while everything 3 m and up is
+// kept.  What the eye then sees at that scale comes from the
+// procedural field and the sward instead, which have real energy
+// there.  `sp` grows with distance (see det_tap_m in main) so the same
+// nine taps double as the missing mip chain in the far field.
+// Out-of-range / non-resident taps carry w = 0 and drop out of the
+// average, so tile borders and the residency edge need no special case.
+vec4 terrainDetailTapSoft(vec2 p, float sp) {
+    vec4 acc = terrainDetailTap(p) * 4.0f;
+    acc += (terrainDetailTap(p + vec2( sp, 0.0f))
+          + terrainDetailTap(p + vec2(-sp, 0.0f))
+          + terrainDetailTap(p + vec2(0.0f,  sp))
+          + terrainDetailTap(p + vec2(0.0f, -sp))) * 2.0f;
+    acc +=  terrainDetailTap(p + vec2( sp,  sp))
+          + terrainDetailTap(p + vec2(-sp,  sp))
+          + terrainDetailTap(p + vec2( sp, -sp))
+          + terrainDetailTap(p + vec2(-sp, -sp));
+    return acc;                      // .w = summed weight, 0..16
+}
+
 // Near-field surface colour from the 1 m tile if resident; `fallback`
-// (global albedo) otherwise / beyond the fade band.
+// (global albedo) otherwise / beyond the fade band.  tap_m is the soft
+// tap's spacing (see terrainDetailTapSoft).
 //
 // blur_dir/blur_m implement ANISOTROPIC filtering along the slope.  The
 // tile is indexed by world XZ, so on a steep face one XZ metre covers
@@ -103,10 +133,12 @@ vec4 terrainDetailTap(vec2 p) {
 // anisotropic sample would do, and it is what stops the macro colour
 // being dragged into 40 m vertical streaks down a cliff.
 vec3 terrainDetailAlbedo(vec2 pos_xz_ws, vec3 fallback, float fade,
-                         vec2 blur_dir, float blur_m) {
+                         vec2 blur_dir, float blur_m, float tap_m) {
     if (fade <= 0.0f) return fallback;
-    vec4 acc = terrainDetailTap(pos_xz_ws) * 3.0f;
-    if (blur_m > 0.05f) {          // flat ground keeps the single tap
+    // The soft tap stands in for the old single centre sample at the
+    // same weight (3 of 9), so the slope kernel below is unchanged.
+    vec4 acc = terrainDetailTapSoft(pos_xz_ws, tap_m) * (3.0f / 16.0f);
+    if (blur_m > 0.05f) {          // flat ground keeps the soft tap only
         vec2 d1 = blur_dir * (blur_m * 0.5f);
         vec2 d2 = blur_dir * blur_m;
         acc += (terrainDetailTap(pos_xz_ws - d1)
@@ -144,17 +176,36 @@ vec4 terrainDetailSurfTap(vec2 p, out float w) {
                       0.0f);
 }
 
-// Near-field packed surface, filtered with the SAME five anisotropic taps
-// as terrainDetailAlbedo.  Deliberately the same kernel: the normal and
-// the colour describe one surface, and a normal left sharper than the
-// albedo it belongs to would sparkle down exactly the cliff the colour
-// was just blurred along.
+// Soft 3x3 for the packed surface -- same kernel, same reason as
+// terrainDetailTapSoft: the 1 m tangent normal magnified bilinearly is
+// a quilt of 1 m facets, each lit at its own tilt, which is the other
+// half of the brick paving (the colour half is above).  w_sum returns
+// the summed residency weight.
+vec4 terrainDetailSurfTapSoft(vec2 p, float sp, out float w_sum) {
+    float w;
+    vec4 acc = terrainDetailSurfTap(p, w) * 4.0f;                w_sum = w * 4.0f;
+    acc += terrainDetailSurfTap(p + vec2( sp, 0.0f), w) * 2.0f;  w_sum += w * 2.0f;
+    acc += terrainDetailSurfTap(p + vec2(-sp, 0.0f), w) * 2.0f;  w_sum += w * 2.0f;
+    acc += terrainDetailSurfTap(p + vec2(0.0f,  sp), w) * 2.0f;  w_sum += w * 2.0f;
+    acc += terrainDetailSurfTap(p + vec2(0.0f, -sp), w) * 2.0f;  w_sum += w * 2.0f;
+    acc += terrainDetailSurfTap(p + vec2( sp,  sp), w);          w_sum += w;
+    acc += terrainDetailSurfTap(p + vec2(-sp,  sp), w);          w_sum += w;
+    acc += terrainDetailSurfTap(p + vec2( sp, -sp), w);          w_sum += w;
+    acc += terrainDetailSurfTap(p + vec2(-sp, -sp), w);          w_sum += w;
+    return acc;
+}
+
+// Near-field packed surface, filtered with the SAME soft tap and the
+// SAME five anisotropic taps as terrainDetailAlbedo.  Deliberately the
+// same kernel: the normal and the colour describe one surface, and a
+// normal left sharper than the albedo it belongs to would sparkle down
+// exactly the cliff the colour was just blurred along.
 //
 // Returns the AUTHORITY of the result in [0,1] — how much of this pixel
 // genuinely came from a resident 1 m tile, faded by camera distance.
 // Zero means the caller keeps everything it already had.
 float terrainDetailSurface(vec2 pos_xz_ws, float fade,
-                           vec2 blur_dir, float blur_m,
+                           vec2 blur_dir, float blur_m, float tap_m,
                            out vec2 nrm_xy, out float rough, out float ao) {
     nrm_xy = vec2(0.0f);
     rough  = 0.0f;
@@ -162,9 +213,9 @@ float terrainDetailSurface(vec2 pos_xz_ws, float fade,
     if (fade <= 0.0f) return 0.0f;
     float w;
     float acc_w = 0.0f;
-    vec4  acc = terrainDetailSurfTap(pos_xz_ws, w) * 3.0f;
-    acc_w += w * 3.0f;
-    if (blur_m > 0.05f) {          // flat ground keeps the single tap
+    vec4  acc = terrainDetailSurfTapSoft(pos_xz_ws, tap_m, w) * (3.0f / 16.0f);
+    acc_w += w * (3.0f / 16.0f);
+    if (blur_m > 0.05f) {          // flat ground keeps the soft tap only
         vec2 d1 = blur_dir * (blur_m * 0.5f);
         vec2 d2 = blur_dir * blur_m;
         acc += terrainDetailSurfTap(pos_xz_ws - d1, w) * 2.0f; acc_w += w * 2.0f;
@@ -577,6 +628,110 @@ vec3 terrainSurfaceNormal(vec3 n, vec4 w, vec3 grad) {
     return normalize(n - t * relief);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+//  SWARD LAY -- the ground under the grass pass is grass too
+// ─────────────────────────────────────────────────────────────────────
+// Look at any photograph of open grassland at eye height: between the
+// standing tufts the ground is not soil, it is a continuous mat of
+// cured blades lying every which way -- fine streaks a few centimetres
+// apart, crossing at every angle, each casting a sliver of shadow on
+// its neighbour.  That mat is what reads as "grass" long before any
+// individual blade does.  Ours had nothing at that scale: the 1 m tile
+// (bricks, above), the procedural field (isotropic blobs) and the
+// litter (leaf clumps) are all either too coarse or the wrong shape, so
+// the near ground read as painted lino with tufts stuck on.
+//
+// The lay is value noise stretched ~7:1 along three fixed headings
+// (tangled, not combed), the mix of the first two drifting over ~9 m
+// so patches lie differently, the whole domain warped by ~6 cm over
+// ~1.7 m so the streaks curve like bent blades, plus a finer octave
+// that only exists inside ~20 m.  It is a HEIGHT field: the same value
+// tints the albedo (lit tops warm and pale, gaps in their own shadow)
+// and its analytic gradient perturbs the normal, so the streaks are lit
+// by the sun and not merely painted -- the "one field drives colour,
+// relief and roughness" rule again.  Grass material only (mat_w.x),
+// and each layer retires on terrainGroundField's footprint rule, so
+// beyond ~50 m the whole thing costs one smoothstep.
+#define kSwardAcrossM  (1.0f / 22.0f)   // streak pitch of the coarse layers, m
+#define kSwardFineM    (1.0f / 52.0f)   // fine octave pitch, m
+#define kSwardReliefM  0.007f           // lay height amplitude, m
+
+// Integer lattice hash (lowbias32-style mix).  Integer, not hash1: the
+// lattice cells below run to ~10^6 and hash1's fract(p * 0.318) has
+// nothing left at that magnitude.
+float swardHash(ivec2 c) {
+    uint h = uint(c.x) * 0x9E3779B1u ^ uint(c.y) * 0x85EBCA77u;
+    h ^= h >> 15u; h *= 0x2C1B3C6Du;
+    h ^= h >> 12u; h *= 0x297A2D39u;
+    h ^= h >> 15u;
+    return float(h) * (1.0f / 4294967296.0f);
+}
+
+// One lay layer: value noise with analytic gradient on a lattice of
+// `cpm` INTEGER cells per metre (along, across) in a frame rotated by
+// `ang`.  Returns (value, d/dx, d/dz), gradient in world metres.
+//
+// The cell index is built as an exact integer from the metre-split
+// position.  At 1.9 cm cells a coordinate 16 km out is ~850 000 cells,
+// and a float32 keeps ~5 bits of fraction at that magnitude: done the
+// obvious way (q / cell, then floor/fract) the interpolation weight is
+// quantised into 32 steps and every streak bands.  floor(q) is an exact
+// integer metre, q - floor(q) is good to ~1 mm, and int * int stays
+// exact, so the weight keeps its full precision.
+vec3 swardLayer(vec2 q_m, float ang, ivec2 cpm) {
+    float c = cos(ang), s = sin(ang);
+    vec2  q  = vec2(c * q_m.x - s * q_m.y, s * q_m.x + c * q_m.y);
+    vec2  qb = floor(q);
+    vec2  xf = (q - qb) * vec2(cpm);
+    vec2  xi = floor(xf);
+    ivec2 cell = ivec2(qb) * cpm + ivec2(xi);
+    vec2  w  = xf - xi;
+    vec2  u  = w * w * w * (w * (w * 6.0f - 15.0f) + 10.0f);
+    vec2  du = 30.0f * w * w * (w * (w - 2.0f) + 1.0f);
+    float a = swardHash(cell),               b = swardHash(cell + ivec2(1, 0)),
+          e = swardHash(cell + ivec2(0, 1)), d = swardHash(cell + ivec2(1, 1));
+    float k1 = b - a, k2 = e - a, k4 = a - b - e + d;
+    float v  = -1.0f + 2.0f * (a + k1 * u.x + k2 * u.y + k4 * u.x * u.y);
+    vec2  gq = 2.0f * du * vec2(k1 + k4 * u.y, k2 + k4 * u.x) * vec2(cpm);
+    return vec3(v, c * gq.x + s * gq.y, -s * gq.x + c * gq.y);
+}
+
+// Signed lay value (~[-1, 1], rms ~0.35) with its world gradient, and
+// `wgt` = the coarse layers' distance weight so the caller can skip the
+// rest of the work once the sward has retired.
+float terrainSwardField(vec2 p, float dist, out vec2 grad, out float wgt) {
+    grad = vec2(0.0f);
+    wgt  = 1.0f - smoothstep(kSwardAcrossM * 380.0f,
+                             kSwardAcrossM * 1100.0f, dist);
+    if (wgt <= 0.004f) return 0.0f;
+    vec2 pw = p + kGroundOrigin;
+    // Blades bend: a ~1.7 m warp (+-6 cm) curves every streak.  Its own
+    // gradient is small against the layers' and stays out of the chain
+    // rule, as in terrainLitterField.
+    vec2 warp = vec2(noise(pw * (1.0f / 1.7f) + vec2( 53.1f,  77.9f)),
+                     noise(pw * (1.0f / 1.7f) + vec2(-91.3f,  12.7f))) * 0.06f;
+    vec2 pq = pw + warp;
+    // Which heading dominates drifts over ~9 m, so the lay is combed in
+    // patches.  The headings themselves are FIXED: turning the lattice
+    // with position would swing it about the world origin, hundreds of
+    // cells per metre this far out, and alias into bands.
+    float dm = 0.5f + 0.5f * noise(pw * (1.0f / 9.0f) + vec2(41.3f, -17.9f));
+    vec3 a = swardLayer(pq + vec2( 211.7f,  391.3f), 0.83f, ivec2(3, 22));
+    vec3 b = swardLayer(pq + vec2(-577.1f,  128.9f), 1.71f, ivec2(5, 17));
+    vec3 c = swardLayer(pq + vec2(  97.3f, -311.7f), 2.55f, ivec2(4, 26));
+    float wa = 0.30f + 0.40f * dm;
+    float wb = 0.70f - 0.40f * dm;
+    vec3 acc = ((wa * a + wb * b) * 0.7f + 0.4f * c) * wgt;
+    float wf = 1.0f - smoothstep(kSwardFineM * 380.0f,
+                                 kSwardFineM * 1100.0f, dist);
+    if (wf > 0.004f) {
+        vec3 f = swardLayer(pq + vec2( 733.9f, -845.1f), 2.40f, ivec2(7, 52));
+        acc += 0.35f * f * wf;
+    }
+    grad = acc.yz;
+    return acc.x;
+}
+
 void main() {
 #ifndef GBUFFER_OUTPUT
     // ── Deferred-relight early-out ───────────────────────────────────
@@ -783,8 +938,32 @@ void main() {
     // Near-field: the streamed 1 m albedo tile takes over from the
     // (4 m/texel) global map, fading with the same camera-distance band
     // as the height detail so colour and relief transition together.
-    albedo = terrainDetailAlbedo(pos_p.xz, albedo, detail_fade,
-                                 macro_blur_dir, macro_blur_m);
+    //
+    // Soft-tap spacing: one texel (1 m) up close, where it exists to kill
+    // the bilinear quilt; growing with distance once a texel is smaller
+    // than a couple of pixels (~500 m at 1080p / 60 deg), where the
+    // single-mip tile would otherwise alias and shimmer.
+    float det_tap_m = max(1.0f, view_dist * (1.0f / 500.0f));
+    //
+    // Class-edge dissolve.  The worker paints the tile's grass / bare
+    // ground classes from the 4 m macro mask with NEAREST upsampling, so
+    // every patch boundary in the colour AND surface tiles is a stair of
+    // axis-aligned 4 m steps -- and the surface tile carries a lit ridge
+    // along each step (see kDetailNormalGain).  Rectangles with ridged
+    // outlines, tiled on a 4 m grid, is what "brick paving" is.  The
+    // soft tap above rounds the steps; this wobbles them: the lookup
+    // position is warped by +-0.9 m over a ~4 m field, world-anchored
+    // (kGroundOrigin keeps hash1's zero lines off the map), so the same
+    // boundary becomes an organic edge.  Colour and surface share the
+    // warp, so they still describe one surface; the height tile is not
+    // warped -- geometry stays put, only the paint on it moves, and at
+    // this amplitude the two cannot be told apart.
+    vec2 det_pos = pos_p.xz
+        + vec2(noise((pos_p.xz + kGroundOrigin) * 0.25f + vec2( 17.3f, -41.9f)),
+               noise((pos_p.xz + kGroundOrigin) * 0.25f + vec2(-73.1f,  29.7f)))
+          * 0.9f;
+    albedo = terrainDetailAlbedo(det_pos, albedo, detail_fade,
+                                 macro_blur_dir, macro_blur_m, det_tap_m);
     // Beyond the terrain map: neutral surround (matches the height fade
     // in tile.vert — no stretched border stripes in colour or shading).
     // sfade lives in function scope, not inside the block below: the
@@ -821,14 +1000,60 @@ void main() {
     albedo *= terrainSurfaceShade(mat_w, g_field, mat_rough);
     normal  = terrainSurfaceNormal(normal, mat_w, g_grad);
 
+    // ── Cured turf (tile_common.glsl.h: terrainDryField) ─────────────
+    // The blades brown in drifts (grass.frag: kLeafLive -> kLeafDry by
+    // d*d); the ground under them did not, so a straw tuft stood on
+    // green lino.  Same field, same d*d curve: the turf's hue swings
+    // toward straw at constant luma and then lifts a little, since
+    // cured grass is paler than live (kLeafDry is 1.33x kLeafLive in
+    // luma).  Grass material only -- soil, rock and snow do not cure.
+    float dry01 = 0.0f;
+    {
+        float dry = terrainDryField(pos.xz);
+        dry01 = terrainDryCurve(dry);     // same curve as grass.frag
+        float dry_k = dry01 * mat_w.x * (1.0f - sfade);
+        float luma  = dot(albedo, vec3(0.299f, 0.587f, 0.114f));
+        vec3  straw = luma * vec3(1.26f, 0.97f, 0.45f);   // unit-luma straw
+        albedo = mix(albedo, straw, 0.85f * dry_k);
+        albedo *= 1.0f + 0.22f * dry_k;
+    }
+
+    // ── Sward lay (see terrainSwardField) ────────────────────────────
+    {
+        vec2  sg; float sw_w;
+        float sw = terrainSwardField(pos_p.xz, view_dist, sg, sw_w);
+        float k  = mat_w.x * (1.0f - sfade);
+        if (k * sw_w > 0.003f) {
+            // Gaps darken more than tops brighten (they sit in the tops'
+            // shadow), and the swing carries a hue: lit straw is warm,
+            // the shaded base of the mat is cooler and greener.  Cured
+            // turf shows its lay more strongly -- live grass is a softer,
+            // more uniform mat.
+            float amp = 0.34f + 0.14f * dry01;
+            float m   = 1.0f + amp * k * (sw < 0.0f ? sw * 1.35f : sw);
+            vec3  hue = mix(vec3(0.95f, 1.00f, 1.03f), vec3(1.05f, 1.00f, 0.90f),
+                            clamp(0.5f + 0.5f * sw, 0.0f, 1.0f));
+            albedo *= m * mix(vec3(1.0f), hue, k);
+            // The lay has height: light it.  Tangent-plane projection
+            // like terrainSurfaceNormal, its own relief scale.
+            vec3 t_sw = vec3(sg.x, 0.0f, sg.y) * kSwardReliefM;
+            t_sw -= dot(t_sw, normal) * normal;
+            normal = normalize(normal - t_sw * k);
+        }
+    }
+
     // ── Forest-floor litter (near field) ─────────────────────────────
     // Same field as the parallax, re-evaluated at the corrected position
     // so colour, relief and depth agree.  Litter holds on grass and bare
-    // soil (mat_w.x + mat_w.z); rock and snow shed it.
+    // soil (mat_w.x + mat_w.z); rock and snow shed it.  On GRASS it is
+    // damped: leaf clumps belong under a canopy, and full-strength on
+    // open turf they were half of the mottle -- and a cured meadow is
+    // thatch, which the sward above already is, not leaf litter.
     if (lit_fade > 0.0f) {
         vec2  lg; float leaf_m, twig_m;
         float lh = terrainLitterField(pos_p.xz, lg, leaf_m, twig_m);
-        float ground_w = clamp(mat_w.x + mat_w.z, 0.0f, 1.0f);
+        float ground_w = clamp(mat_w.x * (0.55f - 0.40f * dry01) + mat_w.z,
+                               0.0f, 1.0f);
         float lw = lit_fade * ground_w * (1.0f - sfade);
         if (lw > 0.003f) {
             float luma = dot(albedo, vec3(0.299f, 0.587f, 0.114f));
@@ -856,6 +1081,11 @@ void main() {
         }
     }
 
+    // ── Macro colour grade (tile_common.glsl.h) ──────────────────────
+    // The surround plain past the map edge is a constant already tuned
+    // for the lighting; only the authored/streamed colour is graded.
+    albedo = mix(terrainGradeAlbedo(albedo), albedo, sfade);
+
     // ── Authored surface maps over the procedural estimate ───────────
     // Three sources of relief, stacked by scale: the 1 m ML detail tile
     // wins where it is resident, the 4 m macro map carries the rest of
@@ -864,9 +1094,19 @@ void main() {
     // there is where neither map exists.  Nothing is switched off; the
     // authored data cross-fades in on top of what is already there.
     vec2  det_nrm_xy; float det_rough, det_ao;
-    float det_w = terrainDetailSurface(pos_p.xz, detail_fade,
+    float det_w = terrainDetailSurface(det_pos, detail_fade,
                                        macro_blur_dir, macro_blur_m,
+                                       det_tap_m,
                                        det_nrm_xy, det_rough, det_ao);
+    // The detail tile's tangent normal, measured on this map: +-0.03 of
+    // per-texel salt-and-pepper (1 m facets, each lit at its own tilt)
+    // plus a ridge along every class edge (the brick outlines).  Real
+    // metre-scale relief is already in the height tile the geometry and
+    // shading normal come from, so little is lost by damping it; the
+    // sub-metre relief that is missing comes from the procedural field
+    // and the sward, which have real energy there.  1.0 = as authored.
+    const float kDetailNormalGain = 0.40f;
+    det_nrm_xy *= kDetailNormalGain;
     vec2  surf_nrm_xy  = mix(macro_nrm_xy, det_nrm_xy, det_w);
     float surf_nrm_w   = mix(macro_nrm_w, 1.0f, det_w) * (1.0f - sfade);
     float surf_rough   = mix(macro_rough, det_rough, det_w);

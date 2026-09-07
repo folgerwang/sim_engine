@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "renderer/renderer.h"
+#include "vehicle_system.h"
 
 namespace engine {
 namespace game_object {
@@ -106,6 +107,14 @@ public:
     // what stays distance-tiered.
     size_t populationLoaded() const { return persons_.size(); }
     size_t activeCount() const { return persons_.size(); }
+    // The cars they drive (see vehicle_system.h): set once the roads
+    // are loaded; without it everybody walks.
+    void setVehicles(const std::shared_ptr<VehicleSystem>& v) {
+        vehicles_ = v;
+    }
+    // The walk clock's current scale (legs keep up with the world
+    // clock), so the vehicles can keep the same time.
+    float walkScale() const { return walk_scale_; }
 
 private:
     struct Step {
@@ -130,6 +139,8 @@ private:
         int   duty = 0;                // Duty enum
         float height = 1.7f;
         float bulk = 1.0f;             // width factor from body status
+        int   age = 0;                 // 0 adult, 1 child, 2 toddler,
+                                       // 3 senior (city json "age")
         float speed = 1.35f;           // walk m/s
         bool  works_weekend = false;
         std::vector<Step> weekday;
@@ -179,6 +190,9 @@ private:
         int16_t nav_room = -1;
         bool  walking = false;
         bool  inited = false;
+        // 0 on foot, 2 in their car (the vehicle system drives it; the
+        // person is not drawn until it parks)
+        uint8_t ride = 0;
     };
 
     // ── FURNITURE ANCHORS ────────────────────────────────────────────
@@ -244,6 +258,59 @@ private:
     // commute; everything else — bodies, walking, ground clamping,
     // rendering — is the same code path.
     void synthesizeResidents();
+    // Street life: three short spells outdoors a day for everyone, in
+    // front of wherever their schedule has them (see the .cpp).
+    void addOutings();
+    // The people in the ambient cars (VehicleSystem::occupants), drawn
+    // seated through emitPerson with a throwaway Person each.
+    void emitOccupants(const glm::vec3& camera_pos);
+
+    // ── STROLLERS: ambient people on the streets around the camera ───
+    // The schedules put ~2 people on a 300 m block at noon (everyone
+    // else is indoors, at work or 4 km away in the district), which
+    // reads as an empty town however faithful it is.  Strollers are
+    // the crowd the camera sees: a ring around it, populated by the
+    // houses in it (kStrollPerHouse each, cap kStrollMax), each one a
+    // throwaway Person walking house to house through the
+    // neighbourhood -- front yard to a neighbour's front yard, round
+    // the houses, a pause at each -- or along the road edge where a
+    // road runs by (VehicleSystem::Stroll).  Recycled once far from
+    // the camera or after a few minutes.  Drawn through emitPerson
+    // like everyone else, so they get the same tiers and clothes.
+    struct Stroller {
+        glm::vec3 pos{0.0f};
+        glm::vec3 target{0.0f};
+        float yaw = 0.0f;
+        float phase = 0.0f;
+        float wait_t = 0.0f;           // standing at the target
+        float life_t = 0.0f;           // seconds left before recycling
+        uint32_t seed = 0;
+        int   kind = 0;                // 0 house to house, 1 the road
+        int   house = -1;              // kind 0: the house visited
+        bool  walking = true;
+        VehicleSystem::Stroll road;    // kind 1
+        Person look;                   // duty, age, height, bulk, and
+                                       // a one-step outdoors schedule
+    };
+    std::vector<Stroller> strollers_;
+    uint32_t stroll_rng_ = 0x6A09E667u;
+    float    stroll_timer_ = 0.0f;
+    int      stroll_target_ = 0;
+    int      stroll_houses_ = 0;       // houses in the ring (telemetry)
+    void updateStrollers(float delta_t, const glm::vec3& camera_pos,
+                         float walk_scale);
+    bool spawnStroller(const glm::vec3& camera_pos, Stroller& w);
+    bool nextHop(Stroller& w);
+    void tickStroller(Stroller& w, float dt, float walk_scale);
+    int  countHousesNear(const glm::vec3& c, float radius) const;
+    bool randomHouseNear(const glm::vec3& c, float min_m, float max_m,
+                         uint32_t& rng, int& out) const;
+    // The spot in front of the person's own front door (place -2), or
+    // outside building `bi` (place -(100 + bi)).
+    // out_extra pushes the spot further out from the door: a passer-by
+    // stops on the street side of the fence, not in the garden.
+    glm::vec3 yardSpot(const Person& p, int pid, int bi,
+                       float out_extra = 0.0f) const;
     glm::vec3 placePos(const Person& p, const Step& s, int pid) const;
 
     // ── Walking around buildings ─────────────────────────────────────
@@ -259,8 +326,11 @@ private:
                                 int exempt_house, int exempt_dest) const;
     std::unordered_map<uint64_t, std::vector<int>> house_grid_;
     int currentStep(const std::vector<Step>& sched, float tod) const;
+    // detailed: the articulated figure (else the far one-box);
+    // fine: the sixteen-part rounded figure with clothes and a face
+    // (else the seven-cube one).
     void emitPerson(int pid, const SimState& a, const Person& p,
-                    bool detailed);
+                    bool detailed, bool fine);
 
     // static render objects
     static std::shared_ptr<renderer::PipelineLayout> s_pipeline_layout_;
@@ -269,6 +339,29 @@ private:
     static std::shared_ptr<renderer::BufferInfo>     s_cube_nrm_;
     static std::shared_ptr<renderer::BufferInfo>     s_cube_idx_;
     static uint32_t                                  s_cube_index_count_;
+    // The fine tier's shared ROUNDED box (a superellipsoid): the same
+    // unit extents as the cube, so every part transform is written the
+    // same way, but with smooth normals and soft corners.
+    static std::shared_ptr<renderer::BufferInfo>     s_round_pos_;
+    static std::shared_ptr<renderer::BufferInfo>     s_round_nrm_;
+    static std::shared_ptr<renderer::BufferInfo>     s_round_idx_;
+    static uint32_t                                  s_round_index_count_;
+    // The SKINNED fine tier (v3): three shared meshes -- a tube for
+    // limbs and the neck, the rounded blob above for torso, pelvis and
+    // shoes, a ball for head and hands -- drawn through a second
+    // pipeline whose vertex shader skins each part's ends to the
+    // neighbouring joints (see SkinInstance and citizen_skin.vert).
+    static std::shared_ptr<renderer::BufferInfo>     s_tube_pos_;
+    static std::shared_ptr<renderer::BufferInfo>     s_tube_nrm_;
+    static std::shared_ptr<renderer::BufferInfo>     s_tube_idx_;
+    static uint32_t                                  s_tube_index_count_;
+    static std::shared_ptr<renderer::BufferInfo>     s_ball_pos_;
+    static std::shared_ptr<renderer::BufferInfo>     s_ball_nrm_;
+    static std::shared_ptr<renderer::BufferInfo>     s_ball_idx_;
+    static uint32_t                                  s_ball_index_count_;
+    static std::shared_ptr<renderer::Pipeline>       s_skin_pipeline_;
+    static std::shared_ptr<renderer::BufferInfo>     s_skin_buf_;
+    static uint32_t                                  s_skin_capacity_;
     // ── PER-FRAME INSTANCE STREAM ───────────────────────────────────
     // frame_parts_ uploaded once and drawn with ONE instanced call.
     // The device is kept because draw() is handed a command buffer and
@@ -390,13 +483,37 @@ private:
     float clock_rate_ = 0.0f;          // 0 = unmeasured -> life speed
     GroundQueryFn ground_;
 
-    struct PartInstance { glm::mat4 xform; glm::vec4 color; };
-    std::vector<PartInstance> frame_parts_;
+    // xform: the part's world transform (unit box -> world); color:
+    // rgb + the readability lift; extra: (part kind, style, packed
+    // accent colour, seed) -- what citizen.frag paints the garment
+    // detail from.  Kind 0 is a plain box.
+    struct PartInstance { glm::mat4 xform; glm::vec4 color;
+                          glm::vec4 extra; };
+    std::vector<PartInstance> frame_parts_;   // cube-mesh parts
+    // A SKINNED part (the fine tier).  self / up / lo: three 3x4
+    // transforms (rows) taking the part's unit box to the world -- as
+    // hung off its own joint, off the joint above, off the joint
+    // below; they agree at the shared pivots, and the vertex shader
+    // blends between them by unit height.  shape: (unit y of the
+    // upper pivot, unit y of the lower pivot, blend half-width in unit
+    // y, taper = bottom width / top width).  color / extra as the
+    // cube parts.
+    struct SkinInstance { glm::vec4 self[3]; glm::vec4 up[3];
+                          glm::vec4 lo[3]; glm::vec4 color;
+                          glm::vec4 extra; glm::vec4 shape; };
+    std::vector<SkinInstance> frame_tube_;    // limbs, neck
+    std::vector<SkinInstance> frame_blob_;    // torso, pelvis, shoes, hair
+    std::vector<SkinInstance> frame_ball_;    // head, hands
     // Per-frame scratch, kept as members so the render-tier pass does
     // not heap-allocate (and free) a population-sized buffer every
     // frame — with 3-5 residents per house that is a quarter-megabyte
     // malloc per frame, for nothing.
     std::vector<uint8_t> is_detailed_;
+    std::vector<uint8_t> is_fine_;
+    // ── driving ──────────────────────────────────────────────────────
+    std::shared_ptr<VehicleSystem> vehicles_;
+    std::vector<int> car_of_;          // per person: -2 undecided, -1 none
+    float walk_scale_ = 1.0f;
     std::vector<std::pair<float, int>> near_ids_;
 };
 

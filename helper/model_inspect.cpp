@@ -2809,10 +2809,13 @@ bool bakeModelToRenderReady(
 
         auto mat_key = [](const GeoSectionOut& s) {
             char b[160];
-            std::snprintf(b, sizeof(b), "%.6g,%.6g,%.6g,%.6g|%.6g|%.6g|",
+            // flags are part of the identity: a translucent section
+            // must not merge with an opaque one over the same maps.
+            std::snprintf(b, sizeof(b), "%.6g,%.6g,%.6g,%.6g|%.6g|%.6g|%u|",
                           (double)s.base_color.x, (double)s.base_color.y,
                           (double)s.base_color.z, (double)s.base_color.w,
-                          (double)s.metallic, (double)s.roughness);
+                          (double)s.metallic, (double)s.roughness,
+                          (unsigned)s.flags);
             return std::string(b) + s.tex_rel + '|' + s.nrm_rel + '|' +
                    s.mr_rel;
         };
@@ -2917,6 +2920,13 @@ bool bakeModelToRenderReady(
                     // format bump — s.flags is already a v7 field.
                     if (mn.find("_snowcover") != std::string::npos) {
                         s.flags |= kSecSnowCover;
+                    }
+                    // Translucency travels as a section flag: the
+                    // baked file has no material names or alpha modes
+                    // for the runtime to read (see kSecBlend).
+                    if (model.materials[prim.material].alphaMode ==
+                        "BLEND") {
+                        s.flags |= kSecBlend;
                     }
                 }
                 // Full PBR refs: normal + metallic-roughness maps.
@@ -3029,24 +3039,43 @@ bool bakeModelToRenderReady(
                                                         : glm::vec2(0.0f));
                 }
                 mg.lvl[level].assign(mg.usec.size(), glm::uvec2(0));
-                for (const auto& s : secs) {
-                    const std::string mk = mat_key(s);
+                // Primitives that share a MATERIAL IDENTITY are appended
+                // TOGETHER, so the material's section is one contiguous
+                // range.  This loop used to file each primitive's range
+                // into its slot in turn -- an assignment, so of several
+                // primitives on one material only the LAST survived and
+                // the others became orphaned indices no section named.
+                // The house library lost its roof fascias, window sashes
+                // and interior trim that way: they share their paint
+                // with the garden fence, which comes last.
+                std::vector<std::string> keys;
+                keys.reserve(secs.size());
+                for (const auto& s : secs) keys.push_back(mat_key(s));
+                std::vector<char> filed(secs.size(), 0);
+                for (size_t a = 0; a < secs.size(); ++a) {
+                    if (filed[a]) continue;
+                    const std::string& mk = keys[a];
                     size_t slot = 0;
                     while (slot < mg.ukey.size() && mg.ukey[slot] != mk)
                         ++slot;
                     if (slot == mg.ukey.size()) {       // new material
                         mg.ukey.push_back(mk);
-                        GeoSectionOut us = s;
+                        GeoSectionOut us = secs[a];
                         us.first_index = 0;
                         us.index_count = 0;
                         mg.usec.push_back(us);
                         for (auto& lv : mg.lvl) lv.push_back(glm::uvec2(0));
                     }
                     const uint32_t first = (uint32_t)mg.d.indices.size();
-                    for (uint32_t n = 0; n < s.index_count; ++n) {
-                        const uint32_t ix = s.first_index + n;
-                        if (ix < d.indices.size())
-                            mg.d.indices.push_back(vbase + d.indices[ix]);
+                    for (size_t b = a; b < secs.size(); ++b) {
+                        if (filed[b] || keys[b] != mk) continue;
+                        filed[b] = 1;
+                        const auto& s = secs[b];
+                        for (uint32_t n = 0; n < s.index_count; ++n) {
+                            const uint32_t ix = s.first_index + n;
+                            if (ix < d.indices.size())
+                                mg.d.indices.push_back(vbase + d.indices[ix]);
+                        }
                     }
                     const uint32_t cnt =
                         (uint32_t)mg.d.indices.size() - first;

@@ -25,9 +25,12 @@ layout(std430, set = NODE_TABLE_PARAMS_SET, binding = NODE_TABLE_SLOTS_BINDING) 
     uint node_slots[];
 };
 ModelParams model_params;
+// Per-node plant extent for the sway (see ModelParams::debug_skip_skinning).
+uint veg_plant_bits = 0u;
 void ntLoadModelParams() {
     const uint slot = floatBitsToUint(pc_params.lod_fade) + uint(gl_DrawIDARB);
     model_params = node_params[node_slots[slot]];
+    veg_plant_bits = model_params.debug_skip_skinning;
     // Per-drawable / per-pass fields always come from the push constant;
     // the record keeps the node's own bits (flips, interior) and its
     // dissolve weight (0 = steady; per-instance bands carry theirs in
@@ -46,6 +49,8 @@ void ntLoadModelParams() {
 layout(push_constant) uniform ModelUniformBufferObject {
     ModelParams model_params;
 };
+// Classic path: the push constant IS the node's record.
+#define veg_plant_bits (model_params.debug_skip_skinning)
 #endif
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
@@ -238,18 +243,24 @@ void main() {
     // (pre-instance) height, so a rotated or scaled instance still
     // bends from its own roots.  Same function runs in
     // base_depthonly.vert — shadows track the canopy.
+    float sway_travel = 0.0f;
     if ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) {
         vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
                            in_loc_rot_mat_2.w);
         // Instance up axis: gates out the deadfall trunks that lie
         // pitched ~90 deg on the ground (see kVegFallenCos).
-        position_ws += vegSwayOffset(inst_t, position_ls.y,
-                                     camera_info.time_s,
-                                     local_world_rot_mat * vec3(0.0f, 1.0f,
-                                                                0.0f));
+        sway_travel = vegSwayTravel(inst_t, position_ls.y,
+                                    camera_info.time_s,
+                                    local_world_rot_mat * vec3(0.0f, 1.0f,
+                                                               0.0f),
+                                    veg_plant_bits);
+        position_ws += vegSwayVec(sway_travel);
     }
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
+    // Handed to the G-buffer so the resolve can trace from the rest
+    // position (see vertex_sway in ObjectVsPsData).
+    out_data.vertex_sway = sway_travel;
 
     // ── Per-instance LOD band (dense ground cover) ───────────────────
     // See ModelParams::model_params_pad0.  Weight mirrors the CPU's
@@ -326,7 +337,17 @@ void main() {
 
 #ifdef HAS_NORMALS
     mat3 normal_mat = transpose(inverse(local_world_rot_mat * mat3(matrix_ls)));
-    out_data.vertex_normal = normalize(normal_mat * getNormal());
+    vec3 n_ls = getNormal();
+    vec3 n_ws = normalize(normal_mat * n_ls);
+    out_data.vertex_normal = n_ws;
+    // Vegetation: the crown-shell normal for the LEAVES (vegCrownNormal,
+    // ObjectVsPsData::vertex_crown_normal), gated on the same per-draw
+    // flag as the sway.  Applied by base.frag to alpha-masked materials
+    // only; the trunk of the same draw keeps n_ws.
+    out_data.vertex_crown_normal =
+        ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u)
+            ? normalize(normal_mat * vegCrownNormal(position_ls, n_ls))
+            : n_ws;
 #ifdef HAS_TANGENT
     out_data.vertex_tangent = normalize(normal_mat * getTangent());
     out_data.vertex_binormal = cross(out_data.vertex_normal, out_data.vertex_tangent) * in_tangent.w;
