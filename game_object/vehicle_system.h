@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "renderer/renderer.h"
+#include "actor_shadow_geometry.h"
 
 namespace engine {
 namespace game_object {
@@ -55,7 +56,8 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::PipelineRenderbufferFormats& frame_buffer_format);
+        const renderer::PipelineRenderbufferFormats& frame_buffer_format,
+        const renderer::PipelineRenderbufferFormats& gbuffer_format);
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
@@ -133,12 +135,17 @@ public:
               const renderer::DescriptorSetList& desc_sets,
               const std::shared_ptr<renderer::ImageView>& color_view,
               const std::shared_ptr<renderer::ImageView>& depth_view,
-              const glm::uvec2& buffer_size);
+              const glm::uvec2& buffer_size,
+              const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer = {},
+              bool glass_only = false, bool opaque_only = false);
     void destroy(const std::shared_ptr<renderer::Device>& device);
 
     size_t vehicleCount() const { return vehicles_.size(); }
     size_t nodeCount() const { return nodes_.size(); }
     size_t edgeCount() const { return edges_.size(); }
+
+    static std::shared_ptr<renderer::Pipeline> s_gbuf_pipeline_;
+    void collectShadowGeometry(ActorShadowGeometry& out) const;
 
 private:
     // ── the road graph ───────────────────────────────────────────────
@@ -199,6 +206,7 @@ private:
     struct PartInstance { glm::mat4 xform; glm::vec4 color;
                           glm::vec4 extra; };
     struct Mesh {
+        ActorShadowGeometry shadow;
         std::shared_ptr<renderer::BufferInfo> pos, nrm, idx;
         uint32_t count = 0;
     };

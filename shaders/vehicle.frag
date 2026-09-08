@@ -19,7 +19,7 @@ layout(location = 2) in vec4 in_color;
 layout(location = 3) in vec3 in_local;
 layout(location = 4) flat in vec4 in_extra;
 
-layout(location = 0) out vec4 outColor;
+#include "citizen_gbuffer.glsl.h"
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     readonly buffer CameraInfoBuffer {
@@ -260,6 +260,17 @@ void main() {
     vec3 N = normalize(in_normal_ws);
     vec3 V = normalize(camera_info.position - in_position_ws);
     if (dot(N, V) < 0.0) N = -N;          // double-sided hulls
+#ifdef GBUFFER_OUTPUT
+    // Lamps keep their forward emissive colour; the packed G-buffer has
+    // no RGB emission channel. Glass is drawn after the deferred resolve.
+    if (dot(emissive, emissive) > 0.0) {
+        out_albedo_ao = vec4(0.0); out_normal_rough = vec4(0.0);
+        out_emissive_metal = vec4(0.0); out_velocity = vec2(0.0);
+        return;
+    }
+    citizenGbuffer(albedo, N, in_position_ws, camera_info.view_proj,
+                   camera_info.prev_view_proj, kind == 1 ? 0.9 : 0.35);
+#else
     float nl = dot(N, kSunDir) * 0.5 + 0.5;
     vec3 H = normalize(kSunDir + V);
     float sp = pow(max(dot(N, H), 0.0), glass ? 90.0 : 48.0) * (glass ? 1.1 : 0.5);
@@ -270,4 +281,5 @@ void main() {
     lit += emissive;
     outColor = vec4(sceneTonemapExposed(lit,
         sceneExposureScaleOf(camera_info.exposure_scale)), alpha);
+#endif
 }

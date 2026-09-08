@@ -1391,6 +1391,9 @@ public:
     // for the full design.  Empty vector is fine (clears the skeleton
     // set and keeps the TLAS static-only).
     struct RtSkeletonFrameData {
+        // Pre-deformed actor batches have no joint streams. Their vertices
+        // can change without a model/palette change, so bypass pose caching.
+        bool world_space_dynamic = false;
         const std::vector<glm::vec3>*    positions      = nullptr;
         const std::vector<glm::u16vec4>* joints         = nullptr;
         const std::vector<glm::vec4>*    weights        = nullptr;

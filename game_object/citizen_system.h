@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "renderer/renderer.h"
+#include "actor_shadow_geometry.h"
 #include "vehicle_system.h"
 
 namespace engine {
@@ -53,7 +54,8 @@ public:
         const std::shared_ptr<renderer::Device>& device,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-        const renderer::PipelineRenderbufferFormats& frame_buffer_format);
+        const renderer::PipelineRenderbufferFormats& frame_buffer_format,
+        const renderer::PipelineRenderbufferFormats& gbuffer_format);
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
@@ -94,7 +96,8 @@ public:
               const renderer::DescriptorSetList& desc_sets,
               const std::shared_ptr<renderer::ImageView>& color_view,
               const std::shared_ptr<renderer::ImageView>& depth_view,
-              const glm::uvec2& buffer_size);
+              const glm::uvec2& buffer_size,
+              const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer = {});
 
     void destroy(const std::shared_ptr<renderer::Device>& device);
 
@@ -115,6 +118,11 @@ public:
     // The walk clock's current scale (legs keep up with the world
     // clock), so the vehicles can keep the same time.
     float walkScale() const { return walk_scale_; }
+
+    static std::shared_ptr<renderer::Pipeline> s_gbuf_pipeline_;
+    static std::shared_ptr<renderer::Pipeline> s_skin_gbuf_pipeline_;
+    static std::shared_ptr<renderer::Pipeline> s_npc_gbuf_pipeline_;
+    void collectShadowGeometry(ActorShadowGeometry& out) const;
 
 private:
     struct Step {
@@ -377,7 +385,10 @@ private:
     static constexpr int      kNpcJoints = 19;
     static constexpr int      kNpcRows   = kNpcJoints * 3;   // vec4 rows
     static constexpr uint32_t kMaxNpc    = 128;
+    static ActorShadowGeometry s_shadow_cube_, s_shadow_tube_, s_shadow_blob_, s_shadow_ball_;
     struct NpcAsset {
+        ActorShadowGeometry shadow;
+        std::vector<glm::u8vec4> shadow_joints, shadow_weights;
         std::shared_ptr<renderer::BufferInfo> vb, ib;
         uint32_t index_count = 0;
         uint32_t tri_count = 0;

@@ -6380,7 +6380,7 @@ void ClusterRenderer::updateRtSkeletons(
                                      ? *skeletons[i].joint_matrices
                                      : s_empty_jm;
                 const auto& c = rt_skel_cache_[i];
-                if (skeletons[i].model != c.model ||
+                if (skeletons[i].world_space_dynamic || skeletons[i].model != c.model ||
                     jm.size() != c.jm.size() ||
                     (!jm.empty() &&
                      std::memcmp(jm.data(), c.jm.data(),
@@ -6420,14 +6420,15 @@ void ClusterRenderer::updateRtSkeletons(
 
     for (const auto& s : skeletons) {
         if (headers.size() >= RT_SKEL_MAX) break;
-        if (!s.positions || !s.joints || !s.weights || !s.indices ||
-            !s.joint_matrices || s.joint_matrices->empty() ||
-            s.positions->empty() || s.indices->size() < 3 ||
-            s.joints->size() != s.positions->size() ||
-            s.weights->size() != s.positions->size()) {
+        if (!s.positions || !s.indices || s.positions->empty() || s.indices->size() < 3 ||
+            (!s.world_space_dynamic && (!s.joints || !s.weights ||
+             !s.joint_matrices || s.joint_matrices->empty() ||
+             s.joints->size() != s.positions->size() ||
+             s.weights->size() != s.positions->size()))) {
             continue;
         }
-        const auto& jm = *s.joint_matrices;
+        static const std::vector<glm::mat4> empty_joints;
+        const auto& jm = s.joint_matrices ? *s.joint_matrices : empty_joints;
         const uint32_t jm_n = (uint32_t)jm.size();
         const uint32_t vbase = (uint32_t)all_pos.size();
         const bool has_set1 =
@@ -6446,6 +6447,10 @@ void ClusterRenderer::updateRtSkeletons(
             const size_t v0 = b * kVertBlock;
             const size_t v1 = std::min(v0 + kVertBlock, vcount);
             for (size_t v = v0; v < v1; ++v) {
+                if (s.world_space_dynamic) {
+                    all_pos[vbase + v] = glm::vec4((*s.positions)[v], 1.0f);
+                    continue;
+                }
                 const glm::u16vec4& j0 = (*s.joints)[v];
                 const glm::vec4&    w0 = (*s.weights)[v];
                 glm::mat4 skin =

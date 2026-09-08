@@ -538,6 +538,11 @@ constexpr float kYardSpreadR = 4.0f;
 
 }  // namespace
 
+std::shared_ptr<er::Pipeline> CitizenSystem::s_gbuf_pipeline_;
+std::shared_ptr<er::Pipeline> CitizenSystem::s_skin_gbuf_pipeline_;
+std::shared_ptr<er::Pipeline> CitizenSystem::s_npc_gbuf_pipeline_;
+ActorShadowGeometry CitizenSystem::s_shadow_cube_, CitizenSystem::s_shadow_tube_,
+    CitizenSystem::s_shadow_blob_, CitizenSystem::s_shadow_ball_;
 std::shared_ptr<er::PipelineLayout> CitizenSystem::s_pipeline_layout_;
 std::shared_ptr<er::Pipeline>       CitizenSystem::s_pipeline_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_cube_pos_;
@@ -633,7 +638,8 @@ void CitizenSystem::initStaticMembers(
     const std::shared_ptr<er::Device>& device,
     const er::DescriptorSetLayoutList& global_desc_set_layouts,
     const er::GraphicPipelineInfo& graphic_pipeline_info,
-    const er::PipelineRenderbufferFormats& frame_buffer_format) {
+    const er::PipelineRenderbufferFormats& frame_buffer_format,
+    const er::PipelineRenderbufferFormats& gbuffer_format) {
 
     er::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
@@ -695,6 +701,22 @@ void CitizenSystem::initStaticMembers(
         s_pipeline_layout_, bindings, attribs, input_assembly,
         graphic_pipeline_info, shader_modules, frame_buffer_format,
         raster_override, std::source_location::current());
+    {
+        er::ShaderModuleList gbuf_modules = shader_modules;
+        gbuf_modules[1] = er::helper::loadShaderModule(device, "citizen_gbuf_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT, std::source_location::current());
+        er::GraphicPipelineInfo gbuf_info = graphic_pipeline_info;
+        auto att = er::helper::fillPipelineColorBlendAttachmentState(
+            SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
+        gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+            er::helper::fillPipelineColorBlendStateCreateInfo(
+                std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+        s_gbuf_pipeline_ = device->createPipeline(
+            s_pipeline_layout_, bindings, attribs, input_assembly,
+            gbuf_info, gbuf_modules, gbuffer_format,
+            raster_override, std::source_location::current());
+    }
+
 
     // ── THE SKIN PIPELINE (fine tier, v3) ───────────────────────────
     // Same layout and fragment shader; a 12-vec4 instance stream at
@@ -731,6 +753,22 @@ void CitizenSystem::initStaticMembers(
             s_pipeline_layout_, sb, sa, input_assembly,
             graphic_pipeline_info, sm, frame_buffer_format,
             two_sided, std::source_location::current());
+        {
+            er::ShaderModuleList gbuf_modules = sm;
+            gbuf_modules[1] = er::helper::loadShaderModule(device, "citizen_gbuf_frag.spv",
+                er::ShaderStageFlagBits::FRAGMENT_BIT, std::source_location::current());
+            er::GraphicPipelineInfo gbuf_info = graphic_pipeline_info;
+            auto att = er::helper::fillPipelineColorBlendAttachmentState(
+                SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
+            gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+                er::helper::fillPipelineColorBlendStateCreateInfo(
+                    std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+            s_skin_gbuf_pipeline_ = device->createPipeline(
+                s_pipeline_layout_, sb, sa, input_assembly,
+                gbuf_info, gbuf_modules, gbuffer_format,
+                two_sided, std::source_location::current());
+        }
+
     }
 
     // Unit cube centred at origin, half-extent 1, 24 verts so every
@@ -773,6 +811,8 @@ void CitizenSystem::initStaticMembers(
         idx.size() * sizeof(idx[0]), idx.data(),
         std::source_location::current());
     s_cube_index_count_ = uint32_t(idx.size());
+    s_shadow_cube_.positions = pos;
+    s_shadow_cube_.indices = idx;
 
     // ── The fine tier's meshes (v3): tube, blob, ball ───────────────
     // Superellipsoids with the same +-1 extents as the cube, so a part
@@ -829,6 +869,11 @@ void CitizenSystem::initStaticMembers(
             ri.size() * sizeof(ri[0]), ri.data(),
             std::source_location::current());
         count = uint32_t(ri.size());
+        ActorShadowGeometry* shadow = &s_shadow_ball_;
+        if (&pos_b == &s_tube_pos_) shadow = &s_shadow_tube_;
+        else if (&pos_b == &s_round_pos_) shadow = &s_shadow_blob_;
+        shadow->positions = rp;
+        shadow->indices = ri;
     };
     make_shape(0.50f, 1.00f, 14, 12, s_tube_pos_, s_tube_nrm_, s_tube_idx_,
                s_tube_index_count_);                       // limbs, neck
@@ -865,6 +910,12 @@ void CitizenSystem::initStaticMembers(
                 device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
                 idx.size() * sizeof(uint32_t), idx.data(),
                 std::source_location::current());
+            as.shadow.indices = idx;
+            for (const auto& v : verts) {
+                as.shadow.positions.push_back(v.pos);
+                as.shadow_joints.emplace_back(v.joints[0], v.joints[1], v.joints[2], v.joints[3]);
+                as.shadow_weights.emplace_back(v.weights[0], v.weights[1], v.weights[2], v.weights[3]);
+            }
             as.index_count = uint32_t(idx.size());
             as.tri_count = as.index_count / 3u;
             engine::helper::createTextureImage(
@@ -984,6 +1035,22 @@ void CitizenSystem::initStaticMembers(
                 s_npc_layout_, nb, na, ia, graphic_pipeline_info, sm,
                 frame_buffer_format, two_sided,
                 std::source_location::current());
+            {
+                er::ShaderModuleList gbuf_modules = sm;
+                gbuf_modules[1] = er::helper::loadShaderModule(device, "citizen_npc_gbuf_frag.spv",
+                    er::ShaderStageFlagBits::FRAGMENT_BIT, std::source_location::current());
+                er::GraphicPipelineInfo gbuf_info = graphic_pipeline_info;
+                auto att = er::helper::fillPipelineColorBlendAttachmentState(
+                    SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
+                gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+                    er::helper::fillPipelineColorBlendStateCreateInfo(
+                        std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+                s_npc_gbuf_pipeline_ = device->createPipeline(
+                    s_npc_layout_, nb, na, ia, gbuf_info, gbuf_modules,
+                    gbuffer_format, two_sided,
+                    std::source_location::current());
+            }
+
             s_npc_ready_ = s_npc_pipeline_ != nullptr;
             std::cout << "[citizen] character meshes: man "
                       << (s_npc_[0].ok ? s_npc_[0].tri_count : 0u)
@@ -1004,6 +1071,8 @@ void CitizenSystem::destroyStaticMembers(
     if (s_pipeline_layout_) device->destroyPipelineLayout(
         s_pipeline_layout_);
     s_pipeline_layout_ = nullptr;
+    if (s_gbuf_pipeline_) device->destroyPipeline(s_gbuf_pipeline_);
+    s_gbuf_pipeline_ = nullptr;
     if (s_pipeline_) device->destroyPipeline(s_pipeline_);
     s_pipeline_ = nullptr;
     if (s_inst_buf_) {
@@ -1031,6 +1100,8 @@ void CitizenSystem::destroyStaticMembers(
     if (s_ball_idx_) s_ball_idx_->destroy(device);
     s_ball_pos_ = s_ball_nrm_ = s_ball_idx_ = nullptr;
     s_ball_index_count_ = 0;
+    if (s_skin_gbuf_pipeline_) device->destroyPipeline(s_skin_gbuf_pipeline_);
+    s_skin_gbuf_pipeline_ = nullptr;
     if (s_skin_pipeline_) device->destroyPipeline(s_skin_pipeline_);
     s_skin_pipeline_ = nullptr;
     if (s_skin_buf_) s_skin_buf_->destroy(device);
@@ -1038,6 +1109,8 @@ void CitizenSystem::destroyStaticMembers(
     s_skin_capacity_ = 0;
     // the character meshes
     s_npc_ready_ = false;
+    if (s_npc_gbuf_pipeline_) device->destroyPipeline(s_npc_gbuf_pipeline_);
+    s_npc_gbuf_pipeline_ = nullptr;
     if (s_npc_pipeline_) device->destroyPipeline(s_npc_pipeline_);
     s_npc_pipeline_ = nullptr;
     if (s_npc_layout_) device->destroyPipelineLayout(s_npc_layout_);
@@ -4303,12 +4376,68 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
          leg_r, {0.09f * s, 0.90f * s, 0.0f}, look.bottom);
 }
 
+void CitizenSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
+    out.positions.clear(); out.indices.clear();
+    if (!loaded_ || !s_pipeline_) return;
+    for (const auto& part : frame_parts_)
+        out.append(s_shadow_cube_, [&](const glm::vec3& p) {
+            return glm::vec3(part.xform * glm::vec4(p, 1.0f));
+        });
+    auto transform = [](const glm::vec4* rows, const glm::vec4& p) {
+        return glm::vec3(glm::dot(rows[0], p), glm::dot(rows[1], p), glm::dot(rows[2], p));
+    };
+    auto skin = [&](const std::vector<SkinInstance>& parts, const ActorShadowGeometry& mesh) {
+        for (const auto& part : parts) out.append(mesh, [&](const glm::vec3& v) {
+            // Same taper and pivot blend as citizen_skin.vert.
+            const float f = glm::mix(part.shape.w, 1.0f, (v.y + 1.0f) * 0.5f);
+            const glm::vec4 p(v.x * f, v.y, v.z * f, 1.0f);
+            float wu = 0.0f, wl = 0.0f;
+            if (part.shape.z > 0.0f) {
+                wu = glm::clamp(0.5f + (v.y - part.shape.x) / (2.0f * part.shape.z), 0.0f, 1.0f);
+                wl = glm::clamp(0.5f - (v.y - part.shape.y) / (2.0f * part.shape.z), 0.0f, 1.0f);
+            }
+            return std::max(0.0f, 1.0f - wu - wl) * transform(part.self, p)
+                 + wu * transform(part.up, p) + wl * transform(part.lo, p);
+        });
+    };
+    if (s_skin_pipeline_) {
+        skin(frame_tube_, s_shadow_tube_); skin(frame_blob_, s_shadow_blob_);
+        skin(frame_ball_, s_shadow_ball_);
+    }
+    if (!s_npc_ready_) return;
+    for (int c = 0; c < 2; ++c) {
+        const auto& asset = s_npc_[c];
+        if (!asset.ok) continue;
+        for (const auto& inst : frame_npc_[c]) {
+            const size_t row = size_t(inst.a.x + 0.5f);
+            if (row + kNpcRows > frame_palette_.size()) continue;
+            const uint32_t base = uint32_t(out.positions.size());
+            for (size_t v = 0; v < asset.shadow.positions.size(); ++v) {
+                const glm::vec4 p(asset.shadow.positions[v], 1.0f);
+                glm::vec3 world(0.0f); float sum = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const float w = float(asset.shadow_weights[v][k]);
+                    if (w <= 0.0f) continue;
+                    const size_t joint = asset.shadow_joints[v][k];
+                    world += w * transform(frame_palette_.data() + row + joint * 3, p);
+                    sum += w;
+                }
+                out.positions.push_back(sum > 0.0f ? world / sum : transform(frame_palette_.data() + row, p));
+            }
+            for (uint32_t i : asset.shadow.indices) out.indices.push_back(base + i);
+        }
+    }
+}
+
 void CitizenSystem::draw(
     const std::shared_ptr<er::CommandBuffer>& cmd_buf,
     const er::DescriptorSetList& desc_sets,
     const std::shared_ptr<er::ImageView>& color_view,
     const std::shared_ptr<er::ImageView>& depth_view,
-    const glm::uvec2& buffer_size) {
+    const glm::uvec2& buffer_size,
+    const std::vector<std::shared_ptr<er::ImageView>>& gbuffer) {
+    const bool deferred = !gbuffer.empty();
+    if (deferred && (gbuffer.size() != 4 || !s_gbuf_pipeline_)) return;
     if (!loaded_ || !s_pipeline_) return;
     if (frame_parts_.empty() && frame_tube_.empty() &&
         frame_blob_.empty() && frame_ball_.empty() &&
@@ -4433,6 +4562,13 @@ void CitizenSystem::draw(
     ri.layer_count = 1;
     ri.view_mask = 0;
     ri.color_attachments = {color_att};
+    if (deferred) {
+        ri.color_attachments.clear();
+        for (const auto& view : gbuffer) {
+            auto att = color_att; att.image_view = view;
+            ri.color_attachments.push_back(att);
+        }
+    }
     ri.depth_attachments = {depth_att};
     cmd_buf->beginDynamicRendering(ri);
 
@@ -4447,7 +4583,7 @@ void CitizenSystem::draw(
     scissors[0].offset = {0, 0};
     scissors[0].extent = {buffer_size.x, buffer_size.y};
 
-    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, s_pipeline_);
+    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, deferred ? s_gbuf_pipeline_ : s_pipeline_);
     cmd_buf->setViewports(viewports, 0, 1);
     cmd_buf->setScissors(scissors, 0, 1);
     cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
@@ -4471,7 +4607,7 @@ void CitizenSystem::draw(
     // per mesh) over one instance buffer at their offsets.
     if (n_tube + n_blob + n_ball && s_skin_pipeline_ && s_skin_buf_) {
         cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS,
-                              s_skin_pipeline_);
+                              deferred ? s_skin_gbuf_pipeline_ : s_skin_pipeline_);
         cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
                                     s_pipeline_layout_, desc_sets);
         struct Draw { const std::shared_ptr<er::BufferInfo>* pos;
@@ -4517,7 +4653,7 @@ void CitizenSystem::draw(
             off += uint64_t(frame_npc_[c].size()) * sizeof(NpcInstance);
         }
         cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS,
-                              s_npc_pipeline_);
+                              deferred ? s_npc_gbuf_pipeline_ : s_npc_pipeline_);
         uint32_t first = 0;
         for (int c = 0; c < 2; ++c) {
             const uint32_t n = uint32_t(frame_npc_[c].size());

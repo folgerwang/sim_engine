@@ -13,7 +13,7 @@ layout(location = 1) in vec3 in_position_ws;
 layout(location = 2) in vec2 in_uv;
 layout(location = 3) flat in vec4 in_inst;
 
-layout(location = 0) out vec4 outColor;
+#include "citizen_gbuffer.glsl.h"
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     readonly buffer CameraInfoBuffer {
@@ -30,9 +30,15 @@ void main() {
     vec3 albedo = texture(albedo_tex, in_uv).rgb;
     // a touch of per-person variation, so twins in one street differ
     albedo *= 0.90 + 0.20 * in_inst.y;
+#ifdef GBUFFER_OUTPUT
+    if (dot(n, camera_info.position - in_position_ws) < 0.0) n = -n;
+    citizenGbuffer(albedo, n, in_position_ws, camera_info.view_proj,
+                   camera_info.prev_view_proj, 0.9);
+#else
     float nl = dot(n, kSunDir) * 0.5 + 0.5;
     vec3 lit = albedo * (0.45 + 0.70 * nl);
     lit += albedo * in_inst.z;                // readability lift
     outColor = vec4(sceneTonemapExposed(lit,
         sceneExposureScaleOf(camera_info.exposure_scale)), 1.0);
+#endif
 }

@@ -12,7 +12,7 @@ layout(location = 2) in vec4 in_color;
 layout(location = 3) in vec3 in_local;
 layout(location = 4) flat in vec4 in_extra;
 
-layout(location = 0) out vec4 outColor;
+#include "citizen_gbuffer.glsl.h"
 
 // Camera UBO (the vertex stage binds the same set): only the exposure
 // scale is read here, so citizens follow the Camera & Lens exposure.
@@ -176,9 +176,15 @@ void main() {
         albedo = paint(albedo, in_local, in_extra.x, in_extra.y,
                        unpackRGB(in_extra.z), in_extra.w);
     }
+#ifdef GBUFFER_OUTPUT
+    if (dot(n, camera_info.position - in_position_ws) < 0.0) n = -n;
+    citizenGbuffer(albedo, n, in_position_ws, camera_info.view_proj,
+                   camera_info.prev_view_proj, 0.9);
+#else
     float nl = dot(n, kSunDir) * 0.5 + 0.5;          // wrapped
     vec3 lit = albedo * (0.35 + 0.85 * nl);
     lit += albedo * in_color.a;               // readability lift
     outColor = vec4(sceneTonemapExposed(lit,
         sceneExposureScaleOf(camera_info.exposure_scale)), 1.0);
+#endif
 }

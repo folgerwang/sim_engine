@@ -645,6 +645,7 @@ glm::vec3 paletteColor(uint32_t seed) {
 }  // namespace
 
 // ── statics ──────────────────────────────────────────────────────────
+std::shared_ptr<er::Pipeline> VehicleSystem::s_gbuf_pipeline_;
 std::shared_ptr<er::PipelineLayout>  VehicleSystem::s_pipeline_layout_;
 std::shared_ptr<er::Pipeline>        VehicleSystem::s_pipeline_;
 std::vector<VehicleSystem::Mesh>     VehicleSystem::s_meshes_;
@@ -657,7 +658,8 @@ void VehicleSystem::initStaticMembers(
     const std::shared_ptr<er::Device>& device,
     const er::DescriptorSetLayoutList& global_desc_set_layouts,
     const er::GraphicPipelineInfo& graphic_pipeline_info,
-    const er::PipelineRenderbufferFormats& frame_buffer_format) {
+    const er::PipelineRenderbufferFormats& frame_buffer_format,
+    const er::PipelineRenderbufferFormats& gbuffer_format) {
     er::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
         SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
@@ -712,6 +714,22 @@ void VehicleSystem::initStaticMembers(
         s_pipeline_layout_, bindings, attribs, input_assembly,
         graphic_pipeline_info, shader_modules, frame_buffer_format,
         raster_override, std::source_location::current());
+    {
+        er::ShaderModuleList gbuf_modules = shader_modules;
+        gbuf_modules[1] = er::helper::loadShaderModule(device, "vehicle_gbuf_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT, std::source_location::current());
+        er::GraphicPipelineInfo gbuf_info = graphic_pipeline_info;
+        auto att = er::helper::fillPipelineColorBlendAttachmentState(
+            SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
+        gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+            er::helper::fillPipelineColorBlendStateCreateInfo(
+                std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+        s_gbuf_pipeline_ = device->createPipeline(
+            s_pipeline_layout_, bindings, attribs, input_assembly,
+            gbuf_info, gbuf_modules, gbuffer_format,
+            raster_override, std::source_location::current());
+    }
+
     // THE GLASS PASS: the same shaders and layout, alpha-blended, depth
     // tested against the opaque pass but not written (two panes of
     // one car overlap and must not occlude each other).
@@ -745,6 +763,8 @@ void VehicleSystem::initStaticMembers(
     s_meshes_.assign(kMeshCount, Mesh{});
     auto upload = [&](int i, const MeshData& md) {
         Mesh& m = s_meshes_[i];
+        m.shadow.positions = md.pos;
+        m.shadow.indices = md.idx;
         m.pos = helper::createUnifiedMeshBuffer(
             device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
             md.pos.size() * sizeof(glm::vec3), md.pos.data(),
@@ -773,6 +793,8 @@ void VehicleSystem::destroyStaticMembers(
     const std::shared_ptr<er::Device>& device) {
     if (s_pipeline_layout_) device->destroyPipelineLayout(s_pipeline_layout_);
     s_pipeline_layout_ = nullptr;
+    if (s_gbuf_pipeline_) device->destroyPipeline(s_gbuf_pipeline_);
+    s_gbuf_pipeline_ = nullptr;
     if (s_pipeline_) device->destroyPipeline(s_pipeline_);
     s_pipeline_ = nullptr;
     if (s_glass_pipeline_) device->destroyPipeline(s_glass_pipeline_);
@@ -2015,12 +2037,30 @@ void VehicleSystem::emit(const Vehicle& v) {
     }
 }
 
+void VehicleSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
+    out.positions.clear(); out.indices.clear();
+    if (!loaded() || !s_pipeline_) return;
+    // Glass duplicates hull triangles, so submit each hull only once.
+    for (size_t stream = 0; stream < frame_.size() && stream < kStreamGlass0; ++stream) {
+        const int mesh = streamMesh(int(stream));
+        if (mesh < 0 || mesh >= int(s_meshes_.size())) continue;
+        for (const auto& instance : frame_[stream])
+            out.append(s_meshes_[mesh].shadow, [&](const glm::vec3& p) {
+                return glm::vec3(instance.xform * glm::vec4(p, 1.0f));
+            });
+    }
+}
+
 void VehicleSystem::draw(
     const std::shared_ptr<er::CommandBuffer>& cmd_buf,
     const er::DescriptorSetList& desc_sets,
     const std::shared_ptr<er::ImageView>& color_view,
     const std::shared_ptr<er::ImageView>& depth_view,
-    const glm::uvec2& buffer_size) {
+    const glm::uvec2& buffer_size,
+    const std::vector<std::shared_ptr<er::ImageView>>& gbuffer,
+    bool glass_only, bool opaque_only) {
+    const bool deferred = !gbuffer.empty();
+    if (deferred && (gbuffer.size() != 4 || !s_gbuf_pipeline_)) return;
     if (!loaded() || !s_pipeline_ || !s_device_ || !s_pipeline_layout_) return;
     if (!color_view || !depth_view) return;
     size_t total = 0;
@@ -2070,6 +2110,13 @@ void VehicleSystem::draw(
     ri.layer_count = 1;
     ri.view_mask = 0;
     ri.color_attachments = {color_att};
+    if (deferred) {
+        ri.color_attachments.clear();
+        for (const auto& view : gbuffer) {
+            auto att = color_att; att.image_view = view;
+            ri.color_attachments.push_back(att);
+        }
+    }
     ri.depth_attachments = {depth_att};
     cmd_buf->beginDynamicRendering(ri);
     std::vector<er::Viewport> viewports(1);
@@ -2080,7 +2127,7 @@ void VehicleSystem::draw(
     viewports[0].min_depth = 0.0f; viewports[0].max_depth = 1.0f;
     scissors[0].offset = {0, 0};
     scissors[0].extent = {buffer_size.x, buffer_size.y};
-    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, s_pipeline_);
+    cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, deferred ? s_gbuf_pipeline_ : s_pipeline_);
     cmd_buf->setViewports(viewports, 0, 1);
     cmd_buf->setScissors(scissors, 0, 1);
     cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
@@ -2092,6 +2139,8 @@ void VehicleSystem::draw(
         const uint32_t n = uint32_t(frame_[m].size());
         const int mi = streamMesh(int(m));
         if (mi < 0 || mi >= int(s_meshes_.size())) { first += n; continue; }
+        if (glass_only && int(m) < kStreamGlass0) { first += n; continue; }
+        if ((deferred || opaque_only) && int(m) >= kStreamGlass0) break;
         if (int(m) >= kStreamGlass0 && !glass_bound) {
             if (!s_glass_pipeline_) break;     // no glass pass this build
             cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, s_glass_pipeline_);
