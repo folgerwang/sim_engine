@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <filesystem>
+#include <cstddef>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -381,6 +382,9 @@ constexpr size_t kMaxFarParts = 200000;   // far-tier safety valve
 // v3: ~5.6k triangles a figure on the skinned meshes -- 256 of them
 // is ~1.4 M, so the band widens.
 constexpr float  kFineRadius = 90.0f;
+// The CHARACTER MESHES (v33): the nearest kMaxNpc fine persons inside
+// this radius are drawn as baked scans instead of the parts puppet.
+constexpr float  kNpcRadius = 60.0f;
 // Driving (v25): a trip longer than this on foot is taken by car when
 // the person's car is parked within kBoardR of them.
 constexpr float  kDriveMinM = 320.0f;
@@ -558,6 +562,72 @@ uint32_t                            CitizenSystem::s_skin_capacity_ = 0;
 std::shared_ptr<er::Device>         CitizenSystem::s_device_;
 std::shared_ptr<er::BufferInfo>     CitizenSystem::s_inst_buf_;
 uint32_t                            CitizenSystem::s_inst_capacity_ = 0;
+CitizenSystem::NpcAsset             CitizenSystem::s_npc_[2];
+bool                                CitizenSystem::s_npc_ready_ = false;
+std::shared_ptr<er::PipelineLayout> CitizenSystem::s_npc_layout_;
+std::shared_ptr<er::Pipeline>       CitizenSystem::s_npc_pipeline_;
+std::shared_ptr<er::DescriptorSetLayout> CitizenSystem::s_npc_desc_layout_;
+std::shared_ptr<er::DescriptorPool> CitizenSystem::s_npc_pool_;
+std::shared_ptr<er::Sampler>        CitizenSystem::s_npc_sampler_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_npc_inst_buf_;
+std::shared_ptr<er::BufferInfo>     CitizenSystem::s_npc_palette_buf_;
+
+namespace {
+// The .npcmesh file npc_bake.py writes: "NPCM", u32 version, nv, ni,
+// nj; nj x (i32 parent, 3 f32 bind pos); nv x pos, nrm (f32x3), uv
+// (f32x2), joints (u8x4), weights (u8x4); ni x u32 index.
+struct NpcVertex {
+    glm::vec3 pos;
+    glm::vec3 nrm;
+    glm::vec2 uv;
+    uint8_t   joints[4];
+    uint8_t   weights[4];
+};
+bool loadNpcMesh(const std::string& path, std::vector<NpcVertex>& verts,
+                 std::vector<uint32_t>& idx, glm::vec3* bind, int nj_want) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[4];
+    f.read(magic, 4);
+    if (std::string(magic, 4) != "NPCM") return false;
+    uint32_t ver = 0, nv = 0, ni = 0, nj = 0;
+    f.read(reinterpret_cast<char*>(&ver), 4);
+    f.read(reinterpret_cast<char*>(&nv), 4);
+    f.read(reinterpret_cast<char*>(&ni), 4);
+    f.read(reinterpret_cast<char*>(&nj), 4);
+    if (ver != 1 || int(nj) != nj_want || nv == 0 || ni == 0 ||
+        nv > 2000000u || ni > 6000000u) return false;
+    for (uint32_t j = 0; j < nj; ++j) {
+        int32_t parent = 0;
+        f.read(reinterpret_cast<char*>(&parent), 4);
+        f.read(reinterpret_cast<char*>(&bind[j]), 12);
+    }
+    std::vector<glm::vec3> pos(nv), nrm(nv);
+    std::vector<glm::vec2> uv(nv);
+    std::vector<uint8_t> jn(nv * 4), wt(nv * 4);
+    f.read(reinterpret_cast<char*>(pos.data()), std::streamsize(nv) * 12);
+    f.read(reinterpret_cast<char*>(nrm.data()), std::streamsize(nv) * 12);
+    f.read(reinterpret_cast<char*>(uv.data()), std::streamsize(nv) * 8);
+    f.read(reinterpret_cast<char*>(jn.data()), std::streamsize(nv) * 4);
+    f.read(reinterpret_cast<char*>(wt.data()), std::streamsize(nv) * 4);
+    idx.resize(ni);
+    f.read(reinterpret_cast<char*>(idx.data()), std::streamsize(ni) * 4);
+    if (!f) return false;
+    verts.resize(nv);
+    for (uint32_t i = 0; i < nv; ++i) {
+        NpcVertex& v = verts[i];
+        v.pos = pos[i];
+        v.nrm = nrm[i];
+        v.uv = uv[i];
+        for (int k = 0; k < 4; ++k) {
+            v.joints[k] = uint8_t(std::min<uint32_t>(jn[i * 4 + k], nj - 1));
+            v.weights[k] = wt[i * 4 + k];
+        }
+    }
+    for (uint32_t& k : idx) if (k >= nv) return false;
+    return true;
+}
+}  // namespace
 
 void CitizenSystem::initStaticMembers(
     const std::shared_ptr<er::Device>& device,
@@ -766,6 +836,167 @@ void CitizenSystem::initStaticMembers(
                s_round_idx_, s_round_index_count_);        // torso, pelvis
     make_shape(0.85f, 0.90f, 10, 16, s_ball_pos_, s_ball_nrm_, s_ball_idx_,
                s_ball_index_count_);                       // head, hands
+
+    // ── THE CHARACTER MESHES (v33) ──────────────────────────────────
+    // Fail-soft as a whole: without the assets or the shaders the
+    // puppets carry on exactly as before.
+    s_npc_ready_ = false;
+    try {
+        static const char* kNames[2] = {"man", "woman"};
+        std::vector<NpcVertex> verts;
+        std::vector<uint32_t> idx;
+        int loaded = 0;
+        for (int c = 0; c < 2; ++c) {
+            NpcAsset& as = s_npc_[c];
+            as = NpcAsset();
+            const std::string base =
+                std::string("assets/Characters/npc/") + kNames[c];
+            if (!loadNpcMesh(base + ".npcmesh", verts, idx, as.bind,
+                             kNpcJoints)) {
+                std::cout << "[citizen] npc mesh missing/unreadable: "
+                          << base << ".npcmesh" << std::endl;
+                continue;
+            }
+            as.vb = helper::createUnifiedMeshBuffer(
+                device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+                verts.size() * sizeof(NpcVertex), verts.data(),
+                std::source_location::current());
+            as.ib = helper::createUnifiedMeshBuffer(
+                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                idx.size() * sizeof(uint32_t), idx.data(),
+                std::source_location::current());
+            as.index_count = uint32_t(idx.size());
+            as.tri_count = as.index_count / 3u;
+            engine::helper::createTextureImage(
+                device, base + "_albedo.png", er::Format::R8G8B8A8_UNORM,
+                true, as.albedo, std::source_location::current());
+            as.ok = as.vb && as.ib && as.albedo.view != nullptr;
+            if (as.ok) ++loaded;
+        }
+        if (loaded) {
+            // set 2: the palette (vertex) and the albedo (fragment)
+            std::vector<er::DescriptorSetLayoutBinding> b;
+            b.push_back(er::helper::getBufferDescriptionSetLayoutBinding(
+                0, SET_FLAG_BIT(ShaderStage, VERTEX_BIT),
+                er::DescriptorType::STORAGE_BUFFER));
+            b.push_back(er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                1, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER));
+            s_npc_desc_layout_ = device->createDescriptorSetLayout(
+                b, std::source_location::current());
+            er::DescriptorSetLayoutList layouts = global_desc_set_layouts;
+            layouts.push_back(s_npc_desc_layout_);
+            er::PushConstantRange pcr{};
+            pcr.stage_flags =
+                SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
+            pcr.offset = 0;
+            pcr.size = sizeof(glsl::CitizenDrawParams);
+            s_npc_layout_ = device->createPipelineLayout(
+                layouts, { pcr }, std::source_location::current());
+            s_npc_pool_ = device->createDescriptorPool(
+                std::source_location::current());
+            s_npc_sampler_ = device->createSampler(
+                er::Filter::LINEAR, er::SamplerAddressMode::REPEAT,
+                er::SamplerMipmapMode::LINEAR, 0.0f,
+                std::source_location::current());
+            // the palette and the instance stream: fixed capacity, so
+            // the descriptor never has to be rewritten
+            s_npc_palette_buf_ = std::make_shared<er::BufferInfo>();
+            er::Helper::createBuffer(
+                device,
+                SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT,
+                                TRANSFER_DST_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0, s_npc_palette_buf_->buffer, s_npc_palette_buf_->memory,
+                std::source_location::current(),
+                uint64_t(kMaxNpc) * kNpcRows * sizeof(glm::vec4), nullptr);
+            s_npc_inst_buf_ = std::make_shared<er::BufferInfo>();
+            er::Helper::createBuffer(
+                device,
+                SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT,
+                                TRANSFER_DST_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
+                                HOST_COHERENT_BIT),
+                0, s_npc_inst_buf_->buffer, s_npc_inst_buf_->memory,
+                std::source_location::current(),
+                uint64_t(kMaxNpc) * sizeof(NpcInstance), nullptr);
+            for (int c = 0; c < 2; ++c) {
+                NpcAsset& as = s_npc_[c];
+                if (!as.ok) continue;
+                as.desc = device->createDescriptorSets(
+                    s_npc_pool_, s_npc_desc_layout_, 1,
+                    std::source_location::current())[0];
+                er::WriteDescriptorList w;
+                er::Helper::addOneBuffer(
+                    w, as.desc, er::DescriptorType::STORAGE_BUFFER, 0,
+                    s_npc_palette_buf_->buffer,
+                    uint32_t(uint64_t(kMaxNpc) * kNpcRows * sizeof(glm::vec4)));
+                er::Helper::addOneTexture(
+                    w, as.desc, er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    1, s_npc_sampler_, as.albedo.view,
+                    er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                device->updateDescriptorSets(w);
+            }
+            // the pipeline: one interleaved vertex stream + the
+            // per-instance vec4; double-sided (a scan's winding is
+            // not guaranteed), citizen depth and formats
+            std::vector<er::VertexInputBindingDescription> nb(2);
+            std::vector<er::VertexInputAttributeDescription> na(6);
+            nb[0].binding = 0;
+            nb[0].stride = sizeof(NpcVertex);
+            nb[0].input_rate = er::VertexInputRate::VERTEX;
+            nb[1].binding = 1;
+            nb[1].stride = sizeof(NpcInstance);
+            nb[1].input_rate = er::VertexInputRate::INSTANCE;
+            const er::Format fmts[6] = {
+                er::Format::R32G32B32_SFLOAT, er::Format::R32G32B32_SFLOAT,
+                er::Format::R32G32_SFLOAT, er::Format::R8G8B8A8_UINT,
+                er::Format::R8G8B8A8_UNORM, er::Format::R32G32B32A32_SFLOAT};
+            const uint32_t offs[6] = {
+                uint32_t(offsetof(NpcVertex, pos)),
+                uint32_t(offsetof(NpcVertex, nrm)),
+                uint32_t(offsetof(NpcVertex, uv)),
+                uint32_t(offsetof(NpcVertex, joints)),
+                uint32_t(offsetof(NpcVertex, weights)), 0u};
+            for (int k = 0; k < 6; ++k) {
+                na[k].binding = k < 5 ? 0 : 1;
+                na[k].location = uint32_t(k);
+                na[k].format = fmts[k];
+                na[k].offset = offs[k];
+            }
+            er::PipelineInputAssemblyStateCreateInfo ia;
+            ia.topology = er::PrimitiveTopology::TRIANGLE_LIST;
+            ia.restart_enable = false;
+            er::RasterizationStateOverride two_sided;
+            two_sided.override_double_sided = true;
+            two_sided.double_sided = true;
+            er::ShaderModuleList sm(2);
+            sm[0] = er::helper::loadShaderModule(
+                device, "citizen_npc_vert.spv",
+                er::ShaderStageFlagBits::VERTEX_BIT,
+                std::source_location::current());
+            sm[1] = er::helper::loadShaderModule(
+                device, "citizen_npc_frag.spv",
+                er::ShaderStageFlagBits::FRAGMENT_BIT,
+                std::source_location::current());
+            s_npc_pipeline_ = device->createPipeline(
+                s_npc_layout_, nb, na, ia, graphic_pipeline_info, sm,
+                frame_buffer_format, two_sided,
+                std::source_location::current());
+            s_npc_ready_ = s_npc_pipeline_ != nullptr;
+            std::cout << "[citizen] character meshes: man "
+                      << (s_npc_[0].ok ? s_npc_[0].tri_count : 0u)
+                      << " tris, woman "
+                      << (s_npc_[1].ok ? s_npc_[1].tri_count : 0u)
+                      << " tris (" << (s_npc_ready_ ? "on" : "OFF")
+                      << ")" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cout << "[citizen] character meshes disabled: " << e.what()
+                  << std::endl;
+        s_npc_ready_ = false;
+    }
 }
 
 void CitizenSystem::destroyStaticMembers(
@@ -805,6 +1036,28 @@ void CitizenSystem::destroyStaticMembers(
     if (s_skin_buf_) s_skin_buf_->destroy(device);
     s_skin_buf_ = nullptr;
     s_skin_capacity_ = 0;
+    // the character meshes
+    s_npc_ready_ = false;
+    if (s_npc_pipeline_) device->destroyPipeline(s_npc_pipeline_);
+    s_npc_pipeline_ = nullptr;
+    if (s_npc_layout_) device->destroyPipelineLayout(s_npc_layout_);
+    s_npc_layout_ = nullptr;
+    for (auto& as : s_npc_) {
+        if (as.vb) as.vb->destroy(device);
+        if (as.ib) as.ib->destroy(device);
+        if (as.albedo.image) as.albedo.destroy(device);
+        as = NpcAsset();
+    }
+    if (s_npc_pool_) device->destroyDescriptorPool(s_npc_pool_);
+    s_npc_pool_ = nullptr;
+    if (s_npc_desc_layout_) device->destroyDescriptorSetLayout(s_npc_desc_layout_);
+    s_npc_desc_layout_ = nullptr;
+    if (s_npc_sampler_) device->destroySampler(s_npc_sampler_);
+    s_npc_sampler_ = nullptr;
+    if (s_npc_inst_buf_) s_npc_inst_buf_->destroy(device);
+    s_npc_inst_buf_ = nullptr;
+    if (s_npc_palette_buf_) s_npc_palette_buf_->destroy(device);
+    s_npc_palette_buf_ = nullptr;
 }
 
 bool CitizenSystem::loadCity(const std::string& city_json_path,
@@ -3267,9 +3520,26 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             ++n_fine;
         }
     }
+    // The CHARACTER MESHES: the nearest kMaxNpc of the fine tier
+    // inside kNpcRadius (residents first; the strollers take what is
+    // left of the palette).
+    std::vector<uint8_t>& is_npc = is_npc_;
+    is_npc.assign(n, 0);
+    if (s_npc_ready_) {
+        size_t n_npc = 0;
+        for (const auto& [d2, i] : near_ids) {
+            if (d2 >= kNpcRadius * kNpcRadius || n_npc >= kMaxNpc) break;
+            if (!is_fine[i]) continue;
+            is_npc[i] = 1;
+            ++n_npc;
+        }
+    }
     frame_tube_.clear();
     frame_blob_.clear();
     frame_ball_.clear();
+    frame_npc_[0].clear();
+    frame_npc_[1].clear();
+    frame_palette_.clear();
 
     if (far_thresh_ < kMinAngular) far_thresh_ = kMinAngular;
     size_t far_emitted = 0;
@@ -3282,7 +3552,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         if (sim_[i].ride == 2 && !is_detailed[i]) continue;  // in their car
         if (is_detailed[i]) {
             emitPerson(int(i), sim_[i], persons_[i], true,
-                       is_fine[i] != 0);
+                       is_fine[i] != 0, is_npc[i] != 0);
         } else {
             const float dist = std::sqrt(std::max(d2, 1.0f));
             if (persons_[i].height / dist < far_thresh_) continue;
@@ -3311,7 +3581,9 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         const bool detailed = d2 < kDetailRadius * kDetailRadius;
         const bool fine = d2 < kFineRadius * kFineRadius;
         emitPerson(int(0x20000000u | (w.seed & 0x1FFFFFFFu)), ta, w.look,
-                   detailed, detailed && fine);
+                   detailed, detailed && fine,
+                   detailed && fine && s_npc_ready_ &&
+                       d2 < kNpcRadius * kNpcRadius);
     }
     // ── the people in the ambient cars ───────────────────────────────
     emitOccupants(camera_pos);
@@ -3410,7 +3682,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
 
 void CitizenSystem::emitPerson(int pid_i, const SimState& a,
                                const Person& p, bool detailed,
-                               bool fine) {
+                               bool fine, bool npc) {
     if (!detailed) {
         // FAR TIER: one box, person-sized, duty-tinted — a figure at a
         // distance, not a puppet.  Slight walk bob keeps crowds alive.
@@ -3749,6 +4021,64 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         solveSkeleton(sk, root * glm::translate(glm::mat4(1.0f),
                                                 glm::vec3(lateral, 0.0f, 0.0f)));
 
+        // ── THE CHARACTER MESH (v33) ────────────────────────────────
+        // A baked scan instead of the parts: the same skeleton, the
+        // same pose, re-solved on the ASSET's joint positions (scaled
+        // to this person's height) so the mesh bends at its own knees
+        // and elbows; every asset joint follows one citizen joint.
+        // Children keep the puppet -- a scaled-down adult is not a
+        // child.
+        if (npc && s_npc_ready_ && p.age != 1 && p.age != 2 &&
+            frame_palette_.size() + size_t(kNpcRows) <=
+                size_t(kMaxNpc) * size_t(kNpcRows)) {
+            const int ch = look.female ? 1 : 0;
+            const NpcAsset& as = s_npc_[ch].ok ? s_npc_[ch]
+                                                : s_npc_[1 - ch];
+            if (as.ok) {
+                // asset joint -> citizen joint (asset order: hips,
+                // spine, chest, neck, head, L shoulder, L upper arm, L
+                // forearm, L hand, R shoulder, R upper arm, R forearm,
+                // R hand, L thigh, L shin, L foot, R thigh, R shin, R
+                // foot; the asset's LEFT is +x = the citizen's R side)
+                static const int kA2C[kNpcJoints] = {
+                    jPelvis, jSpine, jSpine, jNeck, jHead,
+                    jSpine, jShoulderR, jElbowR, jWristR,
+                    jSpine, jShoulderL, jElbowL, jWristL,
+                    jHipR, jKneeR, jAnkleR, jHipL, jKneeL, jAnkleL};
+                // citizen joint -> the asset joint whose rest position
+                // it takes
+                static const int kC2A[jCount] = {
+                    0, 1, 3, 4, 10, 11, 12, 6, 7, 8, 16, 17, 18, 13, 14, 15};
+                const float H = p.height;
+                Skeleton sk2;
+                for (int j = 0; j < jCount; ++j) {
+                    sk2.pivot[j] = as.bind[kC2A[j]] * H;
+                    sk2.rot[j] = sk.rot[j];
+                }
+                // the scan's arms already clear its torso
+                sk2.rot[jShoulderL].z = 0.0f;
+                sk2.rot[jShoulderR].z = 0.0f;
+                solveSkeleton(sk2, root * glm::translate(glm::mat4(1.0f),
+                                  glm::vec3(lateral, 0.0f, 0.0f)));
+                const uint32_t base_row = uint32_t(frame_palette_.size());
+                const glm::mat4 S = glm::scale(glm::mat4(1.0f), glm::vec3(H));
+                for (int k = 0; k < kNpcJoints; ++k) {
+                    const int j = kA2C[k];
+                    const glm::mat4 M = sk2.world[j] *
+                        glm::translate(glm::mat4(1.0f), -sk2.pivot[j]) * S;
+                    for (int r = 0; r < 3; ++r)
+                        frame_palette_.push_back(
+                            glm::vec4(M[0][r], M[1][r], M[2][r], M[3][r]));
+                }
+                NpcInstance ni;
+                ni.a = glm::vec4(float(base_row),
+                                 lookRand(uint32_t(pid_i), 0x51u),
+                                 0.10f, 0.0f);
+                frame_npc_[&as == &s_npc_[0] ? 0 : 1].push_back(ni);
+                return;
+            }
+        }
+
         // ── the parts, SKINNED onto the joints (v3) ─────────────────
         // A part hangs off joint j; its top end skins to joint `up`,
         // its bottom end to joint `lo` (-1: none).  The three
@@ -3825,13 +4155,36 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         spart(jSpine, -1, jPelvis, {0.0f, 1.225f * s, 0.0f},
              {Wc, 0.235f * s, 0.105f * s * bw}, Ww / Wc, 0.06f * s, 1,
              kPartTorso, look.top, top_style, skin);
+        // v31: the neck flares into the shoulders (taper > 1: wider
+        // at its foot), and the head is an EGG, narrower at the chin
         spart(jNeck, jHead, jSpine, {0.0f, 1.48f * s, 0.0f},
-             {0.045f * s, 0.06f * s, 0.045f * s}, 1.0f, 0.03f * s, 0,
+             {0.048f * s, 0.06f * s, 0.05f * s}, 1.35f, 0.03f * s, 0,
              kPartPlain, skin, 0.0f, skin);
         const float hy = 1.51f * s + 0.12f * s * hs;      // head centre
         spart(jHead, -1, jNeck, {0.0f, hy, 0.0f},
-             {0.10f * s * hs, 0.12f * s * hs, 0.105f * s * hs}, 1.0f,
+             {0.10f * s * hs, 0.12f * s * hs, 0.105f * s * hs}, 0.84f,
              0.03f * s, 2, kPartHead, skin, head_style, look.hair);
+        // ears, nose: small, but they are what makes a head a face
+        // from the side and behind
+        for (int side = 0; side < 2; ++side) {
+            const float ex = (side == 0 ? -1.0f : 1.0f) * 0.104f * s * hs;
+            spart(jHead, -1, -1, {ex, hy - 0.012f * s * hs, -0.012f * s * hs},
+                 {0.016f * s * hs, 0.026f * s * hs, 0.012f * s * hs}, 1.0f,
+                 0.0f, 2, kPartPlain, skin, 0.0f, skin);
+        }
+        spart(jHead, -1, -1, {0.0f, hy - 0.028f * s * hs, 0.104f * s * hs},
+             {0.013f * s * hs, 0.019f * s * hs, 0.016f * s * hs}, 1.0f,
+             0.0f, 2, kPartPlain, skin, 0.0f, skin);
+        // a HAIR VOLUME over the crown and back (the paint alone left
+        // the head a bald ball in silhouette); seniors: some men bald
+        const bool bald = p.age == 3 && !look.female &&
+                          lookRand(uint32_t(pid_i), 0x61u) < 0.35f;
+        if (!bald) {
+            const float hv = look.long_hair ? 1.0f : 0.92f;
+            spart(jHead, -1, -1, {0.0f, hy + 0.028f * s * hs, -0.022f * s * hs},
+                 {0.106f * s * hs, 0.092f * s * hs * hv, 0.112f * s * hs},
+                 0.90f, 0.0f, 1, kPartPlain, look.hair, 0.0f, look.hair);
+        }
         if (look.long_hair) {
             spart(jHead, -1, -1, {0.0f, hy - 0.11f * s * hs, -0.065f * s * hs},
                  {0.115f * s * hs, 0.19f * s * hs, 0.055f * s * hs}, 1.0f,
@@ -3848,9 +4201,26 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
             spart(sh + 1, sh, sh + 2, {x, 1.02f * s, 0.0f},
                  {0.05f * s, 0.17f * s, 0.05f * s}, 0.80f, 0.045f * s, 0,
                  kPartForearm, sleeve_lo, top_style, skin);
-            spart(sh + 2, sh + 1, -1, {x, 0.835f * s, 0.005f * s},
-                 {0.042f * s, 0.06f * s, 0.03f * s}, 0.85f, 0.03f * s, 2,
+            // v31: a flat, tapered palm and a thumb instead of a ball
+            spart(sh + 2, sh + 1, -1, {x, 0.83f * s, 0.005f * s},
+                 {0.041f * s, 0.078f * s, 0.021f * s}, 0.72f, 0.03f * s, 1,
                  kPartHand, skin, 0.0f, skin);
+            spart(sh + 2, -1, -1, {x - (side == 0 ? -1.0f : 1.0f) * 0.034f * s,
+                                   0.865f * s, 0.024f * s},
+                 {0.013f * s, 0.024f * s, 0.013f * s}, 0.8f, 0.0f, 2,
+                 kPartPlain, skin, 0.0f, skin);
+            // the DELTOID: the arm grows out of a shoulder, not out of
+            // the side of the torso.  Hung off the spine so it stays
+            // on the torso whatever the arm does.
+            spart(jSpine, -1, -1, {x - (side == 0 ? -1.0f : 1.0f) * 0.012f * s,
+                                   1.372f * s, 0.0f},
+                 {0.064f * s * bw, 0.060f * s, 0.064f * s * bw}, 1.0f, 0.0f,
+                 2, kPartSleeve, look.top, top_style, skin);
+            // the ELBOW: a ball on the hinge, so a bent arm stays one
+            // limb instead of two tubes meeting at an angle
+            spart(sh + 1, -1, -1, {x, 1.13f * s, 0.0f},
+                 {0.047f * s, 0.048f * s, 0.047f * s}, 1.0f, 0.0f, 2,
+                 kPartPlain, sleeve_lo, 0.0f, sleeve_lo);
         }
         if (senior && look.stick && !sitting && !lying) {
             // a stick from the right hand to the ground: it hangs off
@@ -3878,6 +4248,11 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
                  {0.062f * s * bw, 0.255f * s, 0.062f * s * bw}, 0.72f,
                  0.05f * s, 0, kPartShin, shorts ? skin : look.bottom,
                  bot_style, skin);
+            // v31: the KNEE, a ball on the hinge
+            spart(hp + 1, -1, -1, {x, 0.47f * s, 0.005f * s},
+                 {0.059f * s * bw, 0.060f * s, 0.059f * s * bw}, 1.0f, 0.0f,
+                 2, kPartPlain, shorts ? skin : look.bottom, 0.0f,
+                 shorts ? skin : look.bottom);
             if (look.heels) {
                 // the foot pitched about its toe: the heel end stands
                 // on a heel block, the toe stays on the ground
@@ -3936,7 +4311,8 @@ void CitizenSystem::draw(
     const glm::uvec2& buffer_size) {
     if (!loaded_ || !s_pipeline_) return;
     if (frame_parts_.empty() && frame_tube_.empty() &&
-        frame_blob_.empty() && frame_ball_.empty()) return;
+        frame_blob_.empty() && frame_ball_.empty() &&
+        frame_npc_[0].empty() && frame_npc_[1].empty()) return;
     if (!color_view || !depth_view) return;
     if (!s_device_) return;
     // ── UPLOAD THE INSTANCE STREAM ──────────────────────────────────
@@ -4119,6 +4495,49 @@ void CitizenSystem::draw(
             first += d.n;
         }
     }
+    // ...and the CHARACTER MESHES: the palette and the instance
+    // stream (man instances, then woman) go up, one draw per
+    // character with its own descriptor set behind the two globals.
+    const uint32_t n_npc0 = uint32_t(frame_npc_[0].size());
+    const uint32_t n_npc1 = uint32_t(frame_npc_[1].size());
+    if (n_npc0 + n_npc1 && s_npc_ready_ && s_npc_pipeline_ &&
+        s_npc_inst_buf_ && s_npc_palette_buf_ && !frame_palette_.empty() &&
+        n_npc0 + n_npc1 <= kMaxNpc && desc_sets.size() >= 2) {
+        s_device_->updateBufferMemory(
+            s_npc_palette_buf_->memory,
+            uint64_t(frame_palette_.size()) * sizeof(glm::vec4),
+            frame_palette_.data());
+        uint64_t off = 0;
+        for (int c = 0; c < 2; ++c) {
+            if (frame_npc_[c].empty()) continue;
+            s_device_->updateBufferMemory(
+                s_npc_inst_buf_->memory,
+                uint64_t(frame_npc_[c].size()) * sizeof(NpcInstance),
+                frame_npc_[c].data(), off);
+            off += uint64_t(frame_npc_[c].size()) * sizeof(NpcInstance);
+        }
+        cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS,
+                              s_npc_pipeline_);
+        uint32_t first = 0;
+        for (int c = 0; c < 2; ++c) {
+            const uint32_t n = uint32_t(frame_npc_[c].size());
+            const NpcAsset& as = s_npc_[c];
+            if (n && as.ok && as.desc) {
+                er::DescriptorSetList sets = {desc_sets[0], desc_sets[1],
+                                              as.desc};
+                cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
+                                            s_npc_layout_, sets);
+                std::vector<std::shared_ptr<er::Buffer>> vbs3 = {
+                    as.vb->buffer, s_npc_inst_buf_->buffer};
+                std::vector<uint64_t> offs3 = {0, 0};
+                cmd_buf->bindVertexBuffers(0, vbs3, offs3);
+                cmd_buf->bindIndexBuffer(as.ib->buffer, 0,
+                                         er::IndexType::UINT32);
+                cmd_buf->drawIndexed(as.index_count, n, 0, 0, first);
+            }
+            first += n;
+        }
+    }
     cmd_buf->endDynamicRendering();
 }
 
@@ -4131,6 +4550,11 @@ void CitizenSystem::destroy(const std::shared_ptr<er::Device>& device) {
         v->clear();
         v->shrink_to_fit();
     }
+    frame_npc_[0].clear();
+    frame_npc_[1].clear();
+    frame_palette_.clear();
+    frame_palette_.shrink_to_fit();
+    is_npc_.clear();
     is_detailed_.clear();
     is_detailed_.shrink_to_fit();
     is_fine_.clear();

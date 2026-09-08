@@ -330,7 +330,7 @@ private:
     // fine: the sixteen-part rounded figure with clothes and a face
     // (else the seven-cube one).
     void emitPerson(int pid, const SimState& a, const Person& p,
-                    bool detailed, bool fine);
+                    bool detailed, bool fine, bool npc = false);
 
     // static render objects
     static std::shared_ptr<renderer::PipelineLayout> s_pipeline_layout_;
@@ -369,6 +369,32 @@ private:
     static std::shared_ptr<renderer::Device>         s_device_;
     static std::shared_ptr<renderer::BufferInfo>     s_inst_buf_;
     static uint32_t                                  s_inst_capacity_;
+    // ── THE CHARACTER MESHES (v33) ──────────────────────────────────
+    // Baked scans (tools/terrain/npc_bake.py -> assets/Characters/npc)
+    // for the nearest fine-tier persons: a skinned, textured mesh per
+    // sex, posed from the same skeleton as the puppet through a
+    // per-frame joint palette.  See NpcAsset / emitPerson / draw.
+    static constexpr int      kNpcJoints = 19;
+    static constexpr int      kNpcRows   = kNpcJoints * 3;   // vec4 rows
+    static constexpr uint32_t kMaxNpc    = 128;
+    struct NpcAsset {
+        std::shared_ptr<renderer::BufferInfo> vb, ib;
+        uint32_t index_count = 0;
+        uint32_t tri_count = 0;
+        renderer::TextureInfo albedo;
+        std::shared_ptr<renderer::DescriptorSet> desc;
+        glm::vec3 bind[kNpcJoints];        // joint rest positions, unit height
+        bool ok = false;
+    };
+    static NpcAsset                                   s_npc_[2];   // man, woman
+    static bool                                       s_npc_ready_;
+    static std::shared_ptr<renderer::PipelineLayout>  s_npc_layout_;
+    static std::shared_ptr<renderer::Pipeline>        s_npc_pipeline_;
+    static std::shared_ptr<renderer::DescriptorSetLayout> s_npc_desc_layout_;
+    static std::shared_ptr<renderer::DescriptorPool>  s_npc_pool_;
+    static std::shared_ptr<renderer::Sampler>         s_npc_sampler_;
+    static std::shared_ptr<renderer::BufferInfo>      s_npc_inst_buf_;
+    static std::shared_ptr<renderer::BufferInfo>      s_npc_palette_buf_;
 
     bool loaded_ = false;
     std::vector<glm::vec3> houses_;
@@ -504,6 +530,11 @@ private:
     std::vector<SkinInstance> frame_tube_;    // limbs, neck
     std::vector<SkinInstance> frame_blob_;    // torso, pelvis, shoes, hair
     std::vector<SkinInstance> frame_ball_;    // head, hands
+    // A CHARACTER MESH instance: (first palette row, seed, lift, 0).
+    struct NpcInstance { glm::vec4 a; };
+    std::vector<NpcInstance> frame_npc_[2];   // per character
+    std::vector<glm::vec4>   frame_palette_;  // kNpcRows rows an instance
+    std::vector<uint8_t>     is_npc_;
     // Per-frame scratch, kept as members so the render-tier pass does
     // not heap-allocate (and free) a population-sized buffer every
     // frame — with 3-5 residents per house that is a quarter-megabyte

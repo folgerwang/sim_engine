@@ -239,6 +239,11 @@ void main() {
             albedo = vec3(0.035);
             if (!cap) { float a = atan(lp.y, lp.x); albedo *= 0.8 + 0.4 * step(0.5, fract(a * 6.0)); }
         }
+    } else if (kind == 5) {
+        // ── A SIGNAL: plain colour, lit by blink (v34: traffic-light
+        //    poles, heads and lamps, stop signs) ───────────────────
+        albedo = base;
+        emissive = base * blink;
     } else {
         // ── A LIGHT BAR: unit box, red left / blue right ────────────
         vec3 lens = lp.x < 0.0 ? vec3(0.85, 0.05, 0.02) : vec3(0.05, 0.15, 0.95);

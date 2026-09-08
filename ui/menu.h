@@ -516,7 +516,10 @@ private:
     // wide margin — the far cascades hold most of the caster load and
     // now re-render every 2-4 frames instead of every frame.
     CsmDrawMode csm_draw_mode_ = CsmDrawMode::kRegular;
-    bool turn_on_airflow_ = false;
+    // ON by default: without the airflow step the moisture field never
+    // moves, so the volume clouds are a static noise shell that only
+    // scrolls.  This is the sim that makes them weather.
+    bool turn_on_airflow_ = true;
     uint32_t debug_draw_type_ = 0;
     // PBR / forward-pass debug visualisation; values match
     // DEBUG_RENDER_MODE_* in global_definition.glsl.h.  Driven by the
@@ -567,9 +570,13 @@ private:
     float view_ext_exponent_ = 1.0f;
     float cloud_ambient_intensity_ = 1.0f;
     // Ground fog controls (see getGroundFogParams).
-    bool  ground_fog_on_         = false;
-    float fog_density_           = 0.030f;
-    float fog_height_falloff_    = 0.060f;
+    // ON by default (see the note above turn_on_airflow_): the cloud
+    // march already carries a CSM-shadowed height fog and it was doing
+    // nothing.  0.020 over a ~22 m e-fold is a calm morning -- a town
+    // two kilometres off sits back in the haze, a street stays clear.
+    bool  ground_fog_on_         = true;
+    float fog_density_           = 0.020f;
+    float fog_height_falloff_    = 0.045f;
     float fog_base_y_            = 0.0f;
     float fog_g_                 = 0.55f;
     float fog_sun_intensity_     = 1.2f;

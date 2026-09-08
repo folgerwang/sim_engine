@@ -498,24 +498,30 @@ void ShadowViewCameraObject::computeCascadeMatrices(
         const glm::vec3 light_eye = snapped_centre - light_dir * kPullBack;
         const glm::mat4 lv = glm::lookAt(light_eye, snapped_centre, up);
 
-        // Fixed square window from the sphere; Z range still fitted to
-        // the actual corners (Z pumping cannot make texels crawl in XY,
-        // and the tight slab is what keeps D16 depth precision usable).
-        glm::vec3 ls_min(-radius, -radius,  1e30f);
-        glm::vec3 ls_max( radius,  radius, -1e30f);
-        for (int i = 0; i < 8; ++i) {
-            glm::vec4 ws = inv_main_view * glm::vec4(vs_corners[i], 1.0f);
-            glm::vec3 ls = glm::vec3(lv * ws);
-            ls_min.z = std::min(ls_min.z, ls.z);
-            ls_max.z = std::max(ls_max.z, ls.z);
-        }
+        // Fixed square window from the sphere.
+        const glm::vec3 ls_min(-radius, -radius, 0.0f);
+        const glm::vec3 ls_max( radius,  radius, 0.0f);
 
-        // ── Tight orthographic Z range ────────────────────────────────
-        // Auto-scaled: the depth slab covers EXACTLY the cascade's
-        // light-space frustum bounds.  Combined with the D16_UNORM
-        // shadow texture and the Vulkan ortho projection (which produces
-        // linear-in-view-space depth in [0, 1] NDC), every UNORM step
-        // ≈ (ortho_far - ortho_near) / 65535 world units of precision.
+        // ── STABLE orthographic Z range ───────────────────────────────
+        // It used to be fitted to the eight frustum corners every
+        // frame, which made ortho_near / ortho_far slide as the camera
+        // moved: the D16 map then re-quantised depth against a scale
+        // that had shifted under it, and a fixed compare bias crossed
+        // the surface a texel at a time -- shadows boiling on building
+        // faces while you walk, still the moment you stop (Z pumping).
+        //
+        // The window is a SPHERE of `radius` about the snapped centre,
+        // and the light eye sits kPullBack behind that centre, so the
+        // sphere's extent along the light is exactly [kPullBack -
+        // radius, kPullBack + radius] whatever the camera does.  With
+        // fixed splits and FOV both are CONSTANTS per cascade, so the
+        // depth encoding never moves.  Casters outside the slab on
+        // either side are clamped (depthClampEnable, see below), which
+        // is what makes a fixed slab safe.
+        //
+        // Every UNORM step is (ortho_far - ortho_near) / 65535 world
+        // units: 0.08 mm on the 3 m cascade, ~5 mm on the 300 m one --
+        // both far under a shadow texel.
         //
         // No far-side padding — shadow casters past `ortho_far` are
         // physically behind the cascade slab from the light's POV and
@@ -530,12 +536,12 @@ void ShadowViewCameraObject::computeCascadeMatrices(
         // drawable_object.cpp's createDrawableShadowPipelineInternal
         // for the two pipelines that own that override.
         //
-        // GLM ortho: near/far are positive distances from the camera
-        // along -Z.  ls.z for scene corners in front of the light eye
-        // is negative, so near = -ls_max.z (closest to light), far =
-        // -ls_min.z (furthest from light).
-        const float ortho_near = std::max(-ls_max.z, 0.1f);
-        const float ortho_far  = std::max(-ls_min.z, ortho_near + 1.0f);
+        // GLM ortho: near/far are positive distances from the light eye
+        // along its view direction, and the eye is kPullBack from the
+        // window centre, so the sphere spans kPullBack +- radius.
+        const float ortho_near = std::max(kPullBack - radius, 0.1f);
+        const float ortho_far  = std::max(kPullBack + radius,
+                                          ortho_near + 1.0f);
 
         // Build orthographic projection.  No y-flip: the existing
         // single-cascade shadow code uses glm::ortho without flipping,

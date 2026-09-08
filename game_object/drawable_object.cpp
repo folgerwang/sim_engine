@@ -5822,6 +5822,21 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_double_sided = true;
     rasterization_state_override.double_sided = primitive.tag_.double_sided;
+    if (is_decal) {
+    // ── Ground-decal depth bias ──────────────────────────────────────
+    // Decals are built a few centimetres above the surface they lie on
+    // and tested (never written) against it.  At distance that gap is
+    // inside one depth quantum and the ground wins in patches -- the
+    // road ribbon breaking up as it recedes.  Pull decal fragments
+    // toward the camera: a fraction of a unit flat, plus a slope term
+    // for the grazing angles where a ground plane's depth changes
+    // fastest across a pixel.  Small on purpose: this must not let a
+    // ribbon show through geometry that genuinely occludes it.
+    rasterization_state_override.override_depth_bias = true;
+    rasterization_state_override.depth_bias_enable = true;
+    rasterization_state_override.depth_bias_constant_factor = -1.0f;
+    rasterization_state_override.depth_bias_slope_factor = -2.0f;
+    }
 
     auto drawable_pipeline = device->createPipeline(
         pipeline_layout,
@@ -6063,6 +6078,19 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDecalGbufferPipeline(
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_double_sided = true;
     rasterization_state_override.double_sided = primitive.tag_.double_sided;
+    // ── Ground-decal depth bias ──────────────────────────────────────
+    // Decals are built a few centimetres above the surface they lie on
+    // and tested (never written) against it.  At distance that gap is
+    // inside one depth quantum and the ground wins in patches -- the
+    // road ribbon breaking up as it recedes.  Pull decal fragments
+    // toward the camera: a fraction of a unit flat, plus a slope term
+    // for the grazing angles where a ground plane's depth changes
+    // fastest across a pixel.  Small on purpose: this must not let a
+    // ribbon show through geometry that genuinely occludes it.
+    rasterization_state_override.override_depth_bias = true;
+    rasterization_state_override.depth_bias_enable = true;
+    rasterization_state_override.depth_bias_constant_factor = -1.0f;
+    rasterization_state_override.depth_bias_slope_factor = -2.0f;
 
     return device->createPipeline(
         pipeline_layout,

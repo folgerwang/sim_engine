@@ -182,6 +182,18 @@ private:
         float yaw = 0.0f;
         float y_ground = 0.0f;         // last exact clamp
         int   claim = -1;              // junction node claimed
+        // v34 LANES: lane is the one the car wants (0 inner, by the
+        // centre line; 1 outer, by the kerb), lane_x where it is,
+        // sliding between them over a lane change; lane_cool seconds
+        // until it may change again; stop_t seconds stood at a stop
+        // sign.
+        int   lane = 1;
+        float lane_x = 1.0f;
+        float lane_cool = 0.0f;
+        float stop_t = 0.0f;
+        // v35: seconds this vehicle has been held at a junction -- the
+        // escape valve against any claim that will not clear
+        float block_t = 0.0f;
     };
 
     struct PartInstance { glm::mat4 xform; glm::vec4 color;
@@ -201,8 +213,11 @@ private:
                       std::vector<Leg>& out) const;
     glm::vec3 edgePoint(const Edge& e, float s, glm::vec3* tangent,
                         float* half) const;
+    // lane: 0 the inner lane, 1 the outer (fractional mid-change);
+    // on a road too narrow for two it is ignored.
     glm::vec3 lanePos(const Edge& e, float s, float dir, float extra,
-                      glm::vec3* tangent, float* half) const;
+                      glm::vec3* tangent, float* half,
+                      float lane = 1.0f) const;
     void parkAt(Vehicle& v, const RoadPt& rp);
     // Parked on the VERGE: kVergeM further out than the curb spot,
     // facing along the road in direction `dir` (its own side of the
@@ -227,6 +242,28 @@ private:
     std::unordered_map<uint64_t, int> node_grid_;
     std::vector<Vehicle> vehicles_;
     std::vector<int> node_claim_;       // vehicle holding the node, -1
+    // v35: seconds the current claim has been held.  A claim that
+    // outlives kClaimHoldS is treated as abandoned -- the holder may
+    // have been recycled out of vehicles_ entirely, which used to wedge
+    // the junction for the rest of the session.
+    std::vector<float> node_claim_age_;
+    // ── v34 JUNCTION CONTROL ─────────────────────────────────────────
+    // A crossroads (4+ roads) has TRAFFIC LIGHTS: its roads split into
+    // two groups by heading and the groups take turns.  A T-junction
+    // has a STOP SIGN on its stem, the road that ends there.
+    struct Signal {
+        int  node = -1;
+        int  kind = 0;                 // 1 lights, 2 stop sign
+        std::vector<int> group_a;      // lights: the edges of group A
+        std::vector<int> stems;        // stop: the edges that must stop
+        float phase = 0.0f;            // lights: cycle offset, seconds
+    };
+    std::vector<Signal> signals_;
+    std::vector<int> node_signal_;     // per node: signal index or -1
+    void buildSignals();
+    // 0 green, 1 yellow, 2 red for traffic arriving on `edge`
+    int  lightState(const Signal& sg, int edge) const;
+    void emitSignals(const glm::vec3& camera_pos);
     // Connected components ("islands") of the graph.  The mesh stage's
     // roads are per settlement -- 2171 splines came out as 531
     // islands, the largest 143 edges -- so a destination is only ever

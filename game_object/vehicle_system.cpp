@@ -38,6 +38,44 @@ constexpr float kRecycleM = 1100.0f;
 constexpr float kDestMin = 250.0f, kDestMax = 1500.0f;
 constexpr float kParkedShare = 0.38f;      // ambient cars kerbed on spawn
 constexpr float kVergeM = 2.25f;           // kerbed: this far past the curb spot
+// ── v34: lanes and junction control ──────────────────────────────────
+// Two lanes EACH WAY needs a genuine arterial.  At 4.4 m every paved
+// street in the world qualified (they are all ~4.95 m half-width) and
+// got four lanes on 8.2 m of pavement; a residential street is two
+// lanes, one each way, which is what laneOffset gives below that.
+constexpr float kTwoLaneHalfM = 7.0f;      // half-width from which a road has 2 lanes a side
+constexpr float kStopLineM = 5.0f;         // the stop line, before the node
+constexpr float kStopWaitS = 1.0f;         // a stop sign: stand this long
+constexpr float kCycleS = 36.0f;           // lights: A 0-14 green 14-17 yellow, B 18-32 green 32-35 yellow
+constexpr float kSignalDrawM = 500.0f;     // signals drawn inside this
+constexpr float kClaimHoldS = 7.0f;        // a node claim expires after this
+constexpr float kYieldS = 9.0f;            // held this long at a junction: go
+// ── WHERE THE PAVEMENT IS (v36) ─────────────────────────────────────
+// The road ribbon is not all road: its outer part is shoulder, blended
+// into the terrain, and only the inner fraction is surfaced and
+// painted.  These are the SAME fractions terrain_pcg's road recipe
+// paints to, picked by the same half-width thresholds its mesher sorts
+// the surface classes by (under 1.5 m dirt track, under 2.5 m gravel,
+// wider asphalt) -- so a lane centre here is a lane centre there, and
+// the markings land between the cars instead of under them.
+//
+// This is what the v34 two-lane change got wrong: its outer lane sat
+// at 0.72 of the HALF-WIDTH, which on every one of these roads is out
+// on the verge.
+float carriageFrac(float h) {
+    return h < 1.5f ? 0.50f : (h < 2.5f ? 0.62f : 0.82f);
+}
+
+// Lateral offset of a lane's centre from the road's centre line.  One
+// lane each way on a narrow road, centred in its half of the pavement;
+// on a wide one two, at a quarter and three quarters of it -- either
+// side of the dashed lane line the texture paints at its midpoint.
+float laneOffset(float h, float lane) {
+    const float pave = carriageFrac(h) * h;      // pavement half-width
+    if (h < kTwoLaneHalfM) return 0.5f * pave;
+    return pave * (0.25f + 0.50f * glm::clamp(lane, 0.0f, 1.0f));
+}
+bool twoLane(float h) { return h >= kTwoLaneHalfM; }
 constexpr float kSpawnGapM = 8.0f;         // never spawn onto another car
 constexpr float kRoadPerCarM = 22.0f;      // ambient cars: one per this much road
 constexpr int   kAmbientMin = 12;          // ...but never fewer, where any road is
@@ -230,29 +268,164 @@ struct MeshData {
               const glm::vec3& d) { tri(a, b, c); tri(a, c, d); }
 };
 
-// The side profile extruded across the width, narrowing a little above
-// the belt line (tumblehome).  Caps are the vehicle's sides.
+// min / max y of the profile polygon on the vertical line at x
+bool profileYRange(const std::vector<glm::vec2>& prof, float x, float& yb, float& yt) {
+    bool any = false;
+    yb = 1e9f; yt = -1e9f;
+    const size_t n = prof.size();
+    for (size_t i = 0; i < n; ++i) {
+        const glm::vec2 a = prof[i], b = prof[(i + 1) % n];
+        if ((a.x <= x && x <= b.x) || (b.x <= x && x <= a.x)) {
+            float y0, y1;
+            if (std::abs(b.x - a.x) < 1e-9f) { y0 = a.y; y1 = b.y; }
+            else { const float t = (x - a.x) / (b.x - a.x); y0 = y1 = a.y + (b.y - a.y) * t; }
+            yb = std::min(yb, std::min(y0, y1));
+            yt = std::max(yt, std::max(y0, y1));
+            any = true;
+        }
+    }
+    return any;
+}
+
+// One cross-section ring (y, z) at station x, from the bottom centre
+// round the right side, over the roof, and down the left: rounded
+// sill, side up to the belt, tumblehome to a rounded shoulder, roof.
+// Always the same vertex count, so consecutive rings loft.
+constexpr int kRingSill = 4, kRingSide = 4, kRingTumble = 4, kRingShoulder = 6, kRingRoof = 3;
+constexpr int kRingHalf = kRingSill + 1 + kRingSide + kRingTumble + kRingShoulder + kRingRoof;
+constexpr int kRingN = 2 * kRingHalf - 2;
+
+bool sectionRing(const Spec& sp, const std::vector<glm::vec2>& prof, float x,
+                 float wscale, std::vector<glm::vec2>& ring) {
+    float yb, yt;
+    if (!profileYRange(prof, x, yb, yt)) return false;
+    const float W2 = 0.5f * sp.W * wscale;
+    const float h = std::max(yt - yb, 0.02f);
+    const float rb = std::min(0.10f, 0.30f * h);          // sill radius
+    const float rt = std::min(0.16f, 0.30f * h);          // shoulder radius
+    auto w_at = [&](float y) {
+        const float t = glm::clamp((y - sp.belt) / std::max(sp.roof - sp.belt, 0.05f), 0.0f, 1.0f);
+        return W2 * (1.0f - sp.tumble * t);
+    };
+    std::vector<glm::vec2> right;
+    right.reserve(kRingHalf);
+    for (int k = 0; k <= kRingSill; ++k) {
+        const float a = 1.5707963f * float(k) / kRingSill;
+        right.push_back({yb + rb - rb * std::cos(a), (w_at(yb + rb) - rb) + rb * std::sin(a)});
+    }
+    const float y_lo = yb + rb;
+    const float y_belt = std::max(std::min(sp.belt, yt - rt), y_lo);
+    for (int k = 1; k <= kRingSide; ++k) {
+        const float y = y_lo + (y_belt - y_lo) * float(k) / kRingSide;
+        right.push_back({y, w_at(y)});
+    }
+    const float y_sh = yt - rt;
+    for (int k = 1; k <= kRingTumble; ++k) {
+        const float y = y_belt + (y_sh - y_belt) * float(k) / kRingTumble;
+        right.push_back({y, w_at(y)});
+    }
+    const float wsh = w_at(y_sh);
+    for (int k = 1; k <= kRingShoulder; ++k) {
+        const float a = 1.5707963f * float(k) / kRingShoulder;
+        right.push_back({y_sh + rt * std::sin(a), (wsh - rt) + rt * std::cos(a)});
+    }
+    for (int k = 1; k <= kRingRoof; ++k)
+        right.push_back({yt, (wsh - rt) * (1.0f - float(k) / kRingRoof)});
+    ring.clear();
+    ring.reserve(kRingN);
+    for (const glm::vec2& p : right) ring.push_back(p);
+    for (int i = int(right.size()) - 2; i >= 1; --i) ring.push_back({right[size_t(i)].x, -right[size_t(i)].y});
+    return int(ring.size()) == kRingN;
+}
+
+// THE HULL: a loft of rounded sections along the side profile.  The
+// old extrusion was a slab with the profile as its silhouette; this
+// rounds the sills and shoulders, tapers the body a little toward the
+// bumpers with rounded corners, keeps the tumblehome, and shades the
+// sweep with smooth vertex normals (the bumper faces stay flat, on
+// their own vertices).  vehicle.frag paints by local position, so the
+// glass, lights, grille and seams land where they did.
 MeshData buildHull(const Spec& sp) {
     MeshData m;
     std::vector<glm::vec2> prof = sp.profile;
     if (signedArea(prof) < 0.0f) std::reverse(prof.begin(), prof.end());
-    auto halfw = [&](float y) {
-        const float t = glm::clamp((y - sp.belt) / std::max(sp.roof - sp.belt, 0.05f),
-                                   0.0f, 1.0f);
-        return 0.5f * sp.W * (1.0f - sp.tumble * t);
-    };
-    const size_t n = prof.size();
-    // caps
-    for (const glm::ivec3& t : earClip(prof)) {
-        const glm::vec2 a = prof[t.x], b = prof[t.y], c = prof[t.z];
-        m.tri({a.x, a.y, halfw(a.y)}, {b.x, b.y, halfw(b.y)}, {c.x, c.y, halfw(c.y)});
-        m.tri({a.x, a.y, -halfw(a.y)}, {c.x, c.y, -halfw(c.y)}, {b.x, b.y, -halfw(b.y)});
+    float xmin = 1e9f, xmax = -1e9f;
+    for (const glm::vec2& p : prof) { xmin = std::min(xmin, p.x); xmax = std::max(xmax, p.x); }
+    const float L = std::max(xmax - xmin, 0.1f);
+    // stations: cosine-spaced (dense at the ends) plus every profile x
+    std::vector<float> st;
+    const int n_st = 34;
+    for (int k = 0; k <= n_st; ++k) {
+        const float t = float(k) / n_st;
+        st.push_back(xmin + L * (0.5f - 0.5f * std::cos(3.14159265f * t)));
     }
-    // the sweep (roof, glass slopes, hood, bumpers, floor)
-    for (size_t i = 0; i < n; ++i) {
-        const glm::vec2 a = prof[i], b = prof[(i + 1) % n];
-        const float wa = halfw(a.y), wb = halfw(b.y);
-        m.quad({a.x, a.y, -wa}, {b.x, b.y, -wb}, {b.x, b.y, wb}, {a.x, a.y, wa});
+    for (const glm::vec2& p : prof) st.push_back(p.x);
+    std::sort(st.begin(), st.end());
+    st.erase(std::unique(st.begin(), st.end(), [](float a, float b) { return std::abs(a - b) < 1e-4f; }), st.end());
+    std::vector<float> xs;
+    std::vector<std::vector<glm::vec2>> rings;
+    for (float x : st) {
+        const float t = (x - 0.5f * (xmin + xmax)) / (0.5f * L);
+        const float edge = std::max(0.0f, std::abs(t) - 0.84f) / 0.16f;
+        const float at = std::abs(t);
+        const float wscale = (1.0f - 0.04f * at * at * at) * (1.0f - 0.11f * edge * edge);
+        const float xx = glm::clamp(x, xmin + 1e-4f, xmax - 1e-4f);
+        std::vector<glm::vec2> ring;
+        if (!sectionRing(sp, prof, xx, wscale, ring)) continue;
+        xs.push_back(x);
+        rings.push_back(std::move(ring));
+    }
+    if (rings.size() < 2) return m;
+    const int M = kRingN;
+    // the sweep: shared vertices, smooth normals
+    const uint32_t base = uint32_t(m.pos.size());
+    for (size_t i = 0; i < rings.size(); ++i)
+        for (int j = 0; j < M; ++j)
+            m.pos.push_back({xs[i], rings[i][size_t(j)].x, rings[i][size_t(j)].y});
+    m.nrm.assign(m.pos.size(), glm::vec3(0.0f));
+    auto push_tri = [&](uint32_t a, uint32_t b, uint32_t c) {
+        const glm::vec3 n = glm::cross(m.pos[b] - m.pos[a], m.pos[c] - m.pos[a]);
+        m.idx.push_back(a); m.idx.push_back(b); m.idx.push_back(c);
+        m.nrm[a] += n; m.nrm[b] += n; m.nrm[c] += n;
+    };
+    for (size_t i = 0; i + 1 < rings.size(); ++i) {
+        for (int j = 0; j < M; ++j) {
+            const uint32_t a = base + uint32_t(i * M + j);
+            const uint32_t b = base + uint32_t(i * M + (j + 1) % M);
+            const uint32_t c = base + uint32_t((i + 1) * M + (j + 1) % M);
+            const uint32_t d = base + uint32_t((i + 1) * M + j);
+            push_tri(a, b, c);
+            push_tri(a, c, d);
+        }
+    }
+    // orientation: normals must point OUT; test one roof triangle
+    {
+        const size_t mid = rings.size() / 2;
+        const uint32_t a = base + uint32_t(mid * M + (M / 2));    // roof centre-ish
+        if (m.nrm[a].y < 0.0f) {
+            // flip every sweep triangle and the accumulated normals
+            for (size_t k = 0; k + 2 < m.idx.size(); k += 3) std::swap(m.idx[k + 1], m.idx[k + 2]);
+            for (glm::vec3& n : m.nrm) n = -n;
+        }
+    }
+    for (glm::vec3& n : m.nrm) {
+        const float l = glm::length(n);
+        n = l > 1e-9f ? n / l : glm::vec3(0, 1, 0);
+    }
+    // the bumper faces: flat fans on their own vertices
+    for (int end = 0; end < 2; ++end) {
+        const size_t i = end == 0 ? 0 : rings.size() - 1;
+        const float x = xs[i];
+        float yb = 1e9f, yt = -1e9f;
+        for (const glm::vec2& p : rings[i]) { yb = std::min(yb, p.x); yt = std::max(yt, p.x); }
+        const glm::vec3 c(x, 0.5f * (yb + yt), 0.0f);
+        for (int j = 0; j < M; ++j) {
+            const glm::vec3 a(x, rings[i][size_t(j)].x, rings[i][size_t(j)].y);
+            const glm::vec3 b(x, rings[i][size_t((j + 1) % M)].x, rings[i][size_t((j + 1) % M)].y);
+            // winding chosen so the fan's normal points out: -x at
+            // the tail (end 0), +x at the nose
+            if (end == 0) m.tri(c, a, b); else m.tri(c, b, a);
+        }
     }
     return m;
 }
@@ -765,6 +938,8 @@ void VehicleSystem::buildGraph(std::vector<std::vector<glm::vec3>>& splines,
         }
     }
     node_claim_.assign(nodes_.size(), -1);
+    node_claim_age_.assign(nodes_.size(), 0.0f);
+    buildSignals();
     // 2b. islands: union-find over the nodes, then every edge's island
     {
         std::vector<int> parent(nodes_.size());
@@ -881,11 +1056,12 @@ glm::vec3 VehicleSystem::edgePoint(const Edge& e, float s, glm::vec3* tangent,
 }
 
 glm::vec3 VehicleSystem::lanePos(const Edge& e, float s, float dir, float extra,
-                                 glm::vec3* tangent, float* half) const {
+                                 glm::vec3* tangent, float* half,
+                                 float lane_k) const {
     glm::vec3 t; float h;
     const glm::vec3 p = edgePoint(e, s, &t, &h);
     if (dir < 0.0f) t = -t;
-    const float lane = glm::clamp(h * 0.5f, 1.4f, 2.6f) + extra;
+    const float lane = laneOffset(h, lane_k) + extra;
     const glm::vec3 right(-t.z, 0.0f, t.x);      // right of travel, y up
     if (tangent) *tangent = t;
     if (half) *half = h;
@@ -961,6 +1137,137 @@ bool VehicleSystem::routeBetween(const RoadPt& from, const RoadPt& to,
     return !out.empty();
 }
 
+// ── v34 junction control ─────────────────────────────────────────────
+void VehicleSystem::buildSignals() {
+    signals_.clear();
+    node_signal_.assign(nodes_.size(), -1);
+    int n_lights = 0, n_stops = 0;
+    for (size_t ni = 0; ni < nodes_.size(); ++ni) {
+        const Node& nd = nodes_[ni];
+        if (nd.edges.size() < 3) continue;
+        // the heading of each road leaving the node (a chord 8 m out)
+        std::vector<glm::vec2> dirs;
+        bool ok = true;
+        for (int ei : nd.edges) {
+            const Edge& e = edges_[size_t(ei)];
+            if (e.a == e.b || e.len < 2.0f) { ok = false; break; }
+            const bool at_a = e.a == int(ni);
+            const float s = at_a ? std::min(8.0f, e.len) : std::max(e.len - 8.0f, 0.0f);
+            const glm::vec3 p = edgePoint(e, s, nullptr, nullptr);
+            glm::vec2 d(p.x - nd.pos.x, p.z - nd.pos.z);
+            const float l = glm::length(d);
+            if (l < 0.5f) { ok = false; break; }
+            dirs.push_back(d / l);
+        }
+        if (!ok) continue;
+        Signal sg;
+        sg.node = int(ni);
+        if (nd.edges.size() >= 4) {
+            sg.kind = 1;
+            const glm::vec2 axis = dirs[0];
+            for (size_t k = 0; k < dirs.size(); ++k)
+                if (std::abs(glm::dot(dirs[k], axis)) > 0.5f)
+                    sg.group_a.push_back(nd.edges[k]);
+            if (sg.group_a.size() == nd.edges.size()) continue;   // nothing crosses
+            sg.phase = h01(uint32_t(ni), 0x99u) * kCycleS;
+            ++n_lights;
+        } else {
+            sg.kind = 2;
+            // the through pair is the two most opposite headings; the
+            // third road is the stem
+            float best = 1e9f; size_t bi = 0, bj = 1;
+            for (size_t i = 0; i < dirs.size(); ++i)
+                for (size_t j = i + 1; j < dirs.size(); ++j) {
+                    const float d = glm::dot(dirs[i], dirs[j]);
+                    if (d < best) { best = d; bi = i; bj = j; }
+                }
+            for (size_t k = 0; k < dirs.size(); ++k)
+                if (k != bi && k != bj) sg.stems.push_back(nd.edges[k]);
+            if (sg.stems.empty()) continue;
+            ++n_stops;
+        }
+        node_signal_[ni] = int(signals_.size());
+        signals_.push_back(std::move(sg));
+    }
+    std::cout << "[vehicle] junctions: " << n_lights << " with traffic lights, "
+              << n_stops << " with a stop sign" << std::endl;
+}
+
+int VehicleSystem::lightState(const Signal& sg, int edge) const {
+    const bool in_a = std::find(sg.group_a.begin(), sg.group_a.end(), edge) !=
+                      sg.group_a.end();
+    const float t = std::fmod(anim_t_ + sg.phase, kCycleS);
+    if (in_a) return t < 14.0f ? 0 : t < 17.0f ? 1 : 2;
+    return (t >= 18.0f && t < 32.0f) ? 0 : (t >= 32.0f && t < 35.0f) ? 1 : 2;
+}
+
+// The poles, heads, lamps and signs: boxes from the bar mesh, paint
+// kind 5 (plain colour, emissive by `glow`), on the near-side kerb
+// kStopLineM before the node of every controlled approach.
+void VehicleSystem::emitSignals(const glm::vec3& camera_pos) {
+    if (frame_.size() != size_t(kStreamCount)) return;
+    auto box = [&](const glm::vec3& c, const glm::vec3& half, float yaw,
+                   const glm::vec3& rgb, float glow) {
+        const glm::mat4 M =
+            glm::translate(glm::mat4(1.0f), c) *
+            glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0, 1, 0)) *
+            glm::scale(glm::mat4(1.0f), half);
+        frame_[kMeshBar].push_back({M, glm::vec4(rgb, 0.0f),
+                                    glm::vec4(5.0f, 0.0f, 0.0f, glow)});
+    };
+    const glm::vec3 kPole(0.36f, 0.37f, 0.39f), kHead(0.07f, 0.07f, 0.08f);
+    const glm::vec3 kLampOn[3] = {{1.0f, 0.08f, 0.05f}, {1.0f, 0.72f, 0.10f}, {0.10f, 1.0f, 0.35f}};
+    const glm::vec3 kLampOff[3] = {{0.28f, 0.04f, 0.03f}, {0.30f, 0.22f, 0.04f}, {0.03f, 0.26f, 0.09f}};
+    auto head = [&](const glm::vec3& c, const glm::vec3& t, float yaw, int state) {
+        box(c, {0.16f, 0.50f, 0.14f}, yaw, kHead, 0.0f);
+        for (int k = 0; k < 3; ++k) {
+            const bool on = (state == 2 && k == 0) || (state == 1 && k == 1) ||
+                            (state == 0 && k == 2);
+            box(c + glm::vec3(0.0f, 0.30f - 0.30f * float(k), 0.0f) - t * 0.16f,
+                {0.10f, 0.10f, 0.06f}, yaw, on ? kLampOn[k] : kLampOff[k],
+                on ? 1.8f : 0.0f);
+        }
+    };
+    for (const Signal& sg : signals_) {
+        const glm::vec3& np = nodes_[size_t(sg.node)].pos;
+        const float dx = np.x - camera_pos.x, dz = np.z - camera_pos.z;
+        if (dx * dx + dz * dz > kSignalDrawM * kSignalDrawM) continue;
+        for (int ei : nodes_[size_t(sg.node)].edges) {
+            if (sg.kind == 2 &&
+                std::find(sg.stems.begin(), sg.stems.end(), ei) == sg.stems.end())
+                continue;
+            const Edge& e = edges_[size_t(ei)];
+            const bool at_b = e.b == sg.node;
+            const float dir = at_b ? 1.0f : -1.0f;      // travel toward the node
+            const float s_node = at_b ? e.len : 0.0f;
+            const float s = glm::clamp(s_node - dir * kStopLineM, 0.0f, e.len);
+            glm::vec3 t; float h;
+            const glm::vec3 pc = edgePoint(e, s, &t, &h);
+            if (dir < 0.0f) t = -t;
+            const glm::vec3 right(-t.z, 0.0f, t.x);
+            const glm::vec3 p = pc + right * (h + 0.8f);
+            const float yaw = std::atan2(t.x, t.z);
+            if (sg.kind == 1) {
+                const int st = lightState(sg, ei);
+                box(p + glm::vec3(0.0f, 2.2f, 0.0f), {0.06f, 2.2f, 0.06f}, yaw, kPole, 0.0f);
+                head(p + glm::vec3(0.0f, 3.4f, 0.0f), t, yaw, st);
+                // the arm over the road, with a second head above the
+                // inner lane
+                const float arm = h * 0.5f + 0.8f;
+                box(p + glm::vec3(0.0f, 4.4f, 0.0f) - right * (0.5f * arm),
+                    {0.5f * arm, 0.05f, 0.05f}, yaw, kPole, 0.0f);
+                head(p - right * arm + glm::vec3(0.0f, 3.85f, 0.0f), t, yaw, st);
+            } else {
+                box(p + glm::vec3(0.0f, 1.15f, 0.0f), {0.035f, 1.15f, 0.035f}, yaw, kPole, 0.0f);
+                box(p + glm::vec3(0.0f, 2.45f, 0.0f) + t * 0.012f, {0.40f, 0.40f, 0.012f},
+                    yaw, {0.92f, 0.92f, 0.90f}, 0.05f);
+                box(p + glm::vec3(0.0f, 2.45f, 0.0f) - t * 0.012f, {0.34f, 0.34f, 0.012f},
+                    yaw, {0.78f, 0.04f, 0.04f}, 0.25f);
+            }
+        }
+    }
+}
+
 // ── vehicles ─────────────────────────────────────────────────────────
 void VehicleSystem::parkAt(Vehicle& v, const RoadPt& rp) {
     const Edge& e = edges_[rp.edge];
@@ -968,7 +1275,10 @@ void VehicleSystem::parkAt(Vehicle& v, const RoadPt& rp) {
     glm::vec3 t; float h;
     // parked at the curb, facing along the edge
     v.pos = lanePos(e, s, 1.0f, 0.0f, &t, &h);
-    const float extra = std::max(0.0f, h - 1.1f - glm::clamp(h * 0.5f, 1.4f, 2.6f));
+    // the curb spot; on a two-lane road that is the outer lane, so
+    // the car goes onto the verge instead (where the kerbed ones are)
+    const float extra = std::max(0.0f, h - 1.1f - laneOffset(h, 1.0f)) +
+                        (twoLane(h) ? kVergeM : 0.0f);
     v.pos = lanePos(e, s, 1.0f, extra, &t, &h);
     v.yaw = std::atan2(t.x, t.z);
     v.parked = true;
@@ -988,7 +1298,7 @@ void VehicleSystem::parkVerge(Vehicle& v, const RoadPt& rp, float dir) {
     const float s = e.s[rp.index];
     glm::vec3 t; float h;
     edgePoint(e, s, &t, &h);
-    const float extra = std::max(0.0f, h - 1.1f - glm::clamp(h * 0.5f, 1.4f, 2.6f));
+    const float extra = std::max(0.0f, h - 1.1f - laneOffset(h, 1.0f));
     v.pos = lanePos(e, s, dir, extra + kVergeM, &t, &h);
     v.yaw = std::atan2(t.x, t.z);
     v.parked = true;
@@ -1090,6 +1400,7 @@ bool VehicleSystem::dispatch(int car, const glm::vec3& dest) {
     v.s = v.route[0].s_from;
     v.parked = false;
     v.speed = 0.0f;
+    v.lane = 1; v.lane_x = 1.0f; v.stop_t = 0.0f;
     return true;
 }
 
@@ -1288,6 +1599,9 @@ void VehicleSystem::spawnAmbient(const glm::vec3& camera_pos, uint32_t seed) {
             v.s = v.route[0].s_from;
             v.parked = false;
             v.speed = specs()[v.type].vmax * 0.6f;
+            // spawned moving: either lane (the big ones outer)
+            v.lane = (specs()[v.type].L > 7.0f || h01(seed, 0x3Cu) < 0.6f) ? 1 : 0;
+            v.lane_x = float(v.lane); v.stop_t = 0.0f;
         }
     }
     vehicles_.push_back(v);
@@ -1311,6 +1625,7 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                         v.leg = 0; v.s = v.route[0].s_from;
                         v.parked = false; v.speed = 0.0f;
                         v.kerbed = false;              // pulls out
+                        v.lane = 1; v.lane_x = 1.0f; v.stop_t = 0.0f;
                     }
                 }
                 v.idle_t = 6.0f;
@@ -1344,17 +1659,67 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
         if (nl.s_to < nl.s_from) t1 = -t1;
         const float c = glm::clamp(glm::dot(t0, t1), -1.0f, 1.0f);
         if (c < 0.85f) vlim = std::min(vlim, c < 0.3f ? 3.5f : 5.5f);
-        // junction claim: one vehicle through a node at a time
-        if (node_ahead >= 0 && nodes_[node_ahead].edges.size() > 2) {
-            int& claim = node_claim_[node_ahead];
-            if (claim == -1 || claim == vi) {
-                claim = vi; v.claim = node_ahead;
-            } else if (claim >= 0 && claim < int(vehicles_.size()) &&
-                       vehicles_[claim].parked) {
-                claim = vi; v.claim = node_ahead;    // stale claim
+        // ── junction control (v35): lights, a stop sign, or the claim
+        // WHO CLAIMS.  Only traffic that has to give way queues for the
+        // node: at a stop sign that is the STEM alone (the through road
+        // has priority, and making it queue was half of the deadlock),
+        // at traffic lights nobody (the phases already exclude), and at
+        // an uncontrolled multi-way node everybody, as before.
+        bool need_claim = node_ahead >= 0 && nodes_[node_ahead].edges.size() > 2;
+        const int sgi = node_ahead >= 0 && node_ahead < int(node_signal_.size())
+                            ? node_signal_[node_ahead] : -1;
+        if (sgi >= 0 && signals_[sgi].kind == 1) {
+            // TRAFFIC LIGHTS: stop at the line on red; on yellow only
+            // if there is room to; inside the box, go on through.
+            const int st = lightState(signals_[sgi], leg.edge);
+            const float to_line = remain_leg - kStopLineM;
+            const bool inside = remain_leg < kStopLineM - 2.0f;
+            const bool commit = st == 1 && to_line < 1.2f * v.speed + 1.0f;
+            if (st != 0 && !inside && !commit && to_line > -0.5f)
+                vlim = std::min(vlim, std::sqrt(2.0f * 4.5f * std::max(to_line, 0.0f)));
+            need_claim = false;
+        } else if (sgi >= 0 && signals_[sgi].kind == 2) {
+            const bool stem =
+                std::find(signals_[sgi].stems.begin(), signals_[sgi].stems.end(),
+                          leg.edge) != signals_[sgi].stems.end();
+            if (stem) {
+                // STOP SIGN: halt at the line, stand a moment, then
+                // take the junction under the claim.
+                const float to_line = remain_leg - kStopLineM;
+                if (v.stop_t < kStopWaitS && to_line > -0.5f) {
+                    vlim = std::min(vlim, std::sqrt(2.0f * 4.5f * std::max(to_line, 0.0f)));
+                    if (to_line < 2.0f && v.speed < 0.6f) v.stop_t += dt;
+                }
             } else {
+                need_claim = false;          // the through road: priority
+            }
+        }
+        // THE CLAIM: one vehicle through the node at a time.  The
+        // holder is validated every frame -- it must still be a live,
+        // moving vehicle that names THIS node as its claim -- because
+        // the ambient ring pops slots off vehicles_, and an index left
+        // pointing past the end used to block the node for ever.  A
+        // claim also expires (kClaimHoldS), and a vehicle held here too
+        // long (kYieldS) takes the node regardless: whatever goes
+        // wrong, traffic never stands still permanently.
+        if (need_claim) {
+            int& claim = node_claim_[node_ahead];
+            const bool held =
+                claim >= 0 && claim != vi && claim < int(vehicles_.size()) &&
+                !vehicles_[claim].parked && !vehicles_[claim].dormant &&
+                vehicles_[claim].claim == node_ahead &&
+                node_claim_age_[size_t(node_ahead)] < kClaimHoldS;
+            if (!held || v.block_t > kYieldS) {
+                if (claim != vi) node_claim_age_[size_t(node_ahead)] = 0.0f;
+                claim = vi;
+                v.claim = node_ahead;
+                v.block_t = 0.0f;
+            } else {
+                v.block_t += dt;
                 vlim = remain_leg > 9.0f ? std::min(vlim, 3.0f) : 0.0f;
             }
+        } else {
+            v.block_t = 0.0f;
         }
     }
     // release a claim once the node is well behind
@@ -1366,8 +1731,45 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             v.claim = -1;
         }
     }
-    // the car ahead on this edge, same direction
+    // ── LANES (v34) ─────────────────────────────────────────────────
+    // On a wide road: pull out to pass a slower car when the inner
+    // lane is clear ahead and behind; drift back to the outer lane
+    // when that is clear.  No changes in the last 30 m before a node.
+    float h_here = 0.0f;
+    edgePoint(e, v.s, nullptr, &h_here);
+    const bool two_lane = twoLane(h_here);
+    v.lane_cool = std::max(0.0f, v.lane_cool - dt);
     auto it = on_edge.find(leg.edge);
+    if (!two_lane) {
+        v.lane = 1;
+    } else if (v.lane_cool <= 0.0f && remain_leg > 30.0f && v.speed > 1.0f) {
+        float gap[2] = {1e9f, 1e9f}, back[2] = {1e9f, 1e9f}, osp[2] = {99.0f, 99.0f};
+        if (it != on_edge.end()) {
+            for (int oi : it->second) {
+                if (oi == vi) continue;
+                const Vehicle& o = vehicles_[oi];
+                if (o.parked || o.leg < 0 || o.leg >= int(o.route.size())) continue;
+                const Leg& ol = o.route[o.leg];
+                if ((ol.s_to >= ol.s_from ? 1.0f : -1.0f) != dir) continue;
+                const float g = (o.s - v.s) * dir;
+                for (int l = 0; l < 2; ++l) {
+                    if (std::abs(o.lane_x - float(l)) > 0.55f) continue;
+                    if (g > 0.0f) { if (g < gap[l]) { gap[l] = g; osp[l] = o.speed; } }
+                    else if (-g < back[l]) back[l] = -g;
+                }
+            }
+        }
+        const int cur = v.lane, oth = 1 - v.lane;
+        const bool big = sp.L > 7.0f;                 // buses, trucks: outer
+        if (gap[cur] < 22.0f && osp[cur] < sp.vmax - 2.0f &&
+            gap[oth] > 30.0f && back[oth] > 14.0f && !(big && oth == 0)) {
+            v.lane = oth; v.lane_cool = 6.0f;
+        } else if (cur == 0 && gap[1] > 35.0f && back[1] > 12.0f) {
+            v.lane = 1; v.lane_cool = 6.0f;
+        }
+    }
+    v.lane_x += glm::clamp(float(v.lane) - v.lane_x, -0.7f * dt, 0.7f * dt);
+    // the car ahead on this edge, same direction (and lane)
     if (it != on_edge.end()) {
         float best_gap = 1e9f;
         for (int oi : it->second) {
@@ -1377,6 +1779,8 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             const Leg& ol = o.route[o.leg];
             const float odir = ol.s_to >= ol.s_from ? 1.0f : -1.0f;
             if (odir != dir) continue;
+            // v34: the other lane is not in the way
+            if (two_lane && std::abs(o.lane_x - v.lane_x) > 0.55f) continue;
             const float gap = (o.s - v.s) * dir;
             if (gap > 0.0f && gap < best_gap) best_gap = gap;
         }
@@ -1398,6 +1802,8 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
         if (has_next) {
             ++v.leg;
             v.s = v.route[v.leg].s_from;
+            v.stop_t = 0.0f;
+            v.block_t = 0.0f;
         } else {
             RoadPt rp;
             // park at the destination: the nearest road point to where
@@ -1413,7 +1819,7 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     const Edge& ce = edges_[cl.edge];
     const float cdir = cl.s_to >= cl.s_from ? 1.0f : -1.0f;
     glm::vec3 t;
-    const glm::vec3 np = lanePos(ce, v.s, cdir, 0.0f, &t, nullptr);
+    const glm::vec3 np = lanePos(ce, v.s, cdir, 0.0f, &t, nullptr, v.lane_x);
     const float target_yaw = std::atan2(t.x, t.z);
     float dyaw = target_yaw - v.yaw;
     while (dyaw > 3.14159265f) dyaw -= 6.2831853f;
@@ -1493,6 +1899,10 @@ void VehicleSystem::update(float delta_t, float speed_scale,
             ++alive;
         }
     }
+    // v35: age every node claim once a frame (see kClaimHoldS)
+    if (node_claim_age_.size() != node_claim_.size())
+        node_claim_age_.assign(node_claim_.size(), 0.0f);
+    for (float& t : node_claim_age_) t += dt;
     // ── who is on which edge (car following) ────────────────────────
     std::unordered_map<int, std::vector<int>> on_edge;
     const float sim2 = kSimRadius * kSimRadius;
@@ -1527,21 +1937,24 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         if (dx * dx + dz * dz > draw2) continue;
         emit(v);
     }
+    emitSignals(camera_pos);
     dbg_timer_ += dt;
     if (dbg_timer_ > 10.0f) {
         dbg_timer_ = 0.0f;
-        size_t moving = 0, amb = 0, kerbed = 0, near = 0;
+        size_t moving = 0, amb = 0, kerbed = 0, near = 0, stuck = 0;
         for (const auto& v : vehicles_) {
             if (v.dormant) continue;
             if (!v.parked) ++moving;
             if (v.ambient) ++amb;
             if (v.kerbed) ++kerbed;
+            if (!v.parked && v.speed < 0.2f) ++stuck;
             const float dx = v.pos.x - camera_pos.x, dz = v.pos.z - camera_pos.z;
             if (dx * dx + dz * dz < 300.0f * 300.0f) ++near;
         }
         std::cout << "[vehicle] " << vehicles_.size() << " slots (" << amb
                   << " ambient of " << ambient_now_ << " wanted, " << kerbed
-                  << " kerbed), " << moving << " moving, " << near
+                  << " kerbed), " << moving << " moving (" << stuck
+                  << " standing), " << near
                   << " within 300 m" << std::endl;
     }
 }
