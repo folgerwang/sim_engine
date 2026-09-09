@@ -54,7 +54,7 @@ void main() {
         return;
     }
     const float z = texelFetch(depth_tex, px, 0).r;
-    if (pc.history_valid == 0u || z >= 1.0) {
+    if (z >= 1.0) {
         imageStore(hist_out, px, vec4(cur, 0.0, 1.0));
         return;
     }
@@ -70,7 +70,7 @@ void main() {
     world /= world.w;
     const vec4 pclip = camera_info.prev_view_proj * vec4(world.xyz, 1.0);
     const vec4 cclip = camera_info.view_proj      * vec4(world.xyz, 1.0);
-    if (pclip.w <= 1e-6 || cclip.w <= 1e-6) {
+    if (pc.history_valid == 0u || pclip.w <= 1e-6 || cclip.w <= 1e-6) {
         imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
         return;
     }
@@ -90,16 +90,38 @@ void main() {
 
     // ── Disocclusion: the history pixel must have been (about) this
     //    far from the previous camera ────────────────────────────────
-    vec4 hist = texture(hist_in, prev_uv);
-    if (any(isnan(hist)) || hist.r < 0.0 || hist.a < 0.5) {
-        imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
-        return;
-    }
+    // Validate BEFORE bilinear interpolation. Filtering depth/sentinel
+    // metadata together with visibility mixes foreground, background and
+    // sky at silhouettes. Subpixel camera motion then alternately rejects
+    // good history or accepts visibility from another surface.
     const float depth_tol = 0.04 * pclip.w + 0.15;   // 4 % + 15 cm
-    if (abs(hist.b - pclip.w) > depth_tol) {
+    const ivec2 hist_size = textureSize(hist_in, 0);
+    const vec2 hist_pixel = prev_uv * vec2(hist_size) - 0.5;
+    const ivec2 hist_base = ivec2(floor(hist_pixel));
+    const vec2 fraction = fract(hist_pixel);
+    vec4 hist = vec4(0.0);
+    float hist_weight = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            const ivec2 q = hist_base + ivec2(x, y);
+            if (any(lessThan(q, ivec2(0))) ||
+                any(greaterThanEqual(q, hist_size))) continue;
+            const vec4 tap = texelFetch(hist_in, q, 0);
+            if (any(isnan(tap)) || any(isinf(tap)) ||
+                tap.r < 0.0 || tap.a < 0.5 ||
+                abs(tap.b - pclip.w) > depth_tol) continue;
+            const vec2 w = mix(vec2(1.0) - fraction, fraction,
+                               bvec2(x != 0, y != 0));
+            const float weight = w.x * w.y;
+            hist += tap * weight;
+            hist_weight += weight;
+        }
+    }
+    if (hist_weight <= 1e-5) {
         imageStore(hist_out, px, vec4(cur, cclip.w, 1.0));
         return;
     }
+    hist /= hist_weight;
 
     // ── Neighbourhood clamp against ghosting: variance clipping over
     //    the 5×5 RAW window ─────────────────────────────────────────────
@@ -115,9 +137,17 @@ void main() {
     const ivec2 lim = ivec2(pc.screen_size) - 1;
     for (int dy = -2; dy <= 2; ++dy) {
         for (int dx = -2; dx <= 2; ++dx) {
-            const vec2 n = imageLoad(
-                raw_in, clamp(px + ivec2(dx, dy), ivec2(0), lim)).rg;
+            const ivec2 q = clamp(px + ivec2(dx, dy), ivec2(0), lim);
+            const vec2 n = imageLoad(raw_in, q).rg;
             if (n.r < 0.0) continue;         // sentinel neighbour
+            const float qz = texelFetch(depth_tex, q, 0).r;
+            if (qz >= 1.0) continue;
+            const vec2 qndc = (vec2(q) + 0.5) / vec2(pc.screen_size) * 2.0 - 1.0;
+            const vec4 qworld = camera_info.inv_view_proj * vec4(qndc, qz, 1.0);
+            if (abs(qworld.w) < 1e-9) continue;
+            // VP * inverse(VP) cancels: clip depth is 1 / homogeneous w.
+            const float qdepth = 1.0 / qworld.w;
+            if (abs(qdepth - cclip.w) > 0.04 * cclip.w + 0.15) continue;
             m1 += n;
             m2 += n * n;
             cnt += 1.0;

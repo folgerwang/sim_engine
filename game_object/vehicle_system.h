@@ -195,6 +195,7 @@ private:
         float idle_t = 0.0f;           // ambient: pause at a destination
         glm::vec3 pos{0.0f};
         float yaw = 0.0f;
+        glm::vec3 ground_up{0.0f, 1.0f, 0.0f};
         float y_ground = 0.0f;         // last exact clamp
         int   claim = -1;              // junction node claimed
         // v34 LANES: lane is the one the car wants (0 inner, by the

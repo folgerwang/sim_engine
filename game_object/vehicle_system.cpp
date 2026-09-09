@@ -342,7 +342,7 @@ bool profileYRange(const std::vector<glm::vec2>& prof, float x, float& yb, float
 // sill, side up to the belt, tumblehome to a rounded shoulder, roof.
 // Always the same vertex count, so consecutive rings loft.
 constexpr int kRingSill = 4, kRingSide = 4, kRingTumble = 4, kRingShoulder = 6, kRingRoof = 3;
-constexpr int kRingHalf = kRingSill + 1 + kRingSide + kRingTumble + kRingShoulder + kRingRoof;
+constexpr int kRingHalf = kRingSill + 2 + kRingSide + kRingTumble + kRingShoulder + kRingRoof;
 constexpr int kRingN = 2 * kRingHalf - 2;
 
 // ── THE WHEEL ARCH, as an OPENING and not as paint ───────────────────
@@ -405,6 +405,7 @@ bool sectionRing(const Spec& sp, const std::vector<glm::vec2>& prof, float x,
     };
     std::vector<glm::vec2> right;
     right.reserve(kRingHalf);
+    right.push_back({yb, 0.0f});
     for (int k = 0; k <= kRingSill; ++k) {
         const float a = 1.5707963f * float(k) / kRingSill;
         right.push_back({yb + rb - rb * std::cos(a), (w_at(yb + rb) - rb) + rb * std::sin(a)});
@@ -2297,7 +2298,9 @@ void VehicleSystem::update(float delta_t, float speed_scale,
             float gy; glm::vec3 gn;
             if (ground(v.pos.x, v.pos.z, v.pos.y, gy, gn) &&
                 std::abs(gy - v.pos.y) < 4.0f) {
-                v.pos.y = gy + 0.02f;
+                v.pos.y = gy + 0.005f;
+                if (glm::dot(gn, gn) > 0.5f && gn.y > 0.5f)
+                    v.ground_up = glm::normalize(gn);
             }
         }
     }
@@ -2338,9 +2341,14 @@ void VehicleSystem::emit(const Vehicle& v) {
     // is atan2(t.x, t.z) -- the angle that turns +z onto the road.
     // Turning the model a quarter back first puts +x on the road;
     // without it every vehicle stood across its lane.
-    const glm::mat4 root =
-        glm::translate(glm::mat4(1.0f), v.pos) *
-        glm::rotate(glm::mat4(1.0f), v.yaw - 1.5707963f, glm::vec3(0, 1, 0));
+    // Project the heading onto the contact plane. The body and all axles
+    // share this basis, so tyres meet slopes instead of hovering downhill.
+    const glm::vec3 up = v.ground_up;
+    const glm::vec3 heading(std::sin(v.yaw), 0.0f, std::cos(v.yaw));
+    const glm::vec3 forward = glm::normalize(heading - up * glm::dot(heading, up));
+    const glm::vec3 right = glm::normalize(glm::cross(forward, up));
+    const glm::mat4 root(glm::vec4(forward, 0.0f), glm::vec4(up, 0.0f),
+                         glm::vec4(right, 0.0f), glm::vec4(v.pos, 1.0f));
     const float seed01 = h01(v.seed, 0x91u);
     const float blink = v.lights ? 1.0f + anim_t_ : 0.0f;
 
