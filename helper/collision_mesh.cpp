@@ -1584,7 +1584,7 @@ bool CollisionWorld::raycastDown(
     const glm::vec3& from,
     float max_distance,
     glm::vec3& out_hit,
-    glm::vec3& out_normal) const {
+    glm::vec3& out_normal, bool bvh_only) const {
     // The "closest hit going DOWN" is the one with the largest Y
     // (least far below `from`).  We track the highest hit Y seen so
     // far and replace whenever a mesh produces a closer one.
@@ -1609,7 +1609,7 @@ bool CollisionWorld::raycastDown(
     //     "wall-shaped" (thin in one of XZ, tall Y) — the former
     //     should hit a downward ray, the latter typically won't.
     static uint64_t s_call = 0;
-    const bool log_now = ((s_call++ % 256u) == 0u);
+    const bool log_now = !bvh_only && ((s_call++ % 256u) == 0u);
     int n_total = 0, n_aabb_pass = 0, n_hit = 0;
     struct CandidateDump { AABB b; size_t tri_count; bool hit; };
     std::vector<CandidateDump> dump;
@@ -1619,7 +1619,7 @@ bool CollisionWorld::raycastDown(
     }
 
     for (const auto& m : meshes_) {
-        if (!m || m->empty()) continue;
+        if (!m || m->empty() || (bvh_only && !m->isBVHReady())) continue;
         const AABB& b = m->bounds();
         // XZ overlap with the foot's column.
         if (from.x < b.min_bounds.x || from.x > b.max_bounds.x) continue;

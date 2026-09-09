@@ -441,6 +441,18 @@ struct NodeInfo {
     // drawNodeMesh); the CPU pass keeps only a conservative
     // node-level cull.  Set by parsePlantLodBands.
     uint8_t                     lod_per_instance_ = 0;
+    // ── Not vegetation, whatever the file is ──────────────────────
+    // terrain_pcg.py merges the ROCK scatter into "<map>_pcg_trees.glb"
+    // so boulders share the trees' meshes, LOD chains and instanced
+    // path.  The wind sway is flagged per DRAWABLE from the asset path,
+    // so that merge handed the rocks a bend meant for branches and the
+    // whole talus field breathed with the forest.  A rock has no stem
+    // to bend and no leaves to flutter: nodes whose LOD category is
+    // "rock" carry this, and drawNodeMesh / ntStageRecords drop
+    // MODEL_FLAG_VEGETATION_SWAY for them (which also drops the
+    // crown-normal bend and base.frag's cutout-foliage guess).
+    // Set by parsePlantLodBands.
+    uint8_t                     no_sway_ = 0;
     // ── Building interior (forward-path sky occlusion) ────────────
     // 1 for geometry the generator marked as INSIDE a building: the
     // house "_int_lodtile_" band (interior shell, door leaves) and the
@@ -2195,4 +2207,4 @@ private:
 };
 
 } // namespace game_object
-} // namespace engine
+} // namespace engine

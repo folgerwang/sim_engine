@@ -18,6 +18,8 @@ class VulkanDevice : public Device {
     std::shared_ptr<CommandPool> transient_cmd_pool_;
     std::shared_ptr<CommandBuffer> transient_cmd_buffer_;
     std::shared_ptr<Queue> transient_compute_queue_;
+    std::shared_ptr<Queue> async_compute_queue_;
+    uint32_t async_compute_family_ = 0;
     std::shared_ptr<Fence> transient_fence_;
 
     // ── Async loader queue (see base Device) ──
@@ -70,6 +72,8 @@ public:
     virtual std::shared_ptr<CommandBuffer> setupTransientCommandBuffer() final;
     virtual void submitAndWaitTransientCommandBuffer() final;
 
+    std::shared_ptr<Queue> getAsyncComputeQueue() final { return async_compute_queue_; }
+    uint32_t getAsyncComputeFamily() const final { return async_compute_family_; }
     virtual bool hasLoaderQueue() const final {
         return loader_queue_ != nullptr;
     }

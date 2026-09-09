@@ -21,7 +21,7 @@ namespace game_object {
 namespace {
 
 // ── tuning ───────────────────────────────────────────────────────────
-constexpr float kSimRadius = 1600.0f;      // vehicles ticked, per frame
+constexpr float kSimRadius = 400.0f;      // vehicles ticked, per frame
 constexpr float kDrawRadius = 1400.0f;     // vehicles drawn
 constexpr float kClampRadius = 450.0f;     // exact ground query
 constexpr float kCurbSearchM = 170.0f;     // how far a car may be from a road
@@ -103,39 +103,77 @@ const std::vector<Spec>& specs() {
     static std::vector<Spec> s;
     if (!s.empty()) return s;
     s.resize(VehicleSystem::kTypeCount);
-    // Acura-style sedan
+    // ── EVERY TYPE OFF A REAL VEHICLE'S DIMENSIONS ──────────────────
+    // These were eyeballed, and eyeballed shapes go wrong in the same
+    // two ways every time.  Both are visible the moment you put a render
+    // next to a photograph:
+    //
+    //   HEIGHT OVER LENGTH.  Cars sit in a narrow band — 0.35-0.38 for
+    //   a saloon, 0.37 for a crossover, 0.33 for a pickup — and the old
+    //   sedan was at 0.29.  Under that number a car stops reading as a
+    //   car and starts reading as a doorstop, whatever else is right.
+    //
+    //   GLASS RAKE.  Windshields are LAID BACK: ~30 degrees off the
+    //   horizontal on a saloon, a little steeper on a van, and the
+    //   backlight is steeper again (~35).  Getting this wrong is what
+    //   made the SUV read as a minivan and the ambulance as a wedge —
+    //   and, when the first pass on the sedan overcorrected it to 45,
+    //   what made that one read as a car from 1994.
+    //
+    // Every dimension below is annotated with the vehicle it is taken
+    // from, so the next person to touch it argues with a measurement
+    // instead of with a taste.  L x W x H, then the wheelbase.
+    //
+    // Anything changed here has FOUR partners that must move with it:
+    // kGlass / kDims / kLamp / kCabin in vehicle.frag (the shader paints
+    // by position on the hull, so it re-derives the same geometry) and
+    // cabinOf() below.
+    //
+    // COMPACT FOUR-DOOR — 4.20 x 1.76 x 1.50, WB 2.60 (a small saloon:
+    // 4.0 x 1.7 x 1.5 on a 2.45 wheelbase, stretched a class).
     s[VehicleSystem::kSedan] = {
-        4.80f, 1.85f,
-        {{-2.40f, 0.32f}, {-2.40f, 0.78f}, {-2.25f, 0.96f}, {-1.60f, 1.00f},
-         {-0.85f, 1.38f}, {0.40f, 1.42f}, {1.15f, 1.04f}, {2.10f, 0.90f},
-         {2.40f, 0.76f}, {2.40f, 0.34f}, {2.05f, 0.20f}, {-2.05f, 0.20f}},
-        0.10f, 1.00f, 1.38f, 0.34f, 0.22f, 0.78f, {1.40f, -1.40f},
+        4.20f, 1.76f,
+        {{-2.10f, 0.34f}, {-2.10f, 0.86f}, {-1.95f, 1.02f}, {-1.21f, 1.06f},
+         {-0.58f, 1.50f}, {0.34f, 1.50f}, {1.18f, 1.02f}, {1.95f, 0.94f},
+         {2.10f, 0.78f}, {2.10f, 0.30f}, {1.82f, 0.18f}, {-1.82f, 0.18f}},
+        0.10f, 1.05f, 1.50f, 0.32f, 0.21f, 0.76f, {1.30f, -1.30f},
         {1.0f, 1.0f}, 14.0f, false, {0, 0, 0}, {0, 0}};
-    // compact SUV (XC40-style)
+    // COMPACT CROSSOVER — 4.45 x 1.86 x 1.65, WB 2.70 (XC40: 4.43 x
+    // 1.86 x 1.65, WB 2.70).  The roof runs almost to the tailgate and
+    // the tailgate itself is near vertical; that, not the ride height,
+    // is what separates a crossover's silhouette from a saloon's.
     s[VehicleSystem::kSuv] = {
         4.45f, 1.86f,
-        {{-2.22f, 0.40f}, {-2.22f, 1.00f}, {-2.10f, 1.25f}, {-1.95f, 1.60f},
-         {-0.95f, 1.65f}, {0.45f, 1.65f}, {1.10f, 1.22f}, {1.95f, 1.06f},
-         {2.22f, 0.88f}, {2.22f, 0.40f}, {1.90f, 0.26f}, {-1.90f, 0.26f}},
-        0.12f, 1.08f, 1.60f, 0.36f, 0.24f, 0.78f, {1.33f, -1.33f},
+        {{-2.22f, 0.40f}, {-2.22f, 1.08f}, {-2.12f, 1.38f}, {-1.98f, 1.62f},
+         {-1.45f, 1.65f}, {0.45f, 1.65f}, {1.25f, 1.22f}, {2.00f, 1.10f},
+         {2.22f, 0.92f}, {2.22f, 0.40f}, {1.90f, 0.26f}, {-1.90f, 0.26f}},
+        0.12f, 1.10f, 1.65f, 0.35f, 0.24f, 0.78f, {1.35f, -1.35f},
         {1.0f, 1.0f}, 14.0f, false, {0, 0, 0}, {0, 0}};
-    // the angular stainless pickup
+    // ANGULAR STAINLESS TRUCK — 5.68 x 2.03 x 1.79, WB 3.62.  The single
+    // crease from nose to tail is the whole design; only the wheelbase
+    // was wrong (3.44), which had the wheels tucked under a long body.
     s[VehicleSystem::kCyber] = {
         5.70f, 2.00f,
         {{-2.85f, 0.42f}, {-2.85f, 1.12f}, {-2.30f, 1.28f}, {0.05f, 1.80f},
          {1.75f, 1.22f}, {2.85f, 0.98f}, {2.85f, 0.42f}, {2.45f, 0.30f},
          {-2.45f, 0.30f}},
-        0.16f, 1.14f, 1.74f, 0.44f, 0.30f, 0.86f, {1.72f, -1.72f},
+        0.16f, 1.14f, 1.74f, 0.44f, 0.30f, 0.86f, {1.81f, -1.81f},
         {1.0f, 1.0f}, 14.0f, false, {0, 0, 0}, {0, 0}};
-    // F-150-style pickup
+    // FULL-SIZE PICKUP, crew cab — 5.89 x 2.03 x 1.95, WB 3.68 (F-150
+    // SuperCrew).  Was on a 3.50 wheelbase with a 1.10 front overhang:
+    // a pickup's front wheel sits close under the grille, and moving it
+    // there is most of what makes the stance read as a truck.
     s[VehicleSystem::kPickup] = {
         5.90f, 2.05f,
-        {{-2.95f, 0.42f}, {-2.95f, 1.30f}, {-0.55f, 1.30f}, {-0.55f, 1.95f},
-         {0.60f, 1.95f}, {1.10f, 1.46f}, {2.60f, 1.26f}, {2.95f, 1.06f},
+        {{-2.95f, 0.42f}, {-2.95f, 1.32f}, {-0.62f, 1.32f}, {-0.62f, 1.95f},
+         {0.62f, 1.95f}, {1.28f, 1.50f}, {2.55f, 1.30f}, {2.95f, 1.10f},
          {2.95f, 0.42f}, {2.50f, 0.32f}, {-2.50f, 0.32f}},
-        0.08f, 1.44f, 1.90f, 0.43f, 0.28f, 0.86f, {1.85f, -1.65f},
+        0.08f, 1.44f, 1.90f, 0.43f, 0.28f, 0.86f, {2.00f, -1.68f},
         {1.0f, 1.0f}, 14.0f, false, {0, 0, 0}, {0, 0}};
-    // semi tractor + trailer (one rigid body)
+    // TRACTOR + BOX TRAILER as ONE rigid body — 14.6 m over a 4.05 m
+    // box (13'6" legal height).  Short for a 53-footer on purpose: it
+    // cannot articulate, so a full-length one could not take the
+    // junctions the road graph gives it.
     s[VehicleSystem::kSemi] = {
         14.6f, 2.55f,
         {{-11.0f, 1.20f}, {-11.0f, 4.05f}, {-1.70f, 4.05f}, {-1.70f, 3.55f},
@@ -144,23 +182,33 @@ const std::vector<Spec>& specs() {
         0.02f, 2.35f, 3.45f, 0.52f, 0.32f, 1.10f,
         {2.60f, -0.40f, -1.70f, -8.00f, -9.30f},
         {1.0f, 1.9f, 1.9f, 1.9f, 1.9f}, 11.0f, false, {0, 0, 0}, {0, 0}};
-    // police SUV
+    // POLICE INTERCEPTOR UTILITY — 5.05 x 2.00 x 1.78, WB 3.03
+    // (Explorer PI).  Same crossover roofline correction as kSuv: the
+    // roof carries back to the tailgate instead of falling away from
+    // the middle of the car.
     s[VehicleSystem::kPolice] = {
         5.00f, 2.00f,
-        {{-2.50f, 0.42f}, {-2.50f, 1.05f}, {-2.35f, 1.30f}, {-2.20f, 1.72f},
-         {-1.00f, 1.76f}, {0.55f, 1.76f}, {1.25f, 1.30f}, {2.20f, 1.12f},
-         {2.50f, 0.92f}, {2.50f, 0.42f}, {2.10f, 0.28f}, {-2.10f, 0.28f}},
-        0.12f, 1.12f, 1.72f, 0.38f, 0.25f, 0.84f, {1.50f, -1.50f},
-        {1.0f, 1.0f}, 15.0f, true, {0.0f, 1.84f, 0.0f}, {1.20f, 0.28f}};
-    // ambulance van
+        {{-2.50f, 0.42f}, {-2.50f, 1.10f}, {-2.38f, 1.40f}, {-2.22f, 1.72f},
+         {-1.60f, 1.76f}, {0.55f, 1.76f}, {1.35f, 1.30f}, {2.20f, 1.14f},
+         {2.50f, 0.95f}, {2.50f, 0.42f}, {2.10f, 0.28f}, {-2.10f, 0.28f}},
+        0.12f, 1.12f, 1.76f, 0.38f, 0.25f, 0.84f, {1.52f, -1.52f},
+        {1.0f, 1.0f}, 15.0f, true, {0.0f, 1.88f, 0.0f}, {1.20f, 0.28f}};
+    // AMBULANCE, van conversion — 5.30 x 1.95 x 2.40, WB 3.30 (a
+    // Sprinter, shortened to the world's road widths).  The old one ran
+    // its windshield 1.40 m of length for 1.18 m of rise, which is not a
+    // van's face at all — a van has a SHORT steep bonnet under a nearly
+    // upright screen, and that one profile point is the difference
+    // between an ambulance and a doorstop with a light bar.
     s[VehicleSystem::kAmbulance] = {
         5.30f, 1.95f,
-        {{-2.65f, 0.45f}, {-2.65f, 2.32f}, {0.65f, 2.36f}, {1.30f, 1.78f},
-         {2.05f, 1.18f}, {2.65f, 0.98f}, {2.65f, 0.45f}, {2.30f, 0.32f},
+        {{-2.65f, 0.45f}, {-2.65f, 2.36f}, {0.95f, 2.40f}, {1.72f, 1.58f},
+         {2.30f, 1.30f}, {2.65f, 1.05f}, {2.65f, 0.45f}, {2.30f, 0.32f},
          {-2.30f, 0.32f}},
-        0.04f, 1.38f, 2.24f, 0.37f, 0.24f, 0.82f, {1.75f, -1.55f},
-        {1.0f, 1.0f}, 15.0f, true, {0.40f, 2.44f, 0.0f}, {1.30f, 0.30f}};
-    // school bus
+        0.04f, 1.40f, 2.28f, 0.37f, 0.24f, 0.82f, {1.75f, -1.55f},
+        {1.0f, 1.0f}, 15.0f, true, {0.40f, 2.48f, 0.0f}, {1.30f, 0.30f}};
+    // SCHOOL BUS, Type C (bonneted) — 10.5 x 2.50 x 3.10, WB 6.20.  A
+    // real Type C is 10.9 x 2.44 x 3.05 on 6.0; this one was already
+    // right and is left alone but for the arches every type now gets.
     s[VehicleSystem::kSchoolBus] = {
         10.5f, 2.50f,
         {{-5.25f, 0.55f}, {-5.25f, 3.10f}, {3.05f, 3.10f}, {3.45f, 2.40f},
@@ -168,13 +216,15 @@ const std::vector<Spec>& specs() {
          {-4.90f, 0.42f}},
         0.05f, 1.78f, 2.72f, 0.52f, 0.35f, 1.05f, {3.30f, -2.90f},
         {1.0f, 1.8f}, 10.0f, false, {0, 0, 0}, {0, 0}};
-    // fire engine (cab-over pumper)
+    // FIRE ENGINE, cab-over pumper — 9.50 x 2.50 x 3.40, WB 5.50.  Also
+    // already close to a real pumper (9.8 x 2.5 x 3.2); the front axle
+    // moves forward under the cab, which is where a cab-over's is.
     s[VehicleSystem::kFireEngine] = {
         9.50f, 2.50f,
         {{-4.75f, 0.55f}, {-4.75f, 3.25f}, {0.55f, 3.25f}, {0.75f, 3.40f},
          {3.05f, 3.40f}, {3.45f, 2.55f}, {4.75f, 2.25f}, {4.75f, 0.55f},
          {4.40f, 0.42f}, {-4.40f, 0.42f}},
-        0.04f, 2.10f, 3.30f, 0.55f, 0.40f, 1.05f, {3.20f, -2.30f},
+        0.04f, 2.10f, 3.30f, 0.55f, 0.40f, 1.05f, {3.40f, -2.10f},
         {1.0f, 1.8f}, 12.0f, true, {1.90f, 3.48f, 0.0f}, {1.60f, 0.30f}};
     return s;
 }
@@ -295,6 +345,52 @@ constexpr int kRingSill = 4, kRingSide = 4, kRingTumble = 4, kRingShoulder = 6, 
 constexpr int kRingHalf = kRingSill + 1 + kRingSide + kRingTumble + kRingShoulder + kRingRoof;
 constexpr int kRingN = 2 * kRingHalf - 2;
 
+// ── THE WHEEL ARCH, as an OPENING and not as paint ───────────────────
+// The hull used to be full width all the way down to the sill, so a
+// wheel sat INSIDE the body with only the bottom of the tyre showing,
+// and the arch was a dark ellipse painted on the flank.  That is what
+// made the cars read as a white blob with stickers on it: an arch is
+// the one feature of a car's side that is a HOLE, and a hole painted on
+// a convex surface stays a painting from every angle — no silhouette at
+// the lip, no shadow inside it, and the wheel never looks like it is in
+// anything.
+//
+// So the skin RECEDES to the wheel-house wall inside the arch: below
+// the arc, the section's |z| is pulled in to just inboard of the tyre,
+// which opens a real recess with the wheel standing in it.  It costs no
+// vertices at all (the ring keeps its count; only its z changes) and it
+// gives the lip a genuine silhouette, the house a genuine cavity, and
+// the painted arch something true to sit on.
+//
+// The opening is an ELLIPSE about the wheel centre — wider than the
+// tyre by archMarginX, taller by archMarginY — which is the shape a
+// wheel arch actually is, rather than the circle-clipped-flat the paint
+// was drawing.
+const float kArchMarginX = 0.10f;   // m of opening either side of the tyre
+const float kArchMarginY = 0.10f;   // ...and above it
+const float kArchHouseGap = 0.035f; // clearance between tyre and house wall
+
+// How far ABOVE the wheel centre the arch opening reaches at station x,
+// or a negative number when x is clear of every arch.
+float archTopAt(const Spec& sp, float x) {
+    float best = -1.0f;
+    for (float wx : sp.wheel_x) {
+        const float rx = sp.wheel_r + kArchMarginX;
+        const float ry = sp.wheel_r + kArchMarginY;
+        const float t = (x - wx) / rx;
+        if (t <= -1.0f || t >= 1.0f) continue;
+        best = std::max(best, sp.wheel_r + ry * std::sqrt(1.0f - t * t));
+    }
+    return best;
+}
+
+// The wheel-house wall: just inboard of the widest tyre.
+float archHouseHalfZ(const Spec& sp) {
+    float w = sp.wheel_w;
+    for (float d : sp.wheel_dual) w = std::max(w, sp.wheel_w * d);
+    return std::max(0.10f, sp.wheel_z - 0.5f * w - kArchHouseGap);
+}
+
 bool sectionRing(const Spec& sp, const std::vector<glm::vec2>& prof, float x,
                  float wscale, std::vector<glm::vec2>& ring) {
     float yb, yt;
@@ -315,9 +411,33 @@ bool sectionRing(const Spec& sp, const std::vector<glm::vec2>& prof, float x,
     }
     const float y_lo = yb + rb;
     const float y_belt = std::max(std::min(sp.belt, yt - rt), y_lo);
-    for (int k = 1; k <= kRingSide; ++k) {
-        const float y = y_lo + (y_belt - y_lo) * float(k) / kRingSide;
-        right.push_back({y, w_at(y)});
+    // ── the arch LIP gets its own two vertices ──────────────────────
+    // The arc's height varies continuously with x, but a ring only has
+    // kRingSide samples between the sill and the belt — so testing each
+    // of them against the arc quantises the opening to those few heights
+    // and the arch comes out as a staircase.  Instead, when the arc
+    // passes through this band, two of the side samples are SNAPPED to
+    // it: one a centimetre below (inset, the top of the wheel house) and
+    // one exactly on it (not inset, the lip).  The lip is then an exact
+    // curve across the stations, and the 12 mm between the two vertices
+    // is the wall that gives it its edge.
+    const float arch_top_v = archTopAt(sp, x);
+    const bool  lip_here = arch_top_v > y_lo + 0.03f &&
+                           arch_top_v < y_belt - 0.03f && kRingSide >= 4;
+    if (lip_here) {
+        const float y_in = arch_top_v - 0.012f;
+        right.push_back({y_in, w_at(y_in)});         // inside the house
+        right.push_back({arch_top_v, w_at(arch_top_v)});   // the lip
+        for (int k = 1; k <= kRingSide - 2; ++k) {
+            const float y = arch_top_v +
+                (y_belt - arch_top_v) * float(k) / float(kRingSide - 2);
+            right.push_back({y, w_at(y)});
+        }
+    } else {
+        for (int k = 1; k <= kRingSide; ++k) {
+            const float y = y_lo + (y_belt - y_lo) * float(k) / kRingSide;
+            right.push_back({y, w_at(y)});
+        }
     }
     const float y_sh = yt - rt;
     for (int k = 1; k <= kRingTumble; ++k) {
@@ -331,6 +451,18 @@ bool sectionRing(const Spec& sp, const std::vector<glm::vec2>& prof, float x,
     }
     for (int k = 1; k <= kRingRoof; ++k)
         right.push_back({yt, (wsh - rt) * (1.0f - float(k) / kRingRoof)});
+    // ── the arch opening (see archTopAt) ────────────────────────────
+    // Applied to the half-section before it is mirrored, so both sides
+    // get the same house by construction.
+    if (arch_top_v > 0.0f) {
+        const float house = archHouseHalfZ(sp);
+        // Strictly BELOW the lip: the vertex snapped exactly onto the
+        // arc keeps the body's width, which is what makes the lip an
+        // edge rather than a fade.
+        for (glm::vec2& p : right) {
+            if (p.x < arch_top_v - 1e-4f) p.y = std::min(p.y, house);
+        }
+    }
     ring.clear();
     ring.reserve(kRingN);
     for (const glm::vec2& p : right) ring.push_back(p);
@@ -360,6 +492,18 @@ MeshData buildHull(const Spec& sp) {
         st.push_back(xmin + L * (0.5f - 0.5f * std::cos(3.14159265f * t)));
     }
     for (const glm::vec2& p : prof) st.push_back(p.x);
+    // Stations ON the arch boundary, and a hair either side of it: the
+    // loft interpolates between stations, so without these the opening's
+    // leading and trailing edges become 10 cm ramps instead of the sharp
+    // lip a wheel arch has.  Cheap — six sections a car.
+    for (float wx : sp.wheel_x) {
+        const float rx = sp.wheel_r + kArchMarginX;
+        for (float d : {-1.0f, 1.0f}) {
+            st.push_back(wx + d * rx);
+            st.push_back(wx + d * (rx - 0.012f));
+            st.push_back(wx + d * (rx + 0.012f));
+        }
+    }
     std::sort(st.begin(), st.end());
     st.erase(std::unique(st.begin(), st.end(), [](float a, float b) { return std::abs(a - b) < 1e-4f; }), st.end());
     std::vector<float> xs;
@@ -479,17 +623,19 @@ const Cabin& cabinOf(int type) {
     static std::vector<Cabin> c;
     if (c.empty()) {
         c.resize(VehicleSystem::kTypeCount);
+        // Re-fitted to the shorter body above: the dash moves back with
+        // the windshield base (0.80) and the rear bench with the cabin.
         c[VehicleSystem::kSedan] = {
-            0.30f, -1.35f, 1.05f, 0.78f, {0.95f, 1.40f, 0.70f, 0.96f},
-            {0.72f, 0.86f, -0.38f}, 0.18f,
-            {{0.15f, 0.52f, -0.38f}, {0.15f, 0.52f, 0.38f},
-             {-0.85f, 0.52f, -0.38f}, {-0.85f, 0.52f, 0.38f}},
-            0.50f, 0.48f, 0.60f};
+            0.30f, -1.25f, 1.18f, 0.74f, {1.02f, 1.44f, 0.74f, 1.02f},
+            {0.84f, 0.92f, -0.36f}, 0.18f,
+            {{0.20f, 0.52f, -0.36f}, {0.20f, 0.52f, 0.36f},
+             {-0.80f, 0.52f, -0.36f}, {-0.80f, 0.52f, 0.36f}},
+            0.50f, 0.47f, 0.60f};
         c[VehicleSystem::kSuv] = {
-            0.36f, -1.30f, 1.00f, 0.78f, {0.95f, 1.45f, 0.82f, 1.08f},
-            {0.75f, 0.98f, -0.38f}, 0.18f,
-            {{0.20f, 0.62f, -0.38f}, {0.20f, 0.62f, 0.38f},
-             {-0.80f, 0.62f, -0.38f}, {-0.80f, 0.62f, 0.38f}},
+            0.36f, -1.40f, 1.25f, 0.78f, {1.08f, 1.52f, 0.86f, 1.14f},
+            {0.90f, 1.02f, -0.38f}, 0.18f,
+            {{0.25f, 0.62f, -0.38f}, {0.25f, 0.62f, 0.38f},
+             {-0.85f, 0.62f, -0.38f}, {-0.85f, 0.62f, 0.38f}},
             0.50f, 0.48f, 0.62f};
         c[VehicleSystem::kCyber] = {
             0.40f, -0.40f, 1.40f, 0.86f, {1.30f, 1.75f, 0.85f, 1.10f},
@@ -498,9 +644,10 @@ const Cabin& cabinOf(int type) {
              {-0.30f, 0.66f, -0.42f}, {-0.30f, 0.66f, 0.42f}},
             0.52f, 0.48f, 0.62f};
         c[VehicleSystem::kPickup] = {
-            0.45f, -0.55f, 0.60f, 0.88f, {0.55f, 1.05f, 0.95f, 1.22f},
-            {0.35f, 1.12f, -0.42f}, 0.19f,
-            {{-0.05f, 0.75f, -0.42f}, {-0.05f, 0.75f, 0.42f}},
+            0.45f, -0.58f, 1.28f, 0.88f, {1.10f, 1.55f, 1.00f, 1.28f},
+            {0.92f, 1.18f, -0.42f}, 0.19f,
+            {{0.32f, 0.78f, -0.42f}, {0.32f, 0.78f, 0.42f},
+             {-0.30f, 0.78f, -0.42f}, {-0.30f, 0.78f, 0.42f}},
             0.52f, 0.48f, 0.62f};
         c[VehicleSystem::kSemi] = {
             1.20f, -1.50f, 1.50f, 1.10f, {1.15f, 1.70f, 1.75f, 2.05f},
@@ -508,15 +655,15 @@ const Cabin& cabinOf(int type) {
             {{0.15f, 1.55f, -0.55f}, {0.15f, 1.55f, 0.55f}},
             0.55f, 0.50f, 0.70f};
         c[VehicleSystem::kPolice] = {
-            0.38f, -1.45f, 1.10f, 0.86f, {1.05f, 1.55f, 0.85f, 1.12f},
-            {0.85f, 1.00f, -0.40f}, 0.18f,
-            {{0.20f, 0.64f, -0.40f}, {0.20f, 0.64f, 0.40f},
-             {-0.85f, 0.64f, -0.40f}, {-0.85f, 0.64f, 0.40f}},
+            0.38f, -1.55f, 1.35f, 0.86f, {1.18f, 1.62f, 0.90f, 1.18f},
+            {1.00f, 1.06f, -0.40f}, 0.18f,
+            {{0.30f, 0.64f, -0.40f}, {0.30f, 0.64f, 0.40f},
+             {-0.90f, 0.64f, -0.40f}, {-0.90f, 0.64f, 0.40f}},
             0.50f, 0.48f, 0.62f};
         c[VehicleSystem::kAmbulance] = {
-            0.45f, 0.30f, 1.60f, 0.84f, {1.55f, 2.05f, 0.95f, 1.25f},
-            {1.35f, 1.12f, -0.45f}, 0.19f,
-            {{1.00f, 0.75f, -0.45f}, {1.00f, 0.75f, 0.45f}},
+            0.45f, 0.35f, 1.72f, 0.84f, {1.58f, 2.10f, 1.02f, 1.32f},
+            {1.40f, 1.20f, -0.45f}, 0.19f,
+            {{1.05f, 0.80f, -0.45f}, {1.05f, 0.80f, 0.45f}},
             0.52f, 0.48f, 0.64f};
         c[VehicleSystem::kSchoolBus] = {
             0.55f, -4.80f, 3.60f, 1.08f, {3.65f, 4.20f, 1.00f, 1.42f},
@@ -621,16 +768,51 @@ MeshData buildInterior(const Spec& sp, const Cabin& cb, int type) {
     return m;
 }
 
-// streams: hull per type, interior per type, wheel, bar, then the glass
-// pass per type (the hull mesh again, blended)
+// ── STREAM LAYOUT ───────────────────────────────────────────────────
+// Two of them, because the library is optional.
+//
+// LEGACY (no library): hull per type, interior per type, wheel, bar,
+// then the glass pass per type — the hull mesh again, blended.
+//
+// LIBRARY: three meshes per sample (body, wheel, interior) and four
+// streams (body, wheel, interior, glass).  The streams are grouped BY
+// KIND rather than by sample — all bodies, then all wheels, then all
+// interiors, then all glass — because the draw loop switches to the
+// blended pipeline once and relies on every opaque stream coming
+// first.  Interleaving them per sample would mean rebinding the
+// pipeline per car.
 constexpr int kMeshInterior0 = VehicleSystem::kTypeCount;
 constexpr int kMeshWheel = VehicleSystem::kTypeCount * 2;
 constexpr int kMeshBar = VehicleSystem::kTypeCount * 2 + 1;
 constexpr int kMeshCount = VehicleSystem::kTypeCount * 2 + 2;
-constexpr int kStreamGlass0 = kMeshCount;
-constexpr int kStreamCount = kMeshCount + VehicleSystem::kTypeCount;
+constexpr int kLegacyStreamGlass0 = kMeshCount;
+constexpr int kLegacyStreamCount = kMeshCount + VehicleSystem::kTypeCount;
+
+// Sample count when the library is loaded; 0 = legacy.  A file-scope
+// int rather than a member because the meshes and the streams are both
+// static: one library serves every VehicleSystem in the process.
+int g_lib_n = 0;
+
+int libMesh(int sample, int which) { return sample * 3 + which; }
+// The unit box, for the traffic signals — the one thing drawn through
+// this pipeline that is not a vehicle.  It sits after the samples in
+// both tables, and BEFORE the glass group, because it is opaque and the
+// draw loop switches to the blended pipeline once.
+int libBoxMesh()   { return 3 * g_lib_n; }
+int barStream()    { return g_lib_n ? 3 * g_lib_n : kMeshBar; }
+int streamGlass0() { return g_lib_n ? 3 * g_lib_n + 1 : kLegacyStreamGlass0; }
+int streamCount()  { return g_lib_n ? 4 * g_lib_n + 1 : kLegacyStreamCount; }
 int streamMesh(int stream) {
-    return stream >= kStreamGlass0 ? stream - kStreamGlass0 : stream;
+    if (!g_lib_n) {
+        return stream >= kLegacyStreamGlass0
+                   ? stream - kLegacyStreamGlass0 : stream;
+    }
+    const int n = g_lib_n;
+    if (stream < n)     return libMesh(stream, 0);            // body
+    if (stream < 2 * n) return libMesh(stream - n, 1);        // wheel
+    if (stream < 3 * n) return libMesh(stream - 2 * n, 2);    // interior
+    if (stream == 3 * n) return libBoxMesh();                 // signals
+    return libMesh(stream - 3 * n - 1, 0);  // glass: the body mesh again
 }
 
 glm::vec3 paletteColor(uint32_t seed) {
@@ -644,11 +826,45 @@ glm::vec3 paletteColor(uint32_t seed) {
 
 }  // namespace
 
+// ── WHICH BAKED CAR, AND IN WHAT COLOUR ─────────────────────────────
+// Called once per vehicle at spawn, deterministic in its seed so a
+// respawned slot comes back as the same car.  Sets nothing when the
+// library is absent, which leaves Vehicle::sample at -1 and the vehicle
+// on the built-in hull for its type.
+void VehicleSystem::assignSample(Vehicle& v) {
+    if (!s_lib_.loaded || v.type < 0 ||
+        v.type >= int(s_type_samples_.size())) {
+        return;
+    }
+    const std::vector<int>& set = s_type_samples_[size_t(v.type)];
+    if (set.empty()) return;
+    v.sample = set[size_t(h01(v.seed, 0x5Bu) * float(set.size())) % set.size()];
+    const CarSample& c = s_lib_.samples[size_t(v.sample)];
+    // A sample says which paints it may wear — a green ambulance is a
+    // bug, not variety — and the interior is a free choice out of the
+    // palette, weighted a little toward the dark cloths most cars have.
+    if (!c.paints.empty()) {
+        const size_t k =
+            size_t(h01(v.seed, 0x77u) * float(c.paints.size())) %
+            c.paints.size();
+        v.paint = uint8_t(c.paints[k]);
+    }
+    if (!s_lib_.interiors.empty()) {
+        const float t01 = h01(v.seed, 0x81u);
+        const float bias = t01 * t01;      // toward the head of the list
+        v.trim = uint8_t(size_t(bias * float(s_lib_.interiors.size())) %
+                         s_lib_.interiors.size());
+    }
+}
+
+
 // ── statics ──────────────────────────────────────────────────────────
 std::shared_ptr<er::Pipeline> VehicleSystem::s_gbuf_pipeline_;
 std::shared_ptr<er::PipelineLayout>  VehicleSystem::s_pipeline_layout_;
 std::shared_ptr<er::Pipeline>        VehicleSystem::s_pipeline_;
 std::vector<VehicleSystem::Mesh>     VehicleSystem::s_meshes_;
+CarLibrary                           VehicleSystem::s_lib_;
+std::vector<std::vector<int>>        VehicleSystem::s_type_samples_;
 std::shared_ptr<er::Device>          VehicleSystem::s_device_;
 std::shared_ptr<er::BufferInfo>      VehicleSystem::s_inst_buf_;
 std::shared_ptr<er::Pipeline>        VehicleSystem::s_glass_pipeline_;
@@ -659,7 +875,8 @@ void VehicleSystem::initStaticMembers(
     const er::DescriptorSetLayoutList& global_desc_set_layouts,
     const er::GraphicPipelineInfo& graphic_pipeline_info,
     const er::PipelineRenderbufferFormats& frame_buffer_format,
-    const er::PipelineRenderbufferFormats& gbuffer_format) {
+    const er::PipelineRenderbufferFormats& gbuffer_format,
+    const std::string& car_library_path) {
     er::PushConstantRange push_const_range{};
     push_const_range.stage_flags =
         SET_2_FLAG_BITS(ShaderStage, VERTEX_BIT, FRAGMENT_BIT);
@@ -670,10 +887,15 @@ void VehicleSystem::initStaticMembers(
         std::source_location::current());
     s_device_ = device;
 
-    // the citizens' cube-pipeline vertex layout: POSITION, NORMAL, and
-    // the six per-instance vec4s at locations 10-15 citizen.vert reads
-    std::vector<er::VertexInputBindingDescription> bindings(3);
-    std::vector<er::VertexInputAttributeDescription> attribs(8);
+    // ── VERTEX LAYOUT ───────────────────────────────────────────────
+    // POSITION, NORMAL and the PART ID per vertex, then the seven
+    // per-instance vec4s vehicle.vert reads at locations 10-16: the
+    // transform (four), the colour, the extra, and the paint.  The part
+    // id and the paint are what the library needs; the built-in hulls
+    // bind the same layout with -1 parts and a zero paint, so one
+    // pipeline draws either.
+    std::vector<er::VertexInputBindingDescription> bindings(4);
+    std::vector<er::VertexInputAttributeDescription> attribs(10);
     bindings[0].binding = 0;
     bindings[0].stride = sizeof(glm::vec3);
     bindings[0].input_rate = er::VertexInputRate::VERTEX;
@@ -689,13 +911,20 @@ void VehicleSystem::initStaticMembers(
     attribs[1].format = er::Format::R32G32B32_SFLOAT;
     attribs[1].offset = 0;
     bindings[2].binding = 2;
-    bindings[2].stride = sizeof(PartInstance);
-    bindings[2].input_rate = er::VertexInputRate::INSTANCE;
-    for (int k = 0; k < 6; ++k) {
-        attribs[2 + k].binding = 2;
-        attribs[2 + k].location = uint32_t(10 + k);
-        attribs[2 + k].format = er::Format::R32G32B32A32_SFLOAT;
-        attribs[2 + k].offset = uint32_t(k * sizeof(glm::vec4));
+    bindings[2].stride = sizeof(float);
+    bindings[2].input_rate = er::VertexInputRate::VERTEX;
+    attribs[2].binding = 2;
+    attribs[2].location = VINPUT_TEXCOORD0;
+    attribs[2].format = er::Format::R32_SFLOAT;
+    attribs[2].offset = 0;
+    bindings[3].binding = 3;
+    bindings[3].stride = sizeof(PartInstance);
+    bindings[3].input_rate = er::VertexInputRate::INSTANCE;
+    for (int k = 0; k < 7; ++k) {
+        attribs[3 + k].binding = 3;
+        attribs[3 + k].location = uint32_t(10 + k);
+        attribs[3 + k].format = er::Format::R32G32B32A32_SFLOAT;
+        attribs[3 + k].offset = uint32_t(k * sizeof(glm::vec4));
     }
     er::PipelineInputAssemblyStateCreateInfo input_assembly;
     input_assembly.topology = er::PrimitiveTopology::TRIANGLE_LIST;
@@ -705,7 +934,7 @@ void VehicleSystem::initStaticMembers(
     raster_override.double_sided = true;
     er::ShaderModuleList shader_modules(2);
     shader_modules[0] = er::helper::loadShaderModule(
-        device, "citizen_vert.spv", er::ShaderStageFlagBits::VERTEX_BIT,
+        device, "vehicle_vert.spv", er::ShaderStageFlagBits::VERTEX_BIT,
         std::source_location::current());
     shader_modules[1] = er::helper::loadShaderModule(
         device, "vehicle_frag.spv", er::ShaderStageFlagBits::FRAGMENT_BIT,
@@ -759,38 +988,120 @@ void VehicleSystem::initStaticMembers(
         }
     }
 
-    // meshes: one hull + one interior per type, the wheel, the light bar
-    s_meshes_.assign(kMeshCount, Mesh{});
-    auto upload = [&](int i, const MeshData& md) {
-        Mesh& m = s_meshes_[i];
-        m.shadow.positions = md.pos;
-        m.shadow.indices = md.idx;
+    // ── MESHES ──────────────────────────────────────────────────────
+    // One upload path for both sources.  `part` is a per-vertex stream
+    // the library fills with part ids and the built-in hulls fill with
+    // -1: the shader reads -1 as "this is a legacy hull, work the
+    // details out the old way", so one pipeline serves both and the
+    // fallback needs no second pipeline or second shader.
+    auto upload = [&](int i, const std::vector<glm::vec3>& pos,
+                      const std::vector<glm::vec3>& nrm,
+                      const std::vector<float>& part,
+                      const std::vector<uint32_t>& idx) {
+        Mesh& m = s_meshes_[size_t(i)];
+        // An empty mesh stays empty: a zero-length buffer is not worth
+        // creating and .data() on an empty vector is null, which the
+        // buffer helper has no reason to expect.  The draw skips a mesh
+        // whose buffers are missing, so this is the whole guard.
+        if (pos.empty() || idx.empty()) return;
+        m.shadow.positions = pos;
+        m.shadow.indices = idx;
         m.pos = helper::createUnifiedMeshBuffer(
             device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-            md.pos.size() * sizeof(glm::vec3), md.pos.data(),
+            pos.size() * sizeof(glm::vec3), pos.data(),
             std::source_location::current());
         m.nrm = helper::createUnifiedMeshBuffer(
             device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-            md.nrm.size() * sizeof(glm::vec3), md.nrm.data(),
+            nrm.size() * sizeof(glm::vec3), nrm.data(),
+            std::source_location::current());
+        m.part = helper::createUnifiedMeshBuffer(
+            device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+            part.size() * sizeof(float), part.data(),
             std::source_location::current());
         m.idx = helper::createUnifiedMeshBuffer(
             device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
-            md.idx.size() * sizeof(uint32_t), md.idx.data(),
+            idx.size() * sizeof(uint32_t), idx.data(),
             std::source_location::current());
-        m.count = uint32_t(md.idx.size());
+        m.count = uint32_t(idx.size());
     };
-    for (int t = 0; t < kTypeCount; ++t) {
-        upload(t, buildHull(specs()[t]));
-        upload(kMeshInterior0 + t, buildInterior(specs()[t], cabinOf(t), t));
+    auto upload_legacy = [&](int i, const MeshData& md) {
+        upload(i, md.pos, md.nrm,
+               std::vector<float>(md.pos.size(), -1.0f), md.idx);
+    };
+
+    // The library first; the built-in hulls only if it is not there.
+    if (loadCarLibrary(car_library_path, s_lib_) && !s_lib_.samples.empty()) {
+        g_lib_n = int(s_lib_.samples.size());
+        s_meshes_.assign(size_t(g_lib_n) * 3 + 1, Mesh{});
+        upload_legacy(libBoxMesh(), buildBox());
+        for (int i = 0; i < g_lib_n; ++i) {
+            const CarSample& c = s_lib_.samples[size_t(i)];
+            upload(libMesh(i, 0), c.body.pos, c.body.nrm, c.body.part,
+                   c.body.idx);
+            upload(libMesh(i, 1), c.wheel.pos, c.wheel.nrm, c.wheel.part,
+                   c.wheel.idx);
+            upload(libMesh(i, 2), c.interior.pos, c.interior.nrm,
+                   c.interior.part, c.interior.idx);
+        }
+        // ── WHICH SAMPLES A TYPE MAY WEAR ───────────────────────────
+        // The type still decides behaviour and how often a vehicle is
+        // chosen; the sample decides what is drawn.  A saloon type can
+        // therefore be any of the saloons and hatches in the library,
+        // which is the whole reason the street stops being nine shapes
+        // repeated.  A type whose list comes back empty keeps its
+        // built-in hull, so a library missing a class is survivable.
+        static const char* kSets[kTypeCount][3] = {
+            {"saloon_", "hatch_", nullptr},      // kSedan
+            {"crossover_", "wagon_", nullptr},   // kSuv
+            {"pickup_", nullptr, nullptr},       // kCyber (no sample yet)
+            {"pickup_", nullptr, nullptr},       // kPickup
+            {"semi", nullptr, nullptr},
+            {"police", nullptr, nullptr},
+            {"ambulance", nullptr, nullptr},
+            {"school_bus", nullptr, nullptr},
+            {"fire", nullptr, nullptr},
+        };
+        s_type_samples_.assign(kTypeCount, {});
+        for (int t = 0; t < kTypeCount; ++t) {
+            for (int k = 0; k < 3 && kSets[t][k]; ++k) {
+                for (int id : s_lib_.byPrefix(kSets[t][k])) {
+                    s_type_samples_[size_t(t)].push_back(id);
+                }
+            }
+        }
+        // The minivan and the van have no type of their own yet, so
+        // they ride with the saloons rather than sitting unused.
+        for (const char* p : {"minivan_", "van_"}) {
+            for (int id : s_lib_.byPrefix(p)) {
+                s_type_samples_[kSedan].push_back(id);
+            }
+        }
+        std::cout << "[vehicle] pipeline + " << s_meshes_.size()
+                  << " library meshes ready" << std::endl;
+    } else {
+        g_lib_n = 0;
+        s_meshes_.assign(kMeshCount, Mesh{});
+        for (int t = 0; t < kTypeCount; ++t) {
+            upload_legacy(t, buildHull(specs()[t]));
+            upload_legacy(kMeshInterior0 + t,
+                          buildInterior(specs()[t], cabinOf(t), t));
+        }
+        upload_legacy(kMeshWheel, buildWheel());
+        upload_legacy(kMeshBar, buildBox());
+        std::cout << "[vehicle] pipeline + " << kMeshCount
+                  << " built-in meshes ready" << std::endl;
     }
-    upload(kMeshWheel, buildWheel());
-    upload(kMeshBar, buildBox());
-    std::cout << "[vehicle] pipeline + " << kMeshCount << " meshes ready"
-              << std::endl;
 }
+
+// Replaced instance streams may still be referenced by an in-flight frame.
+// Capacities grow geometrically, so keeping old allocations until device-idle
+// shutdown costs less than one additional maximum-sized stream per type.
+namespace { std::vector<std::shared_ptr<er::BufferInfo>> retired_population_streams; }
 
 void VehicleSystem::destroyStaticMembers(
     const std::shared_ptr<er::Device>& device) {
+    for (auto& buffer : retired_population_streams) buffer->destroy(device);
+    retired_population_streams.clear();
     if (s_pipeline_layout_) device->destroyPipelineLayout(s_pipeline_layout_);
     s_pipeline_layout_ = nullptr;
     if (s_gbuf_pipeline_) device->destroyPipeline(s_gbuf_pipeline_);
@@ -1227,15 +1538,16 @@ int VehicleSystem::lightState(const Signal& sg, int edge) const {
 // kind 5 (plain colour, emissive by `glow`), on the near-side kerb
 // kStopLineM before the node of every controlled approach.
 void VehicleSystem::emitSignals(const glm::vec3& camera_pos) {
-    if (frame_.size() != size_t(kStreamCount)) return;
+    if (frame_.size() != size_t(streamCount())) return;
     auto box = [&](const glm::vec3& c, const glm::vec3& half, float yaw,
                    const glm::vec3& rgb, float glow) {
         const glm::mat4 M =
             glm::translate(glm::mat4(1.0f), c) *
             glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0, 1, 0)) *
             glm::scale(glm::mat4(1.0f), half);
-        frame_[kMeshBar].push_back({M, glm::vec4(rgb, 0.0f),
-                                    glm::vec4(5.0f, 0.0f, 0.0f, glow)});
+        frame_[size_t(barStream())].push_back(
+            {M, glm::vec4(rgb, 0.0f), glm::vec4(5.0f, 0.0f, 0.0f, glow),
+             glm::vec4(0.0f)});
     };
     const glm::vec3 kPole(0.36f, 0.37f, 0.39f), kHead(0.07f, 0.07f, 0.08f);
     const glm::vec3 kLampOn[3] = {{1.0f, 0.08f, 0.05f}, {1.0f, 0.72f, 0.10f}, {0.10f, 1.0f, 0.35f}};
@@ -1403,6 +1715,9 @@ int VehicleSystem::spawnCar(uint32_t seed, const glm::vec3& near_pos) {
     const float r = h01(seed, 0x21u);
     v.type = r < 0.42f ? kSedan : r < 0.72f ? kSuv : r < 0.88f ? kPickup : kCyber;
     v.color = v.type == kCyber ? glm::vec3(0.72f, 0.73f, 0.75f) : paletteColor(seed);
+    // The baked car this one is, if a library is loaded (see
+    // assignSample); v.color stays as the fallback for when it is not.
+    assignSample(v);
     v.ambient = false;
     parkAt(v, rp);
     vehicles_.push_back(v);
@@ -1593,6 +1908,7 @@ void VehicleSystem::spawnAmbient(const glm::vec3& camera_pos, uint32_t seed) {
     case kFireEngine: v.color = {0.75f, 0.05f, 0.04f}; break;
     default:          v.color = paletteColor(seed); break;
     }
+    assignSample(v);
     const float lr = h01(seed, 0x41u);
     v.lights = (v.type == kPolice && lr < 0.30f) ||
                (v.type == kAmbulance && lr < 0.50f) ||
@@ -1925,6 +2241,40 @@ void VehicleSystem::update(float delta_t, float speed_scale,
     if (node_claim_age_.size() != node_claim_.size())
         node_claim_age_.assign(node_claim_.size(), 0.0f);
     for (float& t : node_claim_age_) t += dt;
+    // Advance distant routes cheaply before classifying the current position.
+    // No junction arbitration, pathfinding, ground queries or wheel animation.
+    std::vector<uint8_t> coarse_advanced(vehicles_.size(), 0);
+    for (size_t i = 0; i < vehicles_.size(); ++i) {
+        auto& v = vehicles_[i];
+        const glm::vec2 d(v.pos.x-camera_pos.x, v.pos.z-camera_pos.z);
+        if (v.dormant || glm::dot(d,d) <= kSimRadius*kSimRadius) continue;
+        if (v.parked) { v.idle_t = std::max(0.0f, v.idle_t-dt); continue; }
+        coarse_advanced[i] = 1;
+        if (v.claim >= 0 && node_claim_[v.claim] == int(i)) node_claim_[v.claim] = -1;
+        v.claim = -1;
+        const auto& spec = specs()[v.type];
+        v.speed = spec.vmax * 0.6f;
+        float remaining = v.speed * std::min(speed_scale,
+            kVisualCapMs/std::max(spec.vmax,1.0f)) * dt;
+        while (v.leg >= 0 && v.leg < int(v.route.size())) {
+            const auto leg = v.route[v.leg];
+            const float dir = leg.s_to >= leg.s_from ? 1.0f : -1.0f;
+            const float travel = std::min(remaining, std::abs(leg.s_to-v.s));
+            v.s += travel*dir; remaining -= travel;
+            glm::vec3 tangent;
+            v.pos = lanePos(edges_[leg.edge], v.s, dir, 0.0f,
+                            &tangent, nullptr, v.lane_x);
+            v.yaw = std::atan2(tangent.x,tangent.z);
+            if (std::abs(v.s-leg.s_to) > 1e-3f) break;
+            if (++v.leg == int(v.route.size())) {
+                v.parked = true; v.speed = 0; v.leg = -1;
+                v.route.clear(); v.idle_t = v.ambient ? 10.0f : 0.0f;
+                break;
+            }
+            v.s = v.route[v.leg].s_from;
+            if (remaining <= 0) break;
+        }
+    }
     // ── who is on which edge (car following) ────────────────────────
     std::unordered_map<int, std::vector<int>> on_edge;
     const float sim2 = kSimRadius * kSimRadius;
@@ -1941,6 +2291,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         const float dx = v.pos.x - camera_pos.x, dz = v.pos.z - camera_pos.z;
         const float d2 = dx * dx + dz * dz;
         if (d2 > sim2) continue;
+        if (coarse_advanced[i]) continue; // promoted next frame; never integrate twice
         tick(v, int(i), dt, speed_scale, on_edge);
         if (ground && d2 < kClampRadius * kClampRadius) {
             float gy; glm::vec3 gn;
@@ -1951,7 +2302,8 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         }
     }
     // ── emit the frame ──────────────────────────────────────────────
-    if (frame_.size() != size_t(kStreamCount)) frame_.resize(kStreamCount);
+    if (frame_.size() != size_t(streamCount()))
+        frame_.resize(size_t(streamCount()));
     for (auto& f : frame_) f.clear();
     const float draw2 = kDrawRadius * kDrawRadius;
     for (const Vehicle& v : vehicles_) {
@@ -1982,7 +2334,6 @@ void VehicleSystem::update(float delta_t, float speed_scale,
 }
 
 void VehicleSystem::emit(const Vehicle& v) {
-    const Spec& sp = specs()[v.type];
     // The hull's FORWARD is model +x (the side profile's x), and yaw
     // is atan2(t.x, t.z) -- the angle that turns +z onto the road.
     // Turning the model a quarter back first puts +x on the road;
@@ -1992,14 +2343,75 @@ void VehicleSystem::emit(const Vehicle& v) {
         glm::rotate(glm::mat4(1.0f), v.yaw - 1.5707963f, glm::vec3(0, 1, 0));
     const float seed01 = h01(v.seed, 0x91u);
     const float blink = v.lights ? 1.0f + anim_t_ : 0.0f;
+
+    // ── THE LIBRARY PATH ────────────────────────────────────────────
+    // Everything drawn comes from the sample this vehicle was given at
+    // spawn: its meshes, its axles, its wheel size, its light bar.  The
+    // TYPE is not consulted at all here — that is the point of the id.
+    if (g_lib_n > 0 && v.sample >= 0 && v.sample < g_lib_n) {
+        const CarSample& c = s_lib_.samples[size_t(v.sample)];
+        const CarPaint& p =
+            s_lib_.paints[size_t(v.paint) % s_lib_.paints.size()];
+        const CarInterior& in_c =
+            s_lib_.interiors[size_t(v.trim) % s_lib_.interiors.size()];
+        const glm::vec4 paint(p.metal, p.flake, p.coat, 0.0f);
+        const int n = g_lib_n;
+        frame_[size_t(v.sample)].push_back(
+            {root, glm::vec4(p.base, 0.0f),
+             glm::vec4(0.0f, float(v.sample), seed01, blink), paint});
+        if (s_glass_pipeline_) {
+            frame_[size_t(3 * n + 1 + v.sample)].push_back(
+                {root, glm::vec4(p.base, 0.0f),
+                 glm::vec4(3.0f, float(v.sample), seed01, blink), paint});
+        }
+        if (!c.interior.empty()) {
+            frame_[size_t(2 * n + v.sample)].push_back(
+                {root, glm::vec4(in_c.rgb, 0.0f),
+                 glm::vec4(4.0f, float(v.sample), seed01, blink),
+                 glm::vec4(0.0f)});
+        }
+        for (size_t k = 0; k < c.axle_x.size(); ++k) {
+            const float dual = k < c.axle_dual.size() ? c.axle_dual[k] : 1.0f;
+            const bool front = (k == 0);
+            for (int side = 0; side < 2; ++side) {
+                const float z = (side == 0 ? -1.0f : 1.0f) *
+                    (c.track_z - 0.5f * c.wheel_w * (dual - 1.0f));
+                glm::mat4 M = root * glm::translate(
+                    glm::mat4(1.0f), glm::vec3(c.axle_x[k], c.wheel_r, z));
+                if (front && v.steer != 0.0f) {
+                    M = M * glm::rotate(glm::mat4(1.0f), -v.steer,
+                                        glm::vec3(0, 1, 0));
+                }
+                // The baked wheel is already in metres, so the spin is
+                // the only transform it needs — no scale, unlike the
+                // built-in unit cylinder below.
+                M = M * glm::rotate(glm::mat4(1.0f), -v.wheel,
+                                    glm::vec3(0, 0, 1));
+                if (dual > 1.0f) {
+                    M = M * glm::scale(glm::mat4(1.0f),
+                                       glm::vec3(1.0f, 1.0f, dual));
+                }
+                frame_[size_t(n + v.sample)].push_back(
+                    {M, glm::vec4(0.04f, 0.04f, 0.045f, 0.0f),
+                     glm::vec4(1.0f, float(v.sample), seed01, blink),
+                     glm::vec4(0.0f)});
+            }
+        }
+        return;
+    }
+
+    // ── THE BUILT-IN HULLS ──────────────────────────────────────────
+    const Spec& sp = specs()[v.type];
+    const glm::vec4 no_paint(0.0f);
     // hull: the mesh is in metres with the ground at y = 0
     frame_[v.type].push_back({root, glm::vec4(v.color, 0.0f),
-                              glm::vec4(0.0f, float(v.type), seed01, blink)});
+                              glm::vec4(0.0f, float(v.type), seed01, blink),
+                              no_paint});
     // the same hull again in the glass pass (kind 3: windows only)
     if (s_glass_pipeline_)
-        frame_[kStreamGlass0 + v.type].push_back(
+        frame_[kLegacyStreamGlass0 + v.type].push_back(
             {root, glm::vec4(v.color, 0.0f),
-             glm::vec4(3.0f, float(v.type), seed01, blink)});
+             glm::vec4(3.0f, float(v.type), seed01, blink), no_paint});
     // the interior (kind 4): seats in one of four trims by the seed
     {
         const float tr = h01(v.seed, 0x81u);
@@ -2009,31 +2421,52 @@ void VehicleSystem::emit(const Vehicle& v) {
                                           : glm::vec3(0.62f, 0.58f, 0.50f);
         frame_[kMeshInterior0 + v.type].push_back(
             {root, glm::vec4(trim, 0.0f),
-             glm::vec4(4.0f, float(v.type), seed01, blink)});
+             glm::vec4(4.0f, float(v.type), seed01, blink), no_paint});
     }
     // wheels
     for (size_t k = 0; k < sp.wheel_x.size(); ++k) {
         const float dual = k < sp.wheel_dual.size() ? sp.wheel_dual[k] : 1.0f;
         const bool front = k == 0;
         for (int side = 0; side < 2; ++side) {
-            const float z = (side == 0 ? -1.0f : 1.0f) * (sp.wheel_z - 0.5f * sp.wheel_w * (dual - 1.0f));
+            const float z = (side == 0 ? -1.0f : 1.0f) *
+                (sp.wheel_z - 0.5f * sp.wheel_w * (dual - 1.0f));
             glm::mat4 M = root *
-                glm::translate(glm::mat4(1.0f), glm::vec3(sp.wheel_x[k], sp.wheel_r, z));
+                glm::translate(glm::mat4(1.0f),
+                               glm::vec3(sp.wheel_x[k], sp.wheel_r, z));
             if (front && v.steer != 0.0f)
                 M = M * glm::rotate(glm::mat4(1.0f), -v.steer, glm::vec3(0, 1, 0));
             M = M * glm::rotate(glm::mat4(1.0f), -v.wheel, glm::vec3(0, 0, 1)) *
                 glm::scale(glm::mat4(1.0f),
-                           glm::vec3(sp.wheel_r, sp.wheel_r, 0.5f * sp.wheel_w * dual));
-            frame_[kMeshWheel].push_back({M, glm::vec4(0.04f, 0.04f, 0.045f, 0.0f),
-                                          glm::vec4(1.0f, float(v.type), seed01, 0.0f)});
+                           glm::vec3(sp.wheel_r, sp.wheel_r,
+                                     0.5f * sp.wheel_w * dual));
+            frame_[kMeshWheel].push_back(
+                {M, glm::vec4(0.04f, 0.04f, 0.045f, 0.0f),
+                 glm::vec4(1.0f, float(v.type), seed01, 0.0f), no_paint});
         }
     }
     if (sp.bar) {
         const glm::mat4 M = root *
             glm::translate(glm::mat4(1.0f), sp.bar_at) *
-            glm::scale(glm::mat4(1.0f), glm::vec3(0.5f * sp.bar_size.x, 0.07f, 0.5f * sp.bar_size.y));
-        frame_[kMeshBar].push_back({M, glm::vec4(0.15f, 0.15f, 0.18f, 0.0f),
-                                    glm::vec4(2.0f, float(v.type), seed01, blink)});
+            glm::scale(glm::mat4(1.0f),
+                       glm::vec3(0.5f * sp.bar_size.x, 0.07f,
+                                 0.5f * sp.bar_size.y));
+        frame_[size_t(barStream())].push_back(
+            {M, glm::vec4(0.15f, 0.15f, 0.18f, 0.0f),
+             glm::vec4(2.0f, float(v.type), seed01, blink), no_paint});
+    }
+}
+
+void VehicleSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkinBatch>& out) const {
+    if (!loaded() || !s_pipeline_) return;
+    for (size_t stream=0; stream<frame_.size() && int(stream)<streamGlass0(); ++stream) {
+        const int mesh=streamMesh(int(stream));
+        if (mesh<0 || mesh>=int(s_meshes_.size())) continue;
+        for (const auto& instance : frame_[stream]) {
+            out.emplace_back(); auto& b=out.back();
+            b.positions=&s_meshes_[mesh].shadow.positions;
+            b.indices=&s_meshes_[mesh].shadow.indices;
+            b.model=instance.xform;
+        }
     }
 }
 
@@ -2041,7 +2474,7 @@ void VehicleSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
     out.positions.clear(); out.indices.clear();
     if (!loaded() || !s_pipeline_) return;
     // Glass duplicates hull triangles, so submit each hull only once.
-    for (size_t stream = 0; stream < frame_.size() && stream < kStreamGlass0; ++stream) {
+    for (size_t stream = 0; stream < frame_.size() && int(stream) < streamGlass0(); ++stream) {
         const int mesh = streamMesh(int(stream));
         if (mesh < 0 || mesh >= int(s_meshes_.size())) continue;
         for (const auto& instance : frame_[stream])
@@ -2073,7 +2506,7 @@ void VehicleSystem::draw(
         if (!s_inst_buf_ || need > s_inst_capacity_) {
             uint32_t cap = s_inst_capacity_ ? s_inst_capacity_ : 1024u;
             while (cap < need) cap *= 2u;
-            if (s_inst_buf_) s_inst_buf_->destroy(s_device_);
+            if (s_inst_buf_) retired_population_streams.push_back(s_inst_buf_);
             s_inst_buf_ = std::make_shared<er::BufferInfo>();
             er::Helper::createBuffer(
                 s_device_,
@@ -2089,7 +2522,7 @@ void VehicleSystem::draw(
             if (!f.empty()) {
                 s_device_->updateBufferMemory(
                     s_inst_buf_->memory, uint64_t(f.size()) * sizeof(PartInstance),
-                    f.data(), off);
+                    f.data(), off, true);
             }
             off += uint64_t(f.size()) * sizeof(PartInstance);
         }
@@ -2132,16 +2565,16 @@ void VehicleSystem::draw(
     cmd_buf->setScissors(scissors, 0, 1);
     cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
                                 s_pipeline_layout_, desc_sets);
-    std::vector<uint64_t> offs = {0, 0, 0};
+    std::vector<uint64_t> offs = {0, 0, 0, 0};
     uint32_t first = 0;
     bool glass_bound = false;
     for (size_t m = 0; m < frame_.size(); ++m) {
         const uint32_t n = uint32_t(frame_[m].size());
         const int mi = streamMesh(int(m));
         if (mi < 0 || mi >= int(s_meshes_.size())) { first += n; continue; }
-        if (glass_only && int(m) < kStreamGlass0) { first += n; continue; }
-        if ((deferred || opaque_only) && int(m) >= kStreamGlass0) break;
-        if (int(m) >= kStreamGlass0 && !glass_bound) {
+        if (glass_only && int(m) < streamGlass0()) { first += n; continue; }
+        if ((deferred || opaque_only) && int(m) >= streamGlass0()) break;
+        if (int(m) >= streamGlass0() && !glass_bound) {
             if (!s_glass_pipeline_) break;     // no glass pass this build
             cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS, s_glass_pipeline_);
             cmd_buf->bindDescriptorSets(er::PipelineBindPoint::GRAPHICS,
@@ -2149,9 +2582,10 @@ void VehicleSystem::draw(
             glass_bound = true;
         }
         const Mesh& mesh = s_meshes_[size_t(mi)];
-        if (n && mesh.pos && mesh.nrm && mesh.idx) {
+        if (n && mesh.pos && mesh.nrm && mesh.part && mesh.idx) {
             std::vector<std::shared_ptr<er::Buffer>> vbs = {
-                mesh.pos->buffer, mesh.nrm->buffer, s_inst_buf_->buffer};
+                mesh.pos->buffer, mesh.nrm->buffer, mesh.part->buffer,
+                s_inst_buf_->buffer};
             cmd_buf->bindVertexBuffers(0, vbs, offs);
             cmd_buf->bindIndexBuffer(mesh.idx->buffer, 0, er::IndexType::UINT32);
             cmd_buf->drawIndexed(mesh.count, n, 0, 0, first);

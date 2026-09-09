@@ -524,37 +524,36 @@ std::pair<std::string, int> exec(const char* cmd) {
     return make_pair(result, return_code);
 }
 
-static void analyzeCommandLine(
+static bool analyzeCommandLine(
     const std::string& line,
     std::string& input_name,
     std::string& output_name,
     std::string& params_str) {
 
-    auto o0 = line.rfind(' ');
-    auto o1 = line.rfind('\t');
-    if (o1 != std::string::npos) {
-        if (o0 != std::string::npos) {
-            o0 = std::max(o0, o1);
-        }
-    }
-    auto e0 = line.rfind('\r');
-    auto e1 = line.rfind('\n');
-    if (e1 != std::string::npos) {
-        if (e0 != std::string::npos) {
-            e0 = std::max(e0, e1);
-        }
+    input_name.clear();
+    output_name.clear();
+    params_str.clear();
+    const auto begin = line.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos || line[begin] == '#') return false;
+
+    const auto end = line.find_last_not_of(" \t\r\n");
+    const std::string command = line.substr(begin, end - begin + 1);
+    const auto input_end = command.find_first_of(" \t");
+    const auto output_sep = command.find_last_of(" \t");
+    if (input_end == std::string::npos || input_end == output_sep) {
+        throw std::runtime_error("Invalid shader compile entry: " + command);
     }
 
-    output_name = "\\" + line.substr(o0 + 1, e0 - (o0 + 1));
-
-    auto i0 = line.find(' ');
-    auto i1 = line.find('\t');
-    if (i0 != std::string::npos && i1 != std::string::npos) {
-        i0 = std::max(i0, i1);
+    // Entries have the form: source [compiler options] -o output.
+    const auto option_end = command.find_last_not_of(" \t", output_sep);
+    const auto option_sep = command.find_last_of(" \t", option_end);
+    if (command.substr(option_sep + 1, option_end - option_sep) != "-o") {
+        throw std::runtime_error("Shader compile entry requires -o output: " + command);
     }
-    input_name = "\\" + line.substr(0, i0);
-
-    params_str = line.substr(i0, o0 - i0);
+    input_name = "\\" + command.substr(0, input_end);
+    output_name = "\\" + command.substr(output_sep + 1);
+    params_str = command.substr(input_end, output_sep - input_end);
+    return true;
 }
 
 std::string compileGlobalShaders() {
@@ -582,7 +581,7 @@ std::string compileGlobalShaders() {
             std::istringstream buf_str(buffer);
             for (std::string line; std::getline(buf_str, line); ) {
                 std::string input_name, output_name, params_str;
-                analyzeCommandLine(line, input_name, output_name, params_str);
+                if (!analyzeCommandLine(line, input_name, output_name, params_str)) continue;
                 input_name = s_src_shader_path + input_name;
                 output_name = s_output_path + output_name;
 
@@ -699,7 +698,7 @@ std::string  initCompileGlobalShaders(
     std::istringstream buf_str(buffer);
     for (std::string line; std::getline(buf_str, line); ) {
         std::string input_name, output_name, params_str;
-        analyzeCommandLine(line, input_name, output_name, params_str);
+        if (!analyzeCommandLine(line, input_name, output_name, params_str)) continue;
         input_name = s_src_shader_path + input_name;
         output_name = s_output_path + output_name;
 

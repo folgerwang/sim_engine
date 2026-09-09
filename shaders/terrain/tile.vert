@@ -1,6 +1,7 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 #include "..\global_definition.glsl.h"
+#include "..\water_waves.glsl.h"
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
 	ViewCameraInfo camera_info;
@@ -138,29 +139,9 @@ void main() {
 #endif
 
 #if defined(WATER_LBM)
-    // ── LBM-driven water surface displacement ────────────────────────
-    // Wherever the camera-following LBM patch covers this vertex, add
-    // the sim's height deviation to the water surface.  Feathered over
-    // the outer 12% of the patch so the displaced mesh meets the
-    // un-simulated water outside the patch without a step, and scaled
-    // down as the water gets very shallow so ripples never poke the
-    // surface through the river bed at the banks.
-    if (out_data.water_depth > 0.02f && lbm_region_vs.w > 0.0f) {
-        float lbm_span = lbm_region_vs.y * lbm_region_vs.w;
-        vec2 patch_uv = (pos_xz_ws - lbm_region_vs.xz) / lbm_span;
-        if (all(greaterThan(patch_uv, vec2(0.0f))) &&
-            all(lessThan(patch_uv, vec2(1.0f)))) {
-            float dev = texture(lbm_surface_tex_vs, patch_uv).w;
-            // Ripples are centimetres; anything beyond a decimetre is
-            // sim drift or a blow-up, and must never move the surface
-            // out of its channel (see lbm_water.comp's mean restore).
-            dev = (dev == dev) ? clamp(dev, -0.12f, 0.12f) : 0.0f;
-            vec2  eb  = min(patch_uv, vec2(1.0f) - patch_uv);
-            float feather = smoothstep(0.0f, 0.12f, min(eb.x, eb.y));
-            float shallow = clamp(out_data.water_depth * 4.0f, 0.0f, 1.0f);
-            layer_height += dev * feather * shallow;
-        }
-    }
+    // Keep the base level exactly as authored; add only bounded LBM waves.
+    layer_height += waterWaveOffset(lbm_surface_tex_vs, lbm_region_vs,
+                                    pos_xz_ws, out_data.water_depth);
 #endif
 
     vec4 position_ws = vec4(pos_xz_ws.x, layer_height, pos_xz_ws.y, 1.0);

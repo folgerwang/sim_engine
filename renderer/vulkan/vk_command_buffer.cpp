@@ -40,6 +40,9 @@ void VulkanCommandBuffer::endCommandBuffer() {
 }
 
 void VulkanCommandBuffer::beginDebugUtilsLabel(const char* label_name) {
+    // VK_EXT_debug_utils is optional (normally disabled in Release).
+    // Only emit paired labels when both extension entry points exist.
+    if (!vkCmdBeginDebugUtilsLabelEXT || !vkCmdEndDebugUtilsLabelEXT) return;
     VkDebugUtilsLabelEXT label = {};
     label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
     label.pLabelName = label_name;
@@ -47,6 +50,7 @@ void VulkanCommandBuffer::beginDebugUtilsLabel(const char* label_name) {
 }
 
 void VulkanCommandBuffer::endDebugUtilsLabel() {
+    if (!vkCmdBeginDebugUtilsLabelEXT || !vkCmdEndDebugUtilsLabelEXT) return;
     vkCmdEndDebugUtilsLabelEXT(cmd_buf_);
 }
 

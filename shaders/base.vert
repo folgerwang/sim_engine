@@ -39,6 +39,13 @@ void ntLoadModelParams() {
         (pc_params.flip_uv_coord &
          (MODEL_FLAG_VEGETATION_SWAY | MODEL_FLAG_DEFERRED_RELIGHT |
           MODEL_FLAG_NODE_TABLE));
+    // ...except on a node that opted OUT of the sway (MODEL_FLAG_NO_SWAY,
+    // set per record for the rock scatter that shares the tree file).
+    // The per-drawable bit is what the OR above just handed it, so the
+    // veto has to be applied AFTER the merge, not before.
+    if ((model_params.flip_uv_coord & MODEL_FLAG_NO_SWAY) != 0u) {
+        model_params.flip_uv_coord &= ~MODEL_FLAG_VEGETATION_SWAY;
+    }
     model_params.cascade_idx = pc_params.cascade_idx;
     model_params.debug_force_red = pc_params.debug_force_red;
     model_params.debug_skip_skinning = pc_params.debug_skip_skinning;

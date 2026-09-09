@@ -316,6 +316,7 @@ void GameProfiler::collectResults(
             sd.end_ms   = static_cast<float>(
                 raw[entry.end_query]   - frame_start_tick) * ms_factor;
         }
+        rec.recorded_span_ms = std::max(rec.recorded_span_ms, sd.end_ms);
         rec.scopes.push_back(sd);
     }
 
@@ -371,6 +372,7 @@ void GameProfiler::collectResults(
         return;
     }
 
+    rec.sample_id = ++m_sample_serial_;
     m_frames_[m_frame_write_idx_] = std::move(rec);
     m_frame_write_idx_ = (m_frame_write_idx_ + 1) % kHistorySize;
     if (m_frame_count_ < kHistorySize) ++m_frame_count_;
@@ -584,6 +586,7 @@ void GameProfiler::drawImGui()
 
     ImGui::SameLine(0, 20);
     ImGui::TextDisabled("Wheel=zoom (live)  |  Drag=pan (auto-pause)  |  Space=toggle");
+    ImGui::TextDisabled("CPU/GPU: independent frame-relative clocks; graphics scopes exclude async compute.");
 
     ImGui::Separator();
 

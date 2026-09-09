@@ -1,5 +1,9 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
+// Opaque terrain never discards or writes depth. Reject occluded fragments
+// before material synthesis and VT feedback atomics (which inhibit automatic
+// early testing), especially when re-rasterizing into the G-buffer.
+layout(early_fragment_tests) in;
 #include "..\global_definition.glsl.h"
 #include "..\weather\weather_common.glsl.h"
 #include "..\functions.glsl.h"

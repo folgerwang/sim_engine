@@ -35,6 +35,7 @@
 
 #include "renderer/renderer.h"
 #include "actor_shadow_geometry.h"
+#include "scene_rendering/rt_skin_types.h"
 #include "vehicle_system.h"
 
 namespace engine {
@@ -123,6 +124,7 @@ public:
     static std::shared_ptr<renderer::Pipeline> s_skin_gbuf_pipeline_;
     static std::shared_ptr<renderer::Pipeline> s_npc_gbuf_pipeline_;
     void collectShadowGeometry(ActorShadowGeometry& out) const;
+    void collectGpuShadowGeometry(std::vector<scene_rendering::RtSkinBatch>& out) const;
 
 private:
     struct Step {
@@ -196,6 +198,7 @@ private:
         // archetypes: re-deriving stalled 1.2% of routes outright and
         // left 3.7% ping-ponging; advancing arrives on all of them.
         int16_t nav_room = -1;
+        bool  indoor_idle = false;     // stationary at an indoor schedule anchor
         bool  walking = false;
         bool  inited = false;
         // 0 on foot, 2 in their car (the vehicle system drives it; the
@@ -309,7 +312,7 @@ private:
                          float walk_scale);
     bool spawnStroller(const glm::vec3& camera_pos, Stroller& w);
     bool nextHop(Stroller& w);
-    void tickStroller(Stroller& w, float dt, float walk_scale);
+    void tickStroller(Stroller& w, float dt, float walk_scale, bool detailed);
     int  countHousesNear(const glm::vec3& c, float radius) const;
     bool randomHouseNear(const glm::vec3& c, float min_m, float max_m,
                          uint32_t& rng, int& out) const;
@@ -389,6 +392,8 @@ private:
     struct NpcAsset {
         ActorShadowGeometry shadow;
         std::vector<glm::u8vec4> shadow_joints, shadow_weights;
+        std::vector<glm::u16vec4> rt_joints;
+        std::vector<glm::vec4> rt_weights;
         std::shared_ptr<renderer::BufferInfo> vb, ib;
         uint32_t index_count = 0;
         uint32_t tri_count = 0;

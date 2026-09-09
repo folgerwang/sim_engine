@@ -2981,6 +2981,13 @@ float plantSinkM(const std::string& node_name, float h_m) {
     if (cat == "ground") return kPlantSinkGroundM;
     if (cat == "rock")   return std::min(kPlantSinkRockMaxM,
                                          std::max(0.0f, h_m) * kPlantSinkRockFrac);
+    // "crag" = the mountain outcrops (plant_gen._ROCK_BIG_FAMILIES).
+    // The BAKE already buried them by ~30% of their height and seated
+    // them on the lowest ground under their own footprint, because only
+    // the generator knows either number; this is the same small extra
+    // seat every other category takes, and on a 10 m stone it is noise.
+    if (cat == "crag")   return std::min(kPlantSinkRockMaxM,
+                                         std::max(0.0f, h_m) * kPlantSinkRockFrac);
     return 0.0f;
 }
 }  // namespace
@@ -3068,6 +3075,14 @@ static void parsePlantLodBands(
                 if (gmode == 0) node.interior_ = 1;
                 ++matched;   // arms has_plant_lod_ / the per-node pass
             }
+        }
+        // ROCKS DO NOT SWAY.  The scatter rides in the tree file (see
+        // NodeInfo::no_sway_), and the sway flag is per drawable, so the
+        // veto has to be per node and it has to be set before the LOD
+        // parse can `continue` past it.
+        {
+            const std::string cat_ns = lodCategoryOf(node.name_);
+            node.no_sway_ = (cat_ns == "rock" || cat_ns == "crag") ? 1 : 0;
         }
         int64_t ti = 0, tj = 0;
         float tile_m = 0.0f, near_m = 0.0f, far_m = 0.0f;
@@ -5311,7 +5326,7 @@ static void drawNodeMesh(
                 (node.interior_ ? 0x04 : 0x00) |
                 // bit 3: vegetation — base.vert / base_depthonly.vert
                 // bend this draw in the wind (MODEL_FLAG_VEGETATION_SWAY).
-                (drawable_object->m_vegetation_sway_
+                ((drawable_object->m_vegetation_sway_ && !node.no_sway_)
                      ? MODEL_FLAG_VEGETATION_SWAY : 0x00u) |
                 // bit 4: this node's forward colour is overwritten by
                 // the deferred re-rasterise + resolve this frame, so
@@ -5344,7 +5359,7 @@ static void drawNodeMesh(
             // On vegetation the same field carries the node's plant
             // extent for the sway profile (see packVegPlantExtent).
             model_params.debug_skip_skinning =
-                drawable_object->m_vegetation_sway_
+                (drawable_object->m_vegetation_sway_ && !node.no_sway_)
                     ? packVegPlantExtent(
                           drawable_object->meshes_[node.mesh_idx_].bbox_min_,
                           drawable_object->meshes_[node.mesh_idx_].bbox_max_)
@@ -7786,14 +7801,18 @@ static void ntStageRecords(
         glsl::ModelParams r{};
         r.model_mat = iw * node.cached_matrix_;
         r.flip_uv_coord =
-            base_flags | (node.interior_ ? MODEL_FLAG_INTERIOR : 0x00u);
+            base_flags | (node.interior_ ? MODEL_FLAG_INTERIOR : 0x00u) |
+            // Rocks in the tree file: the per-drawable sway bit lives on
+            // the push constant, so the veto travels per record and the
+            // vertex shader clears the bit after merging the two.
+            (node.no_sway_ ? MODEL_FLAG_NO_SWAY : 0x00u);
         r.cascade_idx = 0u;
         r.debug_force_red = 0u;
         // Vegetation: the node's plant extent for the sway profile.  The
         // shader reads it from the RECORD before the push constant's
         // (per-drawable, 0) value overwrites the field.
         r.debug_skip_skinning =
-            object_->m_vegetation_sway_
+            (object_->m_vegetation_sway_ && !node.no_sway_)
                 ? packVegPlantExtent(object_->meshes_[mesh_idx].bbox_min_,
                                      object_->meshes_[mesh_idx].bbox_max_)
                 : 0u;

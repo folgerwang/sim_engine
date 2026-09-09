@@ -42,6 +42,9 @@ public:
     // Returns nullptr / (uint32_t)-1 if the hardware exposes too few queues
     // to spare one — callers should fall back to the synchronous path
     // (createBuffer + submitAndWaitTransientCommandBuffer) in that case.
+    // Optional spare queue in the graphics family: no ownership transfers.
+    virtual std::shared_ptr<Queue> getAsyncComputeQueue() { return {}; }
+    virtual uint32_t getAsyncComputeFamily() const { return 0; }
     virtual bool hasLoaderQueue() const = 0;
     virtual std::shared_ptr<Queue> getLoaderQueue() = 0;
     virtual uint32_t getLoaderQueueFamilyIndex() const = 0;

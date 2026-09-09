@@ -199,6 +199,16 @@ VulkanDevice::VulkanDevice(
             compute_queue_index,
             transit_queue_index);
 
+    // Queue 0 is graphics/present; last two queues belong to transient
+    // uploads and the loader. Reserve queue 1 only when it is independent.
+    if (compute_queue_index == queue_family_index &&
+        queue_list.getQueueInfo(compute_queue_index).queue_count_ >= 4) {
+        async_compute_family_ = compute_queue_index;
+        async_compute_queue_ = getDeviceQueue(compute_queue_index, 1);
+        std::cout << "[RT_SKIN] async compute family=" << compute_queue_index
+                  << " queue=1" << std::endl;
+    }
+
     transient_fence_ =
         createFence(std::source_location::current());
 

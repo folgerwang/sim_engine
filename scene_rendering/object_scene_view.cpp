@@ -99,6 +99,9 @@ void ObjectSceneView::duplicateDepthBuffer(
     er::ImageResourceInfo depth_src_info = {
         er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         SET_FLAG_BIT(Access, DEPTH_STENCIL_ATTACHMENT_WRITE_BIT),
+        // Opaque terrain uses explicit early tests; cutouts can write late.
+        // The decal coverage copy must see both kinds of depth writes.
+        SET_FLAG_BIT(PipelineStage, EARLY_FRAGMENT_TESTS_BIT) |
         SET_FLAG_BIT(PipelineStage, LATE_FRAGMENT_TESTS_BIT) };
 
     er::ImageResourceInfo depth_dst_info = {

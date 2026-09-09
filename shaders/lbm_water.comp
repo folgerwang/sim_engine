@@ -1,6 +1,7 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 #include "global_definition.glsl.h"
+#include "water_waves.glsl.h"
 
 // ── D2Q9 shallow-water Lattice-Boltzmann river surface ───────────────
 // A REAL LBM this time (the old lbm_patch.comp was a stranded hair
@@ -69,6 +70,14 @@ float loadF(int i, ivec2 p) {
     return imageLoad(src_fC, p).r;
 }
 
+float waveAt(ivec2 p, int size, bool reset) {
+    if (reset) return 0.0;
+    p = clamp(p, ivec2(0), ivec2(size - 1));
+    float depth = 0.0;
+    for (int i = 0; i < 9; ++i) depth += loadF(i, p);
+    return boundedWaterWave((depth - params.rest_depth) * params.normal_amp);
+}
+
 // hash for the stirring term — deterministic per cell+frame
 float lw_h21(vec2 p) {
     vec3 q = fract(vec3(p.xyx) * 0.1031);
@@ -113,6 +122,7 @@ void main() {
         // after ring across the near water.
         ivec2 src = clamp(pc + shift - kE[i], ivec2(0), ivec2(N - 1));
         f[i] = loadF(i, src);
+        fresh = fresh || isnan(f[i]) || isinf(f[i]);
     }
 
     // Rest-state equilibrium fill on the first frame / after a reset.
@@ -176,22 +186,7 @@ void main() {
     } else {
         flow = params.flow_dir.xy;
     }
-    // ── Stir: broadband, and only where there is a current ─────────
-    // The old stir was ONE product of two sine gratings (3-4 m period)
-    // over the whole patch, pushed along a fixed diagonal: a regular
-    // lattice of ripples, amplified x26 into the normal, which from a
-    // deck reads as ruled lines and, undersampled at range, as the
-    // moire arcs that converged on the patch's far corner.  It ran on
-    // still water too, so a lake's near field carried a ripple field
-    // the wind waves outside the patch do not have -- the patch drew
-    // itself.  Now: six incommensurate travelling components at
-    // 5-20 m on two independent axes (nothing for the eye to lock on
-    // to), gated by the local CURRENT, so a river's surface is worked
-    // and a lake's is left to the wind waves tile_water.frag draws
-    // everywhere.  0.02: the longer components carry less slope per
-    // unit of height than the old 3 m grating did, so the budget is
-    // doubled to keep a river's ripple slopes in the band they were
-    // tuned at (~3% at x26, against the grating's 6%).
+    // Gentle momentum stirring on lakes, stronger stirring in a current.
     float t = params.time;
     float sa = sin(dot(wpos, vec2( 0.74,  0.31)) * 0.53 + t * 1.30)
              + sin(dot(wpos, vec2(-0.42,  0.65)) * 0.87 + t * 0.90 + 1.7)
@@ -202,9 +197,8 @@ void main() {
     float stir_gain = smoothstep(0.03, 0.40, length(flow));
     // Rain rings: 1.5e-4 per cell per step was ~40 drops a frame on
     // the patch -- a downpour on a clear day.  A rare touch now.
-    float drop = (lw_h21(wpos + t) > 0.999998) ? 0.03 : 0.0;
     vec2 force = flow * params.flow_strength +
-                 vec2(sa, sb) * (0.02 * stir_gain);
+                 vec2(sa, sb) * (0.005 + 0.015 * stir_gain);
 
     // ── BGK collision against shallow-water equilibrium ─────────────
     float uu = dot(u, u) * inv_e2;
@@ -230,10 +224,9 @@ void main() {
         out_f[i] = f[i] - (f[i] - feq) / tau + fi;
         out_f[i] = max(out_f[i], 0.0);
     }
-    out_f[0] += drop;      // rain-drop perturbations enter as mass
+    // Stir momentum, not mass: waves must not raise the mean water level.
     // ── Mean-depth restoration ──────────────────────────────────────
-    // The lattice has sources (rain drops, the forced equilibrium's
-    // max(0) clip) but no sink except the open boundary, so the mean
+    // The forced equilibrium's max(0) clip can introduce mass, so the mean
     // depth DRIFTS: mass slowly lost or gained shows up as a whole-
     // patch height deviation that tile_water_lbm_vert applies to the
     // MESH -- the river sinking under its bed (gone) or lifting over
@@ -271,23 +264,20 @@ void main() {
     // ── Surface output: height deviation + normal ───────────────────
     // Central differences over THIS step's neighbours (previous-step
     // heights — one frame of latency, invisible at ripple scale).
-    float hl = 0.0, hr = 0.0, hd = 0.0, hup = 0.0;
-    ivec2 pl = ivec2(max(pc.x - 1, 0), pc.y);
-    ivec2 pr = ivec2(min(pc.x + 1, N - 1), pc.y);
-    ivec2 pd = ivec2(pc.x, max(pc.y - 1, 0));
-    ivec2 pu = ivec2(pc.x, min(pc.y + 1, N - 1));
-    for (int i = 0; i < 9; ++i) {
-        hl += loadF(i, pl); hr += loadF(i, pr);
-        hd += loadF(i, pd); hup += loadF(i, pu);
-    }
-    // amplify: LBM height variance at this cell size is centimetres;
-    // the visual ripple wants to read at ~decimetre scale
-    float amp = params.normal_amp;
+    // Sample the same previous-state field for offset and gradient, shifted
+    // with the camera just like streaming. Reset frames publish a flat field
+    // instead of deriving normals from stale/uninitialised distributions.
+    ivec2 world_cell = pc + shift;
+    float deviation = waveAt(world_cell, N, fresh);
+    float hl = waveAt(world_cell - ivec2(1, 0), N, fresh);
+    float hr = waveAt(world_cell + ivec2(1, 0), N, fresh);
+    float hd = waveAt(world_cell - ivec2(0, 1), N, fresh);
+    float hup = waveAt(world_cell + ivec2(0, 1), N, fresh);
     vec3 nrm = normalize(vec3(
-        -(hr - hl) * amp / (2.0 * params.cell_m),
+        -(hr - hl) / (2.0 * params.cell_m),
         1.0,
-        -(hup - hd) * amp / (2.0 * params.cell_m)));
-    imageStore(dst_surface, pc, vec4(nrm, (h - h0)));
+        -(hup - hd) / (2.0 * params.cell_m)));
+    imageStore(dst_surface, pc, vec4(nrm, deviation));
     // Publish this cell's macroscopic velocity — the GENERATED flowmap
     // the water shading advects its surface detail by.
     imageStore(dst_flow, pc, vec4(u, 0.0, 0.0));

@@ -62,6 +62,8 @@ struct ScopeDisplay {
 struct FrameRecord {
     std::vector<ScopeDisplay> scopes;       // GPU scopes (relative to GPU frame-start tick)
     std::vector<ScopeDisplay> cpu_scopes;   // CPU scopes (relative to CPU frame-start time)
+    uint64_t sample_id = 0; // unchanged while paused
+    float recorded_span_ms = 0.0f; // start marker to last GPU scope end
     float total_ms = 0.0f;       // sum of depth-0 GPU scopes
     float total_cpu_ms = 0.0f;   // sum of depth-0 CPU scopes
 };
@@ -69,7 +71,7 @@ struct FrameRecord {
 class GameProfiler {
 public:
     static constexpr int   kHistorySize      = 128;   // frames of ring history
-    static constexpr int   kMaxScopesPerFrame = 64;   // max named scopes per frame
+    static constexpr int   kMaxScopesPerFrame = 128;   // max named scopes per frame
     static constexpr float kFrameGapMs       = 0.3f;  // visual gap between frames (ms)
 
     GameProfiler() = default;
@@ -159,6 +161,17 @@ public:
     //     auto _t = game_profiler_.scope(cmd_buf, "My Pass");
     //     // ... record + execute work ...
     //   }   // scope auto-closes both
+    class CpuScope {
+    public:
+        CpuScope(GameProfiler& p, const char* name) : p_(p), h_(p.beginCpuScope(name)) {}
+        ~CpuScope() { p_.endCpuScope(h_); }
+        CpuScope(const CpuScope&) = delete;
+        CpuScope& operator=(const CpuScope&) = delete;
+    private:
+        GameProfiler& p_;
+        uint32_t h_;
+    };
+
     class Scope {
     public:
         Scope(GameProfiler& p, const std::shared_ptr<renderer::CommandBuffer>& cb,
@@ -171,6 +184,9 @@ public:
             p_.endScope(cb_, gpu_h_);
             p_.endCpuScope(cpu_h_);
         }
+        // A scope may span consecutive submissions on the same queue.
+        // Its end timestamp must be recorded in the new, recording buffer.
+        void continueOn(const std::shared_ptr<renderer::CommandBuffer>& cb) { cb_ = cb; }
         Scope(const Scope&) = delete;
         Scope& operator=(const Scope&) = delete;
         // No move — RAII end is bound to lexical scope.
@@ -184,6 +200,7 @@ public:
     };
 
 private:
+    uint64_t m_sample_serial_ = 0;
     // ----- Recording state (per frame-in-flight slot) ----------------------
 
     struct FrameState {

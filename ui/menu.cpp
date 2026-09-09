@@ -4009,7 +4009,7 @@ bool Menu::draw(
             skydome, dump_volume_noise, delta_t, vp_org, vp_size);
     }
 
-    // ── Viewport Play / Stop button (editor only, top-left corner) ──────────
+    // ── Viewport Play / Stop button (editor only) ──────────
     // Toggles play mode: Play (green ▶) enters play mode (character is
     // controllable, clock visible); Stop (red ■) returns to edit mode (player
     // frozen, camera flies the level).
@@ -4024,7 +4024,16 @@ bool Menu::draw(
         game_state_ == GameState::InGame) {
         ImVec2 tb_pos, tb_size, tb_c;
         getViewportScreenRect(tb_pos, tb_size, tb_c);
-        ImGui::SetNextWindowPos(ImVec2(tb_pos.x + 8.0f, tb_pos.y + 8.0f));
+        // Center the start control in the game viewport, including after
+        // resizing or docking. Keep Stop beside the clock during gameplay.
+        if (play_mode_) {
+            ImGui::SetNextWindowPos(ImVec2(tb_pos.x + 8.0f, tb_pos.y + 8.0f));
+        } else {
+            ImGui::SetNextWindowPos(
+                ImVec2(tb_pos.x + tb_size.x * 0.5f,
+                       tb_pos.y + tb_size.y * 0.5f),
+                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        }
         ImGui::SetNextWindowBgAlpha(0.35f);
         if (ImGui::Begin("##viewport_toolbar", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |

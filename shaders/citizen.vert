@@ -38,6 +38,19 @@ layout(location = 2) out vec4 out_color;
 // garment painting in citizen.frag is drawn in
 layout(location = 3) out vec3 out_local;
 layout(location = 4) flat out vec4 out_extra;
+// ── the MODEL-SPACE normal ──────────────────────────────────────────
+// vehicle.frag decides what every fragment of a car IS — glass, lamp,
+// grille, arch, seam — from where it sits on the hull AND which face it
+// is on, and it used to recover that face from the screen derivatives
+// of out_local.  That works on a big flat panel and fails exactly where
+// the details are: the nose and tail caps are triangle FANS, so their
+// triangles converge to slivers at the centre, dFdx/dFdy of position
+// goes to nothing there, and the normal it reconstructs is noise.  The
+// lamps and the grille then break up into speckle and flicker as the
+// camera moves — read as z-fighting, but nothing is fighting: the
+// classification simply cannot see which way the surface faces.
+// The mesh has always carried the normal; passing it costs one varying.
+layout(location = 5) out vec3 out_normal_ls;
 
 void main() {
     mat4 xform = mat4(in_xform0, in_xform1, in_xform2, in_xform3);
@@ -56,5 +69,6 @@ void main() {
     out_normal_ws = normalize(m3 * (in_normal / max(s2, vec3(1e-8))));
     out_color = in_color;
     out_local = in_position;
+    out_normal_ls = normalize(in_normal);
     out_extra = in_extra;
 }

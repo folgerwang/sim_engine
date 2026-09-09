@@ -34,6 +34,8 @@
 
 #include "renderer/renderer.h"
 #include "actor_shadow_geometry.h"
+#include "scene_rendering/rt_skin_types.h"
+#include "car_library.h"
 
 namespace engine {
 namespace game_object {
@@ -52,12 +54,17 @@ public:
     // Pipeline + the shared meshes.  Same contract as
     // CitizenSystem::initStaticMembers (set 0 PBR-global unused, set 1
     // the camera SSBO the vertex shader reads).
+    // `car_library_path` is the baked library (car_gen.py -> the "cars"
+    // stage).  Absent or unreadable, the built-in hulls are used and
+    // everything still works — see Vehicle::sample.
     static void initStaticMembers(
         const std::shared_ptr<renderer::Device>& device,
         const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
         const renderer::GraphicPipelineInfo& graphic_pipeline_info,
         const renderer::PipelineRenderbufferFormats& frame_buffer_format,
-        const renderer::PipelineRenderbufferFormats& gbuffer_format);
+        const renderer::PipelineRenderbufferFormats& gbuffer_format,
+        const std::string& car_library_path =
+            "content/terrain/lib/cars.rwcar");
     static void destroyStaticMembers(
         const std::shared_ptr<renderer::Device>& device);
 
@@ -146,6 +153,7 @@ public:
 
     static std::shared_ptr<renderer::Pipeline> s_gbuf_pipeline_;
     void collectShadowGeometry(ActorShadowGeometry& out) const;
+    void collectGpuShadowGeometry(std::vector<scene_rendering::RtSkinBatch>& out) const;
 
 private:
     // ── the road graph ───────────────────────────────────────────────
@@ -201,13 +209,30 @@ private:
         // v35: seconds this vehicle has been held at a junction -- the
         // escape valve against any claim that will not clear
         float block_t = 0.0f;
+        // ── WHICH BAKED CAR THIS IS ─────────────────────────────
+        // An index into the library (car_library.h), chosen once at
+        // spawn from the samples its TYPE may wear, plus the paint and
+        // interior it wears out of the palettes.  -1 = no library
+        // loaded, so this vehicle draws with the built-in hull for its
+        // type and the old painted detailing.
+        //
+        // The type still drives BEHAVIOUR (how fast, how it is chosen,
+        // whether it has a light bar); the sample drives what is drawn.
+        // Keeping those apart is what makes the library optional.
+        int      sample = -1;
+        uint8_t  paint = 0;
+        uint8_t  trim = 0;
     };
 
+    // `paint` is (metal, flake, coat, pearl) — the basecoat-under-
+    // clearcoat parameters vehicle.frag renders car paint with.  Zero
+    // on everything that is not painted bodywork, which the shader
+    // reads as "shade this the plain way".
     struct PartInstance { glm::mat4 xform; glm::vec4 color;
-                          glm::vec4 extra; };
+                          glm::vec4 extra; glm::vec4 paint; };
     struct Mesh {
         ActorShadowGeometry shadow;
-        std::shared_ptr<renderer::BufferInfo> pos, nrm, idx;
+        std::shared_ptr<renderer::BufferInfo> pos, nrm, part, idx;
         uint32_t count = 0;
     };
 
@@ -305,6 +330,15 @@ private:
     // not written, windows only (vehicle.frag kind 3)
     static std::shared_ptr<renderer::Pipeline>       s_glass_pipeline_;
     static std::vector<Mesh>                         s_meshes_;
+    // The baked library, and which of its samples each type may wear.
+    // Empty / not loaded = the built-in hulls; see Vehicle::sample.
+    static CarLibrary                                s_lib_;
+    static std::vector<std::vector<int>>             s_type_samples_;
+
+    // Which baked car a vehicle is, and in what colour — set once at
+    // spawn, deterministic in its seed.  A member rather than a free
+    // function because Vehicle is private to this class.
+    static void assignSample(Vehicle& v);
     static std::shared_ptr<renderer::Device>         s_device_;
     static std::shared_ptr<renderer::BufferInfo>     s_inst_buf_;
     static uint32_t                                  s_inst_capacity_;

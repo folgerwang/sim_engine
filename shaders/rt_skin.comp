@@ -1,0 +1,70 @@
+#version 450
+layout(local_size_x=64) in;
+struct Vertex { vec4 p; uvec4 j0; vec4 w0; uvec4 j1; vec4 w1; };
+struct Job { mat4 model; vec4 shape; uvec4 src; uvec4 dst; };
+layout(std430,set=0,binding=0) readonly buffer V { Vertex vertices[]; };
+layout(std430,set=0,binding=1) readonly buffer I { uint source_indices[]; };
+layout(std430,set=0,binding=2) readonly buffer J { Job jobs[]; };
+layout(std430,set=0,binding=3) readonly buffer P { mat4 palette[]; };
+layout(std430,set=0,binding=4) readonly buffer T { uvec2 tasks[]; };
+layout(std430,set=0,binding=5) buffer O { vec4 positions[]; };
+layout(std430,set=0,binding=6) buffer X { uint indices[]; };
+layout(std430,set=0,binding=7) buffer C { vec4 bounds[]; };
+struct Header { vec4 lo; vec4 hi; uint tri_offset; uint tri_count; uint chunk_offset; uint pad; };
+layout(std430,set=0,binding=8) buffer H { uvec4 count; Header headers[]; };
+layout(push_constant) uniform Params { uint phase; uint base; uint total_indices; uint chunks; } pc;
+shared vec3 lows[64]; shared vec3 highs[64];
+void main() {
+    uint lane=gl_LocalInvocationID.x, group=pc.base+gl_WorkGroupID.x;
+    if (pc.phase==0u) {
+        uvec2 task=tasks[group]; Job job=jobs[task.x];
+        uint i=task.y*64u+lane;
+        if (i<job.src.y) {
+            Vertex v=vertices[job.src.x+i]; vec4 p=v.p;
+            uint mode=job.dst.w>>24, nj=job.dst.w & 0x00ffffffu;
+            if (mode==2u) {
+                p.xz*=mix(job.shape.w,1.,(p.y+1.)*.5);
+                float wu=0.,wl=0.;
+                if (job.shape.z>0.) {
+                    wu=clamp(.5+(v.p.y-job.shape.x)/(2.*job.shape.z),0.,1.);
+                    wl=clamp(.5-(v.p.y-job.shape.y)/(2.*job.shape.z),0.,1.);
+                }
+                p=max(0.,1.-wu-wl)*(palette[job.dst.z]*p)
+                  +wu*(palette[job.dst.z+1u]*p)+wl*(palette[job.dst.z+2u]*p);
+            } else if ((mode==1u || mode==3u) && nj>0u) {
+                mat4 skin=mat4(0.); float sum=0.;
+                for (int k=0;k<4;++k) {
+                    skin+=v.w0[k]*palette[job.dst.z+min(v.j0[k],nj-1u)];
+                    skin+=v.w1[k]*palette[job.dst.z+min(v.j1[k],nj-1u)];
+                    sum+=v.w0[k]+v.w1[k];
+                }
+                if (sum>1e-4) p=(skin/sum)*p;
+                else if (mode==3u) p=palette[job.dst.z]*p;
+            }
+            positions[job.dst.x+i]=vec4((job.model*p).xyz,1.);
+        }
+        if (i<job.src.w) indices[job.dst.y+i]=job.dst.x+min(source_indices[job.src.z+i],job.src.y-1u);
+        return;
+    }
+    vec3 lo=vec3(3.402823466e+38),hi=-lo;
+    if (pc.phase==1u) {
+        uint end=min(pc.total_indices,(group+1u)*384u);
+        for (uint i=group*384u+lane;i<end;i+=64u) {
+            vec3 p=positions[indices[i]].xyz;lo=min(lo,p);hi=max(hi,p);
+        }
+    } else {
+        for (uint c=lane;c<pc.chunks;c+=64u) {
+            lo=min(lo,bounds[c*2u].xyz);hi=max(hi,bounds[c*2u+1u].xyz);
+        }
+    }
+    lows[lane]=lo;highs[lane]=hi;barrier();
+    for (uint stride=32u;stride>0u;stride>>=1u) {
+        if (lane<stride) { lows[lane]=min(lows[lane],lows[lane+stride]); highs[lane]=max(highs[lane],highs[lane+stride]); }
+        barrier();
+    }
+    if (lane==0u) {
+        if (pc.phase==1u) { bounds[group*2u]=vec4(lows[0],0);bounds[group*2u+1u]=vec4(highs[0],0); }
+        else { count=uvec4(pc.total_indices>0u?1u:0u,0,0,0);
+            headers[0]=Header(vec4(lows[0],0),vec4(highs[0],0),0,pc.total_indices/3u,0,0); }
+    }
+}

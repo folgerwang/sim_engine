@@ -419,11 +419,14 @@ public:
     // Returns false when no mesh is hit within `max_distance` below
     // `from`.  On hit, out_hit is the world-space intersection point
     // and out_normal is the hit triangle's face normal.
+    // bvh_only skips meshes whose async BVH is not ready; population
+    // queries must not trigger the temporary brute-force fallback.
     bool raycastDown(
         const glm::vec3& from,
         float max_distance,
         glm::vec3& out_hit,
-        glm::vec3& out_normal) const;
+        glm::vec3& out_normal,
+        bool bvh_only = false) const;
 
     // Draw every collision mesh as flat-shaded debug triangles.
     // isolate_index >= 0 draws ONLY meshes_[isolate_index] (the

@@ -12,7 +12,6 @@
 #include "virtual_texture.h"
 
 #include "glm/gtc/packing.hpp"   // packHalf2x16 for the RT pos+uv repack
-#include "helper/thread_pool.h"  // parallel CPU skinning (updateRtSkeletons)
 
 #include <algorithm>
 #include <chrono>
@@ -6354,263 +6353,41 @@ void ClusterRenderer::flushRetiredBuffers(bool force) {
 }
 
 void ClusterRenderer::updateRtSkeletons(
-    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-    const std::vector<RtSkeletonFrameData>& skeletons) {
-
-    if (!gpu_ready_ || !rt_shadow_desc_set_ ||
-        !rt_skel_header_buffer_.buffer) {
+    const std::shared_ptr<renderer::CommandBuffer>& graphics_cmd,
+    const std::vector<RtSkeletonFrameData>& skeletons, uint32_t frame_slot) {
+    if (!gpu_ready_ || !rt_shadow_desc_set_ || !rt_skel_header_buffer_.buffer || !graphics_cmd) return;
+    flushRetiredBuffers();
+    if (!rt_skin_gpu_) rt_skin_gpu_ = std::make_unique<RtSkinGpu>(device_,descriptor_pool_);
+    rt_skin_gpu_->prepare(skeletons,frame_slot);
+    if (!rt_skin_gpu_->changed() && rt_skel_have_gpu_state_) {
+        if (rt_tlas_dirty_ && hw_rt_shadow_ready_)
+            recordRtTlasRebuild(graphics_cmd,rt_skel_last_has_skels_);
         return;
     }
-    // Age out buffers retired on previous ticks (grow paths below).
-    flushRetiredBuffers();
-
-    // ── 0. Change detection ───────────────────────────────────────────
-    // Pose = model matrix + joint matrices.  If every skeleton's pose
-    // is bytewise identical to the previous update, all GPU state
-    // (positions, chunks, headers, BLAS, TLAS) is still valid — skip
-    // the whole update.  Frees idle characters (and the editor at
-    // rest) from the ~7 ms skinning bill.
-    {
-        static const std::vector<glm::mat4> s_empty_jm;
-        bool same = rt_skel_have_gpu_state_ &&
-                    rt_skel_cache_.size() == skeletons.size();
-        if (same) {
-            for (size_t i = 0; i < skeletons.size(); ++i) {
-                const auto& jm = skeletons[i].joint_matrices
-                                     ? *skeletons[i].joint_matrices
-                                     : s_empty_jm;
-                const auto& c = rt_skel_cache_[i];
-                if (skeletons[i].world_space_dynamic || skeletons[i].model != c.model ||
-                    jm.size() != c.jm.size() ||
-                    (!jm.empty() &&
-                     std::memcmp(jm.data(), c.jm.data(),
-                                 jm.size() * sizeof(glm::mat4)) != 0)) {
-                    same = false;
-                    break;
-                }
-            }
-        }
-        if (same) {
-            // Same pose, but the caster instance set changed: refresh
-            // the TLAS only (the skeleton BLAS is still valid).
-            if (rt_tlas_dirty_ && hw_rt_shadow_ready_ && cmd_buf) {
-                recordRtTlasRebuild(cmd_buf, rt_skel_last_has_skels_);
-            }
-            return;
-        }
-        rt_skel_cache_.resize(skeletons.size());
-        for (size_t i = 0; i < skeletons.size(); ++i) {
-            rt_skel_cache_[i].model = skeletons[i].model;
-            rt_skel_cache_[i].jm    = skeletons[i].joint_matrices
-                                          ? *skeletons[i].joint_matrices
-                                          : s_empty_jm;
-        }
-    }
-
-    // Fixed worker pool for the skinning burst — created once, sized to
-    // hardware_concurrency.  parallelFor is only ever entered from the
-    // render thread, so the "no re-entry from workers" rule holds.
-    static helper::ThreadPool s_skel_pool;
-
-    // ── 1. CPU-skin every skeleton into world space ───────────────────
-    std::vector<glm::vec4>          all_pos;
-    std::vector<uint32_t>           all_idx;
-    std::vector<glm::vec4>          all_chunks;   // min,max pairs
-    std::vector<glsl::RtSkelHeader> headers;
-
-    for (const auto& s : skeletons) {
-        if (headers.size() >= RT_SKEL_MAX) break;
-        if (!s.positions || !s.indices || s.positions->empty() || s.indices->size() < 3 ||
-            (!s.world_space_dynamic && (!s.joints || !s.weights ||
-             !s.joint_matrices || s.joint_matrices->empty() ||
-             s.joints->size() != s.positions->size() ||
-             s.weights->size() != s.positions->size()))) {
-            continue;
-        }
-        static const std::vector<glm::mat4> empty_joints;
-        const auto& jm = s.joint_matrices ? *s.joint_matrices : empty_joints;
-        const uint32_t jm_n = (uint32_t)jm.size();
-        const uint32_t vbase = (uint32_t)all_pos.size();
-        const bool has_set1 =
-            s.joints1 && s.weights1 &&
-            s.joints1->size() == s.positions->size() &&
-            s.weights1->size() == s.positions->size();
-
-        const size_t vcount = s.positions->size();
-        all_pos.resize(vbase + vcount);
-        // Parallel skinning: block-granular (1024 verts per task) so the
-        // per-invocation std::function overhead amortises to nothing.
-        // Each block writes a disjoint all_pos range — no sharing.
-        const size_t kVertBlock = 1024;
-        const size_t nblocks = (vcount + kVertBlock - 1) / kVertBlock;
-        s_skel_pool.parallelFor(nblocks, [&](size_t b) {
-            const size_t v0 = b * kVertBlock;
-            const size_t v1 = std::min(v0 + kVertBlock, vcount);
-            for (size_t v = v0; v < v1; ++v) {
-                if (s.world_space_dynamic) {
-                    all_pos[vbase + v] = glm::vec4((*s.positions)[v], 1.0f);
-                    continue;
-                }
-                const glm::u16vec4& j0 = (*s.joints)[v];
-                const glm::vec4&    w0 = (*s.weights)[v];
-                glm::mat4 skin =
-                    w0.x * jm[std::min((uint32_t)j0.x, jm_n - 1u)] +
-                    w0.y * jm[std::min((uint32_t)j0.y, jm_n - 1u)] +
-                    w0.z * jm[std::min((uint32_t)j0.z, jm_n - 1u)] +
-                    w0.w * jm[std::min((uint32_t)j0.w, jm_n - 1u)];
-                float wsum = w0.x + w0.y + w0.z + w0.w;
-                if (has_set1) {
-                    const glm::u16vec4& j1 = (*s.joints1)[v];
-                    const glm::vec4&    w1 = (*s.weights1)[v];
-                    skin += w1.x * jm[std::min((uint32_t)j1.x, jm_n - 1u)] +
-                            w1.y * jm[std::min((uint32_t)j1.y, jm_n - 1u)] +
-                            w1.z * jm[std::min((uint32_t)j1.z, jm_n - 1u)] +
-                            w1.w * jm[std::min((uint32_t)j1.w, jm_n - 1u)];
-                    wsum += w1.x + w1.y + w1.z + w1.w;
-                }
-                // Match base.vert: normalize by the weight sum; identity
-                // for unweighted verts.
-                if (wsum > 1e-4f) skin *= (1.0f / wsum);
-                else              skin  = glm::mat4(1.0f);
-                const glm::vec4 wp =
-                    s.model * (skin * glm::vec4((*s.positions)[v], 1.0f));
-                all_pos[vbase + v] = glm::vec4(glm::vec3(wp), 1.0f);
-            }
-        });
-
-        glsl::RtSkelHeader h{};
-        h.tri_offset   = (uint32_t)(all_idx.size() / 3u);
-        h.tri_count    = (uint32_t)(s.indices->size() / 3u);
-        h.chunk_offset = (uint32_t)(all_chunks.size() / 2u);
-        all_idx.reserve(all_idx.size() + s.indices->size());
-        for (uint32_t idx : *s.indices) {
-            all_idx.push_back(std::min(idx, (uint32_t)s.positions->size() - 1u)
-                              + vbase);
-        }
-
-        // Chunk AABBs (parallel — each chunk is independent), then the
-        // skeleton AABB as a cheap serial reduction over the chunks.
-        const uint32_t chunk_n =
-            (h.tri_count + RT_SKEL_CHUNK_TRIS - 1u) / RT_SKEL_CHUNK_TRIS;
-        const uint32_t chunk_base = h.chunk_offset;
-        all_chunks.resize((chunk_base + chunk_n) * 2u);
-        s_skel_pool.parallelFor(chunk_n, [&](size_t c) {
-            glm::vec3 cmin(std::numeric_limits<float>::max());
-            glm::vec3 cmax(std::numeric_limits<float>::lowest());
-            const uint32_t t0i =
-                (h.tri_offset + (uint32_t)c * RT_SKEL_CHUNK_TRIS) * 3u;
-            const uint32_t t1i = std::min(
-                (uint32_t)all_idx.size(),
-                t0i + RT_SKEL_CHUNK_TRIS * 3u);
-            for (uint32_t i = t0i; i < t1i; ++i) {
-                const glm::vec3 p(all_pos[all_idx[i]]);
-                cmin = glm::min(cmin, p);
-                cmax = glm::max(cmax, p);
-            }
-            all_chunks[(chunk_base + c) * 2u + 0u] = glm::vec4(cmin, 0.0f);
-            all_chunks[(chunk_base + c) * 2u + 1u] = glm::vec4(cmax, 0.0f);
-        });
-        glm::vec3 smin(std::numeric_limits<float>::max());
-        glm::vec3 smax(std::numeric_limits<float>::lowest());
-        for (uint32_t c = 0; c < chunk_n; ++c) {
-            smin = glm::min(smin,
-                            glm::vec3(all_chunks[(chunk_base + c) * 2u]));
-            smax = glm::max(smax,
-                            glm::vec3(all_chunks[(chunk_base + c) * 2u + 1u]));
-        }
-        h.aabb_min = glm::vec4(smin, 0.0f);
-        h.aabb_max = glm::vec4(smax, 0.0f);
-        headers.push_back(h);
-    }
-
-    // ── 2. (Re)create / grow the HOST_VISIBLE buffers ─────────────────
-    auto ensure = [&](renderer::BufferInfo& buf, uint32_t& cap_elems,
-                      uint32_t need_elems, uint32_t elem_bytes,
-                      bool as_input) -> bool {
-        if (need_elems <= cap_elems && buf.buffer) return false;
-        uint32_t new_cap = std::max(cap_elems, 256u);
-        while (new_cap < need_elems) new_cap *= 2u;
-        retireBuffer(buf);   // deferred: last frame may still read it
-        er::Helper::createBuffer(
-            device_,
-            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
-            (as_input
-                 ? (SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT) |
-                    SET_FLAG_BIT(BufferUsage,
-                        ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR))
-                 : 0),
-            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT,
-                            HOST_COHERENT_BIT),
-            as_input ? SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT) : 0,
-            buf.buffer, buf.memory,
-            std::source_location::current(),
-            uint64_t(new_cap) * elem_bytes, nullptr);
-        cap_elems = new_cap;
-        return true;
+    // Output stays device-local; only rest meshes and frame palettes are uploaded.
+    auto ensure = [&](renderer::BufferInfo& buf,uint32_t& cap,uint32_t need,uint32_t bytes,bool as_input) {
+        need=std::max(need,256u);
+        if(buf.buffer && cap>=need) return false;
+        uint32_t next=std::max(cap,256u);while(next<need) next*=2;
+        retireBuffer(buf);
+        er::Helper::createBuffer(device_,SET_FLAG_BIT(BufferUsage,STORAGE_BUFFER_BIT) |
+            (as_input ? SET_FLAG_BIT(BufferUsage,SHADER_DEVICE_ADDRESS_BIT) |
+                SET_FLAG_BIT(BufferUsage,ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR):0),
+            SET_FLAG_BIT(MemoryProperty,DEVICE_LOCAL_BIT),
+            as_input?SET_FLAG_BIT(MemoryAllocate,DEVICE_ADDRESS_BIT):0,
+            buf.buffer,buf.memory,std::source_location::current(),uint64_t(next)*bytes,nullptr);
+        cap=next;return true;
     };
-    bool rewrote = false;
-    if (!headers.empty()) {
-        rewrote |= ensure(rt_skel_chunk_buffer_, rt_skel_chunk_cap_,
-                          (uint32_t)(all_chunks.size() / 2u), 2u * sizeof(glm::vec4),
-                          false);
-        rewrote |= ensure(rt_skel_pos_buffer_, rt_skel_pos_cap_,
-                          (uint32_t)all_pos.size(), sizeof(glm::vec4), true);
-        rewrote |= ensure(rt_skel_index_buffer_, rt_skel_idx_cap_,
-                          (uint32_t)all_idx.size(), sizeof(uint32_t), true);
-        if (rewrote) writeRtSkeletonDescriptors();
-
-        // deferrable: these four are the per-frame RT-skeleton set, read
-        // by the previous frame's still-in-flight resolve.  Queued during
-        // recording and applied just before submit — see
-        // Device::beginDeferredBufferWrites.  Safe because the capacity
-        // grow (ensure() above) already ran, so the memory these name is
-        // the memory the flush will map.
-        device_->updateBufferMemory(rt_skel_pos_buffer_.memory,
-            all_pos.size() * sizeof(glm::vec4), all_pos.data(), 0, true);
-        device_->updateBufferMemory(rt_skel_index_buffer_.memory,
-            all_idx.size() * sizeof(uint32_t), all_idx.data(), 0, true);
-        device_->updateBufferMemory(rt_skel_chunk_buffer_.memory,
-            all_chunks.size() * sizeof(glm::vec4), all_chunks.data(), 0, true);
-    }
-    {
-        // Header buffer: count + entries (count 0 disables the loop).
-        std::vector<uint8_t> hdr(
-            sizeof(glm::uvec4) + RT_SKEL_MAX * sizeof(glsl::RtSkelHeader), 0);
-        glm::uvec4 counts((uint32_t)headers.size(), 0u, 0u, 0u);
-        std::memcpy(hdr.data(), &counts, sizeof(counts));
-        if (!headers.empty()) {
-            std::memcpy(hdr.data() + sizeof(glm::uvec4), headers.data(),
-                        headers.size() * sizeof(glsl::RtSkelHeader));
-        }
-        device_->updateBufferMemory(rt_skel_header_buffer_.memory,
-                                    hdr.size(), hdr.data(), 0, true);
-    }
-    // GPU state is now consistent with rt_skel_cache_ — identical poses
-    // next frame skip the whole update (see the change detection above).
-    rt_skel_have_gpu_state_ = true;
-
-    // Heartbeat (every ~5 s at 60 fps) so "no character shadows" is
-    // debuggable: shows how many skeletons made it through the guards.
-    {
-        static int s_frame = 0;
-        if ((s_frame++ % 300) == 0) {
-            clog_printf(
-                "[RT_SKEL] update: %zu/%zu skeleton(s), %u tris, hw_as=%d\n",
-                headers.size(), skeletons.size(),
-                (uint32_t)(all_idx.size() / 3u),
-                hw_rt_shadow_ready_ ? 1 : 0);
-        }
-    }
-
-    // ── 3. Hardware mode: skeleton BLAS rebuild + TLAS rebuild ────────
-    if (!hw_rt_shadow_ready_ || !cmd_buf) return;
-
-    const uint32_t skel_tris = (uint32_t)(all_idx.size() / 3u);
-    const bool has_skels = !headers.empty() && skel_tris > 0;
-    // NOTE: even with NO skeletons this frame we still fall through to
-    // the TLAS rebuild below (static instance only) — an early return
-    // here would leave the LAST frame's skeleton instance in the TLAS
-    // forever (phantom shadows from unbound / hidden characters).
+    bool rewrote=ensure(rt_skel_pos_buffer_,rt_skel_pos_cap_,rt_skin_gpu_->vertices(),16,true);
+    rewrote|=ensure(rt_skel_index_buffer_,rt_skel_idx_cap_,rt_skin_gpu_->indices(),4,true);
+    rewrote|=ensure(rt_skel_chunk_buffer_,rt_skel_chunk_cap_,rt_skin_gpu_->chunks(),32,false);
+    if(rewrote) writeRtSkeletonDescriptors();
+    const auto cmd_buf=rt_skin_gpu_->record(graphics_cmd,rt_skel_pos_buffer_,rt_skel_index_buffer_,rt_skel_chunk_buffer_,rt_skel_header_buffer_);
+    rt_skel_have_gpu_state_=true;
+    if(!hw_rt_shadow_ready_) {rt_skin_gpu_->finish();return;}
+    const uint32_t skel_tris=rt_skin_gpu_->indices()/3u;
+    const bool has_skels=skel_tris>0;
+    const auto& all_idx=rt_skin_gpu_->topology();
 
     // (Re)create the skeleton BLAS when the triangle budget grows.
     if (has_skels &&
@@ -6618,6 +6395,7 @@ void ClusterRenderer::updateRtSkeletons(
         // Deferred (in-flight): frame N-1's ray query may still hold
         // this BLAS through the previous TLAS.
         retireAs(hw_rt_skel_blas_handle_);
+        hw_rt_skel_blas_indices_.clear();
         uint32_t tri_cap = std::max(1024u, hw_rt_skel_blas_tri_cap_);
         while (tri_cap < skel_tris) tri_cap *= 2u;
 
@@ -6642,7 +6420,8 @@ void ClusterRenderer::updateRtSkeletons(
         er::AccelerationStructureBuildGeometryInfo info{};
         info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
         info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
-                                  PREFER_FAST_BUILD_BIT_KHR);
+                                  PREFER_FAST_BUILD_BIT_KHR) |
+                     SET_FLAG_BIT(BuildAccelerationStructure, ALLOW_UPDATE_BIT_KHR);
         info.geometries = { g };
         er::AccelerationStructureBuildSizesInfo sz{};
         sz.struct_type = er::StructureType::
@@ -6665,7 +6444,7 @@ void ClusterRenderer::updateRtSkeletons(
             er::AccelerationStructureType::BOTTOM_LEVEL_KHR);
         retireBuffer(hw_rt_skel_blas_scratch_);  // deferred (in-flight)
         device_->createBuffer(
-            sz.build_scratch_size,
+            std::max(sz.build_scratch_size, sz.update_scratch_size),
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT) |
             SET_FLAG_BIT(BufferUsage, SHADER_DEVICE_ADDRESS_BIT),
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
@@ -6686,11 +6465,15 @@ void ClusterRenderer::updateRtSkeletons(
         SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_WRITE_BIT_KHR),
         SET_FLAG_BIT(PipelineStage, ACCELERATION_STRUCTURE_BUILD_BIT_KHR) };
     if (has_skels) {
+        auto as_refit_build = as_write_build;
+        as_refit_build.access_flags |=
+            SET_FLAG_BIT(Access, ACCELERATION_STRUCTURE_READ_BIT_KHR);
         cmd_buf->addBufferBarrier(
-            hw_rt_skel_blas_buffer_.buffer, as_read_compute, as_write_build);
+            hw_rt_skel_blas_buffer_.buffer, as_read_compute, as_refit_build);
     }
 
-    // Skeleton BLAS rebuild (positions changed this frame).
+    // Refit moving geometry when topology is unchanged. Periodic rebuilds
+    // keep bounds from degrading as actors travel far from their build pose.
     if (has_skels) {
         auto g = std::make_shared<er::AccelerationStructureGeometry>();
         g->geometry_type = er::GeometryType::TRIANGLES_KHR;
@@ -6713,8 +6496,15 @@ void ClusterRenderer::updateRtSkeletons(
         er::AccelerationStructureBuildGeometryInfo info{};
         info.type = er::AccelerationStructureType::BOTTOM_LEVEL_KHR;
         info.flags = SET_FLAG_BIT(BuildAccelerationStructure,
-                                  PREFER_FAST_BUILD_BIT_KHR);
-        info.mode = er::BuildAccelerationStructureMode::BUILD_KHR;
+                                  PREFER_FAST_BUILD_BIT_KHR) |
+                     SET_FLAG_BIT(BuildAccelerationStructure, ALLOW_UPDATE_BIT_KHR);
+        const bool refit = !hw_rt_skel_blas_indices_.empty() &&
+            hw_rt_skel_blas_indices_ == all_idx &&
+            hw_rt_skel_blas_max_vertex_ == tri.max_vertex &&
+            hw_rt_skel_blas_refits_ < 120u;
+        info.mode = refit ? er::BuildAccelerationStructureMode::UPDATE_KHR
+                          : er::BuildAccelerationStructureMode::BUILD_KHR;
+        if (refit) info.src_as = hw_rt_skel_blas_handle_;
         info.dst_as = hw_rt_skel_blas_handle_;
         info.geometries = { g };
         info.scratch_data.device_address =
@@ -6722,6 +6512,13 @@ void ClusterRenderer::updateRtSkeletons(
         std::vector<er::AccelerationStructureBuildRangeInfo> ranges = {
             { skel_tris, 0u, 0u, 0u } };
         cmd_buf->buildAccelerationStructures({ info }, ranges);
+        if (refit) {
+            ++hw_rt_skel_blas_refits_;
+        } else {
+            hw_rt_skel_blas_indices_ = all_idx;
+            hw_rt_skel_blas_max_vertex_ = tri.max_vertex;
+            hw_rt_skel_blas_refits_ = 0;
+        }
     }
 
     // BLAS write → TLAS build read.
@@ -6738,6 +6535,7 @@ void ClusterRenderer::updateRtSkeletons(
     // + the per-mesh caster instances.
     rt_skel_last_has_skels_ = has_skels;
     recordRtTlasRebuild(cmd_buf, has_skels);
+    rt_skin_gpu_->finish();
 }
 
 // TLAS rebuild on the frame command buffer: [static, skeleton?, casters].
@@ -6802,6 +6600,7 @@ void ClusterRenderer::recordRtTlasRebuild(
 }
 
 void ClusterRenderer::destroy() {
+    rt_skin_gpu_.reset();
     // Drain the deferred-retirement list before member teardown.
     flushRetiredBuffers(/*force*/ true);
     destroyRtMeshSlots();
@@ -6848,7 +6647,6 @@ void ClusterRenderer::destroy() {
     hw_rt_desc_set_layout_.reset();
     hw_rt_shadow_ready_ = false;
     rt_skel_have_gpu_state_ = false;
-    rt_skel_cache_.clear();
 
     // CSM silhouette prepass pipeline.
     silhouette_prepass_pipeline_.reset();

@@ -1326,7 +1326,8 @@ void Helper::submitQueue(
     const std::vector<std::shared_ptr<Semaphore>>& wait_semaphores,
     const std::vector<std::shared_ptr<CommandBuffer>>& command_buffers,
     const std::vector<std::shared_ptr<Semaphore>>& signal_semaphores,
-    const std::vector<uint64_t>& signal_semaphore_values) {
+    const std::vector<uint64_t>& signal_semaphore_values,
+    const std::vector<PipelineStageFlags>& wait_stage_masks) {
 
     std::vector<VkSemaphore> vk_wait_semaphores(wait_semaphores.size());
     for (auto i = 0; i < wait_semaphores.size(); i++) {
@@ -1369,16 +1370,19 @@ void Helper::submitQueue(
     // graphics + compute pass before it can execute immediately.
     // Net effect: GPU idle gap collapses to ~0, frame time drops
     // to whatever GPU work actually requires.
-    VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
+    if (!wait_stage_masks.empty() && wait_stage_masks.size() != wait_semaphores.size())
+        throw std::invalid_argument("submitQueue: one stage mask required per wait semaphore");
+    std::vector<VkPipelineStageFlags> wait_stages(wait_semaphores.size(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+    for (size_t i=0; i<wait_stage_masks.size(); ++i) wait_stages[i]=wait_stage_masks[i];
     submit_info.waitSemaphoreCount = static_cast<uint32_t>(vk_wait_semaphores.size());
     submit_info.pWaitSemaphores = vk_wait_semaphores.data();
-    submit_info.pWaitDstStageMask = wait_stages;
+    submit_info.pWaitDstStageMask = wait_stages.data();
     submit_info.commandBufferCount = static_cast<uint32_t>(vk_cmd_bufs.size());
     submit_info.pCommandBuffers = vk_cmd_bufs.data();
     submit_info.signalSemaphoreCount = static_cast<uint32_t>(vk_signal_semaphores.size());
     submit_info.pSignalSemaphores = vk_signal_semaphores.data();
+    VkTimelineSemaphoreSubmitInfo timeline_info = {};
     if (signal_semaphore_values.size() > 0) {
-        VkTimelineSemaphoreSubmitInfo timeline_info = {};
         timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
         timeline_info.signalSemaphoreValueCount = static_cast<uint32_t>(signal_semaphore_values.size());
         timeline_info.pSignalSemaphoreValues = signal_semaphore_values.data();
@@ -1397,7 +1401,8 @@ void Helper::submitQueue(
             &submit_info,
             vk_in_flight_fence ? vk_in_flight_fence->get() : nullptr);
     if (result != VK_SUCCESS) {
-        throw std::runtime_error("failed to submit draw command buffer!");
+        throw std::runtime_error(std::string("failed to submit draw command buffer: ") +
+                                 vk::VkResultToString(result));
     }
 }
 

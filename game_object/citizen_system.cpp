@@ -349,7 +349,8 @@ constexpr float kClockScale = 60.0f;      // 1 real s = 1 game minute
 // population in view the far tier caps itself at kMaxFarParts draws by
 // raising the cutoff until the crowd fits (nearest, tallest figures
 // keep priority as the angular test is height/dist).
-constexpr float kNearSimRadius = 700.0f;
+constexpr float kNearSimRadius = 300.0f;
+constexpr float kIndoorUpdateRadius = 100.0f;
 constexpr size_t kFarSimPerFrame = 8192;
 constexpr float kDetailRadius = 300.0f;
 // ── THE BUDGETS THAT WERE REALLY DRAW-CALL BUDGETS ──────────────────
@@ -431,11 +432,7 @@ constexpr float kWalkTimeScale = 6.0f;
 // never pops a limb.  Wrapping at all is what keeps the sine arguments
 // in a precise part of the float range over a long session.
 constexpr float kAnimWrap = 25.13274123f;   // 8 * pi
-// Staggered height refresh for everyone the near tier did not reach.
-// Sized against the population this system now carries (~4 residents
-// per house): at 1024 a 228k-person town took ~220 frames to come
-// round, long enough that a far commuter's height visibly snaps.
-constexpr size_t kFarClampPerFrame = 4096;
+// Far residents retain schedule/route height; only active residents probe ground.
 // How many houses per grid cell get promoted to destinations by
 // synthesizeResidents (first four workplaces, the rest shops).  Lives
 // out here because a LOCAL class may not declare a static data member
@@ -915,6 +912,8 @@ void CitizenSystem::initStaticMembers(
                 as.shadow.positions.push_back(v.pos);
                 as.shadow_joints.emplace_back(v.joints[0], v.joints[1], v.joints[2], v.joints[3]);
                 as.shadow_weights.emplace_back(v.weights[0], v.weights[1], v.weights[2], v.weights[3]);
+                as.rt_joints.emplace_back(v.joints[0], v.joints[1], v.joints[2], v.joints[3]);
+                as.rt_weights.emplace_back(v.weights[0], v.weights[1], v.weights[2], v.weights[3]);
             }
             as.index_count = uint32_t(idx.size());
             as.tri_count = as.index_count / 3u;
@@ -1066,8 +1065,15 @@ void CitizenSystem::initStaticMembers(
     }
 }
 
+// Replaced instance streams may still be referenced by an in-flight frame.
+// Capacities grow geometrically, so keeping old allocations until device-idle
+// shutdown costs less than one additional maximum-sized stream per type.
+namespace { std::vector<std::shared_ptr<er::BufferInfo>> retired_population_streams; }
+
 void CitizenSystem::destroyStaticMembers(
     const std::shared_ptr<er::Device>& device) {
+    for (auto& buffer : retired_population_streams) buffer->destroy(device);
+    retired_population_streams.clear();
     if (s_pipeline_layout_) device->destroyPipelineLayout(
         s_pipeline_layout_);
     s_pipeline_layout_ = nullptr;
@@ -3173,7 +3179,7 @@ bool CitizenSystem::spawnStroller(const glm::vec3& camera_pos, Stroller& w) {
     return true;
 }
 
-void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale) {
+void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale, bool detailed) {
     const float v = w.look.speed * walk_scale;
     if (w.kind == 1) {
         if (!vehicles_ || !vehicles_->strollAdvance(w.road, v * dt, stroll_rng_)) {
@@ -3184,7 +3190,7 @@ void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale) {
         w.pos.z = w.road.pos.z;
         w.pos.y += (w.road.pos.y - w.pos.y) * std::min(1.0f, 4.0f * dt);
         w.yaw = w.road.yaw;
-        w.phase += dt * v * 1.7f;
+        if (detailed) w.phase += dt * v * 1.7f;
         w.walking = true;
         return;
     }
@@ -3202,7 +3208,7 @@ void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale) {
         return;
     }
     glm::vec3 dir = d / dist;
-    if (dist > kHouseBlockR + 3.0f) {
+    if (detailed && dist > kHouseBlockR + 3.0f) {
         const glm::vec2 sd = steerAroundHouses(
             glm::vec2(w.pos.x, w.pos.z), glm::vec2(dir.x, dir.z),
             w.house, -1);
@@ -3211,7 +3217,7 @@ void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale) {
     }
     w.pos += dir * std::min(v * dt, dist);
     w.yaw = std::atan2(dir.x, dir.z);
-    w.phase += dt * v * 1.7f;
+    if (detailed) w.phase += dt * v * 1.7f;
     w.pos.y += (w.target.y - w.pos.y) *
                std::min(1.0f, v * dt / std::max(dist, 1e-3f));
 }
@@ -3259,16 +3265,16 @@ void CitizenSystem::updateStrollers(float delta_t, const glm::vec3& camera_pos,
         if (!spawnStroller(camera_pos, w)) continue;
         strollers_.push_back(std::move(w));
     }
-    // tick + ground: every frame inside the clamp radius, every fourth
-    // frame beyond it (a far walker's height is beneath notice)
-    const float clamp2 = kGroundClampRadius * kGroundClampRadius;
-    const uint32_t frame_k = uint32_t(anim_t_ * 60.0f);
+    // Distant walkers advance position without avoidance or animation.
+    // Ground probes are restricted to the full-update radius.
     for (size_t i = 0; i < strollers_.size(); ++i) {
         Stroller& w = strollers_[i];
-        tickStroller(w, delta_t, walk_scale);
+        const glm::vec2 before(w.pos.x-camera_pos.x, w.pos.z-camera_pos.z);
+        tickStroller(w, delta_t, walk_scale,
+                     glm::dot(before,before) <= kNearSimRadius*kNearSimRadius);
         if (!ground_) continue;
         const float dx = w.pos.x - camera_pos.x, dz = w.pos.z - camera_pos.z;
-        if (dx * dx + dz * dz > clamp2 && ((i + frame_k) & 3u) != 0u) continue;
+        if (dx * dx + dz * dz > kNearSimRadius*kNearSimRadius) continue;
         float gy; glm::vec3 gn;
         if (ground_(w.pos.x, w.pos.z, w.pos.y + 1.0f, gy, gn) &&
             std::abs(gy - w.pos.y) < 6.0f)
@@ -3332,11 +3338,52 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
     // the round-robin ring below snaps persons to their schedule
     // anchors.  What does NOT scale at all is the terrain ground
     // query, so that runs per frame only inside kGroundClampRadius and
-    // as its own slow ring (kFarClampPerFrame/frame) — a far
-    // commuter's height refreshes every couple of seconds, which at
-    // 700 m+ is beneath notice.
+    // never for distant residents: their schedule anchors already carry Y.
     const size_t n = persons_.size();
     const float near2 = kNearSimRadius * kNearSimRadius;
+    // far persons: staggered schedule ring.  Each visit snaps the
+    // person to their CURRENT step's anchor — no walking interpolation
+    // out here (a lerp nobody can resolve is a lerp nobody pays for).
+    // With kFarSimPerFrame per frame a 150k-person town fully
+    // refreshes in ~20 frames — well inside one game-minute tick.
+    if (n) {
+        for (size_t k = 0; k < std::min(n, kFarSimPerFrame); ++k) {
+            const size_t i = (sim_cursor_ + k) % n;
+            SimState& a = sim_[i];
+            if (a.inited) {
+                const float dcx = a.pos.x - camera_pos.x;
+                const float dcz = a.pos.z - camera_pos.z;
+                if (dcx * dcx + dcz * dcz <= near2) continue;
+            }
+            const Person& p = persons_[i];
+            const auto& sched = scheduleOf(p);
+            const int cs = currentStep(sched, tod);
+            const Step home_step{};
+            const Step& st = cs >= 0 ? sched[cs] : home_step;
+            if (!a.inited) {
+                a.inited = true;
+                a.yaw = h01(uint32_t(i), 77u) * 6.2831853f;
+            }
+            if (cs != a.cur_step || glm::length(a.pos) < 1e-6f) {
+                a.cur_step = cs;
+                a.gesture_t = 0.0f;
+                a.pos = placePos(p, st, int(i));
+            }
+            // Residents outside the active area use their schedule anchor.
+            if (a.walking && !a.ride) a.pos = placePos(p, st, int(i));
+            a.indoor_idle = anchorHouse(p, st) >= 0 && !a.ride;
+            a.walking = false;
+            // snapped out of a trip: the car comes with them
+            if (a.ride) {
+                a.ride = 0;
+                if (vehicles_ && i < car_of_.size() && car_of_[i] >= 0) {
+                    vehicles_->recall(car_of_[i], a.pos);
+                }
+            }
+        }
+        sim_cursor_ = (sim_cursor_ + std::min(n, kFarSimPerFrame)) % n;
+    }
+
     size_t near_clamps = 0;
     bool clamp_budget_hit = false;
     // Rotating start so the budgeted clamp tier is fair over frames.
@@ -3366,6 +3413,15 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             a.gesture_t = 0.0f;
         }
         glm::vec3 target = placePos(p, st, int(i));
+        const glm::vec2 away(a.pos.x - camera_pos.x, a.pos.z - camera_pos.z);
+        const glm::vec2 to_anchor(target.x - a.pos.x, target.z - a.pos.z);
+        a.indoor_idle = !a.ride && anchorHouse(p, st) >= 0 &&
+                        glm::dot(to_anchor, to_anchor) <= 0.36f;
+        if (a.indoor_idle && glm::dot(away, away) >
+                kIndoorUpdateRadius * kIndoorUpdateRadius) {
+            a.walking = false;
+            continue;
+        }
         // ── INDOOR ROUTING ───────────────────────────────────────────
         // Replace the destination with the next DOORWAY on the way to
         // it while one is still needed.  Near tier only, and only when
@@ -3499,60 +3555,6 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
     // Budget never bound: everyone in the ring was clamped this frame,
     // so there is nothing to resume from.
     if (!clamp_budget_hit) near_clamp_cursor_ = 0;
-    // far persons: staggered schedule ring.  Each visit snaps the
-    // person to their CURRENT step's anchor — no walking interpolation
-    // out here (a lerp nobody can resolve is a lerp nobody pays for).
-    // With kFarSimPerFrame per frame a 150k-person town fully
-    // refreshes in ~20 frames — well inside one game-minute tick.
-    if (n) {
-        for (size_t k = 0; k < kFarSimPerFrame; ++k) {
-            const size_t i = (sim_cursor_ + k) % n;
-            SimState& a = sim_[i];
-            if (a.inited) {
-                const float dcx = a.pos.x - camera_pos.x;
-                const float dcz = a.pos.z - camera_pos.z;
-                if (dcx * dcx + dcz * dcz <= near2) continue;
-            }
-            const Person& p = persons_[i];
-            const auto& sched = scheduleOf(p);
-            const int cs = currentStep(sched, tod);
-            const Step home_step{};
-            const Step& st = cs >= 0 ? sched[cs] : home_step;
-            if (!a.inited) {
-                a.inited = true;
-                a.yaw = h01(uint32_t(i), 77u) * 6.2831853f;
-            }
-            if (cs != a.cur_step || glm::length(a.pos) < 1e-6f) {
-                a.cur_step = cs;
-                a.gesture_t = 0.0f;
-                a.pos = placePos(p, st, int(i));
-            }
-            a.walking = false;
-            // snapped out of a trip: the car comes with them
-            if (a.ride) {
-                a.ride = 0;
-                if (vehicles_ && i < car_of_.size() && car_of_[i] >= 0) {
-                    vehicles_->recall(car_of_[i], a.pos);
-                }
-            }
-        }
-        sim_cursor_ = (sim_cursor_ + kFarSimPerFrame) % n;
-    }
-    // far persons: staggered ground refresh ring
-    if (ground_ && n) {
-        for (size_t k = 0; k < kFarClampPerFrame; ++k) {
-            const size_t i = (clamp_cursor_ + k) % n;
-            SimState& a = sim_[i];
-            float gy;
-            glm::vec3 gn;
-            if (a.inited &&
-                ground_(a.pos.x, a.pos.z, a.pos.y + 2.0f, gy, gn)) {
-                a.pos.y = gy;
-            }
-        }
-        clamp_cursor_ = (clamp_cursor_ + kFarClampPerFrame) % n;
-    }
-
     // ── the ambient crowd round the camera ───────────────────────────
     updateStrollers(delta_t, camera_pos, walk_scale);
 
@@ -3568,6 +3570,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         const float dx = sim_[i].pos.x - camera_pos.x;
         const float dz = sim_[i].pos.z - camera_pos.z;
         const float d2 = dx * dx + dz * dz;
+        if (sim_[i].indoor_idle && d2 > kIndoorUpdateRadius * kIndoorUpdateRadius) continue;
         if (d2 < kDetailRadius * kDetailRadius) {
             near_ids.emplace_back(d2, int(i));
         }
@@ -3621,6 +3624,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         const float dx = sim_[i].pos.x - camera_pos.x;
         const float dz = sim_[i].pos.z - camera_pos.z;
         const float d2 = dx * dx + dz * dz;
+        if (sim_[i].indoor_idle && d2 > kIndoorUpdateRadius * kIndoorUpdateRadius) continue;
         if (d2 > kShowRadius * kShowRadius) continue;
         if (sim_[i].ride == 2 && !is_detailed[i]) continue;  // in their car
         if (is_detailed[i]) {
@@ -4376,6 +4380,41 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
          leg_r, {0.09f * s, 0.90f * s, 0.0f}, look.bottom);
 }
 
+void CitizenSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkinBatch>& out) const {
+    if (!loaded_ || !s_pipeline_) return;
+    auto matrix = [](const glm::vec4* rows) {
+        return glm::transpose(glm::mat4(rows[0], rows[1], rows[2], glm::vec4(0,0,0,1)));
+    };
+    auto add = [&](const ActorShadowGeometry& mesh) -> scene_rendering::RtSkinBatch& {
+        out.emplace_back();
+        out.back().positions = &mesh.positions; out.back().indices = &mesh.indices;
+        return out.back();
+    };
+    for (const auto& part : frame_parts_) add(s_shadow_cube_).model = part.xform;
+    auto skin = [&](const std::vector<SkinInstance>& parts, const ActorShadowGeometry& mesh) {
+        for (const auto& part : parts) {
+            auto& b = add(mesh); b.deformation = 2; b.shape = part.shape;
+            b.palette = {matrix(part.self), matrix(part.up), matrix(part.lo)};
+        }
+    };
+    if (s_skin_pipeline_) {
+        skin(frame_tube_, s_shadow_tube_); skin(frame_blob_, s_shadow_blob_);
+        skin(frame_ball_, s_shadow_ball_);
+    }
+    if (!s_npc_ready_) return;
+    for (int c=0; c<2; ++c) {
+        const auto& asset=s_npc_[c]; if (!asset.ok) continue;
+        for (const auto& inst : frame_npc_[c]) {
+            const size_t row=size_t(inst.a.x+0.5f);
+            if (row+kNpcRows>frame_palette_.size()) continue;
+            auto& b=add(asset.shadow); b.deformation=3;
+            b.joints=&asset.rt_joints; b.weights=&asset.rt_weights;
+            for (size_t j=0; j<kNpcRows/3; ++j)
+                b.palette.push_back(matrix(frame_palette_.data()+row+j*3));
+        }
+    }
+}
+
 void CitizenSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
     out.positions.clear(); out.indices.clear();
     if (!loaded_ || !s_pipeline_) return;
@@ -4455,7 +4494,7 @@ void CitizenSystem::draw(
         if (!s_inst_buf_ || need > s_inst_capacity_) {
             uint32_t cap = s_inst_capacity_ ? s_inst_capacity_ : 4096u;
             while (cap < need) cap *= 2u;
-            if (s_inst_buf_) s_inst_buf_->destroy(s_device_);
+            if (s_inst_buf_) retired_population_streams.push_back(s_inst_buf_);
             s_inst_buf_ = std::make_shared<er::BufferInfo>();
             er::Helper::createBuffer(
                 s_device_,
@@ -4479,7 +4518,7 @@ void CitizenSystem::draw(
             s_device_->updateBufferMemory(
                 s_inst_buf_->memory,
                 uint64_t(frame_parts_.size()) * sizeof(PartInstance),
-                frame_parts_.data());
+                frame_parts_.data(), 0, true);
         }
     }
     // ── THE SKIN STREAM: tube, blob, ball parts in one buffer ───────
@@ -4491,7 +4530,7 @@ void CitizenSystem::draw(
         if (need && (!s_skin_buf_ || need > s_skin_capacity_)) {
             uint32_t cap = s_skin_capacity_ ? s_skin_capacity_ : 1024u;
             while (cap < need) cap *= 2u;
-            if (s_skin_buf_) s_skin_buf_->destroy(s_device_);
+            if (s_skin_buf_) retired_population_streams.push_back(s_skin_buf_);
             s_skin_buf_ = std::make_shared<er::BufferInfo>();
             er::Helper::createBuffer(
                 s_device_,
@@ -4517,7 +4556,7 @@ void CitizenSystem::draw(
                 s_device_->updateBufferMemory(
                     s_skin_buf_->memory,
                     uint64_t(v->size()) * sizeof(SkinInstance),
-                    v->data(), off);
+                    v->data(), off, true);
             }
             off += uint64_t(v->size()) * sizeof(SkinInstance);
         }
@@ -4642,14 +4681,14 @@ void CitizenSystem::draw(
         s_device_->updateBufferMemory(
             s_npc_palette_buf_->memory,
             uint64_t(frame_palette_.size()) * sizeof(glm::vec4),
-            frame_palette_.data());
+            frame_palette_.data(), 0, true);
         uint64_t off = 0;
         for (int c = 0; c < 2; ++c) {
             if (frame_npc_[c].empty()) continue;
             s_device_->updateBufferMemory(
                 s_npc_inst_buf_->memory,
                 uint64_t(frame_npc_[c].size()) * sizeof(NpcInstance),
-                frame_npc_[c].data(), off);
+                frame_npc_[c].data(), off, true);
             off += uint64_t(frame_npc_[c].size()) * sizeof(NpcInstance);
         }
         cmd_buf->bindPipeline(er::PipelineBindPoint::GRAPHICS,

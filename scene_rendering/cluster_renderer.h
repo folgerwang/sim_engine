@@ -1,4 +1,6 @@
 #pragma once
+#include "rt_skin_types.h"
+#include "rt_skin_gpu.h"
 //
 // cluster_renderer.h — GPU-driven cluster culling & rendering.
 //
@@ -594,19 +596,13 @@ private:
     void destroyRtMeshSlots();
 
     // ── RT-shadow skeletons (skinned characters, both RT modes) ────────
-    // Characters deform every frame, so they can't live in the static
-    // structures above.  updateRtSkeletons() CPU-skins each registered
-    // character into WORLD-space vec4 positions (a few characters × tens
-    // of k verts ≈ well under a ms) and:
-    //   SW mode — writes header/chunk-AABB/position/index SSBOs (RT set
-    //             bindings 8..11); rtShadowFactor tests skeleton AABB →
-    //             chunk AABBs (RT_SKEL_CHUNK_TRIS tris each) → triangles.
-    //   HW mode — rebuilds ONE skeleton BLAS over the concatenated
-    //             triangles (FAST_BUILD) + the shared TLAS (static
-    //             instance + skeleton instance) on the frame cmd buffer.
-    // Buffers are HOST_VISIBLE|HOST_COHERENT and single-buffered — same
-    // per-frame overwrite policy the engine already uses for the skinning
-    // joints_buffer_.  Characters are always OPAQUE casters.
+    // GPU skinning writes world vertices, indices and chunk bounds. The same
+    // outputs feed software ray queries and the refittable dynamic BLAS.
+    // A spare queue in the graphics family runs deformation + BLAS/TLAS work;
+    // graphics waits on its semaphore before ray queries. Without a spare
+    // queue the identical GPU work is recorded on the graphics command buffer.
+    // Inputs are cached per frame slot; output reuse follows the existing
+    // previous-frame fence wait. Casters are opaque, as on the raster path.
     renderer::BufferInfo rt_skel_header_buffer_;   // counts + RtSkelHeader[]
     renderer::BufferInfo rt_skel_chunk_buffer_;    // 2×vec4 AABB per chunk
     renderer::BufferInfo rt_skel_pos_buffer_;      // skinned world vec4
@@ -637,6 +633,9 @@ private:
     void flushRetiredBuffers(bool force = false);
     renderer::AccelerationStructure hw_rt_skel_blas_handle_{};
     uint32_t hw_rt_skel_blas_tri_cap_ = 0;  // BLAS sized for this many tris
+    std::vector<uint32_t> hw_rt_skel_blas_indices_;
+    uint32_t hw_rt_skel_blas_max_vertex_ = 0;
+    uint32_t hw_rt_skel_blas_refits_ = 0;
     // (hw_rt_instance_buffer_ now serves both the finalize-time and the
     // per-frame TLAS builds — sized for 2 + kRtCasterMaxInstances.)
     bool rt_skel_last_has_skels_ = false;   // what the last TLAS carried
@@ -644,17 +643,7 @@ private:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         bool include_skeleton);
     void writeRtSkeletonDescriptors();  // rewrite RT-set bindings 8..11
-    // Change detection for updateRtSkeletons: pose = model matrix +
-    // joint matrices, cached per input slot.  When every skeleton's
-    // pose is bytewise identical to last frame, the whole update
-    // (CPU skinning + uploads + BLAS/TLAS rebuild) is skipped — the
-    // GPU state from the previous update is still valid.  Invalidated
-    // by finalize (buildHwRtShadowAs rebuilds a static-only TLAS).
-    struct RtSkelPoseCache {
-        glm::mat4              model = glm::mat4(1.0f);
-        std::vector<glm::mat4> jm;
-    };
-    std::vector<RtSkelPoseCache> rt_skel_cache_;
+    std::unique_ptr<RtSkinGpu> rt_skin_gpu_;
     bool rt_skel_have_gpu_state_ = false;
 
     // ── CSM silhouette prepass pipeline ─────────────────────────────────
@@ -1390,22 +1379,16 @@ public:
     // with every ready skinned character.  See the member-block comment
     // for the full design.  Empty vector is fine (clears the skeleton
     // set and keeps the TLAS static-only).
-    struct RtSkeletonFrameData {
-        // Pre-deformed actor batches have no joint streams. Their vertices
-        // can change without a model/palette change, so bypass pose caching.
-        bool world_space_dynamic = false;
-        const std::vector<glm::vec3>*    positions      = nullptr;
-        const std::vector<glm::u16vec4>* joints         = nullptr;
-        const std::vector<glm::vec4>*    weights        = nullptr;
-        const std::vector<glm::u16vec4>* joints1        = nullptr;  // optional
-        const std::vector<glm::vec4>*    weights1       = nullptr;  // optional
-        const std::vector<uint32_t>*     indices        = nullptr;
-        const std::vector<glm::mat4>*    joint_matrices = nullptr;
-        glm::mat4                        model = glm::mat4(1.0f);
-    };
+    using RtSkeletonFrameData = RtSkinBatch;
     void updateRtSkeletons(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
-        const std::vector<RtSkeletonFrameData>& skeletons);
+        const std::vector<RtSkeletonFrameData>& skeletons, uint32_t frame_slot);
+    bool hasPendingRtSkinCompute() const {
+        return rt_skin_gpu_ && rt_skin_gpu_->pending();
+    }
+    std::shared_ptr<renderer::Semaphore> submitRtSkinCompute() {
+        return rt_skin_gpu_ ? rt_skin_gpu_->submit() : nullptr;
+    }
     const std::vector<glsl::ClusterCullInfo>& getDebugSampleClusters() const {
         return debug_sample_clusters_;
     }

@@ -147,12 +147,16 @@ float linearizeSceneDepth(float window_z) {
 float decalCoverage(vec3 view_dir, vec3 geom_normal, vec3 world_pos) {
     float scene_win_z =
         texelFetch(scene_depth_sampler, ivec2(gl_FragCoord.xy), 0).r;
-    // Positive when the decal floats in FRONT of the scene, which is
-    // the only direction worth fading -- a decal behind the scene has
-    // already been rejected by the depth test.
-    float ray_gap =
-        max(linearizeSceneDepth(scene_win_z) -
-            linearizeSceneDepth(gl_FragCoord.z), 0.0);
+    // Measure geometry, not the rasterizer's depth bias. The decal pipelines
+    // pull depth toward the eye to avoid z-fighting; gl_FragCoord.z includes
+    // that bias, which grows into metres at distance and erased roads.
+    float decal_view_depth = -(camera_info.view * vec4(world_pos, 1.0)).z;
+    float axial_gap = max(linearizeSceneDepth(scene_win_z) -
+                          decal_view_depth, 0.0);
+    // Linearized depth is along the camera's Z axis, not the pixel ray.
+    // Correct off-axis pixels before converting to perpendicular separation.
+    float ray_gap = axial_gap * distance(camera_info.position.xyz, world_pos)
+                              / max(decal_view_depth, 1e-4);
     // ── Along-ray gap -> PERPENDICULAR gap ───────────────────────────
     // What DECAL_FADE_START/END want to measure is "how far is this
     // decal floating off the surface underneath it" -- a property of

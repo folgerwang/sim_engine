@@ -819,6 +819,15 @@ struct ViewParams {
 // the vertex_ilod_fade varying and the interior flag from
 // vertex_node_flags — see base.vert / base.frag.
 #define MODEL_FLAG_NODE_TABLE       0x20u
+// bit 6: this NODE is not vegetation even though the DRAWABLE is.
+// terrain_pcg.py merges the rock scatter into "<map>_pcg_trees.glb" to
+// share meshes and the instanced path, so the per-drawable sway bit
+// (set from the asset path) reaches boulders as well as trees, and the
+// wind rocked them.  A rock is not a plant: the CPU sets this per node
+// for the "rock_" LOD category (NodeInfo::no_sway_) and the vertex
+// shaders clear the sway bit when it is present -- which also drops the
+// crown-normal bend and base.frag's foliage guess for those nodes.
+#define MODEL_FLAG_NO_SWAY          0x40u
 
 struct ModelParams {
     mat4 model_mat;

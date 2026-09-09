@@ -229,6 +229,23 @@ void LbmWater::update(
     device->updateBufferMemory(
         region_buffer_.memory, sizeof(region), &region, 0, true);
 
+    // The surface is shared across frames. Finish earlier vertex/fragment
+    // reads before this dispatch overwrites it (the barrier below handles
+    // the opposite direction: compute writes -> this frame's rendering).
+    {
+        renderer::BarrierList barriers;
+        renderer::helper::addTexturesToBarrierList(
+            barriers, { surface_tex_->image, flow_tex_->image },
+            renderer::ImageLayout::GENERAL,
+            SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+            SET_FLAG_BIT(Access, SHADER_WRITE_BIT));
+        cmd_buf->addBarriers(
+            barriers,
+            SET_3_FLAG_BITS(PipelineStage, COMPUTE_SHADER_BIT,
+                            VERTEX_SHADER_BIT, FRAGMENT_SHADER_BIT),
+            SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT));
+    }
+
     cmd_buf->bindPipeline(
         renderer::PipelineBindPoint::COMPUTE, pipeline_);
     cmd_buf->bindDescriptorSets(
@@ -257,7 +274,8 @@ void LbmWater::update(
     params.rest_depth     = 0.6f;
     params.time           = time_;
     params.flow_strength  = 0.35f;
-    params.normal_amp     = 26.0f;
+    // One gain for wave height; shading derives from that same height field.
+    params.normal_amp     = 2.0f;
     params.grid_size      = kGridSize;
     params.reset          = needs_reset_ ? 1u : 0u;
     needs_reset_ = false;
@@ -288,8 +306,8 @@ void LbmWater::update(
         cmd_buf->addBarriers(
             barrier_list,
             SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT),
-            SET_2_FLAG_BITS(PipelineStage, COMPUTE_SHADER_BIT,
-                            FRAGMENT_SHADER_BIT));
+            SET_3_FLAG_BITS(PipelineStage, COMPUTE_SHADER_BIT,
+                            VERTEX_SHADER_BIT, FRAGMENT_SHADER_BIT));
     }
 
     parity_ ^= 1u;
