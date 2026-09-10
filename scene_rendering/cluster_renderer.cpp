@@ -617,13 +617,18 @@ uint32_t ClusterRenderer::registerClusterMaterial(
             if (mat_idx >= 0 &&
                 static_cast<size_t>(mat_idx) < drawable_data.materials_.size()) {
                 const auto& mat = drawable_data.materials_[mat_idx];
+                float depth_scale = 0.0f, depth_tile_m = 0.0f;
                 // uniform_buffer_ is HOST_VISIBLE|HOST_COHERENT — map, read, unmap.
                 if (mat.uniform_buffer_.memory) {
-                    constexpr uint64_t kVec4Size = sizeof(glm::vec4);
+                    constexpr uint64_t kVec4Size = sizeof(glsl::PbrMaterialParams);
                     void* ptr = device_->mapMemory(
                         mat.uniform_buffer_.memory, kVec4Size, 0);
                     if (ptr) {
-                        std::memcpy(&base_color, ptr, kVec4Size);
+                        std::memcpy(&base_color, ptr, sizeof(base_color));
+                        const auto& values = *static_cast<const glsl::PbrMaterialParams*>(ptr);
+                        depth_scale = values.normal_scale;
+                        if ((values.material_features & FEATURE_MATERIAL_TRIPLANAR) != 0)
+                            depth_tile_m = values.triplanar_tile_m;
                         device_->unmapMemory(mat.uniform_buffer_.memory);
                     }
                 }
@@ -651,7 +656,16 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                     }
                 }
                 // Stage the normal-map texture (binding 3).
-                int32_t norm_idx = mat.normal_idx_;
+                const bool depth_surface = mat.name_.find("_depthsurface_") != std::string::npos;
+                const bool depth_pbr = depth_surface || mat.name_.find("_depthpbr") != std::string::npos;
+                if (depth_surface) {
+                    mp.flags |= BINDLESS_MAT_DEPTH_SURFACE;
+                    std::memcpy(&mp.mr_ao_vt_id,&depth_scale,sizeof(float));
+                    std::memcpy(&mp.emissive_vt_id,&depth_tile_m,sizeof(float));
+                }
+                if (depth_pbr) mp.flags |= BINDLESS_MAT_DEPTH_PBR;
+                // Reuse the linear sampler array; do not convert ORM-depth to BC5.
+                int32_t norm_idx = depth_pbr ? mat.metallic_roughness_idx_ : mat.normal_idx_;
                 const renderer::TextureInfo* normal_tex = nullptr;
                 if (norm_idx >= 0 &&
                     static_cast<size_t>(norm_idx) < drawable_data.textures_.size()) {
@@ -710,7 +724,7 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         vid = vt_it->second;
                     } else {
                         const auto& nrm_img =
-                            (normal_tex && normal_tex->image)
+                            (!depth_pbr && normal_tex && normal_tex->image)
                                 ? normal_tex->image
                                 : std::shared_ptr<renderer::Image>();
                         // Prefer CPU pixels when the loader stashed them
@@ -739,7 +753,7 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                     }
                     if (vid != kInvalidVtId) {
                         mp.albedo_vt_id = vid;
-                        if (normal_tex && normal_tex->image) {
+                        if (!depth_pbr && normal_tex && normal_tex->image) {
                             mp.normal_vt_id = vid;
                         }
                     }

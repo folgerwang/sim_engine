@@ -1,3 +1,4 @@
+#include <glm/gtc/packing.hpp>
 #include <cstdio>
 #include <cstddef>   // offsetof (indirect-command LOD rewrite)
 #include <cstdlib>        // std::strtoll, for the plant-LOD node-name parse
@@ -853,6 +854,14 @@ static void setupMeshState(
             // this also flags forced-glass materials as translucent.
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Blend ? FEATURE_MATERIAL_BLEND : 0);
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
+            if (dst_material.name_.find("_depthpbr") != std::string::npos)
+                ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
+            const auto depth_surface = dst_material.name_.find("_depthsurface_");
+            if (depth_surface != std::string::npos) {
+                const auto code = uint16_t(std::strtoul(dst_material.name_.c_str()+depth_surface+14,nullptr,10));
+                ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR | FEATURE_MATERIAL_DEPTH_SURFACE;
+                ubo.normal_scale = glm::unpackHalf1x16(code);
+            }
             // Foliage subsurface scattering for the forward (base.frag /
             // pbr_lighting) path — the same leaf-name convention the
             // cluster upload uses for BINDLESS_MAT_FOLIAGE_SSS, so a
@@ -12013,7 +12022,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             std::lock_guard<std::mutex> lk(s_rwtex_cache_mutex);
             auto it = s_rwtex_gpu_cache.find(key);
             if (it != s_rwtex_gpu_cache.end()) {
-                dst = it->second;   // shares cpu_pixels / companion
+                dst = it->second;   // shares cpu_pixels / companion / preview
+                dst.borrowed_ = true;
                 continue;
             }
         }
@@ -12037,9 +12047,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // rebuilding per object.
         std::vector<uint8_t> alpha_data;
         int aw = tb.w, ah = tb.h;
-        if (!tb.alpha.empty()) {
+        const bool base_color_texture = std::any_of(md.sections.begin(),md.sections.end(),
+            [ti](const auto& section) { return section.tex_index == int(ti); });
+        if (base_color_texture && !tb.alpha.empty()) {
             alpha_data.assign(tb.alpha.begin(), tb.alpha.end());
-        } else if (!tb.bc7_tiles &&
+        } else if (base_color_texture && !tb.bc7_tiles &&
                    tb.preview_w == tb.w && tb.preview_h == tb.h) {
             // Legacy file: preview IS the full-res image — scan it.
             bool has_transparency = false;
@@ -12084,6 +12096,31 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             !tb.preview_rgba.empty()) {
             dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
                 tb.preview_rgba.begin(), tb.preview_rgba.end());
+        }
+
+        // Depth/PBR cards need a linear ORM-depth sample even before VT
+        // takeover. Keep only the same <=128px preview used by hierarchy loads.
+        const bool depth_preview = std::any_of(md.sections.begin(),md.sections.end(),
+            [ti](const auto& section) {
+                return (section.flags & engine::helper::kSecDepthPbr) != 0 &&
+                       (section.tex_index == int(ti) || section.mr_index == int(ti));
+            });
+        if (depth_preview && !tb.preview_rgba.empty() &&
+            tb.preview_w > 0 && tb.preview_h > 0) {
+            std::vector<unsigned char> small;
+            int w=0,h=0;
+            const bool scaled=downscalePreviewPixels(tb.preview_rgba,
+                tb.preview_w,tb.preview_h,128,small,w,h);
+            uint32_t mips=1;
+            renderer::Helper::create2DTextureImageWithMips(device,
+                renderer::Format::R8G8B8A8_UNORM,
+                scaled?w:tb.preview_w,scaled?h:tb.preview_h,
+                scaled?small.data():tb.preview_rgba.data(),dst.image,dst.memory,
+                mips,std::source_location::current());
+            dst.view=device->createImageView(dst.image,
+                renderer::ImageViewType::VIEW_2D,renderer::Format::R8G8B8A8_UNORM,
+                SET_FLAG_BIT(ImageAspect,COLOR_BIT),std::source_location::current(),0,mips);
+            dst.mip_levels=mips;
         }
 
         {
@@ -12175,6 +12212,16 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // generator authored.
         // Snow cover: see FEATURE_MATERIAL_SNOW_COVER — a shader tint
         // asked for by the material name, not a second mesh.
+        if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
+            dst_material.name_ += "_depthpbr";
+            if ((sec.flags & engine::helper::kSecDepthSurface) != 0) {
+                const uint16_t code = uint16_t(sec.flags >> 16);
+                ubo.material_features |= FEATURE_MATERIAL_DEPTH_SURFACE;
+                ubo.normal_scale = glm::unpackHalf1x16(code);
+                dst_material.name_ += "_depthsurface_" + std::to_string(code);
+            }
+        }
         if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_SNOW_COVER;
         }
@@ -13119,7 +13166,17 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             // "_snowcover" because the site stands on snow.  Pure shader
             // tint (see FEATURE_MATERIAL_SNOW_COVER) — no second mesh,
             // no second atlas.
-            if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
+            if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
+            mat.name_ += "_depthpbr";
+            if ((sec.flags & engine::helper::kSecDepthSurface) != 0) {
+                const uint16_t code = uint16_t(sec.flags >> 16);
+                ubo.material_features |= FEATURE_MATERIAL_DEPTH_SURFACE;
+                ubo.normal_scale = glm::unpackHalf1x16(code);
+                mat.name_ += "_depthsurface_" + std::to_string(code);
+            }
+        }
+        if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
                 ubo.material_features |= FEATURE_MATERIAL_SNOW_COVER;
             }
             if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&
@@ -13870,7 +13927,17 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             // "_snowcover" because the site stands on snow.  Pure shader
             // tint (see FEATURE_MATERIAL_SNOW_COVER) — no second mesh,
             // no second atlas.
-            if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
+            if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
+            mat.name_ += "_depthpbr";
+            if ((sec.flags & engine::helper::kSecDepthSurface) != 0) {
+                const uint16_t code = uint16_t(sec.flags >> 16);
+                ubo.material_features |= FEATURE_MATERIAL_DEPTH_SURFACE;
+                ubo.normal_scale = glm::unpackHalf1x16(code);
+                mat.name_ += "_depthsurface_" + std::to_string(code);
+            }
+        }
+        if ((sec.flags & engine::helper::kSecSnowCover) != 0) {
                 ubo.material_features |= FEATURE_MATERIAL_SNOW_COVER;
             }
             if ((sec.flags & engine::helper::kSecTriplanar) != 0 &&

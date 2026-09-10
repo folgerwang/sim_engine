@@ -7,6 +7,7 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 #include "global_definition.glsl.h"
 #include "functions.glsl.h"
+#include "depth_pbr.glsl.h"
 
 // ─── cluster_bindless.frag ──────────────────────────────────────────
 // Bindless cluster fragment shader.
@@ -603,6 +604,12 @@ void main() {
         albedo_tex = texture(base_color_textures[nonuniformEXT(tex_idx)], v_uv);
     }
     // Case 4 falls through with albedo_tex = vec4(1.0) → albedo4 = base_color.
+    bool depth_surface = (mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0;
+    float depth_scale = depth_surface ? uintBitsToFloat(material_params[mat_idx].mr_ao_vt_id) : 0.0;
+    float depth_tile = depth_surface ? uintBitsToFloat(material_params[mat_idx].emissive_vt_id) : 0.0;
+    if (depth_surface && depth_tile>0.0 && tex_idx>=0)
+        albedo_tex=depthTriplanarSample(base_color_textures[nonuniformEXT(tex_idx)],
+                                       v_world_pos,normalize(v_normal),depth_tile);
     albedo4 *= albedo_tex;
 
     // Alpha mask discard — matches base.frag: if(baseColor.a < alpha_cutoff) discard.
@@ -654,7 +661,25 @@ void main() {
     int  norm_idx     = material_params[mat_idx].normal_tex_idx;
     uint normal_vt    = material_params[mat_idx].normal_vt_id;
     bool has_vt_norm  = (normal_vt != VT_INVALID_ID);
-    if (has_vt_norm || norm_idx >= 0) {
+    bool depth_pbr = (mat_flags & BINDLESS_MAT_DEPTH_PBR) != 0 && norm_idx >= 0;
+    vec4 depth_orm = vec4(1.0,0.9,0.0,0.5);
+    if (depth_pbr) {
+        depth_orm = texture(normal_textures[nonuniformEXT(norm_idx)],v_uv);
+        vec3 T = normalize(v_tangent.xyz-dot(v_tangent.xyz,N)*N);
+        vec3 B = cross(N,T)*v_tangent.w;
+        if (depth_surface && depth_tile>0.0) {
+            depth_orm=depthTriplanarSample(normal_textures[nonuniformEXT(norm_idx)],
+                                          v_world_pos,N,depth_tile);
+            N=depthWorldNormal(depth_orm.a,v_world_pos,N,depth_scale*depth_tile);
+        } else if (depth_surface) {
+            N=normalize(mat3(T,B,N)*depthSurfaceNormal(
+                normal_textures[nonuniformEXT(norm_idx)],v_uv,depth_scale));
+        } else {
+            N = normalize(mat3(T,B,N)*depthPbrNormal(
+                normal_textures[nonuniformEXT(norm_idx)],v_uv));
+        }
+    }
+    else if (has_vt_norm || norm_idx >= 0) {
         // Sample and decode the normal map.
         // Bistro (and most DCC tools) export DirectX-convention normal maps where
         // the green channel is inverted relative to OpenGL/GLSL tangent space.
@@ -746,7 +771,7 @@ void main() {
     // Slot 2: emissive.rgb + metallic.a — both default 0 for the same
     //                                     reason; cluster materials don't
     //                                     yet author either channel.
-    out_albedo_ao      = vec4(albedo, 1.0);
+    out_albedo_ao      = vec4(albedo, depth_pbr ? clamp(depth_orm.r,129.0/255.0,1.0) : 1.0);
     // flags.w: BINDLESS_MAT_FOLIAGE_SSS → 1.0 so deferred_resolve adds
     // the thin-leaf translucency term for this pixel (RGBA8 target —
     // the bit survives quantisation exactly).
@@ -763,6 +788,7 @@ void main() {
     // masonry/bark sits ~0.9+ and these ARE those materials.
     float gbuf_rough = ((mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0)
                            ? 0.95 : 0.92;
+    if (depth_pbr) gbuf_rough = clamp(depth_orm.g,0.045,1.0);
     // .w now carries the leaf SIDE as well as the leaf flag:
     //   0.0  not foliage
     //   0.5  foliage, back (abaxial) face
@@ -782,7 +808,7 @@ void main() {
     // upgrade that wants emissive RGB will need a 4th GBuffer
     // attachment; for now this is the cheapest place to land it.
     vec2 oct_geom = octEncodeDir(N_geom);
-    out_emissive_metal = vec4(oct_geom.x, oct_geom.y, 0.0, 0.0);
+    out_emissive_metal = vec4(oct_geom.x, oct_geom.y, 0.0, depth_pbr ? depth_orm.b : 0.0);
 
     // Screen-space NDC velocity = curNDC.xy - prevNDC.xy.  Both clip
     // positions came from per-vertex matrix multiplies in the vertex
@@ -866,6 +892,22 @@ void main() {
     // this branch never runs with GI driving the ambient.
     ambient += albedo * groundBounceIrradiance(N, L, light_col);
 
+    if (depth_pbr) {
+        float rough = clamp(depth_orm.g,0.045,1.0);
+        float metal = clamp(depth_orm.b,0.0,1.0);
+        float nv = max(dot(N,V),0.001), nl = max(dot(N,L),0.0);
+        float nh = max(dot(N,H),0.0), vh = max(dot(V,H),0.0);
+        float a2 = rough*rough*rough*rough;
+        float denom = nh*nh*(a2-1.0)+1.0;
+        float D = a2/max(M_PI*denom*denom,1e-6);
+        float vis = 0.5/max(nl*sqrt(nv*nv*(1.0-a2)+a2)+
+                            nv*sqrt(nl*nl*(1.0-a2)+a2),1e-5);
+        vec3 f0 = mix(vec3(0.04),albedo,metal);
+        vec3 F = f0+(1.0-f0)*pow(1.0-vh,5.0);
+        diffuse = (1.0-F)*(1.0-metal)*albedo*light_col*(nl*shad/M_PI);
+        specular = F*(D*vis)*light_col*(nl*shad);
+        ambient *= depth_orm.r*(1.0-metal);
+    }
     vec3 color = ambient + diffuse + specular;
 
     // Thin-leaf subsurface scattering — sunlight transmitted through

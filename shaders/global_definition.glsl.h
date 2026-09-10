@@ -290,6 +290,9 @@
 #define FEATURE_MATERIAL_BLEND                  0x00000800
 #define FEATURE_MATERIAL_ALPHA_MASK             0x00001000
 
+#define FEATURE_MATERIAL_DEPTH_SURFACE         0x02000000
+#define FEATURE_MATERIAL_DEPTH_PBR             0x01000000
+
 #define FEATURE_HAS_BASE_COLOR_MAP              0x00010000
 #define FEATURE_HAS_NORMAL_MAP                  0x00020000
 #define FEATURE_HAS_METALLIC_ROUGHNESS_MAP      0x00040000
@@ -1302,6 +1305,8 @@ struct RtSkelHeader {
 // (0..255, plenty for the 11 current categories) packed by
 // ClusterRenderer::applyMaterialCategories() after the LLM classifier
 // runs.  Higher bits are reserved.
+#define BINDLESS_MAT_DEPTH_SURFACE 32  // repeating height, UV relief scale in mr_ao_vt_id
+#define BINDLESS_MAT_DEPTH_PBR     16  // normal binding carries linear ORM-depth, never BC5
 #define BINDLESS_MAT_DOUBLE_SIDED   1   // bit 0: accept both face orientations (flip N on back face)
 #define BINDLESS_MAT_ALPHA_MASK     2   // bit 1: discard if alpha < alpha_cutoff
 #define BINDLESS_MAT_TRANSLUCENT    4   // bit 2: AlphaMode::Blend (glass / windows).
@@ -1345,8 +1350,8 @@ struct BindlessMaterialParams {
     // layer.  See vt_sample.glsl.h::vtSample* for the resolve.
     uint  albedo_vt_id;         // offset 32
     uint  normal_vt_id;         // offset 36
-    uint  mr_ao_vt_id;          // offset 40
-    uint  emissive_vt_id;       // offset 44
+    uint  mr_ao_vt_id;          // offset 40; DEPTH_SURFACE: floatBits(UV relief scale)
+    uint  emissive_vt_id;       // offset 44; DEPTH_SURFACE: floatBits(triplanar metres), 0=UV
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).

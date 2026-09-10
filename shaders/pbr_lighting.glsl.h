@@ -1,3 +1,4 @@
+#include "depth_pbr.glsl.h"
 #ifndef NO_MTL
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D albedo_tex;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = SPECULAR_TEX_INDEX) uniform sampler2D specular_tex;
@@ -210,7 +211,22 @@ NormalInfo getNormalInfo(
     b = normalize(cross(ng, t));
 
     // Compute pertubed normals:
-    if (has_normal_map) {
+    if ((in_mat.material_features & FEATURE_MATERIAL_DEPTH_SURFACE) != 0) {
+        if (materialIsTriplanar(in_mat)) {
+            float h=triplanarSample(metallic_roughness_tex,in_data.vertex_position,
+                                   triplanarNormal(in_data),in_mat.triplanar_tile_m).a;
+            n=depthWorldNormal(h,in_data.vertex_position,ng,
+                               in_mat.normal_scale*in_mat.triplanar_tile_m);
+        } else {
+            n=mat3(t,b,ng)*depthSurfaceNormal(metallic_roughness_tex,
+                getMetallicRoughnessUV(in_data,in_mat),in_mat.normal_scale);
+        }
+    }
+    else if ((in_mat.material_features & FEATURE_MATERIAL_DEPTH_PBR) != 0) {
+        n = mat3(t,b,ng) * depthPbrNormal(metallic_roughness_tex,
+                                        getMetallicRoughnessUV(in_data,in_mat));
+    }
+    else if (has_normal_map) {
         n = texture(normal_tex, uv).rgb;
         float n_sign = n.z >= 0.0 ? 1.0f : -1.0f;
         n.xy = n.xy * 2.0 - 1.0;

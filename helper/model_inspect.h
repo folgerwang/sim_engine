@@ -63,6 +63,10 @@ static const uint32_t kSecSnowCover = 0x2u;
 // pass with base_color.a as the transmission; without the flag a baked
 // section can only be Opaque or Mask, and a pane bakes solid.
 static const uint32_t kSecBlend = 0x4u;
+// Packed ORM + linear front depth in alpha, identified at import.
+static const uint32_t kSecDepthPbr = 0x8u;
+// Generic repeating height; bits 16..31 store a half-float UV relief scale.
+static const uint32_t kSecDepthSurface = 0x10u;
 struct ModelPreviewData {
     std::vector<glm::vec3>      positions;
     std::vector<glm::vec3>      normals;   // recomputed when absent

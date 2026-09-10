@@ -2899,6 +2899,12 @@ bool bakeModelToRenderReady(
                 if (prim.material >= 0 &&
                     prim.material < (int)model.materials.size()) {
                     const std::string& mn = model.materials[prim.material].name;
+                    if (mn.find("_depthpbr") != std::string::npos) s.flags |= kSecDepthPbr;
+                    const auto ds = mn.find("_depthsurface_");
+                    if (ds != std::string::npos) {
+                        const uint32_t scale = uint32_t(std::strtoul(mn.c_str()+ds+14,nullptr,10)) & 0xffffu;
+                        s.flags |= kSecDepthPbr | kSecDepthSurface | (scale << 16);
+                    }
                     static const char kTri[] = "_triplanar_";
                     const size_t tp = mn.find(kTri);
                     if (tp != std::string::npos) {

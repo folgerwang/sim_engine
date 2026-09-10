@@ -569,7 +569,13 @@ void main() {
     // Forward: a partial multiply on the whole colour, since that
     // branch does not separate ambient from direct.
     float mat_ao = 1.0;
-    if ((material.material_features & FEATURE_HAS_OCCLUSION_MAP) != 0u) {
+    if ((material.material_features & FEATURE_MATERIAL_DEPTH_PBR) != 0)
+        mat_ao = (materialIsTriplanar(material)
+            ? triplanarSample(metallic_roughness_tex,ps_in_data.vertex_position,
+                              triplanarNormal(ps_in_data),material.triplanar_tile_m)
+            : texture(metallic_roughness_tex,getMetallicRoughnessUV(ps_in_data,material))).r;
+    if ((material.material_features & FEATURE_HAS_OCCLUSION_MAP) != 0u &&
+        (material.material_features & FEATURE_MATERIAL_DEPTH_PBR) == 0u) {
         float occ = texture(occlusion_tex,
                             getOcclusionUV(ps_in_data, material)).r;
         mat_ao = mix(1.0, occ, material.occlusion_strength);
