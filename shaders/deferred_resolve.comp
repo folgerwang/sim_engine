@@ -14,6 +14,7 @@
 #extension GL_EXT_ray_query : enable
 #endif
 #include "global_definition.glsl.h"
+#include "leaf_age.glsl.h"
 #include "functions.glsl.h"
 #include "brdf.glsl.h"   // D_GGX / V_GGX / F_Schlick for the PBR resolve
 #include "veg_sway.glsl.h"   // vegSwayVec: RT rays launch from the rest pose
@@ -146,6 +147,23 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = 12)
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 13)
     uniform sampler2D gbuf_glass_tint;   // tint.rgb, kind
 
+// Tile-owned pool: 2048 blocks x 32 probes, 112 bytes per probe.
+// Directional distance moments use normalized FP16 to avoid squared-distance overflow.
+struct WorldProbe {
+    vec4 cell_epoch;
+    vec4 state; // sun visibility, ready, light signature, last refresh
+    uvec2 radiance[6]; // FP16 directional RGB + hit distance
+    uint occlusion[6]; // FP16 normalized mean distance and second moment
+};
+layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 14)
+    buffer WorldProbeBuffer {
+        vec4 wp_tile_bounds[2048]; // min XZ, max XZ
+        uvec4 wp_tile_state[2048]; // activation generation, enabled
+        uvec4 wp_tile_lookup[4096]; // min / 64, size / 64, pool slot + 1
+        WorldProbe world_probes[];
+    };
+int wpFindTile(vec2 p);
+
 layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 11)
     buffer GiAccumBuf {
     vec4 gi_accum[];
@@ -171,6 +189,10 @@ layout(push_constant) uniform ResolvePC {
     // sample different cone positions for the accumulator to average.
     uint frame_idx;
     uint temporal_on;
+    uint probe_epoch;
+    float probe_distance;
+    uint probe_enabled;
+    uint probe_pad;
 } rpc;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 9, rg16f)
     uniform writeonly image2D rt_raw_out;
@@ -210,6 +232,15 @@ const float RT_SMOOTH_INVALID = -1.0;
 // (parity with the raster CSM path's alpha-cutoff fragment shader).
 layout(set = RT_SHADOW_DATA_SET, binding = 7)
     uniform sampler2D rt_base_color_textures[MAX_CLUSTER_TEXTURES];
+
+vec4 rtLeafAgeTexel(BindlessMaterialParams m, vec2 uv, vec4 texel) {
+    if ((m.flags & BINDLESS_MAT_LEAF_MASK) == 0) return texel;
+    uint group = (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
+    if (m.emissive_vt_id < MAX_CLUSTER_TEXTURES)
+        group = leafMaskGroup(textureLod(rt_base_color_textures[nonuniformEXT(m.emissive_vt_id)], uv, 0.).b);
+    return leafAgedColor(texel, group, camera_info.global_leaf_age);
+}
+
 // ── RT-shadow skeleton casters (skinned characters) ──────────────────
 // Written per frame by ClusterRenderer::updateRtSkeletons (CPU-skinned
 // WORLD-space positions).  The software path (rtShadowFactor) tests
@@ -625,6 +656,9 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
             // Translucent clusters don't occlude the sun (matches the
             // raster shadow path, which skips them at cull time).
             BindlessMaterialParams m = rt_materials[draw.material_idx];
+            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
+                m.base_color_factor = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
             uint mflags = uint(m.flags);
             if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
 
@@ -669,6 +703,7 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                     rt_base_color_textures[
                         nonuniformEXT(m.base_color_tex_idx)],
                     huv, 0.0).a * m.base_color_factor.a;
+                a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
                 if (a >= m.alpha_cutoff) return 0.0;   // solid texel
                 // Transparent texel — keep marching, but bounded: deep
                 // inside vegetation the answer is "shadowed" anyway.
@@ -1122,6 +1157,9 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
 
             ClusterDrawInfo draw = rt_draw_infos[cluster_idx];
             BindlessMaterialParams m = rt_materials[draw.material_idx];
+            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
+                m.base_color_factor = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
             uint mflags = uint(m.flags);
             if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
             bool masked = (mflags & BINDLESS_MAT_ALPHA_MASK) != 0u &&
@@ -1153,6 +1191,7 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
                         rt_base_color_textures[
                             nonuniformEXT(m.base_color_tex_idx)],
                         huv, RT_GI_TEX_LOD);
+                    texel = rtLeafAgeTexel(m, huv, texel);
                 }
                 if (masked &&
                     texel.a * m.base_color_factor.a < m.alpha_cutoff) {
@@ -1551,6 +1590,9 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                 rayQueryGetIntersectionGeometryIndexEXT(rq, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             BindlessMaterialParams m = rt_materials[t.mat_id];
+            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
+                m.base_color_factor = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
 
             vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
             vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
@@ -1564,6 +1606,7 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                       nonuniformEXT(m.base_color_tex_idx)], huv, 0.0).a
                       * m.base_color_factor.a
                 : m.base_color_factor.a;
+            a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
             if (a >= m.alpha_cutoff) {
                 rayQueryConfirmIntersectionEXT(rq);   // solid texel
             }
@@ -1647,6 +1690,9 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
                 rayQueryGetIntersectionGeometryIndexEXT(rq, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             BindlessMaterialParams m = rt_materials[t.mat_id];
+            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
+                m.base_color_factor = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
 
             vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
             vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
@@ -1661,6 +1707,7 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
                       RT_GI_TEX_LOD).a
                       * m.base_color_factor.a
                 : m.base_color_factor.a;
+            a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
             if (a >= m.alpha_cutoff) {
                 rayQueryConfirmIntersectionEXT(rq);   // solid texel
             }
@@ -1708,6 +1755,9 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         rayQueryGetIntersectionGeometryIndexEXT(rq, true),
         rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
     BindlessMaterialParams m = rt_materials[t.mat_id];
+    if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
+                m.base_color_factor = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
 
     vec4 p0 = hwRtVertex(t.per_mesh, t.i0);
     vec4 p1 = hwRtVertex(t.per_mesh, t.i1);
@@ -1733,6 +1783,7 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         texel = textureLod(
             rt_base_color_textures[nonuniformEXT(m.base_color_tex_idx)],
             huv, RT_GI_TEX_LOD);
+                    texel = rtLeafAgeTexel(m, huv, texel);
     }
     vec3 best_alb = texel.rgb * m.base_color_factor.rgb;
     vec3 best_n   = normalize(cross(p1.xyz - p0.xyz, p2.xyz - p0.xyz));
@@ -2185,6 +2236,11 @@ void giProbeTracePass() {
         float cz  = textureLod(gbuf_depth, cuv, 0.0).r;
         if (cz >= 1.0) continue;                       // sky
         if (textureLod(gbuf_albedo_ao, cuv, 0.0).a < 0.5) continue;  // forward
+        if (rpc.probe_enabled != 0u) {
+            vec4 wp=camera_info.inv_view_proj*vec4(cuv*2.0-1.0,cz,1.0);
+            if(distance(wp.xyz/wp.w,camera_info.position.xyz)>=rpc.probe_distance &&
+               wpFindTile((wp.xyz/wp.w).xz)>=0) continue;
+        }
         ppx = c;
         pz  = cz;
         break;
@@ -2416,7 +2472,225 @@ bool giProbeGather(ivec2 px, ivec2 sz, vec3 world_pos, vec3 N,
 }
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+const float WP_HEIGHT_SPACING = 96.0;
+const float WP_OCCLUSION_RANGE = 512.0;
+uint wpTileHash(ivec2 c,uint size) {
+    return (uint(c.x)*73856093u ^ uint(c.y)*19349663u ^ size*83492791u)&4095u;
+}
+int wpFindTile(vec2 p) {
+    // Fine tiles are centred on 128 m multiples; outer tiles have corner origins.
+    for(int level=0;level<3;++level) {
+        float size=level==0?128.0:(level==1?512.0:2048.0);
+        float offset=level==0?64.0:0.0;
+        ivec2 c=ivec2(round((floor((p+offset)/size)*size-offset)/64.0));
+        uint h=wpTileHash(c,uint(size/64.0));
+        for(uint n=0u;n<4096u;++n) {
+            uvec4 entry=wp_tile_lookup[h];
+            if(entry.w==0u) break;
+            if(all(equal(ivec2(entry.xy),c)) && entry.z==uint(size/64.0))
+                return int(entry.w-1u);
+            h=(h+1u)&4095u;
+        }
+    }
+    return -1;
+}
+vec3 wpPosition(uint tile,ivec3 local) {
+    vec4 bounds=wp_tile_bounds[tile];
+    vec2 xz=mix(bounds.xy,bounds.zw,(vec2(local.x,local.z)+0.5)/2.0);
+    float y=(floor(camera_info.position.y/WP_HEIGHT_SPACING)-4.0+float(local.y)+0.5)*WP_HEIGHT_SPACING;
+    return vec3(xz.x,y,xz.y);
+}
+uint wpIndex(uint tile,ivec3 local) { return tile*32u+uint((local.y*2+local.z)*2+local.x); }
+vec3 wpSky(vec3 n) {
+    vec3 v = textureLod(lambertian_env_sampler,n,0.0).rgb * kIblIrradianceScale;
+#ifndef USE_HDR
+    v = sRGBToLinear(v);
+#endif
+    return max(v,vec3(0.0));
+}
+uvec2 wpPack(vec4 v) {
+    v=clamp(v,vec4(0),vec4(65504.0));
+    return uvec2(packHalf2x16(v.xy),packHalf2x16(v.zw));
+}
+vec4 wpUnpack(uvec2 v) { return vec4(unpackHalf2x16(v.x),unpackHalf2x16(v.y)); }
+vec3 wpAxis(int i) {
+    vec3 v=vec3(0); v[i/2]=(i%2==0)?1.0:-1.0; return v;
+}
+#ifdef HW_RT_SHADOW
+// Closest-hit distance, with foliage cutouts respected. Only back faces of
+// single-sided solid surfaces count as evidence that a probe lies inside.
+float wpTraceDistance(vec3 ro,vec3 rd,out bool backface) {
+    backface=false;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq,hw_rt_tlas,gl_RayFlagsNoOpaqueEXT,0xFFu,
+                          ro,0.001,rd,WP_OCCLUSION_RANGE);
+    while (rayQueryProceedEXT(rq)) {
+        // Only non-opaque (masked) triangle candidates reach here.
+        if (rayQueryGetIntersectionTypeEXT(rq, false) ==
+            gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const HwRtTri t = hwRtResolveTri(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+                rayQueryGetIntersectionGeometryIndexEXT(rq, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+            BindlessMaterialParams m = rt_materials[t.mat_id];
+            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
+                m.base_color_factor = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+            uint candidateFlags=uint(m.flags);
+            if((candidateFlags & BINDLESS_MAT_TRANSLUCENT)!=0u) continue;
+            if((candidateFlags & BINDLESS_MAT_ALPHA_MASK)==0u) {
+                rayQueryConfirmIntersectionEXT(rq);
+                continue;
+            }
+
+            vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
+            vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
+            vec2 uv2 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i2).w));
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+            vec2 huv = uv0 * (1.0 - bary.x - bary.y)
+                     + uv1 * bary.x + uv2 * bary.y;
+
+            float a = (m.base_color_tex_idx >= 0)
+                ? textureLod(rt_base_color_textures[
+                      nonuniformEXT(m.base_color_tex_idx)], huv,
+                      RT_GI_TEX_LOD).a
+                      * m.base_color_factor.a
+                : m.base_color_factor.a;
+            a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
+            if (a >= m.alpha_cutoff) {
+                rayQueryConfirmIntersectionEXT(rq);   // solid texel
+            }
+        }
+    }
+
+    if(rayQueryGetIntersectionTypeEXT(rq,true)==gl_RayQueryCommittedIntersectionNoneEXT)
+        return WP_OCCLUSION_RANGE;
+    if(rayQueryGetIntersectionInstanceCustomIndexEXT(rq,true)!=1) {
+        HwRtTri tri=hwRtResolveTri(rayQueryGetIntersectionInstanceCustomIndexEXT(rq,true),
+            rayQueryGetIntersectionGeometryIndexEXT(rq,true),rayQueryGetIntersectionPrimitiveIndexEXT(rq,true));
+        uint flags=uint(rt_materials[tri.mat_id].flags);
+        backface=!rayQueryGetIntersectionFrontFaceEXT(rq,true) &&
+            (flags & (BINDLESS_MAT_DOUBLE_SIDED|BINDLESS_MAT_ALPHA_MASK|BINDLESS_MAT_TRANSLUCENT))==0u;
+    }
+    return rayQueryGetIntersectionTEXT(rq,true);
+}
+#endif
+void worldProbeUpdate() {
+    uint i=gl_GlobalInvocationID.x+gl_GlobalInvocationID.y*gl_NumWorkGroups.x*8u;
+    if(i>=65536u) return;
+    uint tile=i/32u;
+    if(wp_tile_state[tile].y==0u) return;
+    uint sub=i%32u;
+    ivec3 local=ivec3(int(sub%2u),int(sub/4u),int((sub/2u)%2u));
+    vec3 pos=wpPosition(tile,local);
+    uint epoch=rpc.probe_epoch ^ (wp_tile_state[tile].x*2654435761u);
+    WorldProbe old=world_probes[i];
+    bool valid=all(equal(old.cell_epoch.xyz,pos)) && floatBitsToUint(old.cell_epoch.w)==epoch;
+    vec3 L=normalize(-runtime_lights.lights[0].direction);
+    vec3 sun=runtime_lights.lights[0].color*runtime_lights.lights[0].intensity;
+    uint lightKey=packSnorm4x8(vec4(L,0.0)) ^ floatBitsToUint(floor(length(sun)*8.0));
+    if(!valid) {
+        old.cell_epoch=vec4(pos,uintBitsToFloat(epoch));
+        old.state=vec4(1.0,0.0,uintBitsToFloat(lightKey),0.0);
+        for(int k=0;k<6;++k) {
+            old.radiance[k]=wpPack(vec4(wpSky(wpAxis(k)),RT_GI_MAX_DIST));
+            old.occlusion[k]=packHalf2x16(vec2(1));
+        }
+        world_probes[i]=old;
+    }
+    float d=distance(pos,camera_info.position.xyz);
+    uint period=d<384.0?16u:(d<1024.0?64u:128u);
+    if((i%period)!=(rpc.frame_idx%period)) return;
+#ifdef HW_RT_SHADOW
+    bool history=valid && old.state.y>0.5 && floatBitsToUint(old.state.z)==lightKey;
+    float blend=history?0.25:1.0;
+    uint backfaces=0u;
+    float closest=WP_OCCLUSION_RANGE;
+    // Four rays per cube direction measure surrounding occlusion. Normalized
+    // moments stay in [0,1], retaining FP16 precision without distance^2 overflow.
+    for(int k=0;k<6;++k) {
+        vec3 axis=wpAxis(k);
+        vec3 tangent=wpAxis(((k/2+1)%3)*2);
+        vec3 bitangent=cross(axis,tangent);
+        vec2 moments=vec2(0);
+        for(int r=0;r<4;++r) {
+            vec3 rd=normalize(axis+0.45*((r&1)==0?-1.0:1.0)*tangent+
+                                   0.45*((r&2)==0?-1.0:1.0)*bitangent);
+            bool back;
+            float t=wpTraceDistance(pos,rd,back);
+            backfaces+=back?1u:0u;
+            closest=min(closest,t);
+            float normalized=t/WP_OCCLUSION_RANGE;
+            moments+=vec2(normalized,normalized*normalized)*0.25;
+        }
+        vec2 prev=unpackHalf2x16(old.occlusion[k]);
+        world_probes[i].occlusion[k]=packHalf2x16(mix(prev,moments,blend));
+    }
+    // Closed, consistently wound solids produce mostly exit/back-face hits.
+    // Thin double-sided foliage never counts as solid-volume evidence.
+    if(backfaces>=6u || closest<0.05) {
+        world_probes[i].state=vec4(0.0,-1.0,uintBitsToFloat(lightKey),float(rpc.frame_idx));
+        return; // Retry on the usual schedule, allowing moving objects to leave.
+    }
+    float sunVis=hwRtShadowRayVisible(pos,L,RT_SHADOW_MAX_DIST);
+    for(int k=0;k<6;++k) {
+        float hit;
+        vec3 value=hwRtGiRadiance(pos,wpAxis(k),L,sun,hit);
+        if(any(isnan(value)) || any(isinf(value))) value=wpSky(wpAxis(k));
+        world_probes[i].radiance[k]=wpPack(vec4(mix(wpUnpack(old.radiance[k]).rgb,max(value,vec3(0)),blend),hit));
+    }
+    world_probes[i].state=vec4(mix(old.state.x,sunVis,blend),1.0,uintBitsToFloat(lightKey),float(rpc.frame_idx));
+#endif
+}
+float wpVisibility(WorldProbe probe,vec3 delta) {
+    float dist=length(delta);
+    if(dist<0.001) return 1.0;
+    vec3 dir=delta/dist;
+    vec2 moments=vec2(0);
+    for(int a=0;a<3;++a)
+        moments+=unpackHalf2x16(probe.occlusion[a*2+(dir[a]<0.0?1:0)])*dir[a]*dir[a];
+    float sampleDistance=max(dist-0.2,0.0)/WP_OCCLUSION_RANGE;
+    if(moments.x>=0.999 || sampleDistance<=moments.x) return 1.0;
+    float variance=max(moments.y-moments.x*moments.x,0.000002);
+    float difference=sampleDistance-moments.x;
+    float visibility=variance/(variance+difference*difference);
+    return visibility*visibility*visibility;
+}
+void worldProbeGather(vec3 p,vec3 N,out vec3 irradiance,out float sun) {
+    int owner=wpFindTile(p.xz);
+    irradiance=wpSky(N);sun=1.0;
+    if(owner<0) return;
+    uint tile=uint(owner);
+    vec4 bounds=wp_tile_bounds[tile];
+    vec2 xz=(p.xz-bounds.xy)/(bounds.zw-bounds.xy)*2.0-0.5;
+    float y=p.y/WP_HEIGHT_SPACING-floor(camera_info.position.y/WP_HEIGHT_SPACING)+4.0-0.5;
+    vec3 grid=clamp(vec3(xz.x,y,xz.y),vec3(0),vec3(1,7,1));
+    ivec3 cell=min(ivec3(floor(grid)),ivec3(0,6,0));
+    vec3 f=grid-vec3(cell);
+    vec3 sum=vec3(0);float sunSum=0.0,weight=0.0;
+    bool initialized=false;
+    uint epoch=rpc.probe_epoch ^ (wp_tile_state[tile].x*2654435761u);
+    for(int z=0;z<2;++z)for(int y0=0;y0<2;++y0)for(int x=0;x<2;++x) {
+        ivec3 c=cell+ivec3(x,y0,z);
+        WorldProbe q=world_probes[wpIndex(tile,c)];
+        vec3 position=wpPosition(tile,c);
+        if(any(notEqual(q.cell_epoch.xyz,position)) || floatBitsToUint(q.cell_epoch.w)!=epoch) continue;
+        initialized=initialized || q.state.y!=0.0;
+        if(q.state.y<0.5) continue;
+        vec3 w=mix(1.0-f,f,vec3(x,y0,z));
+        float a=w.x*w.y*w.z*wpVisibility(q,p+N*0.2-position);
+        vec3 E=vec3(0);
+        for(int axis=0;axis<3;++axis) E+=wpUnpack(q.radiance[axis*2+(N[axis]<0.0?1:0)]).rgb*N[axis]*N[axis];
+        sum+=E*a;sunSum+=q.state.x*a;weight+=a;
+    }
+    if(weight>0.001) { irradiance=sum/weight;sun=sunSum/weight; }
+    else if(initialized) { irradiance=wpSky(N)*0.05;sun=0.0; }
+    // Only genuinely uninitialized tiles use open-sky fallback. Adding sky for
+    // occlusion-rejected weights would undo the wall-leak protection above.
+}
+
 void main() {
+    if (rpc.pass_mode == 4u) { worldProbeUpdate(); return; }
     // Screen-probe GI trace runs on a completely different thread
     // mapping (one workgroup per probe) — branch out before anything
     // below interprets gl_GlobalInvocationID as a pixel.
@@ -2682,12 +2956,16 @@ void main() {
     // Replaces the single-sun direct term entirely; ambient IBL and the
     // RT-AO logic below still apply.  The winner's visibility feeds the
     // SHADOW debug view via `shad`.
-    bool restir_active =
+    bool far_probe = rpc.probe_enabled != 0u && distance(world_pos,camera_info.position.xyz)>=rpc.probe_distance &&
+                     wpFindTile(world_pos.xz)>=0;
+    vec3 far_irradiance=vec3(0);float far_sun=1.0;
+    if(far_probe) worldProbeGather(world_pos,N,far_irradiance,far_sun);
+    bool restir_active = !far_probe &&
         (camera_info.input_features & FEATURE_INPUT_RESTIR) != 0u;
     vec3 restir_direct = vec3(0.0);
 
     float shad = 1.0;
-    if (rpc.pass_mode == 2u) {
+    if (far_probe) { shad=far_sun; } else if (rpc.pass_mode == 2u) {
         // APPLY pass: shadow + AO were traced by the GEN dispatch and
         // smoothed by rt_filter.comp — no tracing here.  Values are
         // consumed after the AO block below.
@@ -2743,7 +3021,7 @@ void main() {
     // occlusion-tested per pixel by the shadow rays above, so darkening
     // it again would double-occlude.
     float rt_ao = 1.0;
-    if (rpc.pass_mode != 2u &&
+    if (!far_probe && rpc.pass_mode != 2u &&
         (camera_info.input_features & FEATURE_INPUT_RT_AO) != 0u) {
 #ifdef HW_RT_SHADOW
         if ((camera_info.input_features &
@@ -2766,7 +3044,7 @@ void main() {
         imageStore(rt_raw_out, px, vec4(shad, rt_ao, 0.0, 0.0));
         return;
     }
-    if (rpc.pass_mode == 2u) {
+    if (!far_probe && rpc.pass_mode == 2u) {
         vec2 f = imageLoad(rt_filtered_in, px).rg;
         shad  = clamp(f.r, 0.0, 1.0);
         rt_ao = clamp(f.g, 0.0, 1.0);
@@ -2819,7 +3097,10 @@ void main() {
     gi_debug_E = sRGBToLinear(gi_debug_E);
 #endif
     gi_debug_E *= (ao * rt_ao);
-    if ((camera_info.input_features &
+    if (far_probe) {
+        gi_debug_E=far_irradiance;
+        ambient_diffuse=c_diff*far_irradiance*ao;
+    } else if ((camera_info.input_features &
          (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) ==
         (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) {
         // ── Lumen-style screen probe gather ──────────────────────────
@@ -3001,6 +3282,18 @@ void main() {
     vec3 diffuse = restir_active
         ? restir_direct
         : c_diff * light_col * (NdotL * shad / M_PI);
+
+    // Preserve authored local lights beyond the probe boundary without
+    // issuing per-pixel visibility rays. The world cache supplies sun/GI;
+    // local lights retain their radius attenuation, with approximate shadows.
+    if (far_probe && (camera_info.input_features & FEATURE_INPUT_RESTIR) != 0u) {
+        for (uint k = 0u; k < restir_light_header.x; ++k) {
+            vec3 ray_dir;
+            float ray_max;
+            diffuse += restirEvalSample(k + 2u, L, world_pos, N, c_diff, V,
+                                        ray_dir, ray_max);
+        }
+    }
 
     vec3 specular = vec3(0.0);
     if (!restir_active && NdotL > 0.0) {

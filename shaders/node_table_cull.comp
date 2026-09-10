@@ -78,9 +78,9 @@ void main() {
         // The prepass has no dissolve: a node mid cross-fade or a
         // per-instance-band node would stamp full depth over pixels the
         // colour pass then discards.  Those sit the prepass out.
-        if (per_inst || fading) return;
+        if (per_inst || fading || ((node.flags >> 2u) & 3u) == 0u) return;
     }
-    const bool node_uncovered = per_inst || fading;
+    const bool node_uncovered = per_inst || fading || ((node.flags >> 2u) & 3u) == 0u;
 
     // ── Emit one command per primitive into its bucket ───────────────
     for (uint p = 0u; p < node.prim_count; ++p) {

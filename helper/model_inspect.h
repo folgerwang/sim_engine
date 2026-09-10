@@ -63,6 +63,9 @@ static const uint32_t kSecSnowCover = 0x2u;
 // pass with base_color.a as the transmission; without the flag a baked
 // section can only be Opaque or Mask, and a pane bakes solid.
 static const uint32_t kSecBlend = 0x4u;
+static const uint32_t kSecLeafMask = 0x100u;
+static const uint32_t kSecLeafAge = 0x20u;
+static const uint32_t kSecLeafGroupShift = 6u;
 // Packed ORM + linear front depth in alpha, identified at import.
 static const uint32_t kSecDepthPbr = 0x8u;
 // Generic repeating height; bits 16..31 store a half-float UV relief scale.

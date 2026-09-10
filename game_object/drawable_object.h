@@ -45,6 +45,7 @@ struct MaterialInfo {
     int32_t                occlusion_idx_ = -1;
 
     // Cluster renderer needs these CPU-side (avoids re-reading the GPU UBO).
+    int                    leaf_age_group_ = -1;
     float                  alpha_cutoff_ = 0.0f;  // >0 enables alpha-mask discard
     AlphaMode              alpha_mode_   = AlphaMode::Opaque;
     bool                   alpha_mask_   = false; // legacy alias = (alpha_mode_ == Mask)
@@ -78,6 +79,7 @@ struct MaterialInfo {
     // Consumers: isPrimitiveOpaque() in drawable_object.cpp uses this
     // to decide whether to bind the no-frag shadow pipeline.
     bool                   effective_opaque_ = true;
+    mutable int8_t         prepass_leaf_cache_ = -1;
 
     // ── ECS dedup identity ─────────────────────────────────────────────
     // Renderer-free description of this material, captured at load time
@@ -282,6 +284,9 @@ struct MeshInfo {
     // --cluster-debug CLI flag was set). Otherwise it stays empty and costs
     // nothing. See helper/cluster_mesh.h for the data layout.
     helper::ClusterMesh         cluster_mesh_;
+    // Fine-leaf fallback for direct glTF imports, which have no cluster sidecar.
+    std::shared_ptr<helper::Mesh> leaf_source_;
+    std::vector<uint8_t> leaf_face_groups_;
 
     // GPU-side companion buffers for the cluster debug draw path. Populated
     // by ClusterDebugDraw::uploadForMesh() immediately after cluster_mesh_
@@ -465,6 +470,7 @@ struct NodeInfo {
     // full open-sky irradiance and renders as bright as the lawn.
     // Set by parsePlantLodBands alongside the LOD/gate parse.
     uint8_t                     interior_ = 0;
+    mutable int8_t               prepass_group_cache_ = -1;
     // ── Proximity gate (house interiors / door leaves) ────────────
     // Parsed from a "_pgate_<x_dm>_<z_dm>_<r_dm>_<mode>" marker in the
     // node name (decimetre ints).  mode 0: node draws ONLY when the eye
@@ -1396,6 +1402,13 @@ public:
     // World translation for coarse near-to-far ordering (the depth
     // prepass sorts drawables by it).  The per-instance override wins
     // when set; otherwise the wrapper's location_ translation column.
+    static void drawSortedDepthPrepass(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd,
+        const std::vector<std::shared_ptr<DrawableObject>>& drawables,
+        const renderer::DescriptorSetList& sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors,
+        const glm::vec3& eye, bool leaves_only = false);
     glm::vec3 getSortWorldPos() const {
         return instance_root_valid_ ? instance_root_t_
                                     : glm::vec3(location_[3]);

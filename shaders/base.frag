@@ -487,21 +487,6 @@ void main() {
 #endif
     
 
-    // Reject empty leaf-card pixels before normal maps and material work.
-    // Decals have their own coverage rules below.
-#if defined(ALPHAMODE_MASK) && !defined(NO_MTL) && !defined(DECAL)
-    if (baseColor.a < material.alpha_cutoff) discard;
-#endif
-#if !defined(GBUFFER_OUTPUT) && !defined(GLASS_ATTR) && !defined(DECAL) && !defined(NO_MTL) && !defined(MATERIAL_UNLIT)
-    // Deferred resolve replaces this colour. Preserve coverage/depth,
-    // but avoid normal, roughness and lighting evaluation in forward.
-    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u &&
-        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
-        (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
-        outColor = vec4(linearTosRGB(baseColor.rgb * 0.5), 1.0);
-        return;
-    }
-#endif
 
 #ifndef NO_MTL
 #ifdef MATERIAL_UNLIT
@@ -755,6 +740,26 @@ void main() {
     }
     return;
 #endif // GBUFFER_OUTPUT
+
+#if !defined(GLASS_ATTR) && !defined(DECAL)
+    // Keep derivative-dependent material sampling before divergent alpha
+    // discard. Deferred-covered draws still avoid the lighting stack.
+    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u &&
+        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
+        (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
+#ifdef ALPHAMODE_MASK
+        if (baseColor.a < material.alpha_cutoff) discard;
+#endif
+        float fast_nl = 0.5;
+#ifdef USE_PUNCTUAL
+        fast_nl = max(dot(normal_info.n,
+            normalize(-runtime_lights.lights[0].direction)), 0.0);
+#endif
+        outColor = vec4(linearTosRGB(baseColor.rgb * (0.25 + 0.5 * fast_nl)), 1.0);
+        return;
+    }
+#endif
+
 
 
 

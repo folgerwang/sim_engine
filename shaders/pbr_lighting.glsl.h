@@ -1,3 +1,4 @@
+#include "leaf_age.glsl.h"
 #include "depth_pbr.glsl.h"
 #ifndef NO_MTL
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = ALBEDO_TEX_INDEX) uniform sampler2D albedo_tex;
@@ -274,6 +275,14 @@ vec4 getBaseColor(
             }
         }
     }
+    if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_MASK) != 0) {
+        float ageCode = texture(metallic_roughness_tex, getMetallicRoughnessUV(in_data, in_mat)).b;
+        baseColor = leafAgedColor(baseColor, leafMaskGroup(ageCode), camera_info.global_leaf_age);
+    }
+    else if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
+        baseColor = leafAgedColor(baseColor,
+            (in_mat.material_features >> FEATURE_MATERIAL_LEAF_GROUP_SHIFT) & 3u,
+            camera_info.global_leaf_age);
     // ── Snow cover ───────────────────────────────────────────────────
     // RGB ONLY.  baseColor.a is the foliage cutout the alpha-mask test
     // reads, and washing it toward 1 would turn every leaf spray back
@@ -338,7 +347,7 @@ void getMetallicRoughnessInfo(
     float f0_ior)
 {
 #ifndef NO_MTL
-    info.metallic = in_mat.metallic_factor;
+    info.metallic = (in_mat.material_features & FEATURE_MATERIAL_LEAF_MASK) != 0 ? 0. : in_mat.metallic_factor;
     info.perceptualRoughness = in_mat.roughness_factor;
 
     bool has_metallic_roughness_map = (in_mat.material_features & FEATURE_HAS_METALLIC_ROUGHNESS_MAP) != 0;
@@ -358,6 +367,8 @@ void getMetallicRoughnessInfo(
             info.metallic = (1.0f - mrSample.g);
         }
     }
+
+    if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_MASK) != 0) info.metallic = 0.;
 
 #ifdef MATERIAL_METALLICROUGHNESS_SPECULAROVERRIDE
     // Overriding the f0 creates unrealistic materials if the IOR does not match up.

@@ -129,9 +129,9 @@ void ObjectSceneView::duplicateDepthBuffer(
 
 void ObjectSceneView::drawDepthPrepass(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-    const renderer::DescriptorSetList& desc_sets) {
+    const renderer::DescriptorSetList& desc_sets, bool leaves_only) {
 
-    if (m_drawable_objects_.empty() || !m_depth_buffer_) {
+    if (!m_depth_buffer_) {
         return;
     }
 
@@ -145,19 +145,14 @@ void ObjectSceneView::drawDepthPrepass(
     ego::DrawableObject::setPlantLodEye(
         m_camera_object_->getCameraViewInfo().position);
 
-    // GPU node-table cull for this pass — must precede the rendering
-    // scope (compute dispatches are illegal inside it).
-    ego::DrawableObject::ntBeginPass(
-        cmd_buf, m_drawable_objects_,
-        ego::DrawableObject::DrawMode::kDepthPrepass,
-        /*depth_only*/ false, 0u);
+    // This pass emits globally sorted CPU draw nodes, not node-table buckets.
 
     {
         er::RenderingAttachmentInfo depth_attachment_info;
         depth_attachment_info.image_view = m_depth_buffer_->view;
         depth_attachment_info.image_layout =
             er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        depth_attachment_info.load_op = er::AttachmentLoadOp::CLEAR;
+        depth_attachment_info.load_op = leaves_only ? er::AttachmentLoadOp::LOAD : er::AttachmentLoadOp::CLEAR;
         depth_attachment_info.store_op = er::AttachmentStoreOp::STORE;
         depth_attachment_info.clear_value.depth_stencil = { 1.0f, 0 };
 
@@ -184,37 +179,9 @@ void ObjectSceneView::drawDepthPrepass(
     scissors[0].offset = glm::ivec2(0);
     scissors[0].extent = m_buffer_size_;
 
-    // NEAR TO FAR.  Early-Z inside the prepass only rejects a fragment
-    // when something nearer was recorded FIRST, so the order is most of
-    // the benefit.  Coarse per-drawable ordering by world translation is
-    // enough — the point is the houses before the forest behind them,
-    // not exact per-triangle order — and a stable sort keeps equal-
-    // distance drawables in registration order for cache locality.
-    const glm::vec3 eye = m_camera_object_->getCameraViewInfo().position;
-    std::vector<ego::DrawableObject*> order;
-    order.reserve(m_drawable_objects_.size());
-    for (auto& d : m_drawable_objects_) {
-        order.push_back(d.get());
-    }
-    std::stable_sort(
-        order.begin(), order.end(),
-        [&eye](const ego::DrawableObject* a, const ego::DrawableObject* b) {
-            const glm::vec3 da = a->getSortWorldPos() - eye;
-            const glm::vec3 db = b->getSortWorldPos() - eye;
-            return glm::dot(da, da) < glm::dot(db, db);
-        });
-
-    for (auto* drawable_obj : order) {
-        drawable_obj->draw(
-            cmd_buf,
-            desc_set_list,
-            viewports,
-            scissors,
-            false,
-            ego::DrawableObject::DrawMode::kDepthPrepass,
-            0u);
-    }
-
+    // One merged distance-sorted list across all house, rock and tree nodes.
+    ego::DrawableObject::drawSortedDepthPrepass(cmd_buf, m_drawable_objects_,
+        desc_set_list, viewports, scissors, m_camera_object_->getCameraViewInfo().position, leaves_only);
     cmd_buf->endDynamicRendering();
 }
 

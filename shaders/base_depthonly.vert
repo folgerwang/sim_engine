@@ -205,20 +205,9 @@ void main() {
             float ilod_d = distance(inst_t.xz, camera_info.position.xz);
             float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
             float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;
-            float ilod_k_out = clamp(ilod_far * 0.05, 2.0, 24.0);
-            float ilod_k_in = clamp(ilod_near * 0.05, 2.0, 24.0);
-            float ilod_w_out = ((ilod_bits & 0x80000000u) != 0u)
-                ? clamp((ilod_far + ilod_k_out - ilod_d) /
-                            (2.0 * ilod_k_out), 0.0, 1.0)
-                : (ilod_d < ilod_far ? 1.0 : 0.0);
-            float ilod_w_in = (ilod_near > 0.01)
-                ? clamp((ilod_d - (ilod_near - ilod_k_in)) /
-                            (2.0 * ilod_k_in), 0.0, 1.0)
-                : 1.0;
-            float ilod_w =
-                (ilod_w_in < ilod_w_out) ? -ilod_w_in : ilod_w_out;
+            float ilod_w = (ilod_d >= ilod_near && ilod_d < ilod_far) ? 1.0 : 0.0;
             out_data.vertex_ilod_fade = ilod_w;
-            if (!(ilod_w > 0.5 || ilod_w < -0.5)) {
+            if (ilod_w == 0.0) {
                 gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
                 out_data.vertex_position = vec3(0.0, -4.0e8, 0.0);
             }

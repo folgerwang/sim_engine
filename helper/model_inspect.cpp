@@ -2927,6 +2927,13 @@ bool bakeModelToRenderReady(
                     if (mn.find("_snowcover") != std::string::npos) {
                         s.flags |= kSecSnowCover;
                     }
+                    if (mn.find("_leafmask") != std::string::npos) s.flags |= kSecLeafMask;
+                    const auto leaf_age = mn.find("_leafage_");
+                    if (leaf_age != std::string::npos && leaf_age + 9 < mn.size() &&
+                        mn[leaf_age + 9] >= '0' && mn[leaf_age + 9] <= '3') {
+                        s.flags |= kSecLeafAge |
+                            (uint32_t(mn[leaf_age + 9] - '0') << kSecLeafGroupShift);
+                    }
                     // Translucency travels as a section flag: the
                     // baked file has no material names or alpha modes
                     // for the runtime to read (see kSecBlend).

@@ -525,7 +525,9 @@ private:
     // so the threshold is kept comfortably above that walk distance.
     glm::vec3 rt_build_eye_ = glm::vec3(0.0f);
     bool      rt_build_eye_valid_ = false;
-    float     rt_masked_opaque_dist_m_ = 150.0f;
+    // Keep cutout holes at every distance: opaque leaf cards turn
+    // distant canopies into solid shadow blockers.
+    float     rt_masked_opaque_dist_m_ = 0.0f;
     uint32_t  rt_masked_demoted_tris_ = 0;
     std::shared_ptr<renderer::DescriptorSetLayout> hw_rt_desc_set_layout_;
     std::shared_ptr<renderer::DescriptorSet>       hw_rt_desc_set_;

@@ -626,6 +626,9 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                     if (ptr) {
                         std::memcpy(&base_color, ptr, sizeof(base_color));
                         const auto& values = *static_cast<const glsl::PbrMaterialParams*>(ptr);
+                        if ((values.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
+                            mp.flags |= BINDLESS_MAT_LEAF_AGE |
+                                (((values.material_features >> FEATURE_MATERIAL_LEAF_GROUP_SHIFT) & 3u) << BINDLESS_MAT_LEAF_GROUP_SHIFT);
                         depth_scale = values.normal_scale;
                         if ((values.material_features & FEATURE_MATERIAL_TRIPLANAR) != 0)
                             depth_tile_m = values.triplanar_tile_m;
@@ -656,6 +659,8 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                     }
                 }
                 // Stage the normal-map texture (binding 3).
+                const bool leaf_mask = mat.name_.find("_leafmask") != std::string::npos;
+                if (leaf_mask) mp.flags |= BINDLESS_MAT_LEAF_MASK;
                 const bool depth_surface = mat.name_.find("_depthsurface_") != std::string::npos;
                 const bool depth_pbr = depth_surface || mat.name_.find("_depthpbr") != std::string::npos;
                 if (depth_surface) {
@@ -665,7 +670,7 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                 }
                 if (depth_pbr) mp.flags |= BINDLESS_MAT_DEPTH_PBR;
                 // Reuse the linear sampler array; do not convert ORM-depth to BC5.
-                int32_t norm_idx = depth_pbr ? mat.metallic_roughness_idx_ : mat.normal_idx_;
+                int32_t norm_idx = (depth_pbr || leaf_mask) ? mat.metallic_roughness_idx_ : mat.normal_idx_;
                 const renderer::TextureInfo* normal_tex = nullptr;
                 if (norm_idx >= 0 &&
                     static_cast<size_t>(norm_idx) < drawable_data.textures_.size()) {
@@ -680,6 +685,17 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                             staging_normal_tex_views_.push_back(normal_tex->view);
                             mp.normal_tex_idx = slot;
                         }
+                    }
+                }
+                // Age maps share the linear texture array for raster and the
+                // RT texture array for ray queries. No material-layout expansion.
+                if (leaf_mask && normal_tex && normal_tex->view) {
+                    auto it = staging_tex_slot_map_.find(normal_tex->view.get());
+                    if (it != staging_tex_slot_map_.end()) mp.emissive_vt_id = uint32_t(it->second);
+                    else if (staging_tex_views_.size() < MAX_CLUSTER_TEXTURES) {
+                        mp.emissive_vt_id = uint32_t(staging_tex_views_.size());
+                        staging_tex_slot_map_[normal_tex->view.get()] = int(mp.emissive_vt_id);
+                        staging_tex_views_.push_back(normal_tex->view);
                     }
                 }
                 // ── Unified VT registration (per-material) ────
@@ -724,7 +740,7 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         vid = vt_it->second;
                     } else {
                         const auto& nrm_img =
-                            (!depth_pbr && normal_tex && normal_tex->image)
+                            (!depth_pbr && !leaf_mask && normal_tex && normal_tex->image)
                                 ? normal_tex->image
                                 : std::shared_ptr<renderer::Image>();
                         // Prefer CPU pixels when the loader stashed them
@@ -753,7 +769,7 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                     }
                     if (vid != kInvalidVtId) {
                         mp.albedo_vt_id = vid;
-                        if (!depth_pbr && normal_tex && normal_tex->image) {
+                        if (!depth_pbr && !leaf_mask && normal_tex && normal_tex->image) {
                             mp.normal_vt_id = vid;
                         }
                     }

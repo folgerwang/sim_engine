@@ -515,6 +515,11 @@ Menu::Menu(
     const std::shared_ptr<renderer::Sampler>& sampler,
     const std::shared_ptr<renderer::ImageView>& rt_image_view,
     const std::shared_ptr<renderer::ImageView>& main_image_view) {
+    // Optional startup override for automated debug captures; normal default is off.
+    if (const char* debug = std::getenv("REALWORLD_TILE_PROBE_DEBUG"))
+        world_probe_debug_ = debug[0] == '1';
+    if (const char* leaf = std::getenv("REALWORLD_LEAF_DEPTH_PREPASS"))
+        leaf_depth_prepass_ = leaf[0] == '1';
     std::string path = "assets";
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
         auto path_string = entry.path();
@@ -2362,6 +2367,9 @@ bool Menu::draw(
                     rt_temporal_ = !rt_temporal_;
                 }
                 ImGui::SetNextItemWidth(120.0f);
+                ImGui::Checkbox("Far world probes", &world_probes_enabled_);
+                if (world_probes_enabled_)
+                    ImGui::SliderFloat("Probe lighting starts (m)", &world_probe_distance_m_, 25.0f, 1000.0f, "%.0f m");
                 ImGui::SliderInt("RT rays/px", &rt_samples_per_px_, 1, 8);
 
                 // Directional-sun radiance, live.  This is the knob that
@@ -9686,7 +9694,20 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
 // application.cpp).  Both base.frag and cluster_bindless.frag read and
 // dispatch on this value; mode 0 = the normal shaded path.
 void Menu::drawRenderDebugMenuContent() {
+    ImGui::MenuItem("Leaf alpha-cutoff depth prepass", nullptr, &leaf_depth_prepass_);
+    if (leaf_depth_prepass_)
+        ImGui::Text("Leaf depth: %llu submitted draws (last frame)",
+                    static_cast<unsigned long long>(leaf_depth_prepass_draws_));
     ImGui::MenuItem("VRAM by terrain / asset", nullptr, &show_vram_breakdown_);
+    if (ImGui::BeginMenu("Tile probes")) {
+        ImGui::MenuItem("Draw tile probes", nullptr, &world_probe_debug_);
+        ImGui::Checkbox("Show through geometry", &world_probe_debug_xray_);
+        ImGui::Combo("Color", &world_probe_debug_mode_, "Status\0Radiance\0Sun visibility\0Occlusion distance\0");
+        ImGui::SliderFloat("Draw distance (m)", &world_probe_debug_distance_, 100.0f, 20000.0f, "%.0f m");
+        ImGui::TextUnformatted("Green: valid | Red: rejected | Yellow: pending");
+        ImGui::TextUnformatted("Requires deferred rendering and Far world probes.");
+        ImGui::EndMenu();
+    }
     // ── Layout ──────────────────────────────────────────────────────
     // This was one flat list of ~35 entries: eighteen view modes, then
     // path isolation, skeleton states, pipeline, four viewers and the

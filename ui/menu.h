@@ -347,6 +347,14 @@ class Menu {
     // (1..8).  2 with the accumulator on is visually on par with the old
     // fixed 8 at a quarter of the trace cost; the AO budget follows at
     // half this count.
+    bool world_probes_enabled_ = true;
+    bool world_probe_debug_ = false;
+    bool leaf_depth_prepass_ = false;
+    uint64_t leaf_depth_prepass_draws_ = 0;
+    bool world_probe_debug_xray_ = true;
+    int world_probe_debug_mode_ = 0;
+    float world_probe_debug_distance_ = 1500.0f;
+    float world_probe_distance_m_ = 100.0f;
     int  rt_samples_per_px_ = 2;
     // Screen-probe GI (Lumen-style screen probe gather).  ON: indirect
     // diffuse is traced at ONE probe per 16x16 pixel tile (64
@@ -2280,6 +2288,14 @@ public:
     inline bool isRtSmoothingOn() const { return rt_smoothing_; }
     // Rendering > Shadow > "Temporal RT shadow/AO" and "RT rays/px".
     inline bool isRtTemporalOn() const { return rt_temporal_; }
+    void setLeafDepthPrepassDraws(uint64_t count) { leaf_depth_prepass_draws_ = count; }
+    bool leafDepthPrepass() const { return leaf_depth_prepass_; }
+    bool worldProbeDebug() const { return world_probe_debug_; }
+    bool worldProbeDebugXray() const { return world_probe_debug_xray_; }
+    int worldProbeDebugMode() const { return world_probe_debug_mode_; }
+    float worldProbeDebugDistance() const { return world_probe_debug_distance_; }
+    bool worldProbesEnabled() const { return world_probes_enabled_; }
+    float worldProbeDistance() const { return world_probe_distance_m_; }
     inline int  getRtSamplesPerPx() const { return rt_samples_per_px_; }
 
     // Rendering > Shadow > "Screen-probe GI (Lumen-style)".  Selects the

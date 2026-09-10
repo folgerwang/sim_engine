@@ -90,6 +90,8 @@ static int       s_material_filter = 0;
 // screen-door dissolve).  Same pattern as s_material_filter: a static
 // set by every draw() beats widening four call signatures.
 static bool      s_depth_prepass_pass = false;
+static bool      s_leaf_depth_prepass = false;
+static bool      s_leaf_node_context = false;
 
 // ── Deferred-relight armed (see setDeferredRelightArmed) ─────────────
 // Application-set, once per frame, mirroring the gate that guards the
@@ -834,8 +836,18 @@ static void setupMeshState(
             // this also flags forced-glass materials as translucent.
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Blend ? FEATURE_MATERIAL_BLEND : 0);
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
+            if (dst_material.name_.find("_leafmask") != std::string::npos)
+                ubo.material_features |= FEATURE_MATERIAL_LEAF_MASK;
             if (dst_material.name_.find("_depthpbr") != std::string::npos)
                 ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
+            const auto leaf_age = dst_material.name_.find("_leafage_");
+            if (leaf_age != std::string::npos && leaf_age + 9 < dst_material.name_.size() &&
+                dst_material.name_[leaf_age + 9] >= '0' && dst_material.name_[leaf_age + 9] <= '3')
+            {
+                dst_material.leaf_age_group_ = int(dst_material.name_[leaf_age + 9] - '0');
+                ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
+                    (uint32_t(dst_material.leaf_age_group_) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+            }
             const auto depth_surface = dst_material.name_.find("_depthsurface_");
             if (depth_surface != std::string::npos) {
                 const auto code = uint16_t(std::strtoul(dst_material.name_.c_str()+depth_surface+14,nullptr,10));
@@ -1226,6 +1238,42 @@ static void setupMesh(
 
     for (size_t i = 0; i < src_mesh.primitives.size(); i++) {
         const tinygltf::Primitive& primitive = src_mesh.primitives[i];
+
+        if (primitive.attributes.count("_LEAF_ID") && primitive.attributes.count("POSITION") && primitive.indices >= 0) {
+            const auto& pa=model.accessors[primitive.attributes.at("POSITION")];
+            const auto& ia=model.accessors[primitive.indices];
+            const auto& material_name=model.materials[primitive.material].name;
+            const auto marker=material_name.find("_leafage_");
+            if (marker!=std::string::npos && marker+9<material_name.size() &&
+                material_name[marker+9]>='0' && material_name[marker+9]<='3' &&
+                pa.componentType==TINYGLTF_COMPONENT_TYPE_FLOAT && pa.type==TINYGLTF_TYPE_VEC3 &&
+                pa.bufferView>=0 && ia.bufferView>=0 &&
+                (ia.componentType==TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT || ia.componentType==TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT)) {
+                const auto& pv=model.bufferViews[pa.bufferView];
+                const auto& iv=model.bufferViews[ia.bufferView];
+                const auto& pb=model.buffers[pv.buffer].data;const auto& ib=model.buffers[iv.buffer].data;
+                const size_t ps=pa.ByteStride(pv),is=ia.ByteStride(iv);
+                const size_t po=pv.byteOffset+pa.byteOffset,io=iv.byteOffset+ia.byteOffset;
+                if (ps>=12 && is>=2 && po+pa.count*ps<=pb.size() && io+ia.count*is<=ib.size()) {
+                    if(!mesh_info.leaf_source_) mesh_info.leaf_source_=std::make_shared<helper::Mesh>();
+                    auto& vertices=*mesh_info.leaf_source_->vertex_data_ptr;
+                    auto& faces=*mesh_info.leaf_source_->faces_ptr;
+                    const uint32_t base=uint32_t(vertices.size());
+                    for(size_t v=0;v<pa.count;++v) {
+                        helper::VertexStruct vertex{};std::memcpy(&vertex.position,pb.data()+po+v*ps,12);
+                        vertices.push_back(vertex);
+                    }
+                    for(size_t f=0;f+2<ia.count;f+=3) {
+                        uint32_t indices[3]={};
+                        for(size_t k=0;k<3;++k) std::memcpy(&indices[k],ib.data()+io+(f+k)*is,
+                            ia.componentType==TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT?2:4);
+                        if(indices[0]>=pa.count || indices[1]>=pa.count || indices[2]>=pa.count) continue;
+                        faces.emplace_back(base+indices[0],base+indices[1],base+indices[2]);
+                        mesh_info.leaf_face_groups_.push_back(uint8_t(material_name[marker+9]-'0'));
+                    }
+                }
+            }
+        }
 
         ego::PrimitiveInfo primitive_info;
         primitive_info.tag_.restart_enable = false;
@@ -3520,13 +3568,25 @@ static void selectPlantLodBands(
                                        glm::abs(eye.z - e.wz1));
             const float d_max = glm::sqrt(dxm * dxm + dzm * dzm);
             const uint8_t v_ci =
-                (d < e.far_m + k_out_ci && d_max >= e.near_m - k_in_ci)
+                (d < e.far_m && d_max >= e.near_m)
                     ? 1 : 0;
             vis[i] = v_ci;
             fade[i] = 1.0f;
             owner[i] = v_ci;
             drawn += v_ci;
             continue;
+        }
+
+        // Plant bands switch at one shared boundary: no dual-band draw.
+        const int category_index = drawable_object->nodes_[i].lod_cat_idx_;
+        if (category_index >= 0 && size_t(category_index) < drawable_object->lod_cat_names_.size()) {
+            const auto& category = drawable_object->lod_cat_names_[category_index];
+            if (category == "tree" || category == "bush" || category == "ground") {
+                vis[i] = owner[i] = (d >= e.near_m && d < e.far_m) ? 1 : 0;
+                fade[i] = vis[i] ? 1.0f : 0.0f;
+                drawn += vis[i];
+                continue;
+            }
         }
 
         // ── Band selection with a CROSS-FADE transition ──────────────
@@ -4364,6 +4424,56 @@ static inline bool isPrimitiveOpaque(
         materials[primitive.material_idx_].effective_opaque_;
 }
 
+// Main-view occluders are deliberately stricter than shadow casters.
+static uint32_t prepassNodeGroup(const ego::NodeInfo& node) {
+    if (node.interior_) return 0;
+    if (node.prepass_group_cache_ < 0) {
+        std::string name = node.name_;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        const auto cat = lodCategoryOf(name);
+        node.prepass_group_cache_ = (cat == "house" || cat == "building") ? 1 :
+            ((cat == "rock" || cat == "crag") ? 2 : (cat == "tree" ? 3 : 0));
+    }
+    return uint32_t(node.prepass_group_cache_);
+}
+static bool isPrepassPrimitive(const ego::PrimitiveInfo& prim,
+                               const std::vector<ego::MaterialInfo>& materials) {
+    if (!isPrimitiveOpaque(prim, materials)) return false;
+    if (prim.material_idx_ < 0) return true;
+    const auto& mat = materials[prim.material_idx_];
+    if (mat.glass_forced_) return false;
+    if (mat.prepass_leaf_cache_ < 0) {
+        std::string name = mat.name_;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        bool leaf = false;
+        for (const char* tag : {"leaf", "leaves", "foliage", "needle", "impostor", "billboard", "petal", "blossom"})
+            leaf |= name.find(tag) != std::string::npos;
+        mat.prepass_leaf_cache_ = (leaf ? 1 : 0) |
+            ((name.find("glass") != std::string::npos || name.find("transparent") != std::string::npos) ? 2 : 0);
+    }
+    return mat.prepass_leaf_cache_ == 0;
+}
+
+static bool isLeafDepthPrimitive(const ego::PrimitiveInfo& prim,
+                                 const std::vector<ego::MaterialInfo>& materials,
+                                 bool plant_node = false) {
+    if (prim.material_idx_ < 0 || isPrimitiveOpaque(prim, materials)) return false;
+    const auto& mat = materials[prim.material_idx_];
+    if (mat.alpha_mode_ != ego::AlphaMode::Mask || mat.glass_forced_) return false;
+    // The cached mask uses bit 0 for leaf-like names, bit 1 for glass.
+    if (mat.prepass_leaf_cache_ < 0) {
+        std::string name = mat.name_;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        int mask = 0;
+        for (const char* tag : {"leaf", "leaves", "foliage", "needle", "impostor", "billboard", "petal", "blossom"})
+            if (name.find(tag) != std::string::npos) mask |= 1;
+        if (name.find("glass") != std::string::npos || name.find("transparent") != std::string::npos) mask |= 2;
+        mat.prepass_leaf_cache_ = int8_t(mask);
+    }
+    return (mat.prepass_leaf_cache_ & 2) == 0 &&
+           (plant_node || mat.prepass_leaf_cache_ == 1);
+}
+
 // ── Format-based alpha-channel detector ──────────────────────────────────
 // Returns true iff `format` carries an alpha channel.  A texture stored in
 // an RGB-only format (R8G8B8_UNORM, BC1_RGB, BC4_UNORM_BLOCK, etc.) cannot
@@ -4845,7 +4955,7 @@ static void drawMesh(
     // Use cluster_global_mesh_idx_ >= 0 (set during cluster upload) as the
     // "this mesh is owned by the cluster renderer" flag — independent of
     // whether debug GPU buffers happen to exist.
-    if (engine::helper::clusterIndirectActive() &&
+    if (!s_depth_prepass_pass && engine::helper::clusterIndirectActive() &&
         mesh_info.cluster_global_mesh_idx_ >= 0) {
         if (!depth_only &&
             (drawable_object->m_debug_force_red_ ||
@@ -4855,7 +4965,7 @@ static void drawMesh(
         return;
     }
 
-    if (!depth_only &&
+    if (!depth_only && !s_depth_prepass_pass &&
         engine::helper::clusterRenderingEnabled() &&
         mesh_info.cluster_debug_gpu_.ready() &&
         ego::ClusterDebugDraw::ready()) {
@@ -4951,8 +5061,9 @@ static void drawMesh(
         // covered-prim skip below respects by never skipping them.
         // (effective_opaque Mask materials — no real cutout alpha —
         // count as opaque here AND below, so the two stay consistent.)
-        if (s_depth_prepass_pass &&
-            !isPrimitiveOpaque(prim, drawable_object->materials_)) {
+        if (s_depth_prepass_pass && !(s_leaf_depth_prepass
+            ? isLeafDepthPrimitive(prim, drawable_object->materials_, s_leaf_node_context)
+            : isPrepassPrimitive(prim, drawable_object->materials_))) {
             continue;
         }
         // ── Deferred-covered prim skip (main forward pass only) ──────
@@ -4973,7 +5084,8 @@ static void drawMesh(
             // for.  Masked foliage keeps drawing forward (its depth and
             // screen-door coverage live there); the relight fast path
             // in base.frag keeps that draw cheap.
-            isPrimitiveOpaque(prim, drawable_object->materials_)) {
+            (model_params.flip_uv_coord & MODEL_FLAG_PREPASS_OCCLUDER) != 0u &&
+            isPrepassPrimitive(prim, drawable_object->materials_)) {
             uint32_t ilod_bits = 0u;
             std::memcpy(&ilod_bits, &model_params.model_params_pad0,
                         sizeof(ilod_bits));
@@ -5442,9 +5554,9 @@ static void drawNodeMesh(
         // test against prepass depth.  Those nodes sit the prepass out
         // and rely on the forward pass's own depth write, as before.
         const bool prepass_skips_node =
-            s_depth_prepass_pass && has_lod &&
-            (node.lod_per_instance_ != 0 ||
-             glm::abs(lod_fade) < 0.999f);
+            s_depth_prepass_pass &&
+            ((!s_leaf_depth_prepass && prepassNodeGroup(node) == 0) || node.interior_ || node.skin_idx_ >= 0 ||
+             (has_lod && (node.lod_per_instance_ != 0 || glm::abs(lod_fade) < 0.999f)));
         if (node.mesh_idx_ >= 0 && !node_filtered && !lod_hidden &&
             !prepass_skips_node) {
             if (!depth_only &&
@@ -5466,6 +5578,7 @@ static void drawNodeMesh(
                 // ambient by kInteriorSkyAmbient (the forward path has
                 // no ray tracer to occlude the sky for it).
                 (node.interior_ ? 0x04 : 0x00) |
+                (prepassNodeGroup(node) ? MODEL_FLAG_PREPASS_OCCLUDER : 0u) |
                 // bit 3: vegetation — base.vert / base_depthonly.vert
                 // bend this draw in the wind (MODEL_FLAG_VEGETATION_SWAY).
                 ((drawable_object->m_vegetation_sway_ && !node.no_sway_)
@@ -5944,12 +6057,20 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     decal_pipeline_info.blend_state_info = s_decal_blend_state_info;
     decal_pipeline_info.depth_stencil_info = s_decal_depth_stencil_info;
 
-    const renderer::GraphicPipelineInfo& effective_pipeline_info =
+    renderer::GraphicPipelineInfo effective_pipeline_info =
         is_decal ? decal_pipeline_info : graphic_pipeline_info;
 
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
     topology_info.topology = static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
+
+    // Optional cutout depth prepass already owns equal-depth leaf samples.
+    // The color pass must still shade those samples (and re-test alpha).
+    if (!is_decal && effective_pipeline_info.depth_stencil_info) {
+        effective_pipeline_info.depth_stencil_info = std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+            *effective_pipeline_info.depth_stencil_info);
+        effective_pipeline_info.depth_stencil_info->depth_compare_op = renderer::CompareOp::LESS_OR_EQUAL;
+    }
 
     auto binding_descs = primitive.binding_descs_;
     auto attribute_descs = primitive.attribute_descs_;
@@ -7846,10 +7967,10 @@ static void ntBuildTables(
             const bool opaque = isPrimitiveOpaque(prim, object_->materials_);
             uint32_t f = 0u;
             if (is_blend) f |= NT_PRIM_BLEND;
-            if (opaque) f |= NT_PRIM_OPAQUE;
+            if (isPrepassPrimitive(prim, object_->materials_)) f |= NT_PRIM_OPAQUE;
             // Mirrors drawMesh's covered-prim predicate: opaque,
             // non-skinned, with a material.
-            if (has_mat && !prim.tag_.has_skin_set_0 && opaque) {
+            if (has_mat && !prim.tag_.has_skin_set_0 && isPrepassPrimitive(prim, object_->materials_)) {
                 f |= NT_PRIM_COVERABLE;
             }
             nt.gp_mesh.push_back(uint32_t(mi));
@@ -8000,6 +8121,7 @@ static void ntStageRecords(
             ? object_->mesh_node_sphere_[fi]
             : glm::vec4(0.0f, 0.0f, 0.0f, 1.0e30f);   // no sphere: never culled
         ci.cmd_ofs_u32 = uint32_t(node.indirect_cmd_ofs_) / 4u;
+        flags |= prepassNodeGroup(node) << 2u;
         ci.prim_first = nt.mesh_prim_first[mesh_idx];
         ci.prim_count = uint32_t(object_->meshes_[mesh_idx].primitives_.size());
         ci.flags = flags;
@@ -10196,7 +10318,7 @@ static void buildMeshNodeFlatList(
                 // opaque, non-skinned, with a material.
                 const bool coverable =
                     has_mat && !prim.tag_.has_skin_set_0 &&
-                    isPrimitiveOpaque(prim, object_->materials_);
+                    isPrepassPrimitive(prim, object_->materials_);
                 if (!coverable) f |= DrawableData::kMeshHasUncoverable;
             }
             mpf[mi_i] = f;
@@ -10205,6 +10327,9 @@ static void buildMeshNodeFlatList(
             if (f & DrawableData::kMeshHasUncoverable)
                 object_->any_uncoverable_prims_ = true;
         }
+        for (const auto& node : object_->nodes_)
+            if (node.mesh_idx_ >= 0 && prepassNodeGroup(node) == 0)
+                object_->any_uncoverable_prims_ = true;
         object_->mesh_pass_flags_built_ = true;
     }
     object_->mesh_node_flat_.clear();
@@ -10429,7 +10554,7 @@ static bool rebuildLodSurvivorLists(
                 has_lod && glm::abs(fade_v) < 0.999f;
             const bool per_inst =
                 has_lod && nd.lod_per_instance_ != 0;
-            if (fading || per_inst ||
+            if (fading || per_inst || prepassNodeGroup(nd) == 0 ||
                 (mf & DrawableData::kMeshHasUncoverable) != 0) {
                 unc.push_back(uint32_t(fi));
             }
@@ -10443,6 +10568,80 @@ static bool rebuildLodSurvivorLists(
     object_->lod_pass_flat_n_ = flat_n;
     ++s_draw_stats.lod_rebuilds;
     return true;
+}
+
+void DrawableObject::drawSortedDepthPrepass(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd,
+    const std::vector<std::shared_ptr<DrawableObject>>& drawables,
+    const renderer::DescriptorSetList& sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors,
+    const glm::vec3& eye, bool leaves_only) {
+    struct Item { DrawableObject* owner; int32_t node; float distance; };
+    static thread_local std::vector<Item> items;
+    items.clear();
+    for (const auto& owner : drawables) {
+        if (!owner || !owner->visible_ || owner->ecs_culled_hint_ || !owner->isReady()) continue;
+        owner->stagePerDrawState();
+        auto& data = owner->object_;
+        if (!data->instance_buffer_.buffer) continue;
+        selectPlantLodBands(data, data->m_current_instance_world_);
+        buildMeshNodeFlatList(data, data->default_scene_ >= 0 ? data->default_scene_ : 0);
+        if (data->has_plant_lod_) rebuildLodSurvivorLists(data);
+        auto add = [&](uint32_t fi) {
+            const int32_t ni = data->mesh_node_flat_[fi];
+            const auto& node = data->nodes_[ni];
+            if ((!leaves_only && !prepassNodeGroup(node)) || node.interior_ || node.skin_idx_ >= 0 ||
+                (data->m_only_render_node_ >= 0 && data->m_only_render_node_ != ni)) return;
+            if (data->has_plant_lod_ && size_t(ni) < data->lod_node_fade_.size() &&
+                (node.lod_per_instance_ || glm::abs(data->lod_node_fade_[ni]) < 0.999f)) return;
+            bool solid = false;
+            for (const auto& prim : data->meshes_[node.mesh_idx_].primitives_)
+                solid |= leaves_only ? isLeafDepthPrimitive(prim, data->materials_,
+                    prepassNodeGroup(node) == 3u || (data->m_vegetation_sway_ && !node.no_sway_))
+                    : isPrepassPrimitive(prim, data->materials_);
+            if (!solid) return;
+            const glm::vec4 sphere = data->mesh_node_sphere_[fi];
+            const auto& iw = data->m_current_instance_world_;
+            const glm::vec3 center = glm::vec3(iw * glm::vec4(sphere.x, sphere.y, sphere.z, 1));
+            const float radius = sphere.w * glm::max(glm::length(glm::vec3(iw[0])),
+                glm::max(glm::length(glm::vec3(iw[1])), glm::length(glm::vec3(iw[2]))));
+            if (s_frustum_cull_active) for (const auto& plane : s_frustum_planes)
+                if (glm::dot(glm::vec3(plane), center) + plane.w < -radius) return;
+            items.push_back({owner.get(), ni, glm::max(0.0f, glm::length(center-eye)-radius)});
+        };
+        if (data->has_plant_lod_) {
+            for (uint32_t fi : data->lod_pass_fwd_) add(fi);
+        } else {
+            for (uint32_t fi=0; fi<data->mesh_node_flat_.size(); ++fi) add(fi);
+        }
+    }
+    std::stable_sort(items.begin(), items.end(), [](const Item& a,const Item& b) { return a.distance < b.distance; });
+    s_depth_prepass_pass = true;
+    s_leaf_depth_prepass = leaves_only;
+    s_forward_covered_skip_active = false;
+    s_material_filter = 1;
+    DrawableObject* bound = nullptr;
+    size_t last_hash = 0;
+    for (const auto& item : items) {
+        auto* owner = item.owner;
+        if (bound != owner) {
+            owner->stagePerDrawState();
+            selectPlantLodBands(owner->object_, owner->object_->m_current_instance_world_);
+            cmd->bindVertexBuffers(VINPUT_INSTANCE_BINDING_POINT, {owner->object_->instance_buffer_.buffer}, {0});
+            last_hash = 0;
+            bound = owner;
+        }
+        const auto& node = owner->object_->nodes_[item.node];
+        s_leaf_node_context = prepassNodeGroup(node) == 3u ||
+            (owner->object_->m_vegetation_sway_ && !node.no_sway_);
+        drawNodeMesh(cmd, owner->object_, drawable_pipeline_layout_, sets, item.node,
+            drawable_depth_prepass_pipeline_list_, viewports, scissors, false,
+            last_hash, 0u, false, nullptr);
+    }
+    s_depth_prepass_pass = false;
+    s_leaf_depth_prepass = false;
+    s_leaf_node_context = false;
 }
 
 void DrawableObject::stagePerDrawState() {
@@ -12252,7 +12451,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // takeover. Keep only the same <=128px preview used by hierarchy loads.
         const bool depth_preview = std::any_of(md.sections.begin(),md.sections.end(),
             [ti](const auto& section) {
-                return (section.flags & engine::helper::kSecDepthPbr) != 0 &&
+                return (section.flags & (engine::helper::kSecDepthPbr | engine::helper::kSecLeafMask)) != 0 &&
                        (section.tex_index == int(ti) || section.mr_index == int(ti));
             });
         if (depth_preview && !tb.preview_rgba.empty() &&
@@ -12362,7 +12561,22 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // generator authored.
         // Snow cover: see FEATURE_MATERIAL_SNOW_COVER — a shader tint
         // asked for by the material name, not a second mesh.
-        if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
+        if ((sec.flags & engine::helper::kSecLeafMask) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_LEAF_MASK;
+            dst_material.name_ += "_leafmask";
+        }
+        if ((sec.flags & engine::helper::kSecLeafAge) != 0) {
+                dst_material.leaf_age_group_ = int((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u);
+                dst_material.alpha_mode_ = ego::AlphaMode::Mask;
+                dst_material.alpha_mask_ = true;
+                dst_material.effective_opaque_ = false;
+                dst_material.alpha_cutoff_ = 0.1f;
+                ubo.alpha_cutoff = 0.1f;
+                ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+                ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
+                    (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+            }
+            if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
             dst_material.name_ += "_depthpbr";
             if ((sec.flags & engine::helper::kSecDepthSurface) != 0) {
@@ -13259,6 +13473,9 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             mat.alpha_mask_ = mat_cutout;
             mat.alpha_mode_ = mat_cutout ? ego::AlphaMode::Mask
                                          : ego::AlphaMode::Opaque;
+            // Native streaming bypasses the glTF post-load opacity scan.
+            // Keep depth/shadow classification consistent with detected cutouts.
+            mat.effective_opaque_ = !mat_cutout;
             // TRANSLUCENT section (kSecBlend: the source material was
             // glTF alphaMode BLEND -- the house library's window panes).
             // Routed exactly like the glTF loader's name-forced glass:
@@ -13268,6 +13485,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             // every pane was baked solid and painted the sky's colour.
             if ((sec.flags & engine::helper::kSecBlend) != 0) {
                 mat.alpha_mode_ = ego::AlphaMode::Blend;
+                mat.effective_opaque_ = false;
                 mat.glass_forced_ = true;
                 mat.alpha_mask_ = false;
                 mat.alpha_cutoff_ = 0.0f;
@@ -13319,6 +13537,21 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             // "_snowcover" because the site stands on snow.  Pure shader
             // tint (see FEATURE_MATERIAL_SNOW_COVER) — no second mesh,
             // no second atlas.
+            if ((sec.flags & engine::helper::kSecLeafMask) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_LEAF_MASK;
+            mat.name_ += "_leafmask";
+        }
+        if ((sec.flags & engine::helper::kSecLeafAge) != 0) {
+                mat.leaf_age_group_ = int((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u);
+                mat.alpha_mode_ = ego::AlphaMode::Mask;
+                mat.alpha_mask_ = true;
+                mat.effective_opaque_ = false;
+                mat.alpha_cutoff_ = 0.1f;
+                ubo.alpha_cutoff = 0.1f;
+                ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+                ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
+                    (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+            }
             if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
             mat.name_ += "_depthpbr";
@@ -14036,6 +14269,9 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             mat.alpha_mask_ = mat_cutout;
             mat.alpha_mode_ = mat_cutout ? ego::AlphaMode::Mask
                                          : ego::AlphaMode::Opaque;
+            // Native streaming bypasses the glTF post-load opacity scan.
+            // Keep depth/shadow classification consistent with detected cutouts.
+            mat.effective_opaque_ = !mat_cutout;
             // TRANSLUCENT section (kSecBlend: the source material was
             // glTF alphaMode BLEND -- the house library's window panes).
             // Routed exactly like the glTF loader's name-forced glass:
@@ -14045,6 +14281,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             // every pane was baked solid and painted the sky's colour.
             if ((sec.flags & engine::helper::kSecBlend) != 0) {
                 mat.alpha_mode_ = ego::AlphaMode::Blend;
+                mat.effective_opaque_ = false;
                 mat.glass_forced_ = true;
                 mat.alpha_mask_ = false;
                 mat.alpha_cutoff_ = 0.0f;
@@ -14096,6 +14333,21 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             // "_snowcover" because the site stands on snow.  Pure shader
             // tint (see FEATURE_MATERIAL_SNOW_COVER) — no second mesh,
             // no second atlas.
+            if ((sec.flags & engine::helper::kSecLeafMask) != 0) {
+            ubo.material_features |= FEATURE_MATERIAL_LEAF_MASK;
+            mat.name_ += "_leafmask";
+        }
+        if ((sec.flags & engine::helper::kSecLeafAge) != 0) {
+                mat.leaf_age_group_ = int((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u);
+                mat.alpha_mode_ = ego::AlphaMode::Mask;
+                mat.alpha_mask_ = true;
+                mat.effective_opaque_ = false;
+                mat.alpha_cutoff_ = 0.1f;
+                ubo.alpha_cutoff = 0.1f;
+                ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
+                ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
+                    (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+            }
             if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
             mat.name_ += "_depthpbr";

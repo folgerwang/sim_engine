@@ -292,6 +292,11 @@
 #define FEATURE_MATERIAL_BLEND                  0x00000800
 #define FEATURE_MATERIAL_ALPHA_MASK             0x00001000
 
+#define FEATURE_MATERIAL_LEAF_MASK             0x20000000
+#define FEATURE_MATERIAL_LEAF_AGE              0x04000000
+#define FEATURE_MATERIAL_LEAF_GROUP_SHIFT      27
+#define FEATURE_MATERIAL_LEAF_GROUP_MASK       0x18000000
+
 #define FEATURE_MATERIAL_DEPTH_SURFACE         0x02000000
 #define FEATURE_MATERIAL_DEPTH_PBR             0x01000000
 
@@ -833,6 +838,7 @@ struct ViewParams {
 // shaders clear the sway bit when it is present -- which also drops the
 // crown-normal bend and base.frag's foliage guess for those nodes.
 #define MODEL_FLAG_NO_SWAY          0x40u
+#define MODEL_FLAG_PREPASS_OCCLUDER 0x80u
 
 struct ModelParams {
     mat4 model_mat;
@@ -1307,6 +1313,11 @@ struct RtSkelHeader {
 // (0..255, plenty for the 11 current categories) packed by
 // ClusterRenderer::applyMaterialCategories() after the LLM classifier
 // runs.  Higher bits are reserved.
+#define BINDLESS_MAT_LEAF_MASK 0x00080000
+#define BINDLESS_MAT_LEAF_AGE 0x00010000
+#define BINDLESS_MAT_LEAF_GROUP_SHIFT 17
+#define BINDLESS_MAT_LEAF_GROUP_MASK 0x00060000
+
 #define BINDLESS_MAT_DEPTH_SURFACE 32  // repeating height, UV relief scale in mr_ao_vt_id
 #define BINDLESS_MAT_DEPTH_PBR     16  // normal binding carries linear ORM-depth, never BC5
 #define BINDLESS_MAT_DOUBLE_SIDED   1   // bit 0: accept both face orientations (flip N on back face)
@@ -1353,7 +1364,7 @@ struct BindlessMaterialParams {
     uint  albedo_vt_id;         // offset 32
     uint  normal_vt_id;         // offset 36
     uint  mr_ao_vt_id;          // offset 40; DEPTH_SURFACE: floatBits(UV relief scale)
-    uint  emissive_vt_id;       // offset 44; DEPTH_SURFACE: floatBits(triplanar metres), 0=UV
+    uint  emissive_vt_id;       // offset 44; LEAF_MASK: RT mask texture slot; DEPTH_SURFACE: floatBits(triplanar metres)
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).
@@ -1942,6 +1953,7 @@ struct ViewCameraInfo {
     // update never writes them, which reads as "in air".
     float           underwater_depth;
     float           water_level_y;
+    float           global_leaf_age; // shared runtime float, [0,100]
 };
 
 struct RuntimeLightsParams {

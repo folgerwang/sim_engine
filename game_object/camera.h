@@ -140,6 +140,8 @@ public:
         m_camera_info_.debug_isolate_material = material_idx;
     }
 
+    void setGlobalLeafAge(float age) { m_camera_info_.global_leaf_age = age; }
+
     const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;
     }

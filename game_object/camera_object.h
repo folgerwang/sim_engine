@@ -127,6 +127,7 @@ public:
     }
     float getFovY() const { return m_view_camera_params_.fov; }
     // Camera & Lens exposure scale — see ViewCameraInfo::exposure_scale.
+    void setGlobalLeafAge(float age) { m_view_camera_->setGlobalLeafAge(age); }
     void setExposureScale(float s) { m_view_camera_->setExposureScale(s); }
     // Underwater -- see ViewCamera::setUnderwater.
     void setUnderwater(float depth_m, float level_y) {

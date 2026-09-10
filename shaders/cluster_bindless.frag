@@ -8,6 +8,7 @@
 #include "global_definition.glsl.h"
 #include "functions.glsl.h"
 #include "depth_pbr.glsl.h"
+#include "leaf_age.glsl.h"
 
 // ─── cluster_bindless.frag ──────────────────────────────────────────
 // Bindless cluster fragment shader.
@@ -416,6 +417,12 @@ void main() {
     vec4 base_color = material_params[mat_idx].base_color_factor;
     int  tex_idx    = material_params[mat_idx].base_color_tex_idx;
     int  mat_flags  = material_params[mat_idx].flags;
+    bool leaf_mask = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
+    if (!leaf_mask && (mat_flags & BINDLESS_MAT_LEAF_AGE) != 0) {
+        uint group = (uint(mat_flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
+        if (leafGroupAge(group, camera_info.global_leaf_age) >= 100.) discard;
+        base_color = leafAgedColor(base_color, group, camera_info.global_leaf_age);
+    }
 
     // Floor-only debug view: when the collision-LOD overlay is active
     // the CPU sets FEATURE_INPUT_FLOOR_ONLY so the textured background
@@ -611,6 +618,12 @@ void main() {
         albedo_tex=depthTriplanarSample(base_color_textures[nonuniformEXT(tex_idx)],
                                        v_world_pos,normalize(v_normal),depth_tile);
     albedo4 *= albedo_tex;
+    if (leaf_mask) {
+        int ageIndex = material_params[mat_idx].normal_tex_idx;
+        uint group = (uint(mat_flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
+        if (ageIndex >= 0) group = leafMaskGroup(texture(normal_textures[nonuniformEXT(ageIndex)], v_uv).b);
+        albedo4 = leafAgedColor(albedo4, group, camera_info.global_leaf_age);
+    }
 
     // Alpha mask discard — matches base.frag: if(baseColor.a < alpha_cutoff) discard.
     if ((mat_flags & BINDLESS_MAT_ALPHA_MASK) != 0) {
@@ -665,6 +678,7 @@ void main() {
     vec4 depth_orm = vec4(1.0,0.9,0.0,0.5);
     if (depth_pbr) {
         depth_orm = texture(normal_textures[nonuniformEXT(norm_idx)],v_uv);
+        if (leaf_mask) depth_orm.b = 0.;
         vec3 T = normalize(v_tangent.xyz-dot(v_tangent.xyz,N)*N);
         vec3 B = cross(N,T)*v_tangent.w;
         if (depth_surface && depth_tile>0.0) {
@@ -679,7 +693,7 @@ void main() {
                 normal_textures[nonuniformEXT(norm_idx)],v_uv));
         }
     }
-    else if (has_vt_norm || norm_idx >= 0) {
+    else if (!leaf_mask && (has_vt_norm || norm_idx >= 0)) {
         // Sample and decode the normal map.
         // Bistro (and most DCC tools) export DirectX-convention normal maps where
         // the green channel is inverted relative to OpenGL/GLSL tangent space.

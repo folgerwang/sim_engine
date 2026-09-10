@@ -100,7 +100,7 @@ public:
     // are skipped inside DrawableObject (see DrawMode::kDepthPrepass).
     void drawDepthPrepass(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
-        const renderer::DescriptorSetList& desc_sets);
+        const renderer::DescriptorSetList& desc_sets, bool leaves_only = false);
 
     // Deferred re-rasterise: draw every registered drawable into the
     // cluster G-buffer (4 RTs + the depth this view's forward pass
