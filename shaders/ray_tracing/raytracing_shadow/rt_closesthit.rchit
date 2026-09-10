@@ -35,10 +35,20 @@ struct Vertex
 
 Vertex unpack(uint16_t index, in VertexBufferInfo geom_info)
 {
-	const uint normal_idx = geom_info.normal_base + index * 3;
-	float x = vertices.v[normal_idx + 0];
-	float y = vertices.v[normal_idx + 1];
-	float z = vertices.v[normal_idx + 2];
+    const bool packed = (geom_info.normal_stride & 0x80000000u) != 0u;
+    const uint stride = geom_info.normal_stride & 0x7fffffffu;
+    const uint normal_idx = geom_info.normal_base + uint(index) * stride;
+    vec3 normal;
+    if (packed) {
+        const int bits = int(floatBitsToUint(vertices.v[normal_idx]));
+        normal = max(vec3(bitfieldExtract(bits, 0, 10),
+                          bitfieldExtract(bits, 10, 10),
+                          bitfieldExtract(bits, 20, 10)) / 511.0, vec3(-1.0));
+    } else {
+        normal = vec3(vertices.v[normal_idx], vertices.v[normal_idx + 1],
+                      vertices.v[normal_idx + 2]);
+    }
+    float x = normal.x, y = normal.y, z = normal.z;
 
 	Vertex v;
 	v.normal.x = dot(vec4(x, y, z, 0.0f), geom_info.matrix[0]);

@@ -1,3 +1,4 @@
+#include "helper/compact_vertex.h"
 #include <glm/gtc/packing.hpp>
 #include <cstdio>
 #include <cstddef>   // offsetof (indirect-command LOD rewrite)
@@ -603,30 +604,9 @@ static void setupMeshState(
     std::shared_ptr<ego::DrawableData>& drawable_object,
     const std::string& asset_key) {
 
-    // Buffer
-    {
-        drawable_object->buffers_.resize(model.buffers.size());
-        for (size_t i = 0; i < model.buffers.size(); i++) {
-            auto buffer = model.buffers[i];
-            renderer::Helper::createBuffer(
-                device,
-                SET_5_FLAG_BITS(
-                    BufferUsage,
-                    VERTEX_BUFFER_BIT,
-                    INDEX_BUFFER_BIT,
-                    SHADER_DEVICE_ADDRESS_BIT,
-                    STORAGE_BUFFER_BIT,
-                    ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
-                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
-                SET_FLAG_BIT(MemoryAllocate, DEVICE_ADDRESS_BIT),
-                drawable_object->buffers_[i].buffer,
-                drawable_object->buffers_[i].memory,
-                std::source_location::current(),
-                buffer.data.size(),
-                buffer.data.data());
-        }
-    }
-
+    // Geometry buffers are uploaded after mesh metadata is assembled.
+    // Upload only draw accessors, not the entire GLB (animations/images
+    // and the original unpacked streams are CPU-only).
     // Buffer views.
     {
         auto& buffer_views = drawable_object->buffer_views_;
@@ -822,7 +802,7 @@ static void setupMeshState(
             ubo.metallic_roughness_specular_factor = 1.0f;
             ubo.metallic_factor = static_cast<float>(src_material.pbrMetallicRoughness.metallicFactor);
             ubo.roughness_factor = static_cast<float>(src_material.pbrMetallicRoughness.roughnessFactor);
-            ubo.alpha_cutoff = static_cast<float>(src_material.alphaCutoff);
+            ubo.alpha_cutoff = dst_material.alpha_cutoff_;
             ubo.mip_count = 11;
             ubo.normal_scale = static_cast<float>(src_material.normalTexture.scale);
             ubo.occlusion_strength = static_cast<float>(src_material.occlusionTexture.strength);
@@ -1093,6 +1073,150 @@ static void setupMeshState(
     // constructor (so the FBX path gets it too) — see the
     // computeEffectiveOpaqueForMaterials(object_) call right after the
     // loadFbxModel/loadGltfModel branch.
+}
+
+static void applyPackedVertexLayout(
+    const std::shared_ptr<ego::DrawableData>& data, ego::MeshInfo& mesh,
+    const helper::PackedObjectVertices& packed, int buffer_index,
+    uint64_t page_offset, uint32_t vertex_count) {
+    const uint32_t view_first=uint32_t(data->buffer_views_.size());
+    for(uint32_t attr=0;attr<3;++attr) {
+        data->buffer_views_.emplace_back(); auto& view=data->buffer_views_.back();
+        view.buffer_idx=buffer_index;
+        view.offset=page_offset+packed.vertex_offset+(attr==0?0:(attr==1?packed.normal_offset:packed.uv_offset));
+        view.range=uint64_t(vertex_count)*packed.stride; view.stride=packed.stride;
+    }
+    uint32_t bounds_view=0;
+    if(packed.quantized) {
+        bounds_view=uint32_t(data->buffer_views_.size());
+        for(uint32_t i=0;i<2;++i) {
+            data->buffer_views_.emplace_back(); auto& view=data->buffer_views_.back();
+            view.buffer_idx=buffer_index; view.offset=page_offset+i*16; view.range=16; view.stride=0;
+        }
+    }
+    for(auto& prim:mesh.primitives_) {
+        for(auto& attr:prim.attribute_descs_) {
+            int slot=attr.location==VINPUT_POSITION?0:(attr.location==VINPUT_NORMAL?1:(attr.location==VINPUT_TEXCOORD0?2:-1));
+            if(slot<0) continue;
+            attr.buffer_view=view_first+slot; attr.offset=0;
+            attr.buffer_offset=data->buffer_views_[attr.buffer_view].offset;
+            attr.format=slot==0?(packed.quantized?renderer::Format::R16G16B16A16_UNORM:renderer::Format::R32G32B32_SFLOAT):
+                (slot==1?renderer::Format::A2B10G10R10_SNORM_PACK32:
+                 (packed.half_uv?renderer::Format::R16G16_SFLOAT:renderer::Format::R32G32_SFLOAT));
+            for(auto& binding:prim.binding_descs_) if(binding.binding==attr.binding) binding.stride=packed.stride;
+        }
+        prim.tag_.quantized_position=packed.quantized;
+        if(packed.quantized) {
+            uint32_t next=0; for(const auto& binding:prim.binding_descs_) next=std::max(next,binding.binding+1);
+            for(uint32_t i=0;i<2;++i) {
+                renderer::VertexInputBindingDescription binding{};
+                binding.binding=next+i;binding.stride=0;binding.input_rate=renderer::VertexInputRate::VERTEX;
+                prim.binding_descs_.push_back(binding);
+                renderer::VertexInputAttributeDescription attr{};
+                attr.binding=next+i;attr.buffer_view=bounds_view+i;attr.buffer_offset=page_offset+i*16;
+                attr.location=i==0?VINPUT_QUANT_BIAS:VINPUT_QUANT_SCALE;
+                attr.format=renderer::Format::R32G32B32_SFLOAT;
+                prim.attribute_descs_.push_back(attr);
+            }
+        }
+        prim.generateHash();
+    }
+}
+
+static void uploadGltfDrawBuffers(const std::shared_ptr<renderer::Device>& device,
+    const tinygltf::Model& model, const std::shared_ptr<ego::DrawableData>& data,
+    const std::string& asset) {
+    struct Access { const uint8_t* bytes; size_t stride, element, count; };
+    auto access=[&](int id)->Access {
+        const auto& a=model.accessors.at(id); const auto& v=model.bufferViews.at(a.bufferView);
+        const auto& bytes=model.buffers.at(v.buffer).data;
+        const size_t element=tinygltf::GetComponentSizeInBytes(a.componentType)*tinygltf::GetNumComponentsInType(a.type);
+        const size_t stride=a.ByteStride(v), offset=v.byteOffset+a.byteOffset;
+        if(!element || stride<element || offset>bytes.size() ||
+           (a.count && ((a.count-1)>(bytes.size()-offset)/stride ||
+            element>bytes.size()-offset-(a.count-1)*stride)))
+            throw std::runtime_error("invalid vertex accessor bounds: "+asset);
+        return {bytes.data()+offset,stride,element,a.count};
+    };
+    auto upload=[&](const void* bytes,size_t size) {
+        const int buffer=int(data->buffers_.size());data->buffers_.emplace_back();
+        renderer::Helper::createBuffer(device,
+            SET_5_FLAG_BITS(BufferUsage,VERTEX_BUFFER_BIT,INDEX_BUFFER_BIT,STORAGE_BUFFER_BIT,
+                SHADER_DEVICE_ADDRESS_BIT,ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR),
+            SET_FLAG_BIT(MemoryProperty,DEVICE_LOCAL_BIT),SET_FLAG_BIT(MemoryAllocate,DEVICE_ADDRESS_BIT),
+            data->buffers_.back().buffer,data->buffers_.back().memory,
+            std::source_location::current(),size,bytes);
+        return buffer;
+    };
+    std::unordered_map<int,uint32_t> raw_views;
+    auto rawView=[&](int id) {
+        auto found=raw_views.find(id);if(found!=raw_views.end())return found->second;
+        const auto a=access(id);std::vector<uint8_t> bytes(a.count*a.element);
+        for(size_t i=0;i<a.count;++i) std::memcpy(bytes.data()+i*a.element,a.bytes+i*a.stride,a.element);
+        const int buffer=upload(bytes.data(),bytes.size());
+        uint32_t view=uint32_t(data->buffer_views_.size());data->buffer_views_.emplace_back();
+        auto& v=data->buffer_views_.back();v.buffer_idx=buffer;v.offset=0;v.range=bytes.size();v.stride=a.element;
+        raw_views.emplace(id,view);return view;
+    };
+    struct Packed {helper::PackedObjectVertices layout;int buffer;uint32_t count;};
+    std::map<std::array<int,4>,Packed> packed_cache;
+    const bool supported=device->supportsQuantizedObjectVertices();
+    for(size_t mi=0;mi<model.meshes.size();++mi) {
+        const auto& source=model.meshes[mi];
+        for(size_t pi=0;pi<source.primitives.size();++pi) {
+            const auto& src=source.primitives[pi];auto& prim=data->meshes_[mi].primitives_[pi];
+            auto attributeId=[&](const char* name){auto it=src.attributes.find(name);return it==src.attributes.end()?-1:it->second;};
+            const int pos=attributeId("POSITION"),normal=attributeId("NORMAL"),uv=attributeId("TEXCOORD_0");
+            auto floatAccessor=[&](int id,int components){return id<0 ||
+                (model.accessors.at(id).componentType==TINYGLTF_COMPONENT_TYPE_FLOAT &&
+                 tinygltf::GetNumComponentsInType(model.accessors.at(id).type)==components);};
+            const bool pack=pos>=0 && floatAccessor(pos,3) && floatAccessor(normal,3) && floatAccessor(uv,2);
+            // Copy remaining streams tightly. CPU model data and skinning
+            // sources remain unchanged; no GPU readback or duplicate GLB upload.
+            for(auto& attr:prim.attribute_descs_) {
+                const char* name=nullptr;
+                switch(attr.location) {
+                case VINPUT_POSITION:name="POSITION";break;case VINPUT_NORMAL:name="NORMAL";break;
+                case VINPUT_TEXCOORD0:name="TEXCOORD_0";break;case VINPUT_TEXCOORD1:name="TEXCOORD_1";break;
+                case VINPUT_TANGENT:name="TANGENT";break;case VINPUT_COLOR:name="COLOR_0";break;
+                case VINPUT_JOINTS_0:name="JOINTS_0";break;case VINPUT_WEIGHTS_0:name="WEIGHTS_0";break;
+                case VINPUT_JOINTS_1:name="JOINTS_1";break;case VINPUT_WEIGHTS_1:name="WEIGHTS_1";break;
+                }
+                if(pack && (attr.location==VINPUT_POSITION || attr.location==VINPUT_NORMAL || attr.location==VINPUT_TEXCOORD0))continue;
+                const int id=name?attributeId(name):-1;if(id<0)continue;
+                attr.buffer_view=rawView(id);attr.buffer_offset=0;attr.offset=0;
+                for(auto& binding:prim.binding_descs_)if(binding.binding==attr.binding)
+                    binding.stride=data->buffer_views_[attr.buffer_view].stride;
+            }
+            if(src.indices>=0) {
+                const uint32_t view=rawView(src.indices);
+                for(auto& index:prim.index_desc_) {index.buffer_view=view;index.offset=0;}
+            }
+            if(pack) {
+                const std::string name=asset+" "+source.name;
+                const std::array<int,4> key{pos,normal,uv,int(helper::requiresFloatObjectPositions(name))};
+                auto found=packed_cache.find(key);
+                if(found==packed_cache.end()) {
+                    const auto p=access(pos);std::vector<helper::VertexStruct> vertices(p.count);
+                    const auto n=normal>=0?access(normal):Access{};const auto t=uv>=0?access(uv):Access{};
+                    if((normal>=0 && n.count!=p.count)||(uv>=0 && t.count!=p.count))throw std::runtime_error("mismatched vertex counts");
+                    for(size_t i=0;i<p.count;++i) {
+                        std::memcpy(&vertices[i].position,p.bytes+i*p.stride,12);
+                        vertices[i].normal=glm::vec3(0,1,0);vertices[i].uv=glm::vec2(0);
+                        if(normal>=0)std::memcpy(&vertices[i].normal,n.bytes+i*n.stride,12);
+                        if(uv>=0)std::memcpy(&vertices[i].uv,t.bytes+i*t.stride,8);
+                    }
+                    auto packed=helper::packObjectVertices(vertices,supported,name);
+                    const int buffer=upload(packed.bytes.data(),packed.bytes.size());
+                    packed.bytes.clear();packed.bytes.shrink_to_fit();
+                    found=packed_cache.emplace(key,Packed{std::move(packed),buffer,uint32_t(p.count)}).first;
+                }
+                ego::MeshInfo one;one.primitives_.push_back(std::move(prim));
+                applyPackedVertexLayout(data,one,found->second.layout,found->second.buffer,0,found->second.count);
+                prim=std::move(one.primitives_[0]);
+            } else prim.generateHash();
+        }
+    }
 }
 
 static void setupMesh(
@@ -2137,6 +2261,8 @@ static void setupMesh(
         new_indices.push_back(face.v_indices[2]);
     }
 
+    const auto packed=helper::packObjectVertices(*drawable_vertices,
+        device->supportsQuantizedObjectVertices(), renderer::MemoryOwnerScope::current + " " + std::string(src_mesh->name.data));
     renderer::Helper::createBuffer(
         device,
         SET_4_FLAG_BITS(
@@ -2150,8 +2276,7 @@ static void setupMesh(
         vertex_buffer.buffer,
         vertex_buffer.memory,
         std::source_location::current(),
-        drawable_vertices->size() * sizeof(helper::VertexStruct),
-        drawable_vertices->data());
+        packed.bytes.size(), packed.bytes.data());
 
     auto total_num_indices = new_indices.size();
     auto use_16bits_index = total_num_indices < 65536;
@@ -2341,6 +2466,8 @@ static void setupMesh(
         primitive_info.generateHash();
         num_traingles += part.num_faces;
     }
+    applyPackedVertexLayout(drawable_object,drawable_mesh,packed,vertex_buffer_idx,0,uint32_t(drawable_vertices->size()));
+
 }
 
 static void setupMeshes(
@@ -3966,10 +4093,16 @@ static void setupRaytracing(
                     dst_prim.max_vertex = static_cast<uint32_t>(vertex_buffer_view.range / prim.binding_descs_[i].stride);
                     has_position = true;
                 }
+                else if (attr.location == VINPUT_QUANT_BIAS) {
+                    dst_prim.transform_data.device_address = vertex_device_address + attr.buffer_offset + 32;
+                }
                 else if (attr.location == VINPUT_NORMAL) {
                     assert((attr.buffer_offset % sizeof(float)) == 0);
                     prim.as_geometry->normal.base = static_cast<uint32_t>(attr.buffer_offset / sizeof(float));
                     prim.as_geometry->normal.stride = prim.binding_descs_[i].stride / sizeof(float);
+                    // High bit marks a packed normal; low bits remain float-word stride.
+                    if (attr.format == renderer::Format::A2B10G10R10_SNORM_PACK32)
+                        prim.as_geometry->normal.stride |= 0x80000000u;
                 }
                 else if (attr.location == VINPUT_TEXCOORD0) {
                     assert((attr.buffer_offset % sizeof(float)) == 0);
@@ -4928,7 +5061,7 @@ static void drawMesh(
             pc.ib_first_index            = prim.mesh_shader_ib_first_index_;
             pc.instance_stride_floats    =
                 uint32_t(sizeof(glsl::InstanceDataInfo) / 4u);
-            pc.pad0 = 0; pc.pad1 = 0;
+            pc.pad0 = prim.mesh_shader_quant_bounds_offset_; pc.pad1 = 0;
 
             cmd_buf->pushConstants(
                 SET_FLAG_BIT(ShaderStage, MESH_BIT_EXT),
@@ -5576,6 +5709,7 @@ static std::shared_ptr<renderer::PipelineLayout> createDrawablePipelineLayout(
 
 static renderer::ShaderModuleList getDrawableShaderModules(
     std::shared_ptr<renderer::Device> device,
+    bool quantized_position,
     bool has_normals,
     bool has_tangent,
     bool has_texcoord_0,
@@ -5633,7 +5767,7 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     shader_modules[0] =
         renderer::helper::loadShaderModule(
             device,
-            "base_vert" + vert_feature_str + ".spv",
+            "base_vert" + vert_feature_str + (quantized_position ? "_Q.spv" : ".spv"),
             renderer::ShaderStageFlagBits::VERTEX_BIT,
             std::source_location::current());
 
@@ -5649,6 +5783,7 @@ static renderer::ShaderModuleList getDrawableShaderModules(
 
 static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     std::shared_ptr<renderer::Device> device,
+    bool quantized_position,
     bool has_texcoord_0,
     bool has_skin_set_0,
     bool has_material,
@@ -5710,7 +5845,7 @@ static renderer::ShaderModuleList getDrawableDepthonlyShaderModules(
     shader_modules[0] =
         renderer::helper::loadShaderModule(
             device,
-            "base_depthonly_vert" + vert_feature_str + ".spv",
+            "base_depthonly_vert" + vert_feature_str + (quantized_position ? "_Q.spv" : ".spv"),
             renderer::ShaderStageFlagBits::VERTEX_BIT,
             std::source_location::current());
 
@@ -5750,6 +5885,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     bool is_decal = false) {
     auto shader_modules = getDrawableShaderModules(
         device,
+        primitive.tag_.quantized_position,
         primitive.tag_.has_normal,
         primitive.tag_.has_tangent,
         primitive.tag_.has_texcoord_0,
@@ -5903,6 +6039,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
     const ego::PrimitiveInfo& primitive) {
     auto shader_modules = getDrawableShaderModules(
         device,
+        primitive.tag_.quantized_position,
         primitive.tag_.has_normal,
         primitive.tag_.has_tangent,
         primitive.tag_.has_texcoord_0,
@@ -6017,6 +6154,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDecalGbufferPipeline(
     const ego::PrimitiveInfo& primitive) {
     auto shader_modules = getDrawableShaderModules(
         device,
+        primitive.tag_.quantized_position,
         primitive.tag_.has_normal,
         primitive.tag_.has_tangent,
         primitive.tag_.has_texcoord_0,
@@ -6145,6 +6283,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGlassPipeline(
     const ego::PrimitiveInfo& primitive) {
     auto shader_modules = getDrawableShaderModules(
         device,
+        primitive.tag_.quantized_position,
         primitive.tag_.has_normal,
         primitive.tag_.has_tangent,
         primitive.tag_.has_texcoord_0,
@@ -6240,6 +6379,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     bool depth_clamp = true) {
     auto shader_modules = getDrawableDepthonlyShaderModules(
         device,
+        primitive.tag_.quantized_position,
         primitive.tag_.has_texcoord_0,
         primitive.tag_.has_skin_set_0,
         primitive.material_idx_ >= 0,
@@ -6267,6 +6407,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
             const uint32_t loc = a.location;
             const bool keep =
                 (loc == VINPUT_POSITION) ||
+                ((loc == VINPUT_QUANT_BIAS || loc == VINPUT_QUANT_SCALE) && primitive.tag_.quantized_position) ||
                 (loc == VINPUT_TEXCOORD0 && primitive.tag_.has_texcoord_0) ||
                 (loc == VINPUT_JOINTS_0  && primitive.tag_.has_skin_set_0) ||
                 (loc == VINPUT_WEIGHTS_0 && primitive.tag_.has_skin_set_0) ||
@@ -6648,7 +6789,12 @@ static void buildMeshShaderShadowResources(
             device->updateDescriptorSets(writes);
 
             // Cache per-primitive layout descriptors for the push constant.
-            prim.mesh_shader_vb_stride_floats_          = vb_stride_floats;
+            for (const auto& attr : prim.attribute_descs_)
+                if (attr.location == VINPUT_QUANT_BIAS)
+                    prim.mesh_shader_quant_bounds_offset_ = uint32_t(attr.buffer_offset / 4u);
+            prim.mesh_shader_vb_stride_floats_          = vb_stride_floats |
+                (pos_attr->format == renderer::Format::R16G16B16A16_SFLOAT ? 0x80000000u : 0u) |
+                (prim.tag_.quantized_position ? 0x40000000u : 0u);
             prim.mesh_shader_vb_position_offset_floats_ = vb_position_offset_floats;
             prim.mesh_shader_ib_first_index_            = ib_first_index;
             prim.mesh_shader_vertex_count_              = vertex_count;
@@ -8618,6 +8764,7 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
             // code unmodified. The outer cmd_buf is submitted empty,
             // and its fence signals near-instantly, which is what
             // drives phase 3 on the next main-thread poll().
+            renderer::MemoryOwnerScope asset_memory(file_name);
             try {
                 if (ext == ".fbx") {
                     state->data = loadFbxModel(device, file_name);
@@ -11605,6 +11752,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& input_filename)
 {
+    renderer::MemoryOwnerScope memory_owner(input_filename);
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
     std::string err;
@@ -11640,6 +11788,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadGltfModel(
 
     setupMeshState(device, model, drawable_object, input_filename);
     setupMeshes(model, drawable_object);
+    uploadGltfDrawBuffers(device,model,drawable_object,input_filename);
     setupAnimations(model, drawable_object);
     setupSkins(device, model, drawable_object);
     captureRtSkinSource(model, drawable_object);
@@ -11799,6 +11948,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadFbxModel(
     const std::shared_ptr<renderer::Device>& device,
     const std::string& input_filename)
 {
+    renderer::MemoryOwnerScope memory_owner(input_filename);
     ufbx_load_opts opts = { 0 };
     ufbx_error error;
     ufbx_abi ufbx_scene* fbx_scene =
@@ -12252,6 +12402,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
     auto& vertex_buffer = drawable_object->buffers_[0];
     auto& indice_buffer = drawable_object->buffers_[1];
 
+    const auto packed=helper::packObjectVertices(*cpu_mesh.vertex_data_ptr,
+        device->supportsQuantizedObjectVertices(), input_filename + " " + src_path + " " + ref_name);
     renderer::Helper::createBuffer(
         device,
         SET_4_FLAG_BITS(
@@ -12265,8 +12417,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         vertex_buffer.buffer,
         vertex_buffer.memory,
         std::source_location::current(),
-        cpu_mesh.vertex_data_ptr->size() * sizeof(helper::VertexStruct),
-        cpu_mesh.vertex_data_ptr->data());
+        packed.bytes.size(), packed.bytes.data());
 
     const bool use_16bits_index = vtx_count < 65536;
     uint32_t index_bytes_count = 4;
@@ -12507,6 +12658,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
     drawable_object->update(
         device, 0, 0.0f, drawable_object->m_use_local_matrix_only_);
 
+    applyPackedVertexLayout(drawable_object,drawable_mesh,packed,0,0,vtx_count);
     setupRaytracing(drawable_object);
 
     // ── Indirect draw buffer (same as the FBX path) ───────────────────
@@ -12750,6 +12902,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             cpu_mesh.faces_ptr->emplace_back(
                 md.indices[i], md.indices[i + 1], md.indices[i + 2]);
 
+        const auto packed=helper::packObjectVertices(*cpu_mesh.vertex_data_ptr,
+            device->supportsQuantizedObjectVertices(), input_filename + " " + geo_path);
         // GPU buffers for this object (vertex + index [+ joints + weights]).
         const int vbuf = (int)drawable_object->buffers_.size();
         drawable_object->buffers_.emplace_back();   // vertex
@@ -12760,8 +12914,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             drawable_object->buffers_[vbuf].buffer,
             drawable_object->buffers_[vbuf].memory,
             std::source_location::current(),
-            vtx_count * sizeof(helper::VertexStruct),
-            cpu_mesh.vertex_data_ptr->data());
+            packed.bytes.size(), packed.bytes.data());
 
         const bool use_16 = vtx_count < 65536;
         const uint32_t ibytes = use_16 ? 2u : 4u;
@@ -13303,6 +13456,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             prim.generateHash();
         }
 
+        applyPackedVertexLayout(drawable_object,mesh,packed,vbuf,0,vtx_count);
         if (owner_node >= 0) {
             drawable_object->nodes_[owner_node].mesh_idx_ = mesh_index;
             drawable_object->nodes_[owner_node].skin_idx_ = skin_index;
@@ -13415,6 +13569,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     const std::string& input_filename) {
     namespace fs = std::filesystem;
 
+    renderer::MemoryOwnerScope asset_memory(input_filename);
     const fs::path manifest(input_filename);
     const fs::path group_dir = manifest.parent_path();
     const std::string ref_name = group_dir.filename().string();
@@ -13422,6 +13577,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     // glTF's file name (group folder name + .glb).  World-manifest
     // overrides are registered under it, and the log lines use it.
     const std::string canon_name = ref_name + ".glb";
+    const bool compact_supported = device->supportsQuantizedObjectVertices();
 
     std::vector<helper::RwInstArray> inst_arrays;
     std::vector<helper::RwInstNode> inst_nodes;
@@ -13441,11 +13597,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     }
 
     // ── Baked objects: mesh_ordinal → geometry file ───────────────────
-    // ONE MESH PER ORDINAL still, even where two ordinals name the same
-    // file: bakeInstanceTransforms mirrors a node's instance range onto
-    // its MESH index, so two nodes sharing a mesh would collide and only
-    // the first range would draw.  Dedup saves disk, not mesh entries —
-    // the file is simply read twice.
+    // Mesh identity is shared by geometry path + level below; per-node
+    // draw commands retain each placement's independent instance range.
     const auto ordinal_geo = readOrdinalGeo(group_dir, "[rwinst]");
     if (ordinal_geo.empty()) {
         std::cout << "[rwinst] no baked objects for '" << ref_name << "'"
@@ -13505,6 +13658,15 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     // it lived on the primitive, a shared mesh could carry just one
     // node's instance range and every other node drawing it was lost.
     std::unordered_map<std::string, int> geo_mesh;
+    // LOD mesh records select different index ranges, but the native file
+    // contains ALL levels. Share its full GPU payload across those records.
+    struct ResidentGeometry {
+        int vbuf;
+        uint64_t page_offset, index_offset;
+        helper::PackedObjectVertices packed;
+    };
+    std::unordered_map<std::string, ResidentGeometry> resident_geometry;
+
 
     // ── Parallel geometry pre-load ────────────────────────────────────
     // The per-ordinal loop below used to loadRwGeo + dedup INLINE, one
@@ -13537,6 +13699,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             const auto& oref2 = ordinal_geo[oi];
             const std::string key =
                 oref2.path + "|" + std::to_string(oref2.level);
+            if (geo_mesh.find(key) != geo_mesh.end()) continue;
             if (pre_geo.emplace(key, PreGeo{}).second) {
                 jobs.emplace_back(key, oref2.path);
             }
@@ -13590,12 +13753,17 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     size_t cs_meshes = 0, cs_ok = 0, cs_nofaces = 0, cs_noclusters = 0;
     int    cs_reported = 0;
 
-    const size_t kGeoChunk = 4096;   // ~bounded parsed-file RAM per chunk
+    const size_t kGeoChunk = 256;    // bound parsed geometry and staging-page size
     for (size_t chunk_begin = 0; chunk_begin < ordinal_geo.size();
          chunk_begin += kGeoChunk) {
         const size_t chunk_end =
             std::min(ordinal_geo.size(), chunk_begin + kGeoChunk);
         preload_range(chunk_begin, chunk_end);
+        // Shared static geometry pages. Keep mesh/node identity and local
+        // indices, but avoid two dedicated Vulkan allocations per mesh.
+        const int page_vbuf = (int)drawable_object->buffers_.size();
+        std::vector<uint8_t> page_vertices;
+        std::vector<uint8_t> page_indices;
         for (size_t oref_i = chunk_begin; oref_i < chunk_end; ++oref_i) {
         const auto& oref = ordinal_geo[oref_i];
         const int ordinal = oref.ordinal;
@@ -13653,42 +13821,43 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             cpu_mesh.faces_ptr->emplace_back(
                 md.indices[i], md.indices[i + 1], md.indices[i + 2]);
 
-        const int vbuf = (int)drawable_object->buffers_.size();
-        drawable_object->buffers_.emplace_back();   // vertex
-        drawable_object->buffers_.emplace_back();   // index
-        renderer::Helper::createBuffer(
-            device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
-            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
-            drawable_object->buffers_[vbuf].buffer,
-            drawable_object->buffers_[vbuf].memory,
-            std::source_location::current(),
-            vtx_count * sizeof(helper::VertexStruct),
-            cpu_mesh.vertex_data_ptr->data());
-
         const bool use_16 = vtx_count < 65536;
         const uint32_t ibytes = use_16 ? 2u : 4u;
         const auto itype = use_16 ? renderer::IndexType::UINT16
                                   : renderer::IndexType::UINT32;
-        if (use_16) {
-            std::vector<uint16_t> idx16(index_count);
-            for (uint32_t i = 0; i < index_count; ++i)
-                idx16[i] = (uint16_t)md.indices[i];
-            renderer::Helper::createBuffer(
-                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
-                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
-                drawable_object->buffers_[vbuf + 1].buffer,
-                drawable_object->buffers_[vbuf + 1].memory,
-                std::source_location::current(), idx16.size() * 2,
-                idx16.data());
-        } else {
-            renderer::Helper::createBuffer(
-                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
-                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
-                drawable_object->buffers_[vbuf + 1].buffer,
-                drawable_object->buffers_[vbuf + 1].memory,
-                std::source_location::current(), md.indices.size() * 4,
-                md.indices.data());
+        auto resident = resident_geometry.find(geo_path);
+        if (resident == resident_geometry.end()) {
+            auto packed = helper::packObjectVertices(*cpu_mesh.vertex_data_ptr, compact_supported,
+                                                           ref_name + " " + geo_path);
+            page_vertices.resize((page_vertices.size()+15u)&~size_t(15u));
+            const uint64_t page_offset=page_vertices.size();
+            page_vertices.insert(page_vertices.end(),packed.bytes.begin(),packed.bytes.end());
+            // Every index range is 4-byte aligned, including mixed index types.
+            page_indices.resize((page_indices.size() + 3) & ~size_t(3));
+            const uint64_t index_offset = page_indices.size();
+            page_indices.resize(index_offset + uint64_t(index_count) * ibytes);
+            if (use_16) {
+                for (uint32_t i = 0; i < index_count; ++i) {
+                    const uint16_t value = static_cast<uint16_t>(md.indices[i]);
+                    std::memcpy(page_indices.data() + index_offset + i * 2, &value, 2);
+                }
+            } else {
+                std::memcpy(page_indices.data() + index_offset, md.indices.data(),
+                            uint64_t(index_count) * 4);
+            }
+
+            packed.bytes.clear();
+            packed.bytes.shrink_to_fit();
+            resident = resident_geometry.emplace(geo_path,
+                ResidentGeometry{page_vbuf, page_offset, index_offset, std::move(packed)}).first;
         }
+        const auto& gpu = resident->second;
+        const int vbuf = gpu.vbuf;
+        const auto& packed = gpu.packed;
+        const uint64_t page_offset = gpu.page_offset, index_offset = gpu.index_offset;
+        const uint64_t vertex_offset = page_offset + packed.vertex_offset;
+        const uint32_t vertex_stride=packed.stride,normal_offset=packed.normal_offset,uv_offset=packed.uv_offset;
+        const bool half_vertex=false,half_uv=packed.half_uv;
 
         const int vbase = (int)drawable_object->buffer_views_.size();
         drawable_object->buffer_views_.resize(vbase + 4);
@@ -13696,16 +13865,16 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                   idx_v = vbase + 3;
         {
             auto& pv = drawable_object->buffer_views_[pos_v];
-            pv.buffer_idx = vbuf; pv.offset = 0;
-            pv.range = vtx_count * sizeof(helper::VertexStruct);
-            pv.stride = sizeof(helper::VertexStruct);
+            pv.buffer_idx = vbuf; pv.offset = vertex_offset;
+            pv.range = vtx_count * vertex_stride;
+            pv.stride = vertex_stride;
             drawable_object->buffer_views_[nrm_v] = pv;
-            drawable_object->buffer_views_[nrm_v].offset = sizeof(glm::vec3);
+            drawable_object->buffer_views_[nrm_v].offset = vertex_offset + normal_offset;
             drawable_object->buffer_views_[uv_v] = pv;
             drawable_object->buffer_views_[uv_v].offset =
-                2 * sizeof(glm::vec3);
+                vertex_offset + uv_offset;
             auto& iv = drawable_object->buffer_views_[idx_v];
-            iv.buffer_idx = vbuf + 1; iv.offset = 0;
+            iv.buffer_idx = vbuf + 1; iv.offset = index_offset;
             iv.range = index_count * ibytes; iv.stride = ibytes;
         }
 
@@ -14028,25 +14197,25 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             renderer::VertexInputBindingDescription bd = {};
             renderer::VertexInputAttributeDescription ad = {};
             bd.input_rate = renderer::VertexInputRate::VERTEX;
-            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            bd.binding = b; bd.stride = vertex_stride;
             prim.binding_descs_.push_back(bd);
             ad.buffer_view = pos_v; ad.binding = b; ad.offset = 0;
-            ad.buffer_offset = 0; ad.location = VINPUT_POSITION;
-            ad.format = renderer::Format::R32G32B32_SFLOAT;
+            ad.buffer_offset = vertex_offset; ad.location = VINPUT_POSITION;
+            ad.format = half_vertex ? renderer::Format::R16G16B16A16_SFLOAT : renderer::Format::R32G32B32_SFLOAT;
             prim.attribute_descs_.push_back(ad); ++b;
-            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            bd.binding = b; bd.stride = vertex_stride;
             prim.binding_descs_.push_back(bd);
             ad.buffer_view = nrm_v; ad.binding = b; ad.offset = 0;
-            ad.buffer_offset = sizeof(glm::vec3);
+            ad.buffer_offset = vertex_offset + normal_offset;
             ad.location = VINPUT_NORMAL;
-            ad.format = renderer::Format::R32G32B32_SFLOAT;
+            ad.format = renderer::Format::A2B10G10R10_SNORM_PACK32;
             prim.attribute_descs_.push_back(ad); ++b;
-            bd.binding = b; bd.stride = sizeof(helper::VertexStruct);
+            bd.binding = b; bd.stride = vertex_stride;
             prim.binding_descs_.push_back(bd);
             ad.buffer_view = uv_v; ad.binding = b; ad.offset = 0;
-            ad.buffer_offset = 2 * sizeof(glm::vec3);
+            ad.buffer_offset = vertex_offset + uv_offset;
             ad.location = VINPUT_TEXCOORD0;
-            ad.format = renderer::Format::R32G32_SFLOAT;
+            ad.format = half_uv ? renderer::Format::R16G16_SFLOAT : renderer::Format::R32G32_SFLOAT;
             prim.attribute_descs_.push_back(ad); ++b;
 
             prim.index_desc_.resize(helper::c_num_lods + 1);
@@ -14191,11 +14360,32 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             }
         }
 
+        applyPackedVertexLayout(drawable_object,mesh,packed,vbuf,page_offset,vtx_count);
         ordinal_mesh.emplace(ordinal, mesh_index);
         geo_mesh.emplace(geo_key, mesh_index);
         if (owner_node >= 0)
             drawable_object->nodes_[owner_node].mesh_idx_ = mesh_index;
     }
+        if (!page_vertices.empty()) {
+            drawable_object->buffers_.resize(page_vbuf + 2);
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[page_vbuf].buffer,
+                drawable_object->buffers_[page_vbuf].memory,
+                std::source_location::current(),
+                page_vertices.size(), page_vertices.data());
+            renderer::Helper::createBuffer(
+                device, SET_FLAG_BIT(BufferUsage, INDEX_BUFFER_BIT),
+                SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+                drawable_object->buffers_[page_vbuf + 1].buffer,
+                drawable_object->buffers_[page_vbuf + 1].memory,
+                std::source_location::current(), page_indices.size(), page_indices.data());
+            std::cout << "[rwinst-memory] " << ref_name
+                      << " geometry page: vertices=" << page_vertices.size()
+                      << " index_bytes=" << page_indices.size()
+                      << " buffers=" << drawable_object->buffers_.size() << std::endl;
+        }
     }
 
     if (drawable_object->meshes_.empty()) return nullptr;

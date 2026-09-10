@@ -90,6 +90,10 @@ layout(std430, set = SKIN_PARAMS_SET, binding = JOINT_CONSTANT_INDEX) readonly b
 #endif
 
 layout(location = VINPUT_POSITION) in vec3 in_position;
+#ifdef QUANTIZED_POSITION
+layout(location = VINPUT_QUANT_BIAS) in vec3 in_quant_bias;
+layout(location = VINPUT_QUANT_SCALE) in vec3 in_quant_scale;
+#endif
 
 #ifdef HAS_UV_SET0
 layout(location = VINPUT_TEXCOORD0) in vec2 in_tex_coord;
@@ -138,7 +142,11 @@ void main() {
 #endif
     matrix_ls = matrix_ls * skin_matrix;
 #endif
-    vec3 position_ls = (matrix_ls * vec4(in_position, 1.0f)).xyz;
+    vec3 decoded_position = in_position;
+#ifdef QUANTIZED_POSITION
+    decoded_position = in_quant_bias + in_position * in_quant_scale;
+#endif
+    vec3 position_ls = (matrix_ls * vec4(decoded_position, 1.0f)).xyz;
 
     mat3 local_world_rot_mat =
         mat3x3(in_loc_rot_mat_0.xyz,

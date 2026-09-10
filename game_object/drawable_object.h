@@ -114,6 +114,7 @@ union PrimitiveHashTag {
         // (implies has_skin_set_0; selects the _SKIN8 shader permutations).
         uint32_t                has_skin_set_1 : 1;
         uint32_t                topology : 16;
+        uint32_t                quantized_position : 1;
     };
 };
 
@@ -154,6 +155,7 @@ public:
     // Layout descriptors consumed by the MeshShadowPC push constant.
     // All values in FLOATS (not bytes) — buildMeshShaderShadowResources
     // converts byte offsets to float strides at pipeline-build time.
+    uint32_t mesh_shader_quant_bounds_offset_ = 0;
     uint32_t mesh_shader_vb_stride_floats_          = 0;
     uint32_t mesh_shader_vb_position_offset_floats_ = 0;
     uint32_t mesh_shader_ib_first_index_            = 0;

@@ -30,6 +30,8 @@
 #define VINPUT_JOINTS_1             7
 #define VINPUT_WEIGHTS_1            8
 #define VINPUT_TEXCOORD1            9
+#define VINPUT_QUANT_BIAS           11
+#define VINPUT_QUANT_SCALE          15
 
 #define IINPUT_MAT_ROT_0            10
 #define IINPUT_MAT_ROT_1            12

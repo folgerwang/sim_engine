@@ -98,7 +98,19 @@ layout(push_constant) uniform MeshShadowPC {
 } pc;
 
 vec3 fetchPosition(uint vertex_idx) {
-    uint base = vertex_idx * pc.vb_stride_floats + pc.vb_position_offset_floats;
+    uint base = vertex_idx * (pc.vb_stride_floats & 0x3fffffffu) + pc.vb_position_offset_floats;
+    if ((pc.vb_stride_floats & 0x40000000u) != 0u) {
+        vec2 xy=unpackUnorm2x16(floatBitsToUint(vb_floats[base]));
+        vec2 zw=unpackUnorm2x16(floatBitsToUint(vb_floats[base+1u]));
+        vec3 bias=vec3(vb_floats[pc.pad0],vb_floats[pc.pad0+1u],vb_floats[pc.pad0+2u]);
+        vec3 scale=vec3(vb_floats[pc.pad0+4u],vb_floats[pc.pad0+5u],vb_floats[pc.pad0+6u]);
+        return bias+vec3(xy,zw.x)*scale;
+    }
+    if ((pc.vb_stride_floats & 0x80000000u) != 0u) {
+        vec2 xy = unpackHalf2x16(floatBitsToUint(vb_floats[base]));
+        vec2 zw = unpackHalf2x16(floatBitsToUint(vb_floats[base + 1u]));
+        return vec3(xy, zw.x);
+    }
     return vec3(
         vb_floats[base + 0u],
         vb_floats[base + 1u],

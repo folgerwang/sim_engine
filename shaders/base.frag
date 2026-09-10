@@ -487,6 +487,22 @@ void main() {
 #endif
     
 
+    // Reject empty leaf-card pixels before normal maps and material work.
+    // Decals have their own coverage rules below.
+#if defined(ALPHAMODE_MASK) && !defined(NO_MTL) && !defined(DECAL)
+    if (baseColor.a < material.alpha_cutoff) discard;
+#endif
+#if !defined(GBUFFER_OUTPUT) && !defined(GLASS_ATTR) && !defined(DECAL) && !defined(NO_MTL) && !defined(MATERIAL_UNLIT)
+    // Deferred resolve replaces this colour. Preserve coverage/depth,
+    // but avoid normal, roughness and lighting evaluation in forward.
+    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u &&
+        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
+        (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
+        outColor = vec4(linearTosRGB(baseColor.rgb * 0.5), 1.0);
+        return;
+    }
+#endif
+
 #ifndef NO_MTL
 #ifdef MATERIAL_UNLIT
     outColor = (vec4(linearTosRGB(baseColor.rgb), baseColor.a));
@@ -740,42 +756,7 @@ void main() {
     return;
 #endif // GBUFFER_OUTPUT
 
-#if !defined(GLASS_ATTR) && !defined(DECAL)
-    // ── Deferred-relight fast path ───────────────────────────────────
-    // When the deferred G-buffer re-rasterise + resolve is armed this
-    // frame (FEATURE_INPUT_DEFERRED_RELIGHT) and THIS draw is one the
-    // re-rasterise covers (MODEL_FLAG_DEFERRED_RELIGHT — CPU-set, never
-    // on skinned nodes, which have no _GBUF permutation), every colour
-    // this branch could produce is overwritten by deferred_resolve.comp.
-    // Running the full IBL + punctual stack here was the largest slice
-    // of the forward pass, shading pixels whose lighting was then thrown
-    // away.  Emit a cheap flat approximation instead.  Depth, the LOD
-    // dissolve discards at the top of main(), and the cutout discard all
-    // still run, so depth and coverage stay bit-identical to the full
-    // path — only the doomed colour is cheapened.
-    // (A Blend material never takes this path: it is not in the
-    // G-buffer the resolve relights, and its colour -- drawn by the
-    // post-resolve glass pass -- is the one the screen keeps.)
-    if ((camera_info.input_features & FEATURE_INPUT_DEFERRED_RELIGHT) != 0u &&
-        (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
-        (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
-#if defined(ALPHAMODE_MASK)
-        // Same late cutout discard as the full path below.
-        if (baseColor.a < material.alpha_cutoff) {
-            discard;
-        }
-#endif // ALPHAMODE_MASK
-        float fast_nl = 0.5f;
-#ifdef USE_PUNCTUAL
-        fast_nl = max(dot(normal_info.n,
-                          normalize(-runtime_lights.lights[0].direction)),
-                      0.0f);
-#endif // USE_PUNCTUAL
-        outColor = vec4(
-            linearTosRGB(baseColor.rgb * (0.25f + 0.5f * fast_nl)), 1.0f);
-        return;
-    }
-#endif // !GLASS_ATTR && !DECAL
+
 
     // Skip shadow sampling when the pass is disabled (avoids stale/zero CSM
     // texture reads that would incorrectly shadow the whole scene).

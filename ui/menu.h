@@ -1419,6 +1419,7 @@ public:
     // Two sources: (1) Vulkan VK_EXT_memory_budget = THIS process's Vulkan
     // allocations (engine + ImGui); (2) CUDA cudaMemGetInfo = DEVICE-WIDE
     // usage incl. ML (LibTorch/CUDA in-process and the FLUX/Ollama processes).
+    bool show_vram_breakdown_ = false;
     double vram_used_mb_   = 0.0;   // engine Vulkan usage (this process)
     double vram_budget_mb_ = 0.0;   // amount this process may allocate
     double vram_total_mb_  = 0.0;   // Vulkan device-local capacity

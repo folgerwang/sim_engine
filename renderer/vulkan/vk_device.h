@@ -48,6 +48,7 @@ class VulkanDevice : public Device {
     // pools, but our bookkeeping vectors are not thread-safe — hence the
     // lock. Held only around the std::vector push_back / erase / find.
     mutable std::mutex tracking_mutex_;
+    std::unordered_map<const DeviceMemory*, MemoryUsageRow> memory_usage_;
     std::vector<std::shared_ptr<Buffer>> buffer_list_;
     std::vector<std::shared_ptr<Image>> image_list_;
     std::vector<std::shared_ptr<ImageView>> image_view_list_;
@@ -178,6 +179,9 @@ public:
         uint64_t offset = 0,
         bool deferrable = false) final;
     virtual void dumpVramBreakdown(const char* tag) final;
+    std::vector<MemoryUsageRow> getMemoryUsageByPart() override;
+    bool supportsHalfPlantVertices() override;
+    bool supportsQuantizedObjectVertices() override;
     virtual void beginDeferredBufferWrites() final;
     virtual void flushDeferredBufferWrites() final;
     virtual void dumpBufferMemory(

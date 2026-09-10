@@ -1670,6 +1670,52 @@ static double vramBytesPerTexel(int fmt) {
     }
 }
 
+bool VulkanDevice::supportsHalfPlantVertices() {
+    auto physical = RENDER_TYPE_CAST(PhysicalDevice, getPhysicalDevice());
+    VkFormatProperties position{}, uv{};
+    vkGetPhysicalDeviceFormatProperties(physical->get(), VK_FORMAT_R16G16B16A16_SFLOAT, &position);
+    vkGetPhysicalDeviceFormatProperties(physical->get(), VK_FORMAT_R16G16_SFLOAT, &uv);
+    return (position.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) &&
+           (position.bufferFeatures & VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR) &&
+           (uv.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+}
+
+bool VulkanDevice::supportsQuantizedObjectVertices() {
+    auto physical = RENDER_TYPE_CAST(PhysicalDevice, getPhysicalDevice());
+    VkFormatProperties position{}, uv{};
+    vkGetPhysicalDeviceFormatProperties(physical->get(), VK_FORMAT_R16G16B16A16_UNORM, &position);
+    vkGetPhysicalDeviceFormatProperties(physical->get(), VK_FORMAT_R16G16_SFLOAT, &uv);
+    return (position.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) &&
+           (position.bufferFeatures & VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR) &&
+           (uv.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+}
+
+std::vector<MemoryUsageRow> VulkanDevice::getMemoryUsageByPart() {
+    std::map<std::string, MemoryUsageRow> totals;
+    std::lock_guard<std::mutex> lock(tracking_mutex_);
+    for (const auto& [memory, entry] : memory_usage_) {
+        std::string part = entry.name;
+        std::string lower = part;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower.find("_pcg_clutter_far") != std::string::npos) part = "Terrain / Far clutter";
+        else if (lower.find("_pcg_clutter") != std::string::npos) part = "Terrain / Near clutter";
+        else if (lower.find("_pcg_trees") != std::string::npos) part = "Terrain / Trees and vegetation";
+        else if (lower.find("_pcg_roads") != std::string::npos) part = "Terrain / Roads";
+        else if (lower.find("_pcg_houses") != std::string::npos) part = "Terrain / Buildings";
+        else if (lower.find("_pcg_objects") != std::string::npos) part = "Terrain / Placed objects";
+        auto& row = totals[part]; row.name = part;
+        row.device_bytes += entry.device_bytes; row.host_bytes += entry.host_bytes;
+        row.allocations += entry.allocations;
+    }
+    std::vector<MemoryUsageRow> rows;
+    for (auto& [name, row] : totals) rows.push_back(std::move(row));
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        return a.device_bytes > b.device_bytes;
+    });
+    return rows;
+}
+
 void VulkanDevice::dumpVramBreakdown(const char* tag) {
     struct Site { uint64_t bytes = 0; uint32_t count = 0; };
     std::map<std::string, Site> buf_sites, img_sites;
@@ -1844,6 +1890,24 @@ VulkanDevice::allocateMemory(
     auto vk_device_memory =
         std::make_shared<VulkanDeviceMemory>();
     vk_device_memory->set(memory);
+    VkPhysicalDeviceMemoryProperties heaps{};
+    auto physical = RENDER_TYPE_CAST(PhysicalDevice, getPhysicalDevice());
+    vkGetPhysicalDeviceMemoryProperties(physical->get(), &heaps);
+    const auto heap = heaps.memoryTypes[alloc_info.memoryTypeIndex].heapIndex;
+    const bool local = (heaps.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+    std::string owner = MemoryOwnerScope::current;
+    if (owner.empty()) {
+        owner = src_location.file_name();
+        const auto slash = owner.find_last_of("/\\");
+        if (slash != std::string::npos) owner.erase(0, slash + 1);
+        owner = "Shared / " + owner;
+    }
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        memory_usage_[vk_device_memory.get()] =
+            {owner, local ? buf_size : 0, local ? 0 : buf_size, 1};
+    }
+
 
     return vk_device_memory;
 }
@@ -2160,6 +2224,8 @@ void VulkanDevice::freeMemory(std::shared_ptr<DeviceMemory> memory) {
     auto vk_memory = RENDER_TYPE_CAST(DeviceMemory, memory);
     if (vk_memory) {
         vkFreeMemory(device_, vk_memory->get(), nullptr);
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        memory_usage_.erase(vk_memory.get());
     }
 }
 

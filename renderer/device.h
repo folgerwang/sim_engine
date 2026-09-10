@@ -1,12 +1,33 @@
 #pragma once
 #include <thread>
+#include <string>
 #include "renderer_structs.h"
 
 namespace engine {
 namespace renderer {
 
+// Allocation attribution follows the loading thread, not the render thread.
+class MemoryOwnerScope {
+public:
+    inline static thread_local std::string current;
+    explicit MemoryOwnerScope(const std::string& owner) : previous_(current) { current = owner; }
+    ~MemoryOwnerScope() { current = previous_; }
+    MemoryOwnerScope(const MemoryOwnerScope&) = delete;
+    MemoryOwnerScope& operator=(const MemoryOwnerScope&) = delete;
+private:
+    std::string previous_;
+};
+struct MemoryUsageRow {
+    std::string name;
+    uint64_t device_bytes = 0, host_bytes = 0;
+    uint32_t allocations = 0;
+};
+
 class Device {
 public:
+    virtual bool supportsQuantizedObjectVertices() { return false; }
+    virtual bool supportsHalfPlantVertices() { return false; }
+    virtual std::vector<MemoryUsageRow> getMemoryUsageByPart() { return {}; }
     virtual std::shared_ptr<DescriptorPool> createDescriptorPool(
         const std::source_location& src_location =
             std::source_location::current()) = 0;

@@ -4278,6 +4278,38 @@ bool Menu::draw(
             dl->AddText(sp, col, sbuf);
         }
     }
+    if (show_vram_breakdown_ && editor_enabled_ && game_state_ == GameState::InGame) {
+        ImGui::SetNextWindowSize(ImVec2(680, 360), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("VRAM by terrain / asset", &show_vram_breakdown_)) {
+            static double last_refresh = -10.0;
+            static std::vector<renderer::MemoryUsageRow> rows;
+            if (ImGui::GetTime() - last_refresh >= 1.0) {
+                rows = device_->getMemoryUsageByPart(); last_refresh = ImGui::GetTime();
+            }
+            ImGui::TextWrapped("Live Vulkan allocations, refreshed each second. Shared terrain, VT and render resources are listed by source. MiB = 1024 x 1024 bytes.");
+            uint64_t total = 0, host = 0;
+            for (const auto& row : rows) { total += row.device_bytes; host += row.host_bytes; }
+            ImGui::Text("Device-local: %.1f MiB | Host heaps: %.1f MiB", total / 1048576.0, host / 1048576.0);
+            ImGui::TextWrapped("Allocated bytes, not physical residency; excludes CUDA, other processes and driver-owned allocations.");
+            if (ImGui::BeginTable("memory_parts", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 230))) {
+                ImGui::TableSetupColumn("Terrain part / asset");
+                ImGui::TableSetupColumn("VRAM MiB");
+                ImGui::TableSetupColumn("Host MiB");
+                ImGui::TableSetupColumn("Allocations");
+                ImGui::TableHeadersRow();
+                for (const auto& row : rows) {
+                    ImGui::TableNextRow(); ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(row.name.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", row.name.c_str());
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", row.device_bytes / 1048576.0);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", row.host_bytes / 1048576.0);
+                    ImGui::TableNextColumn(); ImGui::Text("%u", row.allocations);
+                }
+                ImGui::EndTable();
+            }
+        }
+        ImGui::End();
+    }
     // ------------------------------------------------------------------------
 
     renderer::Helper::addImGuiToCommandBuffer(cmd_buf);
@@ -9654,6 +9686,7 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
 // application.cpp).  Both base.frag and cluster_bindless.frag read and
 // dispatch on this value; mode 0 = the normal shaded path.
 void Menu::drawRenderDebugMenuContent() {
+    ImGui::MenuItem("VRAM by terrain / asset", nullptr, &show_vram_breakdown_);
     // ── Layout ──────────────────────────────────────────────────────
     // This was one flat list of ~35 entries: eighteen view modes, then
     // path isolation, skeleton states, pipeline, four viewers and the
