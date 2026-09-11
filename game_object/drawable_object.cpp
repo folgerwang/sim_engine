@@ -1,4 +1,6 @@
 #include "helper/compact_vertex.h"
+#include "helper/pcg_asset_paths.h"
+#include "helper/pcg_lod.h"
 #include <glm/gtc/packing.hpp>
 #include <cstdio>
 #include <cstddef>   // offsetof (indirect-command LOD rewrite)
@@ -840,6 +842,10 @@ static void setupMeshState(
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_MASK;
             if (dst_material.name_.find("_depthpbr") != std::string::npos)
                 ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
+            if (dst_material.name_.find("clutter_grass")!=std::string::npos || dst_material.name_.find("clutter_far_")!=std::string::npos) {
+                dst_material.leaf_age_group_=0;
+                ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE;
+            }
             const auto leaf_age = dst_material.name_.find("_leafage_");
             if (leaf_age != std::string::npos && leaf_age + 9 < dst_material.name_.size() &&
                 dst_material.name_[leaf_age + 9] >= '0' && dst_material.name_[leaf_age + 9] <= '3')
@@ -922,6 +928,12 @@ static void setupMeshState(
             ubo.specular_color = glm::vec3(1.0f, 1.0f, 1.0f);
             ubo.specular_exponent = 1.0f;
 
+            if((ubo.material_features & FEATURE_MATERIAL_LEAF_AGE)!=0u &&
+                engine::helper::plantSeasonMode(engine::helper::treePaletteIndex(dst_material.name_))!=2u)
+                ubo.alpha_cutoff=.09f;
+            ubo.pad_3 = engine::helper::treePaletteIndex(dst_material.name_);
+            if((ubo.material_features & FEATURE_MATERIAL_LEAF_AGE)!=0u && engine::helper::plantSeasonMode(ubo.pad_3)!=2u)
+                ubo.alpha_cutoff=.09f;
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
 
             // ECS dedup identity — mirrors exactly what was uploaded above.
@@ -1797,6 +1809,12 @@ static void setupMeshState(
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Blend ? FEATURE_MATERIAL_BLEND : 0);
             ubo.material_features |= (dst_material.alpha_mode_ == ego::AlphaMode::Mask  ? FEATURE_MATERIAL_ALPHA_MASK : 0);
 
+            if((ubo.material_features & FEATURE_MATERIAL_LEAF_AGE)!=0u &&
+                engine::helper::plantSeasonMode(engine::helper::treePaletteIndex(dst_material.name_))!=2u)
+                ubo.alpha_cutoff=.09f;
+            ubo.pad_3 = engine::helper::treePaletteIndex(dst_material.name_);
+            if((ubo.material_features & FEATURE_MATERIAL_LEAF_AGE)!=0u && engine::helper::plantSeasonMode(ubo.pad_3)!=2u)
+                ubo.alpha_cutoff=.09f;
             device->updateBufferMemory(dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
 
             // ECS dedup identity — mirrors exactly what was uploaded above.
@@ -3208,7 +3226,7 @@ static void applyPlantLodBands(
                               : std::string());
         const bool last_rung =
             (static_cast<size_t>(b) + 1 >= authored.size());
-        if (!edges.empty() &&
+        if (!d->lod_preserve_authored_ && !edges.empty() &&
             static_cast<size_t>(b) + 1 < edges.size()) {
             node.lod_near_m_ = (b == 0) ? 0.0f : edges[b];
             // The OUTERMOST rung of this chain always runs to the
@@ -3239,6 +3257,18 @@ static void applyPlantLodBands(
 static void parsePlantLodBands(
     std::shared_ptr<ego::DrawableData>& drawable_object,
     const std::string& input_filename) {
+
+    // A shard can hold only one rung of a multi-file chain. Ranking that
+    // local subset as a complete chain remaps EVERY shard to [0, far):
+    // detailed trees, simplified trees and billboard cards draw together.
+    // Authored distances remain a complete partition across all shards.
+    // Preserve them until a whole-family override table is available.
+    drawable_object->lod_preserve_authored_ =
+        engine::helper::pcgFamilyIsSharded(input_filename);
+    if (drawable_object->lod_preserve_authored_) {
+        std::cout << "[lod] " << input_filename
+                  << ": preserving authored distances across shards" << std::endl;
+    }
 
     uint32_t matched = 0;
     float near_far_min = std::numeric_limits<float>::max();
@@ -3461,24 +3491,10 @@ static void selectPlantLodBands(
                     // measured distance SMALLER — i.e. err toward more
                     // detail, never toward a hole.
                     const glm::mat4 m = instance_world * node.cached_matrix_;
-                    const float x0 = node.lod_lx0_;
-                    const float z0 = node.lod_lz0_;
-                    const float x1 = x0 + node.lod_tile_m_;
-                    const float z1 = z0 + node.lod_tile_m_;
-                    const glm::vec3 c[4] = {
-                        glm::vec3(m * glm::vec4(x0, 0.0f, z0, 1.0f)),
-                        glm::vec3(m * glm::vec4(x1, 0.0f, z0, 1.0f)),
-                        glm::vec3(m * glm::vec4(x0, 0.0f, z1, 1.0f)),
-                        glm::vec3(m * glm::vec4(x1, 0.0f, z1, 1.0f)),
-                    };
-                    node.lod_wx0_ = glm::min(glm::min(c[0].x, c[1].x),
-                                             glm::min(c[2].x, c[3].x));
-                    node.lod_wx1_ = glm::max(glm::max(c[0].x, c[1].x),
-                                             glm::max(c[2].x, c[3].x));
-                    node.lod_wz0_ = glm::min(glm::min(c[0].z, c[1].z),
-                                             glm::min(c[2].z, c[3].z));
-                    node.lod_wz1_ = glm::max(glm::max(c[0].z, c[1].z),
-                                             glm::max(c[2].z, c[3].z));
+                    const auto rect = engine::helper::pcgLodTileRect(
+                        m, node.lod_lx0_, node.lod_lz0_, node.lod_tile_m_);
+                    node.lod_wx0_ = rect.x; node.lod_wz0_ = rect.y;
+                    node.lod_wx1_ = rect.z; node.lod_wz1_ = rect.w;
                 }
             }
             if (node.lod_per_instance_) flags |= ego::DrawableData::kLodSoaPerInstance;
@@ -3533,7 +3549,8 @@ static void selectPlantLodBands(
             // and at four triangles a tree it cannot stall the frame the
             // way selecting the near LOD for the whole map would.  The
             // next frame has an eye and corrects itself.
-            vis[i] = (e.far_m >= far_max) ? uint8_t(1) : uint8_t(0);
+            vis[i] = (!drawable_object->lod_preserve_authored_ && e.far_m >= far_max)
+                ? uint8_t(1) : uint8_t(0);
             fade[i] = 1.0f;
             owner[i] = vis[i];
             drawn += vis[i];
@@ -3546,11 +3563,8 @@ static void selectPlantLodBands(
         // meshes for cards because of that reads as the forest below
         // you dissolving when you climb.  Ground distance is what the
         // eye judges tree detail by.
-        const float dx = glm::max(glm::max(e.wx0 - eye.x, 0.0f),
-                                  eye.x - e.wx1);
-        const float dz = glm::max(glm::max(e.wz0 - eye.z, 0.0f),
-                                  eye.z - e.wz1);
-        const float d = glm::sqrt(dx * dx + dz * dz);
+        const float d = glm::sqrt(engine::helper::pcgLodDistanceSquared(
+            glm::vec4(e.wx0, e.wz0, e.wx1, e.wz1), eye));
 
         if ((e.flags & ego::DrawableData::kLodSoaPerInstance) != 0) {
             // Per-instance banding: the vertex shader resolves the band
@@ -3581,7 +3595,8 @@ static void selectPlantLodBands(
         const int category_index = drawable_object->nodes_[i].lod_cat_idx_;
         if (category_index >= 0 && size_t(category_index) < drawable_object->lod_cat_names_.size()) {
             const auto& category = drawable_object->lod_cat_names_[category_index];
-            if (category == "tree" || category == "bush" || category == "ground") {
+            if (drawable_object->lod_preserve_authored_ ||
+                category == "tree" || category == "bush" || category == "ground") {
                 vis[i] = owner[i] = (d >= e.near_m && d < e.far_m) ? 1 : 0;
                 fade[i] = vis[i] ? 1.0f : 0.0f;
                 drawn += vis[i];
@@ -3993,6 +4008,12 @@ static void createInstanceBuffer(
         sizeof(ego::BakedInstanceXform) == 48,
         "BakedInstanceXform must stay 48 B (3 vec4s, translation in .w)");
 
+    // One immutable float per instance; transforms remain the compact 48-byte layout.
+    data->tree_age_bases_.resize(std::max<size_t>(kNumDrawableInstance, data->baked_instances_.size()), 0.f);
+    renderer::Helper::createBuffer(device,
+        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT), SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+        data->tree_age_buffer_.buffer, data->tree_age_buffer_.memory,
+        std::source_location::current(), data->tree_age_bases_.size()*sizeof(float), data->tree_age_bases_.data());
     const auto usage =
         SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT);
     const auto mem_prop = SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT);
@@ -4626,6 +4647,7 @@ static void computeEffectiveOpaqueForMaterials(
         // (Blend materials don't reach the shadow draw most of the
         // time anyway — the cull bucket filters them out — but if
         // they DO get drawn we want correct depth output).
+        if (mat.leaf_age_group_ >= 0) { mat.effective_opaque_ = false; continue; }
         if (mat.alpha_mode_ == ego::AlphaMode::Opaque) {
             mat.effective_opaque_ = true;
             continue;
@@ -6099,6 +6121,15 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
     attribute_descs.push_back(attr);
+    desc.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    desc.stride = sizeof(float);
+    binding_descs.push_back(desc);
+    attr.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    attr.location = IINPUT_TREE_AGE;
+    attr.offset = 0;
+    attr.format = renderer::Format::R32_SFLOAT;
+    attribute_descs.push_back(attr);
+
 
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_double_sided = true;
@@ -6218,6 +6249,15 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
     attribute_descs.push_back(attr);
+    desc.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    desc.stride = sizeof(float);
+    binding_descs.push_back(desc);
+    attr.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    attr.location = IINPUT_TREE_AGE;
+    attr.offset = 0;
+    attr.format = renderer::Format::R32_SFLOAT;
+    attribute_descs.push_back(attr);
+
 
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_double_sided = true;
@@ -6357,6 +6397,15 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDecalGbufferPipeline(
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
     attribute_descs.push_back(attr);
+    desc.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    desc.stride = sizeof(float);
+    binding_descs.push_back(desc);
+    attr.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    attr.location = IINPUT_TREE_AGE;
+    attr.offset = 0;
+    attr.format = renderer::Format::R32_SFLOAT;
+    attribute_descs.push_back(attr);
+
 
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_double_sided = true;
@@ -6466,6 +6515,15 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGlassPipeline(
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
     attribute_descs.push_back(attr);
+    desc.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    desc.stride = sizeof(float);
+    binding_descs.push_back(desc);
+    attr.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    attr.location = IINPUT_TREE_AGE;
+    attr.offset = 0;
+    attr.format = renderer::Format::R32_SFLOAT;
+    attribute_descs.push_back(attr);
+
 
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_double_sided = true;
@@ -6572,6 +6630,15 @@ static std::shared_ptr<renderer::Pipeline> createDrawableShadowPipelineInternal(
     attr.location = IINPUT_MAT_ROT_2;
     attr.offset = offsetof(glsl::InstanceDataInfo, mat_rot_2);
     attribute_descs.push_back(attr);
+    desc.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    desc.stride = sizeof(float);
+    binding_descs.push_back(desc);
+    attr.binding = VINPUT_TREE_AGE_BINDING_POINT;
+    attr.location = IINPUT_TREE_AGE;
+    attr.offset = 0;
+    attr.format = renderer::Format::R32_SFLOAT;
+    attribute_descs.push_back(attr);
+
     renderer::RasterizationStateOverride rasterization_state_override;
     rasterization_state_override.override_depth_clamp_enable = true;
     rasterization_state_override.depth_clamp_enable = depth_clamp;
@@ -7337,6 +7404,7 @@ bool PcgInstanceRegistry::load(const std::string& json_path) {
         {"houses", 3}, {"objects", 4}};
 
     std::lock_guard<std::mutex> lk(mu_);
+    tree_year_ = 0.0;
     nodes_.clear(); recs_.clear();
     by_id_.clear(); by_pos_.clear();
     binds_.clear(); dirty_.clear();
@@ -7372,7 +7440,27 @@ bool PcgInstanceRegistry::load(const std::string& json_path) {
             PcgInstanceRecord r;
             r.id = id[i].get<uint64_t>();
             r.node = node_base + (uint32_t)ni[i].get<size_t>();
+            if (r.node >= nodes_.size()) continue;
             r.category = cat;
+            if (cat == 1) {
+                r.age_base_years = engine::helper::treeInitialAgeBase(r.id);
+                r.aging_ratio = engine::helper::treeAgingRatio(nodes_[r.node]);
+                r.lifespan_years = engine::helper::treeInstanceLifespan(r.id, nodes_[r.node]);
+                const auto ratio = tab.find("aging_ratio");
+                if (ratio != tab.end() && ratio->is_array() && ratio->size() == n && (*ratio)[i].is_number()) {
+                    const float value = (*ratio)[i].get<float>();
+                    if (std::isfinite(value)) r.aging_ratio = std::clamp(value, .1f, 100.f);
+                }
+                const auto birth = tab.find(tab.contains("seasonal_timing_seed") ? "seasonal_timing_seed" : "age_base_years"), life = tab.find("lifespan_years");
+                if (birth != tab.end() && birth->is_array() && birth->size() == n && (*birth)[i].is_number()) {
+                    const float value = (*birth)[i].get<float>();
+                    if (std::isfinite(value) && value >= -100.f && value <= 0.f) r.age_base_years = std::round(value);
+                }
+                if (life != tab.end() && life->is_array() && life->size() == n && (*life)[i].is_number()) {
+                    const float value = (*life)[i].get<float>();
+                    if (std::isfinite(value) && value > 0.f) r.lifespan_years = value;
+                }
+            }
             r.state = 0;
             r.weight_kg = w[i].get<float>();
             r.t = glm::vec3(t[i * 3 + 0].get<float>(),
@@ -7395,9 +7483,25 @@ bool PcgInstanceRegistry::load(const std::string& json_path) {
 
 void PcgInstanceRegistry::clear() {
     std::lock_guard<std::mutex> lk(mu_);
+    tree_year_ = 0.0;
     nodes_.clear(); recs_.clear();
     by_id_.clear(); by_pos_.clear();
     binds_.clear(); dirty_.clear();
+}
+
+void PcgInstanceRegistry::advanceTreeYears(double years) {
+    if (!std::isfinite(years) || years < 0.0) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (std::isfinite(tree_year_ + years)) tree_year_ += years;
+}
+void PcgInstanceRegistry::setTreeAgeTime(double age_time) {
+    if (!std::isfinite(age_time) || age_time < 0.0) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    tree_year_ = age_time;
+}
+double PcgInstanceRegistry::treeSimulationYear() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return tree_year_;
 }
 
 size_t PcgInstanceRegistry::size() const {
@@ -7509,7 +7613,17 @@ void PcgInstanceRegistry::bindBakedRange(
     const std::vector<float>& translations,
     size_t count) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (recs_.empty() || count == 0) return;
+    if (count == 0) return;
+    const bool tree_node = node_name.rfind("tree_",0)==0;
+    if (tree_node) {
+        data->tree_age_bases_.resize(std::max(data->tree_age_bases_.size(), size_t(first_slot)+count), 0.f);
+        for (size_t i=0; i<count && (i+1)*3<=translations.size(); ++i) {
+            const uint64_t key=uint64_t(uint32_t(std::lround(translations[i*3]*1000))) |
+                (uint64_t(uint32_t(std::lround(translations[i*3+2]*1000)))<<32);
+            data->tree_age_bases_[first_slot+i]=engine::helper::treeInitialAgeBase(key);
+        }
+    }
+    if (recs_.empty()) return;
     // longest registry key that prefixes this node's name — same rule
     // the world-manifest overrides use (find_over above)
     int best = -1;
@@ -7547,6 +7661,7 @@ void PcgInstanceRegistry::bindBakedRange(
             }
         }
         if (rec == UINT32_MAX) continue;
+        if (tree_node) data->tree_age_bases_[first_slot+i]=recs_[rec].age_base_years;
         binds_[rec].push_back(Binding{data, first_slot + (uint32_t)i});
         ++bound;
         // a prop destroyed BEFORE this asset loaded (apply order, or a
@@ -8342,6 +8457,7 @@ void DrawableData::destroy(
 
     indirect_draw_cmd_.destroy(device);
     instance_buffer_.destroy(device);
+    tree_age_buffer_.destroy(device);
     if (nt_) {
         ntReleaseGpu(device, *nt_);
         nt_.reset();
@@ -10628,7 +10744,7 @@ void DrawableObject::drawSortedDepthPrepass(
         if (bound != owner) {
             owner->stagePerDrawState();
             selectPlantLodBands(owner->object_, owner->object_->m_current_instance_world_);
-            cmd->bindVertexBuffers(VINPUT_INSTANCE_BINDING_POINT, {owner->object_->instance_buffer_.buffer}, {0});
+            cmd->bindVertexBuffers(VINPUT_INSTANCE_BINDING_POINT, {owner->object_->instance_buffer_.buffer, owner->object_->tree_age_buffer_.buffer}, {0,0});
             last_hash = 0;
             bound = owner;
         }
@@ -10854,6 +10970,7 @@ void DrawableObject::draw(
     std::vector<uint64_t> offsets(1);
     buffers[0] = object_->instance_buffer_.buffer;
     offsets[0] = 0;
+    buffers.push_back(object_->tree_age_buffer_.buffer); offsets.push_back(0);
     cmd_buf->bindVertexBuffers(VINPUT_INSTANCE_BINDING_POINT, buffers, offsets);
 
     num_draw_meshes = 0;
@@ -12570,8 +12687,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
                 dst_material.alpha_mode_ = ego::AlphaMode::Mask;
                 dst_material.alpha_mask_ = true;
                 dst_material.effective_opaque_ = false;
-                dst_material.alpha_cutoff_ = 0.1f;
-                ubo.alpha_cutoff = 0.1f;
+                dst_material.alpha_cutoff_ = 0.09f;
+                ubo.alpha_cutoff = 0.09f;
                 ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
                     (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
@@ -12599,6 +12716,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // the flat section colour; the cluster pass samples the VT pool.
         ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
 
+        ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
+        ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
         device->updateBufferMemory(
             dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
 
@@ -13546,8 +13665,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 mat.alpha_mode_ = ego::AlphaMode::Mask;
                 mat.alpha_mask_ = true;
                 mat.effective_opaque_ = false;
-                mat.alpha_cutoff_ = 0.1f;
-                ubo.alpha_cutoff = 0.1f;
+                mat.alpha_cutoff_ = 0.09f;
+                ubo.alpha_cutoff = 0.09f;
                 ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
                     (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
@@ -13578,6 +13697,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             if ((sec.flags & engine::helper::kSecBlend) != 0) {
                 ubo.material_features |= FEATURE_MATERIAL_BLEND;
             }
+            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
+            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
             // ECS dedup identity — baked character sections.
@@ -14342,8 +14463,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 mat.alpha_mode_ = ego::AlphaMode::Mask;
                 mat.alpha_mask_ = true;
                 mat.effective_opaque_ = false;
-                mat.alpha_cutoff_ = 0.1f;
-                ubo.alpha_cutoff = 0.1f;
+                mat.alpha_cutoff_ = 0.09f;
+                ubo.alpha_cutoff = 0.09f;
                 ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
                     (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
@@ -14374,6 +14495,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             if ((sec.flags & engine::helper::kSecBlend) != 0) {
                 ubo.material_features |= FEATURE_MATERIAL_BLEND;
             }
+            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
+            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
             captureMaterialDesc(
@@ -14823,7 +14946,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     }
 
     // LODs and gates off the node names — same pass as every loader.
-    parsePlantLodBands(drawable_object, canon_name);
+    parsePlantLodBands(drawable_object, input_filename);
 
     // Scene bbox + world transforms.
     for (auto& scene : drawable_object->scenes_) {

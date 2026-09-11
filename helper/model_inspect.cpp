@@ -1,3 +1,5 @@
+#include "tree_lifecycle.h"
+#include "tree_lifecycle.h"
 #include "model_inspect.h"
 #include "helper/mesh_tool.h"   // decimateMesh — bakes .rwgeo LOD levels
 
@@ -2928,10 +2930,12 @@ bool bakeModelToRenderReady(
                         s.flags |= kSecSnowCover;
                     }
                     if (mn.find("_leafmask") != std::string::npos) s.flags |= kSecLeafMask;
+                    if (mn.find("clutter_grass")!=std::string::npos || mn.find("clutter_far_")!=std::string::npos)
+                        s.flags |= (treePaletteIndex(mn)<<20) | kSecLeafAge;
                     const auto leaf_age = mn.find("_leafage_");
                     if (leaf_age != std::string::npos && leaf_age + 9 < mn.size() &&
                         mn[leaf_age + 9] >= '0' && mn[leaf_age + 9] <= '3') {
-                        s.flags |= kSecLeafAge |
+                        s.flags |= (treePaletteIndex(mn) << 20) | kSecLeafAge |
                             (uint32_t(mn[leaf_age + 9] - '0') << kSecLeafGroupShift);
                     }
                     // Translucency travels as a section flag: the

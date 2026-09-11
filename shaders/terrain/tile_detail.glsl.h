@@ -49,6 +49,27 @@ float terrainDetailHeight(vec2 pos_xz_ws, float base_h, float fade) {
         return base_h;
     int slot = detail_slot_map[t.y * kDetailTilesPerSide + t.x];
     if (slot < 0) return base_h;
+    // During streaming a neighbouring tile may not be resident yet.
+    // Fade to the same base height at that boundary instead of creating
+    // a vertical step. Include diagonal neighbours for corner continuity.
+    vec2 local_m = (rel - vec2(t)) * kDetailTileMeters;
+    const float border_m = 32.0f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 neighbour = t + ivec2(dx, dy);
+            bool resident = false;
+            if (all(greaterThanEqual(neighbour, ivec2(0))) &&
+                all(lessThan(neighbour, ivec2(kDetailTilesPerSide))))
+                resident = detail_slot_map[neighbour.y * kDetailTilesPerSide + neighbour.x] >= 0;
+            if (!resident) {
+                vec2 lo = vec2(dx, dy) * kDetailTileMeters;
+                vec2 hi = lo + vec2(kDetailTileMeters);
+                float d = length(local_m - clamp(local_m, lo, hi));
+                fade = min(fade, smoothstep(0.0f, border_m, d));
+            }
+        }
+    }
     // Texel k center at tile-origin + k * cell (res 1025 texels span the
     // tile; cell = kDetailTileMeters / (kDetailTileRes - 1)).
     vec2 texels = (rel - vec2(t)) * float(kDetailTileRes - 1);

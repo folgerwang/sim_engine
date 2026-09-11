@@ -420,8 +420,8 @@ void main() {
     bool leaf_mask = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
     if (!leaf_mask && (mat_flags & BINDLESS_MAT_LEAF_AGE) != 0) {
         uint group = (uint(mat_flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
-        if (leafGroupAge(group, camera_info.global_leaf_age) >= 100.) discard;
-        base_color = leafAgedColor(base_color, group, camera_info.global_leaf_age);
+
+        base_color = leafAgedColor(base_color, group, camera_info.global_leaf_age, (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, material_params[mat_idx].tree_life.x);
     }
 
     // Floor-only debug view: when the collision-LOD overlay is active
@@ -622,7 +622,7 @@ void main() {
         int ageIndex = material_params[mat_idx].normal_tex_idx;
         uint group = (uint(mat_flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
         if (ageIndex >= 0) group = leafMaskGroup(texture(normal_textures[nonuniformEXT(ageIndex)], v_uv).b);
-        albedo4 = leafAgedColor(albedo4, group, camera_info.global_leaf_age);
+        albedo4 = leafAgedColor(albedo4, group, camera_info.global_leaf_age, (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, material_params[mat_idx].tree_life.x);
     }
 
     // Alpha mask discard — matches base.frag: if(baseColor.a < alpha_cutoff) discard.

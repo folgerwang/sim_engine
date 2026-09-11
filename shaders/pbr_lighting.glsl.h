@@ -277,12 +277,12 @@ vec4 getBaseColor(
     }
     if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_MASK) != 0) {
         float ageCode = texture(metallic_roughness_tex, getMetallicRoughnessUV(in_data, in_mat)).b;
-        baseColor = leafAgedColor(baseColor, leafMaskGroup(ageCode), camera_info.global_leaf_age);
+        baseColor = leafAgedColor(baseColor, leafMaskGroup(ageCode), camera_info.global_leaf_age, in_mat.pad_3, in_data.vertex_tree_age_base);
     }
     else if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
         baseColor = leafAgedColor(baseColor,
             (in_mat.material_features >> FEATURE_MATERIAL_LEAF_GROUP_SHIFT) & 3u,
-            camera_info.global_leaf_age);
+            camera_info.global_leaf_age, in_mat.pad_3, in_data.vertex_tree_age_base);
     // ── Snow cover ───────────────────────────────────────────────────
     // RGB ONLY.  baseColor.a is the foliage cutout the alpha-mask test
     // reads, and washing it toward 1 would turn every leaf spray back

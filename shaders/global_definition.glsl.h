@@ -18,6 +18,8 @@
 // clear of them and safely inside Metal's range on every backend.
 #define VINPUT_VERTEX_BINDING_POINT         24
 #define VINPUT_INSTANCE_BINDING_POINT       25
+#define VINPUT_TREE_AGE_BINDING_POINT       26
+#define IINPUT_TREE_AGE                     14
 
 // Vertex input attribute location.
 #define VINPUT_POSITION             0
@@ -1313,6 +1315,10 @@ struct RtSkelHeader {
 // (0..255, plenty for the 11 current categories) packed by
 // ClusterRenderer::applyMaterialCategories() after the LLM classifier
 // runs.  Higher bits are reserved.
+#define BINDLESS_MAT_TREE_PROFILE_SHIFT 20
+#define BINDLESS_MAT_TREE_PROFILE_MASK 0x3ff00000
+#define BINDLESS_MAT_TREE_PROFILE_SHIFT 20
+#define BINDLESS_MAT_TREE_PROFILE_MASK 0x3ff00000
 #define BINDLESS_MAT_LEAF_MASK 0x00080000
 #define BINDLESS_MAT_LEAF_AGE 0x00010000
 #define BINDLESS_MAT_LEAF_GROUP_SHIFT 17
@@ -1365,6 +1371,7 @@ struct BindlessMaterialParams {
     uint  normal_vt_id;         // offset 36
     uint  mr_ao_vt_id;          // offset 40; DEPTH_SURFACE: floatBits(UV relief scale)
     uint  emissive_vt_id;       // offset 44; LEAF_MASK: RT mask texture slot; DEPTH_SURFACE: floatBits(triplanar metres)
+    vec4 tree_life;             // offset 48, x: immutable tree initial age
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).
@@ -1726,7 +1733,7 @@ struct PbrMaterialParams {
     uint            tonemap_type;
 
     vec3            emissive_color;
-    uint            pad_3;
+    uint            pad_3; // Tree aging palette index (leaf materials only). // Tree aging palette index (leaf materials only).
 
     mat3            base_color_uv_transform;
     mat3            normal_uv_transform;
@@ -1759,6 +1766,7 @@ struct ObjectVsPsData {
     // G-buffer permutation encodes it so the deferred resolve can
     // launch its RT rays from the unswayed surface the BLAS holds.
     float vertex_sway;
+    float vertex_tree_age_base;
 #ifdef HAS_NORMALS
     vec3 vertex_normal;
     // Crown-shell normal for vegetation draws (veg_sway.glsl.h
@@ -1953,7 +1961,7 @@ struct ViewCameraInfo {
     // update never writes them, which reads as "in air".
     float           underwater_depth;
     float           water_level_y;
-    float           global_leaf_age; // shared runtime float, [0,100]
+    float           global_leaf_age; // shared, nonnegative elapsed age time (unbounded)
 };
 
 struct RuntimeLightsParams {

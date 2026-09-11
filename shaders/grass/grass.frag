@@ -8,6 +8,7 @@
 #include "..\tonemap.glsl.h"
 #include "..\terrain\tile_common.glsl.h"
 #include "grass_common.glsl.h"
+#include "../plant_season.glsl.h"
 
 // ─────────────────────────────────────────────────────────────────────
 // What this used to be:
@@ -166,6 +167,9 @@ void main() {
     vec3 albedo = mix(kLeafShade, leaf, sward);
     albedo = mix(albedo, mix(albedo, kLeafDry, 0.30f),
                  smoothstep(0.70f, 1.0f, v));
+
+    // Seasonal tint affects both forward and G-buffer grass; coverage never changes.
+    albedo = grassSeasonColor(albedo, camera_info.global_leaf_age);
 
     // Thin translucent margin along the rim of the blade.
     albedo *= 1.0f + 0.12f * smoothstep(0.70f, 1.0f, edge);

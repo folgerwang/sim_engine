@@ -97,7 +97,7 @@ static_assert(offsetof(glsl::BindlessMaterialParams, albedo_vt_id)       == 32, 
 static_assert(offsetof(glsl::BindlessMaterialParams, normal_vt_id)       == 36, "");
 static_assert(offsetof(glsl::BindlessMaterialParams, mr_ao_vt_id)        == 40, "");
 static_assert(offsetof(glsl::BindlessMaterialParams, emissive_vt_id)     == 44, "");
-static_assert(sizeof(glsl::BindlessMaterialParams)                       == 48, "");
+static_assert(sizeof(glsl::BindlessMaterialParams)                       == 64, "");
 
 // Flip to 1 to re-enable the diagnostic upload / finalize lines that
 // otherwise printed for every ClusterRenderer mesh upload + a few
@@ -629,6 +629,8 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         if ((values.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
                             mp.flags |= BINDLESS_MAT_LEAF_AGE |
                                 (((values.material_features >> FEATURE_MATERIAL_LEAF_GROUP_SHIFT) & 3u) << BINDLESS_MAT_LEAF_GROUP_SHIFT);
+                        mp.flags |= int((values.pad_3 & 1023u) << BINDLESS_MAT_TREE_PROFILE_SHIFT);
+                        mp.flags |= int((values.pad_3 & 1023u) << BINDLESS_MAT_TREE_PROFILE_SHIFT);
                         depth_scale = values.normal_scale;
                         if ((values.material_features & FEATURE_MATERIAL_TRIPLANAR) != 0)
                             depth_tile_m = values.triplanar_tile_m;
@@ -867,7 +869,7 @@ void ClusterRenderer::uploadMeshClusters(
     const game_object::DrawableData& drawable_data,
     uint32_t mesh_idx,
     const std::vector<uint32_t>& cluster_prim_map,
-    const glm::mat4& model_transform) {
+    const glm::mat4& model_transform, float tree_age_base) {
 
     if (cluster_mesh.empty() || !cluster_mesh.source) {
         return;
@@ -949,6 +951,7 @@ void ClusterRenderer::uploadMeshClusters(
         if (cache_it != prim_to_mat_idx.end()) return cache_it->second;
         const uint32_t idx = registerClusterMaterial(
             drawable_data, mesh_idx, prim_idx, mesh_object_name);
+        staging_material_params_[idx].tree_life.x = tree_age_base;
         prim_to_mat_idx[prim_idx] = idx;
         return idx;
     };
@@ -5320,14 +5323,14 @@ void ClusterRenderer::buildHwRtShadowAs() {
         // Translucent never occludes the sun (parity with raster + SW RT).
         if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
         bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u;
-        if (masked && m.base_color_tex_idx < 0) {
+        if (masked && m.base_color_tex_idx < 0 && (flags & BINDLESS_MAT_LEAF_AGE) == 0u) {
             // Texture-less cutout: constant alpha decides once.
             if (m.base_color_factor.a < m.alpha_cutoff) continue;
             masked = false;
         }
         // Far masked clusters are emitted as opaque — see
         // rt_masked_opaque_dist_m_ in the header.
-        if (masked && rt_build_eye_valid_ && rt_masked_opaque_dist_m_ > 0.0f &&
+        if (masked && (flags & BINDLESS_MAT_LEAF_AGE) == 0u && rt_build_eye_valid_ && rt_masked_opaque_dist_m_ > 0.0f &&
             ci < staging_cull_infos_.size()) {
             const glm::vec4 bs = staging_cull_infos_[ci].bounds_sphere;
             const float dist =
@@ -6223,7 +6226,7 @@ uint32_t ClusterRenderer::writeRtTlasInstances(bool include_skeleton,
     }
     if (rt_per_mesh_blas_) {
         for (const RtCasterInstance& ci : rt_caster_instances_) {
-            if (ci.slot >= rt_mesh_slots_.size()) continue;
+            if (ci.slot >= rt_mesh_slots_.size() || ci.slot >= 65535u) continue;
             const RtMeshSlot& s = rt_mesh_slots_[ci.slot];
             if (!s.built) continue;
             er::AccelerationStructureInstance in = base;
@@ -6234,7 +6237,8 @@ uint32_t ClusterRenderer::writeRtTlasInstances(bool include_skeleton,
                 }
             }
             in.instance_custom_index =
-                (2u + ((ci.slot << 1) | (ci.far_lod ? 1u : 0u))) & 0xFFFFFFu;
+                ((uint32_t(std::clamp(-ci.tree_age_base,0.f,100.f)) << 17) |
+                 (2u + ((ci.slot << 1) | (ci.far_lod ? 1u : 0u))));
             in.acceleration_structure_reference = ci.far_lod ? s.addr_far : s.addr_near;
             s_insts.push_back(in);
             if (s_insts.size() >= 2u + kRtCasterMaxInstances) break;

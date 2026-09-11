@@ -238,7 +238,7 @@ vec4 rtLeafAgeTexel(BindlessMaterialParams m, vec2 uv, vec4 texel) {
     uint group = (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
     if (m.emissive_vt_id < MAX_CLUSTER_TEXTURES)
         group = leafMaskGroup(textureLod(rt_base_color_textures[nonuniformEXT(m.emissive_vt_id)], uv, 0.).b);
-    return leafAgedColor(texel, group, camera_info.global_leaf_age);
+    return leafAgedColor(texel, group, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
 }
 
 // ── RT-shadow skeleton casters (skinned characters) ──────────────────
@@ -329,9 +329,12 @@ struct HwRtTri {
     uint i0, i1, i2;
     uint mat_id;
     bool per_mesh;
+    float tree_age_base;
 };
 HwRtTri hwRtResolveTri(int custom, int geom, int prim) {
     HwRtTri t;
+    t.tree_age_base = -float(uint(custom) >> 17);
+    custom = int(uint(custom) & 0x1ffffu);
     if (custom >= 2) {
         const uint code = uint(custom) - 2u;
         const RtMeshInfo mi = rt_mesh_infos[code >> 1];
@@ -658,7 +661,7 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
             BindlessMaterialParams m = rt_materials[draw.material_idx];
             if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
                 m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
             uint mflags = uint(m.flags);
             if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
 
@@ -1159,7 +1162,7 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
             BindlessMaterialParams m = rt_materials[draw.material_idx];
             if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
                 m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
             uint mflags = uint(m.flags);
             if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
             bool masked = (mflags & BINDLESS_MAT_ALPHA_MASK) != 0u &&
@@ -1590,9 +1593,10 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                 rayQueryGetIntersectionGeometryIndexEXT(rq, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             BindlessMaterialParams m = rt_materials[t.mat_id];
+            if (t.per_mesh) m.tree_life.x = t.tree_age_base;
             if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
                 m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
 
             vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
             vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
@@ -1690,9 +1694,10 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
                 rayQueryGetIntersectionGeometryIndexEXT(rq, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             BindlessMaterialParams m = rt_materials[t.mat_id];
+            if (t.per_mesh) m.tree_life.x = t.tree_age_base;
             if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
                 m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
 
             vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
             vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));
@@ -1755,9 +1760,10 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         rayQueryGetIntersectionGeometryIndexEXT(rq, true),
         rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
     BindlessMaterialParams m = rt_materials[t.mat_id];
+            if (t.per_mesh) m.tree_life.x = t.tree_age_base;
     if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
                 m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
 
     vec4 p0 = hwRtVertex(t.per_mesh, t.i0);
     vec4 p1 = hwRtVertex(t.per_mesh, t.i1);
@@ -2533,9 +2539,10 @@ float wpTraceDistance(vec3 ro,vec3 rd,out bool backface) {
                 rayQueryGetIntersectionGeometryIndexEXT(rq, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             BindlessMaterialParams m = rt_materials[t.mat_id];
+            if (t.per_mesh) m.tree_life.x = t.tree_age_base;
             if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
                 m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age);
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
             uint candidateFlags=uint(m.flags);
             if((candidateFlags & BINDLESS_MAT_TRANSLUCENT)!=0u) continue;
             if((candidateFlags & BINDLESS_MAT_ALPHA_MASK)==0u) {

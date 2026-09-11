@@ -1,4 +1,5 @@
 #pragma once
+#include "helper/tree_lifecycle.h"
 #include <atomic>
 #include <mutex>          // PcgInstanceRegistry guards its tables
 #include <unordered_map>
@@ -636,6 +637,8 @@ struct DrawableData {
     uint32_t                    num_prims_ = 0;
     renderer::BufferInfo        indirect_draw_cmd_;
     renderer::BufferInfo        instance_buffer_;
+    renderer::BufferInfo        tree_age_buffer_;
+    std::vector<float>          tree_age_bases_;
 
     // ── Baked GPU instancing (EXT_mesh_gpu_instancing) ───────────────
     // Non-empty only for assets that carried the extension — today the
@@ -755,6 +758,7 @@ struct DrawableData {
     // still has something sane for the rungs the table does not cover.
     std::vector<std::string>              lod_cat_names_;
     std::vector<std::vector<glm::vec2>>   lod_band_authored_;
+    bool                                lod_preserve_authored_ = false;
     // Value of plantLodBandGeneration() the node distances were last
     // written for.  Bumped by setPlantLodBands(), so the per-frame pass
     // rewrites 690k node distances only when the table actually changed.
@@ -2150,6 +2154,20 @@ struct PcgInstanceRecord {
     uint32_t  node = 0;          // index into the loaded node-name table
     uint8_t   category = 0;      // 0 rocks 1 trees 2 bushes 3 houses 4 objects
     uint8_t   state = 0;         // 0 static 1 moving 2 destroyed
+    float     aging_ratio = 1.0f;     // Species rate, [0.1,100].
+    float     age_base_years = 0.0f;       // Trees only; signed age base, initially [-100,0].
+    float     lifespan_years = 0.0f;   // Species profile + instance variation.
+    double ageYears(double simulation_year) const {
+        return engine::helper::treeAgeYears(simulation_year * aging_ratio, age_base_years);
+    }
+    engine::helper::TreeLifeStage lifeStage(double simulation_year) const {
+        return engine::helper::treeLifeStage(ageYears(simulation_year), lifespan_years);
+    }
+    engine::helper::LeafLifeState leafLife(double global_age_time,
+        float initial_leaf_age, float leaf_lifespan=100.f) const {
+        return engine::helper::treeLeafLife(age_base_years, global_age_time,
+            aging_ratio, initial_leaf_age, leaf_lifespan);
+    }
     float     weight_kg = 0.0f;
     glm::vec3 t{0.0f};
     float     yaw = 0.0f;
@@ -2166,6 +2184,11 @@ public:
     bool load(const std::string& json_path);
     void clear();
     size_t size() const;
+    // O(1) shared calendar; individual ages derive from stable age bases.
+    void advanceTreeYears(double years);
+    void setTreeAgeTime(double age_time);
+    double treeSimulationYear() const;
+
 
     const PcgInstanceRecord* find(uint64_t id) const;   // nullptr if unknown
     // ids within `radius` of `p` (plan distance), optionally one
@@ -2206,6 +2229,7 @@ private:
     BakedInstanceXform xformOf(const PcgInstanceRecord& r) const;
     void queueRecord(uint32_t rec_idx, const BakedInstanceXform& x);
 
+    double tree_year_ = 0.0;
     mutable std::mutex mu_;
     std::vector<std::string> nodes_;
     std::vector<PcgInstanceRecord> recs_;

@@ -116,6 +116,7 @@ layout(location = VINPUT_WEIGHTS_1) in vec4 in_weights_1;
 layout(location = IINPUT_MAT_ROT_0) in vec4 in_loc_rot_mat_0;
 layout(location = IINPUT_MAT_ROT_1) in vec4 in_loc_rot_mat_1;
 layout(location = IINPUT_MAT_ROT_2) in vec4 in_loc_rot_mat_2;
+layout(location = IINPUT_TREE_AGE) in float in_tree_age_base;
 
 layout(location = 0) out ObjectVsPsData out_data;
 
@@ -273,6 +274,7 @@ void main() {
     }
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;
+    out_data.vertex_tree_age_base = in_tree_age_base;
     // Handed to the G-buffer so the resolve can trace from the rest
     // position (see vertex_sway in ObjectVsPsData).
     out_data.vertex_sway = sway_travel;

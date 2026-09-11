@@ -53,6 +53,7 @@ public:
         // beyond rt_masked_opaque_dist_m_: all-opaque BLAS.  (Not `far`:
         // windef.h still #defines that legacy keyword to nothing.)
         bool      far_lod;
+        float     tree_age_base = 0.f;
     };
 
     // ── Translucent (glass) rendering mode ─────────────────────────────
@@ -804,7 +805,7 @@ public:
         const game_object::DrawableData& drawable_data,
         uint32_t mesh_idx,
         const std::vector<uint32_t>& cluster_prim_map,
-        const glm::mat4& model_transform);
+        const glm::mat4& model_transform, float tree_age_base = 0.f);
 
     // ── Per-mesh BLAS instanced RT casters ────────────────────────────
     // The instanced placed world (EXT_mesh_gpu_instancing groups: trees,
