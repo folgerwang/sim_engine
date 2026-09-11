@@ -36,6 +36,7 @@
 #include "actor_shadow_geometry.h"
 #include "scene_rendering/rt_skin_types.h"
 #include "car_library.h"
+#include "vehicle_bounds.h"
 
 namespace engine {
 namespace game_object {
@@ -220,6 +221,8 @@ private:
         // The type still drives BEHAVIOUR (how fast, how it is chosen,
         // whether it has a light bar); the sample drives what is drawn.
         // Keeping those apart is what makes the library optional.
+        glm::vec3 bounds_min{-2.5f, 0.0f, -1.1f};
+        glm::vec3 bounds_max{2.5f, 2.0f, 1.1f};
         int      sample = -1;
         uint8_t  paint = 0;
         uint8_t  trim = 0;
@@ -252,6 +255,9 @@ private:
     glm::vec3 lanePos(const Edge& e, float s, float dir, float extra,
                       glm::vec3* tangent, float* half,
                       float lane = 1.0f) const;
+    bool spaceFree(const Vehicle& v, int ignore = -1, const Vehicle* previous = nullptr) const;
+    bool parkFree(Vehicle& v, const RoadPt& rp, int ignore = -1);
+    void guardMove(Vehicle& v, const Vehicle& previous, int index);
     void parkAt(Vehicle& v, const RoadPt& rp);
     // Parked on the VERGE: kVergeM further out than the curb spot,
     // facing along the road in direction `dir` (its own side of the

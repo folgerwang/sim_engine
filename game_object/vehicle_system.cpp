@@ -833,6 +833,9 @@ glm::vec3 paletteColor(uint32_t seed) {
 // library is absent, which leaves Vehicle::sample at -1 and the vehicle
 // on the built-in hull for its type.
 void VehicleSystem::assignSample(Vehicle& v) {
+    const Spec& fallback = specs()[v.type];
+    v.bounds_min = {-fallback.L*0.5f-0.15f, 0.0f, -fallback.W*0.5f-0.25f};
+    v.bounds_max = { fallback.L*0.5f+0.15f, fallback.roof+0.3f, fallback.W*0.5f+0.25f};
     if (!s_lib_.loaded || v.type < 0 ||
         v.type >= int(s_type_samples_.size())) {
         return;
@@ -841,6 +844,21 @@ void VehicleSystem::assignSample(Vehicle& v) {
     if (set.empty()) return;
     v.sample = set[size_t(h01(v.seed, 0x5Bu) * float(set.size())) % set.size()];
     const CarSample& c = s_lib_.samples[size_t(v.sample)];
+    v.bounds_min = {-c.L*0.5f, 0.0f, -c.W*0.5f};
+    v.bounds_max = { c.L*0.5f, c.H, c.W*0.5f};
+    for (const auto* mesh : {&c.body, &c.interior})
+        for (const auto& p : mesh->pos) {
+            v.bounds_min = glm::min(v.bounds_min, p);
+            v.bounds_max = glm::max(v.bounds_max, p);
+        }
+    // Include tyres at every axle; the sphere also covers front-wheel steering.
+    const float radius = std::sqrt(c.wheel_r*c.wheel_r+c.wheel_w*c.wheel_w);
+    for (float axle : c.axle_x) for (float side : {-1.0f, 1.0f}) {
+        const glm::vec3 centre(axle,c.wheel_r,side*c.track_z);
+        v.bounds_min=glm::min(v.bounds_min,centre-glm::vec3(radius));
+        v.bounds_max=glm::max(v.bounds_max,centre+glm::vec3(radius));
+    }
+
     // A sample says which paints it may wear — a green ambulance is a
     // bug, not variety — and the interior is a free choice out of the
     // palette, weighted a little toward the dark cloths most cars have.
@@ -1604,6 +1622,65 @@ void VehicleSystem::emitSignals(const glm::vec3& camera_pos) {
 }
 
 // ── vehicles ─────────────────────────────────────────────────────────
+bool VehicleSystem::spaceFree(const Vehicle& v, int ignore, const Vehicle* previous) const {
+    auto box = vehicleBounds(v.pos,v.yaw,v.ground_up,v.bounds_min,v.bounds_max);
+    if (previous) box=sweptVehicleBounds(vehicleBounds(previous->pos,previous->yaw,
+        previous->ground_up,previous->bounds_min,previous->bounds_max),box);
+    const float radius=glm::length(box.half);
+    for(size_t i=0;i<vehicles_.size();++i) {
+        const auto& other=vehicles_[i];
+        if (int(i)==ignore || other.dormant) continue;
+        const auto d=other.pos-box.centre;
+        const float reach=radius+glm::length(glm::max(glm::abs(other.bounds_min),
+                                                      glm::abs(other.bounds_max)))+0.3f;
+        if(glm::dot(d,d)>reach*reach) continue;
+        const auto ob=vehicleBounds(other.pos,other.yaw,other.ground_up,
+                                    other.bounds_min,other.bounds_max);
+        if(vehicleBoundsOverlap(box,ob)) return false;
+    }
+    return true;
+}
+
+bool VehicleSystem::parkFree(Vehicle& v, const RoadPt& rp, int ignore) {
+    // Search neighbouring curb points in both directions, never stack cars
+    // when multiple households share the same nearest road sample.
+    const auto& edge=edges_[rp.edge];
+    const float origin=edge.s[rp.index];
+    for(int step=0;step<int(edge.pts.size());++step) {
+        for(int direction : {1,-1}) {
+            if(step==0 && direction==-1) continue;
+            const int at=rp.index+step*direction;
+            if(at<0 || at>=int(edge.pts.size())) continue;
+            if(std::abs(edge.s[at]-origin)>kCurbSearchM) continue;
+            Vehicle candidate=v;
+            candidate.claim=-1;
+            parkAt(candidate, RoadPt{rp.edge,at});
+            if(!spaceFree(candidate,ignore)) continue;
+            if(v.claim>=0 && v.claim<int(node_claim_.size()) && node_claim_[v.claim]==ignore)
+                node_claim_[v.claim]=-1;
+            v=std::move(candidate);
+            return true;
+        }
+    }
+    return false;
+}
+
+void VehicleSystem::guardMove(Vehicle& v, const Vehicle& previous, int index) {
+    if(v.pos==previous.pos && v.yaw==previous.yaw && v.ground_up==previous.ground_up) return;
+    if(spaceFree(v,index,&previous)) return;
+    const int new_claim=v.claim;
+    const float idle=v.idle_t, stop=v.stop_t, block=v.block_t, cool=v.lane_cool;
+    v=previous;
+    v.speed=0;
+    v.idle_t=idle; v.stop_t=stop; v.block_t=block; v.lane_cool=cool;
+    if(new_claim>=0 && new_claim<int(node_claim_.size()) && node_claim_[new_claim]==index)
+        node_claim_[new_claim]=-1;
+    if(v.claim>=0) {
+        if(node_claim_[v.claim]<0) node_claim_[v.claim]=index;
+        else if(node_claim_[v.claim]!=index) v.claim=-1;
+    }
+}
+
 void VehicleSystem::parkAt(Vehicle& v, const RoadPt& rp) {
     const Edge& e = edges_[rp.edge];
     const float s = e.s[rp.index];
@@ -1720,7 +1797,7 @@ int VehicleSystem::spawnCar(uint32_t seed, const glm::vec3& near_pos) {
     // assignSample); v.color stays as the fallback for when it is not.
     assignSample(v);
     v.ambient = false;
-    parkAt(v, rp);
+    if (!parkFree(v, rp)) return -1;
     vehicles_.push_back(v);
     return int(vehicles_.size()) - 1;
 }
@@ -1810,7 +1887,7 @@ void VehicleSystem::occupants(const glm::vec3& cam, float radius,
 void VehicleSystem::recall(int car, const glm::vec3& pos) {
     if (car < 0 || car >= int(vehicles_.size())) return;
     RoadPt rp;
-    if (nearestRoadPt(pos, kCurbSearchM, rp)) parkAt(vehicles_[car], rp);
+    if (nearestRoadPt(pos, kCurbSearchM, rp)) parkFree(vehicles_[car], rp, car);
 }
 
 bool VehicleSystem::randomDestination(const glm::vec3& from, float min_m,
@@ -1924,7 +2001,7 @@ void VehicleSystem::spawnAmbient(const glm::vec3& camera_pos, uint32_t seed) {
         parkVerge(v, rp, h01(seed, 0x47u) < 0.5f ? 1.0f : -1.0f);
         v.lights = false;
         v.idle_t = 120.0f + 600.0f * h01(seed, 0x46u);
-        vehicles_.push_back(v);
+        if (spaceFree(v)) vehicles_.push_back(v);
         return;
     }
     parkAt(v, rp);
@@ -1943,7 +2020,14 @@ void VehicleSystem::spawnAmbient(const glm::vec3& camera_pos, uint32_t seed) {
             v.lane_x = float(v.lane); v.stop_t = 0.0f;
         }
     }
-    vehicles_.push_back(v);
+    if (!v.parked && !v.route.empty()) {
+        const auto& leg=v.route[0];
+        glm::vec3 tangent;
+        v.pos=lanePos(edges_[leg.edge],v.s,leg.s_to>=leg.s_from?1.0f:-1.0f,
+                      0.0f,&tangent,nullptr,v.lane_x);
+        v.yaw=std::atan2(tangent.x,tangent.z);
+    }
+    if (spaceFree(v)) vehicles_.push_back(v);
 }
 
 void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
@@ -2148,7 +2232,9 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             // park at the destination: the nearest road point to where
             // the last leg ends
             const glm::vec3 end = edgePoint(e, leg.s_to, nullptr, nullptr);
-            if (nearestRoadPt(end, 30.0f, rp)) parkAt(v, rp);
+            if (nearestRoadPt(end, 30.0f, rp)) {
+                if (!parkFree(v, rp, vi)) { v.s=leg.s_to; v.speed=0.0f; return; }
+            }
             else { v.parked = true; v.speed = 0.0f; v.leg = -1; v.route.clear(); }
             v.idle_t = v.ambient ? 4.0f + 8.0f * h01(v.seed, 0x77u) : 0.0f;
             return;
@@ -2251,6 +2337,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         if (v.dormant || glm::dot(d,d) <= kSimRadius*kSimRadius) continue;
         if (v.parked) { v.idle_t = std::max(0.0f, v.idle_t-dt); continue; }
         coarse_advanced[i] = 1;
+        const Vehicle previous=v;
         if (v.claim >= 0 && node_claim_[v.claim] == int(i)) node_claim_[v.claim] = -1;
         v.claim = -1;
         const auto& spec = specs()[v.type];
@@ -2275,6 +2362,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
             v.s = v.route[v.leg].s_from;
             if (remaining <= 0) break;
         }
+        guardMove(v,previous,int(i));
     }
     // ── who is on which edge (car following) ────────────────────────
     std::unordered_map<int, std::vector<int>> on_edge;
@@ -2293,6 +2381,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         const float d2 = dx * dx + dz * dz;
         if (d2 > sim2) continue;
         if (coarse_advanced[i]) continue; // promoted next frame; never integrate twice
+        const Vehicle previous=v;
         tick(v, int(i), dt, speed_scale, on_edge);
         if (ground && d2 < kClampRadius * kClampRadius) {
             float gy; glm::vec3 gn;
@@ -2303,6 +2392,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
                     v.ground_up = glm::normalize(gn);
             }
         }
+        guardMove(v,previous,int(i));
     }
     // ── emit the frame ──────────────────────────────────────────────
     if (frame_.size() != size_t(streamCount()))
