@@ -111,12 +111,15 @@ public:
     // decal list is deliberately excluded — alpha-blended geometry has
     // no place in an opaque G-buffer (same rule terrain applies to its
     // grass and water).
+    void clearDeferredTargets(std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+                              bool preserve_depth);
+
     void drawGbuffer(
         std::shared_ptr<renderer::CommandBuffer> cmd_buf,
         const renderer::DescriptorSetList& desc_sets,
         const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
         const std::shared_ptr<renderer::ImageView>& depth_view,
-        const glm::uvec2& buffer_size);
+        const glm::uvec2& buffer_size, bool coverage_only = false);
 
     // Forward translucent GLASS pass: draw ONLY the Blend/glass
     // primitives of every registered drawable, alpha-blended over the

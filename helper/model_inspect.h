@@ -1,4 +1,5 @@
 #pragma once
+#include "plant_material_flags.h"
 //
 // model_inspect.h  --  CPU-only structural peek at model files.
 //
@@ -62,6 +63,7 @@ static const uint32_t kSecSnowCover = 0x2u;
 // (window panes).  The native loaders draw it through the forward glass
 // pass with base_color.a as the transmission; without the flag a baked
 // section can only be Opaque or Mask, and a pane bakes solid.
+// In leaf sections this bit extends the age group; use sectionIsBlend().
 static const uint32_t kSecBlend = 0x4u;
 static const uint32_t kSecLeafMask = 0x100u;
 static const uint32_t kSecLeafAge = 0x20u;

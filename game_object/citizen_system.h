@@ -182,7 +182,8 @@ private:
         // packing.
         int   headcount = 1;
     };
-    struct SimState {                   // per-person, ALWAYS ticking
+    struct SimState {
+        VehicleSystem::FootPath foot;                   // per-person, ALWAYS ticking
         glm::vec3 pos{0.0f};
         float yaw = 0.0f;
         float phase = 0.0f;            // walk cycle
@@ -289,6 +290,7 @@ private:
     // the camera or after a few minutes.  Drawn through emitPerson
     // like everyone else, so they get the same tiers and clothes.
     struct Stroller {
+        VehicleSystem::FootPath foot;
         glm::vec3 pos{0.0f};
         glm::vec3 target{0.0f};
         float yaw = 0.0f;

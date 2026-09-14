@@ -80,7 +80,6 @@ void main() {
         // colour pass then discards.  Those sit the prepass out.
         if (per_inst || fading || ((node.flags >> 2u) & 3u) == 0u) return;
     }
-    const bool node_uncovered = per_inst || fading || ((node.flags >> 2u) & 3u) == 0u;
 
     // ── Emit one command per primitive into its bucket ───────────────
     for (uint p = 0u; p < node.prim_count; ++p) {
@@ -93,7 +92,7 @@ void main() {
             if (pc.mode == NT_MODE_PREPASS &&
                 (pf & NT_PRIM_OPAQUE) == 0u) continue;          // prepass: opaque only
             if (pc.mode == NT_MODE_FWD_COVERED &&
-                !node_uncovered && (pf & NT_PRIM_COVERABLE) != 0u) continue;
+                (pf & NT_PRIM_COVERABLE) != 0u) continue;
         }
         const uvec2 pb = prim_bases[gp];
         const uint k = atomicAdd(counts[gp], 1u);

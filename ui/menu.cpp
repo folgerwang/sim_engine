@@ -2666,6 +2666,33 @@ bool Menu::draw(
         // installed sherpa-onnx voices under assets/ml_models/tts; selecting one
         // switches live and re-speaks the last dialog line so you can audition
         // them one by one.
+        if (ImGui::BeginMenu("Seasons")) {
+            ImGui::TextUnformatted("Tree leaves and grass");
+            ImGui::Checkbox("Play annual cycle", &season_cycle_playing_);
+            ImGui::SetNextItemWidth(320.f);
+            if (ImGui::SliderFloat("Year duration", &season_cycle_minutes_, 0.1f, 120.f,
+                                   "%.1f minutes", ImGuiSliderFlags_Logarithmic))
+                season_duration_dirty_ = true;
+            ImGui::TextDisabled("Duration of one complete seasonal year.");
+            ImGui::SetNextItemWidth(320.f);
+            if (ImGui::SliderFloat("Year cycle", &season_cycle_percent_, 0.f, 100.f, "%.1f%%")) {
+                season_cycle_dirty_=true;
+                season_cycle_playing_=false;
+            }
+            ImGui::TextUnformatted("0 Spring | 25 Summer | 50 Autumn | 75 Winter | 100 Spring");
+            const char* names[]={"Spring","Summer","Autumn","Winter"};
+            const int current=int(season_cycle_percent_/25.f)%4;
+            ImGui::Text("Current season: %s",names[current]);
+            for(int i=0;i<4;++i) {
+                if(i) ImGui::SameLine();
+                if(ImGui::Button(names[i])) {
+                    season_cycle_percent_=float(i)*25.f+12.5f;
+                    season_cycle_dirty_=true;season_cycle_playing_=false;
+                }
+            }
+            ImGui::TextDisabled("Dragging pauses time. Enable Play to resume from here.");
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Audio"))
         {
             namespace au = engine::audio;
@@ -9694,6 +9721,19 @@ void Menu::buildAssetPreview(const std::string& path, int sub_index,
 // application.cpp).  Both base.frag and cluster_bindless.frag read and
 // dispatch on this value; mode 0 = the normal shaded path.
 void Menu::drawRenderDebugMenuContent() {
+    if (ImGui::BeginMenu("Leaf draw profiling")) {
+        const char* passes[]={"Depth coverage","G-buffer","Forward / blending","Raster shadows"};
+        for (size_t i=0;i<4;++i) {
+            ImGui::Text("%s: %llu calls (%llu GPU batches), capacity %llu",passes[i],
+                (unsigned long long)(leaf_profile_draws_[i]+leaf_profile_batches_[i]),
+                (unsigned long long)leaf_profile_batches_[i],
+                (unsigned long long)(leaf_profile_draws_[i]+leaf_profile_capacity_[i]));
+        }
+        ImGui::TextUnformatted("Per-frame CPU submissions; capacity is NOT GPU-surviving draws.");
+        ImGui::TextUnformatted("Ray-traced shadows issue rays, not leaf raster draw calls.");
+        ImGui::TextUnformatted("Pass GPU timings remain in the Game Profiler.");
+        ImGui::EndMenu();
+    }
     ImGui::MenuItem("Leaf alpha-cutoff depth prepass", nullptr, &leaf_depth_prepass_);
     if (leaf_depth_prepass_)
         ImGui::Text("Leaf depth: %llu submitted draws (last frame)",

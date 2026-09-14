@@ -235,7 +235,7 @@ layout(set = RT_SHADOW_DATA_SET, binding = 7)
 
 vec4 rtLeafAgeTexel(BindlessMaterialParams m, vec2 uv, vec4 texel) {
     if ((m.flags & BINDLESS_MAT_LEAF_MASK) == 0) return texel;
-    uint group = (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u;
+    uint group = UNPACK_BINDLESS_LEAF_GROUP(uint(m.flags));
     if (m.emissive_vt_id < MAX_CLUSTER_TEXTURES)
         group = leafMaskGroup(textureLod(rt_base_color_textures[nonuniformEXT(m.emissive_vt_id)], uv, 0.).b);
     return leafAgedColor(texel, group, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
@@ -659,9 +659,6 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
             // Translucent clusters don't occlude the sun (matches the
             // raster shadow path, which skips them at cull time).
             BindlessMaterialParams m = rt_materials[draw.material_idx];
-            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
-                m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
             uint mflags = uint(m.flags);
             if ((mflags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
 
@@ -672,6 +669,14 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
             // raster CSM path, which runs those materials through the
             // alpha-test fragment shader.
             bool masked = (mflags & BINDLESS_MAT_ALPHA_MASK) != 0u;
+            if ((mflags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u) {
+                vec4 leaf = leafAgedColor(m.base_color_factor,
+                    (mflags >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u,
+                    camera_info.global_leaf_age,
+                    (mflags >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
+                if (leaf.a <= 0.0) continue;
+                masked = false;
+            }
             if (masked && m.base_color_tex_idx < 0) {
                 // No texture — the constant factor decides for the whole
                 // cluster: below the cutoff nothing here ever occludes.
@@ -1594,9 +1599,17 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                 rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             BindlessMaterialParams m = rt_materials[t.mat_id];
             if (t.per_mesh) m.tree_life.x = t.tree_age_base;
-            if ((m.flags & BINDLESS_MAT_LEAF_AGE) != 0 && (m.flags & BINDLESS_MAT_LEAF_MASK) == 0)
-                m.base_color_factor = leafAgedColor(m.base_color_factor,
-                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u, camera_info.global_leaf_age, (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
+
+            // All tree LODs cast opaque geometric silhouettes, including
+            // coarse cards. Seasonal absence gates the whole cohort only.
+            if ((m.flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0) {
+                vec4 leaf = leafAgedColor(m.base_color_factor,
+                    (uint(m.flags) >> BINDLESS_MAT_LEAF_GROUP_SHIFT) & 3u,
+                    camera_info.global_leaf_age,
+                    (uint(m.flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, m.tree_life.x);
+                if (leaf.a > 0.0) rayQueryConfirmIntersectionEXT(rq);
+                continue;
+            }
 
             vec2 uv0 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i0).w));
             vec2 uv1 = unpackHalf2x16(floatBitsToUint(hwRtVertex(t.per_mesh, t.i1).w));

@@ -116,6 +116,28 @@ struct FootIkParams {
 };
 
 class Menu {
+    float season_cycle_percent_ = 25.f;
+    bool season_cycle_playing_ = true;
+    bool season_cycle_dirty_ = false;
+    float season_cycle_minutes_ = 30.f;
+    bool season_duration_dirty_ = false;
+public:
+    void syncSeasonCycle(float percent) {
+        if(!season_cycle_dirty_) season_cycle_percent_=percent;
+    }
+    bool consumeSeasonCycle(float& percent) {
+        if(!season_cycle_dirty_) return false;
+        percent=season_cycle_percent_;season_cycle_dirty_=false;return true;
+    }
+    void syncSeasonDuration(float minutes) {
+        if (!season_duration_dirty_) season_cycle_minutes_ = minutes;
+    }
+    bool consumeSeasonDuration(float& minutes) {
+        if (!season_duration_dirty_) return false;
+        minutes = season_cycle_minutes_; season_duration_dirty_ = false; return true;
+    }
+    bool seasonCyclePlaying() const {return season_cycle_playing_;}
+private:
     std::vector<std::string> gltf_file_names_;
     std::vector<std::string> to_load_gltf_names_;
     // One-shot "snap the player to the camera" request — drained by
@@ -351,6 +373,9 @@ class Menu {
     bool world_probe_debug_ = false;
     bool leaf_depth_prepass_ = false;
     uint64_t leaf_depth_prepass_draws_ = 0;
+    std::array<uint64_t,4> leaf_profile_draws_{};
+    std::array<uint64_t,4> leaf_profile_batches_{};
+    std::array<uint64_t,4> leaf_profile_capacity_{};
     bool world_probe_debug_xray_ = true;
     int world_probe_debug_mode_ = 0;
     float world_probe_debug_distance_ = 1500.0f;
@@ -2288,6 +2313,11 @@ public:
     inline bool isRtSmoothingOn() const { return rt_smoothing_; }
     // Rendering > Shadow > "Temporal RT shadow/AO" and "RT rays/px".
     inline bool isRtTemporalOn() const { return rt_temporal_; }
+    void setLeafDrawProfile(const std::array<uint64_t,4>& draws,
+                           const std::array<uint64_t,4>& batches,
+                           const std::array<uint64_t,4>& capacity) {
+        leaf_profile_draws_=draws; leaf_profile_batches_=batches; leaf_profile_capacity_=capacity;
+    }
     void setLeafDepthPrepassDraws(uint64_t count) { leaf_depth_prepass_draws_ = count; }
     bool leafDepthPrepass() const { return leaf_depth_prepass_; }
     bool worldProbeDebug() const { return world_probe_debug_; }

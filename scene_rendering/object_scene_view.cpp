@@ -190,12 +190,14 @@ void ObjectSceneView::drawGbuffer(
     const renderer::DescriptorSetList& desc_sets,
     const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
     const std::shared_ptr<renderer::ImageView>& depth_view,
-    const glm::uvec2& buffer_size) {
+    const glm::uvec2& buffer_size, bool coverage_only) {
 
     if (m_drawable_objects_.empty() || !depth_view) {
         return;
     }
 
+    const auto mode = coverage_only ? ego::DrawableObject::DrawMode::kCoveragePrepass
+                                    : ego::DrawableObject::DrawMode::kGBuffer;
     renderer::DescriptorSetList desc_set_list = desc_sets;
     desc_set_list[VIEW_PARAMS_SET] =
         m_camera_object_->getViewCameraDescriptorSet();
@@ -206,7 +208,7 @@ void ObjectSceneView::drawGbuffer(
         m_camera_object_->getCameraViewInfo().position);
     ego::DrawableObject::ntBeginPass(
         cmd_buf, m_drawable_objects_,
-        ego::DrawableObject::DrawMode::kGBuffer,
+        mode,
         /*depth_only*/ false, 0u);
 
     {
@@ -269,7 +271,7 @@ void ObjectSceneView::drawGbuffer(
             viewports,
             scissors,
             false,
-            ego::DrawableObject::DrawMode::kGBuffer,
+            mode,
             0u);
     }
 
@@ -565,6 +567,31 @@ void ObjectSceneView::drawDecals(
     // elsewhere would be a nasty thing to debug.
     ego::DrawableObject::clearViewerWorldPos();
 
+    cmd_buf->endDynamicRendering();
+}
+
+void ObjectSceneView::clearDeferredTargets(
+    std::shared_ptr<renderer::CommandBuffer> cmd_buf, bool preserve_depth) {
+    er::RenderingAttachmentInfo color;
+    color.image_view = m_color_buffer_->view;
+    color.image_layout = er::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    color.load_op = er::AttachmentLoadOp::CLEAR;
+    color.store_op = er::AttachmentStoreOp::STORE;
+    color.clear_value.color = {{0.3f, 0.3f, 0.3f, 1.0f}};
+    er::RenderingAttachmentInfo depth;
+    depth.image_view = m_depth_buffer_->view;
+    depth.image_layout = er::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depth.load_op = preserve_depth ? er::AttachmentLoadOp::LOAD
+                                  : er::AttachmentLoadOp::CLEAR;
+    depth.store_op = er::AttachmentStoreOp::STORE;
+    depth.clear_value.depth_stencil = {1.0f, 0};
+    er::RenderingInfo info = {};
+    info.render_area_offset = {0, 0};
+    info.render_area_extent = {m_buffer_size_.x, m_buffer_size_.y};
+    info.layer_count = 1;
+    info.color_attachments = {color};
+    info.depth_attachments = {depth};
+    cmd_buf->beginDynamicRendering(info);
     cmd_buf->endDynamicRendering();
 }
 

@@ -2931,12 +2931,12 @@ bool bakeModelToRenderReady(
                     }
                     if (mn.find("_leafmask") != std::string::npos) s.flags |= kSecLeafMask;
                     if (mn.find("clutter_grass")!=std::string::npos || mn.find("clutter_far_")!=std::string::npos)
-                        s.flags |= (treePaletteIndex(mn)<<20) | kSecLeafAge;
+                        s.flags |= packPlantPalette(treePaletteIndex(mn)) | kSecLeafAge;
                     const auto leaf_age = mn.find("_leafage_");
                     if (leaf_age != std::string::npos && leaf_age + 9 < mn.size() &&
-                        mn[leaf_age + 9] >= '0' && mn[leaf_age + 9] <= '3') {
-                        s.flags |= (treePaletteIndex(mn) << 20) | kSecLeafAge |
-                            (uint32_t(mn[leaf_age + 9] - '0') << kSecLeafGroupShift);
+                        mn[leaf_age + 9] >= '0' && mn[leaf_age + 9] <= '7') {
+                        s.flags |= packPlantPalette(treePaletteIndex(mn)) | kSecLeafAge |
+                            packLeafGroup(uint32_t(mn[leaf_age + 9] - '0'));
                     }
                     // Translucency travels as a section flag: the
                     // baked file has no material names or alpha modes

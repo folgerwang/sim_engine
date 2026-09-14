@@ -297,7 +297,9 @@
 #define FEATURE_MATERIAL_LEAF_MASK             0x20000000
 #define FEATURE_MATERIAL_LEAF_AGE              0x04000000
 #define FEATURE_MATERIAL_LEAF_GROUP_SHIFT      27
-#define FEATURE_MATERIAL_LEAF_GROUP_MASK       0x18000000
+#define FEATURE_MATERIAL_LEAF_GROUP_MASK       0x58000000
+#define PACK_LEAF_GROUP(g) ((((g)&3u)<<27) | (((g)&4u)<<28))
+#define UNPACK_LEAF_GROUP(f) ((((f)>>27)&3u) | (((f)>>28)&4u))
 
 #define FEATURE_MATERIAL_DEPTH_SURFACE         0x02000000
 #define FEATURE_MATERIAL_DEPTH_PBR             0x01000000
@@ -1290,7 +1292,7 @@ struct ClusterDrawInfo {
 // Must match the sampler2D array size in cluster_bindless.frag.
 // Bistro has 600+ DDS textures; 256 covers the most common base-colour set
 // without blowing the descriptor pool budget.
-#define MAX_CLUSTER_TEXTURES 256
+#define MAX_CLUSTER_TEXTURES 8192 // foliage albedo + cohort maps for large worlds
 
 // ── RT-shadow skeleton (skinned character) casters ───────────────────
 // Written per frame by ClusterRenderer::updateRtSkeletons after CPU
@@ -1322,7 +1324,9 @@ struct RtSkelHeader {
 #define BINDLESS_MAT_LEAF_MASK 0x00080000
 #define BINDLESS_MAT_LEAF_AGE 0x00010000
 #define BINDLESS_MAT_LEAF_GROUP_SHIFT 17
-#define BINDLESS_MAT_LEAF_GROUP_MASK 0x00060000
+#define BINDLESS_MAT_LEAF_GROUP_MASK 0x40060000
+#define PACK_BINDLESS_LEAF_GROUP(g) ((((g)&3u)<<17) | (((g)&4u)<<28))
+#define UNPACK_BINDLESS_LEAF_GROUP(f) ((((f)>>17)&3u) | (((f)>>28)&4u))
 
 #define BINDLESS_MAT_DEPTH_SURFACE 32  // repeating height, UV relief scale in mr_ao_vt_id
 #define BINDLESS_MAT_DEPTH_PBR     16  // normal binding carries linear ORM-depth, never BC5
@@ -1813,6 +1817,7 @@ struct TileVsPsData {
     vec2    world_map_uv;
     vec3    test_color;
     float   water_depth;
+    float   surface_kind; // tile topology: 0 ground, 1 asphalt, 2 concrete
 };
 
 struct PbrLightsColorInfo {

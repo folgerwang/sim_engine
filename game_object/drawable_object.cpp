@@ -1,3 +1,5 @@
+#include "helper/native_material_key.h"
+#include "helper/cutout_mips.h"
 #include "helper/compact_vertex.h"
 #include "helper/pcg_asset_paths.h"
 #include "helper/pcg_lod.h"
@@ -63,6 +65,7 @@ static uint32_t  s_shadow_plane_count = 0;
 // Defined here rather than beside its accessors because drawMesh (far
 // earlier in this file) increments it.
 static engine::game_object::DrawableObject::DrawStats s_draw_stats;
+static size_t s_leaf_profile_pass = 2;
 static glm::vec4 s_frustum_planes[6];
 
 // ── Per-frame eye position (set by ObjectSceneView::drawDecals) ────────
@@ -130,6 +133,22 @@ static bool      s_shader_nt_variant = false;
 // pre-merge / forward window.  128² keeps foliage-card alpha cutouts
 // legible and cuts that cost 4×.  Returns false when the source is
 // already within max_dim (caller uploads it as-is, no copy).
+static void uploadPreviewMips(
+    const std::shared_ptr<engine::renderer::Device>& device, engine::renderer::Format format,
+    int w,int h,const unsigned char* pixels,
+    std::shared_ptr<engine::renderer::Image>& image,
+    std::shared_ptr<engine::renderer::DeviceMemory>& memory,uint32_t& levels,
+    const std::source_location& source,bool foliage) {
+    if(!foliage) {
+        engine::renderer::Helper::create2DTextureImageWithMips(device,format,w,h,pixels,image,memory,levels,source);
+        return;
+    }
+    auto chain=engine::helper::cutoutMipChain(pixels,w,h);
+    levels=chain.levels;
+    engine::renderer::Helper::create2DTextureImage(device,format,w,h,int(levels),
+        chain.pixels.size(),chain.pixels.data(),image,memory,source);
+}
+
 static bool downscalePreviewPixels(
     const std::vector<unsigned char>& src, int sw, int sh, int max_dim,
     std::vector<unsigned char>& out, int& ow, int& oh) {
@@ -848,11 +867,11 @@ static void setupMeshState(
             }
             const auto leaf_age = dst_material.name_.find("_leafage_");
             if (leaf_age != std::string::npos && leaf_age + 9 < dst_material.name_.size() &&
-                dst_material.name_[leaf_age + 9] >= '0' && dst_material.name_[leaf_age + 9] <= '3')
+                dst_material.name_[leaf_age + 9] >= '0' && dst_material.name_[leaf_age + 9] <= '7')
             {
                 dst_material.leaf_age_group_ = int(dst_material.name_[leaf_age + 9] - '0');
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
-                    (uint32_t(dst_material.leaf_age_group_) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+                    PACK_LEAF_GROUP(uint32_t(dst_material.leaf_age_group_));
             }
             const auto depth_surface = dst_material.name_.find("_depthsurface_");
             if (depth_surface != std::string::npos) {
@@ -1290,6 +1309,11 @@ static void setupMesh(
         ego::PrimitiveInfo primitive_info;
         primitive_info.tag_.restart_enable = false;
         primitive_info.tag_.double_sided = model.materials[primitive.material].doubleSided;
+        const auto& leaf_material = model.materials[primitive.material].name;
+        if (leaf_material.find("_leaf") != std::string::npos ||
+            leaf_material.find("foliage") != std::string::npos ||
+            leaf_material.find("spray") != std::string::npos)
+            primitive_info.tag_.double_sided = true;
         primitive_info.material_idx_ = primitive.material;
 
         auto mode = renderer::PrimitiveTopology::MAX_ENUM;
@@ -3315,13 +3339,12 @@ static void parsePlantLodBands(
             static_cast<double>(ti) * static_cast<double>(tile_m));
         node.lod_lz0_ = static_cast<float>(
             static_cast<double>(tj) * static_cast<double>(tile_m));
-        // Ground cover switches bands per INSTANCE in the shader (see
-        // lod_per_instance_ in the header): its 20-40 m bands on 256 m
-        // tiles made the per-node rect test flip whole tiles at once.
-        // Scoped to the "ground" category for now — trees/houses keep
-        // the node-tile path (their tiles are fine-grained per band).
-        node.lod_per_instance_ =
-            (lodCategoryOf(node.name_) == "ground") ? 1 : 0;
+        // Vegetation batches share a 512 m tile across every LOD. A
+        // tile-distance pick promoted the entire tile to 0-20 m leaves.
+        // The tile test is conservative; vertex/depth paths pick the
+        // same half-open band from each plant's world-space root.
+        node.lod_per_instance_ = engine::helper::pcgLodUsesInstanceDistance(
+            lodCategoryOf(node.name_)) ? 1 : 0;
         // House bands are named "<sample>_<band>_lodtile_..." — the
         // "int" band IS the room shell (walls seen from inside, floors,
         // door leaves).  Marking it interior is what lets the forward
@@ -4797,6 +4820,13 @@ static inline size_t getDepthonlyHashForMaterial(
             ? kDepthonlyHashOpaqueBit : size_t(0));
 }
 
+static bool profileLeafPrimitive(const ego::PrimitiveInfo& prim,
+                                 const std::vector<ego::MaterialInfo>& materials) {
+    return prim.material_idx_ >= 0 && prim.material_idx_ < int(materials.size()) &&
+        (materials[prim.material_idx_].leaf_age_group_ >= 0 ||
+         isLeafDepthPrimitive(prim, materials));
+}
+
 static void drawMesh(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const std::shared_ptr<ego::DrawableData>& drawable_object,
@@ -5088,32 +5118,16 @@ static void drawMesh(
             : isPrepassPrimitive(prim, drawable_object->materials_))) {
             continue;
         }
-        // ── Deferred-covered prim skip (main forward pass only) ──────
-        // See setMainForwardCoveredSkip.  MODEL_FLAG_DEFERRED_RELIGHT
-        // already encodes "relight armed AND node not skinned"; the two
-        // model fields below are the node's dissolve state — a node
-        // mid-cross-fade (lod_fade != 0) or on a per-instance band
-        // (ilod bits in model_params_pad0) must keep drawing forward,
-        // because the prepass skipped its depth and its screen-door
-        // coverage only exists in base.frag/base.vert.  Skinned or
-        // material-less prims inside an otherwise covered node also
-        // keep drawing — the G-buffer has no permutation for them.
+        // The G-buffer writes depth and runs the same alpha/season/LOD
+        // discard shader, so all supported opaque and masked primitives
+        // have one raster owner, including fading vegetation.
         if (s_forward_covered_skip_active &&
             (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
             prim.material_idx_ >= 0 &&
+            prim.material_idx_ < int(drawable_object->materials_.size()) &&
             !prim.tag_.has_skin_set_0 &&
-            // Only prims the OPAQUE-ONLY prepass actually stamped depth
-            // for.  Masked foliage keeps drawing forward (its depth and
-            // screen-door coverage live there); the relight fast path
-            // in base.frag keeps that draw cheap.
-            (model_params.flip_uv_coord & MODEL_FLAG_PREPASS_OCCLUDER) != 0u &&
-            isPrepassPrimitive(prim, drawable_object->materials_)) {
-            uint32_t ilod_bits = 0u;
-            std::memcpy(&ilod_bits, &model_params.model_params_pad0,
-                        sizeof(ilod_bits));
-            if (model_params.lod_fade == 0.0f && ilod_bits == 0u) {
-                continue;
-            }
+            drawable_object->materials_[prim.material_idx_].alpha_mode_ != ego::AlphaMode::Blend) {
+            continue;
         }
         const auto& attrib_list = prim.attribute_descs_;
         if (!depth_only &&
@@ -5205,6 +5219,8 @@ static void drawMesh(
 
             // Task shader amplifies (1,1,1) → CSM_CASCADE_COUNT mesh WGs.
             cmd_buf->drawMeshTasks(1u, 1u, 1u);
+            if (profileLeafPrimitive(prim, drawable_object->materials_))
+                ++s_draw_stats.leaf_draws[s_leaf_profile_pass];
             if (!depth_only &&
                 (drawable_object->m_debug_force_red_ ||
                  drawable_object->m_debug_log_draws_)) {
@@ -5406,6 +5422,8 @@ static void drawMesh(
         // list and skips primitives with no pipeline, so a counter would
         // drift off the commands the fill wrote.
         ++s_draw_stats.prims;
+        if (profileLeafPrimitive(prim, drawable_object->materials_))
+            ++s_draw_stats.leaf_draws[s_leaf_profile_pass];
         cmd_buf->drawIndexedIndirect(
             drawable_object->indirect_draw_cmd_,
             node_cmd_ofs >= 0
@@ -5865,7 +5883,7 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     // Glass-attribute permutation (DrawMode::kGlassAttr): fragment
     // stage only, base_frag_*_GLASS.  Mutually exclusive with both
     // flags above.
-    bool is_glass = false) {
+    bool is_glass = false, bool is_coverage = false) {
     renderer::ShaderModuleList shader_modules(2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "") +
         (has_tangent ? "_TN" : (has_normals ? "_N" : ""));
@@ -5892,6 +5910,7 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     }
     // Appended in the same position _DECAL occupies (after _DS):
     // CompileShaders.cmake registers base_frag<layout>[_DS]_GBUF.spv.
+    if (is_coverage) frag_feature_str += "_COVERAGE";
     if (is_gbuffer) {
         frag_feature_str += "_GBUF";
     }
@@ -6181,14 +6200,21 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDecalPipeline(
 // G-buffer re-rasterise pipeline (DrawMode::kGBuffer).  Fixed-function
 // state mirrors TerrainSceneView::initGbufferPipeline: one no-blend
 // attachment per G-buffer RT, depth test LESS_OR_EQUAL against the depth
-// the forward pass stamped this frame, depth writes OFF — the pass adds
-// material attributes only where the drawable is the visible surface.
+// existing scene depth, with depth writes ON. This pass owns opaque and
+// masked drawable coverage, including seasonal and LOD alpha discard.
+static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> s_coverage_pipeline_list;
+
 static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats& gbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const ego::PrimitiveInfo& primitive) {
+    const ego::PrimitiveInfo& primitive, bool coverage_only = false) {
+    if (!coverage_only && !s_shader_nt_variant) {
+        s_coverage_pipeline_list[primitive.getHash()] = createDrawableGbufferPipeline(
+            device, gbuffer_formats, pipeline_layout, graphic_pipeline_info,
+            primitive, true);
+    }
     auto shader_modules = getDrawableShaderModules(
         device,
         primitive.tag_.quantized_position,
@@ -6200,7 +6226,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
         primitive.tag_.double_sided,
         primitive.tag_.has_skin_set_1,
         /*is_decal*/ false,
-        /*is_gbuffer*/ true);
+        /*is_gbuffer*/ !coverage_only, false, coverage_only);
 
     // Function-local statics for the same lifetime reason the decal
     // states are static: GraphicPipelineInfo holds shared_ptrs.
@@ -6216,12 +6242,24 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
             renderer::helper::fillPipelineDepthStencilStateCreateInfo(
                 /*depth_test_enable*/ true,
                 /*depth_write_enable*/ false,
-                renderer::CompareOp::LESS_OR_EQUAL));
+                renderer::CompareOp::EQUAL));
 
     renderer::GraphicPipelineInfo gbuf_pipeline_info = graphic_pipeline_info;
     gbuf_pipeline_info.blend_state_info = s_gbuf_blend_state_info;
     gbuf_pipeline_info.depth_stencil_info = s_gbuf_depth_stencil_info;
 
+    auto pass_formats = gbuffer_formats;
+    if (coverage_only) {
+        pass_formats.color_formats.clear();
+        gbuf_pipeline_info.depth_stencil_info =
+            std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+                renderer::helper::fillPipelineDepthStencilStateCreateInfo(
+                    true, true, renderer::CompareOp::LESS_OR_EQUAL));
+        gbuf_pipeline_info.blend_state_info =
+            std::make_shared<renderer::PipelineColorBlendStateCreateInfo>(
+                renderer::helper::fillPipelineColorBlendStateCreateInfo(
+                    std::vector<renderer::PipelineColorBlendAttachmentState>{}));
+    }
     renderer::PipelineInputAssemblyStateCreateInfo topology_info;
     topology_info.restart_enable = primitive.tag_.restart_enable;
     topology_info.topology = static_cast<renderer::PrimitiveTopology>(primitive.tag_.topology);
@@ -6270,7 +6308,7 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
         topology_info,
         gbuf_pipeline_info,
         shader_modules,
-        gbuffer_formats,
+        pass_formats,
         rasterization_state_override,
         std::source_location::current());
 }
@@ -8083,9 +8121,8 @@ static void ntBuildTables(
             uint32_t f = 0u;
             if (is_blend) f |= NT_PRIM_BLEND;
             if (isPrepassPrimitive(prim, object_->materials_)) f |= NT_PRIM_OPAQUE;
-            // Mirrors drawMesh's covered-prim predicate: opaque,
-            // non-skinned, with a material.
-            if (has_mat && !prim.tag_.has_skin_set_0 && isPrepassPrimitive(prim, object_->materials_)) {
+            // Mirrors drawMesh: non-blended, non-skinned, with a material.
+            if (has_mat && !prim.tag_.has_skin_set_0 && !is_blend) {
                 f |= NT_PRIM_COVERABLE;
             }
             nt.gp_mesh.push_back(uint32_t(mi));
@@ -8715,15 +8752,10 @@ DrawableObject::DrawableObject(
                 }
 
                 {
-                    // G-buffer pipeline (DrawMode::kGBuffer) — deferred
-                    // re-rasterise of this primitive.  Skinned layouts
-                    // and material-less primitives are skipped: no
-                    // _GBUF permutation exists for them (see
-                    // CompileShaders.cmake), and skinned world
-                    // velocity would be wrong anyway.
-                    if (gbuffer_formats_valid_ &&
-                        !primitive.tag_.has_skin_set_0 &&
-                        primitive.material_idx_ >= 0) {
+                    // G-buffer owns opaque/masked draws. Skinned vertex shaders
+                    // share the fragment interface; material-less layouts
+                    // use the neutral deferred fallback.
+                    if (gbuffer_formats_valid_) {
                         auto hash_value = primitive.getHash();
                         auto result =
                             drawable_gbuffer_pipeline_list_.find(hash_value);
@@ -8782,8 +8814,7 @@ DrawableObject::DrawableObject(
                     // Skip rules follow the plain G-buffer list, not the
                     // forward decal list above: the _DECAL_GBUF matrix has
                     // no _NOMTL and no skinned permutations.
-                    if (gbuffer_formats_valid_ &&
-                        !primitive.tag_.has_skin_set_0 &&
+                    if (gbuffer_formats_valid_ && !primitive.tag_.has_skin_set_0 &&
                         primitive.material_idx_ >= 0) {
                         auto dg_result =
                             drawable_decal_gbuffer_pipeline_list_.find(hash_value);
@@ -9141,9 +9172,7 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                     }
                     {
                         // G-buffer pipeline — see the sync ctor.
-                        if (gbuffer_formats_valid_ &&
-                            !primitive.tag_.has_skin_set_0 &&
-                            primitive.material_idx_ >= 0) {
+                        if (gbuffer_formats_valid_) {
                             auto hash_value = primitive.getHash();
                             auto result =
                                 drawable_gbuffer_pipeline_list_.find(
@@ -9193,9 +9222,8 @@ std::shared_ptr<DrawableObject> DrawableObject::createAsync(
                                     primitive);
                         }
                         // Deferred variant — G-buffer skip rules.
-                        if (gbuffer_formats_valid_ &&
-                            !primitive.tag_.has_skin_set_0 &&
-                            primitive.material_idx_ >= 0) {
+                        if (gbuffer_formats_valid_ && !primitive.tag_.has_skin_set_0 &&
+                        primitive.material_idx_ >= 0) {
                             auto dg_result =
                                 drawable_decal_gbuffer_pipeline_list_.find(
                                     hash_value);
@@ -9788,6 +9816,8 @@ void DrawableObject::recreateStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_gbuffer_pipeline_list_.clear();
+    for (auto& entry : s_coverage_pipeline_list) device->destroyPipeline(entry.second);
+    s_coverage_pipeline_list.clear();
     for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -9834,8 +9864,7 @@ void DrawableObject::recreateStaticMembers(
                             primitive);
                 }
                 // Deferred variant — G-buffer skip rules.
-                if (gbuffer_formats_valid_ &&
-                    !primitive.tag_.has_skin_set_0 &&
+                if (gbuffer_formats_valid_ && !primitive.tag_.has_skin_set_0 &&
                     primitive.material_idx_ >= 0) {
                     auto decal_gbuf_result =
                         drawable_decal_gbuffer_pipeline_list_.find(hash_value);
@@ -9851,9 +9880,7 @@ void DrawableObject::recreateStaticMembers(
                     }
                 }
                 // G-buffer pipeline — see the sync ctor for the skip rules.
-                if (gbuffer_formats_valid_ &&
-                    !primitive.tag_.has_skin_set_0 &&
-                    primitive.material_idx_ >= 0) {
+                if (gbuffer_formats_valid_) {
                     auto gbuf_result =
                         drawable_gbuffer_pipeline_list_.find(hash_value);
                     if (gbuf_result == drawable_gbuffer_pipeline_list_.end()) {
@@ -10036,6 +10063,8 @@ void DrawableObject::destroyStaticMembers(
         device->destroyPipeline(pipeline.second);
     }
     drawable_gbuffer_pipeline_list_.clear();
+    for (auto& entry : s_coverage_pipeline_list) device->destroyPipeline(entry.second);
+    s_coverage_pipeline_list.clear();
     for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -10430,11 +10459,9 @@ static void buildMeshNodeFlatList(
                     object_->materials_[prim.material_idx_]
                             .alpha_mode_ == ego::AlphaMode::Blend;
                 if (is_blend) f |= DrawableData::kMeshHasBlend;
-                // Mirrors drawMesh's covered-prim predicate:
-                // opaque, non-skinned, with a material.
+                // Mirrors drawMesh: non-blended, non-skinned, with a material.
                 const bool coverable =
-                    has_mat && !prim.tag_.has_skin_set_0 &&
-                    isPrepassPrimitive(prim, object_->materials_);
+                    has_mat && !prim.tag_.has_skin_set_0 && !is_blend;
                 if (!coverable) f |= DrawableData::kMeshHasUncoverable;
             }
             mpf[mi_i] = f;
@@ -10733,6 +10760,7 @@ void DrawableObject::drawSortedDepthPrepass(
         }
     }
     std::stable_sort(items.begin(), items.end(), [](const Item& a,const Item& b) { return a.distance < b.distance; });
+    s_leaf_profile_pass = 0;
     s_depth_prepass_pass = true;
     s_leaf_depth_prepass = leaves_only;
     s_forward_covered_skip_active = false;
@@ -10938,6 +10966,10 @@ void DrawableObject::draw(
     // a caller cannot silently demote a decal draw into the shadow list;
     // the decal pass never wants a depth-only pipeline.
     s_depth_prepass_pass = (draw_mode == DrawMode::kDepthPrepass);
+    s_leaf_profile_pass = (draw_mode == DrawMode::kCoveragePrepass || draw_mode == DrawMode::kDepthPrepass) ? 0 :
+        draw_mode == DrawMode::kGBuffer ? 1 :
+        (depth_only || draw_mode == DrawMode::kShadow || draw_mode == DrawMode::kCsmLayered ||
+         draw_mode == DrawMode::kCsmPerCascade || draw_mode == DrawMode::kCsmMeshShader) ? 3 : 2;
     s_forward_covered_skip_active =
         s_fwd_covered_window && (draw_mode == DrawMode::kForward);
     auto& pipeline_list =
@@ -10947,6 +10979,7 @@ void DrawableObject::draw(
         (draw_mode == DrawMode::kCsmMeshShader) ? drawable_csm_mesh_shader_pipeline_list_ :
         (draw_mode == DrawMode::kDecal)         ? drawable_decal_pipeline_list_           :
         (draw_mode == DrawMode::kDecalGBuffer)  ? drawable_decal_gbuffer_pipeline_list_   :
+        (draw_mode == DrawMode::kCoveragePrepass) ? s_coverage_pipeline_list :
         (draw_mode == DrawMode::kGBuffer)       ? drawable_gbuffer_pipeline_list_         :
         (draw_mode == DrawMode::kGlassAttr)     ? drawable_glass_pipeline_list_           :
         depth_only                              ? drawable_shadow_pipeline_list_           :
@@ -11426,6 +11459,7 @@ bool DrawableObject::ntEligible(DrawMode draw_mode) const {
         case DrawMode::kCsmLayered:
         case DrawMode::kCsmPerCascade:
             return true;
+        case DrawMode::kCoveragePrepass:
         case DrawMode::kGBuffer:
             return gbuffer_formats_valid_;
         default:
@@ -11668,6 +11702,7 @@ void DrawableObject::ntDraw(
     switch (draw_mode) {
         case DrawMode::kForward:       pass = kNtPassForward;       break;
         case DrawMode::kGBuffer:       pass = kNtPassGBuffer;       break;
+        case DrawMode::kCoveragePrepass: pass = kNtPassCoverage; break;
         case DrawMode::kGlassAttr:     pass = kNtPassGlass;         break;
         case DrawMode::kDepthPrepass:  pass = kNtPassDepthPrepass;  break;
         case DrawMode::kShadow:        pass = kNtPassShadow;        break;
@@ -11694,12 +11729,13 @@ void DrawableObject::ntDraw(
                         device, nt_formats_forward_, drawable_pipeline_layout_,
                         nt_graphic_pipeline_info_, prim);
                     break;
+                case kNtPassCoverage:
                 case kNtPassGBuffer:
-                    if (gbuffer_formats_valid_ && has_mat) {
+                    if (gbuffer_formats_valid_) {
                         p = createDrawableGbufferPipeline(
                             device, gbuffer_renderbuffer_formats_,
                             drawable_pipeline_layout_,
-                            nt_graphic_pipeline_info_, prim);
+                            nt_graphic_pipeline_info_, prim, pass == kNtPassCoverage);
                     }
                     break;
                 case kNtPassGlass:
@@ -11864,6 +11900,10 @@ void DrawableObject::ntDraw(
             sizeof(renderer::DrawIndexedIndirectCommand));
         ++s_draw_stats.nt_draws;
         ++s_draw_stats.prims;
+        if (profileLeafPrimitive(prim, materials)) {
+            ++s_draw_stats.leaf_batches[s_leaf_profile_pass];
+            s_draw_stats.leaf_command_capacity[s_leaf_profile_pass] += pb.y;
+        }
         ++nt.stat_draws;
     }
 }
@@ -12578,11 +12618,15 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             const bool scaled=downscalePreviewPixels(tb.preview_rgba,
                 tb.preview_w,tb.preview_h,128,small,w,h);
             uint32_t mips=1;
-            renderer::Helper::create2DTextureImageWithMips(device,
+            uploadPreviewMips(device,
                 renderer::Format::R8G8B8A8_UNORM,
                 scaled?w:tb.preview_w,scaled?h:tb.preview_h,
                 scaled?small.data():tb.preview_rgba.data(),dst.image,dst.memory,
-                mips,std::source_location::current());
+                mips,std::source_location::current(),
+                    std::any_of(md.sections.begin(),md.sections.end(),[ti](const auto& section) {
+                        return section.tex_index==int(ti) &&
+                            (section.flags & (engine::helper::kSecLeafMask | engine::helper::kSecLeafAge))!=0;
+                    }));
             dst.view=device->createImageView(dst.image,
                 renderer::ImageViewType::VIEW_2D,renderer::Format::R8G8B8A8_UNORM,
                 SET_FLAG_BIT(ImageAspect,COLOR_BIT),std::source_location::current(),0,mips);
@@ -12683,7 +12727,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             dst_material.name_ += "_leafmask";
         }
         if ((sec.flags & engine::helper::kSecLeafAge) != 0) {
-                dst_material.leaf_age_group_ = int((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u);
+                dst_material.leaf_age_group_ = int(engine::helper::unpackLeafGroup(sec.flags));
                 dst_material.alpha_mode_ = ego::AlphaMode::Mask;
                 dst_material.alpha_mask_ = true;
                 dst_material.effective_opaque_ = false;
@@ -12691,7 +12735,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
                 ubo.alpha_cutoff = 0.09f;
                 ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
-                    (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+                    PACK_LEAF_GROUP(engine::helper::unpackLeafGroup(sec.flags));
             }
             if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
@@ -12716,8 +12760,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         // the flat section colour; the cluster pass samples the VT pool.
         ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
 
-        ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
-        ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
+        ubo.pad_3 = engine::helper::unpackPlantPalette(sec.flags);
         device->updateBufferMemory(
             dst_material.uniform_buffer_.memory, sizeof(ubo), &ubo);
 
@@ -12840,7 +12883,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             renderer::PrimitiveTopology::TRIANGLE_LIST);
         primitive_info.tag_.has_texcoord_0 = true;
         primitive_info.tag_.has_normal = true;
-        primitive_info.tag_.double_sided = false;
+        primitive_info.tag_.double_sided = (sec.flags & (engine::helper::kSecLeafAge | engine::helper::kSecLeafMask)) != 0;
 
         uint32_t dst_binding = 0;
         engine::renderer::VertexInputBindingDescription binding = {};
@@ -13184,6 +13227,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
 
     // Per-character VT texture cache (canonical .rwtex path → TextureInfo).
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
+    std::unordered_map<std::string, int32_t> native_materials;
     // Which texture slots carry a real cutout alpha (baked alpha plane,
     // or legacy full-res preview with any translucent texel).  Drives
     // alpha_mask_ below: blanket-masking EVERY placed material sent 100%
@@ -13540,7 +13584,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 // distant foliage shimmers/aliases.  The shared
                 // texture_sampler_ already has maxLod=1024.
                 uint32_t preview_mips = 1;
-                renderer::Helper::create2DTextureImageWithMips(
+                uploadPreviewMips(
                     device,
                     renderer::Format::R8G8B8A8_UNORM,
                     scaled ? ds_w : tb.preview_w,
@@ -13549,7 +13593,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                     dst.image,
                     dst.memory,
                     preview_mips,
-                    std::source_location::current());
+                    std::source_location::current(),
+                    std::any_of(md.sections.begin(),md.sections.end(),[ti](const auto& section) {
+                        return section.tex_index==int(ti) &&
+                            (section.flags & (engine::helper::kSecLeafMask | engine::helper::kSecLeafAge))!=0;
+                    }));
                 dst.view = device->createImageView(
                     dst.image,
                     renderer::ImageViewType::VIEW_2D,
@@ -13565,11 +13613,17 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
         }
 
         // Materials (one per section), global texture indices.
-        const size_t mat_base = drawable_object->materials_.size();
-        drawable_object->materials_.resize(mat_base + md.sections.size());
+        std::vector<int32_t> section_materials(md.sections.size());
         for (size_t si = 0; si < md.sections.size(); ++si) {
             const auto& sec = md.sections[si];
-            auto& mat = drawable_object->materials_[mat_base + si];
+            auto key=engine::helper::nativeMaterialKey(sec,drawable_object->textures_,tex_base);
+            const auto found=native_materials.find(key);
+            if(found!=native_materials.end()) {section_materials[si]=found->second; continue;}
+            const int32_t material_index=int32_t(drawable_object->materials_.size());
+            section_materials[si]=material_index;
+            native_materials.emplace(std::move(key),material_index);
+            drawable_object->materials_.emplace_back();
+            auto& mat = drawable_object->materials_.back();
             mat.name_ = ref_name + "_o" + std::to_string(ordinal) + "_s" +
                         std::to_string(si);
             if (sec.tex_index >= 0)
@@ -13602,7 +13656,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             // depth write, "over" blend) where base_color.a is the
             // transmission.  The native path had only Opaque/Mask, so
             // every pane was baked solid and painted the sky's colour.
-            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+            if (engine::helper::sectionIsBlend(sec.flags)) {
                 mat.alpha_mode_ = ego::AlphaMode::Blend;
                 mat.effective_opaque_ = false;
                 mat.glass_forced_ = true;
@@ -13661,7 +13715,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             mat.name_ += "_leafmask";
         }
         if ((sec.flags & engine::helper::kSecLeafAge) != 0) {
-                mat.leaf_age_group_ = int((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u);
+                mat.leaf_age_group_ = int(engine::helper::unpackLeafGroup(sec.flags));
                 mat.alpha_mode_ = ego::AlphaMode::Mask;
                 mat.alpha_mask_ = true;
                 mat.effective_opaque_ = false;
@@ -13669,7 +13723,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 ubo.alpha_cutoff = 0.09f;
                 ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
-                    (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+                    PACK_LEAF_GROUP(engine::helper::unpackLeafGroup(sec.flags));
             }
             if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
@@ -13694,11 +13748,10 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             // shader dispatches on this bit to keep the pane's alpha
             // through its cutout branch -- same bit the glTF loader
             // raises for its Blend materials.
-            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+            if (engine::helper::sectionIsBlend(sec.flags)) {
                 ubo.material_features |= FEATURE_MATERIAL_BLEND;
             }
-            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
-            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
+            ubo.pad_3 = engine::helper::unpackPlantPalette(sec.flags);
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
             // ECS dedup identity — baked character sections.
@@ -13721,12 +13774,12 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             const auto& sec = md.sections[si];
             auto& prim = mesh.primitives_[si];
             prim.tag_.restart_enable = false;
-            prim.material_idx_ = (int32_t)(mat_base + si);
+            prim.material_idx_ = section_materials[si];
             prim.tag_.topology =
                 (uint32_t)renderer::PrimitiveTopology::TRIANGLE_LIST;
             prim.tag_.has_texcoord_0 = true;
             prim.tag_.has_normal = true;
-            prim.tag_.double_sided = false;
+            prim.tag_.double_sided = (sec.flags & (engine::helper::kSecLeafAge | engine::helper::kSecLeafMask)) != 0;
             prim.tag_.has_skin_set_0 = skinned;
             prim.tag_.has_skin_set_1 = skinned8;   // 8-bone debug path
 
@@ -14089,6 +14142,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     };
 
     std::unordered_map<std::string, renderer::TextureInfo> tex_gpu_cache;
+    std::unordered_map<std::string, int32_t> native_materials;
     // Which texture slots carry a real cutout alpha (baked alpha plane,
     // or legacy full-res preview with any translucent texel).  Drives
     // alpha_mask_ below: blanket-masking EVERY placed material sent 100%
@@ -14338,7 +14392,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 // distant foliage shimmers/aliases.  The shared
                 // texture_sampler_ already has maxLod=1024.
                 uint32_t preview_mips = 1;
-                renderer::Helper::create2DTextureImageWithMips(
+                uploadPreviewMips(
                     device,
                     renderer::Format::R8G8B8A8_UNORM,
                     scaled ? ds_w : tb.preview_w,
@@ -14347,7 +14401,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                     dst.image,
                     dst.memory,
                     preview_mips,
-                    std::source_location::current());
+                    std::source_location::current(),
+                    std::any_of(md.sections.begin(),md.sections.end(),[ti](const auto& section) {
+                        return section.tex_index==int(ti) &&
+                            (section.flags & (engine::helper::kSecLeafMask | engine::helper::kSecLeafAge))!=0;
+                    }));
                 dst.view = device->createImageView(
                     dst.image,
                     renderer::ImageViewType::VIEW_2D,
@@ -14363,11 +14421,17 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         }
 
         // Materials (one per section).
-        const size_t mat_base = drawable_object->materials_.size();
-        drawable_object->materials_.resize(mat_base + num_sections);
+        std::vector<int32_t> section_materials(num_sections);
         for (size_t si = 0; si < num_sections; ++si) {
             const auto& sec = md.sections[si];
-            auto& mat = drawable_object->materials_[mat_base + si];
+            auto key=engine::helper::nativeMaterialKey(sec,drawable_object->textures_,tex_base);
+            const auto found=native_materials.find(key);
+            if(found!=native_materials.end()) {section_materials[si]=found->second; continue;}
+            const int32_t material_index=int32_t(drawable_object->materials_.size());
+            section_materials[si]=material_index;
+            native_materials.emplace(std::move(key),material_index);
+            drawable_object->materials_.emplace_back();
+            auto& mat = drawable_object->materials_.back();
             mat.name_ = ref_name + "_o" + std::to_string(ordinal) + "_s" +
                         std::to_string(si);
             if (sec.tex_index >= 0)
@@ -14400,7 +14464,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             // depth write, "over" blend) where base_color.a is the
             // transmission.  The native path had only Opaque/Mask, so
             // every pane was baked solid and painted the sky's colour.
-            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+            if (engine::helper::sectionIsBlend(sec.flags)) {
                 mat.alpha_mode_ = ego::AlphaMode::Blend;
                 mat.effective_opaque_ = false;
                 mat.glass_forced_ = true;
@@ -14459,7 +14523,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             mat.name_ += "_leafmask";
         }
         if ((sec.flags & engine::helper::kSecLeafAge) != 0) {
-                mat.leaf_age_group_ = int((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u);
+                mat.leaf_age_group_ = int(engine::helper::unpackLeafGroup(sec.flags));
                 mat.alpha_mode_ = ego::AlphaMode::Mask;
                 mat.alpha_mask_ = true;
                 mat.effective_opaque_ = false;
@@ -14467,7 +14531,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 ubo.alpha_cutoff = 0.09f;
                 ubo.material_features |= FEATURE_MATERIAL_ALPHA_MASK;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE |
-                    (((sec.flags >> engine::helper::kSecLeafGroupShift) & 3u) << FEATURE_MATERIAL_LEAF_GROUP_SHIFT);
+                    PACK_LEAF_GROUP(engine::helper::unpackLeafGroup(sec.flags));
             }
             if ((sec.flags & engine::helper::kSecDepthPbr) != 0) {
             ubo.material_features |= FEATURE_MATERIAL_DEPTH_PBR;
@@ -14492,11 +14556,10 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             // shader dispatches on this bit to keep the pane's alpha
             // through its cutout branch -- same bit the glTF loader
             // raises for its Blend materials.
-            if ((sec.flags & engine::helper::kSecBlend) != 0) {
+            if (engine::helper::sectionIsBlend(sec.flags)) {
                 ubo.material_features |= FEATURE_MATERIAL_BLEND;
             }
-            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
-            ubo.pad_3 = (sec.flags & engine::helper::kSecLeafAge) ? ((sec.flags >> 20) & 1023u) : 0u;
+            ubo.pad_3 = engine::helper::unpackPlantPalette(sec.flags);
             device->updateBufferMemory(mat.uniform_buffer_.memory,
                                        sizeof(ubo), &ubo);
             captureMaterialDesc(
@@ -14555,7 +14618,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             }
             auto& prim = mesh.primitives_[ai];
             prim.tag_.restart_enable = false;
-            prim.material_idx_ = (int32_t)(mat_base + si);
+            prim.material_idx_ = section_materials[si];
             prim.tag_.topology =
                 (uint32_t)renderer::PrimitiveTopology::TRIANGLE_LIST;
             prim.tag_.has_texcoord_0 = true;

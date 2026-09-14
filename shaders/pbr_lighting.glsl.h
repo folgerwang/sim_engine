@@ -281,7 +281,7 @@ vec4 getBaseColor(
     }
     else if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
         baseColor = leafAgedColor(baseColor,
-            (in_mat.material_features >> FEATURE_MATERIAL_LEAF_GROUP_SHIFT) & 3u,
+            UNPACK_LEAF_GROUP(in_mat.material_features),
             camera_info.global_leaf_age, in_mat.pad_3, in_data.vertex_tree_age_base);
     // ── Snow cover ───────────────────────────────────────────────────
     // RGB ONLY.  baseColor.a is the foliage cutout the alpha-mask test

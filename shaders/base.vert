@@ -301,8 +301,8 @@ void main() {
     {
         uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
         if (ilod_bits != 0u) {
-            vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,
-                               in_loc_rot_mat_2.w);
+            vec3 inst_t = (model_params.model_mat * vec4(in_loc_rot_mat_0.w,
+                in_loc_rot_mat_1.w, in_loc_rot_mat_2.w, 1.0)).xyz;
             float ilod_d = distance(inst_t.xz, camera_info.position.xz);
             float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
             float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;

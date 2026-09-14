@@ -8,7 +8,18 @@ vec4 leafAgedColor(vec4 color, uint group, float seasonTime, uint profile, float
     uint mode=treePalette_seasonMode[profile];
     float phase=plantSeasonPhase(seasonTime,timingSeed,group);
     if(mode==2u) return vec4(grassSeasonColor(color.rgb,seasonTime),color.a);
-    if(mode==1u) return vec4(color.rgb*mix(vec3(1),vec3(.85,.92,.88),plantSeasonDormancy(phase)),color.a);
+    if(mode==1u) {
+        // Evergreen needles stay attached, but still follow the year:
+        // fresh spring green, summer green, subtle species-specific autumn
+        // bronzing and cooler winter foliage. Alpha is never changed.
+        float spring=smoothstep(0.,.08,phase)*(1.-smoothstep(.16,.30,phase));
+        float autumn=smoothstep(.40,.55,phase)*(1.-smoothstep(.72,.85,phase));
+        vec3 tinted=color.rgb*mix(vec3(1),vec3(.85,.92,.88),plantSeasonDormancy(phase));
+        tinted*=mix(vec3(1),vec3(1.04,1.12,.88),spring);
+        vec3 target=treePalette_aging[profile];
+        target*=dot(color.rgb,vec3(.2126,.7152,.0722))/max(dot(target,vec3(.2126,.7152,.0722)),.01);
+        return vec4(mix(tinted,target,.12*autumn),color.a);
+    }
     float coverage=plantSeasonCoverage(phase);
     // Each year's newborn starts at baby color, then reaches its cohort's
     // authored initial color; autumn coloring starts only after maturation.
@@ -21,6 +32,6 @@ vec4 leafAgedColor(vec4 color, uint group, float seasonTime, uint profile, float
 }
 vec4 leafAgedColor(vec4 c,uint g,float t,uint p) {return leafAgedColor(c,g,t,p,0.);}
 vec4 leafAgedColor(vec4 c,uint g,float t) {return leafAgedColor(c,g,t,0u,0.);}
-uint leafMaskGroup(float code) {return min(uint(clamp(code,0.,1.)*4.),3u);}
+uint leafMaskGroup(float code) {return min(uint(clamp(code,0.,1.)*8.),7u);}
 float leafMaskCoverage(float code,float t) {return plantSeasonCoverage(plantSeasonPhase(t,0.,leafMaskGroup(code)));}
 #endif

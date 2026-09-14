@@ -1193,6 +1193,18 @@ void main() {
     mat_rough = clamp(mix(mat_rough, bounded_rough + g_field * 0.07f,
                           surf_rough_w), 0.75f, 1.0f);
 
+    // Pavement belongs to this tile's own topology. Its depth and material
+    // are emitted together; it never waits for a separate road drawable.
+    if (in_data.surface_kind > 0.5) {
+        float grain = fract(sin(dot(floor(pos.xz * 18.0), vec2(12.9898,78.233))) * 43758.5453);
+        bool concrete = in_data.surface_kind > 1.5;
+        albedo = (concrete ? vec3(0.52,0.50,0.46) : vec3(0.105,0.11,0.115))
+                   * (0.94 + 0.12 * grain);
+        mat_rough = concrete ? 0.88 : 0.94;
+        surf_ao = 1.0;
+        normal = geom_normal;
+    }
+
 #ifdef GBUFFER_OUTPUT
     // Deferred path: write material attributes and stop.  Lighting (sun +
     // CSM / raytraced shadows + RT-AO) runs once per pixel in

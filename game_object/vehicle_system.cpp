@@ -11,6 +11,7 @@
 
 #include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp
 #include "helper/engine_helper.h"
+#include "helper/junction_control.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
 
@@ -48,8 +49,6 @@ constexpr float kStopLineM = 5.0f;         // the stop line, before the node
 constexpr float kStopWaitS = 1.0f;         // a stop sign: stand this long
 constexpr float kCycleS = 36.0f;           // lights: A 0-14 green 14-17 yellow, B 18-32 green 32-35 yellow
 constexpr float kSignalDrawM = 500.0f;     // signals drawn inside this
-constexpr float kClaimHoldS = 7.0f;        // a node claim expires after this
-constexpr float kYieldS = 9.0f;            // held this long at a junction: go
 // ── WHERE THE PAVEMENT IS (v36) ─────────────────────────────────────
 // The road ribbon is not all road: its outer part is shoulder, blended
 // into the terrain, and only the inner fraction is surfaced and
@@ -82,7 +81,7 @@ constexpr int   kAmbientMin = 12;          // ...but never fewer, where any road
 constexpr float kPtCell = 32.0f;           // road-point hash cell
 constexpr float kNodeCell = 6.0f;
 constexpr float kNodeMerge = 2.5f;
-constexpr float kTeeSnapM = 9.0f;
+constexpr float kTeeSnapM = 1.0f; // reconcile seams, never invent a road across a plot
 
 // ── a vehicle type ───────────────────────────────────────────────────
 struct Spec {
@@ -1431,6 +1430,12 @@ bool VehicleSystem::routeBetween(const RoadPt& from, const RoadPt& to,
         out.push_back({from.edge, s0, s1});
         return true;
     }
+    // Prefer a slightly longer open road to a stationary queue.
+    std::vector<float> congestion(edges_.size(),0.f);
+    for(const auto& car:vehicles_) {
+        if(car.parked || car.dormant || car.leg<0 || car.leg>=int(car.route.size())) continue;
+        congestion[car.route[car.leg].edge] += car.speed<1.f?25.f:4.f;
+    }
     // A* from both ends of e0 to either end of e1
     const int n = int(nodes_.size());
     std::vector<float> g(n, std::numeric_limits<float>::max());
@@ -1458,7 +1463,7 @@ bool VehicleSystem::routeBetween(const RoadPt& from, const RoadPt& to,
             const Edge& e = edges_[ei];
             const int nj = e.a == ni ? e.b : e.a;
             if (nj == ni || closed[nj]) continue;
-            const float ng = g[ni] + e.len;
+            const float ng = g[ni] + e.len + congestion[ei];
             if (ng < g[nj]) {
                 g[nj] = ng; parent_edge[nj] = ei; parent_node[nj] = ni;
                 open.push({ng + heur(nj), nj});
@@ -1556,7 +1561,7 @@ int VehicleSystem::lightState(const Signal& sg, int edge) const {
 // The poles, heads, lamps and signs: boxes from the bar mesh, paint
 // kind 5 (plain colour, emissive by `glow`), on the near-side kerb
 // kStopLineM before the node of every controlled approach.
-void VehicleSystem::emitSignals(const glm::vec3& camera_pos) {
+void VehicleSystem::emitSignals(const glm::vec3& camera_pos, const GroundQueryFn& ground) {
     if (frame_.size() != size_t(streamCount())) return;
     auto box = [&](const glm::vec3& c, const glm::vec3& half, float yaw,
                    const glm::vec3& rgb, float glow) {
@@ -1581,6 +1586,32 @@ void VehicleSystem::emitSignals(const glm::vec3& camera_pos) {
                 on ? 1.8f : 0.0f);
         }
     };
+    // Mark the exact crossing stations used by pedestrian routing.
+    for(const auto& e:edges_) {
+        if(e.len<2.f*kStopLineM) continue;
+        for(float station:{kStopLineM,e.len-kStopLineM}) {
+            glm::vec3 t;float h;const auto c=edgePoint(e,station,&t,&h);
+            const glm::vec2 d(c.x-camera_pos.x,c.z-camera_pos.z);
+            if(glm::dot(d,d)>kSignalDrawM*kSignalDrawM) continue;
+            const glm::vec3 right(-t.z,0,t.x);
+            for(float x=-h;x<h;x+=.9f) {
+                auto p=c+right*x;float y;glm::vec3 up;
+                // Wait for a real support surface; never draw floating paint
+                // while the corresponding road/bridge tile is still loading.
+                if(!ground || !ground(p.x,p.z,p.y,y,up) || up.y<.5f) continue;
+                up=glm::normalize(up);
+                auto forward=glm::normalize(t-up*glm::dot(t,up));
+                auto across=glm::normalize(glm::cross(up,forward));
+                glm::mat4 M(1.f);
+                M[0]=glm::vec4(across*.22f,0);
+                M[1]=glm::vec4(up*.001f,0);
+                M[2]=glm::vec4(forward,0);
+                M[3]=glm::vec4(glm::vec3(p.x,y,p.z)+up*.003f,1);
+                frame_[size_t(barStream())].push_back({M,glm::vec4(.9f,.9f,.85f,0),
+                    glm::vec4(5.f,0,0,0),glm::vec4(0)});
+            }
+        }
+    }
     for (const Signal& sg : signals_) {
         const glm::vec3& np = nodes_[size_t(sg.node)].pos;
         const float dx = np.x - camera_pos.x, dz = np.z - camera_pos.z;
@@ -1598,7 +1629,10 @@ void VehicleSystem::emitSignals(const glm::vec3& camera_pos) {
             const glm::vec3 pc = edgePoint(e, s, &t, &h);
             if (dir < 0.0f) t = -t;
             const glm::vec3 right(-t.z, 0.0f, t.x);
-            const glm::vec3 p = pc + right * (h + 0.8f);
+            glm::vec3 p = pc + right * (h + 0.8f);
+            float base_y;glm::vec3 base_normal;
+            if(!ground || !ground(p.x,p.z,p.y,base_y,base_normal)) continue;
+            p.y=base_y;
             const float yaw = std::atan2(t.x, t.z);
             if (sg.kind == 1) {
                 const int st = lightState(sg, ei);
@@ -1723,13 +1757,71 @@ void VehicleSystem::parkVerge(Vehicle& v, const RoadPt& rp, float dir) {
     v.claim = -1;
 }
 
+bool VehicleSystem::footStep(FootPath& path, glm::vec3& pos,
+                             const glm::vec3& goal, float distance, float& yaw) {
+    auto flat=[](glm::vec3 p){return glm::vec2(p.x,p.z);};
+    if(!loaded()) return false;
+    if(!path.admitted && glm::length(flat(path.goal-goal))>2.f) path=FootPath{};
+    if(path.next>=path.points.size()) {
+        path=FootPath{};path.goal=goal;
+        const auto delta=goal-pos;const float length=glm::length(flat(delta));
+        for(float d=0.f;d<=std::min(length,std::max(4.f,distance+2.f));d+=1.f) {
+            RoadPt rp;const auto q=pos+delta*(d/std::max(length,.001f));
+            if(!nearestRoadPt(q,24.f,rp)) continue;
+            const Edge& e=edges_[rp.edge];const float rs=e.s[rp.index];
+            glm::vec3 tangent;float half;
+            const auto centre=edgePoint(e,rs,&tangent,&half);
+            const glm::vec3 right(-tangent.z,0,tangent.x);
+            if(std::abs(glm::dot(q-centre,right))>half+.35f || glm::length(flat(q-centre))>half+1.f) continue;
+            const float side=glm::dot(pos-centre,right)>=0?1.f:-1.f;
+            if(side*glm::dot(goal-centre,right)>half+1.f && side*glm::dot(pos-centre,right)>half+.35f) continue;
+            if(e.len<2.f*kStopLineM) return true;
+            const float cs=rs<e.len*.5f?kStopLineM:e.len-kStopLineM;
+            auto curb=[&](float station,float sign){
+                glm::vec3 t;float h;auto c=edgePoint(e,station,&t,&h);
+                return c+glm::vec3(-t.z,0,t.x)*(sign*(h+1.f));
+            };
+            path.edge=rp.edge;path.crossing_s=cs;
+            path.points.push_back(curb(rs,side));
+            const int steps=std::max(1,int(std::ceil(std::abs(cs-rs)/2.f)));
+            for(int j=1;j<=steps;++j) path.points.push_back(curb(rs+(cs-rs)*float(j)/steps,side));
+            path.points.push_back(curb(cs,-side));path.crossing_end=path.points.size()-1;
+            for(int j=1;j<=steps;++j) path.points.push_back(curb(cs+(rs-cs)*float(j)/steps,-side));
+            break;
+        }
+        if(path.points.empty()) return false;
+    }
+    while(path.next<path.points.size() && glm::length(flat(path.points[path.next]-pos))<.15f) ++path.next;
+    if(path.next>=path.points.size()) return true;
+    if(path.next==path.crossing_end) {
+        const auto centre=edgePoint(edges_[path.edge],path.crossing_s,nullptr,nullptr);
+        if(!path.admitted) {
+            const Edge& e=edges_[path.edge];const int node=path.crossing_s<e.len*.5f?e.a:e.b;
+            const int sg=node>=0?node_signal_[node]:-1;
+            if(sg>=0 && signals_[sg].kind==1 && lightState(signals_[sg],path.edge)!=2) return true;
+            for(const auto& car:vehicles_) {
+                if(car.dormant) continue;
+                const float gap=glm::length(flat(car.pos-centre));
+                if(gap<specs()[car.type].L*.5f+3.f || (!car.parked && car.speed>.2f && gap<car.speed*8.f+specs()[car.type].L+5.f)) return true;
+            }
+            path.admitted=true;
+        }
+        auto it=std::find_if(foot_claims_.begin(),foot_claims_.end(),[&](const FootClaim& c){return c.edge==path.edge && std::abs(c.s-path.crossing_s)<.1f;});
+        if(it==foot_claims_.end()) foot_claims_.push_back({path.edge,path.crossing_s,anim_t_+2.f});
+        else it->until=anim_t_+2.f;
+    }
+    const auto delta=path.points[path.next]-pos;const float length=glm::length(flat(delta));
+    if(length>.001f){pos+=delta*(std::min(distance,length)/length);yaw=std::atan2(delta.x,delta.z);}
+    return true;
+}
+
 void VehicleSystem::strollPlace(Stroll& st) const {
     const Edge& e = edges_[size_t(st.edge)];
     glm::vec3 t; float h;
     const glm::vec3 p = edgePoint(e, st.s, &t, &h);
     if (st.dir < 0.0f) t = -t;
     const glm::vec3 right(-t.z, 0.0f, t.x);
-    st.pos = p + right * std::max(0.6f, h - st.side);
+    st.pos = p + right * ((st.side<0.f?-1.f:1.f)*(h+1.f));
     st.yaw = std::atan2(t.x, t.z);
 }
 
@@ -1740,7 +1832,9 @@ bool VehicleSystem::strollStartNear(const glm::vec3& near, float radius,
     if (!nearestRoadPt(near, radius, rp)) return false;
     uint32_t st = seed;
     out.edge = rp.edge;
-    out.s = edges_[size_t(rp.edge)].s[size_t(rp.index)];
+    const auto& edge=edges_[size_t(rp.edge)];
+    const float margin=std::min(kStopLineM,edge.len*.5f);
+    out.s = glm::clamp(edge.s[size_t(rp.index)],margin,edge.len-margin);
     out.dir = rnd01(st) < 0.5f ? 1.0f : -1.0f;
     out.side = 0.35f + 0.35f * rnd01(st);
     strollPlace(out);
@@ -1752,27 +1846,19 @@ bool VehicleSystem::strollAdvance(Stroll& st, float ds, uint32_t& rng) const {
     const Edge* e = &edges_[size_t(st.edge)];
     st.s += ds * st.dir;
     for (int guard = 0; guard < 4; ++guard) {
-        const bool past_end = st.dir > 0.0f ? st.s > e->len : st.s < 0.0f;
+        const float margin=std::min(kStopLineM,e->len*.5f);
+        const bool past_end = st.dir > 0.0f ? st.s > e->len-margin : st.s < margin;
         if (!past_end) break;
-        const float over = st.dir > 0.0f ? st.s - e->len : -st.s;
+        const float over = st.dir > 0.0f ? st.s-(e->len-margin) : margin-st.s;
         const int node = st.dir > 0.0f ? e->b : e->a;
-        int   next = st.edge;
-        float ndir = -st.dir;                          // dead end: back
-        if (node >= 0 && node < int(nodes_.size()) &&
-            nodes_[size_t(node)].edges.size() > 1) {
-            const std::vector<int>& ne = nodes_[size_t(node)].edges;
-            for (int tries = 0; tries < 6; ++tries) {
-                const int c = ne[size_t(int(rnd01(rng) * float(ne.size())) % ne.size())];
-                if (c != st.edge) { next = c; break; }
-            }
-            if (next != st.edge)
-                ndir = edges_[size_t(next)].a == node ? 1.0f : -1.0f;
-        }
+        int next=st.edge;
+        float ndir=-st.dir;
+        st.side=-st.side; // reverse on the same sidewalk, never jump across the junction
         st.edge = next;
         e = &edges_[size_t(next)];
         st.dir = ndir;
-        st.s = ndir > 0.0f ? std::min(over, e->len)
-                           : std::max(e->len - over, 0.0f);
+        st.s = ndir > 0.0f ? std::min(margin+over,e->len-margin)
+                           : std::max(e->len-margin-over,margin);
     }
     st.s = glm::clamp(st.s, 0.0f, e->len);
     strollPlace(st);
@@ -1781,6 +1867,7 @@ bool VehicleSystem::strollAdvance(Stroll& st, float ds, uint32_t& rng) const {
 
 void VehicleSystem::clearVehicles() {
     vehicles_.clear();
+    foot_claims_.clear();
     std::fill(node_claim_.begin(), node_claim_.end(), -1);
 }
 
@@ -2066,7 +2153,11 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
         remain_total += std::abs(v.route[k].s_to - v.route[k].s_from);
 
     // ── speed limits ────────────────────────────────────────────────
-    float vlim = sp.vmax * (v.lights ? 1.25f : 1.0f);
+    float road_half=0.f;
+    edgePoint(e,v.s,nullptr,&road_half);
+    const float road_limit=road_half>=7.f?13.89f:road_half>=2.5f?8.33f:5.56f;
+    float vlim=std::min(sp.vmax,road_limit);
+    float rule_stop=1e9f;
     // stop at the destination
     vlim = std::min(vlim, std::sqrt(2.0f * 3.0f * std::max(remain_total, 0.0f)) + 0.3f);
     // corners: heading change into the next leg
@@ -2098,8 +2189,10 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             const float to_line = remain_leg - kStopLineM;
             const bool inside = remain_leg < kStopLineM - 2.0f;
             const bool commit = st == 1 && to_line < 1.2f * v.speed + 1.0f;
-            if (st != 0 && !inside && !commit && to_line > -0.5f)
+            if (st != 0 && !inside && !commit && to_line > -0.5f) {
+                rule_stop=std::min(rule_stop,std::max(to_line,0.f));
                 vlim = std::min(vlim, std::sqrt(2.0f * 4.5f * std::max(to_line, 0.0f)));
+            }
             need_claim = false;
         } else if (sgi >= 0 && signals_[sgi].kind == 2) {
             const bool stem =
@@ -2110,6 +2203,7 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                 // take the junction under the claim.
                 const float to_line = remain_leg - kStopLineM;
                 if (v.stop_t < kStopWaitS && to_line > -0.5f) {
+                    rule_stop=std::min(rule_stop,std::max(to_line,0.f));
                     vlim = std::min(vlim, std::sqrt(2.0f * 4.5f * std::max(to_line, 0.0f)));
                     if (to_line < 2.0f && v.speed < 0.6f) v.stop_t += dt;
                 }
@@ -2117,29 +2211,68 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                 need_claim = false;          // the through road: priority
             }
         }
-        // THE CLAIM: one vehicle through the node at a time.  The
-        // holder is validated every frame -- it must still be a live,
-        // moving vehicle that names THIS node as its claim -- because
-        // the ambient ring pops slots off vehicles_, and an index left
-        // pointing past the end used to block the node for ever.  A
-        // claim also expires (kClaimHoldS), and a vehicle held here too
-        // long (kYieldS) takes the node regardless: whatever goes
-        // wrong, traffic never stands still permanently.
+        // A green phase or priority road never permits blocking the exit.
+        const Leg& outgoing=v.route[v.leg+1];
+        const float outgoing_dir=outgoing.s_to>=outgoing.s_from?1.f:-1.f;
+        for(const auto& crossing:foot_claims_) {
+            if(crossing.until>=anim_t_ && crossing.edge==outgoing.edge && remain_leg>=kStopLineM-1.f) {
+                rule_stop=std::min(rule_stop,std::max(0.f,remain_leg-kStopLineM));
+                vlim=std::min(vlim,std::sqrt(2.f*kBrake*rule_stop));
+            }
+        }
+        for(int oi=0;oi<int(vehicles_.size());++oi) {
+            if(oi==vi) continue;
+            const auto& other=vehicles_[oi];
+            if(other.dormant || other.leg<0 || other.leg>=int(other.route.size())) continue;
+            const auto& ol=other.route[other.leg];
+            if(ol.edge!=outgoing.edge || (ol.s_to>=ol.s_from?1.f:-1.f)!=outgoing_dir) continue;
+            const float gap=(other.s-outgoing.s_from)*outgoing_dir;
+            if(gap>=0.f && gap<sp.L+specs()[other.type].L+3.f && remain_leg>=kStopLineM-1.f) {
+                rule_stop=std::min(rule_stop,std::max(0.f,remain_leg-kStopLineM));
+                vlim=std::min(vlim,std::sqrt(2.f*kBrake*rule_stop));
+            }
+        }
+        // FIFO admission: reserve only after reaching the stop line and
+        // completing the stop. Never steal an occupied box on a timeout.
         if (need_claim) {
-            int& claim = node_claim_[node_ahead];
-            const bool held =
-                claim >= 0 && claim != vi && claim < int(vehicles_.size()) &&
-                !vehicles_[claim].parked && !vehicles_[claim].dormant &&
-                vehicles_[claim].claim == node_ahead &&
-                node_claim_age_[size_t(node_ahead)] < kClaimHoldS;
-            if (!held || v.block_t > kYieldS) {
-                if (claim != vi) node_claim_age_[size_t(node_ahead)] = 0.0f;
-                claim = vi;
-                v.claim = node_ahead;
-                v.block_t = 0.0f;
+            int& claim=node_claim_[node_ahead];
+            bool clear=true;
+            const Leg& exit_leg=v.route[v.leg+1];
+            for(int other=0;other<int(vehicles_.size());++other) {
+                if(other==vi) continue;
+                const auto& o=vehicles_[other];
+                if(o.dormant) continue;
+                // Keep the exit clear for this vehicle's full length.
+                if(o.leg>=0 && o.leg<int(o.route.size()) &&
+                   o.route[o.leg].edge==exit_leg.edge) {
+                    const float exit_dir=exit_leg.s_to>=exit_leg.s_from?1.f:-1.f;
+                    const float ahead=(o.s-exit_leg.s_from)*exit_dir;
+                    const float other_dir=o.route[o.leg].s_to>=o.route[o.leg].s_from?1.f:-1.f;
+                    if(exit_dir==other_dir && ahead>=0 && ahead<sp.L+specs()[o.type].L+3.f) clear=false;
+                }
+                // Stop-controlled stems yield to approaching through traffic.
+                if(sgi>=0 && signals_[sgi].kind==2 && !o.parked &&
+                   o.leg>=0 && o.leg<int(o.route.size())) {
+                    const auto& ol=o.route[o.leg]; const auto& oe=edges_[ol.edge];
+                    const float od=ol.s_to>=ol.s_from?1.f:-1.f;
+                    const int dest=od>0?oe.b:oe.a;
+                    const auto& stems=signals_[sgi].stems;
+                    if(dest==node_ahead && std::find(stems.begin(),stems.end(),ol.edge)==stems.end() &&
+                       (ol.s_to-o.s)*od<std::max(10.f,o.speed*3.f)) clear=false;
+                }
+                const glm::vec2 delta(o.pos.x-nodes_[node_ahead].pos.x,o.pos.z-nodes_[node_ahead].pos.z);
+                // Waiting cars outside the line do not occupy the box.
+                if(glm::dot(delta,delta)<3.f*3.f) clear=false;
+            }
+            const bool stop_ready=sgi<0 || signals_[sgi].kind!=2 || v.stop_t>=kStopWaitS;
+            if(engine::helper::junctionAdmission(vehicles_,node_ahead,vi,claim,stop_ready,clear)) {
+                if(claim!=vi) node_claim_age_[size_t(node_ahead)]=0.f;
+                claim=vi;v.claim=node_ahead;v.block_t=0.f;
             } else {
-                v.block_t += dt;
-                vlim = remain_leg > 9.0f ? std::min(vlim, 3.0f) : 0.0f;
+                v.block_t+=dt;
+                const float to_line=std::max(0.f,remain_leg-kStopLineM);
+                rule_stop=std::min(rule_stop,to_line);
+                vlim=std::min(vlim,std::sqrt(2.f*kBrake*to_line));
             }
         } else {
             v.block_t = 0.0f;
@@ -2149,7 +2282,7 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     if (v.claim >= 0 && v.claim != node_ahead) {
         const glm::vec3& np = nodes_[v.claim].pos;
         const float ddx = np.x - v.pos.x, ddz = np.z - v.pos.z;
-        if (ddx * ddx + ddz * ddz > 16.0f * 16.0f) {
+        if (ddx * ddx + ddz * ddz > std::pow(std::max(8.f,sp.L*.5f+4.f),2.f)) {
             if (node_claim_[v.claim] == vi) node_claim_[v.claim] = -1;
             v.claim = -1;
         }
@@ -2205,19 +2338,29 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             // v34: the other lane is not in the way
             if (two_lane && std::abs(o.lane_x - v.lane_x) > 0.55f) continue;
             const float gap = (o.s - v.s) * dir;
-            if (gap > 0.0f && gap < best_gap) best_gap = gap;
+            if (gap > 0.0f) best_gap = std::min(best_gap,gap-0.5f*specs()[o.type].L);
         }
         if (best_gap < 1e8f) {
             const float free = best_gap - kCarLenGap - 0.5f * sp.L;
             vlim = std::min(vlim, std::max(0.0f, free / 1.4f));
         }
     }
+    // Pedestrians already crossing retain priority through a phase change.
+    foot_claims_.erase(std::remove_if(foot_claims_.begin(),foot_claims_.end(),
+        [&](const FootClaim& c){return c.until<anim_t_;}),foot_claims_.end());
+    float foot_stop=rule_stop;
+    for(const auto& c:foot_claims_) if(c.edge==leg.edge) {
+        const float gap=(c.s-v.s)*dir;
+        if(gap>=0.f) foot_stop=std::min(foot_stop,std::max(0.f,gap-sp.L*.5f-2.f));
+    }
+    if(foot_stop<1e8f) vlim=std::min(vlim,std::sqrt(2.f*kBrake*foot_stop));
     // ── integrate ───────────────────────────────────────────────────
-    const float scale_vis = std::min(speed_scale, kVisualCapMs / std::max(sp.vmax, 1.0f));
+    const float scale_vis = std::min(1.f, std::min(speed_scale, kVisualCapMs / std::max(sp.vmax, 1.0f)));
     const float dv = vlim - v.speed;
     v.speed += glm::clamp(dv, -kBrake * dt, kAccel * dt);
     v.speed = std::max(v.speed, 0.0f);
-    const float ds = v.speed * scale_vis * dt;
+    const float ds = std::min(v.speed * scale_vis * dt, foot_stop);
+    if(foot_stop<=ds+.001f) v.speed=0.f;
     v.wheel += ds / sp.wheel_r;
     v.s += ds * dir;
     if ((leg.s_to - v.s) * dir <= 0.0f) {
@@ -2233,7 +2376,28 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             // the last leg ends
             const glm::vec3 end = edgePoint(e, leg.s_to, nullptr, nullptr);
             if (nearestRoadPt(end, 30.0f, rp)) {
-                if (!parkFree(v, rp, vi)) { v.s=leg.s_to; v.speed=0.0f; return; }
+                if (!parkFree(v, rp, vi)) {
+                    v.s=leg.s_to; v.speed=0.0f;
+                    // Ambient traffic keeps looking instead of permanently
+                    // blocking the lane at a full destination. Keep the current
+                    // edge and travel direction; never teleport or U-turn here.
+                    v.idle_t-=dt;
+                    if(v.ambient && v.idle_t<=0.f) {
+                        v.idle_t=3.f;
+                        RoadPt to;
+                        if(randomDestination(v.pos,kDestMin,kDestMax,
+                            v.seed^uint32_t(anim_t_*977.f),to,edge_comp_[size_t(rp.edge)])) {
+                            std::vector<Leg> onward;
+                            if(routeBetween(rp,to,onward) && !onward.empty() &&
+                               onward[0].edge==leg.edge &&
+                               (onward[0].s_to-v.s)*dir>1.f) {
+                                onward[0].s_from=v.s;
+                                v.route=std::move(onward);v.leg=0;v.stop_t=0.f;
+                            }
+                        }
+                    }
+                    return;
+                }
             }
             else { v.parked = true; v.speed = 0.0f; v.leg = -1; v.route.clear(); }
             v.idle_t = v.ambient ? 4.0f + 8.0f * h01(v.seed, 0x77u) : 0.0f;
@@ -2324,7 +2488,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
             ++alive;
         }
     }
-    // v35: age every node claim once a frame (see kClaimHoldS)
+    // Track claim duration for diagnostics; occupancy, not time, releases it.
     if (node_claim_age_.size() != node_claim_.size())
         node_claim_age_.assign(node_claim_.size(), 0.0f);
     for (float& t : node_claim_age_) t += dt;
@@ -2374,6 +2538,29 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         if (dx * dx + dz * dz > sim2) continue;
         on_edge[v.route[v.leg].edge].push_back(int(i));
     }
+    // Collect arrivals from the same frame snapshot before any car moves.
+    std::vector<std::pair<float,int>> arrivals;
+    for(int i=0;i<int(vehicles_.size());++i) {
+        auto& v=vehicles_[i]; int node=-1; float distance=0;
+        if(!v.parked && !v.dormant && !coarse_advanced[i] &&
+           ((v.pos.x-camera_pos.x)*(v.pos.x-camera_pos.x)+(v.pos.z-camera_pos.z)*(v.pos.z-camera_pos.z))<=sim2 &&
+           v.leg>=0 && v.leg+1<int(v.route.size())) {
+            const auto& leg=v.route[v.leg]; const auto& edge=edges_[leg.edge];
+            const float dir=leg.s_to>=leg.s_from?1.f:-1.f;
+            distance=std::max(0.f,(leg.s_to-v.s)*dir);
+            const int ahead=dir>0?edge.b:edge.a;
+            if(ahead>=0 && nodes_[ahead].edges.size()>2 && distance<22.f) {
+                const int signal=node_signal_[ahead];
+                if(signal<0) node=ahead;
+                else if(signals_[signal].kind==2 &&
+                    std::find(signals_[signal].stems.begin(),signals_[signal].stems.end(),leg.edge)!=signals_[signal].stems.end() &&
+                    distance<=kStopLineM+2.f && (v.speed<.6f || v.queue_node==ahead)) node=ahead;
+            }
+        }
+        if(v.queue_node!=node) {v.queue_node=node;v.arrival_ticket=0;}
+        if(node>=0 && !v.arrival_ticket) arrivals.emplace_back(distance,i);
+    }
+    engine::helper::assignJunctionTickets(vehicles_,arrivals,next_arrival_ticket_);
     // ── tick ────────────────────────────────────────────────────────
     for (size_t i = 0; i < vehicles_.size(); ++i) {
         Vehicle& v = vehicles_[i];
@@ -2404,7 +2591,7 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         if (dx * dx + dz * dz > draw2) continue;
         emit(v);
     }
-    emitSignals(camera_pos);
+    emitSignals(camera_pos, ground);
     dbg_timer_ += dt;
     if (dbg_timer_ > 10.0f) {
         dbg_timer_ = 0.0f;

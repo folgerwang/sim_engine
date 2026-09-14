@@ -41,10 +41,26 @@ inline uint32_t plantSeasonMode(uint32_t palette) {
     };
     return modes[std::min(palette,uint32_t(sizeof(modes)/sizeof(modes[0])-1))];
 }
+// All legal seeds/cohorts shed in [62,80.6] of each 100-unit year.
+// Conservative interval test also handles fast playback crossing New Year.
+inline bool plantShedInterval(double before,double now) {
+    if (!(now>before) || !std::isfinite(before) || !std::isfinite(now)) return false;
+    const double year=std::floor((now-62.)/100.);
+    return before <= year*100.+80.6;
+}
 inline bool plantShedCrossing(double before,double now,float seed,uint32_t group) {
-    const double offset=std::clamp(-double(seed),0.,100.)*.0003+std::min(group,3u)*.012;
+    const double offset=std::clamp(-double(seed),0.,100.)*.0003+std::min(group,7u)*(.036/7.);
     // Each cohort detaches as its autumn coverage reaches zero, every year.
     return now>before && std::floor(now*.01-offset-.74)>std::floor(before*.01-offset-.74);
+}
+// A stable leaf-local detachment time, spread across the fade interval.
+inline bool plantLeafShedCrossing(double before,double now,float seed,uint32_t group,uint32_t leafId) {
+    uint32_t h=leafId^0x9e3779b9u;
+    h^=h>>16; h*=0x7feb352du; h^=h>>15; h*=0x846ca68bu; h^=h>>16;
+    const double u=double(h&0xffffffu)/16777215.;
+    const double offset=std::clamp(-double(seed),0.,100.)*.0003+std::min(group,7u)*(.036/7.);
+    const double threshold=.62+.12*u+offset;
+    return now>before && std::floor(now*.01-threshold)>std::floor(before*.01-threshold);
 }
 struct TreeLifeProfile { const char* family; float minimum, maximum; };
 inline TreeLifeProfile treeLifeProfile(const std::string& species) {

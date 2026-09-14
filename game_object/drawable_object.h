@@ -1,5 +1,6 @@
 #pragma once
 #include "helper/tree_lifecycle.h"
+#include <array>
 #include <atomic>
 #include <mutex>          // PcgInstanceRegistry guards its tables
 #include <unordered_map>
@@ -1181,6 +1182,7 @@ private:
     enum NtPassMode : uint32_t {
         kNtPassForward = 0,
         kNtPassGBuffer,
+        kNtPassCoverage,
         kNtPassGlass,
         kNtPassDepthPrepass,
         kNtPassShadow,
@@ -1704,6 +1706,7 @@ public:
                         // primitives, into the two glass targets the
                         // resolve ray-traces reflection/refraction from.
                         // Uses drawable_glass_pipeline_list_.
+        kCoveragePrepass, // Camera depth with identical raster coverage to G-buffer.
         kGBuffer,       // Deferred re-rasterise: material attributes into
                         // the 4-RT cluster G-buffer (depth-gated LEQUAL
                         // against the forward pass's depth, no depth
@@ -1887,6 +1890,10 @@ public:
     // If that ever stops being true these turn into a data race, which is
     // exactly the tripwire you want when someone parallelises recording.
     struct DrawStats {
+        // Coverage, G-buffer, forward/translucent, raster shadows.
+        std::array<uint64_t,4> leaf_draws{};
+        std::array<uint64_t,4> leaf_batches{};
+        std::array<uint64_t,4> leaf_command_capacity{};
         uint64_t drawables = 0;     // DrawableObject::draw() bodies entered
         uint64_t nodes = 0;         // mesh nodes considered (flat lane)
         uint64_t sub_lane = 0;      // drawables that took the recursive

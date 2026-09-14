@@ -2,7 +2,7 @@
 #define PLANT_SEASON_GLSL_H
 // One common year: spring 0, summer .25, autumn .5, winter .75.
 float plantSeasonPhase(float time, float seed, uint group) {
-    float offset = clamp(-seed,0.,100.)*.0003 + float(min(group,3u))*.012;
+    float offset = clamp(-seed,0.,100.)*.0003 + float(min(group,7u))*(.036/7.);
     return fract(time*.01-offset);
 }
 float plantSeasonDormancy(float phase) {

@@ -3215,6 +3215,7 @@ void CitizenSystem::tickStroller(Stroller& w, float dt, float walk_scale, bool d
         dir.x = sd.x;
         dir.z = sd.y;
     }
+    if (vehicles_ && vehicles_->footStep(w.foot,w.pos,w.target,v*dt,w.yaw)) return;
     w.pos += dir * std::min(v * dt, dist);
     w.yaw = std::atan2(dir.x, dir.z);
     if (detailed) w.phase += dt * v * 1.7f;
@@ -3510,8 +3511,9 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                 dir.z = sd.y;
             }
             const float v = p.speed * walk_scale;
-            a.pos += dir * std::min(v * delta_t, dist) * 1.0f;
-            a.yaw = std::atan2(dir.x, dir.z);
+            const bool sidewalk = vehicles_ && vehicles_->footStep(a.foot,a.pos,target,v*delta_t,a.yaw);
+            if (!sidewalk) a.pos += dir * std::min(v * delta_t, dist);
+            if (!sidewalk) a.yaw = std::atan2(dir.x, dir.z);
             a.phase += delta_t * v * 1.7f;
             // walking between anchors: carry Y by blending the two
             // endpoints' base heights so far commuters don't tunnel;

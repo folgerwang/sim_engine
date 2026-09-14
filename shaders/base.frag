@@ -93,7 +93,11 @@ vec2 octEncodeDir(vec3 n) {
     return oct * 0.5 + 0.5;
 }
 #else
+#ifdef DEPTH_COVERAGE
+vec4 outColor;
+#else
 layout(location = 0) out vec4 outColor;
+#endif
 #endif
 
 #ifdef DECAL
@@ -456,7 +460,12 @@ bool lodFadeDiscards(float w) {
     return (w >= 0.0) ? (w <= ign) : (-w <= 1.0 - ign);
 }
 
+#if defined(GBUFFER_OUTPUT) && !defined(DECAL)
+layout(early_fragment_tests) in;
+#endif
+
 void main() {
+#if !defined(GBUFFER_OUTPUT) || defined(DECAL)
     // Band transition: dissolve before any shading work is done.
     // Per-instance mode (model_params_pad0 != 0, dense ground cover)
     // uses the weight base.vert computed from the instance's own
@@ -476,6 +485,27 @@ void main() {
     } else if (lodFadeDiscards(model_params.lod_fade)) {
         discard;
     }
+#endif // coverage is already in camera depth
+#if defined(GBUFFER_OUTPUT) && defined(NO_MTL)
+    // Geometry without an authored material still participates in depth
+    // and deferred lighting; use a neutral matte fallback.
+    vec3 fallback_n = cross(dFdx(ps_in_data.vertex_position),
+                            dFdy(ps_in_data.vertex_position));
+    fallback_n = dot(fallback_n, fallback_n) > 1e-12
+        ? normalize(fallback_n) : vec3(0.0, 1.0, 0.0);
+    vec2 fallback_oct = octEncodeDir(fallback_n);
+    out_albedo_ao = vec4(0.5, 0.5, 0.5, 1.0);
+    out_normal_rough = vec4(fallback_oct, 0.8, 0.0);
+    out_emissive_metal = vec4(fallback_oct, 0.0, 0.0);
+    out_velocity = vec2(0.0);
+    return;
+#endif
+#ifdef DEPTH_COVERAGE
+#ifndef NO_MTL
+    if (getBaseColor(ps_in_data, material).a < material.alpha_cutoff) discard;
+#endif
+    return;
+#endif
     bool is_front_face = gl_FrontFacing;
 #ifndef NO_MTL
     vec4 baseColor = getBaseColor(ps_in_data, material);
@@ -634,7 +664,7 @@ void main() {
     // actually goes dark).  The LOD dissolve / per-instance-band
     // discards already ran at the top of main(), so the G-buffer
     // respects the same dithered band handoff the forward pass shows.
-#if defined(ALPHAMODE_MASK) && !defined(DECAL)
+#if defined(ALPHAMODE_MASK) && !defined(DECAL) && !defined(GBUFFER_OUTPUT)
     // The forward path's cutout discard sits AFTER its lighting; here it
     // must run before the writes or masked foliage would stamp opaque
     // rectangles into the G-buffer.
@@ -911,7 +941,7 @@ void main() {
 // partially transparent at the margins, so the cutout branch (which
 // discards low alpha and then forces a to 1.0) would destroy exactly
 // the signal we need.  Skip it on that permutation only.
-#if defined(ALPHAMODE_MASK) && !defined(DECAL)
+#if defined(ALPHAMODE_MASK) && !defined(DECAL) && !defined(GBUFFER_OUTPUT)
     // Late discard to avoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
     if(baseColor.a < material.alpha_cutoff)
     {

@@ -111,15 +111,12 @@ public:
                    std::vector<Occupant>& out) const;
 
     // ── the road edge, for the citizens' STROLLERS ───────────────────
-    // There is no pavement mesh, so a walker keeps just inside the
-    // asphalt edge on the right of travel (the lane centre is 1.4-2.6
-    // m out, a car's flank at most 1.25 m past that; the walker sits
-    // 0.35-0.7 m in from the edge of a road at least 2.8 m wide).
+    // Walk on the generated sidewalk, one metre outside the carriageway.
     struct Stroll {
         int   edge = -1;
         float s = 0.0f;                // arc position on the edge
         float dir = 1.0f;              // +1 towards pts.back
-        float side = 0.5f;             // metres inside the road edge
+        float side = 0.5f;             // signed sidewalk side; preserved on reversal
         glm::vec3 pos{0.0f};           // world, y = graded road height
         float yaw = 0.0f;              // atan2(t.x, t.z), as vehicles
     };
@@ -130,6 +127,17 @@ public:
     // Walk `ds` metres on; at a junction take a random other road, at
     // a dead end turn back.  False only for a stale record.
     bool strollAdvance(Stroll& st, float ds, uint32_t& rng) const;
+
+    struct FootPath {
+        std::vector<glm::vec3> points;
+        size_t next=0, crossing_end=0;
+        int edge=-1;
+        float crossing_s=0.f;
+        bool admitted=false;
+        glm::vec3 goal{0.f};
+    };
+    bool footStep(FootPath& path, glm::vec3& pos, const glm::vec3& goal,
+                  float distance, float& yaw);
 
     void setTimeOfDayHours(float h) { tod_hours_ = h; }
     void setAmbientCount(int n) { ambient_target_ = n; }
@@ -157,6 +165,9 @@ public:
     void collectGpuShadowGeometry(std::vector<scene_rendering::RtSkinBatch>& out) const;
 
 private:
+    struct FootClaim { int edge; float s; float until; };
+    std::vector<FootClaim> foot_claims_;
+
     // ── the road graph ───────────────────────────────────────────────
     struct Edge {
         std::vector<glm::vec3> pts;    // world, y = graded road height
@@ -198,6 +209,8 @@ private:
         float yaw = 0.0f;
         glm::vec3 ground_up{0.0f, 1.0f, 0.0f};
         float y_ground = 0.0f;         // last exact clamp
+        int queue_node = -1;
+        uint64_t arrival_ticket = 0;
         int   claim = -1;              // junction node claimed
         // v34 LANES: lane is the one the car wants (0 inner, by the
         // centre line; 1 outer, by the kerb), lane_x where it is,
@@ -281,6 +294,7 @@ private:
     std::unordered_map<uint64_t, std::vector<RoadPt>> pt_grid_;
     std::unordered_map<uint64_t, int> node_grid_;
     std::vector<Vehicle> vehicles_;
+    uint64_t next_arrival_ticket_ = 1;
     std::vector<int> node_claim_;       // vehicle holding the node, -1
     // v35: seconds the current claim has been held.  A claim that
     // outlives kClaimHoldS is treated as abandoned -- the holder may
@@ -303,7 +317,7 @@ private:
     void buildSignals();
     // 0 green, 1 yellow, 2 red for traffic arriving on `edge`
     int  lightState(const Signal& sg, int edge) const;
-    void emitSignals(const glm::vec3& camera_pos);
+    void emitSignals(const glm::vec3& camera_pos, const GroundQueryFn& ground);
     // Connected components ("islands") of the graph.  The mesh stage's
     // roads are per settlement -- 2171 splines came out as 531
     // islands, the largest 143 edges -- so a destination is only ever

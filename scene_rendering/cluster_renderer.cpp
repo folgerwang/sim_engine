@@ -628,7 +628,7 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         const auto& values = *static_cast<const glsl::PbrMaterialParams*>(ptr);
                         if ((values.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
                             mp.flags |= BINDLESS_MAT_LEAF_AGE |
-                                (((values.material_features >> FEATURE_MATERIAL_LEAF_GROUP_SHIFT) & 3u) << BINDLESS_MAT_LEAF_GROUP_SHIFT);
+                                PACK_BINDLESS_LEAF_GROUP(UNPACK_LEAF_GROUP(values.material_features));
                         mp.flags |= int((values.pad_3 & 1023u) << BINDLESS_MAT_TREE_PROFILE_SHIFT);
                         mp.flags |= int((values.pad_3 & 1023u) << BINDLESS_MAT_TREE_PROFILE_SHIFT);
                         depth_scale = values.normal_scale;
@@ -660,6 +660,10 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         // else: over MAX_CLUSTER_TEXTURES — idx stays -1
                     }
                 }
+                // Missing streamed/overflow cutouts are not solid rectangles.
+                // Keep the fallback transparent until an alpha texture is bound.
+                if(mat.alpha_mask_ && tex_idx>=0 && mp.base_color_tex_idx<0)
+                    base_color.a=0.f;
                 // Stage the normal-map texture (binding 3).
                 const bool leaf_mask = mat.name_.find("_leafmask") != std::string::npos;
                 if (leaf_mask) mp.flags |= BINDLESS_MAT_LEAF_MASK;
@@ -5322,7 +5326,13 @@ void ClusterRenderer::buildHwRtShadowAs() {
         const uint32_t flags = static_cast<uint32_t>(m.flags);
         // Translucent never occludes the sun (parity with raster + SW RT).
         if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
-        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u;
+        // All tree leaf LODs enter the hardware-opaque BLAS stream.
+        // This sets VK_GEOMETRY_OPAQUE_BIT_KHR via makeTriGeom(..., true),
+        // bypassing candidate/alpha callbacks rather than merely skipping
+        // texture reads in the shader. Raster material flags stay unchanged.
+        const bool opaque_tree_leaf =
+            (flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u;
+        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u && !opaque_tree_leaf;
         if (masked && m.base_color_tex_idx < 0 && (flags & BINDLESS_MAT_LEAF_AGE) == 0u) {
             // Texture-less cutout: constant alpha decides once.
             if (m.base_color_factor.a < m.alpha_cutoff) continue;
@@ -5873,7 +5883,13 @@ int32_t ClusterRenderer::ensureRtMeshSlot(
         const glsl::BindlessMaterialParams& m = staging_material_params_[mat];
         const uint32_t flags = static_cast<uint32_t>(m.flags);
         if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
-        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u;
+        // All tree leaf LODs enter the hardware-opaque BLAS stream.
+        // This sets VK_GEOMETRY_OPAQUE_BIT_KHR via makeTriGeom(..., true),
+        // bypassing candidate/alpha callbacks rather than merely skipping
+        // texture reads in the shader. Raster material flags stay unchanged.
+        const bool opaque_tree_leaf =
+            (flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u;
+        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u && !opaque_tree_leaf;
         if (masked && m.base_color_tex_idx < 0) {
             if (m.base_color_factor.a < m.alpha_cutoff) continue;
             masked = false;

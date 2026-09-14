@@ -1,7 +1,11 @@
 #pragma once
 #include <glm/glm.hpp>
+#include <string_view>
 
 namespace engine::helper {
+inline bool pcgLodUsesInstanceDistance(std::string_view category) {
+    return category=="tree" || category=="bush" || category=="ground";
+}
 // XZ bounds, packed as xmin/zmin/xmax/zmax. Shared by visible geometry
 // and RT casters so altitude and wrapper transforms cannot select different LODs.
 inline glm::vec4 pcgLodTileRect(const glm::mat4& m, float x, float z, float size) {
