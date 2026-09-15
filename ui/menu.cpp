@@ -7315,6 +7315,86 @@ void Menu::drawTerrainGenPopup() {
         // needs, so "clear then build" collapsed into just "build".  A
         // clear remains available from the CLI — terrain_stages.py
         // --clear <stage> — for the rare forensic wipe.)
+
+        // ── STOP ALL / CLEAN (v38) ────────────────────────────────────
+        // Stop: kill every pipeline process touching this world (the
+        // stage runner named in its lock file, the library runner, the
+        // detail worker, any FLUX / importer children) and stop the
+        // engine streaming it, so a rebuild can overwrite the files.
+        // Clean: after a confirmation, the same stop and then delete
+        // everything the world owns on disk — assets/terrain/<name>/,
+        // content/terrain/<name>/, caches, prompt — after the app has
+        // pulled its objects out of the scene.
+        ImGui::Spacing();
+        {
+            const std::string name = sanitizeTerrainName(terrain_name_);
+            const bool any_busy = world_busy || terrain_lib_status_ == 1 ||
+                                  terrain_gen_status_ == 1;
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.30f, 0.12f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.38f, 0.15f, 1.0f));
+            const bool stop_click = stage_button("Stop all");
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Kill every running build of this terrain\n"
+                                  "(stage runner, library runner, FLUX,\n"
+                                  "importer, detail worker) and stop the\n"
+                                  "engine streaming it, ready for a rebuild.%s",
+                                  any_busy ? "" : "\n(nothing is running now)");
+            if (stop_click) {
+#ifdef _WIN32
+                const std::string cmd =
+                    "cmd /c python \"tools\\terrain\\terrain_stages.py\" --stop" +
+                    (name.empty() ? std::string() : " --map \"" + name + "\"");
+#else
+                const std::string cmd =
+                    "python3 \"tools/terrain/terrain_stages.py\" --stop" +
+                    (name.empty() ? std::string() : " --map \"" + name + "\"");
+#endif
+                EditorLog::get().push("[terrain] STOP ALL -> " + cmd);
+                std::system(cmd.c_str());
+                terrain_stage_status_ = 0;
+                terrain_lib_status_   = 0;
+                terrain_gen_status_   = 0;
+                terrain_stop_request_ = true;
+                EditorLog::get().push("[terrain] all builds stopped; the "
+                                      "world is no longer streaming — "
+                                      "rebuild when ready");
+            }
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.20f, 0.20f, 1.0f));
+            const bool clean_click = stage_button("Clean terrain level...");
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Delete EVERYTHING this terrain owns on disk\n"
+                                  "(assets/terrain/%s, content/terrain/%s,\n"
+                                  "caches, prompt) and remove it from the scene.\n"
+                                  "Asks first.", name.c_str(), name.c_str());
+            if (clean_click) ImGui::OpenPopup("Clean terrain level?");
+            if (ImGui::BeginPopupModal("Clean terrain level?", nullptr,
+                                       ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("Remove terrain '%s' completely?", name.c_str());
+                ImGui::TextDisabled("assets/terrain/%s/", name.c_str());
+                ImGui::TextDisabled("content/terrain/%s/", name.c_str());
+                ImGui::TextDisabled("its tile caches, prompt file, and every "
+                                    "scene object it placed.");
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f),
+                                   "This cannot be undone.");
+                ImGui::Separator();
+                if (ImGui::Button("Delete it", ImVec2(130, 0))) {
+                    terrain_clean_request_ = true;
+                    terrain_clean_name_    = name;
+                    terrain_stage_status_  = 0;
+                    terrain_lib_status_    = 0;
+                    terrain_gen_status_    = 0;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(130, 0)))
+                    ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
         }  // have_terrain — end of the world-stage rows
 
 

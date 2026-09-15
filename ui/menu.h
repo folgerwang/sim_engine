@@ -166,6 +166,11 @@ private:
     // camera-pause state.
     bool        last_in_focus_           = false;
     bool        terrain_apply_request_   = false; // auto + "Rebuild Terrain Now"
+    // v38: "Stop all" / "Clean terrain level" — the app consumes these
+    // (see consumeTerrainStopRequest / consumeTerrainCleanRequest).
+    bool        terrain_stop_request_    = false;
+    bool        terrain_clean_request_   = false;
+    std::string terrain_clean_name_;
     char        terrain_prompt_buf_[512] = {};
     bool        terrain_gen_install_     = true;
     bool        terrain_gen_color_       = true;  // + color satellite map
@@ -1730,6 +1735,38 @@ public:
     // the pipeline finishes writing the heightmap + albedo pair, and by
     // the manual "Rebuild Terrain Now" button.  Hands the app the two
     // texture-map paths for createTerrainFromMaps() — no restart needed.
+    // "Stop all": every build process has already been killed by the
+    // time this fires; the app has to stop STREAMING the world (or the
+    // detail stream would respawn its worker) and drop any pending
+    // apply, so the files are free to be rewritten.
+    bool consumeTerrainStopRequest() {
+        if (terrain_stop_request_) {
+            terrain_stop_request_ = false;
+            terrain_apply_request_ = false;
+            return true;
+        }
+        return false;
+    }
+    // "Clean terrain level": the app removes the world's scene objects
+    // and releases its terrain, then deletes its files through
+    // terrain_stages.py --clean.
+    bool consumeTerrainCleanRequest(std::string& name) {
+        if (terrain_clean_request_) {
+            terrain_clean_request_ = false;
+            terrain_apply_request_ = false;
+            name = terrain_clean_name_;
+            return true;
+        }
+        return false;
+    }
+    // After a clean: rescan the terrain list and forget the name if it
+    // was the one just removed.
+    void terrainRemoved(const std::string& name) {
+        terrain_names_loaded_ = false;
+        if (name == sanitizeTerrainName(terrain_name_)) terrain_name_[0] = '\0';
+        terrain_stage_status_ = 0;
+        terrain_gen_status_ = 0;
+    }
     bool consumeTerrainApplyRequest(std::string& height_png,
                                     std::string& albedo_png) {
         if (terrain_apply_request_) {

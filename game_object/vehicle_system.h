@@ -134,12 +134,16 @@ public:
         int edge=-1;
         float crossing_s=0.f;
         bool admitted=false;
+        // v37: when this walker's hold on the crossing expires.  0 until
+        // the crossing is entered.
+        float hold_until=0.f;
         glm::vec3 goal{0.f};
     };
     bool footStep(FootPath& path, glm::vec3& pos, const glm::vec3& goal,
                   float distance, float& yaw);
 
     void setTimeOfDayHours(float h) { tod_hours_ = h; }
+    void setCameraViewProj(const glm::mat4& vp) { camera_view_proj_ = vp; camera_view_proj_set_ = true; }
     void setAmbientCount(int n) { ambient_target_ = n; }
 
     // speed_scale: the citizens' walk scale (legs keep up with the
@@ -175,6 +179,13 @@ private:
         std::vector<float>     half;   // half-width at each pt
         int a = -1, b = -1;            // nodes at pts.front / pts.back
         float len = 0.0f;
+        // v37: metres from node a / node b to THIS approach's stop line.
+        // Zero when that end is not a junction.  Set by buildSignals
+        // from the widths of the roads being crossed, so the line sits
+        // at the edge of the crossing carriageway plus a crosswalk --
+        // not a fixed 5 m from the node centre, which on a 15 m
+        // arterial was inside the box.
+        float stop_a = 0.0f, stop_b = 0.0f;
     };
     struct Node {
         glm::vec3 pos{0.0f};
@@ -224,6 +235,10 @@ private:
         // v35: seconds this vehicle has been held at a junction -- the
         // escape valve against any claim that will not clear
         float block_t = 0.0f;
+        // v37: seconds standing still, for any reason.  The keep-clear
+        // rule reads this on the car ahead to distinguish a queue that is
+        // moving from one that has deadlocked.
+        float stall_t = 0.0f;
         // ── WHICH BAKED CAR THIS IS ─────────────────────────────
         // An index into the library (car_library.h), chosen once at
         // spawn from the samples its TYPE may wear, plus the paint and
@@ -307,7 +322,7 @@ private:
     // has a STOP SIGN on its stem, the road that ends there.
     struct Signal {
         int  node = -1;
-        int  kind = 0;                 // 1 lights, 2 stop sign
+        int  kind = 0;                 // 1 lights, 2 stop sign on `stems`, 3 all-way stop
         std::vector<int> group_a;      // lights: the edges of group A
         std::vector<int> stems;        // stop: the edges that must stop
         float phase = 0.0f;            // lights: cycle offset, seconds
@@ -315,8 +330,21 @@ private:
     std::vector<Signal> signals_;
     std::vector<int> node_signal_;     // per node: signal index or -1
     void buildSignals();
+    // The stop-line distance for the approach to node a (at_a) or b.
+    float stopDist(const Edge& e, bool at_a) const {
+        const float d = at_a ? e.stop_a : e.stop_b;
+        return d > 0.0f ? d : 5.0f;
+    }
+    // Lane / edge / centre lines, stop bars and crosswalks, as ground-
+    // conforming paint quads on the bar stream.
+    void emitRoadPaint(const glm::vec3& camera_pos, const GroundQueryFn& ground);
     // 0 green, 1 yellow, 2 red for traffic arriving on `edge`
     int  lightState(const Signal& sg, int edge) const;
+    // v38: the pedestrian head for crossing `edge` at a signalised
+    // node: 0 WALK, 1 flashing DON'T WALK (finish, don't start), 2
+    // DON'T WALK.  Walk runs while that edge's traffic is on red, ending
+    // kPedClearS before its next green.
+    int  pedState(const Signal& sg, int edge) const;
     void emitSignals(const glm::vec3& camera_pos, const GroundQueryFn& ground);
     // Connected components ("islands") of the graph.  The mesh stage's
     // roads are per settlement -- 2171 splines came out as 531
@@ -341,6 +369,12 @@ private:
     float dbg_timer_ = 0.0f;
     uint32_t rng_ = 0x2545F491u;
     glm::vec3 camera_pos_{0.0f};
+    // v38: the main camera's view-projection, for the spawn ring.  A car
+    // may only be spawned where it cannot be seen; without this every
+    // spawn was a car popping into the frame.
+    glm::mat4 camera_view_proj_{1.0f};
+    bool camera_view_proj_set_ = false;
+    bool pointInView(const glm::vec3& p, float margin = 0.15f) const;
 
     // per-frame instance streams, one per mesh
     std::vector<std::vector<PartInstance>> frame_;

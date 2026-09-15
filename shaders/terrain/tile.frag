@@ -1196,11 +1196,35 @@ void main() {
     // Pavement belongs to this tile's own topology. Its depth and material
     // are emitted together; it never waits for a separate road drawable.
     if (in_data.surface_kind > 0.5) {
-        float grain = fract(sin(dot(floor(pos.xz * 18.0), vec2(12.9898,78.233))) * 43758.5453);
+        // v37: a road surface, not a flat tint.  Three world-anchored
+        // hash octaves: aggregate speckle (the light stones in the
+        // bitumen, ~5 cm), chip-seal mottle (~25 cm) and the broad
+        // patch-repair / weathering tone (~4 m).  The lane paint is
+        // drawn by the vehicle system from the road graph (it knows
+        // where the centre line is; this pass does not).
+        vec2 pw = pos.xz;
+        float g1 = fract(sin(dot(floor(pw * 20.0), vec2(12.9898, 78.233))) * 43758.5453);
+        float g2 = fract(sin(dot(floor(pw * 4.0) + 7.0, vec2(26.651, 61.331))) * 24634.6345);
+        float g3 = fract(sin(dot(floor(pw * 0.25) + 3.0, vec2(41.233, 17.797))) * 13758.5453);
         bool concrete = in_data.surface_kind > 1.5;
-        albedo = (concrete ? vec3(0.52,0.50,0.46) : vec3(0.105,0.11,0.115))
-                   * (0.94 + 0.12 * grain);
-        mat_rough = concrete ? 0.88 : 0.94;
+        if (concrete) {
+            // pale, slightly warm, with the 1.2 m slab joints of a
+            // poured footpath
+            vec2 slab = fract(pw / 1.2);
+            float joint = 1.0 - smoothstep(0.0, 0.03, min(min(slab.x, 1.0 - slab.x), min(slab.y, 1.0 - slab.y)));
+            albedo = vec3(0.56, 0.54, 0.50) * (0.90 + 0.14 * g1) * (0.95 + 0.10 * g3)
+                     * (1.0 - 0.25 * joint);
+            mat_rough = 0.90;
+        } else {
+            // dark grey bitumen with light aggregate showing through;
+            // brighter (0.12-0.16) than the old 0.105, which read as
+            // wet.  The speckle is where the surface character lives.
+            float speckle = smoothstep(0.78, 0.98, g1);
+            albedo = vec3(0.128, 0.130, 0.134)
+                     * (0.86 + 0.24 * g2) * (0.90 + 0.20 * g3)
+                     + vec3(0.30, 0.29, 0.27) * speckle * (0.5 + 0.5 * g2);
+            mat_rough = 0.92 - 0.06 * speckle;
+        }
         surf_ao = 1.0;
         normal = geom_normal;
     }
