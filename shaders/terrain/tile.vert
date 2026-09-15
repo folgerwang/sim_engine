@@ -107,6 +107,8 @@ void main() {
         detail_fade *= 1.0f - clamp(uw_m * 2.0f, 0.0f, 1.0f);
     }
 #endif
+    // Baked pavement must never inherit streamed terrain micro-relief.
+    if (out_data.surface_kind > 0.5) detail_fade = 0.0;
     layer_height = terrainDetailHeight(pos_xz_ws, layer_height, detail_fade);
     // Beyond the terrain map: fade to the neutral surround plain instead
     // of stretching the border texels into stripes.

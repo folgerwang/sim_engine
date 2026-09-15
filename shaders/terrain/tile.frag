@@ -1219,10 +1219,12 @@ void main() {
             // dark grey bitumen with light aggregate showing through;
             // brighter (0.12-0.16) than the old 0.105, which read as
             // wet.  The speckle is where the surface character lives.
-            float speckle = smoothstep(0.78, 0.98, g1);
+            float footprint = max(length(dFdx(pw)), length(dFdy(pw)));
+            float detail = 1.0 - smoothstep(0.015, 0.08, footprint);
+            float speckle = (g1 - 0.5) * detail;
             albedo = vec3(0.128, 0.130, 0.134)
-                     * (0.86 + 0.24 * g2) * (0.90 + 0.20 * g3)
-                     + vec3(0.30, 0.29, 0.27) * speckle * (0.5 + 0.5 * g2);
+                     * (0.98 + 0.04 * g2) * (0.98 + 0.04 * g3)
+                     + vec3(0.012) * speckle;
             mat_rough = 0.92 - 0.06 * speckle;
         }
         surf_ao = 1.0;

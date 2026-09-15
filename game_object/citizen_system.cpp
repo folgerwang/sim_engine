@@ -3239,8 +3239,8 @@ void CitizenSystem::updateStrollers(float delta_t, const glm::vec3& camera_pos,
         Stroller& w = strollers_[i];
         const float dx = w.pos.x - camera_pos.x, dz = w.pos.z - camera_pos.z;
         w.life_t -= delta_t;
-        if (dx * dx + dz * dz > kStrollRecycleM * kStrollRecycleM ||
-            w.life_t <= 0.0f) {
+        if (dx * dx + dz * dz > std::max(kShowRadius,kStrollRecycleM) * std::max(kShowRadius,kStrollRecycleM) ||
+            (w.life_t <= 0.0f && dx*dx+dz*dz > kShowRadius*kShowRadius)) {
             if (i + 1 < strollers_.size()) strollers_[i] = std::move(strollers_.back());
             strollers_.pop_back();
             continue;
@@ -3257,6 +3257,7 @@ void CitizenSystem::updateStrollers(float delta_t, const glm::vec3& camera_pos,
             const float d2 = dx * dx + dz * dz;
             if (d2 > far_d2) { far_d2 = d2; far_i = i; }
         }
+        if(far_d2 <= kShowRadius*kShowRadius) break;
         if (far_i + 1 < strollers_.size()) strollers_[far_i] = std::move(strollers_.back());
         strollers_.pop_back();
     }
@@ -3271,8 +3272,21 @@ void CitizenSystem::updateStrollers(float delta_t, const glm::vec3& camera_pos,
     for (size_t i = 0; i < strollers_.size(); ++i) {
         Stroller& w = strollers_[i];
         const glm::vec2 before(w.pos.x-camera_pos.x, w.pos.z-camera_pos.z);
+        const auto old_pos=w.pos;
+        const auto old_road=w.road;
+        const float old_phase=w.phase;
+        const uint64_t crowd_id=(uint64_t(1)<<32)|w.seed;
         tickStroller(w, delta_t, walk_scale,
                      glm::dot(before,before) <= kNearSimRadius*kNearSimRadius);
+        if(!pedestrian_spacing_.allow(crowd_id,old_pos,w.pos)) {
+            w.pos=old_pos; w.road=old_road;
+        }
+        pedestrian_spacing_.move(crowd_id,old_pos,w.pos);
+        // A queued house walker must retry next tick; walking also drives
+        // route state there, so animation is measured separately below.
+        w.phase=old_phase;
+        w.moving=pedestrianMoving(old_pos,w.pos,delta_t);
+        if(w.moving) w.phase+=glm::length(glm::vec2(w.pos.x-old_pos.x,w.pos.z-old_pos.z))*1.7f;
         if (!ground_) continue;
         const float dx = w.pos.x - camera_pos.x, dz = w.pos.z - camera_pos.z;
         if (dx * dx + dz * dz > kNearSimRadius*kNearSimRadius) continue;
@@ -3287,6 +3301,14 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                            const GroundQueryFn& ground) {
     if (!loaded_) return;
     ground_ = ground;
+    motion_time_ += std::max(0.f,delta_t);
+    pedestrian_spacing_.clear();
+    for(size_t i=0;i<sim_.size();++i) {
+        const auto& a=sim_[i];
+        if(a.inited && !a.ride && glm::distance(a.pos,camera_pos)<kNearSimRadius)
+            pedestrian_spacing_.add(i,a.pos);
+    }
+    for(const auto& w:strollers_) pedestrian_spacing_.add((uint64_t(1)<<32)|w.seed,w.pos);
     // Pose clock (see anim_t_ in the header): REAL seconds, advanced
     // here and nowhere else, deliberately independent of clock_min_
     // and of whatever multiplier the time-of-day slider is on.
@@ -3362,25 +3384,34 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             const Step home_step{};
             const Step& st = cs >= 0 ? sched[cs] : home_step;
             if (!a.inited) {
-                a.inited = true;
-                a.yaw = h01(uint32_t(i), 77u) * 6.2831853f;
+                a.inited=true; a.pos=placePos(p,st,int(i));
+                a.yaw=h01(uint32_t(i),77u)*6.2831853f;
+                a.last_motion_time=motion_time_;
             }
-            if (cs != a.cur_step || glm::length(a.pos) < 1e-6f) {
-                a.cur_step = cs;
-                a.gesture_t = 0.0f;
-                a.pos = placePos(p, st, int(i));
+            a.cur_step=cs;
+            const float elapsed=float(std::clamp(motion_time_-a.last_motion_time,0.,1.));
+            a.last_motion_time=motion_time_;
+            if(a.ride && vehicles_ && i<car_of_.size() && car_of_[i]>=0) {
+                if(vehicles_->parked(car_of_[i])) {
+                    a.ride=0; a.pos=vehicles_->stepOut(car_of_[i]);
+                } else { a.pos=vehicles_->seatPos(car_of_[i],0); continue; }
             }
-            // Residents outside the active area use their schedule anchor.
-            if (a.walking && !a.ride) a.pos = placePos(p, st, int(i));
-            a.indoor_idle = anchorHouse(p, st) >= 0 && !a.ride;
-            a.walking = false;
-            // snapped out of a trip: the car comes with them
-            if (a.ride) {
-                a.ride = 0;
-                if (vehicles_ && i < car_of_.size() && car_of_[i] >= 0) {
-                    vehicles_->recall(car_of_[i], a.pos);
+            const auto target=placePos(p,st,int(i));
+            auto delta=target-a.pos; delta.y=0.f;
+            float distance=glm::length(delta);
+            const auto before=a.pos;
+            if(distance>.6f) {
+                const float step=std::min(p.speed*walk_scale*elapsed,distance);
+                if(!(vehicles_ && vehicles_->footStep(a.foot,a.pos,target,step,a.yaw))) {
+                    a.pos+=delta*(step/distance);
+                    a.yaw=std::atan2(delta.x,delta.z);
                 }
             }
+            a.walking=pedestrianMoving(before,a.pos,elapsed);
+            a.waiting_for_space=distance>.6f && !a.walking;
+            if(a.walking) a.phase+=glm::length(glm::vec2(a.pos.x-before.x,a.pos.z-before.z))*1.7f;
+            a.indoor_idle=distance<=.6f && anchorHouse(p,st)>=0;
+
         }
         sim_cursor_ = (sim_cursor_ + std::min(n, kFarSimPerFrame)) % n;
     }
@@ -3398,6 +3429,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
             const float dcz0 = a.pos.z - camera_pos.z;
             if (dcx0 * dcx0 + dcz0 * dcz0 > near2) continue;
         }
+        a.last_motion_time=motion_time_;
         const Person& p = persons_[i];
         const auto& sched = scheduleOf(p);
         int cs = currentStep(sched, tod);
@@ -3488,6 +3520,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                 }
             }
         }
+        a.waiting_for_space = false;
         a.walking = dist > 0.6f;
         if (a.walking) {
             glm::vec3 dir = d / dist;
@@ -3511,10 +3544,15 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
                 dir.z = sd.y;
             }
             const float v = p.speed * walk_scale;
+            const auto before=a.pos;
             const bool sidewalk = vehicles_ && vehicles_->footStep(a.foot,a.pos,target,v*delta_t,a.yaw);
             if (!sidewalk) a.pos += dir * std::min(v * delta_t, dist);
             if (!sidewalk) a.yaw = std::atan2(dir.x, dir.z);
-            a.phase += delta_t * v * 1.7f;
+            if(!pedestrian_spacing_.allow(i,before,a.pos)) a.pos=before;
+            pedestrian_spacing_.move(i,before,a.pos);
+            a.walking=pedestrianMoving(before,a.pos,delta_t);
+            a.waiting_for_space=!a.walking;
+            if(a.walking) a.phase += glm::length(glm::vec2(a.pos.x-before.x,a.pos.z-before.z))*1.7f;
             // walking between anchors: carry Y by blending the two
             // endpoints' base heights so far commuters don't tunnel;
             // the ground clamp below refines it when it is their turn
@@ -3654,7 +3692,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         ta.pos = w.pos;
         ta.yaw = w.yaw;
         ta.phase = w.phase;
-        ta.walking = w.walking;
+        ta.walking = w.moving;
         ta.inited = true;
         ta.cur_step = 0;
         const bool detailed = d2 < kDetailRadius * kDetailRadius;
@@ -3766,6 +3804,22 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         // FAR TIER: one box, person-sized, duty-tinted — a figure at a
         // distance, not a puppet.  Slight walk bob keeps crowds alive.
         const float s = p.height / 1.75f;
+        if(a.walking) {
+            const auto root=glm::translate(glm::mat4(1.f),a.pos)*
+                glm::rotate(glm::mat4(1.f),a.yaw,glm::vec3(0,1,0));
+            auto part=[&](glm::mat4 m,glm::vec3 scale) {
+                frame_parts_.push_back({m*glm::scale(glm::mat4(1.f),scale),
+                    glm::vec4(dutyColor(p.duty),.12f),glm::vec4(0.f)});
+            };
+            part(root*glm::translate(glm::mat4(1.f),glm::vec3(0,1.25f*s,0)),{.2f*s*p.bulk,.5f*s,.13f*s});
+            for(int side:{-1,1}) {
+                auto leg=root*glm::translate(glm::mat4(1.f),glm::vec3(side*.1f*s,.8f*s,0))*
+                    glm::rotate(glm::mat4(1.f),side*.5f*std::sin(a.phase),glm::vec3(1,0,0))*
+                    glm::translate(glm::mat4(1.f),glm::vec3(0,-.4f*s,0));
+                part(leg,{.08f*s,.4f*s,.09f*s});
+            }
+            return;
+        }
         float bob = a.walking
                         ? std::abs(std::cos(a.phase)) * 0.03f * s : 0.0f;
         glm::mat4 M =
@@ -3788,10 +3842,11 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
     // placePos made when it decided where to put this person — so the
     // pose and the spot always agree.
     int act = a.walking ? kActWalk : resolveActivity(st);
+    if(a.waiting_for_space || (!a.walking && act==kActWalk)) act=kActIdle;
     // Door-open gesture on arrival home — but never in place of going
     // to bed: at 03:00 an arm reaching for a door handle is not what
     // anybody is doing.
-    if (!a.walking && act != kActSleepish && a.gesture_t > 0.0f &&
+    if (!a.walking && !a.waiting_for_space && act != kActSleepish && a.gesture_t > 0.0f &&
         a.gesture_t < 1.2f && st.place == -1) {
         act = kActBrowse;              // arm-forward: opening the door
     }
@@ -3808,9 +3863,9 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
     float     body_yaw = a.yaw;
     bool      lying    = false;
     bool      seated   = false;
-    if (!a.walking) {
+    if (!a.walking && !a.waiting_for_space) {
         const Anchor an = furnitureAnchor(p, st, act);
-        if (an.kind != kAnchorNone) {
+        if (an.kind != kAnchorNone && glm::length(glm::vec2(an.pos.x-a.pos.x,an.pos.z-a.pos.z)) < 1.f) {
             body_pos = an.pos;
             body_yaw = an.yaw;
             lying    = (an.kind == kAnchorBed);

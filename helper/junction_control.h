@@ -5,6 +5,12 @@
 #include <utility>
 
 namespace engine::helper {
+// Stop positions refer to the vehicle centre; keep its bumper behind paint.
+inline float junctionStopCentre(float line, float length) { return line + .5f*length + .75f; }
+inline bool junctionStopped(float remaining, float centre, float speed) {
+    // Include a small overshoot so an already-stationary car can recover.
+    return remaining <= centre+2.f && remaining >= centre-2.f && speed < .6f;
+}
 // Collect arrivals before movement, then assign stable tickets. Distance and
 // vehicle identity break same-frame ties without favoring vector iteration.
 template<class Vehicles>

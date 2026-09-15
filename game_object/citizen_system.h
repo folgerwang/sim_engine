@@ -1,4 +1,5 @@
 #pragma once
+#include "helper/pedestrian_spacing.h"
 
 // CitizenSystem — box-people living the city simulation.
 //
@@ -201,6 +202,8 @@ private:
         int16_t nav_room = -1;
         bool  indoor_idle = false;     // stationary at an indoor schedule anchor
         bool  walking = false;
+        bool waiting_for_space = false;
+        double last_motion_time = 0.;
         bool  inited = false;
         // 0 on foot, 2 in their car (the vehicle system drives it; the
         // person is not drawn until it parks)
@@ -301,10 +304,13 @@ private:
         int   kind = 0;                // 0 house to house, 1 the road
         int   house = -1;              // kind 0: the house visited
         bool  walking = true;
+        bool moving = false;
         VehicleSystem::Stroll road;    // kind 1
         Person look;                   // duty, age, height, bulk, and
                                        // a one-step outdoors schedule
     };
+    double motion_time_ = 0.;
+    PedestrianSpacing pedestrian_spacing_;
     std::vector<Stroller> strollers_;
     uint32_t stroll_rng_ = 0x6A09E667u;
     float    stroll_timer_ = 0.0f;

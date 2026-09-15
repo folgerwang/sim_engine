@@ -20,7 +20,7 @@ vec4 leafAgedColor(vec4 color, uint group, float seasonTime, uint profile, float
         target*=dot(color.rgb,vec3(.2126,.7152,.0722))/max(dot(target,vec3(.2126,.7152,.0722)),.01);
         return vec4(mix(tinted,target,.12*autumn),color.a);
     }
-    float coverage=plantSeasonCoverage(phase);
+    float coverage=group==0u ? 1. : plantSeasonCoverage(phase);
     // Each year's newborn starts at baby color, then reaches its cohort's
     // authored initial color; autumn coloring starts only after maturation.
     float babyToInitial=smoothstep(.02,.25,phase);
@@ -33,5 +33,5 @@ vec4 leafAgedColor(vec4 color, uint group, float seasonTime, uint profile, float
 vec4 leafAgedColor(vec4 c,uint g,float t,uint p) {return leafAgedColor(c,g,t,p,0.);}
 vec4 leafAgedColor(vec4 c,uint g,float t) {return leafAgedColor(c,g,t,0u,0.);}
 uint leafMaskGroup(float code) {return min(uint(clamp(code,0.,1.)*8.),7u);}
-float leafMaskCoverage(float code,float t) {return plantSeasonCoverage(plantSeasonPhase(t,0.,leafMaskGroup(code)));}
+float leafMaskCoverage(float code,float t) {return leafMaskGroup(code)==0u ? 1. : plantSeasonCoverage(plantSeasonPhase(t,0.,leafMaskGroup(code)));}
 #endif
