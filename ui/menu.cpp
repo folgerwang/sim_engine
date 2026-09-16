@@ -7117,7 +7117,6 @@ void Menu::drawTerrainGenPopup() {
         // build and a world build can be in flight at the same time
         // without overwriting each other's status.
         std::string graph_action;
-        static bool rebuild_library_all = false;
         auto launch_stage = [&](const char* stage, bool world) {
             namespace fsl = std::filesystem;
             // The NAME goes to python, which resolves it to
@@ -7145,7 +7144,6 @@ void Menu::drawTerrainGenPopup() {
                 stage;
             if (world) args += " --map \"" + name + "\"";
             if (!graph_action.empty()) args += " --graph-action " + graph_action;
-            if (!world && rebuild_library_all) args += " --rebuild-library";
             // The prompt rides along for PLACE too, because place's
             // dependency graph includes maps: a world whose map has not
             // been generated yet needs the text, and one whose map is
@@ -7300,6 +7298,18 @@ void Menu::drawTerrainGenPopup() {
           while (std::getline(input, line)) {
               const auto first = line.find('\t'), second = line.find('\t', first + 1);
               if (first != std::string::npos) graph_states[line.substr(0, first)] = line.substr(first + 1, second - first - 1);
+          }
+        }
+        // Global library state overrides any old per-terrain snapshot.
+        // New maps reuse the same library assets and completion records.
+        { std::ifstream input("assets/terrain/lib/library_graph.tsv"); std::string line;
+          while (std::getline(input, line)) {
+              const auto first=line.find('\t'), second=line.find('\t',first+1);
+              if(first==std::string::npos) continue;
+              const auto key=line.substr(0,first);
+              if(key=="houses" || key=="objects" || key=="cars" || key=="stones" ||
+                 key=="trees" || key=="shrubs" || key=="flowers" || key=="grass")
+                  graph_states[key]=line.substr(first+1,second-first-1);
           }
         }
         struct GraphNode { const char* key; const char* label; int col; int row; };
@@ -7498,29 +7508,7 @@ void Menu::drawTerrainGenPopup() {
 
 
 
-        // Libraries live outside terrain levels and can be built without selecting a map.
-        ImGui::TextDisabled("Shared libraries: assets/terrain/lib (reused by all terrain levels)");
-        const bool lib_busy = (terrain_lib_status_ == 1);
-        ImGui::Checkbox("Rebuild entire selected library", &rebuild_library_all);
-        if (lib_busy || world_busy || terrain_gen_status_ == 1) ImGui::BeginDisabled();
-        if (stage_button("House samples"))
-            launch_stage("houses", false);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Every house archetype -> lib/houses.glb.");
-        ImGui::SameLine();
-        if (stage_button("Plant samples"))
-            launch_stage("plants", false);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Build the separate stone, tree, shrub, flower and grass libraries.");
-        ImGui::SameLine();
-        if (stage_button("Room decals"))
-            launch_stage("objects", false);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Furniture, lamps, doors -> "
-                              "lib/room_decals.glb.");
-        ImGui::SameLine();
-        if (stage_button("Car samples")) launch_stage("cars", false);
-        if (lib_busy || world_busy || terrain_gen_status_ == 1) ImGui::EndDisabled();
+        // Library builds are controlled by the pipeline graph nodes.
         poll_stage(terrain_lib_status_, terrain_lib_name_,
                    terrain_lib_prog_);
         if (terrain_lib_status_ == 2) {

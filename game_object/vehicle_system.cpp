@@ -1843,8 +1843,12 @@ void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQuery
                 }
             }
         }
+        // Short links between junctions lie inside their combined paved box.
+        // They have no room for a separate pedestrian crossing or stop stripe.
+        const bool internal_junction_link = e.stop_a > 0.f && e.stop_b > 0.f &&
+            e.len <= e.stop_a + e.stop_b + 2.f * (kCrosswalkM + kKerbM);
         // ── junction ends: stop bar + crosswalk ───────────────────
-        for (int end = 0; end < 2; ++end) {
+        for (int end = 0; end < 2 && !internal_junction_link; ++end) {
             const float sd = end == 0 ? e.stop_a : e.stop_b;
             if (sd <= 0.0f) continue;
             // stations measured from the node; `dir` is travel toward it
