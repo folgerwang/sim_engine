@@ -6791,16 +6791,14 @@ void Menu::drawTerrainGenPopup() {
     }
 
     if (!terrain_gen_popup_open_) return;
-    ImGui::SetNextWindowSize(ImVec2(960, 0), ImGuiCond_FirstUseEver);
-    // Pin the WIDTH: with AlwaysAutoResize alone, the auto-layout feeds
-    // back through GetContentRegionAvail()-sized items (prompt box /
-    // combo) and the window creeps wider every time text is added.
-    // Constraints keep width fixed at 960 while height still auto-fits.
-    ImGui::SetNextWindowSizeConstraints(ImVec2(960.0f, 0.0f),
-                                        ImVec2(960.0f, 10000.0f));
+    ImGui::SetNextWindowSize(ImVec2(960, 780), ImGuiCond_FirstUseEver);
+    // User-controlled size, persisted by ImGui. Scroll when the panel is
+    // smaller than its contents instead of forcing the window to auto-fit.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(480.0f, 320.0f),
+        ImVec2(std::numeric_limits<float>::max(), std::numeric_limits<float>::max()));
     if (ImGui::Begin("Generate Terrain (AI)", &terrain_gen_popup_open_,
                      ImGuiWindowFlags_NoDocking |
-                     ImGuiWindowFlags_AlwaysAutoResize)) {
+                     ImGuiWindowFlags_HorizontalScrollbar)) {
         ImGui::TextWrapped(
             "Describe the terrain as a REGION seen from orbit: the map "
             "covers 32.8 km across at 4 m per texel, so ask for whole "
@@ -6977,7 +6975,7 @@ void Menu::drawTerrainGenPopup() {
         // reads as a dead button.  Gate it in the UI instead, so the
         // reason is visible before the click rather than never.
         const bool have_prompt = (terrain_prompt_buf_[0] != '\0');
-        const bool busy = (terrain_gen_status_ == 1);
+        const bool busy = (terrain_gen_status_ == 1 || terrain_stage_status_ == 1 || terrain_lib_status_ == 1);
         const bool gen_blocked = (busy || !have_terrain || !have_prompt);
         if (gen_blocked) ImGui::BeginDisabled();
         // Sized to ITS OWN LABEL, exactly like the stage buttons below
@@ -7112,12 +7110,14 @@ void Menu::drawTerrainGenPopup() {
         // first, in that order, without being asked to.
         ImGui::Separator();
         ImGui::TextUnformatted("Staged pipeline");
-        ImGui::TextDisabled("Unchanged stages are skipped.");
+        ImGui::TextDisabled("Continue pauses after each stage. Select a node to rebuild its dependents.");
 
         // One launcher for both chains.  `world` picks which of the two
         // runners (and which manifest) the run belongs to, so a library
         // build and a world build can be in flight at the same time
         // without overwriting each other's status.
+        std::string graph_action;
+        static bool rebuild_library_all = false;
         auto launch_stage = [&](const char* stage, bool world) {
             namespace fsl = std::filesystem;
             // The NAME goes to python, which resolves it to
@@ -7144,12 +7144,13 @@ void Menu::drawTerrainGenPopup() {
                 std::string("\"tools/terrain/terrain_stages.py\" --stage ") +
                 stage;
             if (world) args += " --map \"" + name + "\"";
+            if (!graph_action.empty()) args += " --graph-action " + graph_action;
+            if (!world && rebuild_library_all) args += " --rebuild-library";
             // The prompt rides along for PLACE too, because place's
             // dependency graph includes maps: a world whose map has not
             // been generated yet needs the text, and one whose map is
             // current simply never reads it.
-            if (world && (std::string(stage) == "maps" ||
-                          std::string(stage) == "place")) {
+            if (world) {
                 // The maps stage needs the same prompt the one-shot
                 // button uses; it goes through a FILE for the same
                 // reason it does there — a prompt with quotes in it
@@ -7279,25 +7280,122 @@ void Menu::drawTerrainGenPopup() {
         }
         const bool  world_busy = (terrain_stage_status_ == 1);
         if (have_terrain) {
-        if (world_busy) ImGui::BeginDisabled();
-        if (stage_button("1. ML maps (materials)"))
-            launch_stage("maps", true);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Heightmap, albedo, segmentation.\n"
-                              "Uses the prompt above.");
-        ImGui::SameLine();
-        if (stage_button("2. Terrain mesh"))
-            launch_stage("mesh", true);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Rivers, graded roads, bridges,\n"
-                              "house pads, ground mesh.");
-        ImGui::SameLine();
-        if (stage_button("3. Place houses & plants"))
-            launch_stage("place", true);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("House / plant instances,\n"
-                              "then the design-match check.");
-        if (world_busy) ImGui::EndDisabled();
+        // Read the runner's atomic DAG snapshot; never infer success from progress.
+        const std::string graph_name = sanitizeTerrainName(terrain_name_);
+        const std::string graph_path = "assets/terrain/" + graph_name + "/" + graph_name + "_graph.tsv";
+        static std::string graph_previous;
+        static double graph_refresh = -100.;
+        const bool graph_busy = world_busy || terrain_lib_status_ == 1 || terrain_gen_status_ == 1;
+        if (!graph_busy && (graph_previous != graph_name || ImGui::GetTime() - graph_refresh > 10.)) {
+            graph_previous = graph_name; graph_refresh = ImGui::GetTime();
+#ifdef _WIN32
+            const std::string refresh = "cmd /c start \"terrain-graph\" /B python \"tools/terrain/terrain_stages.py\" --graph-action refresh --map \"" + graph_name + "\"";
+#else
+            const std::string refresh = "python3 tools/terrain/terrain_stages.py --graph-action refresh --map \"" + graph_name + "\" &";
+#endif
+            std::system(refresh.c_str());
+        }
+        std::unordered_map<std::string, std::string> graph_states;
+        { std::ifstream input(graph_path); std::string line;
+          while (std::getline(input, line)) {
+              const auto first = line.find('\t'), second = line.find('\t', first + 1);
+              if (first != std::string::npos) graph_states[line.substr(0, first)] = line.substr(first + 1, second - first - 1);
+          }
+        }
+        struct GraphNode { const char* key; const char* label; int col; int row; };
+        const GraphNode nodes[] = {
+            {"maps", "ML maps", 0, 0}, {"mesh", "Terrain mesh", 1, 0},
+            {"place_houses", "Place houses", 2, 0}, {"place_plants", "Place landscape", 2, 1},
+            {"houses", "House library", 0, 2}, {"objects", "Object library", 1, 2},
+            {"stones", "Stone library", 0, 3}, {"trees", "Tree library", 1, 3},
+            {"shrubs", "Shrub library", 2, 3}, {"flowers", "Flower library", 0, 4},
+            {"grass", "Grass library", 1, 4}, {"cars", "Car library", 2, 4}};
+        ImGui::TextDisabled("Green: complete   Blue: ready / rebuild needed   Grey: blocked   Orange: running");
+        ImGui::BeginChild("Terrain dependency graph", ImVec2(0, 372), true, ImGuiWindowFlags_HorizontalScrollbar);
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float node_w = std::max(175.0f, ImGui::CalcTextSize("Object library [rebuild needed]").x + 20.0f);
+        const float dx = node_w + 45.0f, dy = 70.0f;
+        auto center = [&](int i) { return ImVec2(origin.x + nodes[i].col*dx + node_w*.5f, origin.y + nodes[i].row*dy + 24.f); };
+        const int edges[][2] = {{0,1},{1,2},{1,3},{2,3},{4,2},{5,2},{6,3},{7,3},{8,3},{9,3},{10,3},{9,10}};
+        auto* draw = ImGui::GetWindowDrawList();
+        // Draw every connection first; opaque node backplates below hide
+        // curves that pass behind a node, including disabled buttons.
+        for (const auto& edge : edges) {
+            auto from = center(edge[0]), to = center(edge[1]);
+            ImVec2 c1, c2;
+            if(nodes[edge[0]].col != nodes[edge[1]].col) {
+                const float direction = to.x > from.x ? 1.f : -1.f;
+                from.x += direction*node_w*.5f; to.x -= direction*node_w*.5f;
+                const float bend = std::max(30.f,std::abs(to.x-from.x)*.5f);
+                c1=ImVec2(from.x+direction*bend,from.y);
+                c2=ImVec2(to.x-direction*bend,to.y);
+            } else {
+                const float direction = to.y > from.y ? 1.f : -1.f;
+                from.y += direction*24.f; to.y -= direction*24.f;
+                const float bend = std::max(12.f,std::abs(to.y-from.y)*.5f);
+                c1=ImVec2(from.x,from.y+direction*bend);
+                c2=ImVec2(to.x,to.y-direction*bend);
+            }
+            draw->AddBezierCubic(from,c1,c2,to,IM_COL32(115,135,160,220),2.f);
+            // Orient the arrowhead along the spline's arrival tangent.
+            const float vx=to.x-c2.x, vy=to.y-c2.y, length=std::sqrt(vx*vx+vy*vy);
+            if(length>1.f) {
+                const float ux=vx/length, uy=vy/length;
+                draw->AddTriangleFilled(to,ImVec2(to.x-ux*10.f-uy*4.f,to.y-uy*10.f+ux*4.f),
+                    ImVec2(to.x-ux*10.f+uy*4.f,to.y-uy*10.f-ux*4.f),IM_COL32(155,175,200,255));
+            }
+        }
+        for (int i=0; i<static_cast<int>(sizeof(nodes)/sizeof(nodes[0])); ++i) {
+            const auto& node=nodes[i];
+            const auto found=graph_states.find(node.key);
+            const std::string state=found == graph_states.end() ? "blocked" : found->second;
+            const bool disabled=graph_busy || state=="blocked";
+            ImGui::SetCursorScreenPos(ImVec2(origin.x+node.col*dx,origin.y+node.row*dy));
+            ImVec4 color = state=="complete" ? ImVec4(.18f,.43f,.26f,1) :
+                state=="running" ? ImVec4(.65f,.38f,.12f,1) :
+                state=="failed" ? ImVec4(.60f,.18f,.18f,1) : ImVec4(.20f,.34f,.58f,1);
+            const ImVec2 node_lo=ImGui::GetCursorScreenPos();
+            draw->AddRectFilled(node_lo,ImVec2(node_lo.x+node_w,node_lo.y+48.f),
+                               IM_COL32(18,22,32,255),ImGui::GetStyle().FrameRounding);
+            ImGui::PushStyleColor(ImGuiCol_Button,color);
+            if(disabled) ImGui::BeginDisabled();
+            std::string label=std::string(node.label)+" ["+state+"]";
+            if(ImGui::Button(label.c_str(),ImVec2(node_w,48))) {
+                graph_action="rebuild";
+                launch_stage(node.key,true);
+                graph_refresh=-100.;
+            }
+            if(disabled) ImGui::EndDisabled();
+            if(state=="running") {
+                // Sweep a soft gold band across the active node. Keep the text
+                // above the animation and the node non-interactive while busy.
+                const ImVec2 lo=ImGui::GetItemRectMin(), hi=ImGui::GetItemRectMax();
+                draw->AddRectFilled(lo,hi,IM_COL32(117,68,24,255),ImGui::GetStyle().FrameRounding);
+                draw->PushClipRect(ImVec2(lo.x+2.f,lo.y+2.f),ImVec2(hi.x-2.f,hi.y-2.f),true);
+                const float band=(hi.x-lo.x)*.32f;
+                const float phase=static_cast<float>(std::fmod(ImGui::GetTime()/1.8,1.0));
+                const float x=lo.x-band+phase*((hi.x-lo.x)+2.f*band);
+                const ImU32 clear=IM_COL32(255,185,65,0), glow=IM_COL32(255,185,65,145);
+                draw->AddRectFilledMultiColor(ImVec2(x-band,lo.y),ImVec2(x,hi.y),clear,glow,glow,clear);
+                draw->AddRectFilledMultiColor(ImVec2(x,lo.y),ImVec2(x+band,hi.y),glow,clear,clear,glow);
+                const ImVec2 text_size=ImGui::CalcTextSize(label.c_str());
+                draw->AddText(ImVec2(lo.x+((hi.x-lo.x)-text_size.x)*.5f,
+                                    lo.y+((hi.y-lo.y)-text_size.y)*.5f),
+                              IM_COL32(255,240,210,255),label.c_str());
+                draw->PopClipRect();
+            }
+            if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(state=="blocked" ? "Complete prerequisites first using Continue." : "Rebuild this node and its downstream dependents. Shared libraries are reused.");
+            ImGui::PopStyleColor();
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x+3*dx,origin.y+5*dy)); ImGui::Dummy(ImVec2(1,1));
+        ImGui::EndChild();
+        bool can_continue=false;
+        for(const auto& item:graph_states) if((item.second=="ready" || item.second=="rebuild needed" || item.second=="failed") && item.first!="cars") can_continue=true;
+        if(graph_busy || !can_continue) ImGui::BeginDisabled();
+        if(stage_button("Continue")) { graph_action="continue"; launch_stage("place",true); graph_refresh=-100.; }
+        if(graph_busy || !can_continue) ImGui::EndDisabled();
+        ImGui::SameLine(); ImGui::TextDisabled("Run the next ready stage, then pause.");
         poll_stage(terrain_stage_status_, terrain_stage_name_,
                    terrain_stage_prog_);
         if (terrain_stage_status_ == 2) {
@@ -7378,6 +7476,7 @@ void Menu::drawTerrainGenPopup() {
                 ImGui::TextDisabled("content/terrain/%s/", name.c_str());
                 ImGui::TextDisabled("its tile caches, prompt file, and every "
                                     "scene object it placed.");
+                ImGui::TextDisabled("Shared house, plant, object and car libraries are kept.");
                 ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f),
                                    "This cannot be undone.");
                 ImGui::Separator();
@@ -7399,20 +7498,11 @@ void Menu::drawTerrainGenPopup() {
 
 
 
-        // The two LIBRARIES depend on no map at all: they are built once
-        // and reused by every world, so they get their own row and their
-        // own runner rather than sitting in the ordered chain.
-        //
-        // They are nonetheless gated on a selected terrain, like every
-        // other build button here.  Not because a library needs the
-        // name — it does not — but because ONE rule that holds for the
-        // whole panel ("name a terrain, then build") is worth more than
-        // an exception a user has to learn: a lone enabled button under
-        // an otherwise empty panel reads as an oversight, and building a
-        // library is only ever a step toward placing it in a world.
-        ImGui::TextDisabled("Sample libraries (world-independent)");
+        // Libraries live outside terrain levels and can be built without selecting a map.
+        ImGui::TextDisabled("Shared libraries: assets/terrain/lib (reused by all terrain levels)");
         const bool lib_busy = (terrain_lib_status_ == 1);
-        if (lib_busy || !have_terrain) ImGui::BeginDisabled();
+        ImGui::Checkbox("Rebuild entire selected library", &rebuild_library_all);
+        if (lib_busy || world_busy || terrain_gen_status_ == 1) ImGui::BeginDisabled();
         if (stage_button("House samples"))
             launch_stage("houses", false);
         if (ImGui::IsItemHovered())
@@ -7421,14 +7511,16 @@ void Menu::drawTerrainGenPopup() {
         if (stage_button("Plant samples"))
             launch_stage("plants", false);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Every species -> lib/plants.glb.");
+            ImGui::SetTooltip("Build the separate stone, tree, shrub, flower and grass libraries.");
         ImGui::SameLine();
         if (stage_button("Room decals"))
             launch_stage("objects", false);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Furniture, lamps, doors -> "
                               "lib/room_decals.glb.");
-        if (lib_busy || !have_terrain) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (stage_button("Car samples")) launch_stage("cars", false);
+        if (lib_busy || world_busy || terrain_gen_status_ == 1) ImGui::EndDisabled();
         poll_stage(terrain_lib_status_, terrain_lib_name_,
                    terrain_lib_prog_);
         if (terrain_lib_status_ == 2) {
