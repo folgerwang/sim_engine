@@ -32,69 +32,7 @@ layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
 };
 
 // set 2 — cluster SSBOs + texture arrays
-layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 0)
-    readonly buffer DrawInfoBuffer {
-    ClusterDrawInfo draw_infos[];
-};
-layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 1)
-    readonly buffer MaterialParamsBuffer {
-    BindlessMaterialParams material_params[];
-};
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = 2)
-    uniform sampler2D base_color_textures[MAX_CLUSTER_TEXTURES];
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = 3)
-    uniform sampler2D normal_textures[MAX_CLUSTER_TEXTURES];
-
-// ── Runtime Virtual Texture (RVT) bindings ──────────────────────────
-// The four pool textures + page table + meta SSBO live on the same
-// descriptor set as the rest of the cluster bindless data (set 2).
-// vt_sample.glsl.h's helpers (`vtSampleAlbedo`, `vtSampleNormal`, …)
-// reference the resource names declared below — the names must match
-// exactly or the included file will fail to compile.
-//
-// When a material's *_vt_id is VT_INVALID_ID (== 0xFFFFFFFF), the
-// shader falls back to the legacy bindless texture arrays declared
-// above; otherwise it routes through `vtResolve` and samples from the
-// pool texture matching the layer encoded in the upper bits of the
-// id.  See virtual_texture.h for the encoding.
-//
-// Order of declarations matters here:
-//   1. vt_types.glsl.h     — declares VirtualTextureMeta + constants.
-//   2. SSBO/sampler bindings (use the struct from step 1).
-//   3. vt_sample.glsl.h    — defines helpers that reference the
-//                            bindings from step 2.
-// GLSL needs every identifier in scope at parse time, so we cannot
-// pull in the helpers until both the struct AND the bindings exist.
-#include "vt_types.glsl.h"
-
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = 4)
-    uniform sampler2D vt_pool_albedo;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = 5)
-    uniform sampler2D vt_pool_normal;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = 6)
-    uniform sampler2D vt_pool_mr_ao;
-layout(set = PBR_MATERIAL_PARAMS_SET, binding = 7)
-    uniform sampler2D vt_pool_emissive;
-layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 8)
-    readonly buffer VtPageTableBuffer {
-    uint vt_page_table[];
-};
-layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 9)
-    readonly buffer VtMetaBuffer {
-    VirtualTextureMeta vt_meta[];
-};
-// VT streaming feedback — one tile-key uint per 8×8 screen block.
-// The cluster fragment shader writes its desired (vt, mip, page) key
-// from the (0,0) fragment of each 8×8 block; the CPU streamer
-// (VirtualTextureManager::tick) reads, dedupes, and acts on requests
-// at frame end.  Buffer is laid out row-major
-// (screen_w / VT_FEEDBACK_BLOCK_SIZE) × (screen_h / VT_FEEDBACK_BLOCK_SIZE)
-// — the row stride lives in the push-constant `vt_feedback_pitch`
-// below so the shader doesn't have to query the swapchain size.
-layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 10)
-    buffer VtFeedbackBuffer {
-    uint vt_feedback[];
-};
+#include "cluster_bindless_bindings.glsl.h"
 
 // Now that the resources above are in scope, pull in the VT sampling
 // helpers.  The header declares `vtSampleAlbedo / vtSampleNormal /
@@ -627,7 +565,7 @@ void main() {
 
     // Alpha mask discard — matches base.frag: if(baseColor.a < alpha_cutoff) discard.
     if ((mat_flags & BINDLESS_MAT_ALPHA_MASK) != 0) {
-        if (albedo4.a < material_params[mat_idx].alpha_cutoff) discard;
+        if (albedo4.a < DBG_CUTOFF(material_params[mat_idx].alpha_cutoff)) discard;
     }
 
     vec3 albedo = albedo4.rgb;
