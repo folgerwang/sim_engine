@@ -1418,6 +1418,13 @@ struct ClusterBVHNodeGPU {
     uint    pad1;
 };
 
+// Push constants for visbuffer_material.comp (the deferred material
+// pass).  Only the dispatch extent -- everything else the pass needs
+// comes from VIEW_PARAMS_SET / PBR_MATERIAL_PARAMS_SET / VISBUF_SET.
+struct VisMaterialPushConstants {
+    uvec2   screen_size;
+};
+
 // Push constants for the cluster culling compute shader.
 struct ClusterCullPushConstants {
     mat4    view_proj;

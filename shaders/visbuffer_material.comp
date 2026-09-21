@@ -123,7 +123,16 @@ void main() {
     vec2 uv_ddx  = vec2(uv_u.y, uv_v.y);
     vec2 uv_ddy  = vec2(uv_u.z, uv_v.z);
 
-    vec3 world_pos = vbInterp3(bary, v0.pos, v1.pos, v2.pos);
+    // World position AND its screen-space derivatives.  The derivatives
+    // are free here (the barycentric solve already produced them) and
+    // are what replaces dFdx(p)/dFdy(p) for the DEPTH_SURFACE relief
+    // normal further down.
+    vec3 wp_x = vbInterp(bary, vec3(v0.pos.x, v1.pos.x, v2.pos.x));
+    vec3 wp_y = vbInterp(bary, vec3(v0.pos.y, v1.pos.y, v2.pos.y));
+    vec3 wp_z = vbInterp(bary, vec3(v0.pos.z, v1.pos.z, v2.pos.z));
+    vec3 world_pos    = vec3(wp_x.x, wp_y.x, wp_z.x);
+    vec3 world_pos_dx = vec3(wp_x.y, wp_y.y, wp_z.y);
+    vec3 world_pos_dy = vec3(wp_x.z, wp_y.z, wp_z.z);
     vec3 v_normal  = vbInterp3(bary, v0.nrm, v1.nrm, v2.nrm);
     vec4 v_tangent = vec4(vbInterp3(bary, v0.tan.xyz, v1.tan.xyz, v2.tan.xyz),
                           v0.tan.w);
@@ -171,18 +180,39 @@ void main() {
         if (leaf_mask) depth_orm.b = 0.0;
         vec3 T = normalize(v_tangent.xyz - dot(v_tangent.xyz, N) * N);
         vec3 B = cross(N, T) * v_tangent.w;
+        // Explicit-LOD forms of the depth_pbr helpers -- textureQueryLod
+        // and dFdx are fragment-only, and the mip is derived here from
+        // the analytic UV gradients instead.  Same core functions the
+        // raster path runs, so the two paths cannot diverge.
+        float dp_lod = depthPbrLodFromGrad(
+            normal_textures[nonuniformEXT(norm_idx)], uv_ddx, uv_ddy);
         if (depth_surface && depth_tile > 0.0) {
-            depth_orm = depthTriplanarSample(
+            depth_orm = depthTriplanarSampleLod(
                 normal_textures[nonuniformEXT(norm_idx)],
-                world_pos, N, depth_tile);
-            N = depthWorldNormal(depth_orm.a, world_pos, N,
-                                 depth_scale * depth_tile);
+                world_pos, N, depth_tile, max(dp_lod, 0.0));
+            // d(height)/d(screen x,y) by finite difference along the
+            // analytic world-position gradients -- two extra triplanar
+            // taps, and only for DEPTH_SURFACE materials (rock / terrain
+            // decals), never for the foliage this pass exists to speed
+            // up.
+            float h_dx = depthTriplanarSampleLod(
+                normal_textures[nonuniformEXT(norm_idx)],
+                world_pos + world_pos_dx, N, depth_tile,
+                max(dp_lod, 0.0)).a - depth_orm.a;
+            float h_dy = depthTriplanarSampleLod(
+                normal_textures[nonuniformEXT(norm_idx)],
+                world_pos + world_pos_dy, N, depth_tile,
+                max(dp_lod, 0.0)).a - depth_orm.a;
+            N = depthWorldNormalGrad(N, depth_scale * depth_tile,
+                                     world_pos_dx, world_pos_dy,
+                                     h_dx, h_dy);
         } else if (depth_surface) {
-            N = normalize(mat3(T, B, N) * depthSurfaceNormal(
-                normal_textures[nonuniformEXT(norm_idx)], uv, depth_scale));
+            N = normalize(mat3(T, B, N) * depthSurfaceNormalLod(
+                normal_textures[nonuniformEXT(norm_idx)], uv, depth_scale,
+                dp_lod));
         } else {
-            N = normalize(mat3(T, B, N) * depthPbrNormal(
-                normal_textures[nonuniformEXT(norm_idx)], uv));
+            N = normalize(mat3(T, B, N) * depthPbrNormalLod(
+                normal_textures[nonuniformEXT(norm_idx)], uv, dp_lod));
         }
     } else if (!leaf_mask && (has_vt_norm || norm_idx >= 0)) {
         vec4 raw_n = vec4(0.5, 0.5, 1.0, 1.0);

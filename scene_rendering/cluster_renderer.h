@@ -401,6 +401,37 @@ private:
     // hasn't been initialised so legacy forward callers are unaffected.
     std::shared_ptr<renderer::Pipeline>            bindless_gbuffer_pipeline_;
 
+    // ── Visibility-buffer (Nanite-style deferred material) variant ───────
+    // Two pipelines replacing the single G-buffer raster pass:
+    //
+    //   1. visbuffer_pipeline_ rasterises cluster_bindless.vert +
+    //      cluster_visbuffer.frag into ONE R32G32_UINT target holding
+    //      (cluster_idx+1, gl_PrimitiveID).  It still has to run the
+    //      cutout alpha fetch (leaves are holes, and the depth test has
+    //      to see through them), but nothing else -- no normal map, no
+    //      PBR chain, no four-target write.
+    //   2. visbuffer_material_pipeline_ is a compute pass, one thread per
+    //      pixel, that rebuilds the winning triangle and evaluates the
+    //      material EXACTLY ONCE per pixel, writing the same four
+    //      G-buffer targets the raster path wrote, so deferred_resolve
+    //      .comp is untouched.
+    //
+    // The win is entirely in overdraw: a crown pixel with 20 stacked leaf
+    // fragments paid 20 full material evaluations on the raster path and
+    // pays 1 here.  See design/NANITE_VISIBILITY_BUFFER.md.
+    //
+    // Both live lazily; initVisBufferPipelines() must be called after
+    // initBindlessPipeline().  Everything no-ops when they are null, so
+    // the legacy G-buffer path stays the fallback in the same build.
+    std::shared_ptr<renderer::Pipeline>            visbuffer_pipeline_;
+    std::shared_ptr<renderer::DescriptorSetLayout> visbuffer_desc_set_layout_;
+    std::shared_ptr<renderer::DescriptorSet>       visbuffer_desc_set_;
+    std::shared_ptr<renderer::PipelineLayout>      visbuffer_material_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            visbuffer_material_pipeline_;
+    // Set by updateVisBufferTargets(); the dispatch no-ops until the
+    // application has handed us a visibility target and G-buffer views.
+    bool                                           visbuffer_targets_bound_ = false;
+
     // ── CSM shadow variant ───────────────────────────────────────────────
     // Depth-only single-pass CSM pipeline + its own slim layout.  Built
     // from a mesh shader (cluster_bindless_shadow.mesh) — see the comment
@@ -757,6 +788,7 @@ private:
     // buys little; keep it opt-in until the gather is made conservative
     // (full texel-grid loop over the footprint instead of 4 corners).
     bool use_hiz_occlusion_cull_ = false;
+    bool use_visibility_buffer_ = false;
 
     // Hi-Z pyramid handles supplied via setHiZTexture().  view + sampler
     // get bound at descriptor binding 11 of the cull set; size + mip
@@ -1100,6 +1132,75 @@ public:
         return drawOpaqueGBuffer(cmd_buf, desc_sets, viewports, scissors);
     }
 
+    // ── Visibility buffer (Nanite-style deferred material shading) ───────
+    // Build the two pipelines.  Must be called AFTER initBindlessPipeline
+    // (it reuses bindless_pipeline_layout_ for the raster half) and after
+    // the caller knows the visibility target format.  `vis_format` is a
+    // single-attachment R32G32_UINT colour format plus the scene depth
+    // format -- exactly the G-buffer setup with three attachments removed.
+    // `global_desc_set_layouts` is the same list initBindlessPipeline got;
+    // the compute half needs VIEW_PARAMS_SET from it.
+    //
+    // No-ops if the bindless path never came up, or if called twice.
+    void initVisBufferPipelines(
+        const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+        const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+        const renderer::PipelineRenderbufferFormats& vis_format);
+
+    // Point the material pass at this frame's targets.  Call once at
+    // startup and again after every swap-chain rebuild -- the image views
+    // change and a stale descriptor set would sample destroyed memory.
+    // All five views must be non-null; passing any null unbinds the pass
+    // (dispatchVisBufferMaterial then no-ops) rather than half-updating.
+    void updateVisBufferTargets(
+        const std::shared_ptr<renderer::ImageView>& vis_view,
+        const std::shared_ptr<renderer::ImageView>& gbuf_albedo_view,
+        const std::shared_ptr<renderer::ImageView>& gbuf_normal_view,
+        const std::shared_ptr<renderer::ImageView>& gbuf_emissive_view,
+        const std::shared_ptr<renderer::ImageView>& gbuf_velocity_view);
+
+    // Visibility raster, Phase A / Phase B.  Byte-for-byte the same
+    // indirect draws as drawOpaqueGBufferPhaseA/B -- only the bound
+    // pipeline (and therefore the fragment shader and the attachment
+    // set) differs.  Caller must have an active dynamic-rendering pass
+    // with the R32G32_UINT visibility attachment + scene depth bound.
+    uint32_t drawVisBufferPhaseA(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
+    uint32_t drawVisBufferPhaseB(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<renderer::Viewport>& viewports,
+        const std::vector<renderer::Scissor>& scissors);
+
+    // Deferred material resolve.  Must run OUTSIDE any dynamic-rendering
+    // pass, after the visibility raster has completed and its writes have
+    // been made visible to the compute stage, and before
+    // deferred_resolve.comp reads the G-buffer.  The caller owns the
+    // barriers on the visibility image (COLOR_ATTACHMENT_OPTIMAL ->
+    // GENERAL) and on the four G-buffer images (-> GENERAL).
+    //
+    // `desc_sets` must carry VIEW_PARAMS_SET; PBR_MATERIAL_PARAMS_SET is
+    // filled in here with the bindless set, exactly as the raster draws
+    // do.  No-ops until initVisBufferPipelines + updateVisBufferTargets
+    // have both run.
+    void dispatchVisBufferMaterial(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const glm::uvec2& screen_size);
+
+    // True once both visibility pipelines exist AND their targets are
+    // bound -- the application uses this to decide whether the runtime
+    // "use visibility buffer" toggle can actually be honoured this frame.
+    bool visBufferReady() const {
+        return visbuffer_pipeline_ != nullptr &&
+               visbuffer_material_pipeline_ != nullptr &&
+               visbuffer_targets_bound_;
+    }
+
     // Reset the persistent visibility bit set to all zeros.  Called
     // between Phase A and Phase B each frame so that Phase B's atomicOr
     // writes produce the correct "visible this frame" set without any
@@ -1340,6 +1441,15 @@ public:
     bool& getDebugDrawBBox() { return debug_draw_bbox_; }
     bool& getDebugDistanceCull() { return debug_distance_cull_; }
     bool& getUseHiZOcclusionCull() { return use_hiz_occlusion_cull_; }
+
+    // Runtime A/B switch between the two opaque-cluster shading paths.
+    // Lives here rather than on the application so the cluster debug
+    // menu can reach it the same way it reaches the Hi-Z toggle; the
+    // application reads it once per frame and ANDs it with
+    // visBufferReady().  Flipping it mid-flight is safe -- both paths
+    // write the same four G-buffer targets and neither carries state
+    // across frames.
+    bool& getUseVisibilityBuffer() { return use_visibility_buffer_; }
 
     // ── Software-RT shadow accessors ────────────────────────────────────
     // rtShadowReady(): the BVH + descriptor set exist (finalizeUploads

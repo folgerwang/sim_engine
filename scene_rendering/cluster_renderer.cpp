@@ -629,6 +629,8 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         if ((values.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0)
                             mp.flags |= BINDLESS_MAT_LEAF_AGE |
                                 PACK_BINDLESS_LEAF_GROUP(UNPACK_LEAF_GROUP(values.material_features));
+                        if ((values.material_features & FEATURE_MATERIAL_GROUND_CARD) != 0)
+                            mp.flags |= BINDLESS_MAT_GROUND_CARD;
                         mp.flags |= int((values.pad_3 & 1023u) << BINDLESS_MAT_TREE_PROFILE_SHIFT);
                         mp.flags |= int((values.pad_3 & 1023u) << BINDLESS_MAT_TREE_PROFILE_SHIFT);
                         depth_scale = values.normal_scale;
@@ -820,6 +822,10 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                                    lname.begin(), [](unsigned char c) {
                                        return std::tolower(c);
                                    });
+                    // v44: belt and braces for the RT builders -- the
+                    // material's UBO may not carry the feature bit yet.
+                    if (lname.rfind("clutter_", 0) == 0)
+                        mp.flags |= BINDLESS_MAT_GROUND_CARD;
                     if (lname.find("leaf") != std::string::npos ||
                         lname.find("foliage") != std::string::npos ||
                         // Keep in lockstep with the drawable-path
@@ -3068,44 +3074,55 @@ void ClusterRenderer::initBindlessPipeline(
     // binding 10: VtFeedback  SSBO (uint[])  — streaming requests
     {
         std::vector<er::DescriptorSetLayoutBinding> bindings(11);
+        // Every binding here is ALSO visible to COMPUTE.  The
+        // visibility-buffer material pass (visbuffer_material.comp) binds
+        // this exact set and reads the draw infos, material params, the
+        // legacy bindless texture arrays and the whole VT chain from a
+        // compute shader.  A descriptor read from a stage the layout
+        // binding does not list is undefined behaviour (and a validation
+        // error), so the stage masks below are the union of every stage
+        // that touches the set -- not an oversight.
+        const auto kFragCompute =
+            SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT) |
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT);
         bindings[0] = er::helper::getBufferDescriptionSetLayoutBinding(
-            0, SET_FLAG_BIT(ShaderStage, VERTEX_BIT) |
-               SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            0, SET_FLAG_BIT(ShaderStage, VERTEX_BIT) | kFragCompute,
             er::DescriptorType::STORAGE_BUFFER);
         bindings[1] = er::helper::getBufferDescriptionSetLayoutBinding(
-            1, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            1, kFragCompute,
             er::DescriptorType::STORAGE_BUFFER);
         // Base-colour texture array.
         auto tex_binding = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
-            2, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            2, kFragCompute,
             er::DescriptorType::COMBINED_IMAGE_SAMPLER);
         tex_binding.descriptor_count = MAX_CLUSTER_TEXTURES;
         bindings[2] = tex_binding;
         // Normal-map texture array.
         auto norm_binding = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
-            3, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            3, kFragCompute,
             er::DescriptorType::COMBINED_IMAGE_SAMPLER);
         norm_binding.descriptor_count = MAX_CLUSTER_TEXTURES;
         bindings[3] = norm_binding;
         // VT pool samplers (one per layer — albedo, normal, mr_ao, emissive).
         for (uint32_t l = 0; l < 4; ++l) {
             auto vt_pool_binding = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
-                4u + l, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+                4u + l, kFragCompute,
                 er::DescriptorType::COMBINED_IMAGE_SAMPLER);
             bindings[4u + l] = vt_pool_binding;
         }
         // VT page table SSBO.
         bindings[8] = er::helper::getBufferDescriptionSetLayoutBinding(
-            8, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            8, kFragCompute,
             er::DescriptorType::STORAGE_BUFFER);
         // VT meta SSBO.
         bindings[9] = er::helper::getBufferDescriptionSetLayoutBinding(
-            9, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            9, kFragCompute,
             er::DescriptorType::STORAGE_BUFFER);
-        // VT feedback SSBO — fragment shader writes one tile-key per
+        // VT feedback SSBO — the shading stage (fragment on the raster
+        // path, compute on the visibility path) writes one tile-key per
         // 8×8 screen block; the streamer reads at frame end.
         bindings[10] = er::helper::getBufferDescriptionSetLayoutBinding(
-            10, SET_FLAG_BIT(ShaderStage, FRAGMENT_BIT),
+            10, kFragCompute,
             er::DescriptorType::STORAGE_BUFFER);
         bindless_desc_set_layout_ = device_->createDescriptorSetLayout(bindings);
     }
@@ -3958,6 +3975,399 @@ uint32_t ClusterRenderer::drawOpaqueGBuffer(
         draw_count_buffer_, 0,
         total_clusters_all_meshes_);
     return total_visible_all_meshes_;
+}
+
+
+// ─── Visibility buffer (Nanite-style deferred material shading) ──────────
+//
+// The problem this solves, measured on the tree-heavy view with Nsight
+// GPU Trace: 151 ms/frame with L1TEX saturated, SM warp occupancy pegged
+// and SM throughput near zero -- the signature of a texture-latency-bound
+// pass.  Root cause: cluster_bindless.frag `discard`s for the leaf cutout,
+// which defeats early-Z, so every one of the 10-30 leaf fragments stacked
+// on a crown pixel ran the FULL material chain (VT resolve + albedo +
+// normal + MR/AO + emissive, five dependent VT chains each) before the
+// depth test threw 29 of them away.
+//
+// Nanite's answer -- and the only half of Nanite that addresses this frame
+// (the cluster DAG and software raster target triangle count, which is not
+// what is slow here) -- is to split raster from shading:
+//
+//   Pass 1 (raster, visbuffer_pipeline_): same geometry, same indirect
+//     draws, same depth test, but the fragment shader writes only
+//     (cluster_idx+1, gl_PrimitiveID) to one R32G32_UINT target.  It still
+//     fetches cutout alpha -- it must, or the depth buffer would be wrong
+//     -- but that is ONE VT chain instead of five, and nothing else runs.
+//
+//   Pass 2 (compute, visbuffer_material_pipeline_): one thread per pixel.
+//     Reads the visibility buffer, rebuilds the winning triangle from the
+//     merged vertex/index buffers, computes perspective-correct
+//     barycentrics AND their screen-space derivatives analytically (the
+//     Schied & Dachsbacher deferred-attribute-interpolation formulation --
+//     there is no dFdx in a compute shader), and runs the material chain
+//     ONCE.  It writes the same four G-buffer targets the raster path
+//     wrote, so deferred_resolve.comp and everything downstream is
+//     untouched.
+//
+// So the hidden fragments cost one alpha fetch and nothing else, and the
+// visible one costs exactly what it always did.  Material cost per pixel
+// goes from O(overdraw) to O(1).
+//
+// Correctness rests on one property of this engine, checked before any of
+// this was written: the cluster path does NO vertex animation.
+// cluster_bindless.vert passes pre-baked world positions straight through,
+// so the triangle pass 2 rebuilds from the merged buffers is bit-for-bit
+// the triangle pass 1 rasterised.  If vertex animation is ever added to
+// the cluster path, this pass breaks and the fix is to write interpolated
+// attributes (or a transform id) alongside the ids.
+//
+// What this does NOT do, deliberately: no cluster DAG, no LOD hierarchy,
+// no software rasteriser.  See design/NANITE_VISIBILITY_BUFFER.md -- none
+// of those are justified by any measurement taken on this scene, and leaf
+// slivers are close to a worst case for quadric simplification.
+
+void ClusterRenderer::initVisBufferPipelines(
+    const renderer::DescriptorSetLayoutList& global_desc_set_layouts,
+    const renderer::GraphicPipelineInfo& graphic_pipeline_info,
+    const renderer::PipelineRenderbufferFormats& vis_format) {
+
+    // Same guard as initBindlessGBufferPipeline: if the bindless path
+    // never came up there is no merged geometry to rasterise and the
+    // application falls back to the legacy G-buffer path.
+    if (!gpu_ready_ || !bindless_pipeline_layout_ ||
+        !bindless_desc_set_layout_) {
+        return;
+    }
+    if (visbuffer_pipeline_ && visbuffer_material_pipeline_) {
+        return;   // already built
+    }
+
+    // ── Pass 1: visibility raster ────────────────────────────────────
+    // Reuses bindless_pipeline_layout_ verbatim -- the vertex shader is
+    // literally the same SPV the G-buffer path uses, and the fragment
+    // shader reads the same bindless set for the cutout alpha.  Only the
+    // fragment SPV and the attachment format change.
+    if (!visbuffer_pipeline_) {
+        std::vector<er::VertexInputBindingDescription> binding_descs(1);
+        binding_descs[0].binding    = 0;
+        binding_descs[0].stride     = sizeof(BindlessVertex);
+        binding_descs[0].input_rate = er::VertexInputRate::VERTEX;
+
+        // Packed 24 B BindlessVertex -- identical to the description in
+        // initBindlessPipeline / initBindlessGBufferPipeline.  Mirrored
+        // rather than factored out to keep this addition self-contained.
+        std::vector<er::VertexInputAttributeDescription> attrib_descs(4);
+        attrib_descs[0].binding  = 0;
+        attrib_descs[0].location = 0;
+        attrib_descs[0].format   = er::Format::R32G32B32_SFLOAT;
+        attrib_descs[0].offset   = offsetof(BindlessVertex, position);
+        attrib_descs[1].binding  = 0;
+        attrib_descs[1].location = 1;
+        attrib_descs[1].format   = er::Format::R32_UINT;
+        attrib_descs[1].offset   = offsetof(BindlessVertex, packed_normal);
+        attrib_descs[2].binding  = 0;
+        attrib_descs[2].location = 2;
+        attrib_descs[2].format   = er::Format::R32_UINT;
+        attrib_descs[2].offset   = offsetof(BindlessVertex, packed_uv);
+        attrib_descs[3].binding  = 0;
+        attrib_descs[3].location = 3;
+        attrib_descs[3].format   = er::Format::R32_UINT;
+        attrib_descs[3].offset   = offsetof(BindlessVertex, packed_tangent);
+
+        er::PipelineInputAssemblyStateCreateInfo input_assembly;
+        input_assembly.topology       = er::PrimitiveTopology::TRIANGLE_LIST;
+        input_assembly.restart_enable = false;
+
+        // Double-sided for the same reason the G-buffer path is: leaf
+        // cards are single-quad geometry seen from both sides, and the
+        // material pass recovers facing from the screen-space winding of
+        // the rebuilt triangle rather than gl_FrontFacing.
+        er::RasterizationStateOverride raster_override{};
+        raster_override.override_double_sided = true;
+        raster_override.double_sided          = true;
+
+        // One integer attachment, no blending -- blending an id would be
+        // meaningless.  (Vulkan would reject blend on a UINT format
+        // anyway; this is stated explicitly so the intent is not mistaken
+        // for an oversight.)
+        std::vector<er::PipelineColorBlendAttachmentState> vis_no_blend(
+            vis_format.color_formats.size(),
+            er::helper::fillPipelineColorBlendAttachmentState());
+        auto vis_blend_state =
+            std::make_shared<er::PipelineColorBlendStateCreateInfo>(
+                er::helper::fillPipelineColorBlendStateCreateInfo(
+                    vis_no_blend));
+
+        er::GraphicPipelineInfo vis_info = graphic_pipeline_info;
+        vis_info.blend_state_info = vis_blend_state;
+
+        er::ShaderModuleList vis_shader_modules(2);
+        vis_shader_modules[0] = er::helper::loadShaderModule(
+            device_, "cluster_bindless_vert.spv",
+            er::ShaderStageFlagBits::VERTEX_BIT,
+            std::source_location::current());
+        vis_shader_modules[1] = er::helper::loadShaderModule(
+            device_, "cluster_visbuffer_frag.spv",
+            er::ShaderStageFlagBits::FRAGMENT_BIT,
+            std::source_location::current());
+
+        visbuffer_pipeline_ = device_->createPipeline(
+            bindless_pipeline_layout_,
+            binding_descs,
+            attrib_descs,
+            input_assembly,
+            vis_info,
+            vis_shader_modules,
+            vis_format,
+            raster_override,
+            std::source_location::current());
+    }
+
+    // ── Pass 2: deferred material compute ────────────────────────────
+    if (!visbuffer_material_pipeline_) {
+        // VISBUF_SET layout -- see the binding constants in
+        // global_definition.glsl.h, which visbuffer_material.comp uses
+        // for its layout() decorations, so the two cannot drift.
+        //   0  merged vertex buffer   SSBO
+        //   1  merged index buffer    SSBO
+        //   2  visibility target      storage image (rg32ui, read)
+        //   3  G-buffer albedo/AO     storage image (rgba8,  write)
+        //   4  G-buffer normal/rough  storage image (rgba8,  write)
+        //   5  G-buffer emissive/met  storage image (rgba8,  write)
+        //   6  G-buffer velocity      storage image (rg16f,  write)
+        if (!visbuffer_desc_set_layout_) {
+            std::vector<er::DescriptorSetLayoutBinding> vb_bindings;
+            vb_bindings.push_back(
+                er::helper::getBufferDescriptionSetLayoutBinding(
+                    VISBUF_VERTEX_BUFFER,
+                    SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                    er::DescriptorType::STORAGE_BUFFER));
+            vb_bindings.push_back(
+                er::helper::getBufferDescriptionSetLayoutBinding(
+                    VISBUF_INDEX_BUFFER,
+                    SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                    er::DescriptorType::STORAGE_BUFFER));
+            for (uint32_t b : { uint32_t(VISBUF_VIS_IMAGE),
+                                uint32_t(VISBUF_GBUF_ALBEDO),
+                                uint32_t(VISBUF_GBUF_NORMAL),
+                                uint32_t(VISBUF_GBUF_EMISSIVE),
+                                uint32_t(VISBUF_GBUF_VELOCITY) }) {
+                vb_bindings.push_back(
+                    er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+                        b, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                        er::DescriptorType::STORAGE_IMAGE));
+            }
+            visbuffer_desc_set_layout_ =
+                device_->createDescriptorSetLayout(vb_bindings);
+        }
+
+        // Pipeline layout: the compute pass binds VIEW_PARAMS_SET (camera
+        // + previous-frame VP for velocity), PBR_MATERIAL_PARAMS_SET (the
+        // cluster bindless set: draw infos, material params, VT pool and
+        // page tables) and VISBUF_SET.  Vulkan forbids gaps, so every slot
+        // in between gets an empty layout -- the same trick
+        // initBindlessPipeline uses for SKIN_PARAMS_SET.
+        er::DescriptorSetLayoutList all_layouts;
+        all_layouts.resize(VISBUF_SET + 1, nullptr);
+        for (uint32_t i = 0;
+             i < static_cast<uint32_t>(global_desc_set_layouts.size()) &&
+             i <= VISBUF_SET; ++i) {
+            all_layouts[i] = global_desc_set_layouts[i];
+        }
+        all_layouts[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_layout_;
+        all_layouts[VISBUF_SET]              = visbuffer_desc_set_layout_;
+
+        auto empty_layout = device_->createDescriptorSetLayout({});
+        for (auto& layout : all_layouts) {
+            if (!layout) layout = empty_layout;
+        }
+
+        visbuffer_material_pipeline_layout_ =
+            er::helper::createComputePipelineLayout(
+                device_, all_layouts,
+                sizeof(glsl::VisMaterialPushConstants));
+
+        visbuffer_material_pipeline_ = er::helper::createComputePipeline(
+            device_,
+            visbuffer_material_pipeline_layout_,
+            "visbuffer_material_comp.spv",
+            std::source_location::current());
+
+        if (!visbuffer_desc_set_) {
+            visbuffer_desc_set_ = device_->createDescriptorSets(
+                descriptor_pool_, visbuffer_desc_set_layout_, 1)[0];
+        }
+    }
+}
+
+// Bind the merged geometry (constant for the lifetime of the merge) and
+// this frame's render targets (which change on every swap-chain rebuild)
+// into VISBUF_SET.  The geometry half could be written once at merge
+// time, but writing all seven together keeps the "descriptor set is
+// valid iff this returned true" invariant in one place, and this runs
+// once per resize, not per frame.
+void ClusterRenderer::updateVisBufferTargets(
+    const std::shared_ptr<renderer::ImageView>& vis_view,
+    const std::shared_ptr<renderer::ImageView>& gbuf_albedo_view,
+    const std::shared_ptr<renderer::ImageView>& gbuf_normal_view,
+    const std::shared_ptr<renderer::ImageView>& gbuf_emissive_view,
+    const std::shared_ptr<renderer::ImageView>& gbuf_velocity_view) {
+
+    visbuffer_targets_bound_ = false;
+
+    if (!visbuffer_desc_set_ || !gpu_ready_ ||
+        total_merged_vertices_ == 0 || total_merged_indices_ == 0) {
+        return;
+    }
+    // All-or-nothing: a half-updated set would leave a stale view bound
+    // and the dispatch would write through freed memory after a resize.
+    if (!vis_view || !gbuf_albedo_view || !gbuf_normal_view ||
+        !gbuf_emissive_view || !gbuf_velocity_view) {
+        return;
+    }
+
+    er::WriteDescriptorList writes;
+    writes.reserve(7);
+
+    er::Helper::addOneBuffer(writes, visbuffer_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, VISBUF_VERTEX_BUFFER,
+        merged_vertex_buffer_.buffer,
+        static_cast<uint32_t>(
+            total_merged_vertices_ * sizeof(BindlessVertex)));
+    er::Helper::addOneBuffer(writes, visbuffer_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, VISBUF_INDEX_BUFFER,
+        merged_index_buffer_.buffer,
+        static_cast<uint32_t>(total_merged_indices_ * sizeof(uint32_t)));
+
+    // GENERAL layout for all five: the visibility target is read as a
+    // storage image here (not sampled), and the four G-buffer targets are
+    // written as storage images.  The application transitions them.
+    const std::pair<uint32_t, std::shared_ptr<er::ImageView>> img_binds[] = {
+        { uint32_t(VISBUF_VIS_IMAGE),      vis_view },
+        { uint32_t(VISBUF_GBUF_ALBEDO),    gbuf_albedo_view },
+        { uint32_t(VISBUF_GBUF_NORMAL),    gbuf_normal_view },
+        { uint32_t(VISBUF_GBUF_EMISSIVE),  gbuf_emissive_view },
+        { uint32_t(VISBUF_GBUF_VELOCITY),  gbuf_velocity_view },
+    };
+    for (const auto& [binding, view] : img_binds) {
+        er::Helper::addOneTexture(
+            writes, visbuffer_desc_set_,
+            er::DescriptorType::STORAGE_IMAGE,
+            binding, nullptr, view,
+            er::ImageLayout::GENERAL);
+    }
+
+    device_->updateDescriptorSets(writes);
+    visbuffer_targets_bound_ = true;
+}
+
+// Phase A / Phase B visibility raster.  These are drawOpaqueGBufferPhaseA
+// / drawOpaqueGBuffer with one line changed (the bound pipeline), kept as
+// separate functions rather than a bool parameter so that the call sites
+// in application.cpp read the same way the existing ones do.
+uint32_t ClusterRenderer::drawVisBufferPhaseA(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !visbuffer_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, visbuffer_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_pipeline_layout_, all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    cmd_buf->drawIndexedIndirectCount(
+        indirect_draw_buffer_phase_a_, 0,
+        draw_count_buffer_phase_a_, 0,
+        total_clusters_all_meshes_);
+    return total_visible_all_meshes_;
+}
+
+uint32_t ClusterRenderer::drawVisBufferPhaseB(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const std::vector<renderer::Viewport>& viewports,
+    const std::vector<renderer::Scissor>& scissors) {
+    if (!gpu_ready_ || !visbuffer_pipeline_ || !bindless_desc_set_) {
+        return 0;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    while (all_desc_sets.size() <= PBR_MATERIAL_PARAMS_SET) {
+        all_desc_sets.push_back(nullptr);
+    }
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::GRAPHICS, visbuffer_pipeline_);
+    cmd_buf->setViewports(viewports);
+    cmd_buf->setScissors(scissors);
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::GRAPHICS,
+        bindless_pipeline_layout_, all_desc_sets);
+    cmd_buf->bindVertexBuffers(
+        0, { merged_vertex_buffer_.buffer }, { 0 });
+    cmd_buf->bindIndexBuffer(
+        merged_index_buffer_.buffer, 0, er::IndexType::UINT32);
+
+    // Phase B reads the standard opaque indirect buffer, which cullPhaseB
+    // fills with the COMPLETE visible set for this frame (it overwrites
+    // Phase A's count) -- same contract as drawOpaqueGBuffer.
+    cmd_buf->drawIndexedIndirectCount(
+        indirect_draw_buffer_, 0,
+        draw_count_buffer_, 0,
+        total_clusters_all_meshes_);
+    return total_visible_all_meshes_;
+}
+
+void ClusterRenderer::dispatchVisBufferMaterial(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const renderer::DescriptorSetList& desc_sets,
+    const glm::uvec2& screen_size) {
+    if (!visBufferReady() || !bindless_desc_set_) {
+        return;
+    }
+    if (screen_size.x == 0 || screen_size.y == 0) {
+        return;
+    }
+
+    er::DescriptorSetList all_desc_sets = desc_sets;
+    all_desc_sets.resize(VISBUF_SET + 1, nullptr);
+    all_desc_sets[PBR_MATERIAL_PARAMS_SET] = bindless_desc_set_;
+    all_desc_sets[VISBUF_SET]              = visbuffer_desc_set_;
+
+    glsl::VisMaterialPushConstants push{};
+    push.screen_size = screen_size;
+
+    cmd_buf->bindPipeline(
+        er::PipelineBindPoint::COMPUTE, visbuffer_material_pipeline_);
+    cmd_buf->pushConstants(
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        visbuffer_material_pipeline_layout_, &push, sizeof(push));
+    cmd_buf->bindDescriptorSets(
+        er::PipelineBindPoint::COMPUTE,
+        visbuffer_material_pipeline_layout_, all_desc_sets);
+
+    // 8x8 workgroup -- matches local_size in visbuffer_material.comp.
+    cmd_buf->dispatch(
+        (screen_size.x + 7) / 8,
+        (screen_size.y + 7) / 8);
 }
 
 // ─── Cluster CSM shadow pipeline + draw ──────────────────────────────────
@@ -5326,15 +5736,27 @@ void ClusterRenderer::buildHwRtShadowAs() {
         const uint32_t flags = static_cast<uint32_t>(m.flags);
         // Translucent never occludes the sun (parity with raster + SW RT).
         if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+        if ((flags & BINDLESS_MAT_GROUND_CARD) != 0u) continue;   // v44: ground clutter casts nothing
         // All tree leaf LODs enter the hardware-opaque BLAS stream.
         // This sets VK_GEOMETRY_OPAQUE_BIT_KHR via makeTriGeom(..., true),
         // bypassing candidate/alpha callbacks rather than merely skipping
         // texture reads in the shader. Raster material flags stay unchanged.
-        const bool opaque_tree_leaf =
+        // ...except the GROUND CARDS (clutter_grass*/clutter_far_*): a
+        // flat quad whose plant is only its alpha, entered opaque, is a
+        // solid square shadow lying on the meadow.  Those stay masked.
+        // v42: leaf cards are MASKED geometry like any other cutout, so
+        // a shadow ray tests the texel at the hit (deferred_resolve.comp)
+        // and the shadow is the leaf, not the card.  This is the cost the
+        // opaque shortcut was avoiding -- most BLAS triangles are leaf
+        // cards -- and it is paid on purpose: a card-shaped shadow under
+        // every shrub was the visible price of the shortcut.
+        const bool leaf_mat =
             (flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u;
-        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u && !opaque_tree_leaf;
-        if (masked && m.base_color_tex_idx < 0 && (flags & BINDLESS_MAT_LEAF_AGE) == 0u) {
-            // Texture-less cutout: constant alpha decides once.
+        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u || leaf_mat;
+        if (masked && m.base_color_tex_idx < 0 && !leaf_mat) {
+            // Texture-less cutout: constant alpha decides once.  (A
+            // textureless LEAF material stays masked: the shader gates it
+            // by its cohort's season.)
             if (m.base_color_factor.a < m.alpha_cutoff) continue;
             masked = false;
         }
@@ -5883,14 +6305,24 @@ int32_t ClusterRenderer::ensureRtMeshSlot(
         const glsl::BindlessMaterialParams& m = staging_material_params_[mat];
         const uint32_t flags = static_cast<uint32_t>(m.flags);
         if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0u) continue;
+        if ((flags & BINDLESS_MAT_GROUND_CARD) != 0u) continue;   // v44: ground clutter casts nothing
         // All tree leaf LODs enter the hardware-opaque BLAS stream.
         // This sets VK_GEOMETRY_OPAQUE_BIT_KHR via makeTriGeom(..., true),
         // bypassing candidate/alpha callbacks rather than merely skipping
         // texture reads in the shader. Raster material flags stay unchanged.
-        const bool opaque_tree_leaf =
+        // ...except the GROUND CARDS (clutter_grass*/clutter_far_*): a
+        // flat quad whose plant is only its alpha, entered opaque, is a
+        // solid square shadow lying on the meadow.  Those stay masked.
+        // v42: leaf cards are MASKED geometry like any other cutout, so
+        // a shadow ray tests the texel at the hit (deferred_resolve.comp)
+        // and the shadow is the leaf, not the card.  This is the cost the
+        // opaque shortcut was avoiding -- most BLAS triangles are leaf
+        // cards -- and it is paid on purpose: a card-shaped shadow under
+        // every shrub was the visible price of the shortcut.
+        const bool leaf_mat =
             (flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u;
-        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u && !opaque_tree_leaf;
-        if (masked && m.base_color_tex_idx < 0) {
+        bool masked = (flags & BINDLESS_MAT_ALPHA_MASK) != 0u || leaf_mat;
+        if (masked && m.base_color_tex_idx < 0 && !leaf_mat) {
             if (m.base_color_factor.a < m.alpha_cutoff) continue;
             masked = false;
         }
@@ -6658,6 +7090,12 @@ void ClusterRenderer::destroy() {
     bindless_translucent_pipeline_.reset();
     bindless_translucent_oit_pipeline_.reset();
     bindless_gbuffer_pipeline_.reset();
+    visbuffer_pipeline_.reset();
+    visbuffer_material_pipeline_.reset();
+    visbuffer_material_pipeline_layout_.reset();
+    visbuffer_desc_set_layout_.reset();
+    visbuffer_desc_set_.reset();
+    visbuffer_targets_bound_ = false;
     bindless_shadow_pipeline_.reset();
     bindless_shadow_pipeline_layout_.reset();
     bindless_pipeline_layout_.reset();

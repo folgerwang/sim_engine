@@ -3034,6 +3034,35 @@ bool Menu::draw(
             if (ImGui::Checkbox("Hi-Z Occlusion Cull", &hiz_cull)) {
                 cluster_renderer_->getUseHiZOcclusionCull() = hiz_cull;
             }
+            // Visibility buffer (Nanite-style deferred material
+            // shading).  On, the cluster opaque pass rasterises only
+            // (cluster_idx+1, primitive_id) into an R32G32_UINT target
+            // and a compute pass evaluates the material once per PIXEL;
+            // off, the legacy 4-RT G-buffer raster evaluates it once per
+            // FRAGMENT.  The difference only shows up where there is
+            // overdraw -- dense foliage is the case this was built for.
+            // Greyed out until the pipelines and targets are up.
+            {
+                const bool vis_ready = cluster_renderer_->visBufferReady();
+                ImGui::BeginDisabled(!vis_ready);
+                bool use_vis = cluster_renderer_->getUseVisibilityBuffer();
+                if (ImGui::Checkbox("Visibility Buffer (Nanite-like)",
+                                    &use_vis)) {
+                    cluster_renderer_->getUseVisibilityBuffer() = use_vis;
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        vis_ready
+                        ? "Raster writes triangle IDs only; a compute "
+                          "pass shades once per pixel instead of once "
+                          "per fragment.  Compare 'Cluster Draw' vs "
+                          "'Cluster VisBuf' + 'VisBuf Material Resolve' "
+                          "in the profiler."
+                        : "Unavailable: visibility pipelines or render "
+                          "targets are not initialised.");
+                }
+            }
             // TAA — see application initTaa/taa_resolve.comp.  Live
             // toggle: unchecking zeroes the projection jitter and drops
             // the history next frame, so flicker suspects can be A/B'd
@@ -4055,8 +4084,17 @@ bool Menu::draw(
     // forever.  The button shows whenever the editor is in game; pressing
     // Play without a collision world surfaces the "No collision map" banner
     // (pointing at Tools > Bake Collision Map) instead of silently no-oping.
+    // ...and only once the scene has finished loading: while meshes are
+    // still streaming in, placements are pending or the VT warm-up is
+    // running (the same conditions that show the rune loader), Play is
+    // withheld -- pressing it into a half-loaded world put the player on
+    // ground that was not there yet.  Stop stays available regardless.
+    bool scene_loading = vt_warm_active_ || !scene_place_pending_.empty();
+    if (!scene_loading && mesh_load_task_manager_)
+        scene_loading = !mesh_load_task_manager_->inFlightFilenames().empty();
     if (editor_enabled_ &&
-        game_state_ == GameState::InGame) {
+        game_state_ == GameState::InGame &&
+        (play_mode_ || !scene_loading)) {
         ImVec2 tb_pos, tb_size, tb_c;
         getViewportScreenRect(tb_pos, tb_size, tb_c);
         // Center the start control in the game viewport, including after
@@ -4459,6 +4497,38 @@ void Menu::drawEditorDockSpace() {
         ImGui::DockBuilderDockWindow("Outliner", right);
         ImGui::DockBuilderDockWindow("Debug Display", right);  // tab w/ Outliner
         ImGui::DockBuilderFinish(dock_id);
+        editor_layout_size_ = glm::vec2(vp->WorkSize.x, vp->WorkSize.y);
+    }
+
+    // ── Scale the panels with the window ─────────────────────────────
+    // ImGui's split layout hands a resize entirely to the central node
+    // and leaves every side panel at its absolute SizeRef, so the
+    // Content Browser / Output Log strip stayed 2560 px wide and the
+    // Outliner column 614 px on a 3840 px window (layout saved in
+    // imgui.ini from the 2560x1440 the window is created at).  When the
+    // work area changes, rescale every node's SizeRef by the ratio; the
+    // user's own splitter positions survive as proportions.
+    {
+        const glm::vec2 now(vp->WorkSize.x, vp->WorkSize.y);
+        if (editor_layout_size_.x > 1.0f && editor_layout_size_.y > 1.0f &&
+            now.x > 1.0f && now.y > 1.0f &&
+            (std::fabs(now.x - editor_layout_size_.x) > 0.5f ||
+             std::fabs(now.y - editor_layout_size_.y) > 0.5f)) {
+            const ImVec2 ratio(now.x / editor_layout_size_.x,
+                               now.y / editor_layout_size_.y);
+            if (ImGuiDockNode* root = ImGui::DockBuilderGetNode(dock_id)) {
+                std::function<void(ImGuiDockNode*)> rescale =
+                    [&](ImGuiDockNode* n) {
+                        if (!n) return;
+                        n->SizeRef.x *= ratio.x;
+                        n->SizeRef.y *= ratio.y;
+                        rescale(n->ChildNodes[0]);
+                        rescale(n->ChildNodes[1]);
+                    };
+                rescale(root);
+            }
+            editor_layout_size_ = now;
+        }
     }
 
     // Track the central node rect (the 3D Viewport region) so the app can
@@ -6975,8 +7045,26 @@ void Menu::drawTerrainGenPopup() {
         // reads as a dead button.  Gate it in the UI instead, so the
         // reason is visible before the click rather than never.
         const bool have_prompt = (terrain_prompt_buf_[0] != '\0');
+        // ...but only while the MAPS stage would actually run.  A terrain
+        // whose ML maps are already complete needs no prompt to rebuild
+        // the rest of its chain, and demanding one greyed the button out
+        // on every existing world with an empty prompt box -- which reads
+        // as a dead button, the very thing the gate exists to prevent.
+        bool maps_done = false;
+        if (have_terrain) {
+            const std::string gname = sanitizeTerrainName(terrain_name_);
+            std::ifstream ginput("assets/terrain/" + gname + "/" + gname + "_graph.tsv");
+            std::string gline;
+            while (std::getline(ginput, gline)) {
+                const auto f1 = gline.find('\t');
+                if (f1 == std::string::npos || gline.substr(0, f1) != "maps") continue;
+                const auto f2 = gline.find('\t', f1 + 1);
+                maps_done = (gline.substr(f1 + 1, f2 - f1 - 1) == "complete");
+                break;
+            }
+        }
         const bool busy = (terrain_gen_status_ == 1 || terrain_stage_status_ == 1 || terrain_lib_status_ == 1);
-        const bool gen_blocked = (busy || !have_terrain || !have_prompt);
+        const bool gen_blocked = (busy || !have_terrain || !(have_prompt || maps_done));
         if (gen_blocked) ImGui::BeginDisabled();
         // Sized to ITS OWN LABEL, exactly like the stage buttons below
         // (same CalcTextSize + margin rule): a fixed pixel width clipped
@@ -6999,9 +7087,9 @@ void Menu::drawTerrainGenPopup() {
                                      "Full Stage Generate").x + 26.0f,
                                  0.0f))) {
             const std::string p(terrain_prompt_buf_);
-            if (!p.empty()) {
+            if (!p.empty() || maps_done) {
                 full_stage_click = true;
-                addTerrainPrompt(p, /*favorite*/ false);   // recents history
+                if (!p.empty()) addTerrainPrompt(p, /*favorite*/ false);   // recents history
                 std::error_code ec;
                 fs::create_directories("content/terrain/.terrain_tmp", ec);
                 // Same NAMED terrain the staged buttons build, in the
@@ -7028,7 +7116,7 @@ void Menu::drawTerrainGenPopup() {
                 const std::string pfile =
                     (fs::path("content/terrain/.terrain_tmp") /
                      (base + ".prompt.txt")).string();
-                { std::ofstream pf(pfile, std::ios::binary); pf << p; }
+                if (!p.empty()) { std::ofstream pf(pfile, std::ios::binary); pf << p; }
                 terrain_gen_err_.clear();
                 // Clear the one-shot generator's status: its "Done —
                 // terrain created." is what used to sit next to a
@@ -7052,9 +7140,10 @@ void Menu::drawTerrainGenPopup() {
         if (gen_blocked) ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip(!have_terrain ? "Name a terrain above first."
-                              : !have_prompt
+                              : !(have_prompt || maps_done)
                                   ? "Describe the terrain in the box at\n"
-                                    "the top first."
+                                    "the top first (its ML maps are not\n"
+                                    "built yet)."
                                   : "Run all stages in one pass.");
 
         // Idle / done / failed: the short status sits beside the button.
@@ -7250,9 +7339,19 @@ void Menu::drawTerrainGenPopup() {
                     if (!label.empty() && label[0] == ' ') label.erase(0, 1);
                 }
             }
+            // `name` is the stage this run was LAUNCHED for, which stops
+            // being true as soon as the run moves on to the next item in
+            // its plan -- a tree-library build read as "stones: ...".
+            // The python side now names the working stage inside the
+            // label itself ("[stage 2/3] trees: ..."), so prefixing it
+            // again would only repeat the wrong name.
             char overlay[224];
-            std::snprintf(overlay, sizeof(overlay), "%s: %s  %.0f%%",
-                          name.c_str(), label.c_str(), frac * 100.0f);
+            if (label.rfind("[stage", 0) == 0)
+                std::snprintf(overlay, sizeof(overlay), "%s  %.0f%%",
+                              label.c_str(), frac * 100.0f);
+            else
+                std::snprintf(overlay, sizeof(overlay), "%s: %s  %.0f%%",
+                              name.c_str(), label.c_str(), frac * 100.0f);
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
                                   ImVec4(0.42f, 0.78f, 1.0f, 1.0f));
             ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
@@ -9893,6 +9992,23 @@ void Menu::drawRenderDebugMenuContent() {
         ImGui::TextUnformatted("Ray-traced shadows issue rays, not leaf raster draw calls.");
         ImGui::TextUnformatted("Pass GPU timings remain in the Game Profiler.");
         ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Colour terrain tiles")) {
+        const char* names[] = { "Off", "Per mesh tile", "Per LOD ring (tile size)",
+                                "1 km detail tiles (green = 1 m colour resident)" };
+        for (int i = 0; i < 4; ++i)
+            if (ImGui::MenuItem(names[i], nullptr, tile_debug_mode_ == i))
+                tile_debug_mode_ = i;
+        ImGui::EndMenu();
+    }
+    {
+        bool lod_colors = engine::game_object::DrawableObject::getLodDebugColors();
+        if (ImGui::MenuItem("Colour plant LOD bands", nullptr, &lod_colors))
+            engine::game_object::DrawableObject::setLodDebugColors(lod_colors);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Paint every plant-LOD node by its rung:\n"
+                              "0 red, 1 orange, 2 yellow, 3 green,\n"
+                              "4 cyan, 5 blue, 6 magenta, 7 white.");
     }
     ImGui::MenuItem("Leaf alpha-cutoff depth prepass", nullptr, &leaf_depth_prepass_);
     if (leaf_depth_prepass_)

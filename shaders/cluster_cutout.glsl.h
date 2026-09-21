@@ -3,10 +3,18 @@
 // A compute unit defines VT_NO_DERIVATIVES, which compiles the hardware
 // samplers out; the macro keeps this one source compiling in both stages
 // without an #ifdef around every call site.
+// The implicit-LOD forms (vtSampleAlbedo, texture()) are fragment-only in
+// GLSL -- glslang rejects them in a compute unit whether or not the
+// branch containing them can be taken at run time, since it compiles
+// both sides.  So they are macros: real calls in a fragment unit, dead
+// constants in a compute unit, where have_grad is always true and the
+// gradient forms beside them are what actually run.
 #ifdef VT_NO_DERIVATIVES
 #define VT_SAMPLE_ALBEDO_HW(id, uv) vec4(1.0)
+#define TEX_SAMPLE_HW(s, uv)        vec4(1.0)
 #else
 #define VT_SAMPLE_ALBEDO_HW(id, uv) vtSampleAlbedo(id, uv)
+#define TEX_SAMPLE_HW(s, uv)        texture(s, uv)
 #endif
 // ── The cutout decision, in ONE place ────────────────────────────────
 // Which triangle owns a pixel is decided by the alpha test, and with a
@@ -66,7 +74,7 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
         tex = have_grad
             ? textureGrad(base_color_textures[nonuniformEXT(tex_idx)], uv,
                           lod_uv_ddx, lod_uv_ddy)
-            : texture(base_color_textures[nonuniformEXT(tex_idx)], uv);
+            : TEX_SAMPLE_HW(base_color_textures[nonuniformEXT(tex_idx)], uv);
     }
     vec4 albedo4 = base * tex;
 
@@ -80,7 +88,7 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
             float code = have_grad
                 ? textureGrad(normal_textures[nonuniformEXT(age_idx)], uv,
                               lod_uv_ddx, lod_uv_ddy).b
-                : texture(normal_textures[nonuniformEXT(age_idx)], uv).b;
+                : TEX_SAMPLE_HW(normal_textures[nonuniformEXT(age_idx)], uv).b;
             group = leafMaskGroup(code);
         }
         albedo4 = leafAgedColor(albedo4, group, camera_info.global_leaf_age,
