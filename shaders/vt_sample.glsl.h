@@ -67,6 +67,36 @@
 // derivatives must be uniform across the quad for the result to be
 // meaningful.  All current callers (cluster_bindless.frag's albedo /
 // normal sample sites) satisfy this.
+// ── Gradient-explicit LOD (compute-safe) ─────────────────────────────
+// dFdx/dFdy exist only in a fragment shader, so the visibility-buffer
+// material pass -- which runs in compute -- supplies the UV gradients
+// it derived analytically from the triangle (visbuffer_common.glsl.h,
+// vbCalcFullBary).  Same rho^2 metric as vtComputeLod below, so a pixel
+// picks the SAME mip whichever pass shades it; if these two disagreed
+// the vis path and the raster path would stream different pages.
+float vtComputeLodGrad(in VirtualTextureMeta meta, vec2 uv_ddx, vec2 uv_ddy) {
+    vec2 sz = vec2(float(meta.width_px), float(meta.height_px));
+    vec2 dx = uv_ddx * sz;
+    vec2 dy = uv_ddy * sz;
+    float rho2 = max(dot(dx, dx), dot(dy, dy));
+    return 0.5 * log2(max(rho2, 1.0));
+}
+
+void vtPickMipAndFracGrad(in VirtualTextureMeta meta, vec2 uv_ddx, vec2 uv_ddy,
+                          out uint mip, out float frac) {
+    float lod_cont = vtComputeLodGrad(meta, uv_ddx, uv_ddy);
+    uint  mip_max  = max(1u, meta.mip_count) - 1u;
+    mip  = clamp(uint(lod_cont), 0u, mip_max);
+    frac = (mip == mip_max) ? 0.0
+                            : clamp(lod_cont - float(mip), 0.0, 1.0);
+}
+
+// ── Fragment-only entry points ───────────────────────────────────────
+// Everything from here to the matching #endif calls dFdx/dFdy, directly
+// or through vtComputeLod.  A compute translation unit must define
+// VT_NO_DERIVATIVES before including this header: glslang rejects dFdx
+// in a compute stage even inside a function nobody calls.
+#ifndef VT_NO_DERIVATIVES
 float vtComputeLod(in VirtualTextureMeta meta, vec2 uv) {
     vec2 src_uv = uv * vec2(float(meta.width_px), float(meta.height_px));
     vec2 dx     = dFdx(src_uv);
@@ -87,6 +117,7 @@ uint vtPickMip(in VirtualTextureMeta meta, vec2 uv) {
     uint  mip_max = max(1u, meta.mip_count) - 1u;
     return clamp(uint(lod), 0u, mip_max);
 }
+#endif // VT_NO_DERIVATIVES  (vtResolve below needs no derivatives)
 
 // ── Core: virtual UV → physical pool UV ────────────────────────────
 // Translate a (vt_id, uv, mip) sample request into a physical pool
@@ -152,6 +183,7 @@ bool vtResolve(
     phys_uv = slot_origin_uv + in_page_uv * vec2(VT_PAGE_TO_POOL_X, VT_PAGE_TO_POOL_Y);
     return true;
 }
+#ifndef VT_NO_DERIVATIVES
 
 // ── Per-layer convenience samplers ─────────────────────────────────
 // Each takes a VirtualTextureId + UV and returns the sampled value
@@ -260,6 +292,45 @@ vec4 vtSampleEmissive(uint vt_id, vec2 uv) {
         return vec4(0.0);
     }
     return textureLod(vt_pool_emissive, phys_uv, frac);
+}
+#endif // VT_NO_DERIVATIVES
+
+
+
+// ── Gradient-explicit samplers (compute-safe) ────────────────────────
+// Mirror vtSampleAlbedo / vtResolveSharedSlot exactly, magenta
+// unresident-page diagnostic included, but take the analytic gradients
+// instead of asking the hardware for them.
+vec4 vtSampleAlbedoGrad(uint vt_id, vec2 uv, vec2 uv_ddx, vec2 uv_ddy) {
+    if (vt_id == VT_INVALID_ID) return vec4(1.0);
+    VirtualTextureMeta meta = vt_meta[vtIndexOf(vt_id)];
+    uint mip; float frac;
+    vtPickMipAndFracGrad(meta, uv_ddx, uv_ddy, mip, frac);
+    vec2 phys_uv;
+    if (!vtResolve(vt_id, uv, meta, mip, phys_uv)) {
+        return vec4(1.0, 0.0, 1.0, 1.0);   // magenta diagnostic
+    }
+    return textureLod(vt_pool_albedo, phys_uv, frac);
+}
+
+bool vtResolveSharedSlotGrad(uint vt_id, vec2 uv, vec2 uv_ddx, vec2 uv_ddy,
+                             out vec2 phys_uv, out float frac) {
+    if (vt_id == VT_INVALID_ID) { phys_uv = vec2(0.0); frac = 0.0; return false; }
+    VirtualTextureMeta meta = vt_meta[vtIndexOf(vt_id)];
+    uint mip;
+    vtPickMipAndFracGrad(meta, uv_ddx, uv_ddy, mip, frac);
+    return vtResolve(vt_id, uv, meta, mip, phys_uv);
+}
+
+// The mip a pixel WANTS, for the streaming feedback write.  The vis
+// material pass has to keep emitting these or the streamer never learns
+// which pages are needed and the pool stays unresident (magenta).
+uint vtWantedMipGrad(uint vt_id, vec2 uv_ddx, vec2 uv_ddy) {
+    if (vt_id == VT_INVALID_ID) return 0u;
+    VirtualTextureMeta meta = vt_meta[vtIndexOf(vt_id)];
+    uint mip; float frac;
+    vtPickMipAndFracGrad(meta, uv_ddx, uv_ddy, mip, frac);
+    return mip;
 }
 
 #endif  // VT_SAMPLE_GLSL_H

@@ -1,5 +1,13 @@
 #ifndef CLUSTER_CUTOUT_GLSL_H
 #define CLUSTER_CUTOUT_GLSL_H
+// A compute unit defines VT_NO_DERIVATIVES, which compiles the hardware
+// samplers out; the macro keeps this one source compiling in both stages
+// without an #ifdef around every call site.
+#ifdef VT_NO_DERIVATIVES
+#define VT_SAMPLE_ALBEDO_HW(id, uv) vec4(1.0)
+#else
+#define VT_SAMPLE_ALBEDO_HW(id, uv) vtSampleAlbedo(id, uv)
+#endif
 // ── The cutout decision, in ONE place ────────────────────────────────
 // Which triangle owns a pixel is decided by the alpha test, and with a
 // visibility buffer that decision is made in one pass (cluster_visbuffer
@@ -49,7 +57,11 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
     uint vt      = material_params[mat_idx].albedo_vt_id;
     int  tex_idx = material_params[mat_idx].base_color_tex_idx;
     if (vt != 0u) {
-        tex = vtSampleAlbedo(vt, uv);
+        // Gradient form in the compute pass (no dFdx there), hardware
+        // form in the raster pass -- same rho^2 metric either way, so
+        // both passes land on the same mip and the same page.
+        tex = have_grad ? vtSampleAlbedoGrad(vt, uv, lod_uv_ddx, lod_uv_ddy)
+                        : VT_SAMPLE_ALBEDO_HW(vt, uv);
     } else if (tex_idx >= 0) {
         tex = have_grad
             ? textureGrad(base_color_textures[nonuniformEXT(tex_idx)], uv,

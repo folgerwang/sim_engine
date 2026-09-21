@@ -1,0 +1,254 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : enable
+// ── DEFERRED MATERIAL PASS ───────────────────────────────────────────
+// One thread per pixel.  Reads the visibility buffer written by
+// cluster_visbuffer.frag, rebuilds the triangle that won the pixel, and
+// evaluates the material ONCE -- then writes the same four G-buffer
+// targets the raster path wrote, so deferred_resolve.comp is unchanged.
+//
+// This is the whole point of the exercise: the raster path ran the full
+// material chain for every one of the 10-30 leaf fragments stacked on a
+// crown pixel (no early-Z, because it discards).  Here the hidden ones
+// cost one alpha fetch in the vis pass and nothing at all here.
+//
+// Correctness rests on one property of this engine: the cluster path
+// does NO vertex animation (cluster_bindless.vert passes pre-baked
+// world positions straight through), so the triangle rebuilt from the
+// merged buffers is exactly the one that was rasterised.
+#define VT_NO_DERIVATIVES 1   // compute stage: no dFdx/dFdy anywhere
+#include "global_definition.glsl.h"
+#include "cluster_bindless_bindings.glsl.h"
+#include "vt_sample.glsl.h"
+#include "functions.glsl.h"
+#include "depth_pbr.glsl.h"
+#include "leaf_age.glsl.h"
+#include "cluster_cutout.glsl.h"
+#include "visbuffer_common.glsl.h"
+
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
+    readonly buffer ViewCameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+// Geometry, read straight out of the buffers the raster pass draws from.
+// Both already carry STORAGE_BUFFER_BIT (added for the mesh-shader CSM
+// path), so this costs no extra upload and no duplicate copy.
+layout(std430, set = VISBUF_SET, binding = VISBUF_VERTEX_BUFFER)
+    readonly buffer MergedVertexBuffer { uint merged_verts[]; };
+layout(std430, set = VISBUF_SET, binding = VISBUF_INDEX_BUFFER)
+    readonly buffer MergedIndexBuffer  { uint merged_indices[]; };
+
+layout(set = VISBUF_SET, binding = VISBUF_VIS_IMAGE, rg32ui)
+    uniform readonly uimage2D vis_buffer;
+layout(set = VISBUF_SET, binding = VISBUF_GBUF_ALBEDO,   rgba8)
+    uniform writeonly image2D out_albedo_ao;
+layout(set = VISBUF_SET, binding = VISBUF_GBUF_NORMAL,   rgba8)
+    uniform writeonly image2D out_normal_rough;
+layout(set = VISBUF_SET, binding = VISBUF_GBUF_EMISSIVE, rgba8)
+    uniform writeonly image2D out_emissive_metal;
+layout(set = VISBUF_SET, binding = VISBUF_GBUF_VELOCITY, rg16f)
+    uniform writeonly image2D out_velocity;
+
+// Byte-identical to the copy in cluster_bindless.frag / base.frag: this
+// pass writes the same G-buffer deferred_resolve.comp decodes, so the
+// encoding may not drift.  (The engine already carries four copies of
+// this function; unifying them is a separate cleanup.)
+vec2 octEncodeDir(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 oct = (n.z >= 0.0) ? n.xy
+                            : (1.0 - abs(n.yx)) * vec2(
+                                  n.x >= 0.0 ? 1.0 : -1.0,
+                                  n.y >= 0.0 ? 1.0 : -1.0);
+    return oct * 0.5 + 0.5;
+}
+
+layout(push_constant) uniform VisMaterialParams {
+    uvec2 screen_size;
+} pc;
+
+// BindlessVertex is 24 B = 6 uints: position(3) + packed normal /
+// tangent / uv.  Decoders live in global_definition.glsl.h so this
+// stays in sync with the vertex-input path by construction.
+struct VbVertex { vec3 pos; vec3 nrm; vec4 tan; vec2 uv; };
+
+VbVertex vbFetchVertex(uint vertex_index) {
+    uint o = vertex_index * 6u;
+    VbVertex v;
+    v.pos = vec3(uintBitsToFloat(merged_verts[o + 0u]),
+                 uintBitsToFloat(merged_verts[o + 1u]),
+                 uintBitsToFloat(merged_verts[o + 2u]));
+    v.nrm = bvDecodeNormal(merged_verts[o + 3u]);
+    v.tan = bvDecodeTangent(merged_verts[o + 4u]);
+    v.uv  = bvDecodeUv(merged_verts[o + 5u]);
+    return v;
+}
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.screen_size.x) || px.y >= int(pc.screen_size.y)) return;
+
+    uvec2 vis = imageLoad(vis_buffer, px).xy;
+    if (vbIsEmpty(vis)) return;   // sky / terrain / anything else owns it
+
+    uint cluster_idx = vbCluster(vis);
+    uint prim_id     = vbPrim(vis);
+
+    ClusterDrawInfo di = draw_infos[cluster_idx];
+    uint mat_idx  = di.material_idx;
+    int  mat_flags = material_params[mat_idx].flags;
+
+    // ── Rebuild the triangle ─────────────────────────────────────────
+    // index_offset is a BYTE offset into the global index buffer; the
+    // indices are uint32, hence the >> 2.
+    uint base = (di.index_offset >> 2u) + prim_id * 3u;
+    uint i0 = merged_indices[base + 0u] + di.vertex_offset;
+    uint i1 = merged_indices[base + 1u] + di.vertex_offset;
+    uint i2 = merged_indices[base + 2u] + di.vertex_offset;
+    VbVertex v0 = vbFetchVertex(i0);
+    VbVertex v1 = vbFetchVertex(i1);
+    VbVertex v2 = vbFetchVertex(i2);
+
+    // ── Barycentrics + analytic gradients ────────────────────────────
+    vec4 c0 = camera_info.view_proj * vec4(v0.pos, 1.0);
+    vec4 c1 = camera_info.view_proj * vec4(v1.pos, 1.0);
+    vec4 c2 = camera_info.view_proj * vec4(v2.pos, 1.0);
+    vec2 ndc = (vec2(px) + 0.5) / vec2(pc.screen_size) * 2.0 - 1.0;
+    VbBary bary = vbCalcFullBary(c0, c1, c2, ndc, vec2(pc.screen_size));
+
+    vec3 uv_u = vbInterp(bary, vec3(v0.uv.x, v1.uv.x, v2.uv.x));
+    vec3 uv_v = vbInterp(bary, vec3(v0.uv.y, v1.uv.y, v2.uv.y));
+    vec2 uv      = vec2(uv_u.x, uv_v.x);
+    vec2 uv_ddx  = vec2(uv_u.y, uv_v.y);
+    vec2 uv_ddy  = vec2(uv_u.z, uv_v.z);
+
+    vec3 world_pos = vbInterp3(bary, v0.pos, v1.pos, v2.pos);
+    vec3 v_normal  = vbInterp3(bary, v0.nrm, v1.nrm, v2.nrm);
+    vec4 v_tangent = vec4(vbInterp3(bary, v0.tan.xyz, v1.tan.xyz, v2.tan.xyz),
+                          v0.tan.w);
+
+    // Facing: the rasterizer's gl_FrontFacing, recovered from the
+    // triangle's winding in screen space.  Foliage is two-sided and the
+    // leaf SIDE decides its albedo and its translucency, so this cannot
+    // be guessed.
+    vec2 s0 = c0.xy / c0.w, s1 = c1.xy / c1.w, s2 = c2.xy / c2.w;
+    float area = (s1.x - s0.x) * (s2.y - s0.y) - (s2.x - s0.x) * (s1.y - s0.y);
+    bool front_facing = area < 0.0;   // matches VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                      // under the engine's y-flipped viewport
+
+    // ── Albedo (shared with the vis pass, gradient form) ─────────────
+    vec4 albedo4 = clusterCutoutAlbedo(mat_idx, mat_flags, uv,
+                                       uv_ddx, uv_ddy, true);
+    vec3 albedo = albedo4.rgb;
+
+    // ── Normals, exactly as cluster_bindless.frag derives them ───────
+    vec3 N = normalize(v_normal);
+    bool is_foliage  = (mat_flags & BINDLESS_MAT_FOLIAGE_SSS) != 0;
+    bool leaf_mask   = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
+    float leaf_front = front_facing ? 1.0 : 0.0;
+    if (((mat_flags & BINDLESS_MAT_DOUBLE_SIDED) != 0 || is_foliage) &&
+        !front_facing) {
+        N = -N;
+    }
+    if (is_foliage && leaf_front < 0.5) albedo = leafBacksideAlbedo(albedo);
+
+    vec3 N_geom = N;
+    int  norm_idx    = material_params[mat_idx].normal_tex_idx;
+    uint normal_vt   = material_params[mat_idx].normal_vt_id;
+    bool has_vt_norm = (normal_vt != VT_INVALID_ID);
+    bool depth_surface = (mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0;
+    float depth_scale = depth_surface
+        ? uintBitsToFloat(material_params[mat_idx].mr_ao_vt_id) : 0.0;
+    float depth_tile = depth_surface
+        ? uintBitsToFloat(material_params[mat_idx].emissive_vt_id) : 0.0;
+    bool depth_pbr = (mat_flags & BINDLESS_MAT_DEPTH_PBR) != 0 && norm_idx >= 0;
+    vec4 depth_orm = vec4(1.0, 0.9, 0.0, 0.5);
+
+    if (depth_pbr) {
+        depth_orm = textureGrad(normal_textures[nonuniformEXT(norm_idx)],
+                                uv, uv_ddx, uv_ddy);
+        if (leaf_mask) depth_orm.b = 0.0;
+        vec3 T = normalize(v_tangent.xyz - dot(v_tangent.xyz, N) * N);
+        vec3 B = cross(N, T) * v_tangent.w;
+        if (depth_surface && depth_tile > 0.0) {
+            depth_orm = depthTriplanarSample(
+                normal_textures[nonuniformEXT(norm_idx)],
+                world_pos, N, depth_tile);
+            N = depthWorldNormal(depth_orm.a, world_pos, N,
+                                 depth_scale * depth_tile);
+        } else if (depth_surface) {
+            N = normalize(mat3(T, B, N) * depthSurfaceNormal(
+                normal_textures[nonuniformEXT(norm_idx)], uv, depth_scale));
+        } else {
+            N = normalize(mat3(T, B, N) * depthPbrNormal(
+                normal_textures[nonuniformEXT(norm_idx)], uv));
+        }
+    } else if (!leaf_mask && (has_vt_norm || norm_idx >= 0)) {
+        vec4 raw_n = vec4(0.5, 0.5, 1.0, 1.0);
+        bool vt_resolved = false;
+        if (has_vt_norm) {
+            vec2 phys_uv; float frac;
+            if (vtResolveSharedSlotGrad(normal_vt, uv, uv_ddx, uv_ddy,
+                                        phys_uv, frac)) {
+                raw_n       = textureLod(vt_pool_normal, phys_uv, frac);
+                vt_resolved = true;
+            }
+        }
+        if (!vt_resolved && norm_idx >= 0) {
+            raw_n = textureGrad(normal_textures[nonuniformEXT(norm_idx)],
+                                uv, uv_ddx, uv_ddy);
+        }
+        vec2 nxy  = raw_n.xy * 2.0 - 1.0;
+        nxy.y     = -nxy.y;                       // DX -> GL convention
+        vec3 ts_n = vec3(nxy, sqrt(max(1.0 - dot(nxy, nxy), 0.0)));
+        vec3 T = normalize(v_tangent.xyz - dot(v_tangent.xyz, N) * N);
+        vec3 B = cross(N, T) * v_tangent.w;
+        N = normalize(mat3(T, B, N) * ts_n);
+    }
+
+    // ── Streaming feedback ───────────────────────────────────────────
+    // One tile key per 8x8 block, from its (0,0) thread -- the same rate
+    // the raster pass emitted.  Without this the streamer never learns
+    // which pages are wanted and the pool stays unresident (magenta).
+    if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == 0u) {
+        uint albedo_vt = material_params[mat_idx].albedo_vt_id;
+        if (albedo_vt != VT_INVALID_ID) {
+            uvec2 blk = uvec2(px) >> 3u;
+            if (blk.x < VT_FEEDBACK_PITCH && blk.y < VT_FEEDBACK_PITCH) {
+                uint fb_idx = blk.y * VT_FEEDBACK_PITCH + blk.x;
+                VirtualTextureMeta meta = vt_meta[vtIndexOf(albedo_vt)];
+                uint want_mip = vtWantedMipGrad(albedo_vt, uv_ddx, uv_ddy);
+                uvec2 mip_pages = vtMipPagesXY(meta, want_mip);
+                vec2  wrapped   = fract(uv);
+                uvec2 page = uvec2(floor(wrapped * vec2(mip_pages)));
+                page.x = min(page.x, mip_pages.x - 1u);
+                page.y = min(page.y, mip_pages.y - 1u);
+                vt_feedback[fb_idx] =
+                    vtMakeTileKey(vtIndexOf(albedo_vt), want_mip, page);
+            }
+        }
+    }
+
+    // ── The G-buffer, byte for byte what the raster path wrote ───────
+    imageStore(out_albedo_ao, px,
+        vec4(albedo, depth_pbr ? clamp(depth_orm.r, 129.0 / 255.0, 1.0) : 1.0));
+
+    float gbuf_rough = is_foliage ? 0.95 : 0.92;
+    if (depth_pbr) gbuf_rough = clamp(depth_orm.g, 0.045, 1.0);
+    imageStore(out_normal_rough, px,
+        vec4(octEncodeDir(N), gbuf_rough,
+             is_foliage ? mix(0.5, 1.0, leaf_front) : 0.0));
+
+    vec2 oct_geom = octEncodeDir(N_geom);
+    imageStore(out_emissive_metal, px,
+        vec4(oct_geom.x, oct_geom.y, 0.0, depth_pbr ? depth_orm.b : 0.0));
+
+    // Velocity: static world-space geometry, so this is camera motion
+    // alone -- no per-cluster previous transforms needed.
+    vec4 cur_clip  = camera_info.view_proj      * vec4(world_pos, 1.0);
+    vec4 prev_clip = camera_info.prev_view_proj * vec4(world_pos, 1.0);
+    vec2 cur_ndc   = cur_clip.xy  / cur_clip.w;
+    vec2 prev_ndc  = prev_clip.xy / prev_clip.w;
+    imageStore(out_velocity, px, vec4(cur_ndc - prev_ndc, 0.0, 0.0));
+}

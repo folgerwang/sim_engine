@@ -1,3 +1,4 @@
+#include "debug_toggles.glsl.h"
 #define HAS_BASE_COLOR_MAP          1
 #define USE_IBL                     1
 #define USE_HDR                     1
@@ -53,6 +54,22 @@
 // classic set so the classic pipelines and their bind lists are
 // unaffected.
 #define NODE_TABLE_PARAMS_SET       MAX_NUM_PARAMS_SETS
+
+// ── Visibility buffer (Nanite-style deferred material shading) ───────
+// One extra set, bound only by visbuffer_material.comp: the merged
+// geometry it rebuilds triangles from, the R32G32_UINT visibility
+// target the raster pass wrote, and the four G-buffer images it writes.
+// Sits after every classic set, like NODE_TABLE_PARAMS_SET, so no
+// existing pipeline layout moves.  The pass ALSO binds VIEW_PARAMS_SET
+// and PBR_MATERIAL_PARAMS_SET (the cluster bindless set) unchanged.
+#define VISBUF_SET                  (NODE_TABLE_PARAMS_SET + 1)
+#define VISBUF_VERTEX_BUFFER        0
+#define VISBUF_INDEX_BUFFER         1
+#define VISBUF_VIS_IMAGE            2
+#define VISBUF_GBUF_ALBEDO          3
+#define VISBUF_GBUF_NORMAL          4
+#define VISBUF_GBUF_EMISSIVE        5
+#define VISBUF_GBUF_VELOCITY        6
 #define NODE_TABLE_PARAMS_BINDING   0   // ModelParams per LOD-survivor record
 #define NODE_TABLE_SLOTS_BINDING    1   // record index per bucket slot
 
@@ -293,6 +310,10 @@
 // they show up in the visualisation alongside asset-authored blends.
 #define FEATURE_MATERIAL_BLEND                  0x00000800
 #define FEATURE_MATERIAL_ALPHA_MASK             0x00001000
+// Ground-cover CARDS (clutter_grass*/clutter_far_*): quads whose plant is
+// only the texture's alpha.  Depth-only passes must cut them out -- cast
+// as geometry they are solid squares lying on the grass.
+#define FEATURE_MATERIAL_GROUND_CARD            0x00002000
 
 #define FEATURE_MATERIAL_LEAF_MASK             0x20000000
 #define FEATURE_MATERIAL_LEAF_AGE              0x04000000
@@ -597,6 +618,12 @@
 // the per-texel world size doesn't jump as much.  See cascade splits in
 // application.cpp for the actual far-depth values.
 #define CSM_CASCADE_COUNT                       6
+// Terrain holes (ViewCameraInfo::terrain_holes): rectangles the terrain
+// tiles are cut over -- the civic district's parking structure sits in
+// one.  tile.vert snaps every terrain vertex inside a hole onto its
+// edge, so the tile mesh stops at the retaining wall with no discard,
+// no depth-write games and no change to the tile pipeline.
+#define TERRAIN_HOLE_MAX                        8
 
 #define TONEMAP_DEFAULT                         0
 #define TONEMAP_UNCHARTED                       1
@@ -1339,6 +1366,7 @@ struct RtSkelHeader {
                                         // these materials, and so future work that adds
                                         // a real translucent pipeline pass has the data.
 #define BINDLESS_MAT_FOLIAGE_SSS    8   // bit 3: thin-slab foliage subsurface
+#define BINDLESS_MAT_GROUND_CARD  64   // bit 6: flat ground-cover card -- never an opaque RT caster
                                         // scattering.  Set at cluster upload for
                                         // leaf materials (name contains "leaf" /
                                         // "foliage" — covers terrain_pcg's
@@ -1967,6 +1995,18 @@ struct ViewCameraInfo {
     float           underwater_depth;
     float           water_level_y;
     float           global_leaf_age; // shared, nonnegative elapsed age time (unbounded)
+    // ── Terrain holes (see TERRAIN_HOLE_MAX) ─────────────────────────
+    // Two pad floats bring the struct to a 16-byte boundary (offset 616
+    // -> 624) so the vec4 arrays sit at the same offset under std140
+    // and under glm's natural layout.  Per hole: terrain_holes =
+    // (cx, cz, hx, hz) world metres / half extents, terrain_hole_rot =
+    // (cos yaw, sin yaw, active 0|1, 0).  Filled by
+    // ViewCamera::setTerrainHoles from the <map>_holes.txt sidecar;
+    // the GPU camera update never writes them.
+    float           terrain_hole_pad0;
+    float           terrain_hole_pad1;
+    vec4            terrain_holes[TERRAIN_HOLE_MAX];
+    vec4            terrain_hole_rot[TERRAIN_HOLE_MAX];
 };
 
 struct RuntimeLightsParams {
