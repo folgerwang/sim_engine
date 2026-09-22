@@ -1761,14 +1761,37 @@ bool VirtualTextureManager::encodeAlbedoTileCacheCpu(
             }
         }
 
-        uint8_t* dst0 = out_blob.data() +
-                        uint64_t(entry_idx) * kBc7BytesPerEntry;
-        encodeBC7Mode6(tile_rgba.data(), kVtTileSize, kVtTileSize, dst0);
-
+        // Half-res tile FIRST, while alpha is still real:
+        // boxDownsampleSrgb8 weights RGB by alpha so transparent texels
+        // don't drag a dark fringe into the edge.
         std::vector<uint8_t> tile_rgba_half(
             (kVtTileSize / 2) * (kVtTileSize / 2) * 4u);
         boxDownsampleSrgb8(tile_rgba.data(), kVtTileSize, kVtTileSize,
                            tile_rgba_half.data());
+
+        // Strip alpha, exactly as the runtime encoder in
+        // encodeAndCacheVt does.  These two MUST agree: this one bakes
+        // the blob a .rwtex carries and that one encodes from live CPU
+        // pixels, and the same asset can take either route.  If only
+        // the runtime path stripped, re-importing an asset would
+        // silently un-do the fix and the imported copy would keep
+        // paying mode 6's shared colour/alpha index forever.
+        //
+        // Safe because the cutout alpha is written separately: the
+        // caller (writeRwTex) emits a full-res alpha plane for exactly
+        // the textures that have cutout, and the loader turns that into
+        // the BC4 alpha layer.  See the ALPHA layer notes in
+        // virtual_texture.h.
+        for (size_t i = 3; i < tile_rgba.size(); i += 4) {
+            tile_rgba[i] = 255u;
+        }
+        for (size_t i = 3; i < tile_rgba_half.size(); i += 4) {
+            tile_rgba_half[i] = 255u;
+        }
+
+        uint8_t* dst0 = out_blob.data() +
+                        uint64_t(entry_idx) * kBc7BytesPerEntry;
+        encodeBC7Mode6(tile_rgba.data(), kVtTileSize, kVtTileSize, dst0);
         encodeBC7Mode6(tile_rgba_half.data(),
                        kVtTileSize / 2, kVtTileSize / 2,
                        dst0 + kBc7BytesMip0);

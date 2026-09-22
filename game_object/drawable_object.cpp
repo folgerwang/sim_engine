@@ -12663,15 +12663,26 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
                 }
             }
         }
+        // Keep the file's alpha plane on the CPU: the VT registration
+        // below builds the BC4 alpha layer from it, and on this path the
+        // albedo is a pre-encoded BC7 blob with alpha stripped out, so
+        // this plane is the ONLY readable copy of the cutout alpha.
+        //
+        // Keyed on tb.alpha directly, NOT on alpha_data -- alpha_data is
+        // additionally gated on the texture being referenced as some
+        // section's base colour, which is the right test for building
+        // the shadow pass's R8 companion but too narrow here.  A cutout
+        // texture that failed that gate would get a stripped (opaque)
+        // albedo and no alpha layer, and the shader's fallback would
+        // read alpha 1.0 -- rendering every leaf card as a solid quad.
+        // The plane's presence in the file is the signal that matters.
+        if (!tb.alpha.empty() &&
+            tb.alpha.size() == size_t(tb.w) * size_t(tb.h)) {
+            dst.cpu_alpha = std::make_shared<std::vector<uint8_t>>(
+                tb.alpha.begin(), tb.alpha.end());
+        }
+
         if (!alpha_data.empty()) {
-            // Keep the plane on the CPU as well: the VT registration
-            // below builds a BC4 alpha layer from it, and on this path
-            // the albedo is a pre-encoded BC7 blob, so this is the only
-            // place the cutout alpha still exists in a readable form.
-            if (aw == tb.w && ah == tb.h) {
-                dst.cpu_alpha =
-                    std::make_shared<std::vector<uint8_t>>(alpha_data);
-            }
             renderer::Helper::create2DTextureImage(
                 device,
                 renderer::Format::R8_UNORM,
