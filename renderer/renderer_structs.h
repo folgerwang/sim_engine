@@ -472,6 +472,16 @@ struct TextureInfo {
     // consumers can hand the buffer around without copying.
     std::shared_ptr<std::vector<uint8_t>> cpu_pixels;
 
+    // Full-res single-channel cutout alpha, width*height bytes, kept
+    // on the CPU.  Needed because the VT registration wants to build
+    // its own BC4 alpha layer, and on the .rwtex path the albedo
+    // arrives as a pre-encoded BC7 blob that alpha cannot be
+    // recovered from.  The .rwtex file already carries this plane
+    // (it feeds alpha_only_image below), so this just keeps the bytes
+    // alive long enough for registerMaterial to see them.  Null for
+    // opaque textures.
+    std::shared_ptr<std::vector<uint8_t>> cpu_alpha;
+
     // Optional: pre-encoded Virtual Texture albedo tile cache (BC7),
     // baked at import time into the .rwtex asset.  When present the VT
     // manager's registerMaterial adopts it directly — no runtime CPU

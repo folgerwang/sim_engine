@@ -177,21 +177,47 @@ enum class VtLayer : uint32_t {
     NORMAL         = 1,
     METAL_ROUGH_AO = 2,
     EMISSIVE       = 3,
-    COUNT          = 4,
+    // Cutout alpha, on its own, as BC4_UNORM (8 B per 4x4 block --
+    // half of BC7).  Two reasons it is not just the albedo's .a:
+    //
+    //   Bandwidth.  The alpha test is the ONLY thing the visibility
+    //   pass needs, and it runs per FRAGMENT, so on dense foliage it
+    //   runs 10-30x per pixel.  Reading 8 bytes from a small pool
+    //   instead of 16 from the big albedo pool halves the bytes and,
+    //   more importantly, keeps the albedo pool out of L1TEX during
+    //   the pass that was measured saturating it.
+    //
+    //   Quality.  BC7 mode 6 carries ONE index set shared between
+    //   colour and alpha.  At a leaf's cutout edge -- precisely where
+    //   the two disagree most -- the encoder has to compromise, and
+    //   alpha smears across the silhouette.  That was the root cause
+    //   of the alpha-test artifacts.  A BC4 block gives alpha its own
+    //   8-bit endpoints and 3-bit indices, so the edge survives.
+    //
+    // Registered only for textures that actually have cutout; opaque
+    // materials leave the alpha cache empty and the shader reads 1.0.
+    ALPHA          = 4,
+    COUNT          = 5,
 };
 
 // 32-bit packed virtual-texture handle.  Layout above.
 using VirtualTextureId = uint32_t;
 constexpr VirtualTextureId kInvalidVtId = 0xFFFFFFFFu;
 
+// The layer field widened from 2 bits to 3 when ALPHA became the
+// fifth layer.  It is vestigial either way -- registerMaterial always
+// returns makeVtId(ALBEDO, index), the pools share one slot allocator
+// so a single id resolves to the same phys_uv in every pool, and no
+// shader calls vtLayerOf.  Kept for debuggability.  kInvalidVtId
+// (0xFFFFFFFF) stays outside the valid index range.
 inline VirtualTextureId makeVtId(VtLayer layer, uint32_t vt_index) {
-    return (static_cast<uint32_t>(layer) << 30) | (vt_index & 0x3FFFFFFFu);
+    return (static_cast<uint32_t>(layer) << 29) | (vt_index & 0x1FFFFFFFu);
 }
 inline VtLayer vtLayer(VirtualTextureId id) {
-    return static_cast<VtLayer>((id >> 30) & 0x3u);
+    return static_cast<VtLayer>((id >> 29) & 0x7u);
 }
 inline uint32_t vtIndex(VirtualTextureId id) {
-    return id & 0x3FFFFFFFu;
+    return id & 0x1FFFFFFFu;
 }
 
 // One entry per registered virtual texture — describes its dimensions
@@ -318,7 +344,24 @@ public:
         uint32_t width,
         uint32_t height,
         const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles =
-            nullptr);
+            nullptr,
+        // Optional full-res single-channel cutout alpha, width*height
+        // bytes.  Needed only when albedo_pixels is null -- that is,
+        // when the albedo arrives as a pre-encoded BC7 blob from a
+        // .rwtex bake, where alpha cannot be recovered from the blob.
+        // The .rwtex format already carries exactly this plane (see
+        // writeRwTex), so the caller has it in hand.  When
+        // albedo_pixels IS present, alpha comes from its channel 3
+        // and this may be null.
+        const uint8_t* alpha_plane = nullptr);
+
+    // True when this VT built a BC4 cutout-alpha layer -- i.e. the
+    // source texture actually had alpha below the cutout threshold.
+    // The caller stamps BINDLESS_MAT_ALPHA_VT from this so the shader
+    // knows whether to sample vt_pool_alpha or just take 1.0.  The
+    // alpha layer reuses the albedo's id and slot (all pools share one
+    // allocator), so there is no second id to carry.
+    bool hasAlphaLayer(VirtualTextureId id) const;
 
     // ── Bake-time CPU encode ──────────────────────────────────────────
     // Build the per-tile BC7 albedo cache blob for a width×height RGBA8
@@ -535,7 +578,9 @@ private:
         uint32_t pages_x, uint32_t pages_y, uint32_t mip_count,
         uint32_t page_table_offset,
         const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles =
-            nullptr);
+            nullptr,
+        // See registerMaterial's alpha_plane.
+        const uint8_t* alpha_plane = nullptr);
 
     // Decompress an arbitrary-format GPU image into a CPU RGBA8
     // buffer.  Uses vkCmdBlitImage to decompress BC formats into a
@@ -765,6 +810,11 @@ private:
         // source path so the ORM source image can be destroyed by
         // the caller after registerMaterial returns.
         std::vector<uint8_t> bc7_mr_ao;
+        // Per-VT BC4 cache for the ALPHA layer.  HALF the per-entry
+        // size of the others (kBc4BytesPerEntry), so its offset
+        // arithmetic uses the kBc4* constants -- do not reuse the
+        // kBc7* ones here.  Empty when the texture is fully opaque.
+        std::vector<uint8_t> bc4_alpha;
         std::shared_ptr<renderer::Image> albedo_src;
         std::shared_ptr<renderer::Image> normal_src;
         std::shared_ptr<renderer::Image> mr_ao_src;
@@ -809,6 +859,18 @@ private:
     static constexpr uint32_t kBc7BytesMip0     = (kVtTileSize / 4u) * (kVtTileSize / 4u) * 16u;
     static constexpr uint32_t kBc7BytesMip1     = ((kVtTileSize / 2u) / 4u) * ((kVtTileSize / 2u) / 4u) * 16u;
     static constexpr uint32_t kBc7BytesPerEntry = kBc7BytesMip0 + kBc7BytesMip1;
+    // BC4 is 8 B per 4x4 block, exactly half of BC7/BC5, so the ALPHA
+    // layer's per-entry chain is half the size.  Its staging subslot
+    // is still kBc7BytesPerEntry wide so the per-slot offset
+    // arithmetic stays uniform across all four BC layers; the unused
+    // half costs ~100 KB per frame-in-flight and buys one multiply.
+    static constexpr uint32_t kBc4BytesMip0     = (kVtTileSize / 4u) * (kVtTileSize / 4u) * 8u;
+    static constexpr uint32_t kBc4BytesMip1     = ((kVtTileSize / 2u) / 4u) * ((kVtTileSize / 2u) / 4u) * 8u;
+    static constexpr uint32_t kBc4BytesPerEntry = kBc4BytesMip0 + kBc4BytesMip1;
+    // CPU-encoded BC layers sharing the per-upload staging region:
+    // ALBEDO (BC7), NORMAL (BC5), MR_AO (BC7), ALPHA (BC4).  EMISSIVE
+    // is GPU-blitted and uses no staging.
+    static constexpr uint32_t kVtStagingSubslots = 4u;
     // Tail pointer into page_table_cpu_ for the next registerTexture
     // call's contiguous window.  v1: monotonic; v2: free-list.
     uint32_t next_page_table_tail_ = 0;

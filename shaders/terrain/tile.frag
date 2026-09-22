@@ -71,6 +71,57 @@ vec3 waterColumnTint(vec3 albedo) {
 
 #include "tile_detail.glsl.h"
 
+// ── Tile debug overlay (Render Debug > "Colour terrain tiles") ───────
+// tile_params.pad_0 bits 8..15 carry the mode:
+//   1  each mesh tile in its own colour (hash of tile_index), with its
+//      edges drawn; the tile's SIZE is what the LOD ring is, so same-
+//      size neighbours share a ring and a size step is a ring boundary
+//   2  colour by LOD ring (tile size): red = smallest .. blue = largest
+//   3  1 km detail tiles: green where the 1 m colour tile is resident,
+//      orange where only the 4 m map is, with the 1 km grid drawn
+uint tileDebugMode() { return (tile_params.pad_0 >> 8u) & 0xFFu; }
+vec3 tileDebugHash(uint i) {
+    i ^= i >> 16u; i *= 0x7feb352du; i ^= i >> 15u; i *= 0x846ca68bu; i ^= i >> 16u;
+    return vec3(0.35f) + 0.65f * vec3(float(i & 255u), float((i >> 8u) & 255u),
+                                      float((i >> 16u) & 255u)) / 255.0f;
+}
+vec3 tileDebugColor(vec3 lit, vec2 world_xz) {
+    const uint mode = tileDebugMode();
+    if (mode == 0u) return lit;
+    vec3 tint = lit;
+    float edge = 0.0f;
+    if (mode == 1u || mode == 2u) {
+        const vec2 local = (world_xz - tile_params.min) / max(tile_params.range, vec2(1e-3f));
+        const vec2 d = min(local, 1.0f - local) * tile_params.range;   // metres to the edge
+        edge = 1.0f - smoothstep(0.0f, 0.6f, min(d.x, d.y));
+        if (mode == 1u) {
+            tint = tileDebugHash(tile_params.tile_index);
+        } else {
+            // ring = log2 of the tile size, from the smallest ring up
+            const float ring = clamp(log2(max(tile_params.range.x, 1.0f)) - 5.0f, 0.0f, 7.0f);
+            const vec3 table[8] = vec3[8](
+                vec3(1.0, 0.15, 0.10), vec3(1.0, 0.55, 0.05), vec3(1.0, 0.95, 0.10),
+                vec3(0.15, 0.95, 0.20), vec3(0.10, 0.90, 0.95), vec3(0.20, 0.35, 1.0),
+                vec3(0.95, 0.20, 0.95), vec3(1.0, 1.0, 1.0));
+            tint = table[int(ring)];
+        }
+    } else {
+        const vec2 rel = (world_xz + vec2(kTerrainMapMeters * 0.5f)) / kDetailTileMeters;
+        const ivec2 t = ivec2(floor(rel));
+        bool resident = false;
+        if (!any(lessThan(t, ivec2(0))) && !any(greaterThanEqual(t, ivec2(kDetailTilesPerSide))))
+            resident = detail_color_slot[t.y * kDetailTilesPerSide + t.x] >= 0;
+        tint = resident ? vec3(0.2, 0.9, 0.3) : vec3(1.0, 0.55, 0.1);
+        const vec2 f = fract(rel);
+        const vec2 d = min(f, 1.0f - f) * kDetailTileMeters;
+        edge = 1.0f - smoothstep(0.0f, 3.0f, min(d.x, d.y));
+    }
+    // keep the shading, replace the colour; edges solid black
+    const float luma = dot(lit, vec3(0.2126f, 0.7152f, 0.0722f));
+    vec3 c = tint * clamp(luma * 1.6f + 0.25f, 0.25f, 1.2f);
+    return mix(c, vec3(0.0f), edge);
+}
+
 // 1 m albedo detail tiles (fragment-only binding — streamed with the
 // height tiles; RGBA8 2048^2 per slot).
 layout(set = TILE_PARAMS_SET, binding = TERRAIN_DETAIL_COLOR_INDEX)
@@ -1208,12 +1259,18 @@ void main() {
         float g3 = fract(sin(dot(floor(pw * 0.25) + 3.0, vec2(41.233, 17.797))) * 13758.5453);
         bool concrete = in_data.surface_kind > 1.5;
         if (concrete) {
-            // pale, slightly warm, with the 1.2 m slab joints of a
-            // poured footpath
-            vec2 slab = fract(pw / 1.2);
-            float joint = 1.0 - smoothstep(0.0, 0.03, min(min(slab.x, 1.0 - slab.x), min(slab.y, 1.0 - slab.y)));
-            albedo = vec3(0.56, 0.54, 0.50) * (0.90 + 0.14 * g1) * (0.95 + 0.10 * g3)
-                     * (1.0 - 0.25 * joint);
+            // PLAIN poured concrete.  The 1.2 m slab joints that used to
+            // be drawn here were a WORLD-axis grid: this pass knows that
+            // a fragment is pavement, not which way the pavement runs,
+            // so on any driveway or footpath not aligned to the map the
+            // joints came out as a diagonal lattice cutting across it.
+            // A pattern that cannot follow the path is worse than none.
+            // What is left is direction-free: fine aggregate, a little
+            // trowel mottle at hand scale, broad weathering.
+            float footprint_c = max(length(dFdx(pw)), length(dFdy(pw)));
+            float fine = (g1 - 0.5) * (1.0 - smoothstep(0.015, 0.08, footprint_c));
+            albedo = vec3(0.47, 0.46, 0.44) * (1.0 + 0.10 * fine)
+                     * (0.97 + 0.06 * g2) * (0.95 + 0.10 * g3);
             mat_rough = 0.90;
         } else {
             // dark grey bitumen with light aggregate showing through;
@@ -1250,6 +1307,7 @@ void main() {
     // whatever the forward branch left, and never gets lit.  129/255 =
     // 0.50588 is a full quantisation step clear of the boundary, so the
     // sentinel cannot misfire whichever way the hardware rounds.
+    if (tileDebugMode() != 0u) albedo = tileDebugColor(albedo, pos.xz);
     out_albedo_ao      = vec4(waterColumnTint(albedo), clamp(surf_ao, 129.0f / 255.0f, 1.0f));
     out_normal_rough   = vec4(octEncodeDir(normal), mat_rough, 0.0f);
     vec2 oct_geom      = octEncodeDir(geom_normal);
@@ -1357,5 +1415,6 @@ void main() {
         outColor = vec4(1.0f);
     }
 //    outColor.xyz *= in_data.test_color;
+    if (tileDebugMode() != 0u) outColor.rgb = tileDebugColor(outColor.rgb, pos.xz);
 #endif  // !GBUFFER_OUTPUT
 }

@@ -128,6 +128,11 @@ public:
     float getFovY() const { return m_view_camera_params_.fov; }
     // Camera & Lens exposure scale — see ViewCameraInfo::exposure_scale.
     void setGlobalLeafAge(float age) { m_view_camera_->setGlobalLeafAge(age); }
+
+    // Terrain holes -- see ViewCamera::setTerrainHoles.
+    void setTerrainHoles(const std::vector<std::array<float, 5>>& holes) {
+        m_view_camera_->setTerrainHoles(holes);
+    }
     void setExposureScale(float s) { m_view_camera_->setExposureScale(s); }
     // Underwater -- see ViewCamera::setUnderwater.
     void setUnderwater(float depth_m, float level_y) {

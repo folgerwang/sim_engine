@@ -75,7 +75,8 @@ void main() {
     }
 
     out_data.surface_kind = 0.0;
-    if (tile_params.pad_0 == 1u) {
+    // bit 0 only: bits 8..15 carry the tile debug overlay mode (tile.frag)
+    if ((tile_params.pad_0 & 1u) == 1u) {
         uint packed = uint(gl_VertexIndex);
         out_data.surface_kind = float(packed >> 30);
         factor_xy = vec2(packed & 32767u, (packed >> 15) & 32767u) / 32767.0;
@@ -83,6 +84,34 @@ void main() {
 
     // tile world position.
     vec2 pos_xz_ws = tile_params.min + factor_xy * tile_params.range;
+
+    // ── TERRAIN HOLES ────────────────────────────────────────────────
+    // A vertex inside a hole rectangle is moved to the nearest point on
+    // the rectangle's edge (in the hole's own rotated frame).  Every
+    // triangle wholly inside collapses onto the boundary (zero area,
+    // nothing rasterised); a triangle straddling the edge becomes a
+    // sliver along it.  The terrain therefore ends exactly at the
+    // retaining wall of whatever sits in the pit, at every LOD, with no
+    // discard and no gap.  The ground stage graded the footprint flat
+    // (plus a margin), so the height sampled at the moved position is
+    // the same grade the wall meets.  Slots are ordered; the first
+    // inactive one ends the list.
+    for (int hi = 0; hi < TERRAIN_HOLE_MAX; ++hi) {
+        vec4 hr = camera_info.terrain_hole_rot[hi];
+        if (hr.z < 0.5) break;
+        vec4 hh = camera_info.terrain_holes[hi];
+        vec2 d = pos_xz_ws - hh.xy;
+        float lu =  d.x * hr.x + d.y * hr.y;
+        float lv = -d.x * hr.y + d.y * hr.x;
+        if (abs(lu) < hh.z && abs(lv) < hh.w) {
+            float su = hh.z - abs(lu);
+            float sv = hh.w - abs(lv);
+            if (su < sv) lu = (lu >= 0.0) ? hh.z : -hh.z;
+            else         lv = (lv >= 0.0) ? hh.w : -hh.w;
+            pos_xz_ws = hh.xy + vec2(lu * hr.x - lv * hr.y,
+                                     lu * hr.y + lv * hr.x);
+        }
+    }
 
     // convert tile world position to uv coordinate.
     vec2 world_map_uv = (pos_xz_ws - tile_params.world_min) * tile_params.inv_world_range;

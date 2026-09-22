@@ -556,6 +556,26 @@ void main() {
         albedo_tex=depthTriplanarSample(base_color_textures[nonuniformEXT(tex_idx)],
                                        v_world_pos,normalize(v_normal),depth_tile);
     albedo4 *= albedo_tex;
+
+    // ── Cutout alpha from the dedicated BC4 layer ────────────────────
+    // When BINDLESS_MAT_ALPHA_VT is set the albedo above was encoded
+    // OPAQUE (alpha forced to 255 before the BC7 encode), so
+    // albedo_tex.a is meaningless and everything downstream -- the leaf
+    // aging silhouette just below, then the alpha-mask discard -- has
+    // to read the real alpha from vt_pool_alpha instead.  Same vt_id,
+    // same pool slot, different sampler: all layer pools share one
+    // allocator.
+    //
+    // This MUST land before the aging call: leafAgedColor derives its
+    // silhouette from the incoming alpha, so aging an opaque 1.0 would
+    // hand the discard below a fully solid leaf card.
+    //
+    // Assets baked before the split leave the flag clear and keep
+    // taking alpha from the albedo, unchanged.
+    if ((mat_flags & BINDLESS_MAT_ALPHA_VT) != 0) {
+        albedo4.a = base_color.a *
+                    vtSampleAlpha(material_params[mat_idx].albedo_vt_id, v_uv);
+    }
     if (leaf_mask) {
         int ageIndex = material_params[mat_idx].normal_tex_idx;
         uint group = UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags));

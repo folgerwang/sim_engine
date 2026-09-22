@@ -27,10 +27,14 @@ layout(std430, set = NODE_TABLE_PARAMS_SET, binding = NODE_TABLE_SLOTS_BINDING) 
 ModelParams model_params;
 // Per-node plant extent for the sway (see ModelParams::debug_skip_skinning).
 uint veg_plant_bits = 0u;
+uint lod_debug_code = 0u;
 void ntLoadModelParams() {
     const uint slot = floatBitsToUint(pc_params.lod_fade) + uint(gl_DrawIDARB);
     model_params = node_params[node_slots[slot]];
     veg_plant_bits = model_params.debug_skip_skinning;
+    // LOD debug colour code (>= 16) travels in the RECORD's field --
+    // kept aside here and handed to the fragment stage in the varying.
+    lod_debug_code = model_params.debug_force_red >= 16u ? model_params.debug_force_red - 15u : 0u;
     // Per-drawable / per-pass fields always come from the push constant;
     // the record keeps the node's own bits (flips, interior) and its
     // dissolve weight (0 = steady; per-instance bands carry theirs in
@@ -58,6 +62,7 @@ layout(push_constant) uniform ModelUniformBufferObject {
 };
 // Classic path: the push constant IS the node's record.
 #define veg_plant_bits (model_params.debug_skip_skinning)
+#define lod_debug_code (model_params.debug_force_red >= 16u ? model_params.debug_force_red - 15u : 0u)
 #endif
 
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
@@ -119,6 +124,17 @@ layout(location = IINPUT_MAT_ROT_2) in vec4 in_loc_rot_mat_2;
 layout(location = IINPUT_TREE_AGE) in float in_tree_age_base;
 
 layout(location = 0) out ObjectVsPsData out_data;
+
+// ── gl_Position MUST be bit-identical across permutations ────────────
+// The cutout depth prepass (DEPTH_COVERAGE) and the colour G-buffer
+// pass are two different permutations of THIS vertex shader, and the
+// colour pass depth-tests EQUAL against the depth the prepass wrote
+// (drawable_object.cpp, createDrawablePipeline).  Without this
+// qualifier a compiler may reassociate the MVP multiply differently in
+// each permutation; the last-bit disagreement that produces would fail
+// the EQUAL test on a scattered subset of pixels, i.e. it would look
+// exactly like the leaf dithering the EQUAL test is there to fix.
+invariant gl_Position;
 
 // ── Skinning helpers ─────────────────────────────────────────────────────────
 // getNormal() / getTangent() are called before skin_matrix is computed in
@@ -192,6 +208,43 @@ void main() {
 #ifdef GPU_NODE_TABLE
     ntLoadModelParams();
 #endif
+    // ── Per-instance LOD band: TESTED FIRST, NOT LAST ────────────────
+    // This test used to sit at the BOTTOM of main(), after skinning,
+    // the world transform, the wind sway, the normal and tangent
+    // transforms and every varying write -- and then threw the vertex
+    // away with gl_Position = (0,0,2,1).  Because the node-level cull
+    // is only conservative (a 512 m tile overlaps five of the six tree
+    // bands, so five nodes each submit the tile's FULL instance list
+    // and the shader discards four bands' worth), most invocations in
+    // a plant draw are discards, and each was paying for a complete
+    // vertex first.
+    //
+    // Everything the test needs is available here: model_params (the
+    // push constant, or the record ntLoadModelParams just fetched) and
+    // the instance translation, which rides the .w lanes of the three
+    // basis columns.  Nothing below this point feeds it.
+    //
+    // Safe to return early: all vertices of a triangle share an
+    // instance, so the whole primitive is clipped together (z=2 > w=1)
+    // and no fragment ever reads the varyings left unwritten.
+    bool ilod_active = false;
+    {
+        uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
+        if (ilod_bits != 0u) {
+            ilod_active = true;
+            vec3 inst_t = (model_params.model_mat * vec4(in_loc_rot_mat_0.w,
+                in_loc_rot_mat_1.w, in_loc_rot_mat_2.w, 1.0)).xyz;
+            float ilod_d = distance(inst_t.xz, camera_info.position.xz);
+            float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
+            float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;
+            // Exact half-open bands: one LOD owns each instance.
+            if (!(ilod_d >= ilod_near && ilod_d < ilod_far)) {
+                out_data.vertex_ilod_fade = 0.0;
+                gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+                return;
+            }
+        }
+    }
 	// Calculate skinned matrix from weights and joint indices of the current vertex
     mat4 matrix_ls = model_params.model_mat;
 #if defined(HAS_SKIN_SET_0) || defined(HAS_SKIN_SET_1)
@@ -298,21 +351,15 @@ void main() {
     out_data.vertex_node_flags =
         ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u) ? 1.0 : 0.0;
 #endif
-    {
-        uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
-        if (ilod_bits != 0u) {
-            vec3 inst_t = (model_params.model_mat * vec4(in_loc_rot_mat_0.w,
-                in_loc_rot_mat_1.w, in_loc_rot_mat_2.w, 1.0)).xyz;
-            float ilod_d = distance(inst_t.xz, camera_info.position.xz);
-            float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
-            float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;
-            // Exact half-open bands: one LOD owns each instance.
-            out_data.vertex_ilod_fade =
-                (ilod_d >= ilod_near && ilod_d < ilod_far) ? 1.0 : 0.0;
-            if (out_data.vertex_ilod_fade == 0.0)
-                gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        }
-    }
+    // Bit 0 = interior; bits 1.. = the LOD debug colour code (0 = none).
+    // See lodDebugTint in base.frag.
+    out_data.vertex_node_flags += 2.0 * float(lod_debug_code);
+    // The band test itself now runs at the TOP of main() and returns
+    // early on a miss (see there).  Reaching this line with
+    // ilod_active means this instance IS in its band, so the
+    // per-instance weight overrides whatever the node-table path put
+    // in the varying -- exactly as before, minus the wasted vertex.
+    if (ilod_active) out_data.vertex_ilod_fade = 1.0;
 
     // ── Weight-sum debug varying ─────────────────────────────────────────────
     // Carry the raw (pre-normalization) sum of all skin influences so the

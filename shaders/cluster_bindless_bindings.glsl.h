@@ -58,6 +58,14 @@ layout(set = PBR_MATERIAL_PARAMS_SET, binding = 6)
     uniform sampler2D vt_pool_mr_ao;
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 7)
     uniform sampler2D vt_pool_emissive;
+// BC4 cutout-alpha pool.  Binding 11, NOT 8: appending it after the
+// SSBOs avoids renumbering the page table / meta / feedback bindings
+// and every literal that references them.  VT_HAS_ALPHA_POOL tells
+// vt_sample.glsl.h the sampler exists -- terrain/tile.frag declares
+// its own VT bindings without this one and must not get the helpers.
+#define VT_HAS_ALPHA_POOL 1
+layout(set = PBR_MATERIAL_PARAMS_SET, binding = 11)
+    uniform sampler2D vt_pool_alpha;
 layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 8)
     readonly buffer VtPageTableBuffer {
     uint vt_page_table[];

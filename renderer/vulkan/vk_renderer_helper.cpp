@@ -1,3 +1,5 @@
+#include <cstring>
+#include <algorithm>
 #include <iostream>
 #include <set>
 #include <cstdlib>   // std::getenv (RW_NO_VSYNC present-mode override)
@@ -1581,8 +1583,26 @@ std::vector<const char*> getRequiredExtensions() {
     std::vector<const char*> extensions(glfw_extensions, glfw_extensions + glfw_extensionCount);
     extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 
-    if (hasEnabledValidationLayers()) {
-       extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // VK_EXT_debug_utils is requested in EVERY build, not only with the
+    // validation layers: it is what carries the pass names (debug labels)
+    // that Nsight Graphics / RenderDoc show as ranges, and without it a
+    // Release capture -- the only build worth profiling -- is a flat list
+    // of anonymous vkCmdDraw calls.  The labels cost nothing when no tool
+    // is attached; the debug MESSENGER stays tied to the validation
+    // layers as before.  Skipped quietly if the loader does not offer it.
+    {
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> props(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
+        const bool have_debug_utils = std::any_of(
+            props.begin(), props.end(), [](const VkExtensionProperties& e) {
+                return std::strcmp(e.extensionName,
+                                   VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+            });
+        if (have_debug_utils || hasEnabledValidationLayers()) {
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
     }
 
     return extensions;

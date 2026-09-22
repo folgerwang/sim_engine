@@ -22,13 +22,17 @@
 #include "functions.glsl.h"
 #include "depth_pbr.glsl.h"
 #include "leaf_age.glsl.h"
-#include "cluster_cutout.glsl.h"
-#include "visbuffer_common.glsl.h"
 
+// Declared HERE, before cluster_cutout.glsl.h, not after: that header
+// reads camera_info.global_leaf_age, and glslang resolves identifiers
+// at parse time, so a later declaration is not visible to it.
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     readonly buffer ViewCameraInfoBuffer {
     ViewCameraInfo camera_info;
 };
+
+#include "cluster_cutout.glsl.h"
+#include "visbuffer_common.glsl.h"
 
 // Geometry, read straight out of the buffers the raster pass draws from.
 // Both already carry STORAGE_BUFFER_BIT (added for the mesh-shader CSM

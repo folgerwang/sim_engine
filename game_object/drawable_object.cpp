@@ -125,6 +125,9 @@ static glm::vec3 s_plant_lod_eye_ws = glm::vec3(0.0f);
 // module loaders then append "_NT" to the VERTEX shader name, selecting
 // the GPU_NODE_TABLE permutation (see getDrawableShaderModules).
 static bool      s_shader_nt_variant = false;
+// Render Debug > "Colour plant LOD bands" — see lodDebugTint in base.frag.
+static bool      s_lod_debug_colors = false;
+static uint32_t  s_lod_debug_gen = 0;
 
 // Box-downscale a baked .rwtex RGBA8 preview for the forward-path
 // stopgap image (see the "Forward-path preview image" blocks below).
@@ -190,6 +193,31 @@ static bool downscalePreviewPixels(
 }
 
 namespace ego = engine::game_object;
+// Every rung near-distance seen per category, across all loaded files:
+// the debug ordinal is a node's position in its category's set.
+static std::map<std::string, std::set<float>> s_lod_cat_nears;
+static uint32_t  s_lod_cat_ver = 1;
+static void refreshLodDebugOrdinals(engine::game_object::DrawableData& d) {
+    if (d.lod_debug_ver_ == s_lod_cat_ver) return;
+    d.lod_debug_ver_ = s_lod_cat_ver;
+    d.lod_debug_ord_.assign(d.nodes_.size(), uint8_t(0));
+    for (size_t i = 0; i < d.nodes_.size(); ++i) {
+        const auto& n = d.nodes_[i];
+        if (n.lod_tile_m_ <= 0.0f || n.lod_cat_idx_ < 0 ||
+            size_t(n.lod_cat_idx_) >= d.lod_cat_names_.size()) continue;
+        const auto it = s_lod_cat_nears.find(d.lod_cat_names_[size_t(n.lod_cat_idx_)]);
+        if (it == s_lod_cat_nears.end()) continue;
+        const auto& set = it->second;
+        const size_t ord = size_t(std::distance(set.begin(), set.lower_bound(n.lod_near_m_ - 0.01f)));
+        d.lod_debug_ord_[i] = uint8_t(std::min<size_t>(ord, 7));
+    }
+}
+void engine::game_object::DrawableObject::setLodDebugColors(bool on) {
+    if (s_lod_debug_colors == on) return;
+    s_lod_debug_colors = on;
+    ++s_lod_debug_gen;
+}
+bool engine::game_object::DrawableObject::getLodDebugColors() { return s_lod_debug_colors; }
 
 // ── ECS material-dedup capture ──────────────────────────────────────────
 // Fill MaterialInfo::desc_ (the renderer-free ecs::MaterialDesc dedup
@@ -865,6 +893,11 @@ static void setupMeshState(
                 dst_material.leaf_age_group_=0;
                 ubo.material_features |= FEATURE_MATERIAL_LEAF_AGE;
             }
+            // v44: EVERY clutter card (grass, flower, far meadow) is a
+            // ground card: cut by its alpha in the depth passes and
+            // absent from the RT acceleration structures.
+            if (dst_material.name_.rfind("clutter_", 0) == 0)
+                ubo.material_features |= FEATURE_MATERIAL_GROUND_CARD;
             const auto leaf_age = dst_material.name_.find("_leafage_");
             if (leaf_age != std::string::npos && leaf_age + 9 < dst_material.name_.size() &&
                 dst_material.name_[leaf_age + 9] >= '0' && dst_material.name_[leaf_age + 9] <= '7')
@@ -1229,7 +1262,7 @@ static void uploadGltfDrawBuffers(const std::shared_ptr<renderer::Device>& devic
                 const int id=name?attributeId(name):-1;if(id<0)continue;
                 attr.buffer_view=rawView(id);attr.buffer_offset=0;attr.offset=0;
                 for(auto& binding:prim.binding_descs_)if(binding.binding==attr.binding)
-                    binding.stride=data->buffer_views_[attr.buffer_view].stride;
+                    binding.stride=static_cast<uint32_t>(data->buffer_views_[attr.buffer_view].stride);
             }
             if(src.indices>=0) {
                 const uint32_t view=rawView(src.indices);
@@ -3321,6 +3354,12 @@ static void parsePlantLodBands(
         {
             const std::string cat_ns = lodCategoryOf(node.name_);
             node.no_sway_ = (cat_ns == "rock" || cat_ns == "crag") ? 1 : 0;
+            // SHRUBS CAST NO SHADOW.  A bush's shadow is a dark blot the
+            // size of the bush, under the bush, on ground the bush
+            // already hides; what showed was its card geometry.  Dropped
+            // from every depth-only pass (lod_node_owner_) and from the
+            // RT caster set (application.cpp reads the same flag).
+            node.no_shadow_ = (cat_ns == "bush" || cat_ns == "ground") ? 1 : 0;
         }
         int64_t ti = 0, tj = 0;
         float tile_m = 0.0f, near_m = 0.0f, far_m = 0.0f;
@@ -3376,6 +3415,10 @@ static void parsePlantLodBands(
         drawable_object->lod_cat_names_.clear();
         drawable_object->lod_band_authored_.clear();
         for (const auto& kv : by_cat) {
+            // global rung registry for the LOD debug colours
+            auto& nears = s_lod_cat_nears[kv.first];
+            for (const auto& nf : kv.second)
+                if (nears.insert(nf.first).second) { ++s_lod_cat_ver; ++s_lod_debug_gen; }
             cat_idx[kv.first] =
                 static_cast<int>(drawable_object->lod_cat_names_.size());
             drawable_object->lod_cat_names_.push_back(kv.first);
@@ -3691,6 +3734,11 @@ static void selectPlantLodBands(
         if (v == 0) { fade[i] = 0.0f; owner[i] = 0; }
         drawn += v;
     }
+    // v44: nodes flagged no_shadow_ (shrubs) leave every depth-only
+    // pass -- classic, survivor lists and the GPU node table all read
+    // lod_node_owner_ for those.
+    for (size_t i = 0; i < owner.size() && i < drawable_object->nodes_.size(); ++i)
+        if (drawable_object->nodes_[i].no_shadow_) owner[i] = 0;
     drawable_object->lod_nodes_drawn_ = drawn;
     // Every consumer that caches a derived form of vis/owner watches
     // this counter — see DrawableData::lod_tables_version_.  Bumped only
@@ -4959,6 +5007,9 @@ static void drawMesh(
     // the two conditions would be confusing to read fused together.  The
     // duplicated sphere math only runs for drawables that actually set a
     // fade distance — i.e. the clutter import and nothing else.
+    // v44: ground clutter (the grass / flower / meadow cards) casts no
+    // shadow at all -- a blot of card shadow on the grass it grows from.
+    if (depth_only && drawable_object->m_clutter_fade_end_m_ > 0.0f) return;
     if (!depth_only && s_viewer_pos_valid &&
         drawable_object->m_clutter_fade_end_m_ > 0.0f) {
         // cullBbox* for the same reason as the frustum test above; the
@@ -5646,6 +5697,11 @@ static void drawNodeMesh(
                 drawable_object->m_debug_force_red_ ? 1u
                 : ((drawable_object->m_highlight_node_ == node_idx ||
                     drawable_object->m_highlight_node_ == -2) ? 2u : 0u);
+            // LOD band debug: 16 + rung ordinal (see lodDebugTint).
+            if (s_lod_debug_colors && model_params.debug_force_red == 0u &&
+                has_lod && node.lod_band_idx_ >= 0 &&
+                size_t(node_idx) < drawable_object->lod_debug_ord_.size())
+                model_params.debug_force_red = 16u + uint32_t(drawable_object->lod_debug_ord_[node_idx]);
             // base.vert's skin-matrix multiplication is skipped when
             // this is set (see DrawableData::m_debug_skip_skinning_).
             // For depth-only / shadow / mesh-shader CSM permutations
@@ -6107,6 +6163,21 @@ static std::shared_ptr<renderer::Pipeline> createDrawablePipeline(
 
     // Optional cutout depth prepass already owns equal-depth leaf samples.
     // The color pass must still shade those samples (and re-test alpha).
+    //
+    // MUST STAY LESS_OR_EQUAL.  EQUAL looks right on paper -- prepass
+    // alpha-tests, colour pass shades its survivors as opaque -- and it
+    // is wrong here, because the prepass does NOT cover the geometry it
+    // would have to.  node_table_cull.comp, NT_MODE_PREPASS:
+    //
+    //     if (per_inst || fading || ...) return;
+    //
+    // Per-instance-band nodes -- every tree, bush and ground-cover node
+    // -- sit the prepass out by design (a per-instance node would stamp
+    // full depth over pixels the colour pass then discards).  So plants
+    // never write prepass depth, and under EQUAL every plant fragment
+    // would fail the test and the entire vegetation layer would vanish.
+    // The re-test of alpha in base.frag's G-buffer permutation is what
+    // makes LESS_OR_EQUAL correct; keep the two together.
     if (!is_decal && effective_pipeline_info.depth_stencil_info) {
         effective_pipeline_info.depth_stencil_info = std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
             *effective_pipeline_info.depth_stencil_info);
@@ -8184,11 +8255,16 @@ static void ntStageRecords(
     const std::shared_ptr<ego::DrawableData>& object_,
     NodeTableGpu& nt) {
     const glm::mat4 iw = object_->m_current_instance_world_;
-    if (nt.staged_version == object_->lod_pass_version_ &&
+    // The LOD debug toggle is folded into the version so flipping it
+    // restages AND re-uploads every record (the upload compares this
+    // same value).
+    const uint64_t want_version =
+        object_->lod_pass_version_ ^ (uint64_t(s_lod_debug_gen) << 48);
+    if (nt.staged_version == want_version &&
         std::memcmp(&nt.staged_iw, &iw, sizeof(glm::mat4)) == 0) {
         return;
     }
-    nt.staged_version = object_->lod_pass_version_;
+    nt.staged_version = want_version;
     nt.staged_iw = iw;
     // Every GPU copy is now stale.
     nt.uploaded_version[0] = ~uint64_t(0);
@@ -8235,7 +8311,9 @@ static void ntStageRecords(
             // vertex shader clears the bit after merging the two.
             (node.no_sway_ ? MODEL_FLAG_NO_SWAY : 0x00u);
         r.cascade_idx = 0u;
-        r.debug_force_red = 0u;
+        r.debug_force_red = (s_lod_debug_colors && has_lod && node.lod_band_idx_ >= 0 &&
+                             size_t(ni) < object_->lod_debug_ord_.size())
+            ? 16u + uint32_t(object_->lod_debug_ord_[size_t(ni)]) : 0u;
         // Vegetation: the node's plant extent for the sway profile.  The
         // shader reads it from the RECORD before the push constant's
         // (per-drawable, 0) value overwrites the field.
@@ -10864,6 +10942,17 @@ void DrawableObject::draw(
     // very top means no instance-buffer bind, no node walk, no shadow
     // recording — exactly what we want when the user hides this drawable.
     if (!visible_) return;
+    if (s_lod_debug_colors && object_ && object_->has_plant_lod_)
+        refreshLodDebugOrdinals(*object_);
+
+    // v44: ground clutter casts no shadow -- at the very top, so it
+    // holds on the node-table path as well as the classic one (the
+    // drawMesh guard only sees the classic walk).
+    if (clutter_fade_end_m_ > 0.0f &&
+        (depth_only || draw_mode == DrawMode::kShadow ||
+         draw_mode == DrawMode::kCsmLayered ||
+         draw_mode == DrawMode::kCsmPerCascade ||
+         draw_mode == DrawMode::kCsmMeshShader)) return;
 
     // ECS object-level frustum cull: a coarse early-out computed by
     // ecs::CullingSystem over the entity's WorldBounds.  FORWARD ONLY —
@@ -12575,6 +12664,14 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             }
         }
         if (!alpha_data.empty()) {
+            // Keep the plane on the CPU as well: the VT registration
+            // below builds a BC4 alpha layer from it, and on this path
+            // the albedo is a pre-encoded BC7 blob, so this is the only
+            // place the cutout alpha still exists in a readable form.
+            if (aw == tb.w && ah == tb.h) {
+                dst.cpu_alpha =
+                    std::make_shared<std::vector<uint8_t>>(alpha_data);
+            }
             renderer::Helper::create2DTextureImage(
                 device,
                 renderer::Format::R8_UNORM,

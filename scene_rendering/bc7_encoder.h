@@ -67,5 +67,45 @@ void encodeBC5UNorm(
     uint32_t       height,
     uint8_t*       dst_bc5);
 
+// Compress ONE channel of an RGBA8 source into BC4_UNORM (8 bytes per
+// 4x4 block -- half of BC7, and a quarter of raw R8).
+//
+// This exists for the cutout alpha layer.  Alpha used to ride in the
+// albedo's BC7 alpha channel, where mode 6 shares a single index set
+// between colour and alpha: the encoder had to spend that index on
+// whichever of the two it judged more important, and at a leaf's
+// cutout edge -- exactly where colour and alpha disagree most -- the
+// result was alpha smeared across the silhouette.  Given its own BC4
+// block, alpha gets 8-bit endpoints and 3-bit indices of its own, so
+// the edge is as sharp as the source.  The visibility pass then reads
+// 8 bytes per block instead of 16, and never touches the albedo pool
+// at all.
+//
+// Output buffer must be at least:
+//     ((width + 3) / 4) * ((height + 3) / 4) * 8   bytes
+//
+// Edge padding matches encodeBC7Mode6 / encodeBC5UNorm: blocks past
+// the image right/bottom edge clamp to the rightmost/bottommost real
+// texel.
+//
+// The source is described by a base pointer and a texel stride rather
+// than a channel index, so one function serves both callers: the alpha
+// channel of an RGBA8 buffer is (rgba + 3, stride 4), and a tightly
+// packed single-channel plane -- which is how a .rwtex bake stores its
+// cutout alpha -- is (plane, stride 1).
+//
+//   src        first byte of the channel's first texel, row-major.
+//   src_stride bytes between consecutive texels (4 for RGBA8, 1 for a
+//              packed single-channel plane).
+//   width,
+//   height     source dimensions in texels.
+//   dst_bc4    destination buffer (caller-allocated).
+void encodeBC4UNorm(
+    const uint8_t* src,
+    uint32_t       src_stride,
+    uint32_t       width,
+    uint32_t       height,
+    uint8_t*       dst_bc4);
+
 }  // namespace scene_rendering
 }  // namespace engine

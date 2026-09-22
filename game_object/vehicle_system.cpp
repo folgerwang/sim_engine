@@ -66,6 +66,8 @@ constexpr float kPedClearS = 4.0f;
 // breaks in a few seconds, long enough that ordinary stop-and-go
 // traffic never trips it.
 constexpr float kGridlockS = 6.0f;
+constexpr float kJunctionKeepOutM = 12.0f;   // v39: see inJunctionZone
+constexpr float kBoxWedgedS = 15.0f;         // v39: a stationary non-holder in the box stops counting
 // A pedestrian may hold a crossing for this long.  Without a cap, one
 // walker who stops advancing pins every approach to that edge for the
 // rest of the session.
@@ -1166,6 +1168,7 @@ void VehicleSystem::destroyStaticMembers(
 // ── the road graph ───────────────────────────────────────────────────
 bool VehicleSystem::loadRoads(const std::string& roads_json) {
     edges_.clear(); nodes_.clear(); pt_grid_.clear(); node_grid_.clear();
+    paint_ok_.clear();
     vehicles_.clear(); node_claim_.clear();
     std::ifstream f(roads_json);
     if (!f) {
@@ -1765,6 +1768,45 @@ void VehicleSystem::emitSignals(const glm::vec3& camera_pos, const GroundQueryFn
 //     bar across the entering half; a zebra crosswalk between the bar
 //     and the box, square to THIS approach.
 // Nothing is painted inside the box itself.
+bool VehicleSystem::paintAllowed(int ei, float s) const {
+    if (ei < 0 || ei >= int(edges_.size())) return false;
+    if (paint_ok_.size() != edges_.size()) paint_ok_.assign(edges_.size(), {});
+    auto& ok = paint_ok_[size_t(ei)];
+    const Edge& e = edges_[size_t(ei)];
+    if (ok.empty()) {
+        const int n = std::max(1, int(std::ceil(e.len)) + 1);
+        ok.assign(size_t(n), uint8_t(1));
+        const int r = int(std::ceil(20.0f / kPtCell));
+        for (int k = 0; k < n; ++k) {
+            const glm::vec3 p = edgePoint(e, float(k), nullptr, nullptr);
+            const int cx = int(std::floor(p.x / kPtCell));
+            const int cz = int(std::floor(p.z / kPtCell));
+            bool covered = false;
+            for (int dz = -r; dz <= r && !covered; ++dz)
+                for (int dx = -r; dx <= r && !covered; ++dx) {
+                    auto it = pt_grid_.find(cellKey(float(cx + dx) * kPtCell,
+                                                    float(cz + dz) * kPtCell, kPtCell));
+                    if (it == pt_grid_.end()) continue;
+                    for (const RoadPt& rp : it->second) {
+                        if (rp.edge == ei) continue;
+                        const Edge& o = edges_[size_t(rp.edge)];
+                        // the road this one continues as, or meets at a
+                        // node: its box is already handled by the stop
+                        // lines, and its pavement near the node is ours
+                        if (o.a == e.a || o.a == e.b || o.b == e.a || o.b == e.b) continue;
+                        const glm::vec3& q = o.pts[size_t(rp.index)];
+                        const float ddx = q.x - p.x, ddz = q.z - p.z;
+                        const float reach = o.half[size_t(rp.index)] + 0.3f;
+                        if (ddx * ddx + ddz * ddz < reach * reach) { covered = true; break; }
+                    }
+                }
+            if (covered) ok[size_t(k)] = 0;
+        }
+    }
+    const int k = glm::clamp(int(s + 0.5f), 0, int(ok.size()) - 1);
+    return ok[size_t(k)] != 0;
+}
+
 void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQueryFn& ground) {
     if (!ground) return;
     const glm::vec3 kWhite(0.90f, 0.90f, 0.86f), kYellow(0.92f, 0.78f, 0.28f);
@@ -1791,7 +1833,12 @@ void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQuery
             if(!ground(c.x+offset.x,c.z+offset.z,y,support,normal)) return;
             clearance=std::max(clearance,support-(y+offset.y));
         }
-        M[3] = glm::vec4(glm::vec3(c.x, y+clearance+0.015f, c.z), 1.0f);
+        // v42: 8 mm, not 15 -- on a crowned road the clearance already
+        // lifts the quad, and 2 m quads stood in a visible staircase with
+        // a shadow under each tread (the stripe is 1 mm thick; the shadow
+        // was the lift).  Paint no longer casts at all, see
+        // collectShadowGeometry.
+        M[3] = glm::vec4(glm::vec3(c.x, y+clearance+0.008f, c.z), 1.0f);
         frame_[size_t(barStream())].push_back(
             {M, glm::vec4(rgb, 0.0f), glm::vec4(5.0f, 0.0f, 0.0f, 0.0f), glm::vec4(0.0f)});
     };
@@ -1813,7 +1860,7 @@ void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQuery
         const bool surfaced = h_mid >= 2.5f;           // dirt and gravel carry no paint
         // ── along-road lines ─────────────────────────────────────
         if (surfaced && s1 - s0 > 6.0f) {
-            const float step = 2.0f;
+            const float step = 1.0f;     // v42: was 2 m; halves the tread height on a crown
             for (float sa = s0; sa < s1; sa += step) {
                 const float sb = std::min(sa + step, s1);
                 const float sm = 0.5f * (sa + sb);
@@ -1821,6 +1868,7 @@ void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQuery
                 const glm::vec3 c = edgePoint(e, sm, &t, &h);
                 const float dx = c.x - camera_pos.x, dz = c.z - camera_pos.z;
                 if (dx * dx + dz * dz > draw2) continue;
+                if (!paintAllowed(int(&e - edges_.data()), sm)) continue;   // v44
                 const glm::vec3 right(-t.z, 0.0f, t.x);
                 const float pave = carriageFrac(h) * h;
                 const float hl = 0.5f * (sb - sa);
@@ -1859,6 +1907,7 @@ void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQuery
             const glm::vec3 pc = edgePoint(e, at(sd), &t, &h);
             const float dx = pc.x - camera_pos.x, dz = pc.z - camera_pos.z;
             if (dx * dx + dz * dz > draw2) continue;
+            if (!paintAllowed(int(&e - edges_.data()), at(sd))) continue;   // v44
             if (dir < 0.0f) t = -t;
             const glm::vec3 right(-t.z, 0.0f, t.x);      // right of travel
             const float pave = carriageFrac(h) * h;
@@ -1880,6 +1929,36 @@ void VehicleSystem::emitRoadPaint(const glm::vec3& camera_pos, const GroundQuery
 }
 
 // ── vehicles ─────────────────────────────────────────────────────────
+// ── v39: NOTHING STARTS, ENDS OR PARKS INSIDE A JUNCTION ───────────────
+// Road samples run node to node, so index 0 / last of an edge IS the box
+// centre.  Spawns, destinations and kerb spots were drawn from every
+// sample, and a car whose trip ended on one stopped in the middle of the
+// crossroad: it could not re-route (there is no "onward on the same
+// edge" from the end of an edge), and the box-occupancy test then
+// refused every other car admission -- one car, whole junction dead.
+// The keep-out is the approach's stop distance plus a bus length.
+bool VehicleSystem::inJunctionZone(const Edge& e, int idx) const {
+    if (idx < 0 || idx >= int(e.s.size())) return true;
+    const auto junction = [&](int node) {
+        return node >= 0 && node < int(nodes_.size()) && nodes_[size_t(node)].edges.size() > 2;
+    };
+    const float s = e.s[size_t(idx)];
+    if (junction(e.a) && s < stopDist(e, true) + kJunctionKeepOutM) return true;
+    if (junction(e.b) && e.len - s < stopDist(e, false) + kJunctionKeepOutM) return true;
+    return false;
+}
+
+VehicleSystem::RoadPt VehicleSystem::clearOfJunction(RoadPt rp) const {
+    const Edge& e = edges_[size_t(rp.edge)];
+    if (!inJunctionZone(e, rp.index)) return rp;
+    const int n = int(e.pts.size());
+    // nearest sample outside both keep-outs; a short edge gives its middle
+    for (int step = 1; step < n; ++step)
+        for (int at : {rp.index + step, rp.index - step})
+            if (at >= 0 && at < n && !inJunctionZone(e, at)) return RoadPt{rp.edge, at};
+    return RoadPt{rp.edge, n / 2};
+}
+
 bool VehicleSystem::spaceFree(const Vehicle& v, int ignore, const Vehicle* previous) const {
     auto box = vehicleBounds(v.pos,v.yaw,v.ground_up,v.bounds_min,v.bounds_max);
     if (previous) box=sweptVehicleBounds(vehicleBounds(previous->pos,previous->yaw,
@@ -1910,6 +1989,7 @@ bool VehicleSystem::parkFree(Vehicle& v, const RoadPt& rp, int ignore) {
             const int at=rp.index+step*direction;
             if(at<0 || at>=int(edge.pts.size())) continue;
             if(std::abs(edge.s[at]-origin)>kCurbSearchM) continue;
+            if(inJunctionZone(edge,at)) continue;          // v39
             Vehicle candidate=v;
             candidate.claim=-1;
             parkAt(candidate, RoadPt{rp.edge,at});
@@ -1925,7 +2005,33 @@ bool VehicleSystem::parkFree(Vehicle& v, const RoadPt& rp, int ignore) {
 
 void VehicleSystem::guardMove(Vehicle& v, const Vehicle& previous, int index) {
     if(v.pos==previous.pos && v.yaw==previous.yaw && v.ground_up==previous.ground_up) return;
+    if(v.ghost_t>0.f) return;
     if(spaceFree(v,index,&previous)) return;
+    // ── v42: A MUTUAL BLOCK ALWAYS CLEARS ──────────────────────────
+    // Reverting the move is right while the other car is going to get
+    // out of the way.  When everything this car touches has itself been
+    // standing for seconds, nobody is: two cars nose to nose each revert
+    // for ever.  Then ONE of them (the lower index; anyone after 20 s)
+    // drives through for a few seconds.  A brief overlap is ugly; a dead
+    // junction with three queues behind it is worse.
+    if(previous.stall_t>=6.f && !previous.parked) {
+        bool all_stuck=true, lowest=true;
+        const auto box=sweptVehicleBounds(vehicleBounds(previous.pos,previous.yaw,
+            previous.ground_up,previous.bounds_min,previous.bounds_max),
+            vehicleBounds(v.pos,v.yaw,v.ground_up,v.bounds_min,v.bounds_max));
+        for(size_t i=0;i<vehicles_.size();++i) {
+            const auto& o=vehicles_[i];
+            if(int(i)==index || o.dormant) continue;
+            const auto d=o.pos-box.centre;
+            if(glm::dot(d,d)>30.f*30.f) continue;
+            if(!vehicleBoundsOverlap(box,vehicleBounds(o.pos,o.yaw,o.ground_up,
+                                                       o.bounds_min,o.bounds_max))) continue;
+            if(!o.parked && o.stall_t<4.f) all_stuck=false;
+            if(!o.parked && o.ghost_t<=0.f && int(i)<index) lowest=false;
+            if(o.ghost_t>0.f) all_stuck=false;          // it is already on its way out
+        }
+        if(all_stuck && (lowest || previous.stall_t>=20.f)) { v.ghost_t=5.f; return; }
+    }
     const int new_claim=v.claim;
     const float idle=v.idle_t, stop=v.stop_t, block=v.block_t, cool=v.lane_cool;
     v=previous;
@@ -2038,20 +2144,33 @@ bool VehicleSystem::footStep(FootPath& path, glm::vec3& pos,
             });
             if(pending==foot_claims_.end()) foot_claims_.push_back({path.edge,path.crossing_s,anim_t_+2.f});
             else pending->until=anim_t_+2.f;
+            // ── WHO A WALKER ACTUALLY WAITS FOR (v41) ────────────────
+            // The test here was radial: ANY moving car within
+            // speed*8 + L + 5 m of the crossing, on any road, going any
+            // way.  At 50 km/h that is a 125 m bubble, so beside a through
+            // road with steady traffic a walker was never admitted -- while
+            // the claim it refreshes every frame held this approach at its
+            // line for good.  That is the crowd on the corner and the queue
+            // beside it.  A car matters only if it can REACH the crosswalk
+            // before it can stop: one on this road, heading for the
+            // crossing, inside its own braking distance; or one already
+            // rolling through the box a few metres away.  Everything else
+            // either is not coming or will stop for the claim.
             for(const auto& car:vehicles_) {
                 if(car.dormant) continue;
                 const float gap=glm::length(flat(car.pos-centre));
-                // A car that is MOVING gets its stopping distance; a car
-                // that is standing only blocks the crossing it is
-                // physically on.  The old test gave a stationary car the
-                // same 5.5-6.5 m berth, and the stop line is 5 m from the
-                // node -- so the first car in any queue parked itself
-                // inside that radius and no pedestrian at a busy junction
-                // could ever be admitted.  They stood at the kerb, which
-                // is where the screenshots show them.
-                const bool moving=!car.parked && car.speed>.2f;
-                if(gap<specs()[car.type].L*.5f+.5f) return true;
-                if(moving && gap<car.speed*8.f+specs()[car.type].L+5.f) return true;
+                const float carL=specs()[car.type].L;
+                if(gap<carL*.5f+.5f) return true;                 // standing on it
+                if(car.parked || car.speed<=.2f) continue;
+                if(gap<carL*.5f+4.f) return true;                 // rolling past, right here
+                if(car.leg<0 || car.leg>=int(car.route.size())) continue;
+                const auto& cl=car.route[car.leg];
+                if(cl.edge!=path.edge) continue;
+                const float cdir=cl.s_to>=cl.s_from?1.f:-1.f;
+                const float ahead=(path.crossing_s-car.s)*cdir;   // metres to the crosswalk
+                if(ahead<0.f) continue;                           // already past it
+                const float stopping=car.speed*car.speed/(2.f*kBrake)+carL*.5f+3.f;
+                if(ahead<stopping) return true;                   // cannot stop in time
             }
             path.admitted=true;
         }
@@ -2131,6 +2250,7 @@ int VehicleSystem::spawnCar(uint32_t seed, const glm::vec3& near_pos) {
     if (!loaded()) return -1;
     RoadPt rp;
     if (!nearestRoadPt(near_pos, kCurbSearchM, rp)) return -1;
+    rp = clearOfJunction(rp);
     Vehicle v;
     v.seed = seed;
     const float r = h01(seed, 0x21u);
@@ -2151,6 +2271,7 @@ bool VehicleSystem::dispatch(int car, const glm::vec3& dest) {
     RoadPt from, to;
     if (!nearestRoadPt(v.pos, kCurbSearchM, from)) return false;
     if (!nearestRoadPt(dest, kCurbSearchM, to)) return false;
+    to = clearOfJunction(to);
     std::vector<Leg> route;
     if (!routeBetween(from, to, route)) return false;
     v.route = std::move(route);
@@ -2230,7 +2351,7 @@ void VehicleSystem::occupants(const glm::vec3& cam, float radius,
 void VehicleSystem::recall(int car, const glm::vec3& pos) {
     if (car < 0 || car >= int(vehicles_.size())) return;
     RoadPt rp;
-    if (nearestRoadPt(pos, kCurbSearchM, rp)) parkFree(vehicles_[car], rp, car);
+    if (nearestRoadPt(pos, kCurbSearchM, rp)) parkFree(vehicles_[car], clearOfJunction(rp), car);
 }
 
 bool VehicleSystem::randomDestination(const glm::vec3& from, float min_m,
@@ -2257,6 +2378,7 @@ bool VehicleSystem::randomDestination(const glm::vec3& from, float min_m,
         const Edge& e = edges_[size_t(ei)];
         const int idx = int(rnd01(st) * float(e.pts.size())) % int(e.pts.size());
         const float d = dist_to(e.pts[size_t(idx)]);
+        if (inJunctionZone(e, idx)) continue;          // v39
         if (d >= min_m && d <= max_m) { out = {ei, idx}; return true; }
     }
     // 2. on a small island the window is often empty: the farthest of
@@ -2266,8 +2388,10 @@ bool VehicleSystem::randomDestination(const glm::vec3& from, float min_m,
         for (int tries = 0; tries < 40; ++tries) {
             const int ei = (*pool)[size_t(int(rnd01(st) * float(npool)) % npool)];
             const Edge& e = edges_[size_t(ei)];
-            for (const int idx : {0, int(e.pts.size()) - 1,
+            for (const int raw : {0, int(e.pts.size()) - 1,
                                   int(rnd01(st) * float(e.pts.size())) % int(e.pts.size())}) {
+                // v39: idx 0 / last are node centres -- step in off the box
+                const int idx = clearOfJunction(RoadPt{ei, raw}).index;
                 const float d = dist_to(e.pts[size_t(idx)]);
                 if (d > best && d <= max_m * 1.5f) { best = d; out = {ei, idx}; found = true; }
             }
@@ -2399,6 +2523,33 @@ void VehicleSystem::spawnAmbient(const glm::vec3& camera_pos, uint32_t seed) {
 void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                          const std::unordered_map<int, std::vector<int>>& on_edge) {
     const Spec& sp = specs()[v.type];
+    // ── v43: NOTHING PARKS IN THE LANE, NOTHING PARKS IN A JUNCTION ──
+    // A car that had to stop where it was (no kerb spot, no road point,
+    // end of a coarse route) is flagged lane_parked and keeps trying for
+    // a kerb spot clear of every junction; an ambient one that cannot
+    // find one is retired once nobody is looking.  A parked car whose
+    // road point lies in a junction zone is treated the same way.
+    if (v.parked && !v.dormant) {
+        bool bad = v.lane_parked;
+        RoadPt here;
+        const bool have_pt = nearestRoadPt(v.pos, 30.0f, here);
+        if (!bad && have_pt && inJunctionZone(edges_[here.edge], here.index)) bad = true;
+        if (bad) {
+            v.relocate_t -= dt;
+            if (v.relocate_t <= 0.0f) {
+                v.relocate_t = 1.0f;
+                if (have_pt && parkFree(v, clearOfJunction(here), vi)) {
+                    v.lane_parked = false;
+                } else if (v.ambient && !(camera_view_proj_set_ && pointInView(v.pos))) {
+                    if (v.claim >= 0 && node_claim_[v.claim] == vi) node_claim_[v.claim] = -1;
+                    v.claim = -1; v.dormant = true; v.kerbed = false; v.lights = false;
+                    v.route.clear(); v.leg = -1; v.lane_parked = false;
+                    v.pos = glm::vec3(1.0e7f, 0.0f, 1.0e7f);
+                    return;
+                }
+            }
+        }
+    }
     if (v.parked) {
         if (v.ambient) {
             v.idle_t -= dt;
@@ -2550,8 +2701,10 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             // the car counts; one behind is already crossed.
             const bool exit_cw = crossing.edge==outgoing.edge;
             const float cw_ahead = (leg.s_to-crossing.s)*dir;      // this edge: metres from crossing to node
+            // v41: ...and only while the nose is still short of the stripes
+            // (see the foot_stop note below) -- a car already on them goes.
             const bool here_cw = crossing.edge==leg.edge && cw_ahead>=0.f &&
-                                 cw_ahead<stop_m && remain_leg>cw_ahead+.5f;
+                                 cw_ahead<stop_m && remain_leg>cw_ahead+sp.L*.5f+.75f;
             if((exit_cw && remain_leg>=stop_m-1.f) || here_cw) {
                 pedestrian_waiting=true;
                 rule_stop=std::min(rule_stop,std::max(0.f,remain_leg-stop_m));
@@ -2623,7 +2776,12 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                 }
                 const glm::vec2 delta(o.pos.x-nodes_[node_ahead].pos.x,o.pos.z-nodes_[node_ahead].pos.z);
                 // Waiting cars outside the line do not occupy the box.
-                if(glm::dot(delta,delta)<3.f*3.f) clear=false;
+                // v39: nor does a car that is PARKED there, or one that has
+                // stood in it without the claim for kBoxWedgedS -- neither
+                // is going to leave by being waited for, and one such car
+                // used to hold every approach at its line for good.
+                const bool inert=o.parked || (claim!=other && o.stall_t>=kBoxWedgedS);
+                if(!inert && glm::dot(delta,delta)<3.f*3.f) clear=false;
             }
             const bool stop_ready=sgi<0 || signals_[sgi].kind<2 || v.stop_t>=kStopWaitS;
             if(engine::helper::junctionAdmission(vehicles_,node_ahead,vi,claim,stop_ready,clear)) {
@@ -2637,6 +2795,33 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             }
         } else {
             v.block_t = 0.0f;
+            // ── v42: PRIORITY IS NOT A RIGHT TO AN OCCUPIED BOX ────────
+            // Through traffic and green lights never queued for the
+            // claim, and never looked into the box either: a stem car
+            // that had been admitted and was half way round its turn got
+            // a through car driven at it, the overlap guard froze both,
+            // and the junction was dead.  Hold at the line while someone
+            // slow is in the box and is not just the car we are following.
+            if (node_ahead >= 0 && remain_leg >= stop_m - 1.0f) {
+                bool occupied = false;
+                const float box_r = std::max(3.0f, stop_m - kStopBarM - kCrosswalkM);
+                for (int oi = 0; oi < int(vehicles_.size()) && !occupied; ++oi) {
+                    if (oi == vi) continue;
+                    const auto& o = vehicles_[oi];
+                    if (o.dormant || o.parked || o.speed > 3.0f) continue;
+                    if (o.stall_t >= kBoxWedgedS && node_claim_[node_ahead] != oi) continue;
+                    if (o.leg >= 0 && o.leg < int(o.route.size()) &&
+                        o.route[o.leg].edge == outgoing.edge) continue;   // leaving the way we go: car-following has it
+                    const glm::vec2 dl(o.pos.x - nodes_[node_ahead].pos.x,
+                                       o.pos.z - nodes_[node_ahead].pos.z);
+                    if (glm::dot(dl, dl) < box_r * box_r) occupied = true;
+                }
+                if (occupied) {
+                    const float to_line = std::max(0.0f, remain_leg - stop_m);
+                    rule_stop = std::min(rule_stop, to_line);
+                    vlim = std::min(vlim, std::sqrt(2.0f * kBrake * to_line));
+                }
+            }
         }
     }
     // release a claim once the node is well behind
@@ -2717,7 +2902,13 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     float foot_stop=rule_stop;
     for(const auto& c:foot_claims_) if(c.edge==leg.edge) {
         const float gap=(c.s-v.s)*dir;
-        if(gap>=0.f) foot_stop=std::min(foot_stop,std::max(0.f,gap-sp.L*.5f-2.f));
+        // v41: only a car that can still stop SHORT of the crosswalk stops
+        // for it.  One whose nose is already on the stripes (it was held
+        // there by the queue ahead, or the claim arrived late) used to be
+        // frozen in place by this -- distance-to-stop clamped to zero --
+        // while the walkers waited for the crossing it was standing on to
+        // clear.  Neither could ever move again.  It drives off instead.
+        if(gap>=sp.L*.5f+.75f) foot_stop=std::min(foot_stop,std::max(0.f,gap-sp.L*.5f-2.f));
     }
     if(foot_stop<1e8f) vlim=std::min(vlim,std::sqrt(2.f*kBrake*foot_stop));
     // ── integrate ───────────────────────────────────────────────────
@@ -2731,6 +2922,7 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     // every leg change and only ever ticks for the car at the head of a
     // queue -- never for the cars whose presence is the blockage.
     if (v.speed < 0.3f && !v.parked) v.stall_t += dt; else v.stall_t = 0.0f;
+    v.ghost_t = std::max(0.0f, float(v.ghost_t - dt));
     const float ds = std::min(v.speed * scale_vis * dt, foot_stop);
     if(foot_stop<=ds+.001f) v.speed=0.f;
     v.wheel += ds / sp.wheel_r;
@@ -2748,8 +2940,20 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
             // the last leg ends
             const glm::vec3 end = edgePoint(e, leg.s_to, nullptr, nullptr);
             if (nearestRoadPt(end, 30.0f, rp)) {
+                rp = clearOfJunction(rp);
                 if (!parkFree(v, rp, vi)) {
                     v.s=leg.s_to; v.speed=0.0f;
+                    // v39: an ambient car that cannot park and cannot find
+                    // a way on is removed once nobody is looking, instead
+                    // of standing in the lane for the rest of the session.
+                    if(v.ambient && v.stall_t>=20.f &&
+                       !(camera_view_proj_set_ && pointInView(v.pos))) {
+                        if(v.claim>=0 && node_claim_[v.claim]==vi) node_claim_[v.claim]=-1;
+                        v.claim=-1; v.dormant=true; v.parked=true; v.kerbed=false;
+                        v.lights=false; v.route.clear(); v.leg=-1;
+                        v.pos=glm::vec3(1.0e7f,0.0f,1.0e7f);
+                        return;
+                    }
                     // Ambient traffic keeps looking instead of permanently
                     // blocking the lane at a full destination. Keep the current
                     // edge and travel direction; never teleport or U-turn here.
@@ -2771,7 +2975,12 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                     return;
                 }
             }
-            else { v.parked = true; v.speed = 0.0f; v.leg = -1; v.route.clear(); }
+            else {
+                // v43: no road point within reach -- this is NOT a parking
+                // spot.  The car stops, flagged, and relocateLaneParked
+                // moves it to a kerb (or retires it) on a later tick.
+                v.parked = true; v.lane_parked = true; v.speed = 0.0f; v.leg = -1; v.route.clear();
+            }
             v.idle_t = v.ambient ? 4.0f + 8.0f * h01(v.seed, 0x77u) : 0.0f;
             return;
         }
@@ -2780,7 +2989,88 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     const Edge& ce = edges_[cl.edge];
     const float cdir = cl.s_to >= cl.s_from ? 1.0f : -1.0f;
     glm::vec3 t;
-    const glm::vec3 np = lanePos(ce, v.s, cdir, 0.0f, &t, nullptr, v.lane_x);
+    glm::vec3 np = lanePos(ce, v.s, cdir, 0.0f, &t, nullptr, v.lane_x);
+    // ── TURNS ARE ARCS (v40) ─────────────────────────────────────────
+    // A route is a chain of edges that meet at the node centre, and a
+    // car followed each lane line to the very end of its leg and then
+    // jumped onto the next one: through a right angle that is a car
+    // driving to the middle of the box, stopping being on one road and
+    // starting to be on the other -- a square corner, with the body
+    // swinging round afterwards at the yaw rate limit.  Inside the turn
+    // radius of a corner the car instead rides a quadratic Bezier from
+    // its lane on the way in to its lane on the way out, with the
+    // control point where the two lane lines cross.  The tangent of the
+    // curve is the heading, so the car points along what it is driving.
+    // Straight-through joints (and gentle bends) are left alone: the
+    // lane lines already meet there.
+    {
+        const auto arc = [&](const Leg& in_leg, const Leg& out_leg, float u_along,
+                             bool on_out) {
+            const Edge& ie = edges_[in_leg.edge];
+            const Edge& oe = edges_[out_leg.edge];
+            const float idir = in_leg.s_to >= in_leg.s_from ? 1.0f : -1.0f;
+            const float odir = out_leg.s_to >= out_leg.s_from ? 1.0f : -1.0f;
+            const float ilen = std::abs(in_leg.s_to - in_leg.s_from);
+            const float olen = std::abs(out_leg.s_to - out_leg.s_from);
+            // the box, plus a little: from the stop line in to the far
+            // crosswalk out, never more than half of either leg
+            const float r_in  = std::min(stopDist(ie, idir < 0.0f) + 1.0f, 0.5f * ilen);
+            const float r_out = std::min(stopDist(oe, odir > 0.0f) + 1.0f, 0.5f * olen);
+            if (r_in < 1.0f || r_out < 1.0f) return;
+            const float along = on_out ? u_along : -u_along;   // metres past the node
+            if (along < -r_in || along > r_out) return;
+            glm::vec3 t0, t2;
+            const glm::vec3 p0 = lanePos(ie, in_leg.s_to - idir * r_in, idir, 0.0f,
+                                         &t0, nullptr, v.lane_x);
+            const glm::vec3 p2 = lanePos(oe, out_leg.s_from + odir * r_out, odir, 0.0f,
+                                         &t2, nullptr, v.lane_x);
+            const float c = t0.x * t2.x + t0.z * t2.z;
+            if (c > 0.94f) return;                              // straight on
+            if (c < -0.80f) {
+                // ── v44: A U-TURN IS A LOOP, NOT A JUMP ─────────────────
+                // At a dead end the route comes back along the same road
+                // (or a road folded onto it).  The Bezier below has no
+                // crossing point for that (the lane lines are parallel),
+                // so the car used to reach the end and swing round on the
+                // spot -- through the oncoming lane and whatever was in
+                // it, where the overlap guard then froze it for good.  A
+                // cubic Hermite with long tangents drives PAST the end,
+                // loops round and comes back on the other lane.
+                const float u = glm::clamp((along + r_in) / (r_in + r_out), 0.0f, 1.0f);
+                const float reach = 0.9f * (r_in + r_out) + 3.0f;   // how far the loop pokes past
+                const glm::vec3 m0(t0.x * reach, 0.0f, t0.z * reach);
+                const glm::vec3 m1(t2.x * reach, 0.0f, t2.z * reach);
+                const float u2 = u * u, u3 = u2 * u;
+                const float h00 = 2*u3 - 3*u2 + 1, h10 = u3 - 2*u2 + u,
+                            h01 = -2*u3 + 3*u2,    h11 = u3 - u2;
+                np = h00 * p0 + h10 * m0 + h01 * p2 + h11 * m1;
+                const float d00 = 6*u2 - 6*u, d10 = 3*u2 - 4*u + 1,
+                            d01 = -6*u2 + 6*u, d11 = 3*u2 - 2*u;
+                glm::vec3 d = d00 * p0 + d10 * m0 + d01 * p2 + d11 * m1;
+                d.y = 0.0f;
+                if (glm::dot(d, d) > 1e-8f) t = glm::normalize(d);
+                return;
+            }
+            // where the two lane lines cross (2D); parallel is excluded above
+            const float den = t0.x * t2.z - t0.z * t2.x;
+            if (std::abs(den) < 1e-4f) return;
+            const float k = ((p2.x - p0.x) * t2.z - (p2.z - p0.z) * t2.x) / den;
+            if (k <= 0.0f || k > 4.0f * (r_in + r_out)) return; // lines cross behind the car
+            const glm::vec3 p1(p0.x + t0.x * k, 0.5f * (p0.y + p2.y), p0.z + t0.z * k);
+            const float u = glm::clamp((along + r_in) / (r_in + r_out), 0.0f, 1.0f);
+            const float w = 1.0f - u;
+            np = w * w * p0 + 2.0f * w * u * p1 + u * u * p2;
+            glm::vec3 d = 2.0f * w * (p1 - p0) + 2.0f * u * (p2 - p1);
+            d.y = 0.0f;
+            if (glm::dot(d, d) > 1e-8f) t = glm::normalize(d);
+        };
+        const float done = std::abs(v.s - cl.s_from);           // metres into this leg
+        const float left = std::abs(cl.s_to - v.s);             // metres to its end
+        if (v.leg + 1 < int(v.route.size()) && left < done)
+            arc(cl, v.route[v.leg + 1], left, false);
+        else if (v.leg > 0)
+            arc(v.route[v.leg - 1], cl, done, true);
+    }
     const float target_yaw = std::atan2(t.x, t.z);
     float dyaw = target_yaw - v.yaw;
     while (dyaw > 3.14159265f) dyaw -= 6.2831853f;
@@ -2891,8 +3181,19 @@ void VehicleSystem::update(float delta_t, float speed_scale,
             v.yaw = std::atan2(tangent.x,tangent.z);
             if (std::abs(v.s-leg.s_to) > 1e-3f) break;
             if (++v.leg == int(v.route.size())) {
-                v.parked = true; v.speed = 0; v.leg = -1;
-                v.route.clear(); v.idle_t = v.ambient ? 10.0f : 0.0f;
+                // v43: the coarse path used to leave the car standing in
+                // the lane, sometimes inside a junction, and the camera
+                // found it there.  Park at the kerb if a spot is free;
+                // otherwise stop flagged for relocateLaneParked.
+                v.speed = 0; v.leg = -1; v.route.clear();
+                v.idle_t = v.ambient ? 10.0f : 0.0f;
+                RoadPt rp;
+                if (nearestRoadPt(v.pos, 30.0f, rp) &&
+                    parkFree(v, clearOfJunction(rp), int(i))) {
+                    v.lane_parked = false;
+                } else {
+                    v.parked = true; v.lane_parked = true;
+                }
                 break;
             }
             v.s = v.route[v.leg].s_from;
@@ -3043,8 +3344,20 @@ void VehicleSystem::emit(const Vehicle& v) {
                 // The baked wheel is already in metres, so the spin is
                 // the only transform it needs — no scale, unlike the
                 // built-in unit cylinder below.
-                M = M * glm::rotate(glm::mat4(1.0f), -v.wheel,
-                                    glm::vec3(0, 0, 1));
+                // v42: the baked wheel has ONE dressed face (+z: rim and
+                // spokes; -z is the blind inboard disc).  The -z side of
+                // the car showed that disc to the street -- flat black
+                // wheels.  Turn those about the vertical, and spin them
+                // the other way round so they still roll forwards.
+                if (side == 0) {
+                    M = M * glm::rotate(glm::mat4(1.0f), 3.14159265f,
+                                        glm::vec3(0, 1, 0));
+                    M = M * glm::rotate(glm::mat4(1.0f), v.wheel,
+                                        glm::vec3(0, 0, 1));
+                } else {
+                    M = M * glm::rotate(glm::mat4(1.0f), -v.wheel,
+                                        glm::vec3(0, 0, 1));
+                }
                 if (dual > 1.0f) {
                     M = M * glm::scale(glm::mat4(1.0f),
                                        glm::vec3(1.0f, 1.0f, dual));
@@ -3120,6 +3433,7 @@ void VehicleSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkin
         const int mesh=streamMesh(int(stream));
         if (mesh<0 || mesh>=int(s_meshes_.size())) continue;
         for (const auto& instance : frame_[stream]) {
+            if (instance.extra.x == 5.0f) continue;      // v42: paint casts no shadow
             out.emplace_back(); auto& b=out.back();
             b.positions=&s_meshes_[mesh].shadow.positions;
             b.indices=&s_meshes_[mesh].shadow.indices;
@@ -3135,10 +3449,12 @@ void VehicleSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
     for (size_t stream = 0; stream < frame_.size() && int(stream) < streamGlass0(); ++stream) {
         const int mesh = streamMesh(int(stream));
         if (mesh < 0 || mesh >= int(s_meshes_.size())) continue;
-        for (const auto& instance : frame_[stream])
+        for (const auto& instance : frame_[stream]) {
+            if (instance.extra.x == 5.0f) continue;      // v42: paint casts no shadow
             out.append(s_meshes_[mesh].shadow, [&](const glm::vec3& p) {
                 return glm::vec3(instance.xform * glm::vec4(p, 1.0f));
             });
+        }
     }
 }
 
@@ -3258,6 +3574,7 @@ void VehicleSystem::destroy(const std::shared_ptr<er::Device>& device) {
     vehicles_.clear();
     frame_.clear();
     edges_.clear();
+    paint_ok_.clear();
     nodes_.clear();
     pt_grid_.clear();
     node_grid_.clear();

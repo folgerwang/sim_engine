@@ -1,5 +1,8 @@
 #pragma once
 #include <unordered_map>
+#include <array>
+#include <vector>
+#include <cmath>
 #include "renderer/renderer.h"
 #include "shaders/global_definition.glsl.h"
 
@@ -141,6 +144,28 @@ public:
     }
 
     void setGlobalLeafAge(float age) { m_camera_info_.global_leaf_age = age; }
+
+    // Terrain holes (ViewCameraInfo::terrain_holes / terrain_hole_rot):
+    // rectangles tile.vert snaps terrain vertices out of -- the parking
+    // structure's pit.  Each hole is {cx, cz, hx, hz, yaw}.  Same
+    // whole-struct upload path as the leaf age; unused slots are
+    // zeroed with the active flag clear, and the shader stops at the
+    // first inactive slot.
+    void setTerrainHoles(const std::vector<std::array<float, 5>>& holes) {
+        for (int i = 0; i < TERRAIN_HOLE_MAX; ++i) {
+            if (i < int(holes.size())) {
+                const auto& h = holes[size_t(i)];
+                m_camera_info_.terrain_holes[i] =
+                    glm::vec4(h[0], h[1], h[2], h[3]);
+                m_camera_info_.terrain_hole_rot[i] =
+                    glm::vec4(std::cos(h[4]), std::sin(h[4]), 1.0f, 0.0f);
+            } else {
+                m_camera_info_.terrain_holes[i] = glm::vec4(0.0f);
+                m_camera_info_.terrain_hole_rot[i] =
+                    glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+    }
 
     const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;

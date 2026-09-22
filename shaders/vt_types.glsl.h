@@ -107,15 +107,20 @@ const uint VT_LAYER_ALBEDO         = 0u;
 const uint VT_LAYER_NORMAL         = 1u;
 const uint VT_LAYER_METAL_ROUGH_AO = 2u;
 const uint VT_LAYER_EMISSIVE       = 3u;
-const uint VT_LAYER_COUNT          = 4u;
+const uint VT_LAYER_ALPHA          = 4u;   // BC4 cutout alpha
+const uint VT_LAYER_COUNT          = 5u;
 
 // VirtualTextureId encoding — must match makeVtId/vtLayer/vtIndex
 // in virtual_texture.h.
-//   bits 30..31  layer (2 bits)
-//   bits  0..29  vt_index (30 bits)
+//   bits 29..31  layer (3 bits)
+//   bits  0..28  vt_index (29 bits)
+// VT_INVALID_ID decodes to layer 7, outside VT_LAYER_COUNT, so it can
+// never collide with a real id.
 const uint VT_INVALID_ID = 0xFFFFFFFFu;
-uint vtLayerOf(uint vt_id) { return (vt_id >> 30) & 0x3u; }
-uint vtIndexOf(uint vt_id) { return vt_id & 0x3FFFFFFFu; }
+// 3-bit layer field (widened from 2 when ALPHA became the fifth
+// layer) -- must match makeVtId / vtIndex in virtual_texture.h.
+uint vtLayerOf(uint vt_id) { return (vt_id >> 29) & 0x7u; }
+uint vtIndexOf(uint vt_id) { return vt_id & 0x1FFFFFFFu; }
 
 // VirtualTextureMeta — 32 B, must match C++ layout exactly.
 //

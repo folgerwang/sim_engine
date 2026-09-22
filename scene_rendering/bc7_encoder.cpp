@@ -63,6 +63,21 @@ void encodeBC7Mode6(
     // m_try_least_squares.
     bc7enc_compress_block_params params;
     bc7enc_compress_block_params_init(&params);
+    // ── Alpha blocks: make the encoder care about alpha ──────────────
+    // bc7enc tries mode 6 (one index shared by colour and alpha), and
+    // modes 5/7 (alpha with its own indices) for blocks that have alpha,
+    // and picks by weighted error.  The perceptual defaults weight luma
+    // 128 against alpha 32, so at a cutout edge -- where colour and
+    // alpha do not move together -- it takes the colour-accurate mode
+    // and smears the alpha, and the alpha test then lets transparent
+    // texels through.  Alpha at 512 makes the alpha-exact modes win
+    // those blocks.  Measured on the needle spray: transparent texels
+    // passing the cutout 54% -> 30% from this alone, and 1.0% -> 0.5%
+    // together with the shader's noise-tolerant silhouette; the cost is
+    // ~1.4 levels of RGB error on the edge texels, which the cutout
+    // mostly removes anyway.  Opaque blocks are untouched.
+    bc7enc_compress_block_params params_alpha = params;
+    params_alpha.m_weights[3] = 512;
 
     const uint32_t blocks_x = (width  + 3u) / 4u;
     const uint32_t blocks_y = (height + 3u) / 4u;
@@ -82,8 +97,13 @@ void encodeBC7Mode6(
                 }
             }
 
+            bool has_alpha = false;
+            for (int i = 0; i < 16; ++i) {
+                if (pixels[i * 4 + 3] < 255) { has_alpha = true; break; }
+            }
             uint8_t* block = dst_bc7 + (size_t(by) * blocks_x + bx) * 16u;
-            bc7enc_compress_block(block, pixels, &params);
+            bc7enc_compress_block(block, pixels,
+                                  has_alpha ? &params_alpha : &params);
         }
     }
 }
@@ -188,6 +208,37 @@ void encodeBC5UNorm(
             uint8_t* block = dst_bc5 + (size_t(by) * blocks_x + bx) * 16u;
             encodeBC4Block(r, block);
             encodeBC4Block(g, block + 8);
+        }
+    }
+}
+
+void encodeBC4UNorm(
+    const uint8_t* src,
+    uint32_t       src_stride,
+    uint32_t       width,
+    uint32_t       height,
+    uint8_t*       dst_bc4) {
+
+    if (!src || !dst_bc4 || width == 0 || height == 0) return;
+    if (src_stride == 0u) return;
+
+    const uint32_t blocks_x = (width  + 3u) / 4u;
+    const uint32_t blocks_y = (height + 3u) / 4u;
+
+    for (uint32_t by = 0; by < blocks_y; ++by) {
+        for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+            // Same edge clamp as the BC7 / BC5 paths, so a tile's
+            // blocks line up texel-for-texel across every VT layer.
+            uint8_t c[16];
+            for (int py = 0; py < 4; ++py) {
+                uint32_t y = std::min(by * 4u + uint32_t(py), height - 1u);
+                for (int px = 0; px < 4; ++px) {
+                    uint32_t x = std::min(bx * 4u + uint32_t(px), width - 1u);
+                    c[py * 4 + px] =
+                        src[(size_t(y) * width + x) * size_t(src_stride)];
+                }
+            }
+            encodeBC4Block(c, dst_bc4 + (size_t(by) * blocks_x + bx) * 8u);
         }
     }
 }

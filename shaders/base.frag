@@ -216,6 +216,9 @@ float decalCoverage(vec3 view_dir, vec3 geom_normal, vec3 world_pos) {
 // any partial transparency.  Returns true when this fragment should be
 // discarded.  Shared for the same anti-drift reason as decalCoverage.
 bool decalScreenDoorCull(float base_alpha, float cutoff, float coverage) {
+#if DEBUG_NO_LOD_DITHER
+    return false;
+#endif
     float ign = fract(52.9829189 *
                       fract(dot(gl_FragCoord.xy,
                                 vec2(0.06711056, 0.00583715))));
@@ -224,6 +227,23 @@ bool decalScreenDoorCull(float base_alpha, float cutoff, float coverage) {
 #endif // DECAL
 
 #include "pbr_lighting.glsl.h"
+
+// ── LOD band debug colours ───────────────────────────────────────────
+// Render Debug > "Colour plant LOD bands": every plant-LOD node is
+// painted by its rung ordinal (drawNodeMesh / ntStageRecords put
+// 16 + band into debug_force_red; base.vert carries it here in
+// vertex_node_flags, bits 1..).  Rung 0 red, 1 orange, 2 yellow,
+// 3 green, 4 cyan, 5 blue, 6 magenta, 7 white.
+bool lodDebugTint(inout vec3 rgb) {
+    const int code = int(floor(ps_in_data.vertex_node_flags * 0.5 + 0.001));
+    if (code <= 0) return false;
+    const vec3 table[8] = vec3[8](
+        vec3(1.0, 0.15, 0.10), vec3(1.0, 0.55, 0.05), vec3(1.0, 0.95, 0.10),
+        vec3(0.15, 0.95, 0.20), vec3(0.10, 0.90, 0.95), vec3(0.20, 0.35, 1.0),
+        vec3(0.95, 0.20, 0.95), vec3(1.0, 1.0, 1.0));
+    rgb = table[min(code - 1, 7)];
+    return true;
+}
 
 // PCSS soft shadow with cascade-consistent WORLD-SPACE blur radius.
 // See deferred_resolve.comp for full tuning notes; constants MUST
@@ -449,6 +469,9 @@ const float kInteriorSkyAmbient = 0.18;
 // none — no holes opening up mid-transition and no double-drawn
 // silhouettes.  Costs one compare on ordinary geometry (lod_fade 1.0).
 bool lodFadeDiscards(float w) {
+#if DEBUG_NO_LOD_DITHER
+    return false;
+#endif
     // 0 = no dissolve.  This is BOTH the common case and the value every
     // zero-initialised ModelParams carries, so it must mean "draw".
     if (w == 0.0) return false;
@@ -502,7 +525,7 @@ void main() {
 #endif
 #ifdef DEPTH_COVERAGE
 #ifndef NO_MTL
-    if (getBaseColor(ps_in_data, material).a < material.alpha_cutoff) discard;
+    if (getBaseColor(ps_in_data, material).a < DBG_CUTOFF(material.alpha_cutoff)) discard;
 #endif
     return;
 #endif
@@ -664,11 +687,23 @@ void main() {
     // actually goes dark).  The LOD dissolve / per-instance-band
     // discards already ran at the top of main(), so the G-buffer
     // respects the same dithered band handoff the forward pass shows.
-#if defined(ALPHAMODE_MASK) && !defined(DECAL) && !defined(GBUFFER_OUTPUT)
+// v56: THIS BLOCK NEVER COMPILED.  It sits inside #ifdef
+// GBUFFER_OUTPUT and its own condition demanded !defined(
+// GBUFFER_OUTPUT), so the deferred permutation never alpha-tested a
+// cutout -- the one thing the comment below says it must do, and the
+// one thing drawable_object.cpp's pipeline comment ("the color pass
+// must still shade those samples AND RE-TEST ALPHA") assumes it does.
+//
+// It cannot be replaced by an EQUAL depth test against the prepass:
+// node_table_cull.comp excludes per-instance-band nodes (every tree,
+// bush and ground node) from NT_MODE_PREPASS, so plants have no
+// prepass depth to match.  The compare op stays LESS_OR_EQUAL and
+// THIS test is what defines a cutout's silhouette in the G-buffer.
+#if defined(ALPHAMODE_MASK) && !defined(DECAL)
     // The forward path's cutout discard sits AFTER its lighting; here it
     // must run before the writes or masked foliage would stamp opaque
     // rectangles into the G-buffer.
-    if (baseColor.a < material.alpha_cutoff) {
+    if (baseColor.a < DBG_CUTOFF(material.alpha_cutoff)) {
         discard;
     }
 #endif // ALPHAMODE_MASK
@@ -705,7 +740,7 @@ void main() {
             // Foliage cards: cut, don't blend.  Survivors are fully
             // opaque so overlapping cards stop compositing into soup —
             // identical policy to the forward decal branch.
-            if (decalScreenDoorCull(baseColor.a, material.alpha_cutoff,
+            if (decalScreenDoorCull(baseColor.a, DBG_CUTOFF(material.alpha_cutoff),
                                     coverage)) {
                 discard;
             }
@@ -724,6 +759,7 @@ void main() {
     // reason.  The material's occlusion map goes here (mat_ao, above),
     // floored a quantisation step clear of the sentinel; the decal
     // permutation overrides it with its coverage instead.
+    lodDebugTint(baseColor.rgb);       // LOD band debug (no-op when off)
 #ifdef DECAL
     out_albedo_ao = vec4(baseColor.rgb, gbuf_alpha);
 #else
@@ -778,7 +814,7 @@ void main() {
         (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
         (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
 #ifdef ALPHAMODE_MASK
-        if (baseColor.a < material.alpha_cutoff) discard;
+        if (baseColor.a < DBG_CUTOFF(material.alpha_cutoff)) discard;
 #endif
         float fast_nl = 0.5;
 #ifdef USE_PUNCTUAL
@@ -832,7 +868,7 @@ void main() {
     // between the IBL and punctual calls, so it scales only the
     // environment term: the sun (and its shadow) is untouched.
     if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u ||
-        ps_in_data.vertex_node_flags > 0.5) {
+        mod(ps_in_data.vertex_node_flags, 2.0) > 0.5) {
         back_color_info.f_specular  *= kInteriorSkyAmbient;
         back_color_info.f_diffuse   *= kInteriorSkyAmbient;
         back_color_info.f_clearcoat *= kInteriorSkyAmbient;
@@ -868,7 +904,7 @@ void main() {
         normal_info, v);
     // Interior sky occlusion — see kInteriorSkyAmbient.
     if ((model_params.flip_uv_coord & MODEL_FLAG_INTERIOR) != 0u ||
-        ps_in_data.vertex_node_flags > 0.5) {
+        mod(ps_in_data.vertex_node_flags, 2.0) > 0.5) {
         color_info.f_specular  *= kInteriorSkyAmbient;
         color_info.f_diffuse   *= kInteriorSkyAmbient;
         color_info.f_clearcoat *= kInteriorSkyAmbient;
@@ -943,7 +979,7 @@ void main() {
 // the signal we need.  Skip it on that permutation only.
 #if defined(ALPHAMODE_MASK) && !defined(DECAL) && !defined(GBUFFER_OUTPUT)
     // Late discard to avoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if(baseColor.a < material.alpha_cutoff)
+    if(baseColor.a < DBG_CUTOFF(material.alpha_cutoff))
     {
         discard;
     }
@@ -969,7 +1005,7 @@ void main() {
         // Foliage cards: screen-door cut, survivors fully opaque (under
         // the decal pipeline's blend state alpha 1.0 is a full
         // overwrite, so overlapping cards stop compositing into soup).
-        if (decalScreenDoorCull(baseColor.a, material.alpha_cutoff,
+        if (decalScreenDoorCull(baseColor.a, DBG_CUTOFF(material.alpha_cutoff),
                                 decal_alpha)) {
             discard;
         }
@@ -1054,6 +1090,10 @@ void main() {
     // specific DrawableObject (currently the PlayerController player)
     // via setDebugForceRed(true); every other drawable keeps the
     // field at 0 and is unaffected.
+    {
+        vec3 lod_rgb;
+        if (lodDebugTint(lod_rgb)) outColor.rgb = lod_rgb;
+    }
     if (model_params.debug_force_red == 1u) {
         outColor = vec4(1.0, 0.0, 0.0, 1.0);
     } else if (model_params.debug_force_red == 2u) {

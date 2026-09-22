@@ -205,6 +205,8 @@ private:
         // Ambient, KERBED: parked on the verge for a few minutes,
         // empty -- the cars a street has standing along it.
         bool  kerbed = false;
+        bool  lane_parked = false;     // v43: stopped IN the lane; must still find a kerb spot
+        float relocate_t = 0.0f;       // v43: seconds until the next kerb-spot search
         // Ambient, DORMANT: a slot the ring does not need right now,
         // parked 10,000 km off (see update); reused by the next spawn.
         bool  dormant = false;
@@ -239,6 +241,7 @@ private:
         // rule reads this on the car ahead to distinguish a queue that is
         // moving from one that has deadlocked.
         float stall_t = 0.0f;
+        float ghost_t = 0.0f;          // v42: seconds left of a deadlock-breaking pass-through
         // ── WHICH BAKED CAR THIS IS ─────────────────────────────
         // An index into the library (car_library.h), chosen once at
         // spawn from the samples its TYPE may wear, plus the paint and
@@ -272,6 +275,9 @@ private:
     void buildGraph(std::vector<std::vector<glm::vec3>>& splines,
                     std::vector<std::vector<float>>& halves);
     int  nodeAt(const glm::vec3& p);
+    // v39: spawn / destination / kerb samples keep out of junction boxes.
+    bool inJunctionZone(const Edge& e, int idx) const;
+    RoadPt clearOfJunction(RoadPt rp) const;
     bool nearestRoadPt(const glm::vec3& p, float radius, RoadPt& out,
                        float* out_dist = nullptr) const;
     bool routeBetween(const RoadPt& from, const RoadPt& to,
@@ -304,6 +310,13 @@ private:
     void emit(const Vehicle& v);
 
     std::vector<Edge> edges_;
+    // v44: per edge, one byte per metre of arclength: 1 where this
+    // edge's paint may be laid, 0 where the point lies on ANOTHER road's
+    // pavement (a crossing with no shared node, an overlapping apron) --
+    // two roads' lines drawn through each other is what that looked
+    // like.  Built lazily by paintAllowed, cleared with the graph.
+    mutable std::vector<std::vector<uint8_t>> paint_ok_;
+    bool paintAllowed(int edge, float s) const;
     std::vector<Node> nodes_;
     // spatial hash of every road point, for curb / spawn queries
     std::unordered_map<uint64_t, std::vector<RoadPt>> pt_grid_;

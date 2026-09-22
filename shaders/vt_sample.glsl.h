@@ -333,4 +333,39 @@ uint vtWantedMipGrad(uint vt_id, vec2 uv_ddx, vec2 uv_ddy) {
     return mip;
 }
 
+// ── Cutout alpha (BC4 layer) ─────────────────────────────────────────
+// The alpha layer shares the albedo's vt_id and pool slot -- every
+// layer pool is indexed by one allocator, so a resolved phys_uv is
+// valid in all of them.  That is why there is no separate alpha id to
+// carry: the same id, a different sampler.
+//
+// Returns 1.0 (fully opaque, nothing cut away) for an invalid id or an
+// unresident page.  NOT the magenta diagnostic the albedo sampler
+// uses: this feeds an alpha TEST, and a diagnostic value here would
+// either dissolve the geometry or stamp solid quads into the depth
+// buffer while pages stream in.  Erring opaque keeps the silhouette
+// coarse for a frame instead of wrong for a frame.
+#ifdef VT_HAS_ALPHA_POOL
+float vtSampleAlphaGrad(uint vt_id, vec2 uv, vec2 uv_ddx, vec2 uv_ddy) {
+    if (vt_id == VT_INVALID_ID) return 1.0;
+    VirtualTextureMeta meta = vt_meta[vtIndexOf(vt_id)];
+    uint mip; float frac;
+    vtPickMipAndFracGrad(meta, uv_ddx, uv_ddy, mip, frac);
+    vec2 phys_uv;
+    if (!vtResolve(vt_id, uv, meta, mip, phys_uv)) return 1.0;
+    return textureLod(vt_pool_alpha, phys_uv, frac).r;
+}
+#ifndef VT_NO_DERIVATIVES
+float vtSampleAlpha(uint vt_id, vec2 uv) {
+    if (vt_id == VT_INVALID_ID) return 1.0;
+    VirtualTextureMeta meta = vt_meta[vtIndexOf(vt_id)];
+    uint mip; float frac;
+    vtPickMipAndFrac(meta, uv, mip, frac);
+    vec2 phys_uv;
+    if (!vtResolve(vt_id, uv, meta, mip, phys_uv)) return 1.0;
+    return textureLod(vt_pool_alpha, phys_uv, frac).r;
+}
+#endif  // VT_NO_DERIVATIVES
+#endif  // VT_HAS_ALPHA_POOL
+
 #endif  // VT_SAMPLE_GLSL_H

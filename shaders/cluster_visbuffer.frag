@@ -27,13 +27,17 @@
 #include "cluster_bindless_bindings.glsl.h"
 #include "vt_sample.glsl.h"
 #include "leaf_age.glsl.h"
-#include "cluster_cutout.glsl.h"
-#include "visbuffer_common.glsl.h"
 
+// Declared HERE, before cluster_cutout.glsl.h, not after: that header
+// reads camera_info.global_leaf_age, and glslang resolves identifiers
+// at parse time, so a later declaration is not visible to it.
 layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX)
     readonly buffer ViewCameraInfoBuffer {
     ViewCameraInfo camera_info;
 };
+
+#include "cluster_cutout.glsl.h"
+#include "visbuffer_common.glsl.h"
 
 // Interface kept identical to cluster_bindless.vert's outputs so the
 // SAME vertex shader feeds both passes -- a second vertex permutation
@@ -59,13 +63,18 @@ void main() {
     // to the translucent pipeline.
     if ((flags & BINDLESS_MAT_TRANSLUCENT) != 0) discard;
 
-    // The cutout, from the one shared implementation the material
-    // pass also calls -- see cluster_cutout.glsl.h.  Hardware mip
-    // selection here (have_grad = false): this pass has real
-    // derivatives, the compute pass does not.
-    vec4 albedo4 = clusterCutoutAlbedo(mat_idx, flags, v_uv,
-                                       vec2(0.0), vec2(0.0), false);
-    if (clusterCutoutRejects(mat_idx, flags, albedo4.a)) discard;
+    // The cutout, from the one shared implementation the material pass
+    // also calls -- see cluster_cutout.glsl.h.  clusterCutoutAlpha
+    // reaches the SAME value clusterCutoutAlbedo puts in .a, but off
+    // the dedicated BC4 alpha layer, so this pass never touches the
+    // albedo pool.  That is the point: this runs per fragment, and a
+    // crown pixel has 10-30 of them.
+    //
+    // Hardware mip selection here (have_grad = false): this pass has
+    // real derivatives; the compute pass does not.
+    float alpha = clusterCutoutAlpha(mat_idx, flags, v_uv,
+                                     vec2(0.0), vec2(0.0), false);
+    if (clusterCutoutRejects(mat_idx, flags, alpha)) discard;
 
     out_vis = vbPack(v_cluster_idx, uint(gl_PrimitiveID));
 }

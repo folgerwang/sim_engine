@@ -1367,6 +1367,12 @@ struct RtSkelHeader {
                                         // a real translucent pipeline pass has the data.
 #define BINDLESS_MAT_FOLIAGE_SSS    8   // bit 3: thin-slab foliage subsurface
 #define BINDLESS_MAT_GROUND_CARD  64   // bit 6: flat ground-cover card -- never an opaque RT caster
+// bit 7: this material's VT has a dedicated BC4 cutout-alpha layer,
+// so the alpha test samples vt_pool_alpha instead of the albedo's .a.
+// Clear means either an opaque texture or a legacy asset whose albedo
+// still carries its alpha -- both handled by falling back to albedo.a,
+// which is why this is a capability bit and not a behaviour switch.
+#define BINDLESS_MAT_ALPHA_VT    128   // bit 7
                                         // scattering.  Set at cluster upload for
                                         // leaf materials (name contains "leaf" /
                                         // "foliage" — covers terrain_pcg's

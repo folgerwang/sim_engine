@@ -9,12 +9,26 @@
 // both sides.  So they are macros: real calls in a fragment unit, dead
 // constants in a compute unit, where have_grad is always true and the
 // gradient forms beside them are what actually run.
+// A consumer that declares no alpha pool (terrain, say) still has to
+// compile this file.  Both alpha entry points then read 1.0 and the
+// BINDLESS_MAT_ALPHA_VT branch is dead -- which is correct, since
+// nothing would have bound the pool for it anyway.
+#ifndef VT_HAS_ALPHA_POOL
+#define vtSampleAlphaGrad(id, uv, ddx, ddy) 1.0
+#define VT_SAMPLE_ALPHA_HW(id, uv)          1.0
+#endif
+
 #ifdef VT_NO_DERIVATIVES
 #define VT_SAMPLE_ALBEDO_HW(id, uv) vec4(1.0)
 #define TEX_SAMPLE_HW(s, uv)        vec4(1.0)
 #else
 #define VT_SAMPLE_ALBEDO_HW(id, uv) vtSampleAlbedo(id, uv)
 #define TEX_SAMPLE_HW(s, uv)        texture(s, uv)
+#endif
+#if !defined(VT_NO_DERIVATIVES) && defined(VT_HAS_ALPHA_POOL)
+#define VT_SAMPLE_ALPHA_HW(id, uv)  vtSampleAlpha(id, uv)
+#elif !defined(VT_SAMPLE_ALPHA_HW)
+#define VT_SAMPLE_ALPHA_HW(id, uv)  1.0
 #endif
 // ── The cutout decision, in ONE place ────────────────────────────────
 // Which triangle owns a pixel is decided by the alpha test, and with a
@@ -64,7 +78,7 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
     vec4 tex = vec4(1.0);
     uint vt      = material_params[mat_idx].albedo_vt_id;
     int  tex_idx = material_params[mat_idx].base_color_tex_idx;
-    if (vt != 0u) {
+    if (vt != VT_INVALID_ID) {
         // Gradient form in the compute pass (no dFdx there), hardware
         // form in the raster pass -- same rho^2 metric either way, so
         // both passes land on the same mip and the same page.
@@ -76,6 +90,17 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
                           lod_uv_ddx, lod_uv_ddy)
             : TEX_SAMPLE_HW(base_color_textures[nonuniformEXT(tex_idx)], uv);
     }
+    // With a dedicated BC4 alpha layer the albedo was encoded OPAQUE,
+    // so tex.a is 255 and meaningless -- the real cutout alpha comes
+    // from the alpha pool.  It shares this material's vt_id and pool
+    // slot, so it resolves to the same page; only the sampler differs.
+    // One extra small fetch, paid once per pixel in the material pass.
+    if ((mat_flags & BINDLESS_MAT_ALPHA_VT) != 0) {
+        tex.a = have_grad
+            ? vtSampleAlphaGrad(vt, uv, lod_uv_ddx, lod_uv_ddy)
+            : VT_SAMPLE_ALPHA_HW(vt, uv);
+    }
+
     vec4 albedo4 = base * tex;
 
     if (leaf_mask) {
@@ -95,6 +120,74 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
                                 profile, life);
     }
     return albedo4;
+}
+
+// ── Cutout alpha ALONE -- the visibility pass's whole job ────────────
+// Same value clusterCutoutAlbedo would put in .a, reached without
+// fetching albedo RGB at all.  That matters because this runs per
+// FRAGMENT: under dense foliage the alpha test executes 10-30x per
+// pixel, so it is the one sample whose cost multiplies by the
+// overdraw.  A BC4 tap is 8 bytes per block against BC7's 16, and the
+// big albedo pool never enters L1TEX during the pass that was measured
+// saturating it.
+//
+// The aging algebra below is NOT redundant with clusterCutoutAlbedo --
+// it has to match it exactly, or the visibility pass would keep a
+// different set of fragments than the raster path and a pixel could be
+// shaded from a triangle the depth test rejected.  It is reproducible
+// cheaply because leafAgedColor's ALPHA output depends only on the
+// incoming alpha (plus group / season / profile), never on RGB: see
+// leafSilhouette and the `sil * vis` return in leaf_age.glsl.h.  So we
+// feed it a black vec4 carrying just the alpha.  The RGB math it does
+// on that black is wasted ALU and costs nothing here -- this pass is
+// latency-bound on texture fetches, not arithmetic.
+float clusterCutoutAlpha(uint mat_idx, int mat_flags, vec2 uv,
+                         vec2 lod_uv_ddx, vec2 lod_uv_ddy,
+                         bool have_grad) {
+    // No dedicated alpha layer: the alpha still rides in the albedo
+    // (an asset baked before the split, or a legacy bindless texture),
+    // so there is nothing cheaper available and we take the full path.
+    if ((mat_flags & BINDLESS_MAT_ALPHA_VT) == 0) {
+        return clusterCutoutAlbedo(mat_idx, mat_flags, uv,
+                                   lod_uv_ddx, lod_uv_ddy, have_grad).a;
+    }
+
+    float base_a   = material_params[mat_idx].base_color_factor.a;
+    bool  leaf_mask = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
+    uint  profile  = (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u;
+    float life     = material_params[mat_idx].tree_life.x;
+
+    // Asymmetric, exactly as clusterCutoutAlbedo: LEAF_AGE without
+    // LEAF_MASK ages the FACTOR before the texture multiply.
+    if (!leaf_mask && (mat_flags & BINDLESS_MAT_LEAF_AGE) != 0) {
+        base_a = leafAgedColor(vec4(0.0, 0.0, 0.0, base_a),
+                               UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags)),
+                               camera_info.global_leaf_age, profile, life).a;
+    }
+
+    uint vt = material_params[mat_idx].albedo_vt_id;
+    float a = base_a * (have_grad
+        ? vtSampleAlphaGrad(vt, uv, lod_uv_ddx, lod_uv_ddy)
+        : VT_SAMPLE_ALPHA_HW(vt, uv));
+
+    // ... and LEAF_MASK ages the PRODUCT afterwards, with the cohort
+    // read per texel from the map in normal_textures.  That fetch is
+    // unavoidable here -- the raster path pays it too -- but it is a
+    // small legacy bindless texture, not the VT albedo chain.
+    if (leaf_mask) {
+        int  age_idx = material_params[mat_idx].normal_tex_idx;
+        uint group   = UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags));
+        if (age_idx >= 0) {
+            float code = have_grad
+                ? textureGrad(normal_textures[nonuniformEXT(age_idx)], uv,
+                              lod_uv_ddx, lod_uv_ddy).b
+                : TEX_SAMPLE_HW(normal_textures[nonuniformEXT(age_idx)], uv).b;
+            group = leafMaskGroup(code);
+        }
+        a = leafAgedColor(vec4(0.0, 0.0, 0.0, a), group,
+                          camera_info.global_leaf_age, profile, life).a;
+    }
+    return a;
 }
 
 // True when this fragment/pixel is cut away.

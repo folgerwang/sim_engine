@@ -462,6 +462,8 @@ struct NodeInfo {
     // crown-normal bend and base.frag's cutout-foliage guess).
     // Set by parsePlantLodBands.
     uint8_t                     no_sway_ = 0;
+    // v44: never a shadow caster (shrubs -- see parsePlantLodBands).
+    uint8_t                     no_shadow_ = 0;
     // ── Building interior (forward-path sky occlusion) ────────────
     // 1 for geometry the generator marked as INSIDE a building: the
     // house "_int_lodtile_" band (interior shell, door leaves) and the
@@ -759,6 +761,12 @@ struct DrawableData {
     // still has something sane for the rungs the table does not cover.
     std::vector<std::string>              lod_cat_names_;
     std::vector<std::vector<glm::vec2>>   lod_band_authored_;
+    // Render Debug "Colour plant LOD bands": per node, the rung ordinal
+    // of its band within its CATEGORY ACROSS EVERY LOADED FILE (a shard
+    // holds one rung, so the per-file ordinal is always 0).  Rebuilt
+    // whenever a new rung is seen anywhere (lod_debug_ver_).
+    std::vector<uint8_t>                  lod_debug_ord_;
+    uint32_t                              lod_debug_ver_ = 0;
     bool                                lod_preserve_authored_ = false;
     // Value of plantLodBandGeneration() the node distances were last
     // written for.  Bumped by setPlantLodBands(), so the per-frame pass
@@ -1511,6 +1519,10 @@ public:
     void setDebugForceRed(bool v) {
         if (object_) object_->m_debug_force_red_ = v;
     }
+    // Render Debug: paint every plant-LOD node by its rung ordinal
+    // (red, orange, yellow, green, cyan, blue, magenta, white).
+    static void setLodDebugColors(bool on);
+    static bool getLodDebugColors();
     bool getDebugForceRed() const {
         return object_ ? object_->m_debug_force_red_ : false;
     }

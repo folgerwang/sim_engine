@@ -759,6 +759,17 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         const uint8_t* px = albedo_has_cpu
                             ? albedo_tex->cpu_pixels->data()
                             : nullptr;
+                        // Cutout alpha for the BC4 alpha layer.  Only
+                        // consulted when px is null (pre-encoded BC7
+                        // blob); when CPU pixels are present their
+                        // channel 3 is the source.
+                        const uint8_t* alpha_px =
+                            (albedo_tex->cpu_alpha &&
+                             albedo_tex->cpu_alpha->size() ==
+                                 size_t(albedo_tex->size.x) *
+                                 size_t(albedo_tex->size.y))
+                                ? albedo_tex->cpu_alpha->data()
+                                : nullptr;
                         vid = vt_manager_->registerMaterial(
                             px,
                             albedo_tex->image,
@@ -767,7 +778,8 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                             /*emissive*/nullptr,
                             albedo_tex->size.x,
                             albedo_tex->size.y,
-                            albedo_tex->vt_bc7_tiles);
+                            albedo_tex->vt_bc7_tiles,
+                            alpha_px);
                         if (vid != kInvalidVtId) {
                             vt_albedo_id_cache_[vt_key] = vid;
                             if (nrm_img) {
@@ -779,6 +791,13 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                         mp.albedo_vt_id = vid;
                         if (!depth_pbr && !leaf_mask && normal_tex && normal_tex->image) {
                             mp.normal_vt_id = vid;
+                        }
+                        // Tell the shader a BC4 alpha layer exists for
+                        // this VT.  Without the bit it falls back to
+                        // the albedo's .a, which is what legacy assets
+                        // (baked before the split) still rely on.
+                        if (vt_manager_->hasAlphaLayer(vid)) {
+                            mp.flags |= BINDLESS_MAT_ALPHA_VT;
                         }
                     }
                 }
@@ -3073,7 +3092,7 @@ void ClusterRenderer::initBindlessPipeline(
     // binding 9:  VtMeta      SSBO (VirtualTextureMeta[])
     // binding 10: VtFeedback  SSBO (uint[])  — streaming requests
     {
-        std::vector<er::DescriptorSetLayoutBinding> bindings(11);
+        std::vector<er::DescriptorSetLayoutBinding> bindings(12);
         // Every binding here is ALSO visible to COMPUTE.  The
         // visibility-buffer material pass (visbuffer_material.comp) binds
         // this exact set and reads the draw infos, material params, the
@@ -3124,6 +3143,17 @@ void ClusterRenderer::initBindlessPipeline(
         bindings[10] = er::helper::getBufferDescriptionSetLayoutBinding(
             10, kFragCompute,
             er::DescriptorType::STORAGE_BUFFER);
+        // binding 11: sampler2D vt_pool_alpha -- the BC4 cutout-alpha
+        // pool.  APPENDED after the SSBOs rather than slotted in next
+        // to the other pools at 4..7, deliberately: putting it at 8
+        // would have shifted the page-table / meta / feedback SSBOs and
+        // every literal 8/9/10 in this file and in two GLSL binding
+        // headers.  The pool bindings are no longer contiguous; the
+        // `l < 4` loops below are for 4..7 only and 11 is written
+        // beside them.
+        bindings[11] = er::helper::getTextureSamplerDescriptionSetLayoutBinding(
+            11, kFragCompute,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER);
         bindless_desc_set_layout_ = device_->createDescriptorSetLayout(bindings);
     }
 
@@ -3632,6 +3662,13 @@ void ClusterRenderer::initBindlessPipeline(
                 er::DescriptorType::STORAGE_BUFFER, 10,
                 vt_manager_->getFeedbackBuffer(),
                 vt_manager_->getFeedbackBufferBytes());
+            // BC4 cutout-alpha pool (binding 11, appended after the
+            // SSBOs -- see the layout comment above).
+            er::Helper::addOneTexture(writes, bindless_desc_set_,
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                11, vt_sampler,
+                vt_manager_->getPoolImageView(VtLayer::ALPHA),
+                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         } else {
             // Fallback: dummy texture for the four pool slots.  No
             // safe placeholder for the SSBOs without allocating one;
@@ -3649,6 +3686,10 @@ void ClusterRenderer::initBindlessPipeline(
                     4u + l, default_sampler_, dummy_texture_.view,
                     er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
             }
+            er::Helper::addOneTexture(writes, bindless_desc_set_,
+                er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                11, default_sampler_, dummy_texture_.view,
+                er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
             clog_printf("[CLUSTER_RENDERER] WARNING: vt_manager_ not set "
                         "during writeBindlessDescriptors. VT bindings 8/9 "
                         "left UNWRITTEN — call setVtManager() before "
@@ -5285,6 +5326,12 @@ void ClusterRenderer::recreate(
             er::DescriptorType::STORAGE_BUFFER, 10,
             vt_manager_->getFeedbackBuffer(),
             vt_manager_->getFeedbackBufferBytes());
+        // BC4 cutout-alpha pool (binding 11).
+        er::Helper::addOneTexture(writes, bindless_desc_set_,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            11, vt_sampler,
+            vt_manager_->getPoolImageView(VtLayer::ALPHA),
+            er::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
     device_->updateDescriptorSets(writes);

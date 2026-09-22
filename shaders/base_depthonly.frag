@@ -42,15 +42,10 @@ layout(location = 0) in ObjectVsPsData ps_in_data;
 
 void main() {
 #ifndef NO_MTL
-    // All leaf LODs cast their geometric silhouette without an
-    // albedo lookup. Seasonal absence still removes the cohort's shadow.
-    if ((material.material_features & (FEATURE_MATERIAL_LEAF_AGE | FEATURE_MATERIAL_LEAF_MASK)) != 0u) {
-        vec4 leaf = leafAgedColor(material.base_color_factor,
-            UNPACK_LEAF_GROUP(material.material_features),
-            camera_info.global_leaf_age, material.pad_3, ps_in_data.vertex_tree_age_base);
-        if (leaf.a <= 0.0) discard;
-        return;
-    }
+    // v42: leaf materials take the SAME sampled path as every other
+    // cutout.  getBaseColor runs leafAgedColor (per-texel cohort under
+    // LEAF_MASK), so the shadow is the leaf's texture silhouette in its
+    // season -- not the card, which is what "blocky shadows" were.
     vec4 baseColor = getBaseColor(ps_in_data, material);
 #ifdef ALPHAMODE_OPAQUE
     baseColor.a = 1.0;
@@ -59,7 +54,8 @@ void main() {
     // Late discard (after the texture sample is complete) to avoid
     // sampling artifacts at neighbouring fragments.  See
     // https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if (baseColor.a < material.alpha_cutoff) {
+    float cutoff = DBG_CUTOFF(material.alpha_cutoff);
+    if (baseColor.a < cutoff) {
         discard;
     }
 #endif // ALPHAMODE_MASK

@@ -163,6 +163,7 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 14)
         WorldProbe world_probes[];
     };
 int wpFindTile(vec2 p);
+bool worldProbeRadiance(vec3 p, vec3 dir, out vec3 rad);
 
 layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 11)
     buffer GiAccumBuf {
@@ -598,6 +599,17 @@ bool rtRayAabb(vec3 ro, vec3 inv_dir, float t_max, vec3 bmin, vec3 bmax) {
 // Möller–Trumbore, double-sided, any-hit semantics.  Barycentrics (u, v)
 // are returned so alpha-masked hits can interpolate the vertex UVs and
 // texture-test the cutoff.
+// ── v45: A SPRAY DOES NOT SHADOW ITSELF ──────────────────────────────
+// A leaf spray is two quads crossed at ~80 deg, each printing the whole
+// spray.  A shadow ray leaving a texel on one quad met the other quad's
+// leaflet rows a few centimetres away, and the rows came through as
+// stripes across the first: the "comb" on every autumn card under RT.
+// Shadow rays launched FROM foliage ignore alpha-masked (leaf) hits
+// closer than this; opaque wood still counts at any distance.  Set per
+// pixel by the resolve before tracing (0 = off, for non-foliage pixels).
+float g_leaf_self_skip = 0.0;
+float g_last_hit_t = 0.0;
+
 bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
               out float o_u, out float o_v) {
     vec3 e1 = v1 - v0;
@@ -615,6 +627,7 @@ bool rtRayTri(vec3 ro, vec3 rd, float t_max, vec3 v0, vec3 v1, vec3 v2,
     float t = dot(e2, qv) * inv_det;
     o_u = u;
     o_v = v;
+    g_last_hit_t = t;
     return t > RT_SHADOW_BIAS && t < t_max;
 }
 
@@ -680,7 +693,7 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
             if (masked && m.base_color_tex_idx < 0) {
                 // No texture — the constant factor decides for the whole
                 // cluster: below the cutoff nothing here ever occludes.
-                if (m.base_color_factor.a < m.alpha_cutoff) continue;
+                if (m.base_color_factor.a < DBG_CUTOFF(m.alpha_cutoff)) continue;
                 masked = false;   // at/above cutoff: behaves opaque
             }
 
@@ -701,6 +714,7 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                     continue;
                 }
                 if (!masked) return 0.0;   // opaque hit — occluded
+                if (g_last_hit_t < g_leaf_self_skip) continue;   // v45: own spray
 
                 // Interpolate UV at the hit and alpha-test the texel.
                 vec2 uv0 = unpackHalf2x16(floatBitsToUint(p0.w));
@@ -712,7 +726,7 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                         nonuniformEXT(m.base_color_tex_idx)],
                     huv, 0.0).a * m.base_color_factor.a;
                 a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
-                if (a >= m.alpha_cutoff) return 0.0;   // solid texel
+                if (a >= DBG_CUTOFF(m.alpha_cutoff)) return 0.0;   // solid texel
                 // Transparent texel — keep marching, but bounded: deep
                 // inside vegetation the answer is "shadowed" anyway.
                 if (++alpha_hits >= RT_ALPHA_HIT_BUDGET) return 0.0;
@@ -777,6 +791,22 @@ float rtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
 // not worth the per-pixel chunk walk.
 const float RT_GI_MAX_DIST    = 120.0;  // bounce interval; sky beyond
 const float RT_GI_NORMAL_BIAS = 0.05;   // metres off the surface
+// ── v46: FOLIAGE IS NOT A ROOF ───────────────────────────────────────
+// A GI ray from the ground that met a leaf card returned that card's
+// bounce, and a card lit from behind bounced nothing: under every crown
+// the ground lost its whole sky term at once and went black -- a hard-
+// edged blot the exact shape of the canopy's cards.  Two things a real
+// canopy does that the card did not: it is POROUS (light gets through
+// between leaves the texture cannot resolve), and each leaf TRANSMITS
+// sunlight.  GI rays now pass through a leaf hit with this probability
+// (per ray, so the average converges on the true occlusion), and a leaf
+// that is hit contributes transmitted sun from its far side.
+const float RT_GI_LEAF_PASS     = 0.45;
+const float RT_GI_LEAF_TRANSMIT = 0.35;
+bool giLeafPasses(vec3 rd, float t) {
+    const float h = fract(sin(dot(vec3(rd.xy, t), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    return h < RT_GI_LEAF_PASS;
+}
 const float RT_GI_TEX_LOD     = 4.0;    // prefiltered albedo fetch
 // Sky fetch mip in the GGX radiance chain: mip 0 is mirror-sharp sky,
 // each mip a wider prefilter.  1.0 keeps the horizon/zenith structure
@@ -947,14 +977,24 @@ void giShBasis(vec3 d, out float y[9]) {
 vec3 giShIrradiance(vec3 c[9], vec3 n) {
     float y[9];
     giShBasis(n, y);
-    const float a0 = 1.0;          // A_0 / PI
-    const float a1 = 2.0 / 3.0;    // A_1 / PI
-    const float a2 = 0.25;         // A_2 / PI
-    vec3 e = c[0] * (a0 * y[0]);
+    // v48: WINDOWED, AND FLOORED.  A probe in a canopy sees one bright
+    // gap and leaves everywhere else: a hard directional signal that
+    // 2nd-order SH reproduces with deep negative lobes.  Evaluated along
+    // a leaf's shading normal -- the depth-relief normal map turns every
+    // leaflet row a different way -- those lobes went below zero and the
+    // clamp made them BLACK, one stripe per leaflet row.  A Hanning
+    // window on L1/L2 damps the ringing, and the result is floored at a
+    // share of the probe's own DC term: a surface can be lit less than
+    // its surroundings' average, but never nothing.
+    const float a0 = 1.0;                 // A_0 / PI
+    const float a1 = (2.0 / 3.0) * 0.85;  // A_1 / PI, windowed
+    const float a2 = 0.25 * 0.55;         // A_2 / PI, windowed
+    vec3 dc = c[0] * (a0 * y[0]);
+    vec3 e = dc;
     e += (c[1] * y[1] + c[2] * y[2] + c[3] * y[3]) * a1;
     e += (c[4] * y[4] + c[5] * y[5] + c[6] * y[6] +
           c[7] * y[7] + c[8] * y[8]) * a2;
-    return max(e, vec3(0.0));      // ringing can push L2 SH negative
+    return max(e, max(dc, vec3(0.0)) * 0.25);
 }
 
 // ── Second bounce: the ray hit reads the radiance cache ─────────────
@@ -1139,6 +1179,7 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
     vec3  best_n   = vec3(0.0);
     vec3  best_alb = vec3(0.0);
     bool  hit = false;
+    bool  best_leaf = false;
 
     uint stack[RT_BVH_STACK_SIZE];
     int  sp = 0;
@@ -1202,13 +1243,16 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
                     texel = rtLeafAgeTexel(m, huv, texel);
                 }
                 if (masked &&
-                    texel.a * m.base_color_factor.a < m.alpha_cutoff) {
+                    texel.a * m.base_color_factor.a < DBG_CUTOFF(m.alpha_cutoff)) {
                     continue;   // transparent texel — ray passes through
                 }
+                const bool leaf_hit = (mflags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u;
+                if (leaf_hit && giLeafPasses(rd, ht)) continue;   // v46: porous canopy
                 best_t   = ht;
                 best_alb = texel.rgb * m.base_color_factor.rgb;
                 best_n   = normalize(cross(p1.xyz - p0.xyz,
                                            p2.xyz - p0.xyz));
+                best_leaf = leaf_hit;
                 hit = true;
             }
         }
@@ -1235,6 +1279,14 @@ vec3 rtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         ? rtShadowRayVisible(hp + hn * RT_GI_NORMAL_BIAS, sun_L,
                              RT_SHADOW_MAX_DIST)
         : 0.0;
+    // v46: a leaf lit from behind transmits (see RT_GI_LEAF_TRANSMIT)
+    if (best_leaf && ndl <= 0.0) {
+        const float ndl_back = max(dot(-hn, sun_L), 0.0);
+        if (ndl_back > 0.0) {
+            ndl = ndl_back * RT_GI_LEAF_TRANSMIT;
+            vis = rtShadowRayVisible(hp - hn * RT_GI_NORMAL_BIAS, sun_L, RT_SHADOW_MAX_DIST);
+        }
+    }
     // Indirect arriving AT the hit point.  With the screen-probe cache
     // live this is a real second bounce read out of last frame's probes;
     // without it (or off-screen) it falls back to the flat sky leak this
@@ -1593,6 +1645,7 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
         // 1) or a per-mesh caster's masked geometry (custom >= 2).
         if (rayQueryGetIntersectionTypeEXT(rq, false) ==
             gl_RayQueryCandidateIntersectionTriangleEXT) {
+            if (rayQueryGetIntersectionTEXT(rq, false) < g_leaf_self_skip) continue;   // v45: own spray
             const HwRtTri t = hwRtResolveTri(
                 rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
                 rayQueryGetIntersectionGeometryIndexEXT(rq, false),
@@ -1624,7 +1677,7 @@ float hwRtShadowRayVisible(vec3 ro, vec3 rd, float t_max) {
                       * m.base_color_factor.a
                 : m.base_color_factor.a;
             a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
-            if (a >= m.alpha_cutoff) {
+            if (a >= DBG_CUTOFF(m.alpha_cutoff)) {
                 rayQueryConfirmIntersectionEXT(rq);   // solid texel
             }
         }
@@ -1726,7 +1779,10 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
                       * m.base_color_factor.a
                 : m.base_color_factor.a;
             a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
-            if (a >= m.alpha_cutoff) {
+            if (a >= DBG_CUTOFF(m.alpha_cutoff)) {
+                // v46: porous canopy -- a share of leaf hits let the ray on
+                if ((m.flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0 &&
+                    giLeafPasses(rd, rayQueryGetIntersectionTEXT(rq, false))) continue;
                 rayQueryConfirmIntersectionEXT(rq);   // solid texel
             }
         }
@@ -1815,6 +1871,14 @@ vec3 hwRtGiRadiance(vec3 ro, vec3 rd, vec3 sun_L, vec3 sun_col,
         ? hwRtShadowRayVisible(hp + hn * RT_GI_NORMAL_BIAS, sun_L,
                                RT_SHADOW_MAX_DIST)
         : 0.0;
+    // v46: a leaf lit from behind transmits (see RT_GI_LEAF_TRANSMIT)
+    if ((m.flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0 && ndl <= 0.0) {
+        const float ndl_back = max(dot(-hn, sun_L), 0.0);
+        if (ndl_back > 0.0) {
+            ndl = ndl_back * RT_GI_LEAF_TRANSMIT;
+            vis = hwRtShadowRayVisible(hp - hn * RT_GI_NORMAL_BIAS, sun_L, RT_SHADOW_MAX_DIST);
+        }
+    }
     // Second bounce out of the screen-probe cache (see rtGiRadiance).
     vec3 hit_amb;
     if (giSecondBounce(hp, hn, hit_amb)) {
@@ -2334,18 +2398,46 @@ void giProbeTracePass() {
             all(lessThan(uvp, vec2(1.0)))) {
             ivec2 qpx = clamp(ivec2(uvp * vec2(sz)), ivec2(0), sz - 1);
             ivec2 qid = clamp(qpx / GI_PROBE_TILE, ivec2(0), dim - ivec2(1));
-            uint  q   = uint(qid.y) * uint(dim.x) + uint(qid.x);
-            uint  qh  = giHdrOfs(nprobes, !parity, q);
-            vec4  h0  = gi_accum[qh];
-            vec4  h1  = gi_accum[qh + 1u];
-            if (h0.w > 0.5 &&
-                dot(h1.xyz, pn) > GI_PROBE_N_ACCEPT &&
-                abs(dot(pwp - h0.xyz, pn)) <=
-                    max(GI_PROBE_PLANE_K * plinz, 0.05)) {
-                hist     = min(h0.w + 1.0, GI_PROBE_HIST_MAX);
-                prev_rad = gi_accum[
-                    giAtlasOfs(nprobes, !parity, q, texel)].rgb;
+            // v46: the reprojected tile first, then its eight neighbours.
+            // A camera turn slides every probe's anchor across a tile
+            // boundary, and a probe whose one candidate failed the
+            // plane/normal test restarted from a single frame of rays --
+            // in a canopy, 64 rays mostly into leaves: a black 16x16
+            // block for the two dozen frames it took to converge, then
+            // the next turn did it again.  A neighbour on the same plane
+            // is a far better prior than nothing.
+            for (int nb = 0; nb < 9 && hist < 1.5; ++nb) {
+                ivec2 off = (nb == 0) ? ivec2(0)
+                          : ivec2((nb - 1) % 3 - 1, (nb - 1) / 3 - 1);
+                if (nb > 0 && off == ivec2(0)) continue;
+                ivec2 nid = qid + off;
+                if (any(lessThan(nid, ivec2(0))) ||
+                    any(greaterThanEqual(nid, dim))) continue;
+                uint  q   = uint(nid.y) * uint(dim.x) + uint(nid.x);
+                uint  qh  = giHdrOfs(nprobes, !parity, q);
+                vec4  h0  = gi_accum[qh];
+                vec4  h1  = gi_accum[qh + 1u];
+                if (h0.w > 0.5 &&
+                    dot(h1.xyz, pn) > GI_PROBE_N_ACCEPT &&
+                    abs(dot(pwp - h0.xyz, pn)) <=
+                        max(GI_PROBE_PLANE_K * plinz, 0.05) * (nb == 0 ? 1.0 : 2.0)) {
+                    // a borrowed neighbour starts with less trust
+                    hist     = min(h0.w + 1.0, nb == 0 ? GI_PROBE_HIST_MAX : 8.0);
+                    prev_rad = gi_accum[
+                        giAtlasOfs(nprobes, !parity, q, texel)].rgb;
+                }
             }
+        }
+    }
+    // v47: no usable screen history -- start from the cached world probe
+    // instead of one frame of rays.  The cache was traced during load
+    // and keeps being refreshed, so a fresh screen probe opens on the
+    // converged answer and only refines it; it never opens black.
+    if (hist < 1.5) {
+        vec3 wp_rad;
+        if (rpc.probe_enabled != 0u && worldProbeRadiance(pwp + pn * 0.5, rd, wp_rad)) {
+            prev_rad = wp_rad;
+            hist = 6.0;
         }
     }
     vec3 out_rad = (hist > 1.5) ? mix(prev_rad, rad, 1.0 / hist) : rad;
@@ -2513,10 +2605,17 @@ int wpFindTile(vec2 p) {
     }
     return -1;
 }
+// v50: the probe column is anchored to the TILE'S GROUND (wp_tile_state.z,
+// the terrain height at the tile centre, written by the app when the
+// tile registers), not to the camera's altitude: layer 0 sits just under
+// the ground and the column climbs from there.  Anchored to the camera,
+// every probe in the world jumped 96 m and re-traced each time the
+// camera crossed a height band -- the "probes follow the camera".
+float wpBaseY(uint tile) { return uintBitsToFloat(wp_tile_state[tile].z); }
 vec3 wpPosition(uint tile,ivec3 local) {
     vec4 bounds=wp_tile_bounds[tile];
     vec2 xz=mix(bounds.xy,bounds.zw,(vec2(local.x,local.z)+0.5)/2.0);
-    float y=(floor(camera_info.position.y/WP_HEIGHT_SPACING)-4.0+float(local.y)+0.5)*WP_HEIGHT_SPACING;
+    float y=wpBaseY(tile)+float(local.y)*WP_HEIGHT_SPACING;
     return vec3(xz.x,y,xz.y);
 }
 uint wpIndex(uint tile,ivec3 local) { return tile*32u+uint((local.y*2+local.z)*2+local.x); }
@@ -2577,7 +2676,7 @@ float wpTraceDistance(vec3 ro,vec3 rd,out bool backface) {
                       * m.base_color_factor.a
                 : m.base_color_factor.a;
             a = rtLeafAgeTexel(m, huv, vec4(1.,1.,1.,a)).a;
-            if (a >= m.alpha_cutoff) {
+            if (a >= DBG_CUTOFF(m.alpha_cutoff)) {
                 rayQueryConfirmIntersectionEXT(rq);   // solid texel
             }
         }
@@ -2605,7 +2704,19 @@ void worldProbeUpdate() {
     vec3 pos=wpPosition(tile,local);
     uint epoch=rpc.probe_epoch ^ (wp_tile_state[tile].x*2654435761u);
     WorldProbe old=world_probes[i];
-    bool valid=all(equal(old.cell_epoch.xyz,pos)) && floatBitsToUint(old.cell_epoch.w)==epoch;
+    bool same_pos=all(equal(old.cell_epoch.xyz,pos));
+    bool valid=same_pos && floatBitsToUint(old.cell_epoch.w)==epoch;
+    // v47: an EPOCH change alone (the placed-object set was re-synced,
+    // which happens every few metres of travel) keeps the probe's traced
+    // data as history and refreshes it on the usual schedule.  Throwing
+    // 65k probes away and re-tracing them in one frame on every sync was
+    // a hitch the burst below must never turn into.
+    bool carried=!valid && same_pos && old.state.y>0.5;
+    if(carried) {
+        old.cell_epoch.w=uintBitsToFloat(epoch);
+        world_probes[i].cell_epoch=old.cell_epoch;
+        valid=true;
+    }
     vec3 L=normalize(-runtime_lights.lights[0].direction);
     vec3 sun=runtime_lights.lights[0].color*runtime_lights.lights[0].intensity;
     uint lightKey=packSnorm4x8(vec4(L,0.0)) ^ floatBitsToUint(floor(length(sun)*8.0));
@@ -2620,7 +2731,12 @@ void worldProbeUpdate() {
     }
     float d=distance(pos,camera_info.position.xyz);
     uint period=d<384.0?16u:(d<1024.0?64u:128u);
-    if((i%period)!=(rpc.frame_idx%period)) return;
+    // v47: a probe that was JUST created (new tile, or a cell that moved
+    // with the camera's height band) is traced THIS frame, not on its
+    // round-robin slot up to 128 frames later.  Until now a fresh probe
+    // held the open-sky guess for that long, and the screen probes that
+    // now seed from this cache would have inherited the guess.
+    if(valid && (i%period)!=(rpc.frame_idx%period)) return;
 #ifdef HW_RT_SHADOW
     bool history=valid && old.state.y>0.5 && floatBitsToUint(old.state.z)==lightKey;
     float blend=history?0.25:1.0;
@@ -2683,7 +2799,7 @@ void worldProbeGather(vec3 p,vec3 N,out vec3 irradiance,out float sun) {
     uint tile=uint(owner);
     vec4 bounds=wp_tile_bounds[tile];
     vec2 xz=(p.xz-bounds.xy)/(bounds.zw-bounds.xy)*2.0-0.5;
-    float y=p.y/WP_HEIGHT_SPACING-floor(camera_info.position.y/WP_HEIGHT_SPACING)+4.0-0.5;
+    float y=(p.y-wpBaseY(tile))/WP_HEIGHT_SPACING;
     vec3 grid=clamp(vec3(xz.x,y,xz.y),vec3(0),vec3(1,7,1));
     ivec3 cell=min(ivec3(floor(grid)),ivec3(0,6,0));
     vec3 f=grid-vec3(cell);
@@ -2707,6 +2823,41 @@ void worldProbeGather(vec3 p,vec3 N,out vec3 irradiance,out float sun) {
     else if(initialized) { irradiance=wpSky(N)*0.05;sun=0.0; }
     // Only genuinely uninitialized tiles use open-sky fallback. Adding sky for
     // occlusion-rejected weights would undo the wall-leak protection above.
+}
+
+// v47: the cached WORLD probes as the prior for a SCREEN probe that has
+// no history.  Radiance arriving at p from direction `dir`, from the
+// nearest world probe cell that has been traced (cube-axis blend, like
+// the gather above).  False when this tile's cache is not there yet.
+bool worldProbeRadiance(vec3 p, vec3 dir, out vec3 rad) {
+    rad = vec3(0.0);
+    int owner = wpFindTile(p.xz);
+    if (owner < 0) return false;
+    uint tile = uint(owner);
+    vec4 bounds = wp_tile_bounds[tile];
+    vec2 xz = (p.xz - bounds.xy) / (bounds.zw - bounds.xy) * 2.0 - 0.5;
+    float y = (p.y - wpBaseY(tile)) / WP_HEIGHT_SPACING;
+    vec3 grid = clamp(vec3(xz.x, y, xz.y), vec3(0), vec3(1, 7, 1));
+    ivec3 cell = min(ivec3(floor(grid)), ivec3(0, 6, 0));
+    vec3 f = grid - vec3(cell);
+    uint epoch = rpc.probe_epoch ^ (wp_tile_state[tile].x * 2654435761u);
+    vec3 sum = vec3(0); float weight = 0.0;
+    for (int z = 0; z < 2; ++z) for (int y0 = 0; y0 < 2; ++y0) for (int x = 0; x < 2; ++x) {
+        ivec3 c = cell + ivec3(x, y0, z);
+        WorldProbe q = world_probes[wpIndex(tile, c)];
+        vec3 position = wpPosition(tile, c);
+        if (any(notEqual(q.cell_epoch.xyz, position)) || floatBitsToUint(q.cell_epoch.w) != epoch) continue;
+        if (q.state.y < 0.5) continue;
+        vec3 w = mix(1.0 - f, f, vec3(x, y0, z));
+        float a = w.x * w.y * w.z;
+        vec3 E = vec3(0);
+        for (int axis = 0; axis < 3; ++axis)
+            E += wpUnpack(q.radiance[axis * 2 + (dir[axis] < 0.0 ? 1 : 0)]).rgb * dir[axis] * dir[axis];
+        sum += E * a; weight += a;
+    }
+    if (weight <= 0.001) return false;
+    rad = sum / weight;
+    return true;
 }
 
 void main() {
@@ -2979,13 +3130,38 @@ void main() {
     bool far_probe = rpc.probe_enabled != 0u && distance(world_pos,camera_info.position.xyz)>=rpc.probe_distance &&
                      wpFindTile(world_pos.xz)>=0;
     vec3 far_irradiance=vec3(0);float far_sun=1.0;
-    if(far_probe) worldProbeGather(world_pos,N,far_irradiance,far_sun);
+    // v49: INDIRECT COMES FROM THE WORLD PROBES EVERYWHERE.  The near
+    // field used to gather the screen probes (per-frame, per-tile, with
+    // all the history trouble that means) and hand over to the cached
+    // world probes only past probe_distance.  Now the cached, ray-traced
+    // probes are the one source of indirect light at every distance; the
+    // near field keeps its traced sun shadow and AO, the far field keeps
+    // taking those from the cache too.
+    bool probe_gi = rpc.probe_enabled != 0u && wpFindTile(world_pos.xz)>=0;
+    if(probe_gi) worldProbeGather(world_pos,N,far_irradiance,far_sun);
     bool restir_active = !far_probe &&
         (camera_info.input_features & FEATURE_INPUT_RESTIR) != 0u;
     vec3 restir_direct = vec3(0.0);
 
+    // v45: foliage pixels (normal_rough.w flags a leaf, see the SSS
+    // block below) ignore leaf hits within 0.6 m -- their own spray.
+    g_leaf_self_skip = (nr.w > 0.25) ? 0.6 : 0.0;
     float shad = 1.0;
-    if (far_probe) { shad=far_sun; } else if (rpc.pass_mode == 2u) {
+    // v51: LEAVES ARE LIT FROM EITHER SIDE.  The "facing away from the
+    // sun, no trace" early-out is right for a wall and wrong for a leaf:
+    // a card's normal points one way, the sun reaches the other side
+    // through the leaf, and the G-buffer's normal was flipped toward the
+    // viewer anyway -- so half of every crown was flat black.  Foliage
+    // pixels trace with the normal turned toward the sun.
+    const bool leaf_px = nr.w > 0.25;
+    const vec3 N_sun = (leaf_px && dot(N_geom, L) < 0.0) ? -N_geom : N_geom;
+    // ...and the far field keeps a PER-PIXEL traced shadow: the cached
+    // probe's sun visibility is a 64 m-cell average, which is why every
+    // tree past probe_distance stopped casting.  The trace is one ray
+    // query per pixel; the cache still supplies the indirect term.
+    if (far_probe && (camera_info.input_features & (FEATURE_INPUT_HW_RT_SHADOW | FEATURE_INPUT_RT_SHADOW)) == 0u) {
+        shad = far_sun;
+    } else if (rpc.pass_mode == 2u) {
         // APPLY pass: shadow + AO were traced by the GEN dispatch and
         // smoothed by rt_filter.comp — no tracing here.  Values are
         // consumed after the AO block below.
@@ -2997,9 +3173,9 @@ void main() {
     if ((camera_info.input_features & FEATURE_INPUT_HW_RT_SHADOW) != 0u) {
         // Hardware ray query vs the cluster TLAS (cone-jittered soft
         // shadow).  Same facing-away early-out as the software path.
-        shad = (dot(N_geom, L) <= 0.0)
+        shad = (dot(N_sun, L) <= 0.0)
                    ? 0.0
-                   : hwRtShadowFactor(rt_pos, N_geom, vec2(px));
+                   : hwRtShadowFactor(rt_pos, N_sun, vec2(px));
         // NO CSM union any more: the app stops rendering the
         // cascades entirely while an RT technique is armed (design
         // decision -- one shadow algorithm at a time), so sampling
@@ -3015,9 +3191,9 @@ void main() {
         // self-shadowed — skip the (expensive) BVH walk entirely.
         // Kills the trace for roughly the back half of the scene's
         // pixels at zero visual cost (diffuse/spec are ~0 there anyway).
-        shad = (dot(N_geom, L) <= 0.0)
+        shad = (dot(N_sun, L) <= 0.0)
                    ? 0.0
-                   : rtShadowFactor(rt_pos, N_geom, vec2(px));
+                   : rtShadowFactor(rt_pos, N_sun, vec2(px));
         // Traced term only -- see the hardware branch's note above.
     } else if ((camera_info.input_features & FEATURE_INPUT_SSRT_SHADOW) != 0u) {
         // Software screen-space raytraced shadows — checked BEFORE the
@@ -3117,9 +3293,9 @@ void main() {
     gi_debug_E = sRGBToLinear(gi_debug_E);
 #endif
     gi_debug_E *= (ao * rt_ao);
-    if (far_probe) {
-        gi_debug_E=far_irradiance;
-        ambient_diffuse=c_diff*far_irradiance*ao;
+    if (probe_gi) {
+        gi_debug_E=far_irradiance*(far_probe?1.0:rt_ao);
+        ambient_diffuse=c_diff*far_irradiance*ao*(far_probe?1.0:rt_ao);
     } else if ((camera_info.input_features &
          (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) ==
         (FEATURE_INPUT_RT_GI | FEATURE_INPUT_GI_SCREEN_PROBE)) {

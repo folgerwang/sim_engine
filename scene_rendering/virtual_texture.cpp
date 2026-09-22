@@ -10,6 +10,7 @@
 #include <atomic>
 #include <thread>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -79,6 +80,81 @@ static void boxDownsampleRgba8(
     }
 }
 
+// ── sRGB-CORRECT box downsample, for ALBEDO ───────────────────────
+// The "v2 quality bump" the note above put off, and it is not a nicety.
+// Averaging sRGB-ENCODED bytes is not averaging light: the mean of a
+// bright texel and a dark one comes out well below the brightness the
+// eye (and the GPU's own linear filtering of mip 0) sees for the same
+// patch.  For a flat-toned material that is invisible.  The terrain
+// albedo is sunlit ground speckled with dark canopy and shadow --
+// exactly the high-contrast case -- so every coarser VT mip was a
+// visibly DARKER, greener picture of the same land (bright 0.80 + dark
+// 0.05, half each: 0.43 linear when averaged properly, 0.29 when the
+// encoded bytes are averaged; a third of the light gone per the first
+// step alone).  The VT streams pages independently, so neighbouring
+// pages routinely sit at different mips, and each coarse one showed up
+// as a dark rectangle on the ground with page-aligned edges.  Decoded
+// to linear, averaged, re-encoded: every mip now carries the same
+// energy and a page changing mip changes sharpness, not colour.
+// Alpha is coverage, not light, and stays a plain average.
+static void boxDownsampleSrgb8(
+    const uint8_t* src, uint32_t src_w, uint32_t src_h,
+    uint8_t* dst) {
+    static const struct Luts {
+        float   to_linear[256];
+        uint8_t to_srgb[4096 + 1];
+        Luts() {
+            for (int i = 0; i < 256; ++i) {
+                const float c = float(i) / 255.0f;
+                to_linear[i] = c <= 0.04045f ? c / 12.92f
+                                             : std::pow((c + 0.055f) / 1.055f, 2.4f);
+            }
+            for (int i = 0; i <= 4096; ++i) {
+                const float l = float(i) / 4096.0f;
+                const float c = l <= 0.0031308f ? l * 12.92f
+                                                : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+                to_srgb[i] = uint8_t(std::min(255.0f, std::max(0.0f, c * 255.0f + 0.5f)));
+            }
+        }
+    } luts;
+    const uint32_t dst_w = std::max(1u, src_w >> 1);
+    const uint32_t dst_h = std::max(1u, src_h >> 1);
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        for (uint32_t x = 0; x < dst_w; ++x) {
+            const uint32_t sx0 = std::min(x * 2u,         src_w - 1u);
+            const uint32_t sx1 = std::min(x * 2u + 1u,    src_w - 1u);
+            const uint32_t sy0 = std::min(y * 2u,         src_h - 1u);
+            const uint32_t sy1 = std::min(y * 2u + 1u,    src_h - 1u);
+            const uint8_t* s00 = src + (sy0 * src_w + sx0) * 4u;
+            const uint8_t* s10 = src + (sy0 * src_w + sx1) * 4u;
+            const uint8_t* s01 = src + (sy1 * src_w + sx0) * 4u;
+            const uint8_t* s11 = src + (sy1 * src_w + sx1) * 4u;
+            uint8_t*       d   = dst + (y   * dst_w + x  ) * 4u;
+            // Colour is averaged WEIGHTED BY ALPHA.  A cutout's transparent
+            // texels carry black, and a plain average pulled every edge
+            // texel toward it: at the mips where a leaf spray's leaflets
+            // are a texel or two apart, the gaps came out as opaque
+            // black stripes between them -- the comb.  Weighting by alpha
+            // gives an edge texel the colour of the ink beside it, which
+            // is what the eye expects to see through a cutout's fringe.
+            const float a00 = s00[3], a10 = s10[3], a01 = s01[3], a11 = s11[3];
+            const float asum = a00 + a10 + a01 + a11;
+            for (int c = 0; c < 3; ++c) {
+                float lin;
+                if (asum > 0.0f) {
+                    lin = (luts.to_linear[s00[c]] * a00 + luts.to_linear[s10[c]] * a10 +
+                           luts.to_linear[s01[c]] * a01 + luts.to_linear[s11[c]] * a11) / asum;
+                } else {
+                    lin = 0.25f * (luts.to_linear[s00[c]] + luts.to_linear[s10[c]] +
+                                   luts.to_linear[s01[c]] + luts.to_linear[s11[c]]);
+                }
+                d[c] = luts.to_srgb[uint32_t(std::min(lin, 1.0f) * 4096.0f + 0.5f)];
+            }
+            d[3] = uint8_t((uint32_t(s00[3]) + s10[3] + s01[3] + s11[3] + 2u) >> 2);
+        }
+    }
+}
+
 static er::Format layerFormat(VtLayer layer) {
     // ALBEDO is BC7_SRGB_BLOCK (4× VRAM win over RGBA8) — encoded
     // CPU-side via Rich Geldreich's bc7enc.  Only EMISSIVE stays
@@ -108,6 +184,14 @@ static er::Format layerFormat(VtLayer layer) {
         // registerMaterial returns.
         case VtLayer::METAL_ROUGH_AO: return er::Format::BC7_UNORM_BLOCK;
         case VtLayer::EMISSIVE:       return er::Format::R8G8B8A8_UNORM;
+        // ALPHA is BC4_UNORM -- single channel, 8 B per 4x4 block.
+        // Half the bytes of every other BC pool here (~42 MB -> ~21 MB
+        // at 8208x4104), and the only layer the visibility pass reads,
+        // which is the entire point: the alpha test runs per fragment
+        // under heavy foliage overdraw, so it is the one sample whose
+        // bandwidth actually multiplies.  CPU-encoded per tile via
+        // encodeBC4UNorm into cache.bc4_alpha.
+        case VtLayer::ALPHA:          return er::Format::BC4_UNORM_BLOCK;
         default:                      return er::Format::R8G8B8A8_UNORM;
     }
 }
@@ -237,16 +321,20 @@ VirtualTextureManager::VirtualTextureManager(
     // ~100 µs on most desktop drivers, so for 32 uploads/frame this
     // alone saves ~3 ms of CPU time per tick.
     {
-        // Three BC layers (ALBEDO BC7 + NORMAL BC5 + MR_AO BC7) each
-        // consume one kBc7BytesPerEntry-sized region per upload, so
-        // each frame needs 3 × N regions.  We allocate kVtCompactSlots
+        // Four BC layers (ALBEDO BC7 + NORMAL BC5 + MR_AO BC7 +
+        // ALPHA BC4) each consume one kBc7BytesPerEntry-sized region
+        // per upload, so each frame needs kVtStagingSubslots × N
+        // regions.  ALPHA only fills half of its region (BC4 is 8 B
+        // per block, not 16) -- the uniform stride is deliberate, it
+        // keeps the per-slot offset arithmetic identical for all four.  We allocate kVtCompactSlots
         // (= FIF) copies of that to make CPU writes safe while the GPU
         // is still reading from the previous frame's slice.
         //
         // Layout per frame slot (frame_index % FIF):
-        //   slot N → bytes [frame_base + N*3 + 0] = ALBEDO
-        //          → bytes [frame_base + N*3 + 1] = NORMAL
-        //          → bytes [frame_base + N*3 + 2] = MR_AO
+        //   slot N → bytes [frame_base + N*4 + 0] = ALBEDO
+        //          → bytes [frame_base + N*4 + 1] = NORMAL
+        //          → bytes [frame_base + N*4 + 2] = MR_AO
+        //          → bytes [frame_base + N*4 + 3] = ALPHA
         // where frame_base = (frame_index % FIF) * kPerFrameBytes.
         //
         // Without this multi-buffering the previous design relied on
@@ -256,7 +344,8 @@ VirtualTextureManager::VirtualTextureManager(
         // command buffer; with FIF separate slices, no synchronization
         // beyond the frame fence is needed.
         const uint64_t kPerFrameBytes =
-            uint64_t(kStreamerUploadsPerFrame) * 3u * kBc7BytesPerEntry;
+            uint64_t(kStreamerUploadsPerFrame) *
+            uint64_t(kVtStagingSubslots) * kBc7BytesPerEntry;
         const uint64_t upload_bytes = kPerFrameBytes * kVtCompactSlots;
         er::Helper::createBuffer(
             device_,
@@ -757,10 +846,16 @@ void VirtualTextureManager::tick(
         // computes the absolute byte offset by adding the frame slice
         // base (stashed in m_active_staging_base_off_ for the duration
         // of the call).
-        // 3 subslots per upload (ALBEDO/NORMAL/MR_AO) — must match the
-        // constructor's kPerFrameBytes and uploadTileAllLayers' offsets.
+        // kVtStagingSubslots per upload (ALBEDO/NORMAL/MR_AO/ALPHA) —
+        // must match the constructor's kPerFrameBytes AND
+        // uploadTileAllLayers' per-slot offsets.  All three multiply by
+        // the same constant for a reason: if this stride is smaller
+        // than the one the offsets use, frame N+1 writes inside frame
+        // N's still-in-flight slice, which is exactly the CPU-write-
+        // over-GPU-read race the FIF slicing exists to prevent.
         const uint64_t kPerFrameStagingBytes =
-            uint64_t(kStreamerUploadsPerFrame) * 3u * kBc7BytesPerEntry;
+            uint64_t(kStreamerUploadsPerFrame) *
+            uint64_t(kVtStagingSubslots) * kBc7BytesPerEntry;
         const uint64_t frame_staging_base =
             uint64_t(frame_index % kVtCompactSlots) * kPerFrameStagingBytes;
         active_staging_base_off_ = frame_staging_base;
@@ -1621,7 +1716,7 @@ bool VirtualTextureManager::encodeAlbedoTileCacheCpu(
         mip_w[k] = std::max(1u, mip_w[k - 1] >> 1);
         mip_h[k] = std::max(1u, mip_h[k - 1] >> 1);
         mip_pixels[k].resize(uint64_t(mip_w[k]) * mip_h[k] * 4u);
-        boxDownsampleRgba8(mip_pixels[k - 1].data(),
+        boxDownsampleSrgb8(mip_pixels[k - 1].data(),
                            mip_w[k - 1], mip_h[k - 1],
                            mip_pixels[k].data());
     }
@@ -1672,7 +1767,7 @@ bool VirtualTextureManager::encodeAlbedoTileCacheCpu(
 
         std::vector<uint8_t> tile_rgba_half(
             (kVtTileSize / 2) * (kVtTileSize / 2) * 4u);
-        boxDownsampleRgba8(tile_rgba.data(), kVtTileSize, kVtTileSize,
+        boxDownsampleSrgb8(tile_rgba.data(), kVtTileSize, kVtTileSize,
                            tile_rgba_half.data());
         encodeBC7Mode6(tile_rgba_half.data(),
                        kVtTileSize / 2, kVtTileSize / 2,
@@ -1712,7 +1807,8 @@ void VirtualTextureManager::encodeAndCacheVt(
     uint32_t width, uint32_t height,
     uint32_t pages_x, uint32_t pages_y, uint32_t mip_count,
     uint32_t page_table_offset,
-    const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles) {
+    const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles,
+    const uint8_t* alpha_plane) {
 
     while (vt_cache_.size() <= vt_index) {
         vt_cache_.emplace_back();
@@ -1771,6 +1867,33 @@ void VirtualTextureManager::encodeAndCacheVt(
         albedo_pixels = fallback_pixels.data();
     }
 
+    // ── ALPHA layer: does this texture have cutout at all? ───────────
+    // Only cutout textures get an alpha cache.  An opaque material
+    // would otherwise pay ~21 MB of pool and a per-tile BC4 encode for
+    // a plane that is uniformly 255, and the shader reads 1.0 for a
+    // missing cache anyway.  The threshold matches writeRwTex's own
+    // cutout test (alpha < 250) so a .rwtex bake and a runtime encode
+    // agree on which textures are cutout.
+    bool has_cutout = false;
+    if (albedo_pixels) {
+        const uint64_t n = uint64_t(width) * height;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (albedo_pixels[i * 4u + 3u] < 250u) { has_cutout = true; break; }
+        }
+    } else if (alpha_plane) {
+        const uint64_t n = uint64_t(width) * height;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (alpha_plane[i] < 250u) { has_cutout = true; break; }
+        }
+    }
+    // 0xFF fill, not 0: an entry that never gets encoded (a tile the
+    // walk skips) then reads as fully opaque rather than fully cut
+    // away, so a bug here loses the cutout instead of the geometry.
+    if (has_cutout) {
+        cache.bc4_alpha.assign(uint64_t(pre_total_pages) * kBc4BytesPerEntry,
+                               0xFFu);
+    }
+
     // ── ALBEDO pipeline: input CPU pixels → per-mip CPU pyramid →
     //    per-tile bordered RGBA8 extraction → bc7enc → cache.bc7_albedo.
     // No GPU readback.  Each tile is kVtTileSize × kVtTileSize at
@@ -1797,7 +1920,7 @@ void VirtualTextureManager::encodeAndCacheVt(
         mip_w[k] = std::max(1u, mip_w[k - 1] >> 1);
         mip_h[k] = std::max(1u, mip_h[k - 1] >> 1);
         mip_pixels[k].resize(uint64_t(mip_w[k]) * mip_h[k] * 4u);
-        boxDownsampleRgba8(mip_pixels[k - 1].data(),
+        boxDownsampleSrgb8(mip_pixels[k - 1].data(),
                            mip_w[k - 1], mip_h[k - 1],
                            mip_pixels[k].data());
     }
@@ -1849,26 +1972,171 @@ void VirtualTextureManager::encodeAndCacheVt(
                 }
             }
 
+            // Half-resolution tile for pool mip 1 — box-downsample
+            // the full bordered tile, then encode that.  The mip 1
+            // slot is kVtTileSize/2 × kVtTileSize/2 = 36×36 → 1296 B.
+            // Built BEFORE alpha is stripped below, because
+            // boxDownsampleSrgb8 weights RGB by alpha so transparent
+            // texels don't drag a dark fringe into the edge.
+            std::vector<uint8_t> tile_rgba_half(
+                (kVtTileSize/2) * (kVtTileSize/2) * 4u);
+            boxDownsampleSrgb8(tile_rgba.data(),
+                               kVtTileSize, kVtTileSize,
+                               tile_rgba_half.data());
+
+            // ── ALPHA layer, encoded from these same tiles ──────────
+            // Free here: the bordered tile is already gathered and
+            // already downsampled, so the cutout alpha costs one BC4
+            // pass over data in cache.  Alpha is plain-averaged by
+            // boxDownsampleSrgb8 (no coverage preservation) — same as
+            // before this split, so silhouettes at distance are
+            // unchanged.
+            if (!cache.bc4_alpha.empty()) {
+                uint8_t* adst0 = cache.bc4_alpha.data()
+                               + uint64_t(entry_idx) * kBc4BytesPerEntry;
+                encodeBC4UNorm(tile_rgba.data() + 3, 4u,
+                               kVtTileSize, kVtTileSize, adst0);
+                encodeBC4UNorm(tile_rgba_half.data() + 3, 4u,
+                               kVtTileSize/2, kVtTileSize/2,
+                               adst0 + kBc4BytesMip0);
+            }
+
+            // ── Strip alpha before the BC7 encode ──────────────────
+            // Alpha now lives in its own BC4 layer, so forcing it
+            // opaque here stops bc7enc from spending mode 6's SHARED
+            // colour/alpha index on a channel nothing reads.  That
+            // shared index was what smeared alpha across cutout edges
+            // — the artifact this split exists to remove.  It also
+            // gives the colour endpoints the whole index budget, so
+            // leaf colour gets slightly better, not worse.
+            for (size_t i = 3; i < tile_rgba.size(); i += 4) {
+                tile_rgba[i] = 255u;
+            }
+            for (size_t i = 3; i < tile_rgba_half.size(); i += 4) {
+                tile_rgba_half[i] = 255u;
+            }
+
             // Encode the bordered tile to BC7 at full resolution
             // (kVtTileSize × kVtTileSize → kBc7BytesMip0 bytes).
             uint8_t* dst0 = cache.bc7_albedo.data()
                           + uint64_t(entry_idx) * kBc7BytesPerEntry;
             encodeBC7Mode6(tile_rgba.data(),
                            kVtTileSize, kVtTileSize, dst0);
-
-            // Half-resolution tile for pool mip 1 — box-downsample
-            // the full bordered tile, then encode that.  The mip 1
-            // slot is kVtTileSize/2 × kVtTileSize/2 = 36×36 → 1296 B.
-            std::vector<uint8_t> tile_rgba_half(
-                (kVtTileSize/2) * (kVtTileSize/2) * 4u);
-            boxDownsampleRgba8(tile_rgba.data(),
-                               kVtTileSize, kVtTileSize,
-                               tile_rgba_half.data());
             encodeBC7Mode6(tile_rgba_half.data(),
                            kVtTileSize/2, kVtTileSize/2,
                            dst0 + kBc7BytesMip0);
         });
     } // !albedo_pre_encoded
+
+    // ── ALPHA pipeline for the pre-encoded albedo path ───────────────
+    // A .rwtex bake hands us BC7 albedo tiles, from which alpha cannot
+    // be recovered — but the same file already carries a full-res
+    // single-channel alpha plane (writeRwTex emits one for every cutout
+    // texture), and the loader passes it in.  This is the path that
+    // matters most in practice: the PCG trees are imported assets, so
+    // without this block the foliage the whole exercise targets would
+    // never get an alpha layer.
+    //
+    // The tile walk below mirrors the ALBEDO one exactly — same mip
+    // pyramid shape, same kVtTileBorder, same edge clamp — because the
+    // two caches are indexed by the SAME entry_idx and must describe
+    // the same texels.
+    //
+    // Note the albedo blob was baked WITH alpha still in it (the bake
+    // predates this split).  That is harmless: nothing reads albedo.a
+    // any more once an alpha layer exists.  Re-importing picks up the
+    // opaque-albedo encode and its quality win.
+    if (albedo_pre_encoded && !cache.bc4_alpha.empty() && alpha_plane) {
+        std::vector<std::vector<uint8_t>> a_mip(mip_count);
+        std::vector<uint32_t> a_w(mip_count), a_h(mip_count);
+        a_mip[0].assign(alpha_plane,
+                        alpha_plane + uint64_t(width) * height);
+        a_w[0] = width; a_h[0] = height;
+        for (uint32_t k = 1; k < mip_count; ++k) {
+            a_w[k] = std::max(1u, a_w[k - 1] >> 1);
+            a_h[k] = std::max(1u, a_h[k - 1] >> 1);
+            a_mip[k].resize(uint64_t(a_w[k]) * a_h[k]);
+            // Plain 2x2 box average, matching how boxDownsampleSrgb8
+            // treats the alpha channel on the CPU-pixels path.  No
+            // coverage preservation, deliberately: this split is a
+            // bandwidth change, and silhouettes at distance should
+            // look exactly as they did before it.
+            for (uint32_t y = 0; y < a_h[k]; ++y) {
+                for (uint32_t x = 0; x < a_w[k]; ++x) {
+                    const uint32_t sx0 = std::min(x * 2u, a_w[k - 1] - 1u);
+                    const uint32_t sy0 = std::min(y * 2u, a_h[k - 1] - 1u);
+                    const uint32_t sx1 = std::min(sx0 + 1u, a_w[k - 1] - 1u);
+                    const uint32_t sy1 = std::min(sy0 + 1u, a_h[k - 1] - 1u);
+                    const uint8_t* p = a_mip[k - 1].data();
+                    const uint32_t pw = a_w[k - 1];
+                    const uint32_t sum =
+                        uint32_t(p[size_t(sy0) * pw + sx0]) +
+                        uint32_t(p[size_t(sy0) * pw + sx1]) +
+                        uint32_t(p[size_t(sy1) * pw + sx0]) +
+                        uint32_t(p[size_t(sy1) * pw + sx1]);
+                    a_mip[k][size_t(y) * a_w[k] + x] =
+                        uint8_t((sum + 2u) / 4u);
+                }
+            }
+        }
+
+        encode_pool_->parallelFor(pre_total_pages,
+            [&](size_t entry_idx) {
+                uint32_t local = uint32_t(entry_idx);
+                uint32_t k = 0;
+                while (k < mip_count) {
+                    uint32_t mp = vtMipPagesAt(pages_x, k) *
+                                  vtMipPagesAt(pages_y, k);
+                    if (local < mp) break;
+                    local -= mp;
+                    ++k;
+                }
+                if (k >= mip_count) return;
+                const uint32_t mpx = vtMipPagesAt(pages_x, k);
+                const uint32_t px  = local % mpx;
+                const uint32_t py  = local / mpx;
+                const uint32_t mw  = a_w[k];
+                const uint32_t mh  = a_h[k];
+                const uint8_t* mip_data = a_mip[k].data();
+
+                std::vector<uint8_t> tile(kVtTileSize * kVtTileSize);
+                const int32_t origin_x =
+                    int32_t(px * kVtPageSize) - int32_t(kVtTileBorder);
+                const int32_t origin_y =
+                    int32_t(py * kVtPageSize) - int32_t(kVtTileBorder);
+                for (uint32_t ty = 0; ty < kVtTileSize; ++ty) {
+                    uint32_t sy = uint32_t(std::clamp(
+                        origin_y + int32_t(ty), 0, int32_t(mh) - 1));
+                    for (uint32_t tx = 0; tx < kVtTileSize; ++tx) {
+                        uint32_t sx = uint32_t(std::clamp(
+                            origin_x + int32_t(tx), 0, int32_t(mw) - 1));
+                        tile[size_t(ty) * kVtTileSize + tx] =
+                            mip_data[size_t(sy) * mw + sx];
+                    }
+                }
+                std::vector<uint8_t> tile_half(
+                    (kVtTileSize / 2) * (kVtTileSize / 2));
+                for (uint32_t y = 0; y < kVtTileSize / 2; ++y) {
+                    for (uint32_t x = 0; x < kVtTileSize / 2; ++x) {
+                        const uint32_t sum =
+                            uint32_t(tile[size_t(y * 2u) * kVtTileSize + x * 2u]) +
+                            uint32_t(tile[size_t(y * 2u) * kVtTileSize + x * 2u + 1u]) +
+                            uint32_t(tile[size_t(y * 2u + 1u) * kVtTileSize + x * 2u]) +
+                            uint32_t(tile[size_t(y * 2u + 1u) * kVtTileSize + x * 2u + 1u]);
+                        tile_half[size_t(y) * (kVtTileSize / 2) + x] =
+                            uint8_t((sum + 2u) / 4u);
+                    }
+                }
+
+                uint8_t* adst0 = cache.bc4_alpha.data()
+                               + uint64_t(entry_idx) * kBc4BytesPerEntry;
+                encodeBC4UNorm(tile.data(), 1u,
+                               kVtTileSize, kVtTileSize, adst0);
+                encodeBC4UNorm(tile_half.data(), 1u,
+                               kVtTileSize / 2, kVtTileSize / 2,
+                               adst0 + kBc4BytesMip0);
+            });
+    }
 
     // ── NORMAL pipeline: identical structure to ALBEDO above but
     //    encoded as BC5_UNORM (RG only) instead of BC7.  The pool's
@@ -2071,14 +2339,14 @@ void VirtualTextureManager::uploadTileAllLayers(
     if (entry_idx_in_cache < cache.bc7_albedo.size() / kBc7BytesPerEntry &&
         upload_staging_mapped_ &&
         staging_slot < kStreamerUploadsPerFrame) {
-        // Per-slot staging layout: ALBEDO uses subslot 0, NORMAL uses
-        // subslot 1, MR_AO uses subslot 2.  All subslots are
+        // Per-slot staging layout: ALBEDO uses subslot 0, NORMAL
+        // subslot 1, MR_AO subslot 2, ALPHA subslot 3.  All subslots are
         // kBc7BytesPerEntry-sized.  The frame's FIF slice base
         // (active_staging_base_off_) is added on so back-to-back
         // frames don't overlap.
         const uint64_t base_off =
             active_staging_base_off_ +
-            uint64_t(staging_slot) * 3u * kBc7BytesPerEntry;
+            uint64_t(staging_slot) * kVtStagingSubslots * kBc7BytesPerEntry;
         std::memcpy(
             upload_staging_mapped_ + base_off,
             cache.bc7_albedo.data() + uint64_t(entry_idx_in_cache) * kBc7BytesPerEntry,
@@ -2119,7 +2387,7 @@ void VirtualTextureManager::uploadTileAllLayers(
         // FIF base + per-slot subslot 1 (NORMAL).
         const uint64_t base_off =
             active_staging_base_off_ +
-            (uint64_t(staging_slot) * 3u + 1u) * kBc7BytesPerEntry;
+            (uint64_t(staging_slot) * kVtStagingSubslots + 1u) * kBc7BytesPerEntry;
         std::memcpy(
             upload_staging_mapped_ + base_off,
             cache.bc5_normal.data() + uint64_t(entry_idx_in_cache) * kBc7BytesPerEntry,
@@ -2162,7 +2430,7 @@ void VirtualTextureManager::uploadTileAllLayers(
         // FIF base + per-slot subslot 2 (MR_AO).
         const uint64_t base_off =
             active_staging_base_off_ +
-            (uint64_t(staging_slot) * 3u + 2u) * kBc7BytesPerEntry;
+            (uint64_t(staging_slot) * kVtStagingSubslots + 2u) * kBc7BytesPerEntry;
         std::memcpy(
             upload_staging_mapped_ + base_off,
             cache.bc7_mr_ao.data() + uint64_t(entry_idx_in_cache) * kBc7BytesPerEntry,
@@ -2189,6 +2457,50 @@ void VirtualTextureManager::uploadTileAllLayers(
         cmd_buf->copyBufferToImage(
             upload_staging_buffer_,
             layer_pools_[uint32_t(VtLayer::METAL_ROUGH_AO)].texture.image,
+            regions, er::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    // ── ALPHA: BC4 from cache → persistent staging buffer subslot 3
+    //    → pool slot.  Same per-tile structure as the layers above,
+    //    with the ONE difference that matters: BC4 is 8 B per 4x4
+    //    block, so every byte offset inside the entry uses kBc4*, not
+    //    kBc7*.  The subslot STRIDE is still kBc7BytesPerEntry (the
+    //    region is simply half-used) so the per-slot arithmetic stays
+    //    uniform.  Empty cache = opaque texture = nothing to upload,
+    //    and the shader reads alpha 1.0 for it.
+    if (!cache.bc4_alpha.empty() &&
+        entry_idx_in_cache < cache.bc4_alpha.size() / kBc4BytesPerEntry &&
+        upload_staging_mapped_ &&
+        staging_slot < kStreamerUploadsPerFrame) {
+        const uint64_t base_off =
+            active_staging_base_off_ +
+            (uint64_t(staging_slot) * kVtStagingSubslots + 3u) * kBc7BytesPerEntry;
+        std::memcpy(
+            upload_staging_mapped_ + base_off,
+            cache.bc4_alpha.data() + uint64_t(entry_idx_in_cache) * kBc4BytesPerEntry,
+            kBc4BytesPerEntry);
+
+        std::vector<er::BufferImageCopyInfo> regions(2);
+        regions[0].buffer_offset = base_off;
+        regions[0].buffer_row_length   = kVtTileSize;
+        regions[0].buffer_image_height = kVtTileSize;
+        regions[0].image_subresource.aspect_mask = SET_FLAG_BIT(ImageAspect, COLOR_BIT);
+        regions[0].image_subresource.mip_level   = 0;
+        regions[0].image_subresource.layer_count = 1;
+        regions[0].image_offset = glm::ivec3(int32_t(phys_page_x*kVtTileSize),
+                                              int32_t(phys_page_y*kVtTileSize), 0);
+        regions[0].image_extent = glm::uvec3(kVtTileSize, kVtTileSize, 1);
+        regions[1] = regions[0];
+        regions[1].buffer_offset = base_off + kBc4BytesMip0;
+        regions[1].buffer_row_length   = kVtTileSize / 2;
+        regions[1].buffer_image_height = kVtTileSize / 2;
+        regions[1].image_subresource.mip_level = 1;
+        regions[1].image_offset = glm::ivec3(int32_t(phys_page_x*(kVtTileSize/2)),
+                                              int32_t(phys_page_y*(kVtTileSize/2)), 0);
+        regions[1].image_extent = glm::uvec3(kVtTileSize/2, kVtTileSize/2, 1);
+        cmd_buf->copyBufferToImage(
+            upload_staging_buffer_,
+            layer_pools_[uint32_t(VtLayer::ALPHA)].texture.image,
             regions, er::ImageLayout::TRANSFER_DST_OPTIMAL);
     }
 
@@ -2239,6 +2551,13 @@ void VirtualTextureManager::uploadTileAllLayers(
     blitOne(VtLayer::EMISSIVE, cache.emissive_src);
 }
 
+bool VirtualTextureManager::hasAlphaLayer(VirtualTextureId id) const {
+    if (id == kInvalidVtId) return false;
+    const uint32_t idx = vtIndex(id);
+    if (idx >= vt_cache_.size()) return false;
+    return !vt_cache_[idx].bc4_alpha.empty();
+}
+
 // ── Public: register a material (Phase B: metadata-only + pin) ───────
 // Allocates the page-table window, builds the per-VT BC7 cache and
 // stashes source images, then PINS the smallest mip (1×1 page = 1
@@ -2254,7 +2573,8 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
     const std::shared_ptr<er::Image>& emissive_image,
     uint32_t width,
     uint32_t height,
-    const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles) {
+    const std::shared_ptr<std::vector<uint8_t>>& albedo_bc7_tiles,
+    const uint8_t* alpha_plane) {
 
     // CPU pixels, a GPU image, OR a bake-time pre-encoded BC7 tile
     // blob must be available — pixels are used directly when present,
@@ -2310,7 +2630,7 @@ VirtualTextureId VirtualTextureManager::registerMaterial(
                      normal_image, mr_ao_image, emissive_image,
                      width, height,
                      pages_x, pages_y, mip_count, table_offset,
-                     albedo_bc7_tiles);
+                     albedo_bc7_tiles, alpha_plane);
 
     // ── Pin the smallest mip (always-resident fallback) ───────────
     // Smallest mip is mip_count - 1 with vtMipPagesAt = 1×1 = 1 page.
@@ -2921,7 +3241,7 @@ void VirtualTextureManager::processPendingWork(PendingWork&& w) {
         mip_widths[k]  = std::max(1u, mip_widths [k - 1] >> 1);
         mip_heights[k] = std::max(1u, mip_heights[k - 1] >> 1);
         mip_pixels[k].resize(uint64_t(mip_widths[k]) * mip_heights[k] * 4u);
-        boxDownsampleRgba8(
+        boxDownsampleSrgb8(
             mip_pixels[k - 1].data(),
             mip_widths [k - 1], mip_heights[k - 1],
             mip_pixels[k].data());
@@ -2988,7 +3308,7 @@ void VirtualTextureManager::processPendingWork(PendingWork&& w) {
             // integer VT-mip boundary.
             std::vector<uint8_t> page_rgba_half(
                 (kVtPageSize / 2) * (kVtPageSize / 2) * 4u);
-            boxDownsampleRgba8(
+            boxDownsampleSrgb8(
                 page_rgba.data(), kVtPageSize, kVtPageSize,
                 page_rgba_half.data());
             uint8_t* dst1 = dst0 + kBc7BytesMip0;
