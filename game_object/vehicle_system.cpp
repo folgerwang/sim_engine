@@ -2546,6 +2546,37 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
                     v.route.clear(); v.leg = -1; v.lane_parked = false;
                     v.pos = glm::vec3(1.0e7f, 0.0f, 1.0e7f);
                     return;
+                } else if (have_pt) {
+                    // LAST RESORT: THE VERGE, NEVER THE LANE.
+                    // Both branches above can decline: parkFree finds no
+                    // kerb spot clear of a junction, and the retire path
+                    // only takes AMBIENT cars that nobody is looking at.
+                    // An owned car, or any car on screen, therefore fell
+                    // through to "do nothing" -- which means it stays
+                    // exactly where it stopped, in the travelled lane,
+                    // blocking traffic that has no way around it.  That
+                    // is the white car sitting in the carriageway.
+                    //
+                    // The verge is always available, so use it: parkVerge
+                    // is the same call the spawner uses to kerb a car,
+                    // and it already offsets clear of the carriageway.
+                    // Side is chosen by which lane the car is nearest, so
+                    // it slides sideways out of the road rather than
+                    // teleporting across it.
+                    const RoadPt cj = clearOfJunction(here);
+                    const Edge& ve = edges_[cj.edge];
+                    const float vs = ve.s[cj.index];
+                    glm::vec3 vt; float vh;
+                    const glm::vec3 pos_p = lanePos(ve, vs,  1.0f, 0.0f, &vt, &vh);
+                    const glm::vec3 pos_n = lanePos(ve, vs, -1.0f, 0.0f, &vt, &vh);
+                    const float side =
+                        glm::length(glm::vec2(v.pos.x - pos_p.x,
+                                              v.pos.z - pos_p.z)) <=
+                        glm::length(glm::vec2(v.pos.x - pos_n.x,
+                                              v.pos.z - pos_n.z))
+                            ? 1.0f : -1.0f;
+                    parkVerge(v, cj, side);
+                    v.lane_parked = false;
                 }
             }
         }

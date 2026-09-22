@@ -177,6 +177,11 @@ uint32_t GameProfiler::beginScope(
         fs->query_pool,
         fs->recorded_scopes.back().begin_query,
         /*after=*/false);
+    // The same scope name as a VK_EXT_debug_utils label, so an Nsight
+    // Graphics / RenderDoc capture shows "Forward Pass", "CSM Drawables"
+    // ... as nested ranges instead of anonymous draws.  No-op when the
+    // extension is not loaded (see VulkanCommandBuffer::beginDebugUtilsLabel).
+    cmd_buf->beginDebugUtilsLabel(name);
 
     fs->open_depth++;
     return scope_idx;
@@ -197,6 +202,7 @@ void GameProfiler::endScope(
     auto& entry     = fs->recorded_scopes[scope_handle];
     entry.end_query = fs->next_query++;
     fs->open_depth  = std::max(0, fs->open_depth - 1);
+    cmd_buf->endDebugUtilsLabel();
 
     cmd_buf->writeTimestamp(fs->query_pool, entry.end_query, /*after=*/true);
 }

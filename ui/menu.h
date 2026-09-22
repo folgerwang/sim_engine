@@ -279,6 +279,7 @@ private:
     // yellow where it holds a thin sheet -- where the water PASS would
     // draw, independent of whether the surface ends up visible.
     bool water_column_overlay_ = false;
+    int  tile_debug_mode_ = 0;      // Render Debug > Colour terrain tiles
     // Defaults to ON (checked) because the tile grass pass was hard-off
     // for a long time: TerrainSceneView::m_b_render_grass_ was a literal
     // `false` with no setter, so the pass never ran.  Now that the menu
@@ -381,8 +382,8 @@ private:
     std::array<uint64_t,4> leaf_profile_draws_{};
     std::array<uint64_t,4> leaf_profile_batches_{};
     std::array<uint64_t,4> leaf_profile_capacity_{};
-    bool world_probe_debug_xray_ = true;
-    int world_probe_debug_mode_ = 0;
+    bool world_probe_debug_xray_ = false;   // depth-tested by default
+    int world_probe_debug_mode_ = 1;        // radiance (the real colour) by default
     float world_probe_debug_distance_ = 1500.0f;
     float world_probe_distance_m_ = 100.0f;
     int  rt_samples_per_px_ = 2;
@@ -1295,6 +1296,18 @@ public:
     int          dbg_sel_seen_node_ = -3;
 
     bool         editor_layout_built_ = false;
+
+    // Work-area size the dock tree was last laid out for.  ImGui keeps a
+
+    // docked side panel at its absolute SizeRef when the host grows (all
+
+    // new space goes to the central node), so a layout saved from a
+
+    // 2560x1440 window stays 2560 wide on a 4K one.  drawEditorDockSpace
+
+    // rescales every node's SizeRef by the size ratio when this changes.
+
+    glm::vec2 editor_layout_size_ = glm::vec2(0.0f);
     float        outliner_list_h_   = 0.0f;   // draggable list/details split (px)
     bool         editor_enabled_    = false;  // editor UI off unless --editor
     // Content Browser current folder — the game project's asset view, rooted
@@ -2469,6 +2482,7 @@ public:
     }
     inline bool isWaterSurfaceOnly() const { return water_surface_only_; }
     inline bool isWaterColumnOverlay() const { return water_column_overlay_; }
+    inline int  getTileDebugMode() const { return tile_debug_mode_; }
 
     inline bool isGrassPassTurnOff() {
         return turn_off_grass_pass_;
