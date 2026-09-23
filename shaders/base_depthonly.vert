@@ -38,7 +38,7 @@ void ntLoadModelParams() {
     model_params.flip_uv_coord |=
         (pc_params.flip_uv_coord &
          (MODEL_FLAG_VEGETATION_SWAY | MODEL_FLAG_DEFERRED_RELIGHT |
-          MODEL_FLAG_NODE_TABLE));
+          MODEL_FLAG_NODE_TABLE | MODEL_FLAG_NT_COMPACTED));
     // ...except on a node that opted OUT of the sway (MODEL_FLAG_NO_SWAY,
     // set per record for the rock scatter that shares the tree file).
     // The per-drawable bit is what the OR above just handed it, so the
@@ -201,6 +201,8 @@ void main() {
     // vertex_position, not gl_Position) drops it too.
     {
         uint ilod_bits = floatBitsToUint(model_params.model_params_pad0);
+        // Compacted draw: the band was decided by nt_instance_compact.comp.
+        if ((model_params.flip_uv_coord & MODEL_FLAG_NT_COMPACTED) != 0u) ilod_bits = 0u;
         if (ilod_bits != 0u) {
             vec3 inst_t = (model_params.model_mat * vec4(in_loc_rot_mat_0.w,
                 in_loc_rot_mat_1.w, in_loc_rot_mat_2.w, 1.0)).xyz;

@@ -571,6 +571,10 @@ private:
     // both leaves only sky), but the shader tolerates both being set.
     bool debug_hide_forward_ = false;
     bool debug_hide_deferred_ = false;
+    // Render Debug > Pipeline > Depth prepass.  Off = skip the drawable +
+    // terrain coverage prepass; the G-buffer drawables pass then writes
+    // its own depth (DrawableObject::setGbufferWritesDepth).
+    bool depth_prepass_on_ = true;
     // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
     // 0 = half-res (richest detail), higher = increasingly down-sampled.
     // Clamped to the actual pyramid mip count by the menu UI.  Packed into
@@ -2465,6 +2469,7 @@ public:
     // global_definition.glsl.h.
     inline bool isHideForwardPixels() const { return debug_hide_forward_; }
     inline bool isHideDeferredPixels() const { return debug_hide_deferred_; }
+    inline bool isDepthPrepassOn() const { return depth_prepass_on_; }
 
     // Forward vs deferred toggle — read by application drawScene to
     // route the cluster opaque pass through the G-buffer + compute

@@ -128,6 +128,15 @@ private:
     // Current state of the VT toggle (default on).  Re-uploads the
     // material_params SSBO on transition.
     bool vt_enabled_ = true;
+    // Render Debug > Trees: hide the wood (trunk + branches) and/or the
+    // leaves of every tree_/bush_ asset.  Applied as
+    // BINDLESS_MAT_DEBUG_HIDDEN on material_params_backup_ and
+    // re-uploaded; re-applied after every finalizeUploads.
+    bool dbg_hide_tree_wood_   = false;
+    bool dbg_hide_tree_leaves_ = false;
+    void applyDebugHidePlants();
+    // Upload material_params_backup_ honouring the VT toggle.
+    void uploadMaterialParamsBackup();
 
     // Active translucent (glass) rendering mode.  Default = ALPHA_BLEND.
     // Pure storage — the dispatch happens in the application's draw
@@ -1237,6 +1246,13 @@ public:
     // transition; cheap (a few hundred KB) and only happens on user
     // click.
     void setVtEnabled(bool enabled);
+    // Render Debug > Trees.  Cheap no-op when unchanged, so the menu
+    // may call it every frame.  Culled in cluster_cull.comp (camera and
+    // per-cascade shadow cull) and the mesh-shader shadow task; the GS
+    // shadow fallback and the RT BLAS are NOT filtered.
+    void setDebugHidePlants(bool hide_wood, bool hide_leaves);
+    bool debugHideTreeWood()   const { return dbg_hide_tree_wood_; }
+    bool debugHideTreeLeaves() const { return dbg_hide_tree_leaves_; }
     bool isVtEnabled() const { return vt_enabled_; }
 
     // Bindless draw — issues two indirect draws and a fullscreen OIT

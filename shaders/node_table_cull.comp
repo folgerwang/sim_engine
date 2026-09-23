@@ -49,6 +49,11 @@ layout(std430, set = 0, binding = 6) readonly buffer PrimFlagBuf {
 layout(std430, set = 0, binding = 7) readonly buffer ClassIdxBuf {
     uint class_idx[];         // [fwd survivors | depth survivors] → record
 };
+// Surviving instance count per record, written by nt_instance_compact.comp
+// this pass (valid only when pc.pad0 != 0).
+layout(std430, set = 0, binding = 8) readonly buffer RecCountBuf {
+    uint rec_counts[];
+};
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -81,6 +86,14 @@ void main() {
         if (per_inst || fading || ((node.flags >> 2u) & 3u) == 0u) return;
     }
 
+    // ── Compacted instances: point the commands at the record's range ─
+    const bool compacted = pc.pad0 != 0u;
+    uint c_count = 0u;
+    if (compacted) {
+        c_count = min(rec_counts[rec], node.inst_cap);
+        if (c_count == 0u) return;              // every instance culled
+    }
+
     // ── Emit one command per primitive into its bucket ───────────────
     for (uint p = 0u; p < node.prim_count; ++p) {
         const uint gp = node.prim_first + p;
@@ -101,10 +114,10 @@ void main() {
         const uint src = node.cmd_ofs_u32 + p * 5u;
         const uint dst = slot * 5u;
         cmd_dst[dst + 0u] = cmd_src[src + 0u];   // index_count
-        cmd_dst[dst + 1u] = cmd_src[src + 1u];   // instance_count
+        cmd_dst[dst + 1u] = compacted ? c_count : cmd_src[src + 1u];   // instance_count
         cmd_dst[dst + 2u] = cmd_src[src + 2u];   // first_index
         cmd_dst[dst + 3u] = cmd_src[src + 3u];   // vertex_offset
-        cmd_dst[dst + 4u] = cmd_src[src + 4u];   // first_instance
+        cmd_dst[dst + 4u] = compacted ? node.out_base : cmd_src[src + 4u];   // first_instance
         slots[slot] = rec;
     }
 }

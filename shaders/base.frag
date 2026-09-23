@@ -483,12 +483,12 @@ bool lodFadeDiscards(float w) {
     return (w >= 0.0) ? (w <= ign) : (-w <= 1.0 - ign);
 }
 
-#if defined(GBUFFER_OUTPUT) && !defined(DECAL)
+#if defined(GBUFFER_OUTPUT) && !defined(DECAL) && !defined(GBUFFER_WRITES_DEPTH)
 layout(early_fragment_tests) in;
 #endif
 
 void main() {
-#if !defined(GBUFFER_OUTPUT) || defined(DECAL)
+#if !defined(GBUFFER_OUTPUT) || defined(DECAL) || defined(GBUFFER_WRITES_DEPTH)
     // Band transition: dissolve before any shading work is done.
     // Per-instance mode (model_params_pad0 != 0, dense ground cover)
     // uses the weight base.vert computed from the instance's own

@@ -1523,6 +1523,20 @@ public:
     // (red, orange, yellow, green, cyan, blue, magenta, white).
     static void setLodDebugColors(bool on);
     static bool getLodDebugColors();
+    // Render Debug > Trees: skip plant wood / leaf primitives in the
+    // direct and node-table draws (forward, G-buffer, prepass, shadows).
+    static void setDebugHidePlants(bool hide_wood, bool hide_leaves);
+    // true = no depth prepass ran this frame: kGBuffer draws write their
+    // own depth (LESS_OR_EQUAL, _GBUFZ fragment) instead of EQUAL-testing
+    // against the prepass.
+    static void setGbufferWritesDepth(bool on);
+    // GPU node table: cull plant instances one by one (LOD band + frustum)
+    // into a compact per-pass instance list before drawing, instead of
+    // submitting each node's full list and rejecting per vertex.
+    static void setNtCompactEnabled(bool on);
+    static bool ntCompactEnabled();
+    static bool debugHideTreeWood();
+    static bool debugHideTreeLeaves();
     bool getDebugForceRed() const {
         return object_ ? object_->m_debug_force_red_ : false;
     }

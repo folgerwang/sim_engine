@@ -1987,6 +1987,8 @@ void ClusterRenderer::finalizeUploads() {
     // ~48 B per material × ~3K materials = ~150 KB CPU; trivial.
     material_params_backup_ = staging_material_params_;
     vt_enabled_ = true;  // freshly uploaded with VT ids → VT is on.
+    // Render Debug > Trees survives a re-finalize (streaming / editor).
+    if (dbg_hide_tree_wood_ || dbg_hide_tree_leaves_) applyDebugHidePlants();
 
     // CPU staging is RETAINED (not cleared) so the editor's incremental
     // flow can resetToBaseUploads() + re-stage placed objects + call
@@ -2218,6 +2220,104 @@ void ClusterRenderer::setVtEnabled(bool enabled) {
                 "(%zu materials, %zu KB)\n",
                 enabled ? "ENABLED" : "DISABLED",
                 material_params_backup_.size(), bytes / 1024u);
+}
+
+// ─── Render Debug > Trees ──────────────────────────────────────────────────
+// Which half of a plant a cluster material is.  Plants are the assets the
+// PCG exporter names "tree_*" / "bush_*" (material or owning object, as a
+// whole '_'-delimited token so "street_lamp" is not a tree).  Leaves are
+// the plant materials carrying the leaf-age / leaf-mask flags or a
+// leaf-ish name; everything else on a plant is wood (trunk, branches, the
+// far "card_depthpbr_wood" impostor).  Ground clutter never counts.
+namespace {
+enum class PlantPart { None, Wood, Leaf };
+
+bool hasPlantToken(const std::string& s) {
+    for (const char* tok : {"tree_", "bush_"}) {
+        for (size_t at = s.find(tok); at != std::string::npos;
+             at = s.find(tok, at + 1)) {
+            if (at == 0 || s[at - 1] == '_' || s[at - 1] == '/' ||
+                s[at - 1] == '\\' || s[at - 1] == '.' || s[at - 1] == ' ')
+                return true;
+        }
+    }
+    return false;
+}
+
+PlantPart classifyPlantPart(std::string m, std::string o, uint32_t flags) {
+    if ((flags & BINDLESS_MAT_GROUND_CARD) != 0u) return PlantPart::None;
+    auto lower = [](std::string& s) {
+        for (auto& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    };
+    lower(m); lower(o);
+    if (m.rfind("clutter_", 0) == 0) return PlantPart::None;
+    if (!hasPlantToken(m) && !hasPlantToken(o)) return PlantPart::None;
+    const bool leaf_flag =
+        (flags & (BINDLESS_MAT_LEAF_AGE | BINDLESS_MAT_LEAF_MASK)) != 0u;
+    bool leaf_name = false;
+    for (const char* t : {"leaf", "foliage", "spray", "blossom", "petal",
+                          "needle", "frond"})
+        leaf_name = leaf_name || m.find(t) != std::string::npos;
+    return (leaf_flag || leaf_name) ? PlantPart::Leaf : PlantPart::Wood;
+}
+}  // namespace
+
+void ClusterRenderer::uploadMaterialParamsBackup() {
+    if (material_params_backup_.empty() || !material_params_buffer_.memory)
+        return;
+    const size_t bytes =
+        material_params_backup_.size() * sizeof(glsl::BindlessMaterialParams);
+    if (vt_enabled_) {
+        device_->updateBufferMemory(material_params_buffer_.memory, bytes,
+                                    material_params_backup_.data());
+        return;
+    }
+    // Same copy setVtEnabled(false) uploads.
+    std::vector<glsl::BindlessMaterialParams> off_copy = material_params_backup_;
+    for (auto& mp : off_copy) {
+        mp.albedo_vt_id = mp.normal_vt_id = 0xFFFFFFFFu;
+        mp.mr_ao_vt_id = mp.emissive_vt_id = 0xFFFFFFFFu;
+    }
+    device_->updateBufferMemory(material_params_buffer_.memory, bytes,
+                                off_copy.data());
+}
+
+void ClusterRenderer::applyDebugHidePlants() {
+    if (material_params_backup_.empty() || !material_params_buffer_.memory)
+        return;
+    const int kHidden = static_cast<int>(BINDLESS_MAT_DEBUG_HIDDEN);
+    const size_t n = std::min(material_params_backup_.size(),
+                              staging_material_names_.size());
+    int wood = 0, leaves = 0;
+    for (auto& mp : material_params_backup_) mp.flags &= ~kHidden;
+    if (dbg_hide_tree_wood_ || dbg_hide_tree_leaves_) {
+        for (size_t i = 0; i < n; ++i) {
+            auto& mp = material_params_backup_[i];
+            const PlantPart part = classifyPlantPart(
+                staging_material_names_[i].first,
+                staging_material_names_[i].second,
+                static_cast<uint32_t>(mp.flags));
+            if (part == PlantPart::Wood && dbg_hide_tree_wood_) {
+                mp.flags |= kHidden; ++wood;
+            } else if (part == PlantPart::Leaf && dbg_hide_tree_leaves_) {
+                mp.flags |= kHidden; ++leaves;
+            }
+        }
+    }
+    uploadMaterialParamsBackup();
+    clog_printf("[CLUSTER_RENDERER] debug hide trees: wood=%s (%d mats) "
+                "leaves=%s (%d mats) of %zu\n",
+                dbg_hide_tree_wood_ ? "on" : "off", wood,
+                dbg_hide_tree_leaves_ ? "on" : "off", leaves,
+                material_params_backup_.size());
+}
+
+void ClusterRenderer::setDebugHidePlants(bool hide_wood, bool hide_leaves) {
+    if (hide_wood == dbg_hide_tree_wood_ && hide_leaves == dbg_hide_tree_leaves_)
+        return;
+    dbg_hide_tree_wood_   = hide_wood;
+    dbg_hide_tree_leaves_ = hide_leaves;
+    applyDebugHidePlants();
 }
 
 // ─── applyMaterialCategories ───────────────────────────────────────────────

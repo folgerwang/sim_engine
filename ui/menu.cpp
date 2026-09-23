@@ -10213,6 +10213,21 @@ void Menu::drawRenderDebugMenuContent() {
                 deferred_rendering_ = false;
             }
             ImGui::Separator();
+            // Deferred only: the prepass exists to prime the G-buffer.
+            if (ImGui::MenuItem("Depth prepass", NULL, depth_prepass_on_,
+                                deferred_rendering_)) {
+                depth_prepass_on_ = !depth_prepass_on_;
+            }
+            // Per-instance plant cull (nt_instance_compact.comp) ahead of
+            // the GPU node table; off = submit full instance lists and
+            // reject out-of-band instances per vertex, as before.
+            {
+                bool compact = engine::game_object::DrawableObject::ntCompactEnabled();
+                if (ImGui::MenuItem("Compact plant instances (GPU)", NULL, compact)) {
+                    engine::game_object::DrawableObject::setNtCompactEnabled(!compact);
+                }
+            }
+            ImGui::Separator();
             ImGui::TextDisabled("Isolate a path");
             // Only the deferred side runs RT GI and traced sky
             // visibility, so "Forward only" is the quickest way to see
@@ -10229,6 +10244,35 @@ void Menu::drawRenderDebugMenuContent() {
                 debug_hide_deferred_ = !debug_hide_deferred_;
                 if (debug_hide_deferred_) debug_hide_forward_ = false;
             }
+            ImGui::EndMenu();
+        }
+    }
+
+    // ── Trees: hide a pass ──────────────────────────────────────────
+    // Drops every tree_/bush_ wood (trunk + branches) or leaf material
+    // from the cluster cull, so it leaves the forward, G-buffer and
+    // raster-shadow passes together.  RT shadows / GI keep using the
+    // BLAS built before the toggle.  See ClusterRenderer::
+    // setDebugHidePlants.
+    {
+        using engine::game_object::DrawableObject;
+        const bool hide_wood   = DrawableObject::debugHideTreeWood();
+        const bool hide_leaves = DrawableObject::debugHideTreeLeaves();
+        auto set_hide = [&](bool w, bool l) {
+            DrawableObject::setDebugHidePlants(w, l);
+            if (cluster_renderer_) cluster_renderer_->setDebugHidePlants(w, l);
+        };
+        char tree_label[64];
+        snprintf(tree_label, sizeof(tree_label), "Trees: %s",
+                 hide_wood && hide_leaves ? "all hidden"
+                 : hide_wood              ? "leaves only"
+                 : hide_leaves            ? "branches only"
+                                          : "all");
+        if (ImGui::BeginMenu(tree_label)) {
+            if (ImGui::MenuItem("Hide tree branches", NULL, hide_wood))
+                set_hide(!hide_wood, hide_leaves);
+            if (ImGui::MenuItem("Hide tree leaves", NULL, hide_leaves))
+                set_hide(hide_wood, !hide_leaves);
             ImGui::EndMenu();
         }
     }

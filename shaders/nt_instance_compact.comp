@@ -1,0 +1,93 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+// ── nt_instance_compact.comp — per-INSTANCE cull for the node table ───
+// Runs before node_table_cull.comp, once per pass, over every instance
+// of every record in the pass's survivor class.
+//
+// Why: a per-instance-band node (a plant "_lodtile_" of one band) owns
+// the tile's FULL instance list.  Five bands overlap a 512 m tile, so
+// the old path submitted every instance five times and base.vert threw
+// four bands' worth away one VERTEX at a time -- every vertex fetched,
+// every triangle assembled and clipped, in the prepass AND again in the
+// G-buffer.  Here each instance is tested ONCE (band + frustum) and only
+// the survivors are copied into a compact per-pass instance buffer; the
+// cull then points each command at the record's compacted range.
+//
+// Non-banded records pass through unchanged (frustum test only), so one
+// compact buffer can serve every command of the pass.
+#include "global_definition.glsl.h"
+
+layout(push_constant) uniform PC {
+    NtCompactPushConstants pc;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer InfoBuf     { NtCullInfo infos[]; };
+layout(std430, set = 0, binding = 1) readonly buffer CmdSrcBuf   { uint cmd_src[]; };
+layout(std430, set = 0, binding = 2) readonly buffer ClassIdxBuf { uint class_idx[]; };
+layout(std430, set = 0, binding = 3) readonly buffer PrefixBuf   { uint class_prefix[]; };
+layout(std430, set = 0, binding = 4) readonly buffer RecordBuf   { ModelParams records[]; };
+layout(std430, set = 0, binding = 5) readonly buffer InstSrcBuf  { InstanceDataInfo inst_src[]; };
+layout(std430, set = 0, binding = 6) readonly buffer AgeSrcBuf   { float age_src[]; };
+layout(std430, set = 0, binding = 7) writeonly buffer InstDstBuf { InstanceDataInfo inst_dst[]; };
+layout(std430, set = 0, binding = 8) writeonly buffer AgeDstBuf  { float age_dst[]; };
+layout(std430, set = 0, binding = 9) buffer RecCountBuf          { uint rec_counts[]; };
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.inst_total || pc.record_count == 0u) return;
+
+    // Which class entry owns this invocation: last e with prefix[e] <= gid.
+    uint lo = 0u, hi = pc.record_count - 1u;
+    while (lo < hi) {
+        const uint mid = (lo + hi + 1u) >> 1u;
+        if (class_prefix[pc.record_first + mid] <= gid) lo = mid; else hi = mid - 1u;
+    }
+    const uint rec = class_idx[pc.record_first + lo];
+    const uint k = gid - class_prefix[pc.record_first + lo];
+    const NtCullInfo info = infos[rec];
+    if (info.prim_count == 0u) return;
+
+    // The node's instance range, straight from its first command.
+    const uint src = info.cmd_ofs_u32;
+    const uint n = min(cmd_src[src + 1u], info.inst_cap);
+    if (k >= n) return;
+    const uint inst = cmd_src[src + 4u] + k;
+    const InstanceDataInfo d = inst_src[inst];
+    const mat4 m = records[rec].model_mat;
+
+    // ── Per-instance LOD band (same expression base.vert used) ────────
+    const uint ilod_bits = floatBitsToUint(records[rec].model_params_pad0);
+    if ((pc.flags & NT_COMPACT_BAND_TEST) != 0u && ilod_bits != 0u) {
+        const vec3 inst_t = (m * vec4(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w, 1.0)).xyz;
+        const float ilod_d = distance(inst_t.xz, pc.eye.xz);
+        const float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
+        const float ilod_far = float(ilod_bits & 0xFFFFu) * 0.25;
+        if (!(ilod_d >= ilod_near && ilod_d < ilod_far)) return;
+    }
+
+    // ── Per-instance frustum ──────────────────────────────────────────
+    const uint plane_count = min(pc.flags & 0xFFu, 6u);
+    if (plane_count > 0u) {
+        const mat3 r = mat3(d.mat_rot_0.xyz, d.mat_rot_1.xyz, d.mat_rot_2.xyz);
+        const vec3 t = vec3(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w);
+        // Same order base.vert places a vertex in: the record matrix
+        // first (mesh -> node space), THEN the instance basis and the
+        // instance translation, which is already a world position.
+        const vec3 c = r * (m * vec4(info.mesh_sphere.xyz, 1.0)).xyz + t;
+        const float s_inst = max(length(r[0]), max(length(r[1]), length(r[2])));
+        const float s_node = max(length(m[0].xyz), max(length(m[1].xyz), length(m[2].xyz)));
+        // Margin for the wind sway, which displaces after this transform.
+        const float rad = info.mesh_sphere.w * s_inst * s_node * 1.1 + 1.0;
+        for (uint p = 0u; p < plane_count; ++p) {
+            if (dot(pc.planes[p].xyz, c) + pc.planes[p].w < -rad) return;
+        }
+    }
+
+    const uint slot = atomicAdd(rec_counts[rec], 1u);
+    if (slot >= info.inst_cap) return;
+    const uint dst = info.out_base + slot;
+    inst_dst[dst] = d;
+    age_dst[dst] = age_src[inst];
+}

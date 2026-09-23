@@ -145,7 +145,11 @@ void main() {
         // Frustum cull is still safe — it's purely cascade-driven, no
         // face-orientation involved.
 
-        for (uint c = 0u; c < uint(CSM_CASCADE_COUNT); ++c) {
+        // Render Debug > Trees: hidden materials cast no raster shadow.
+        const bool dbg_hidden =
+            (uint(material_params[cluster_draw_infos[cluster_idx].material_idx].flags) &
+             BINDLESS_MAT_DEBUG_HIDDEN) != 0u;
+        for (uint c = 0u; c < uint(CSM_CASCADE_COUNT) && !dbg_hidden; ++c) {
             if (sphereInShadowFrustum(lights_params.light_view_proj[c], center, radius)) {
                 local_pass_mask |= (1u << c);
                 local_pass_count += 1u;

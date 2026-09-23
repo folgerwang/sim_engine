@@ -95,6 +95,22 @@ static int       s_material_filter = 0;
 // screen-door dissolve).  Same pattern as s_material_filter: a static
 // set by every draw() beats widening four call signatures.
 static bool      s_depth_prepass_pass = false;
+// DrawMode::kCoveragePrepass is being recorded.  Lets drawMesh route an
+// opaque, non-dissolving primitive to the VERTEX-ONLY coverage pipeline
+// (see kCoverageVertexOnlyBit): no fragment shader means no discard, so
+// the rasteriser keeps early-Z and skips the albedo fetch the
+// DEPTH_COVERAGE fragment does for every layer of overdraw.
+static bool      s_coverage_pass = false;
+// Depth prepass switched OFF (Render Debug > Pipeline): the G-buffer
+// drawables pass must write its own depth, so kGBuffer draws take
+// s_gbufz_pipeline_list (LESS_OR_EQUAL, write on, _GBUFZ fragment).
+// Set by the application each frame from whether the prepass ran.
+static bool      s_gbuffer_writes_depth = false;
+// NT-path key of the depth-writing twin of a G-buffer pipeline.
+static constexpr size_t kGbufWritesDepthBit = size_t(1) << 61;
+// Render Debug > Pipeline > "Compact plant instances": node-table plant
+// draws cull per INSTANCE in nt_instance_compact.comp first.
+static bool      s_nt_compact_enabled = true;
 static bool      s_leaf_depth_prepass = false;
 static bool      s_leaf_node_context = false;
 
@@ -128,6 +144,11 @@ static bool      s_shader_nt_variant = false;
 // Render Debug > "Colour plant LOD bands" — see lodDebugTint in base.frag.
 static bool      s_lod_debug_colors = false;
 static uint32_t  s_lod_debug_gen = 0;
+// Render Debug > Trees: skip the wood / leaf primitives of plants in the
+// direct (drawMesh) and node-table draws.  The cluster path has its own
+// copy of the switch (ClusterRenderer::setDebugHidePlants).
+static bool      s_dbg_hide_tree_wood = false;
+static bool      s_dbg_hide_tree_leaves = false;
 
 // Box-downscale a baked .rwtex RGBA8 preview for the forward-path
 // stopgap image (see the "Forward-path preview image" blocks below).
@@ -218,6 +239,15 @@ void engine::game_object::DrawableObject::setLodDebugColors(bool on) {
     ++s_lod_debug_gen;
 }
 bool engine::game_object::DrawableObject::getLodDebugColors() { return s_lod_debug_colors; }
+void engine::game_object::DrawableObject::setGbufferWritesDepth(bool on) { s_gbuffer_writes_depth = on; }
+void engine::game_object::DrawableObject::setNtCompactEnabled(bool on) { s_nt_compact_enabled = on; }
+bool engine::game_object::DrawableObject::ntCompactEnabled() { return s_nt_compact_enabled; }
+void engine::game_object::DrawableObject::setDebugHidePlants(bool hide_wood, bool hide_leaves) {
+    s_dbg_hide_tree_wood = hide_wood;
+    s_dbg_hide_tree_leaves = hide_leaves;
+}
+bool engine::game_object::DrawableObject::debugHideTreeWood() { return s_dbg_hide_tree_wood; }
+bool engine::game_object::DrawableObject::debugHideTreeLeaves() { return s_dbg_hide_tree_leaves; }
 
 // ── ECS material-dedup capture ──────────────────────────────────────────
 // Fill MaterialInfo::desc_ (the renderer-free ecs::MaterialDesc dedup
@@ -4081,8 +4111,9 @@ static void createInstanceBuffer(
 
     // One immutable float per instance; transforms remain the compact 48-byte layout.
     data->tree_age_bases_.resize(std::max<size_t>(kNumDrawableInstance, data->baked_instances_.size()), 0.f);
+    // STORAGE too: nt_instance_compact.comp copies the surviving ages.
     renderer::Helper::createBuffer(device,
-        SET_FLAG_BIT(BufferUsage, VERTEX_BUFFER_BIT), SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
+        SET_2_FLAG_BITS(BufferUsage, VERTEX_BUFFER_BIT, STORAGE_BUFFER_BIT), SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT), 0,
         data->tree_age_buffer_.buffer, data->tree_age_buffer_.memory,
         std::source_location::current(), data->tree_age_bases_.size()*sizeof(float), data->tree_age_bases_.data());
     const auto usage =
@@ -4501,6 +4532,9 @@ static void updateDescriptorSets(
 // Defined here (above drawMesh) so the draw-time hash lookup can call
 // them; the pipeline-build sites further down in this file reuse them.
 static constexpr size_t kDepthonlyHashOpaqueBit = size_t(1) << 63;
+// Key of the vertex-only twin of a coverage pipeline:
+// s_coverage_pipeline_list[prim.getHash() ^ kCoverageVertexOnlyBit].
+static constexpr size_t kCoverageVertexOnlyBit = size_t(1) << 62;
 
 static inline bool isPrimitiveOpaque(
     const ego::PrimitiveInfo& primitive,
@@ -4875,6 +4909,37 @@ static bool profileLeafPrimitive(const ego::PrimitiveInfo& prim,
          isLeafDepthPrimitive(prim, materials));
 }
 
+// "tree_" / "bush_" as a whole '_'-delimited token ("street_" is not one).
+static bool hasNameToken(const std::string& s, const char* tok) {
+    for (size_t at = s.find(tok); at != std::string::npos; at = s.find(tok, at + 1))
+        if (at == 0 || s[at - 1] == '_' || s[at - 1] == '/' || s[at - 1] == '.')
+            return true;
+    return false;
+}
+
+// Render Debug > Trees.  Leaves = the same test the leaf-draw profiler
+// uses (leaf-age cohort or leaf depth material); wood = every other
+// primitive of a plant (tree/bush-named material, or any non-rock
+// primitive of the plant-LOD tree GLB).  Ground clutter never counts.
+static bool debugHiddenPlantPrimitive(const ego::DrawableData& d,
+                                      const ego::PrimitiveInfo& prim) {
+    if (!s_dbg_hide_tree_wood && !s_dbg_hide_tree_leaves) return false;
+    if (prim.material_idx_ < 0 || prim.material_idx_ >= int(d.materials_.size()))
+        return false;
+    std::string name = d.materials_[prim.material_idx_].name_;
+    for (auto& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (hasNameToken(name, "clutter_")) return false;
+    const bool named_plant = hasNameToken(name, "tree_") || hasNameToken(name, "bush_");
+    const bool rock = hasNameToken(name, "rock_") || hasNameToken(name, "crag_");
+    if (!named_plant && (rock || !d.has_plant_lod_)) {
+        // Not a plant by name or file -- only a leaf-flagged material
+        // still counts (e.g. a baked "<ref>_sN" leaf section).
+        return s_dbg_hide_tree_leaves && d.materials_[prim.material_idx_].leaf_age_group_ >= 0;
+    }
+    return profileLeafPrimitive(prim, d.materials_) ? s_dbg_hide_tree_leaves
+                                                   : s_dbg_hide_tree_wood;
+}
+
 static void drawMesh(
     std::shared_ptr<renderer::CommandBuffer> cmd_buf,
     const std::shared_ptr<ego::DrawableData>& drawable_object,
@@ -5142,6 +5207,7 @@ static void drawMesh(
     for (size_t prim_i = 0; prim_i < prims_count; ++prim_i) {
         const auto* prim_ptr = prims_begin[prim_i];
         const auto& prim = *prim_ptr;
+        if (debugHiddenPlantPrimitive(*drawable_object, prim)) continue;
         // Render-path material filter — see s_material_filter.
         if (s_material_filter != 0) {
             const bool prim_is_blend =
@@ -5199,6 +5265,24 @@ static void drawMesh(
         auto cur_hash = (depth_only || s_depth_prepass_pass)
             ? getDepthonlyHashForMaterial(prim, drawable_object->materials_)
             : prim.getHash();
+        // Coverage prepass: an opaque primitive that is not mid-dissolve
+        // has nothing for the DEPTH_COVERAGE fragment to discard, so it
+        // takes the vertex-only twin.  Anything that can discard -- a
+        // cutout, a LOD cross-fade, per-instance ground cover -- keeps
+        // the fragment pipeline.
+        if (s_coverage_pass &&
+            isPrimitiveOpaque(prim, drawable_object->materials_)) {
+            uint32_t per_instance = 0;
+            std::memcpy(&per_instance, &model_params.model_params_pad0, sizeof(uint32_t));
+            const float w = model_params.lod_fade;
+            const bool dissolving = per_instance != 0u ||
+                (w != 0.0f && w < 0.999f && w > -0.999f);
+            if (!dissolving) {
+                const size_t vo = prim.getHash() ^ kCoverageVertexOnlyBit;
+                auto it = pipelines.find(vo);
+                if (it != pipelines.end() && it->second) cur_hash = vo;
+            }
+        }
 
         // ── Mesh-shader CSM dispatch (eligible primitives only) ─────
         // Take this branch only when mesh-shader mode is active AND
@@ -5939,7 +6023,10 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     // Glass-attribute permutation (DrawMode::kGlassAttr): fragment
     // stage only, base_frag_*_GLASS.  Mutually exclusive with both
     // flags above.
-    bool is_glass = false, bool is_coverage = false) {
+    bool is_glass = false, bool is_coverage = false,
+    // _GBUFZ: the G-buffer permutation that writes its own depth (depth
+    // prepass off).  Replaces is_gbuffer's _GBUF suffix.
+    bool is_gbuffer_z = false) {
     renderer::ShaderModuleList shader_modules(2);
     auto vert_feature_str = std::string(has_texcoord_0 ? "_TEX" : "") +
         (has_tangent ? "_TN" : (has_normals ? "_N" : ""));
@@ -5967,7 +6054,9 @@ static renderer::ShaderModuleList getDrawableShaderModules(
     // Appended in the same position _DECAL occupies (after _DS):
     // CompileShaders.cmake registers base_frag<layout>[_DS]_GBUF.spv.
     if (is_coverage) frag_feature_str += "_COVERAGE";
-    if (is_gbuffer) {
+    if (is_gbuffer_z) {
+        frag_feature_str += "_GBUFZ";
+    } else if (is_gbuffer) {
         frag_feature_str += "_GBUF";
     }
     if (is_glass) {
@@ -6274,17 +6363,28 @@ static std::shared_ptr<renderer::Pipeline> createDrawableDecalPipeline(
 // existing scene depth, with depth writes ON. This pass owns opaque and
 // masked drawable coverage, including seasonal and LOD alpha discard.
 static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> s_coverage_pipeline_list;
+static std::unordered_map<size_t, std::shared_ptr<renderer::Pipeline>> s_gbufz_pipeline_list;
 
 static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
     const std::shared_ptr<renderer::Device>& device,
     const renderer::PipelineRenderbufferFormats& gbuffer_formats,
     const std::shared_ptr<renderer::PipelineLayout>& pipeline_layout,
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
-    const ego::PrimitiveInfo& primitive, bool coverage_only = false) {
-    if (!coverage_only && !s_shader_nt_variant) {
+    const ego::PrimitiveInfo& primitive, bool coverage_only = false,
+    bool vertex_only = false, bool writes_depth = false) {
+    if (!coverage_only && !writes_depth && !s_shader_nt_variant) {
+        s_gbufz_pipeline_list[primitive.getHash()] = createDrawableGbufferPipeline(
+            device, gbuffer_formats, pipeline_layout, graphic_pipeline_info,
+            primitive, false, false, true);
         s_coverage_pipeline_list[primitive.getHash()] = createDrawableGbufferPipeline(
             device, gbuffer_formats, pipeline_layout, graphic_pipeline_info,
             primitive, true);
+        // Same vertex shader (so the depth is bit-identical for the
+        // G-buffer's EQUAL test), no fragment stage.
+        s_coverage_pipeline_list[primitive.getHash() ^ kCoverageVertexOnlyBit] =
+            createDrawableGbufferPipeline(
+                device, gbuffer_formats, pipeline_layout, graphic_pipeline_info,
+                primitive, true, true);
     }
     auto shader_modules = getDrawableShaderModules(
         device,
@@ -6297,7 +6397,9 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
         primitive.tag_.double_sided,
         primitive.tag_.has_skin_set_1,
         /*is_decal*/ false,
-        /*is_gbuffer*/ !coverage_only, false, coverage_only);
+        /*is_gbuffer*/ !coverage_only, false, coverage_only,
+        /*is_gbuffer_z*/ !coverage_only && writes_depth);
+    if (coverage_only && vertex_only) shader_modules.resize(1);  // VS only
 
     // Function-local statics for the same lifetime reason the decal
     // states are static: GraphicPipelineInfo holds shared_ptrs.
@@ -6320,6 +6422,12 @@ static std::shared_ptr<renderer::Pipeline> createDrawableGbufferPipeline(
     gbuf_pipeline_info.depth_stencil_info = s_gbuf_depth_stencil_info;
 
     auto pass_formats = gbuffer_formats;
+    if (!coverage_only && writes_depth) {
+        gbuf_pipeline_info.depth_stencil_info =
+            std::make_shared<renderer::PipelineDepthStencilStateCreateInfo>(
+                renderer::helper::fillPipelineDepthStencilStateCreateInfo(
+                    true, true, renderer::CompareOp::LESS_OR_EQUAL));
+    }
     if (coverage_only) {
         pass_formats.color_formats.clear();
         gbuf_pipeline_info.depth_stencil_info =
@@ -8050,7 +8158,39 @@ struct NodeTableGpu {
     uint32_t stat_draws = 0;
     uint32_t stat_records = 0;
     uint32_t stat_grow = 0;
+
+    // ── Per-instance compaction (nt_instance_compact.comp) ───────────
+    // stage_class_prefix: parallel to stage_class_idx, the exclusive
+    // prefix of inst_cap within each class half (fwd, depth), so the
+    // compact shader can map an invocation to its record by binary
+    // search.  compact_total: sum of inst_cap over ALL records = the
+    // compact buffers' size (each record owns [out_base, +inst_cap)).
+    std::vector<uint32_t> stage_class_prefix;
+    uint32_t fwd_inst_total = 0;
+    uint32_t depth_inst_total = 0;
+    uint32_t compact_total = 0;
+    renderer::BufferInfo class_prefix[2];     // host, per parity
+    renderer::BufferInfo rec_counts;          // device, rec_counts_capacity uints
+    uint32_t rec_counts_capacity = 0;
+    renderer::BufferInfo compact_inst;        // device, InstanceDataInfo per slot
+    renderer::BufferInfo compact_age;         // device, float per slot
+    uint32_t compact_capacity = 0;
+    std::shared_ptr<renderer::DescriptorSet> compact_desc_sets[2];
+    bool     pass_compacted = false;
+    uint64_t stat_inst_submitted = 0;         // instances the compact pass tested
+    // [nt.compact] debug readback (G-buffer pass, every ~4 s).
+    renderer::BufferInfo dbg_rb;              // host visible, 4 KB
+    bool     dbg_pending = false;
+    uint64_t dbg_serial = 0;
+    uint32_t dbg_records = 0;
+    uint32_t dbg_inst_total = 0;
 };
+
+// nt_instance_compact.comp pipeline (file statics: created next to the
+// node-table cull pipeline, destroyed with it).
+static std::shared_ptr<renderer::DescriptorSetLayout> s_nt_compact_desc_set_layout;
+static std::shared_ptr<renderer::PipelineLayout>      s_nt_compact_pipeline_layout;
+static std::shared_ptr<renderer::Pipeline>            s_nt_compact_pipeline;
 
 // VS side: the record table + the bucket slot table (NODE_TABLE_PARAMS_SET).
 static std::shared_ptr<renderer::DescriptorSetLayout> createNodeTableDescSetLayout(
@@ -8071,8 +8211,24 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNodeTableDescSetLayo
 // 3 cmd_dst, 4 slots, 5 counts, 6 prim_flags, 7 class_idx.
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(8);
-    for (uint32_t i = 0; i < 8; ++i) {
+    // 8 = rec_counts (compacted instance count per record).
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(9);
+    for (uint32_t i = 0; i < 9; ++i) {
+        bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+            i,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            renderer::DescriptorType::STORAGE_BUFFER);
+    }
+    return device->createDescriptorSetLayout(bindings);
+}
+
+// nt_instance_compact.comp set 0: 0 infos, 1 cmd_src, 2 class_idx,
+// 3 class_prefix, 4 records, 5 inst_src, 6 age_src, 7 inst_dst,
+// 8 age_dst, 9 rec_counts.
+static std::shared_ptr<renderer::DescriptorSetLayout> createNtCompactDescSetLayout(
+    const std::shared_ptr<renderer::Device>& device) {
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(10);
+    for (uint32_t i = 0; i < 10; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -8148,7 +8304,15 @@ static void ntReleaseGpu(
         nt.prim_bases[p].destroy(device);
         nt.cull_desc_sets[p].reset();
         nt.vs_desc_sets[p].reset();
+        nt.class_prefix[p].destroy(device);
+        nt.compact_desc_sets[p].reset();
     }
+    nt.rec_counts.destroy(device);
+    nt.dbg_rb.destroy(device);
+    nt.compact_inst.destroy(device);
+    nt.compact_age.destroy(device);
+    nt.rec_counts_capacity = 0;
+    nt.compact_capacity = 0;
     nt.prim_flags_buf.destroy(device);
     nt.cmds.destroy(device);
     nt.slots.destroy(device);
@@ -8293,6 +8457,7 @@ static void ntStageRecords(
     static thread_local std::vector<uint32_t> s_dep_idx;
     s_dep_idx.clear();
     s_dep_idx.reserve(dep.size());
+    uint32_t compact_total = 0;
 
     auto add_record = [&](uint32_t fi, bool in_fwd) -> uint32_t {
         const int32_t ni = object_->mesh_node_flat_[fi];
@@ -8355,6 +8520,18 @@ static void ntStageRecords(
         ci.prim_first = nt.mesh_prim_first[mesh_idx];
         ci.prim_count = uint32_t(object_->meshes_[mesh_idx].primitives_.size());
         ci.flags = flags;
+        {
+            const auto& mesh = object_->meshes_[mesh_idx];
+            const bool valid = mesh.bbox_min_.x <= mesh.bbox_max_.x;
+            const glm::vec3 c = valid ? 0.5f * (mesh.bbox_min_ + mesh.bbox_max_) : glm::vec3(0.0f);
+            const float r = valid ? 0.5f * glm::length(mesh.bbox_max_ - mesh.bbox_min_) : 1.0e30f;
+            ci.mesh_sphere = glm::vec4(c, r);
+        }
+        ci.inst_cap = node.inst_count_ ? node.inst_count_ : 1u;
+        ci.out_base = compact_total;
+        ci.info_pad0 = 0u;
+        ci.info_pad1 = 0u;
+        compact_total += ci.inst_cap;
 
         nt.stage_records.push_back(r);
         nt.stage_infos.push_back(ci);
@@ -8392,9 +8569,95 @@ static void ntStageRecords(
     }
     nt.fwd_count = uint32_t(nt.stage_class_idx.size());
     nt.depth_count = uint32_t(s_dep_idx.size());
+
+    // ── [nt.cost] diagnostic: what the colour class SUBMITS vs KEEPS ──
+    // Every fwd record is drawn in the coverage prepass AND the G-buffer
+    // pass.  A per-instance-band node submits its node's FULL instance
+    // list and base.vert throws away every instance outside the band --
+    // after the vertex has been fetched and shaded up to that test.  This
+    // prints, per drawable, the index work submitted, the part whose
+    // instance actually lies in its band (what reaches the rasteriser,
+    // before frustum), and the worst offending nodes.  Rate-limited to
+    // one line per drawable per 2 s; costs one pass over the survivor
+    // instances, on restage only.
+    {
+        static std::unordered_map<const void*, std::chrono::steady_clock::time_point> s_last;
+        const auto now = std::chrono::steady_clock::now();
+        auto& last = s_last[object_.get()];
+        if (now - last > std::chrono::seconds(2)) {
+            last = now;
+            const glm::vec3 eye = s_plant_lod_eye_ws;
+            uint64_t idx_sub = 0, idx_keep = 0, inst_sub = 0, inst_keep = 0;
+            uint32_t n_per_inst = 0;
+            struct Worst { uint64_t waste; int32_t ni; uint64_t sub; uint64_t keep; };
+            std::vector<Worst> worst;
+            for (uint32_t fi : fwd) {
+                if (size_t(fi) >= flat_n) continue;
+                const int32_t ni = object_->mesh_node_flat_[fi];
+                const auto& node = object_->nodes_[ni];
+                const auto& mesh = object_->meshes_[size_t(node.mesh_idx_)];
+                uint64_t idx_per_inst = 0;
+                for (const auto& prim : mesh.primitives_)
+                    if (!prim.index_desc_.empty())
+                        idx_per_inst += prim.index_desc_[0].index_count;
+                const uint32_t ninst = std::max<uint32_t>(node.inst_count_, 1u);
+                const bool per_inst = size_t(ni) < lod_fade_n && node.lod_per_instance_ != 0;
+                uint32_t keep = ninst;
+                if (per_inst && node.inst_count_ > 0 &&
+                    size_t(node.inst_offset_) + node.inst_count_ <= object_->baked_instances_.size()) {
+                    ++n_per_inst;
+                    keep = 0;
+                    const glm::mat4 m = iw * node.cached_matrix_;
+                    for (uint32_t k = 0; k < node.inst_count_; ++k) {
+                        const auto& bx = object_->baked_instances_[node.inst_offset_ + k];
+                        const glm::vec3 t = glm::vec3(m * glm::vec4(bx.mat_rot_0.w, bx.mat_rot_1.w, bx.mat_rot_2.w, 1.0f));
+                        const float d = glm::length(glm::vec2(t.x - eye.x, t.z - eye.z));
+                        if (d >= node.lod_near_m_ && d < node.lod_far_m_) ++keep;
+                    }
+                }
+                const uint64_t sub = idx_per_inst * ninst, kept = idx_per_inst * keep;
+                idx_sub += sub; idx_keep += kept; inst_sub += ninst; inst_keep += keep;
+                if (sub - kept > 0) worst.push_back({sub - kept, ni, sub, kept});
+            }
+            if (idx_sub > 1000000ull) {
+                std::sort(worst.begin(), worst.end(),
+                          [](const Worst& x, const Worst& y) { return x.waste > y.waste; });
+                const double waste_pct = idx_sub ? 100.0 * double(idx_sub - idx_keep) / double(idx_sub) : 0.0;
+                std::cout << "[nt.cost] " << (object_->nodes_.empty() ? std::string("?") : object_->nodes_[0].name_)
+                          << " fwd_records=" << nt.fwd_count << " per_inst_nodes=" << n_per_inst
+                          << " instances submitted=" << inst_sub << " in_band=" << inst_keep
+                          << " indices submitted=" << (idx_sub / 1000000.0) << "M in_band=" << (idx_keep / 1000000.0)
+                          << "M wasted=" << waste_pct << "% (x2 passes: prepass + G-buffer)\n";
+                for (size_t w = 0; w < std::min<size_t>(worst.size(), 5); ++w) {
+                    const auto& n = object_->nodes_[worst[w].ni];
+                    std::cout << "[nt.cost]    " << n.name_ << " band=[" << n.lod_near_m_ << "," << n.lod_far_m_
+                              << ") inst=" << n.inst_count_ << " idx/inst="
+                              << (n.inst_count_ ? worst[w].sub / n.inst_count_ : worst[w].sub)
+                              << " submitted=" << (worst[w].sub / 1000000.0) << "M kept=" << (worst[w].keep / 1000000.0) << "M\n";
+                }
+            }
+        }
+    }
     nt.stage_class_idx.insert(nt.stage_class_idx.end(),
                               s_dep_idx.begin(), s_dep_idx.end());
     nt.record_count = uint32_t(nt.stage_records.size());
+    // Compaction tables: exclusive inst_cap prefix per class half.
+    nt.compact_total = compact_total;
+    nt.stage_class_prefix.resize(nt.stage_class_idx.size());
+    {
+        uint32_t run = 0;
+        for (uint32_t e = 0; e < nt.fwd_count; ++e) {
+            nt.stage_class_prefix[e] = run;
+            run += nt.stage_infos[nt.stage_class_idx[e]].inst_cap;
+        }
+        nt.fwd_inst_total = run;
+        run = 0;
+        for (uint32_t e = nt.fwd_count; e < uint32_t(nt.stage_class_idx.size()); ++e) {
+            nt.stage_class_prefix[e] = run;
+            run += nt.stage_infos[nt.stage_class_idx[e]].inst_cap;
+        }
+        nt.depth_inst_total = run;
+    }
 
     // Bucket bases: capacity = the larger class's reference count, so
     // one table serves both classes.
@@ -8436,7 +8699,10 @@ static void ntEnsureBuffers(
         const uint32_t cap = std::max(class_n + class_n / 2u + 2048u, 8192u);
         for (int p = 0; p < 2; ++p) {
             ntRetire(nt, nt.class_idx[p], serial);
+            ntRetire(nt, nt.class_prefix[p], serial);
             nt.class_idx[p] = ntCreateHostBuffer(
+                device, uint64_t(cap) * sizeof(uint32_t));
+            nt.class_prefix[p] = ntCreateHostBuffer(
                 device, uint64_t(cap) * sizeof(uint32_t));
             nt.uploaded_version[p] = ~uint64_t(0);
             nt.desc_dirty[p] = true;
@@ -8458,6 +8724,31 @@ static void ntEnsureBuffers(
             SET_3_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT,
                             INDIRECT_BUFFER_BIT, TRANSFER_DST_BIT));
         nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+    }
+    if (nt.record_count > nt.rec_counts_capacity || !nt.rec_counts.buffer) {
+        const uint32_t cap = std::max(
+            nt.record_count + nt.record_count / 2u + 1024u, 4096u);
+        ntRetire(nt, nt.rec_counts, serial);
+        nt.rec_counts = ntCreateDeviceBuffer(
+            device, uint64_t(cap) * sizeof(uint32_t),
+            SET_3_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, TRANSFER_DST_BIT, TRANSFER_SRC_BIT));
+        nt.rec_counts_capacity = cap;
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+    }
+    if (nt.compact_total > nt.compact_capacity || !nt.compact_inst.buffer) {
+        const uint32_t cap = std::max(
+            nt.compact_total + nt.compact_total / 4u + 1024u, 4096u);
+        ntRetire(nt, nt.compact_inst, serial);
+        ntRetire(nt, nt.compact_age, serial);
+        nt.compact_inst = ntCreateDeviceBuffer(
+            device, uint64_t(cap) * sizeof(glsl::InstanceDataInfo),
+            SET_3_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, VERTEX_BUFFER_BIT, TRANSFER_SRC_BIT));
+        nt.compact_age = ntCreateDeviceBuffer(
+            device, uint64_t(cap) * sizeof(float),
+            SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, VERTEX_BUFFER_BIT));
+        nt.compact_capacity = cap;
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+        ++nt.stat_grow;
     }
     if (nt.total_slots > nt.slot_capacity || !nt.cmds.buffer) {
         const uint32_t cap = std::max(
@@ -8500,6 +8791,10 @@ static void ntUploadParity(
             nt.class_idx[parity].memory,
             uint64_t(nt.stage_class_idx.size()) * sizeof(uint32_t),
             nt.stage_class_idx.data());
+        device->updateBufferMemory(
+            nt.class_prefix[parity].memory,
+            uint64_t(nt.stage_class_prefix.size()) * sizeof(uint32_t),
+            nt.stage_class_prefix.data());
     }
     device->updateBufferMemory(
         nt.prim_bases[parity].memory,
@@ -8530,7 +8825,7 @@ static void ntWriteDescriptorSets(
             device->createDescriptorSets(pool, vs_layout, 1)[0];
     }
     renderer::WriteDescriptorList writes;
-    writes.reserve(10);
+    writes.reserve(22);
     const auto& cs = nt.cull_desc_sets[parity];
     auto add = [&](const std::shared_ptr<renderer::DescriptorSet>& set,
                    uint32_t binding, const renderer::BufferInfo& buf) {
@@ -8546,6 +8841,24 @@ static void ntWriteDescriptorSets(
     add(cs, 5, nt.counts);
     add(cs, 6, nt.prim_flags_buf);
     add(cs, 7, nt.class_idx[parity]);
+    add(cs, 8, nt.rec_counts);
+    if (s_nt_compact_desc_set_layout && object_->tree_age_buffer_.buffer) {
+        if (!nt.compact_desc_sets[parity]) {
+            nt.compact_desc_sets[parity] =
+                device->createDescriptorSets(pool, s_nt_compact_desc_set_layout, 1)[0];
+        }
+        const auto& ks = nt.compact_desc_sets[parity];
+        add(ks, 0, nt.infos[parity]);
+        add(ks, 1, object_->indirect_draw_cmd_);
+        add(ks, 2, nt.class_idx[parity]);
+        add(ks, 3, nt.class_prefix[parity]);
+        add(ks, 4, nt.records[parity]);
+        add(ks, 5, object_->instance_buffer_);
+        add(ks, 6, object_->tree_age_buffer_);
+        add(ks, 7, nt.compact_inst);
+        add(ks, 8, nt.compact_age);
+        add(ks, 9, nt.rec_counts);
+    }
     add(nt.vs_desc_sets[parity], NODE_TABLE_PARAMS_BINDING, nt.records[parity]);
     add(nt.vs_desc_sets[parity], NODE_TABLE_SLOTS_BINDING, nt.slots);
     device->updateDescriptorSets(writes);
@@ -9724,6 +10037,33 @@ void DrawableObject::createStaticMembers(
                 nt_enabled_ = false;
             }
         }
+        // Per-instance compaction ahead of the cull.  Optional: without
+        // it the node table draws full instance lists as before.
+        if (s_nt_compact_desc_set_layout == nullptr) {
+            s_nt_compact_desc_set_layout = createNtCompactDescSetLayout(device);
+        }
+        if (s_nt_compact_pipeline_layout == nullptr) {
+            s_nt_compact_pipeline_layout =
+                renderer::helper::createComputePipelineLayout(
+                    device,
+                    { s_nt_compact_desc_set_layout },
+                    sizeof(glsl::NtCompactPushConstants));
+        }
+        if (s_nt_compact_pipeline == nullptr) {
+            try {
+                s_nt_compact_pipeline =
+                    renderer::helper::createComputePipeline(
+                        device,
+                        s_nt_compact_pipeline_layout,
+                        "nt_instance_compact_comp.spv",
+                        std::source_location::current());
+            } catch (const std::exception& e) {
+                std::cout << "[drawable.nt] nt_instance_compact_comp.spv unavailable ("
+                          << e.what()
+                          << ") -- instance compaction disabled" << std::endl;
+                s_nt_compact_pipeline = nullptr;
+            }
+        }
 
         if (drawable_pipeline_layout_ == nullptr) {
             assert(material_desc_set_layout_);
@@ -9896,6 +10236,8 @@ void DrawableObject::recreateStaticMembers(
     drawable_gbuffer_pipeline_list_.clear();
     for (auto& entry : s_coverage_pipeline_list) device->destroyPipeline(entry.second);
     s_coverage_pipeline_list.clear();
+    for (auto& entry : s_gbufz_pipeline_list) device->destroyPipeline(entry.second);
+    s_gbufz_pipeline_list.clear();
     for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -10143,6 +10485,8 @@ void DrawableObject::destroyStaticMembers(
     drawable_gbuffer_pipeline_list_.clear();
     for (auto& entry : s_coverage_pipeline_list) device->destroyPipeline(entry.second);
     s_coverage_pipeline_list.clear();
+    for (auto& entry : s_gbufz_pipeline_list) device->destroyPipeline(entry.second);
+    s_gbufz_pipeline_list.clear();
     for (auto& pipeline : drawable_pipeline_list_) {
         device->destroyPipeline(pipeline.second);
     }
@@ -10189,6 +10533,18 @@ void DrawableObject::destroyStaticMembers(
     if (nt_cull_pipeline_layout_) {
         device->destroyPipelineLayout(nt_cull_pipeline_layout_);
         nt_cull_pipeline_layout_ = nullptr;
+    }
+    if (s_nt_compact_pipeline) {
+        device->destroyPipeline(s_nt_compact_pipeline);
+        s_nt_compact_pipeline = nullptr;
+    }
+    if (s_nt_compact_pipeline_layout) {
+        device->destroyPipelineLayout(s_nt_compact_pipeline_layout);
+        s_nt_compact_pipeline_layout = nullptr;
+    }
+    if (s_nt_compact_desc_set_layout) {
+        device->destroyDescriptorSetLayout(s_nt_compact_desc_set_layout);
+        s_nt_compact_desc_set_layout = nullptr;
     }
     nt_device_.reset();
     if (nt_cull_desc_set_layout_) {
@@ -11055,6 +11411,7 @@ void DrawableObject::draw(
     // a caller cannot silently demote a decal draw into the shadow list;
     // the decal pass never wants a depth-only pipeline.
     s_depth_prepass_pass = (draw_mode == DrawMode::kDepthPrepass);
+    s_coverage_pass = (draw_mode == DrawMode::kCoveragePrepass);
     s_leaf_profile_pass = (draw_mode == DrawMode::kCoveragePrepass || draw_mode == DrawMode::kDepthPrepass) ? 0 :
         draw_mode == DrawMode::kGBuffer ? 1 :
         (depth_only || draw_mode == DrawMode::kShadow || draw_mode == DrawMode::kCsmLayered ||
@@ -11069,7 +11426,8 @@ void DrawableObject::draw(
         (draw_mode == DrawMode::kDecal)         ? drawable_decal_pipeline_list_           :
         (draw_mode == DrawMode::kDecalGBuffer)  ? drawable_decal_gbuffer_pipeline_list_   :
         (draw_mode == DrawMode::kCoveragePrepass) ? s_coverage_pipeline_list :
-        (draw_mode == DrawMode::kGBuffer)       ? drawable_gbuffer_pipeline_list_         :
+        (draw_mode == DrawMode::kGBuffer)       ? (s_gbuffer_writes_depth ? s_gbufz_pipeline_list
+                                                                          : drawable_gbuffer_pipeline_list_) :
         (draw_mode == DrawMode::kGlassAttr)     ? drawable_glass_pipeline_list_           :
         depth_only                              ? drawable_shadow_pipeline_list_           :
                                                   drawable_pipeline_list_;
@@ -11700,6 +12058,17 @@ void DrawableObject::ntPrepare(
     pc.record_first = class_first;
     pc.record_count = class_count;
     pc.mode = mode;
+
+    // ── Per-instance compaction: camera passes only ───────────────────
+    // The shadow / CSM passes keep the full lists: their per-instance
+    // band test in base_depthonly.vert is measured from camera_info of
+    // the pass, which the compact shader would have to mirror per pass.
+    const uint32_t inst_total = depth_class ? nt.depth_inst_total : nt.fwd_inst_total;
+    const bool compact =
+        s_nt_compact_enabled && s_nt_compact_pipeline && !depth_only &&
+        class_count > 0u && inst_total > 0u &&
+        nt.compact_desc_sets[parity] && nt.compact_inst.buffer;
+    pc.pad0 = compact ? 1u : 0u;
     pc.iw_scale = glm::max(
         glm::length(glm::vec3(iw[0])),
         glm::max(glm::length(glm::vec3(iw[1])),
@@ -11741,6 +12110,104 @@ void DrawableObject::ntPrepare(
     cmd_buf->addBufferBarrier(nt.prim_flags_buf.buffer, host_write, compute_read);
     cmd_buf->addBufferBarrier(nt.records[parity].buffer, host_write, vs_read);
 
+    if (compact) {
+        const renderer::BufferResourceInfo vertex_attr_read = {
+            SET_FLAG_BIT(Access, VERTEX_ATTRIBUTE_READ_BIT),
+            SET_FLAG_BIT(PipelineStage, VERTEX_INPUT_BIT) };
+        // Previous pass's draws read the compact buffers as instance
+        // attributes; the previous cull read rec_counts.
+        cmd_buf->addBufferBarrier(nt.compact_inst.buffer, vertex_attr_read, compute_write);
+        cmd_buf->addBufferBarrier(nt.compact_age.buffer, vertex_attr_read, compute_write);
+        cmd_buf->addBufferBarrier(nt.records[parity].buffer, host_write, compute_read);
+        cmd_buf->addBufferBarrier(nt.class_prefix[parity].buffer, host_write, compute_read);
+        cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_read, transfer_write);
+        cmd_buf->fillBuffer(nt.rec_counts.buffer, 0,
+                            uint64_t(nt.record_count) * sizeof(uint32_t), 0u);
+        cmd_buf->addBufferBarrier(nt.rec_counts.buffer, transfer_write, compute_rw);
+
+        glsl::NtCompactPushConstants kpc{};
+        uint32_t world_planes = 0u;
+        if (s_frustum_cull_active) {
+            for (int p = 0; p < 6; ++p) kpc.planes[p] = s_frustum_planes[p];
+            world_planes = 6u;
+        }
+        kpc.eye = glm::vec4(s_plant_lod_eye_ws, 1.0f);
+        kpc.flags = world_planes | NT_COMPACT_BAND_TEST;
+        kpc.record_first = class_first;
+        kpc.record_count = class_count;
+        kpc.inst_total = inst_total;
+        cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE,
+                              s_nt_compact_pipeline);
+        cmd_buf->bindDescriptorSets(
+            renderer::PipelineBindPoint::COMPUTE,
+            s_nt_compact_pipeline_layout,
+            { nt.compact_desc_sets[parity] },
+            0);
+        cmd_buf->pushConstants(
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            s_nt_compact_pipeline_layout,
+            &kpc,
+            sizeof(kpc));
+        cmd_buf->dispatch((inst_total + 63u) / 64u, 1u, 1u);
+
+        // ── [nt.compact] debug readback ──────────────────────────────
+        // Print what the previous copy captured (its frame has retired),
+        // then, every ~240 frames, capture this G-buffer pass's
+        // per-record survivor counts and first compacted instances.
+        if (nt.dbg_pending && serial >= nt.dbg_serial + 3u && nt.dbg_rb.memory) {
+            nt.dbg_pending = false;
+            const uint32_t* p = static_cast<const uint32_t*>(
+                device->mapMemory(nt.dbg_rb.memory, 4096, 0));
+            if (p) {
+                const uint32_t nrec = std::min<uint32_t>(nt.dbg_records, 512u);
+                uint64_t sum = 0; uint32_t nonzero = 0;
+                for (uint32_t i = 0; i < nrec; ++i) { sum += p[i]; nonzero += p[i] ? 1u : 0u; }
+                const float* f = reinterpret_cast<const float*>(p + 512);
+                std::cout << "[nt.compact] " << (object_->nodes_.empty() ? std::string("?") : object_->nodes_[0].name_)
+                          << " records=" << nt.dbg_records << " (first " << nrec << ": survivors=" << sum
+                          << " nonzero_records=" << nonzero << ") tested=" << nt.dbg_inst_total
+                          << " inst0=[" << f[0] << "," << f[1] << "," << f[2] << "," << f[3] << " | "
+                          << f[4] << "," << f[5] << "," << f[6] << "," << f[7] << " | "
+                          << f[8] << "," << f[9] << "," << f[10] << "," << f[11] << "]"
+                          << " eye=(" << s_plant_lod_eye_ws.x << "," << s_plant_lod_eye_ws.y << "," << s_plant_lod_eye_ws.z << ")"
+                          << " planes=" << (s_frustum_cull_active ? 6 : 0) << std::endl;
+                device->unmapMemory(nt.dbg_rb.memory);
+            }
+        }
+        if (draw_mode == DrawMode::kGBuffer && !nt.dbg_pending &&
+            serial >= nt.dbg_serial + 240u) {
+            if (!nt.dbg_rb.buffer) {
+                renderer::Helper::createBuffer(
+                    device,
+                    SET_FLAG_BIT(BufferUsage, TRANSFER_DST_BIT),
+                    SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+                    0, nt.dbg_rb.buffer, nt.dbg_rb.memory,
+                    std::source_location::current(), 4096);
+            }
+            const renderer::BufferResourceInfo transfer_read = {
+                SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
+                SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+            cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_rw, transfer_read);
+            cmd_buf->addBufferBarrier(nt.compact_inst.buffer, compute_write, transfer_read);
+            const uint32_t nrec = std::min<uint32_t>(nt.record_count, 512u);
+            cmd_buf->copyBuffer(nt.rec_counts.buffer, nt.dbg_rb.buffer,
+                                { { 0, 0, uint64_t(nrec) * 4u } });
+            cmd_buf->copyBuffer(nt.compact_inst.buffer, nt.dbg_rb.buffer,
+                                { { 0, 2048, 48 } });
+            cmd_buf->addBufferBarrier(nt.rec_counts.buffer, transfer_read, compute_rw);
+            cmd_buf->addBufferBarrier(nt.compact_inst.buffer, transfer_read, compute_write);
+            nt.dbg_pending = true;
+            nt.dbg_serial = serial;
+            nt.dbg_records = nt.record_count;
+            nt.dbg_inst_total = inst_total;
+        }
+
+        cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_rw, compute_read);
+        cmd_buf->addBufferBarrier(nt.compact_inst.buffer, compute_write, vertex_attr_read);
+        cmd_buf->addBufferBarrier(nt.compact_age.buffer, compute_write, vertex_attr_read);
+        nt.stat_inst_submitted += inst_total;
+    }
+
     if (class_count > 0u) {
         cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE,
                               nt_cull_pipeline_);
@@ -11762,6 +12229,7 @@ void DrawableObject::ntPrepare(
     cmd_buf->addBufferBarrier(nt.counts.buffer, compute_rw, indirect_read);
 
     nt.pass_ready = true;
+    nt.pass_compacted = compact;
     nt.pass_parity = parity;
     nt.pass_mode = mode;
     nt.pass_depth_class = depth_class;
@@ -11824,7 +12292,8 @@ void DrawableObject::ntDraw(
                         p = createDrawableGbufferPipeline(
                             device, gbuffer_renderbuffer_formats_,
                             drawable_pipeline_layout_,
-                            nt_graphic_pipeline_info_, prim, pass == kNtPassCoverage);
+                            nt_graphic_pipeline_info_, prim, pass == kNtPassCoverage,
+                            false, pass == kNtPassGBuffer && s_gbuffer_writes_depth);
                     }
                     break;
                 case kNtPassGlass:
@@ -11875,8 +12344,17 @@ void DrawableObject::ntDraw(
     pc.model_mat = glm::mat4(1.0f);
     pc.flip_uv_coord =
         MODEL_FLAG_NODE_TABLE |
+        (nt.pass_compacted ? MODEL_FLAG_NT_COMPACTED : 0x00u) |
         (object_->m_vegetation_sway_ ? MODEL_FLAG_VEGETATION_SWAY : 0x00u) |
         (s_deferred_relight_armed ? MODEL_FLAG_DEFERRED_RELIGHT : 0x00u);
+    // Compacted pass: the commands' first_instance is the record's slot
+    // in the compact per-pass buffers, not in the baked table.
+    if (nt.pass_compacted) {
+        cmd_buf->bindVertexBuffers(
+            VINPUT_INSTANCE_BINDING_POINT,
+            { nt.compact_inst.buffer, nt.compact_age.buffer },
+            { 0, 0 });
+    }
     pc.cascade_idx = csm_cascade_idx;
     pc.debug_force_red = 0u;
     pc.debug_skip_skinning = 0u;
@@ -11918,10 +12396,12 @@ void DrawableObject::ntDraw(
         if (cluster_active && mesh.cluster_global_mesh_idx_ >= 0) continue;
         const auto& prim = mesh.primitives_[nt.gp_local[gp]];
         if (prim.tag_.has_skin_set_0) continue;
+        if (debugHiddenPlantPrimitive(*object_, prim)) continue;
 
         const size_t hash = depth_shape
             ? getDepthonlyHashForMaterial(prim, materials)
-            : prim.getHash();
+            : (pass == kNtPassGBuffer && s_gbuffer_writes_depth
+                   ? prim.getHash() ^ kGbufWritesDepthBit : prim.getHash());
         auto pipe_it = pipelines.find(hash);
         if (pipe_it == pipelines.end()) {
             pipe_it = pipelines.emplace(hash, create_pipeline(prim)).first;

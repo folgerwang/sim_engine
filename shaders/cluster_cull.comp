@@ -131,6 +131,10 @@ void main() {
     ClusterDrawInfo            draw = cluster_draw_infos[cluster_idx];
     BindlessMaterialParams      mat = material_params[draw.material_idx];
     uint   mat_flags_early        = mat.flags;
+    // Render Debug > Trees: a hidden material's clusters are simply not
+    // emitted -- no draw, no visibility bit (Phase A picks them up again
+    // through Phase B the frame they are un-hidden).
+    if ((mat_flags_early & BINDLESS_MAT_DEBUG_HIDDEN) != 0u) return;
     float  mat_alpha_factor_early = mat.base_color_factor.a;
     bool   is_alpha_masked        = (mat_flags_early & BINDLESS_MAT_ALPHA_MASK)  != 0;
     bool   is_double_sided        = (mat_flags_early & BINDLESS_MAT_DOUBLE_SIDED) != 0;

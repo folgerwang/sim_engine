@@ -870,6 +870,13 @@ struct ViewParams {
 // crown-normal bend and base.frag's foliage guess for those nodes.
 #define MODEL_FLAG_NO_SWAY          0x40u
 #define MODEL_FLAG_PREPASS_OCCLUDER 0x80u
+// bit 8: this node-table draw reads a COMPACTED instance list
+// (nt_instance_compact.comp already kept only the instances inside the
+// node's per-instance LOD band and the view).  base.vert /
+// base_depthonly.vert then skip their own per-vertex band test: the
+// compute pass is the single authority, so two bands can never both
+// keep, or both drop, an instance whose distance sits on the edge.
+#define MODEL_FLAG_NT_COMPACTED     0x100u
 
 struct ModelParams {
     mat4 model_mat;
@@ -1373,6 +1380,13 @@ struct RtSkelHeader {
 // still carries its alpha -- both handled by falling back to albedo.a,
 // which is why this is a capability bit and not a behaviour switch.
 #define BINDLESS_MAT_ALPHA_VT    128   // bit 7
+// bit 31: DEBUG ONLY -- the material is hidden by Render Debug > Trees
+// (hide branches / hide leaves).  Set on the CPU copy by
+// ClusterRenderer::setDebugHidePlants and re-uploaded; cluster_cull.comp
+// (camera + per-cascade shadow cull) and the mesh-shader shadow task
+// drop every cluster that carries it, so the cluster never reaches the
+// forward, G-buffer, vis-buffer or raster-shadow passes.
+#define BINDLESS_MAT_DEBUG_HIDDEN 0x80000000u
                                         // scattering.  Set at cluster upload for
                                         // leaf materials (name contains "leaf" /
                                         // "foliage" — covers terrain_pcg's
@@ -2081,6 +2095,16 @@ struct NtCullInfo {
     uint    prim_first;
     uint    prim_count;
     uint    flags;
+    // Instance compaction (nt_instance_compact.comp).  mesh_sphere: the
+    // node mesh's LOCAL bounding sphere (xyz centre, w radius) for the
+    // per-instance frustum test.  out_base: this record's first slot in
+    // the compacted instance buffers; inst_cap: slots reserved there
+    // (= the node's instance count, 1 for a non-instanced node).
+    vec4    mesh_sphere;
+    uint    out_base;
+    uint    inst_cap;
+    uint    info_pad0;
+    uint    info_pad1;
 };
 // Per drawable-global primitive: bit 0 = coverable by the deferred
 // G-buffer (opaque, material, no skin), bit 1 = opaque for the depth
@@ -2104,9 +2128,23 @@ struct NtCullPushConstants {
     uint    record_count;
     uint    mode;             // NT_MODE_*
     float   iw_scale;         // world radius = sphere.w * iw_scale
-    uint    pad0;
+    uint    pad0;             // 1 = instances were compacted this pass (rec_counts valid)
     uint    pad1;
     uint    pad2;
+};
+
+// nt_instance_compact.comp -- one invocation per (class record, instance).
+// 128 bytes.  planes are WORLD space (the per-instance centre is taken to
+// world through the record's model matrix); eye.xyz is the camera the
+// per-instance LOD bands are measured from.
+#define NT_COMPACT_BAND_TEST  0x100u   // flags: apply the per-instance band test
+struct NtCompactPushConstants {
+    vec4    planes[6];        // world-space frustum, normals inward
+    vec4    eye;              // xyz = LOD eye (camera position)
+    uint    flags;            // bits 0..7 = plane count, NT_COMPACT_BAND_TEST
+    uint    record_first;     // first class entry
+    uint    record_count;     // class entries
+    uint    inst_total;       // invocations = sum of inst_cap over the class
 };
 
 // ── Per-mesh BLAS instanced RT casters (ClusterRenderer::ensureRtMeshSlot)
