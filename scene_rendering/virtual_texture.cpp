@@ -183,7 +183,26 @@ static er::Format layerFormat(VtLayer layer) {
         // the caller may destroy the ORM source right after
         // registerMaterial returns.
         case VtLayer::METAL_ROUGH_AO: return er::Format::BC7_UNORM_BLOCK;
-        case VtLayer::EMISSIVE:       return er::Format::R8G8B8A8_UNORM;
+        // EMISSIVE is BC7_SRGB_BLOCK.  It was the last RGBA8 layer here
+        // and cost 160.6 MB of the 301 MB pool on its own -- 4 B/texel
+        // against BC7's 1 -- for a layer BOTH registerMaterial call
+        // sites currently pass nullptr for, so the pool held nothing.
+        //
+        // SRGB, not UNORM, deliberately: this was declared UNORM, which
+        // means no sample-time sRGB decode.  glTF authors emissiveTexture
+        // in sRGB (as it does baseColorTexture, which is why ALBEDO is
+        // BC7_SRGB_BLOCK), so UNORM would have read emissive too bright
+        // in the midtones the moment real data arrived.  Nothing feeds
+        // this layer yet, so fixing it now costs nothing; switch this one
+        // token back to BC7_UNORM_BLOCK if the content is authored linear.
+        //
+        // NOTE FOR WHOEVER WIRES EMISSIVE UP: a BC7 pool image cannot be
+        // a BLIT_DST (see the note in the emissive upload path), so the
+        // vkCmdBlitImage path that used to serve this layer no longer
+        // works.  It needs the CPU encode METAL_ROUGH_AO already uses --
+        // encodeBC7Mode6 into a cache.bc7_emissive laid out at
+        // kBc7BytesPerEntry, same bordered per-tile walk, mip 0 + mip 1.
+        case VtLayer::EMISSIVE:       return er::Format::BC7_SRGB_BLOCK;
         // ALPHA is BC4_UNORM -- single channel, 8 B per 4x4 block.
         // Half the bytes of every other BC pool here (~42 MB -> ~21 MB
         // at 8208x4104), and the only layer the visibility pass reads,

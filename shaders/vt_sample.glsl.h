@@ -297,6 +297,36 @@ vec4 vtSampleEmissive(uint vt_id, vec2 uv) {
 
 
 
+// ── Mip-tail walk: resolve, climbing to coarser mips on a miss ─────
+// cluster_bindless.frag had this inline ("Stage 5") and the shared
+// helper did not.  The consequence was two different answers for the
+// same texel: the RASTER path degraded a non-resident page to a blurry
+// one, while the COMPUTE material pass and every convenience sampler
+// fell straight through to the miss value -- magenta for albedo, and,
+// far worse, 1.0 for ALPHA.  Alpha 1.0 on a cutout leaf card is a
+// fully OPAQUE QUAD: the silhouette disappears and the card draws as a
+// rectangle.  That is not a graceful degradation, it is a wrong image,
+// and it only showed up in the pass that skipped the walk.
+//
+// On success `mip` is updated to the level actually sampled so the
+// caller can force the in-pool trilinear frac to 0 when it walked --
+// pool mip 1 no longer corresponds to the requested LOD, and blurring
+// twice is worse than not blurring at all.
+//
+// Bounded by VT_MAX_MIPS; vt_types.glsl.h states the cap exists for
+// exactly this loop.  The streamer pins the smallest mip per VT, so a
+// healthy pool terminates this well before the cap.
+bool vtResolveWalk(uint vt_id, vec2 uv, in VirtualTextureMeta meta,
+                   inout uint mip, out vec2 phys_uv) {
+    for (uint i = 0u; i < VT_MAX_MIPS; ++i) {
+        if (mip >= meta.mip_count) break;
+        if (vtResolve(vt_id, uv, meta, mip, phys_uv)) return true;
+        ++mip;
+    }
+    phys_uv = vec2(0.0);
+    return false;
+}
+
 // ── Gradient-explicit samplers (compute-safe) ────────────────────────
 // Mirror vtSampleAlbedo / vtResolveSharedSlot exactly, magenta
 // unresident-page diagnostic included, but take the analytic gradients
@@ -307,10 +337,11 @@ vec4 vtSampleAlbedoGrad(uint vt_id, vec2 uv, vec2 uv_ddx, vec2 uv_ddy) {
     uint mip; float frac;
     vtPickMipAndFracGrad(meta, uv_ddx, uv_ddy, mip, frac);
     vec2 phys_uv;
-    if (!vtResolve(vt_id, uv, meta, mip, phys_uv)) {
+    uint want = mip;
+    if (!vtResolveWalk(vt_id, uv, meta, mip, phys_uv)) {
         return vec4(1.0, 0.0, 1.0, 1.0);   // magenta diagnostic
     }
-    return textureLod(vt_pool_albedo, phys_uv, frac);
+    return textureLod(vt_pool_albedo, phys_uv, mip == want ? frac : 0.0);
 }
 
 bool vtResolveSharedSlotGrad(uint vt_id, vec2 uv, vec2 uv_ddx, vec2 uv_ddy,
@@ -352,8 +383,9 @@ float vtSampleAlphaGrad(uint vt_id, vec2 uv, vec2 uv_ddx, vec2 uv_ddy) {
     uint mip; float frac;
     vtPickMipAndFracGrad(meta, uv_ddx, uv_ddy, mip, frac);
     vec2 phys_uv;
-    if (!vtResolve(vt_id, uv, meta, mip, phys_uv)) return 1.0;
-    return textureLod(vt_pool_alpha, phys_uv, frac).r;
+    uint want = mip;
+    if (!vtResolveWalk(vt_id, uv, meta, mip, phys_uv)) return 1.0;
+    return textureLod(vt_pool_alpha, phys_uv, mip == want ? frac : 0.0).r;
 }
 #ifndef VT_NO_DERIVATIVES
 float vtSampleAlpha(uint vt_id, vec2 uv) {
@@ -362,8 +394,9 @@ float vtSampleAlpha(uint vt_id, vec2 uv) {
     uint mip; float frac;
     vtPickMipAndFrac(meta, uv, mip, frac);
     vec2 phys_uv;
-    if (!vtResolve(vt_id, uv, meta, mip, phys_uv)) return 1.0;
-    return textureLod(vt_pool_alpha, phys_uv, frac).r;
+    uint want = mip;
+    if (!vtResolveWalk(vt_id, uv, meta, mip, phys_uv)) return 1.0;
+    return textureLod(vt_pool_alpha, phys_uv, mip == want ? frac : 0.0).r;
 }
 #endif  // VT_NO_DERIVATIVES
 #endif  // VT_HAS_ALPHA_POOL

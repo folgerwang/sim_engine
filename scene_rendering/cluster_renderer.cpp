@@ -645,11 +645,43 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                 // bindless array (parallel path, see VT block
                 // below).  Capture for the combined VT
                 // registration call.
+                // WHO STILL NEEDS A RESIDENT ALBEDO COPY.
+                // This array used to take EVERY material's albedo -- a
+                // full parallel upload beside the VT registration below --
+                // and after the legacy raster fallbacks were removed the
+                // raster shaders sample it for exactly one thing.  Two
+                // users remain, for two unrelated reasons:
+                //
+                //   * _depthsurface_ materials.  Their UVs ARE world
+                //     position (depthTriplanarSample projects p/tile onto
+                //     three planes), so they have no UV parameterisation
+                //     for a VT to page against.  Not virtualisable, full
+                //     stop.
+                //   * ALPHA-MASKED materials.  The ray-query shadow path
+                //     alpha-tests whatever a ray hits, via
+                //     rt_base_color_textures[base_color_tex_idx].  A ray
+                //     goes where the raster did not, so that geometry
+                //     emitted no VT feedback and has no resident page
+                //     beyond the pinned tail -- alpha-testing a blurred
+                //     mip gives wrong shadows.
+                //
+                // Everything else -- opaque UV-mapped geometry, which is
+                // most of the world -- is VT-only now: no upload, no
+                // descriptor slot, base_color_tex_idx stays -1 and the
+                // shader falls through to base_color_factor.
+                //
+                // NOTE: albedo_tex is resolved REGARDLESS of the gate --
+                // it is captured for the registerMaterial call below, and
+                // skipping it here would silently stop VT registration.
+                const bool needs_resident_albedo =
+                    mat.name_.find("_depthsurface_") != std::string::npos ||
+                    mat.name_.find("_leafmask")      != std::string::npos ||
+                    mat.alpha_mask_;
                 const renderer::TextureInfo* albedo_tex = nullptr;
                 if (tex_idx >= 0 &&
                     static_cast<size_t>(tex_idx) < drawable_data.textures_.size()) {
                     albedo_tex = &drawable_data.textures_[tex_idx];
-                    if (albedo_tex->view) {
+                    if (needs_resident_albedo && albedo_tex->view) {
                         auto tex_it = staging_tex_slot_map_.find(albedo_tex->view.get());
                         if (tex_it != staging_tex_slot_map_.end()) {
                             mp.base_color_tex_idx = tex_it->second;

@@ -539,15 +539,10 @@ void main() {
             vt_alb_handled = true;
         }
     }
-    if (!vt_alb_handled && tex_idx >= 0) {
-        // Case 3: no VT registration — legacy bindless path.
-        // nonuniformEXT: tex_idx varies per cluster — the GPU must
-        // not assume it is uniform across the subgroup (wave).
-        // Without this, one texture is picked for the entire wave
-        // and adjacent clusters with different materials get wrong
-        // textures.
-        albedo_tex = texture(base_color_textures[nonuniformEXT(tex_idx)], v_uv);
-    }
+    // Case 3 (legacy bindless albedo) is GONE -- an unregistered
+    // material now falls through to case 4 with albedo_tex = vec4(1.0),
+    // i.e. base_color_factor alone.  See the matching note in
+    // cluster_cutout.glsl.h::clusterCutoutAlbedo.
     // Case 4 falls through with albedo_tex = vec4(1.0) → albedo4 = base_color.
     bool depth_surface = (mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0;
     float depth_scale = depth_surface ? uintBitsToFloat(material_params[mat_idx].mr_ao_vt_id) : 0.0;

@@ -84,12 +84,17 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
         // both passes land on the same mip and the same page.
         tex = have_grad ? vtSampleAlbedoGrad(vt, uv, lod_uv_ddx, lod_uv_ddy)
                         : VT_SAMPLE_ALBEDO_HW(vt, uv);
-    } else if (tex_idx >= 0) {
-        tex = have_grad
-            ? textureGrad(base_color_textures[nonuniformEXT(tex_idx)], uv,
-                          lod_uv_ddx, lod_uv_ddy)
-            : TEX_SAMPLE_HW(base_color_textures[nonuniformEXT(tex_idx)], uv);
     }
+    // NO LEGACY BINDLESS FALLBACK.  A material without a VT id used to
+    // sample base_color_textures[] here.  It now falls through with
+    // tex = vec4(1.0), so albedo4 = base_color_factor alone -- a flat
+    // correctly-tinted surface instead of a second texture path.
+    //
+    // That is a deliberate trade.  vtResolveWalk climbs to the pinned
+    // mip tail, so "registered but not streamed yet" already lands on
+    // real texels; the only case reaching here is "never registered"
+    // (pool full), which should be rare and is better fixed by sizing
+    // the pool than by carrying a parallel sampler array for it.
     // With a dedicated BC4 alpha layer the albedo was encoded OPAQUE,
     // so tex.a is 255 and meaningless -- the real cutout alpha comes
     // from the alpha pool.  It shares this material's vt_id and pool
