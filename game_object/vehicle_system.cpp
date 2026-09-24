@@ -1,4 +1,5 @@
 #include "vehicle_system.h"
+#include "vehicle_ride.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2956,7 +2957,10 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     v.ghost_t = std::max(0.0f, float(v.ghost_t - dt));
     const float ds = std::min(v.speed * scale_vis * dt, foot_stop);
     if(foot_stop<=ds+.001f) v.speed=0.f;
-    v.wheel += ds / sp.wheel_r;
+    const CarSample* sample = v.sample >= 0 && v.sample < g_lib_n
+        ? &s_lib_.samples[size_t(v.sample)] : nullptr;
+    const float rolling_radius = sample ? sample->wheel_r : sp.wheel_r;
+    v.wheel = std::fmod(v.wheel + ds / std::max(rolling_radius, 0.05f), 6.2831853f);
     v.s += ds * dir;
     if ((leg.s_to - v.s) * dir <= 0.0f) {
         // next leg, or arrived
@@ -3108,7 +3112,9 @@ void VehicleSystem::tick(Vehicle& v, int vi, float dt, float speed_scale,
     while (dyaw < -3.14159265f) dyaw += 6.2831853f;
     const float turn = glm::clamp(dyaw, -2.5f * dt, 2.5f * dt);
     v.yaw += turn;
-    v.steer += (glm::clamp(dyaw * 1.5f, -0.5f, 0.5f) - v.steer) * std::min(1.0f, 6.0f * dt);
+    const auto& axles = sample ? sample->axle_x : sp.wheel_x;
+    const float wheelbase = axles.size() > 1 ? std::abs(axles[0] - axles[1]) : 2.5f;
+    v.steer += (roadSteer(turn, ds, wheelbase) - v.steer) * (1.0f - std::exp(-10.0f * dt));
     v.pos.x = np.x; v.pos.z = np.z;
     v.pos.y = np.y;
 }
@@ -3275,15 +3281,62 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         if (coarse_advanced[i]) continue; // promoted next frame; never integrate twice
         const Vehicle previous=v;
         tick(v, int(i), dt, speed_scale, on_edge);
+        v.wheel_contact.fill(false);
         if (ground && d2 < kClampRadius * kClampRadius) {
             float gy; glm::vec3 gn;
             if (ground(v.pos.x, v.pos.z, v.pos.y, gy, gn) &&
                 std::abs(gy - v.pos.y) < 4.0f) {
-                v.pos.y = gy + 0.005f;
-                if (glm::dot(gn, gn) > 0.5f && gn.y > 0.5f)
-                    v.ground_up = glm::normalize(gn);
-            }
-        }
+                float target_y = gy + 0.005f;
+                glm::vec3 target_up = glm::dot(gn, gn) > 0.5f && gn.y > 0.5f
+                    ? glm::normalize(gn) : glm::vec3(0, 1, 0);
+                if (d2 < 120.0f * 120.0f) {
+                    const CarSample* car = v.sample >= 0 && v.sample < g_lib_n
+                        ? &s_lib_.samples[size_t(v.sample)] : nullptr;
+                    const Spec& fallback = specs()[v.type];
+                    const auto& axles = car ? car->axle_x : fallback.wheel_x;
+                    const float track = car ? car->track_z : fallback.wheel_z;
+                    const glm::vec3 f(std::sin(v.yaw), 0, std::cos(v.yaw));
+                    const glm::vec3 right = glm::cross(f, glm::vec3(0, 1, 0));
+                    const glm::vec3 contact_f = glm::normalize(f - v.ground_up * glm::dot(f, v.ground_up));
+                    const glm::vec3 contact_r = glm::normalize(glm::cross(contact_f, v.ground_up));
+                    glm::mat3 normal(0.0f); glm::vec3 rhs(0.0f);
+                    int contacts = 0;
+                    for (size_t k = 0; k < axles.size() && k < 5; ++k) {
+                        for (int side = 0; side < 2; ++side) {
+                            const float z = (side ? 1.0f : -1.0f) * track;
+                            const glm::vec3 delta = contact_f * axles[k] + contact_r * z;
+                            float h; glm::vec3 n;
+                            if (!ground(v.pos.x + delta.x, v.pos.z + delta.z,
+                                        gy, h, n) || std::abs(h - gy) > 2.5f || n.y < 0.5f) continue;
+                            const size_t hub = k * 2 + side;
+                            v.wheel_contact[hub] = true;
+                            v.wheel_ground[hub] = h;
+                            const glm::vec3 row(glm::dot(delta, f), glm::dot(delta, right), 1.0f);
+                            normal += glm::outerProduct(row, row);
+                            rhs += row * (h - gy);
+                            ++contacts;
+                        }
+                    }
+                    if (contacts >= 3 && std::abs(glm::determinant(normal)) > 1e-5f) {
+                        const glm::vec3 plane = glm::inverse(normal) * rhs;
+                        target_y = gy + plane.z + 0.005f;
+                        target_up = glm::normalize(glm::vec3(0, 1, 0) - f * plane.x - right * plane.y);
+                    }
+                    if (!v.ride_ready || std::abs(v.ride_y - target_y) > 1.0f) {
+                        v.ride_y = target_y; v.ride_velocity = 0.0f;
+                    }
+                    dampRide(target_y, dt, 2.8f, v.ride_y, v.ride_velocity);
+                    v.ride_y = glm::clamp(v.ride_y, target_y - 0.12f, target_y + 0.12f);
+                    v.pos.y = v.ride_y;
+                    v.ground_up = glm::normalize(glm::mix(v.ground_up, target_up,
+                        v.ride_ready ? 1.0f - std::exp(-12.0f * dt) : 1.0f));
+                    v.ride_ready = true;
+                } else {
+                    v.pos.y = target_y; v.ground_up = target_up;
+                    v.ride_ready = false;
+                }
+            } else { v.ride_ready = false; }
+        } else { v.ride_ready = false; }
         guardMove(v,previous,int(i));
     }
     // ── emit the frame ──────────────────────────────────────────────
@@ -3360,43 +3413,26 @@ void VehicleSystem::emit(const Vehicle& v) {
                  glm::vec4(4.0f, float(v.sample), seed01, blink),
                  glm::vec4(0.0f)});
         }
+        const float wheelbase = c.axle_x.size() > 1 ? std::abs(c.axle_x[0] - c.axle_x[1]) : 2.5f;
         for (size_t k = 0; k < c.axle_x.size(); ++k) {
             const float dual = k < c.axle_dual.size() ? c.axle_dual[k] : 1.0f;
-            const bool front = (k == 0);
-            for (int side = 0; side < 2; ++side) {
-                const float z = (side == 0 ? -1.0f : 1.0f) *
-                    (c.track_z - 0.5f * c.wheel_w * (dual - 1.0f));
-                glm::mat4 M = root * glm::translate(
-                    glm::mat4(1.0f), glm::vec3(c.axle_x[k], c.wheel_r, z));
-                if (front && v.steer != 0.0f) {
-                    M = M * glm::rotate(glm::mat4(1.0f), -v.steer,
-                                        glm::vec3(0, 1, 0));
+            const int tyres = dual > 1.05f ? 2 : 1;
+            for (int side = 0; side < 2; ++side) for (int tyre = 0; tyre < tyres; ++tyre) {
+                const float z = (side ? 1.0f : -1.0f) * dualTyreCentre(c.track_z, c.wheel_w, dual, tyre);
+                glm::mat4 M = root * glm::translate(glm::mat4(1.0f), glm::vec3(c.axle_x[k], c.wheel_r, z));
+                const size_t hub = k * 2 + side;
+                if (hub < v.wheel_contact.size() && v.wheel_contact[hub]) {
+                    const float target = v.wheel_ground[hub] + c.wheel_r * up.y + 0.005f;
+                    M[3].y += glm::clamp(target - M[3].y, -0.18f, 0.18f);
                 }
-                // The baked wheel is already in metres, so the spin is
-                // the only transform it needs — no scale, unlike the
-                // built-in unit cylinder below.
-                // v42: the baked wheel has ONE dressed face (+z: rim and
-                // spokes; -z is the blind inboard disc).  The -z side of
-                // the car showed that disc to the street -- flat black
-                // wheels.  Turn those about the vertical, and spin them
-                // the other way round so they still roll forwards.
-                if (side == 0) {
-                    M = M * glm::rotate(glm::mat4(1.0f), 3.14159265f,
-                                        glm::vec3(0, 1, 0));
-                    M = M * glm::rotate(glm::mat4(1.0f), v.wheel,
-                                        glm::vec3(0, 0, 1));
-                } else {
-                    M = M * glm::rotate(glm::mat4(1.0f), -v.wheel,
-                                        glm::vec3(0, 0, 1));
-                }
-                if (dual > 1.0f) {
-                    M = M * glm::scale(glm::mat4(1.0f),
-                                       glm::vec3(1.0f, 1.0f, dual));
-                }
+                if (k == 0)
+                    M = M * glm::rotate(glm::mat4(1), hubSteer(v.steer, wheelbase, z), glm::vec3(0, 1, 0));
+                if (side == 0) M = M * glm::rotate(glm::mat4(1), 3.14159265f, glm::vec3(0, 1, 0));
+                M = M * glm::rotate(glm::mat4(1), side == 0 ? v.wheel : -v.wheel, glm::vec3(0, 0, 1));
+                M = M * glm::scale(glm::mat4(1), glm::vec3(1, 1, dualTyreWidth(c.wheel_w, dual) / c.wheel_w));
                 frame_[size_t(n + v.sample)].push_back(
                     {M, glm::vec4(0.04f, 0.04f, 0.045f, 0.0f),
-                     glm::vec4(1.0f, float(v.sample), seed01, blink),
-                     glm::vec4(0.0f)});
+                     glm::vec4(1.0f, float(v.sample), seed01, blink), glm::vec4(0.0f)});
             }
         }
         return;
@@ -3429,18 +3465,21 @@ void VehicleSystem::emit(const Vehicle& v) {
     for (size_t k = 0; k < sp.wheel_x.size(); ++k) {
         const float dual = k < sp.wheel_dual.size() ? sp.wheel_dual[k] : 1.0f;
         const bool front = k == 0;
-        for (int side = 0; side < 2; ++side) {
-            const float z = (side == 0 ? -1.0f : 1.0f) *
-                (sp.wheel_z - 0.5f * sp.wheel_w * (dual - 1.0f));
+        for (int side = 0; side < 2; ++side) for (int tyre = 0; tyre < (dual > 1.05f ? 2 : 1); ++tyre) {
+            const float z = (side == 0 ? -1.0f : 1.0f) * dualTyreCentre(sp.wheel_z, sp.wheel_w, dual, tyre);
             glm::mat4 M = root *
                 glm::translate(glm::mat4(1.0f),
                                glm::vec3(sp.wheel_x[k], sp.wheel_r, z));
+            const size_t hub = k * 2 + side;
+            if (hub < v.wheel_contact.size() && v.wheel_contact[hub])
+                M[3].y += glm::clamp(v.wheel_ground[hub] + sp.wheel_r * up.y + 0.005f - M[3].y, -0.18f, 0.18f);
             if (front && v.steer != 0.0f)
-                M = M * glm::rotate(glm::mat4(1.0f), -v.steer, glm::vec3(0, 1, 0));
+                M = M * glm::rotate(glm::mat4(1.0f), hubSteer(v.steer,
+                    std::abs(sp.wheel_x[0] - sp.wheel_x[1]), z), glm::vec3(0, 1, 0));
             M = M * glm::rotate(glm::mat4(1.0f), -v.wheel, glm::vec3(0, 0, 1)) *
                 glm::scale(glm::mat4(1.0f),
                            glm::vec3(sp.wheel_r, sp.wheel_r,
-                                     0.5f * sp.wheel_w * dual));
+                                     0.5f * dualTyreWidth(sp.wheel_w, dual)));
             frame_[kMeshWheel].push_back(
                 {M, glm::vec4(0.04f, 0.04f, 0.045f, 0.0f),
                  glm::vec4(1.0f, float(v.type), seed01, 0.0f), no_paint});

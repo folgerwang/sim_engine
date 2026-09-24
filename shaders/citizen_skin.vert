@@ -69,18 +69,23 @@ void main() {
     float y = in_position.y;
     float f = mix(in_shape.w, 1.0, (y + 1.0) * 0.5);
     vec3 p = vec3(in_position.x * f, y, in_position.z * f);
-    vec3 n = in_normal;
-    n.y += (1.0 - in_shape.w) * 0.5 * length(in_normal.xz);
-    n = normalize(n);
+    // Inverse-transpose of the taper Jacobian. The old positive offset
+    // tilted every normal upward, including the underside of limbs.
+    float df = (1.0 - in_shape.w) * 0.5;
+    vec3 n = normalize(vec3(in_normal.x / max(f, 1e-4),
+        in_normal.y - df * dot(in_position.xz, in_normal.xz) / max(f, 1e-4),
+        in_normal.z / max(f, 1e-4)));
 
     // the skinning weights, by unit height about the two pivots
     float bl = in_shape.z;
     float wu = 0.0, wl = 0.0;
     if (bl > 0.0) {
-        wu = clamp(0.5 + (y - in_shape.x) / (2.0 * bl), 0.0, 1.0);
-        wl = clamp(0.5 - (y - in_shape.y) / (2.0 * bl), 0.0, 1.0);
+        wu = smoothstep(in_shape.x - bl, in_shape.x + bl, y);
+        wl = 1.0 - smoothstep(in_shape.y - bl, in_shape.y + bl, y);
     }
     float ws = max(0.0, 1.0 - wu - wl);
+    float total = max(ws + wu + wl, 1e-6);
+    ws /= total; wu /= total; wl /= total;
 
     vec3 position_ws =
         ws * xf_point(in_self0, in_self1, in_self2, p) +

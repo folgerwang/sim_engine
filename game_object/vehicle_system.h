@@ -25,6 +25,7 @@
 // above the belt line -- plus a wheel and a light-bar mesh, and
 // vehicle.frag paints glass, pillars, lights, grille, arches, seams
 // and livery onto them from the fragment's position on the hull.
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -221,6 +222,11 @@ private:
         glm::vec3 pos{0.0f};
         float yaw = 0.0f;
         glm::vec3 ground_up{0.0f, 1.0f, 0.0f};
+        // Near-camera wheel contacts; ten hubs cover the five-axle semi.
+        std::array<float, 10> wheel_ground{};
+        std::array<bool, 10> wheel_contact{};
+        float ride_y = 0.0f, ride_velocity = 0.0f;
+        bool ride_ready = false;
         float y_ground = 0.0f;         // last exact clamp
         int queue_node = -1;
         uint64_t arrival_ticket = 0;

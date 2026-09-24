@@ -26,11 +26,12 @@ void main() {
                 p.xz*=mix(job.shape.w,1.,(p.y+1.)*.5);
                 float wu=0.,wl=0.;
                 if (job.shape.z>0.) {
-                    wu=clamp(.5+(v.p.y-job.shape.x)/(2.*job.shape.z),0.,1.);
-                    wl=clamp(.5-(v.p.y-job.shape.y)/(2.*job.shape.z),0.,1.);
+                    wu=smoothstep(job.shape.x-job.shape.z,job.shape.x+job.shape.z,v.p.y);
+                    wl=1.-smoothstep(job.shape.y-job.shape.z,job.shape.y+job.shape.z,v.p.y);
                 }
-                p=max(0.,1.-wu-wl)*(palette[job.dst.z]*p)
-                  +wu*(palette[job.dst.z+1u]*p)+wl*(palette[job.dst.z+2u]*p);
+                float ws=max(0.,1.-wu-wl);
+                p=(ws*(palette[job.dst.z]*p)
+                  +wu*(palette[job.dst.z+1u]*p)+wl*(palette[job.dst.z+2u]*p))/max(ws+wu+wl,1e-6);
             } else if ((mode==1u || mode==3u) && nj>0u) {
                 mat4 skin=mat4(0.); float sum=0.;
                 for (int k=0;k<4;++k) {

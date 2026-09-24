@@ -80,7 +80,7 @@ int main(int argc,char** argv) try {
             for(const auto& v:verts) {
                 glm::vec4 p=v.p;
                 if(mode==1 || mode==3) {glm::mat4 m(0);float sum=0;for(int k=0;k<4;++k){m+=v.w0[k]*palettes[std::min(v.j0[k],2u)]+v.w1[k]*palettes[std::min(v.j1[k],2u)];sum+=v.w0[k]+v.w1[k];}if(sum>1e-4f)p=m/sum*p;else if(mode==3)p=palettes[0]*p;}
-                if(mode==2) {float f=glm::mix(job.shape.w,1.f,(p.y+1)*.5f);p.x*=f;p.z*=f;float wu=glm::clamp(.5f+(v.p.y-job.shape.x)/(2*job.shape.z),0.f,1.f),wl=glm::clamp(.5f-(v.p.y-job.shape.y)/(2*job.shape.z),0.f,1.f);p=std::max(0.f,1-wu-wl)*(palettes[0]*p)+wu*(palettes[1]*p)+wl*(palettes[2]*p);}
+                if(mode==2) {float f=glm::mix(job.shape.w,1.f,(p.y+1)*.5f);p.x*=f;p.z*=f;float wu=glm::smoothstep(job.shape.x-job.shape.z,job.shape.x+job.shape.z,v.p.y),wl=1.f-glm::smoothstep(job.shape.y-job.shape.z,job.shape.y+job.shape.z,v.p.y);float ws=std::max(0.f,1-wu-wl);p=(ws*(palettes[0]*p)+wu*(palettes[1]*p)+wl*(palettes[2]*p))/std::max(ws+wu+wl,1e-6f);}
                 expected.push_back(glm::vec3(job.model*p));
             }
         }

@@ -385,7 +385,7 @@ constexpr size_t kMaxFarParts = 200000;   // far-tier safety valve
 constexpr float  kFineRadius = 90.0f;
 // The CHARACTER MESHES (v33): the nearest kMaxNpc fine persons inside
 // this radius are drawn as baked scans instead of the parts puppet.
-constexpr float  kNpcRadius = 60.0f;
+constexpr float  kNpcRadius = 90.0f;
 // Driving (v25): a trip longer than this on foot is taken by car when
 // the person's car is parked within kBoardR of them.
 constexpr float  kDriveMinM = 320.0f;
@@ -621,10 +621,15 @@ bool loadNpcMesh(const std::string& path, std::vector<NpcVertex>& verts,
         v.pos = pos[i];
         v.nrm = nrm[i];
         v.uv = uv[i];
+        int sum = 0;
         for (int k = 0; k < 4; ++k) {
-            v.joints[k] = uint8_t(std::min<uint32_t>(jn[i * 4 + k], nj - 1));
+            if (jn[i * 4 + k] >= nj) return false;
+            v.joints[k] = jn[i * 4 + k];
             v.weights[k] = wt[i * 4 + k];
+            sum += v.weights[k];
         }
+        if (!sum || !std::isfinite(v.pos.x) || !std::isfinite(v.pos.y) ||
+            !std::isfinite(v.pos.z)) return false;
     }
     for (uint32_t& k : idx) if (k >= nv) return false;
     return true;
@@ -872,11 +877,11 @@ void CitizenSystem::initStaticMembers(
         shadow->positions = rp;
         shadow->indices = ri;
     };
-    make_shape(0.50f, 1.00f, 14, 12, s_tube_pos_, s_tube_nrm_, s_tube_idx_,
+    make_shape(0.50f, 1.00f, 18, 16, s_tube_pos_, s_tube_nrm_, s_tube_idx_,
                s_tube_index_count_);                       // limbs, neck
-    make_shape(0.55f, 0.70f, 10, 16, s_round_pos_, s_round_nrm_,
+    make_shape(0.55f, 0.70f, 14, 20, s_round_pos_, s_round_nrm_,
                s_round_idx_, s_round_index_count_);        // torso, pelvis
-    make_shape(0.85f, 0.90f, 10, 16, s_ball_pos_, s_ball_nrm_, s_ball_idx_,
+    make_shape(0.85f, 0.90f, 16, 24, s_ball_pos_, s_ball_nrm_, s_ball_idx_,
                s_ball_index_count_);                       // head, hands
 
     // ── THE CHARACTER MESHES (v33) ──────────────────────────────────
@@ -3645,7 +3650,7 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         size_t n_npc = 0;
         for (const auto& [d2, i] : near_ids) {
             if (d2 >= kNpcRadius * kNpcRadius || n_npc >= kMaxNpc) break;
-            if (!is_fine[i]) continue;
+            if (!is_fine[i] || persons_[i].age == 1 || persons_[i].age == 2) continue;
             is_npc[i] = 1;
             ++n_npc;
         }
@@ -4489,11 +4494,12 @@ void CitizenSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
             const glm::vec4 p(v.x * f, v.y, v.z * f, 1.0f);
             float wu = 0.0f, wl = 0.0f;
             if (part.shape.z > 0.0f) {
-                wu = glm::clamp(0.5f + (v.y - part.shape.x) / (2.0f * part.shape.z), 0.0f, 1.0f);
-                wl = glm::clamp(0.5f - (v.y - part.shape.y) / (2.0f * part.shape.z), 0.0f, 1.0f);
+                wu = glm::smoothstep(part.shape.x - part.shape.z, part.shape.x + part.shape.z, v.y);
+                wl = 1.0f - glm::smoothstep(part.shape.y - part.shape.z, part.shape.y + part.shape.z, v.y);
             }
-            return std::max(0.0f, 1.0f - wu - wl) * transform(part.self, p)
-                 + wu * transform(part.up, p) + wl * transform(part.lo, p);
+            const float ws = std::max(0.0f, 1.0f - wu - wl);
+            return (ws * transform(part.self, p) + wu * transform(part.up, p)
+                    + wl * transform(part.lo, p)) / std::max(ws + wu + wl, 1e-6f);
         });
     };
     if (s_skin_pipeline_) {
