@@ -41,7 +41,11 @@ layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
 
 #include "ibl.glsl.h"
 
-layout(location = 0) in ObjectVsPsData ps_in_data;
+layout(location = 0) in ObjectVsPsData ps_in_data_in;
+// Working copy of the varyings: main() may displace its UVs (parallax
+// occlusion on DEPTH_SURFACE materials) before any material read, and
+// every function below reads THIS, so the whole shade uses one UV.
+ObjectVsPsData ps_in_data;
 
 #ifdef GBUFFER_OUTPUT
 // Deferred permutation (base_frag*_GBUF.spv): the classic drawable path
@@ -488,6 +492,32 @@ layout(early_fragment_tests) in;
 #endif
 
 void main() {
+    ps_in_data = ps_in_data_in;
+#if !defined(NO_MTL) && !defined(DECAL) && !defined(DEPTH_COVERAGE)
+    // ── Parallax occlusion (DEPTH_SURFACE, UV path) ──────────────────
+    // Derivatives are taken here, in uniform control flow, from the
+    // undisplaced varyings; the march itself uses explicit LOD.
+    {
+        vec2 pom_uv = getMetallicRoughnessUV(ps_in_data, material);
+        vec2 pom_uvx = dFdx(pom_uv), pom_uvy = dFdy(pom_uv);
+        vec3 pom_px = dFdx(ps_in_data.vertex_position);
+        vec3 pom_py = dFdy(ps_in_data.vertex_position);
+        float pom_lod = textureQueryLod(metallic_roughness_tex, pom_uv).x;
+        if ((material.material_features & FEATURE_MATERIAL_DEPTH_SURFACE) != 0u &&
+            !materialIsTriplanar(material) &&
+            ((material.uv_set_flags.x >> 8) & 0x0fu) == 0u) {
+            vec3 pom_to_eye = camera_info.position.xyz - ps_in_data.vertex_position;
+            vec3 pom_n = normalize(cross(pom_px, pom_py));
+            if (dot(pom_n, pom_to_eye) < 0.0) pom_n = -pom_n;
+            vec2 d_uv = depthSurfaceParallaxGrad(
+                metallic_roughness_tex, pom_uv, pom_uvx, pom_uvy,
+                pom_px, pom_py, pom_n, normalize(pom_to_eye),
+                length(pom_to_eye), material.normal_scale,
+                max(pom_lod, 0.0)) - pom_uv;
+            ps_in_data.vertex_tex_coord.xy += d_uv;
+        }
+    }
+#endif
 #if !defined(GBUFFER_OUTPUT) || defined(DECAL) || defined(GBUFFER_WRITES_DEPTH)
     // Band transition: dissolve before any shading work is done.
     // Per-instance mode (model_params_pad0 != 0, dense ground cover)

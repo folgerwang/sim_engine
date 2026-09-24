@@ -110,4 +110,56 @@ vec3 depthWorldNormal(float height,vec3 p,vec3 n,float scaleMetres) {
                                 dFdx(p),dFdy(p),dFdx(height),dFdy(height));
 }
 #endif
+// ── Parallax occlusion for repeating DEPTH_SURFACE materials ─────────
+// UV path only: the triplanar branch has no UV frame to march in.  The
+// ORM texture's .a is height (1 = the proud face of a stone, 0 = the back
+// of a joint) and `scale` is the relief measured in UV units -- the
+// material's depth_scale, height_range_m / tile_m -- so the march is
+// metres-true at any UV density.  x/y are d(world)/d(screen) and uvx/uvy
+// d(uv)/d(screen): dFdx in the raster paths, the analytic barycentric
+// gradients in visbuffer_material.comp, so all three shading paths run
+// this one core.  `lod` is fixed from the UNdisplaced uv.  Returns the
+// displaced uv.  Shading only: depth, silhouette and shadow geometry keep
+// the flat face.  Faded out between DEPTH_POM_NEAR_M and _FAR_M, where
+// the relief is sub-pixel anyway and the taps would be wasted.
+#ifndef DEPTH_POM_NEAR_M
+#define DEPTH_POM_NEAR_M 18.0
+#endif
+#ifndef DEPTH_POM_FAR_M
+#define DEPTH_POM_FAR_M 42.0
+#endif
+vec2 depthSurfaceParallaxGrad(sampler2D tex, vec2 uv, vec2 uvx, vec2 uvy,
+                              vec3 x, vec3 y, vec3 n, vec3 v, float dist,
+                              float scale, float lod) {
+    float fade = 1.0 - smoothstep(DEPTH_POM_NEAR_M, DEPTH_POM_FAR_M, dist);
+    float vn = dot(n, v);
+    if (scale <= 0.0 || fade <= 0.0 || vn <= 0.05) return uv;
+    // in-plane gradients of u and v in world space (cotangent frame)
+    vec3 c2 = cross(y, n), c1 = cross(n, x);
+    float det = dot(x, c2);
+    if (abs(det) < 1e-14) return uv;
+    vec3 gu = (c2 * uvx.x + c1 * uvy.x) / det;
+    vec3 gv = (c2 * uvx.y + c1 * uvy.y) / det;
+    float g2 = 0.5 * (dot(gu, gu) + dot(gv, gv));
+    if (g2 < 1e-12) return uv;
+    float relief_m = scale * inversesqrt(g2) * fade;
+    // sideways metres per metre of depth down the view ray (grazing capped)
+    vec3 side = -(v - n * vn) / max(vn, 0.3);
+    vec2 span = vec2(dot(gu, side), dot(gv, side)) * relief_m;
+    int steps = int(mix(20.0, 6.0, clamp(vn, 0.0, 1.0)));
+    float dt = 1.0 / float(steps);
+    float t = 0.0;
+    float d = 1.0 - textureLod(tex, uv, lod).a;   // depth below the crest
+    if (d <= 0.0) return uv;
+    float prev = d;
+    for (int i = 0; i < 24; ++i) {
+        if (i >= steps || d <= t) break;
+        prev = d - t;
+        t += dt;
+        d = 1.0 - textureLod(tex, uv + span * t, lod).a;
+    }
+    float cur = d - t;                            // <= 0 once the ray is in
+    float w = cur < 0.0 ? prev / max(prev - cur, 1e-5) : 1.0;
+    return uv + span * clamp(t - dt + w * dt, 0.0, 1.0);
+}
 #endif

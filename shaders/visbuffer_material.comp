@@ -141,6 +141,26 @@ void main() {
     vec4 v_tangent = vec4(vbInterp3(bary, v0.tan.xyz, v1.tan.xyz, v2.tan.xyz),
                           v0.tan.w);
 
+    // ── Parallax occlusion (DEPTH_SURFACE, UV path) ──────────────────
+    // Same core as the raster paths, fed the analytic gradients; the
+    // mip stays the undisplaced one (uv_ddx/uv_ddy are left as they are).
+    if ((mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0 &&
+        uintBitsToFloat(material_params[mat_idx].emissive_vt_id) <= 0.0 &&
+        material_params[mat_idx].normal_tex_idx >= 0) {
+        int pom_tex = material_params[mat_idx].normal_tex_idx;
+        vec3 pom_to_eye = camera_info.position - world_pos;
+        vec3 pom_n = normalize(cross(world_pos_dx, world_pos_dy));
+        if (dot(pom_n, pom_to_eye) < 0.0) pom_n = -pom_n;
+        float pom_lod = depthPbrLodFromGrad(
+            normal_textures[nonuniformEXT(pom_tex)], uv_ddx, uv_ddy);
+        uv = depthSurfaceParallaxGrad(
+            normal_textures[nonuniformEXT(pom_tex)], uv, uv_ddx, uv_ddy,
+            world_pos_dx, world_pos_dy, pom_n, normalize(pom_to_eye),
+            length(pom_to_eye),
+            uintBitsToFloat(material_params[mat_idx].mr_ao_vt_id),
+            max(pom_lod, 0.0));
+    }
+
     // Facing: the rasterizer's gl_FrontFacing, recovered from the
     // triangle's winding in screen space.  Foliage is two-sided and the
     // leaf SIDE decides its albedo and its translucency, so this cannot

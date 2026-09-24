@@ -73,7 +73,10 @@ layout(set = RUNTIME_LIGHTS_PARAMS_SET, binding = RUNTIME_LIGHTS_CONSTANT_INDEX)
 
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_normal;
-layout(location = 2) in vec2 v_uv;
+layout(location = 2) in vec2 v_uv_in;
+// Working UV: main() may displace it (parallax occlusion on
+// DEPTH_SURFACE materials) before any material read.
+vec2 v_uv;
 layout(location = 3) flat in uint v_cluster_idx;
 // Interpolated world-space tangent + bitangent sign (see BindlessVertex doc
 // in cluster_renderer.h).  Replaces the per-fragment dFdx/dFdy tangent
@@ -350,11 +353,34 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
 }
 
 void main() {
+    v_uv = v_uv_in;
+    // Screen derivatives for the parallax march, taken in uniform control
+    // flow before anything branches on the material.
+    vec2 pom_uvx = dFdx(v_uv_in), pom_uvy = dFdy(v_uv_in);
+    vec3 pom_px = dFdx(v_world_pos), pom_py = dFdy(v_world_pos);
     // Base colour — fetch first so we can discard early.
     uint mat_idx    = draw_infos[v_cluster_idx].material_idx;
     vec4 base_color = material_params[mat_idx].base_color_factor;
     int  tex_idx    = material_params[mat_idx].base_color_tex_idx;
     int  mat_flags  = material_params[mat_idx].flags;
+    // ── Parallax occlusion (DEPTH_SURFACE, UV path) ──────────────────
+    // Before the first material read, so albedo, ORM, relief normal and
+    // the VT walks all see the same displaced UV.
+    if ((mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0 &&
+        uintBitsToFloat(material_params[mat_idx].emissive_vt_id) <= 0.0 &&
+        material_params[mat_idx].normal_tex_idx >= 0) {
+        int pom_tex = material_params[mat_idx].normal_tex_idx;
+        vec3 pom_to_eye = camera_info.position - v_world_pos;
+        vec3 pom_n = normalize(cross(pom_px, pom_py));
+        if (dot(pom_n, pom_to_eye) < 0.0) pom_n = -pom_n;
+        float pom_lod = depthPbrLodFromGrad(
+            normal_textures[nonuniformEXT(pom_tex)], pom_uvx, pom_uvy);
+        v_uv = depthSurfaceParallaxGrad(
+            normal_textures[nonuniformEXT(pom_tex)], v_uv_in, pom_uvx, pom_uvy,
+            pom_px, pom_py, pom_n, normalize(pom_to_eye), length(pom_to_eye),
+            uintBitsToFloat(material_params[mat_idx].mr_ao_vt_id),
+            max(pom_lod, 0.0));
+    }
     bool leaf_mask = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
     if (!leaf_mask && (mat_flags & BINDLESS_MAT_LEAF_AGE) != 0) {
         uint group = UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags));
