@@ -4486,6 +4486,38 @@ static void updateDescriptorSets(
     for (auto& material : drawable_object->materials_) {
         material.desc_set_ = device->createDescriptorSets(
             descriptor_pool, material_desc_set_layout, 1)[0];
+        // A material with no parameter UBO used to crash the whole
+        // swap-chain rebuild inside vkUpdateDescriptorSets (null buffer
+        // in the PBR_CONSTANT_INDEX write).  Give it a neutral one so the
+        // set is complete; generateDescriptorSet logs which drawable it
+        // was, so the loader that left it empty can be found.
+        if (!material.uniform_buffer_.buffer) {
+            device->createBuffer(
+                sizeof(glsl::PbrMaterialParams),
+                SET_FLAG_BIT(BufferUsage, UNIFORM_BUFFER_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+                0,
+                material.uniform_buffer_.buffer,
+                material.uniform_buffer_.memory,
+                std::source_location::current());
+            glsl::PbrMaterialParams ubo{};
+            ubo.base_color_factor = glm::vec4(1.0f);
+            ubo.specular_factor = glm::vec3(1.0f);
+            ubo.specular_color = glm::vec3(1.0f);
+            ubo.glossiness_factor = 1.0f;
+            ubo.metallic_roughness_specular_factor = 1.0f;
+            ubo.metallic_factor = 0.0f;
+            ubo.roughness_factor = 1.0f;
+            ubo.alpha_cutoff = 0.5f;
+            ubo.mip_count = 11;
+            ubo.normal_scale = 1.0f;
+            ubo.exposure = 1.0f;
+            ubo.occlusion_strength = 1.0f;
+            ubo.tonemap_type = TONEMAP_DEFAULT;
+            ubo.material_features = FEATURE_MATERIAL_METALLICROUGHNESS;
+            device->updateBufferMemory(
+                material.uniform_buffer_.memory, sizeof(ubo), &ubo);
+        }
 
         // create a global ibl texture descriptor set.
         auto material_descs = addDrawableTextures(
@@ -10440,6 +10472,18 @@ void DrawableObject::generateDescriptorSet(
     const std::shared_ptr<renderer::ImageView>& airflow_tex) {
 
     for (auto& object : drawable_object_list_) {
+        if (!object.second) continue;
+        {
+            size_t missing = 0;
+            for (const auto& m : object.second->materials_)
+                missing += m.uniform_buffer_.buffer ? 0u : 1u;
+            if (missing) {
+                std::cout << "[drawable] '" << object.first << "': " << missing
+                          << " of " << object.second->materials_.size()
+                          << " material(s) had no parameter buffer at descriptor "
+                             "rebuild -- neutral buffer substituted" << std::endl;
+            }
+        }
         updateDescriptorSets(
             device,
             descriptor_pool,
@@ -14573,6 +14617,14 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
     // overrides are registered under it, and the log lines use it.
     const std::string canon_name = ref_name + ".glb";
     const bool compact_supported = device->supportsQuantizedObjectVertices();
+    // [rwinst.time]: where this loader's wall time goes, per file.
+    using LoadClock = std::chrono::steady_clock;
+    const auto t_load0 = LoadClock::now();
+    double ms_preload = 0.0, ms_pack = 0.0, ms_tex = 0.0, ms_mat = 0.0,
+           ms_cluster = 0.0, ms_pages = 0.0;
+    auto ms_since = [](LoadClock::time_point t) {
+        return std::chrono::duration<double, std::milli>(LoadClock::now() - t).count();
+    };
 
     std::vector<helper::RwInstArray> inst_arrays;
     std::vector<helper::RwInstNode> inst_nodes;
@@ -14754,7 +14806,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
          chunk_begin += kGeoChunk) {
         const size_t chunk_end =
             std::min(ordinal_geo.size(), chunk_begin + kGeoChunk);
-        preload_range(chunk_begin, chunk_end);
+        { const auto t = LoadClock::now(); preload_range(chunk_begin, chunk_end); ms_preload += ms_since(t); }
         // Shared static geometry pages. Keep mesh/node identity and local
         // indices, but avoid two dedicated Vulkan allocations per mesh.
         const int page_vbuf = (int)drawable_object->buffers_.size();
@@ -14789,6 +14841,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         std::vector<std::string> tex_paths =
             std::move(pre_it->second.tex_paths);
         pre_it->second.ok = false;   // consumed (moved-from)
+        auto t_stage = LoadClock::now();
 
         const uint32_t vtx_count   = (uint32_t)md.positions.size();
         const uint32_t index_count = (uint32_t)md.indices.size();
@@ -14878,6 +14931,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         // the character group loader.
         const size_t tex_base = drawable_object->textures_.size();
         drawable_object->textures_.resize(tex_base + md.textures.size());
+        ms_pack += ms_since(t_stage); t_stage = LoadClock::now();
         for (size_t ti = 0; ti < md.textures.size() &&
                             ti < tex_paths.size(); ++ti) {
             auto& dst = drawable_object->textures_[tex_base + ti];
@@ -15007,6 +15061,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             tex_gpu_cache.emplace(key, dst);
             tex_gpu_cache.emplace(ckey, dst);
         }
+        ms_tex += ms_since(t_stage); t_stage = LoadClock::now();
 
         // Materials (one per section).
         std::vector<int32_t> section_materials(num_sections);
@@ -15295,6 +15350,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         // emitted, so a cluster's material is its first face's
         // primitive, exactly like the .rwobj path resolves it from
         // contiguous section face ranges.
+        ms_mat += ms_since(t_stage); t_stage = LoadClock::now();
         {
             helper::Mesh cluster_src;
             cluster_src.vertex_data_ptr = cpu_mesh.vertex_data_ptr;
@@ -15386,6 +15442,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             }
         }
 
+        ms_cluster += ms_since(t_stage);
         applyPackedVertexLayout(drawable_object,mesh,packed,vbuf,page_offset,vtx_count);
         ordinal_mesh.emplace(ordinal, mesh_index);
         geo_mesh.emplace(geo_key, mesh_index);
@@ -15689,6 +15746,12 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
               << cs_noclusters << " zero-cluster (of " << cs_meshes
               << " mesh build(s))" << std::endl;
 
+    std::cout << "[rwinst.time] " << canon_name << " total=" << ms_since(t_load0)
+              << "ms preload(geo parse+dedup, threaded)=" << ms_preload
+              << " pack=" << ms_pack << " textures(read+hash+preview upload)=" << ms_tex
+              << " materials(UBO+desc)=" << ms_mat << " clusters=" << ms_cluster
+              << " (per-mesh serial; " << drawable_object->meshes_.size() << " meshes, "
+              << drawable_object->textures_.size() << " texture slots)" << std::endl;
     std::cout << "[rwinst] loaded '" << canon_name << "' ("
               << drawable_object->nodes_.size() << " nodes, "
               << drawable_object->meshes_.size() << " mesh(es), "
