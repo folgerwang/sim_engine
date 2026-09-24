@@ -4060,9 +4060,13 @@ bool Menu::draw(
     }
     // ------------------------------------------------------------------------
 
-    // Chat box / dialogue UI only during gameplay.  In editor mode confine it
-    // to the Viewport rect; otherwise it spans the full window (default args).
-    if (game_state_ == GameState::InGame) {
+    // Chat box / dialogue UI only while PLAYING: in game AND play mode --
+    // i.e. after the viewport Play button in the editor (non-editor runs
+    // are always in play mode).  In edit mode it is not drawn at all, so
+    // it neither takes keyboard focus nor starts the dialogue LLM probe.
+    // In editor mode confine it to the Viewport rect; otherwise it spans
+    // the full window (default args).
+    if (game_state_ == GameState::InGame && play_mode_) {
         ImVec2 cvp_pos, cvp_size, cvp_c;
         getViewportScreenRect(cvp_pos, cvp_size, cvp_c);
         const glm::vec2 vp_org  = isViewportValid()
