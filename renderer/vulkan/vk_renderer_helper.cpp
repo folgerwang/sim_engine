@@ -2849,6 +2849,40 @@ void copyBufferToImage(
     auto mip_count = std::max(mip_levels, 1u);
     copy_regions.resize(mip_count);
 
+    // Bytes per mip: block math for the compressed formats, bytes-per-
+    // pixel for everything else.  This used to apply the BC block math
+    // to EVERY format, which for RGBA8 put mip 1's offset at w*h bytes
+    // instead of w*h*4 -- a quarter of the way into mip 0 -- so every
+    // level past 0 of an uncompressed chain was mip 0's rows re-read at
+    // half width: alternating rows of leaf and gap on every foliage
+    // card the moment it left mip 0 (the "hatched leaves").
+    const auto fmt = uint32_t(format);
+    const bool block_compressed =
+        fmt >= uint32_t(renderer::Format::BC1_RGB_UNORM_BLOCK) &&
+        fmt <= uint32_t(renderer::Format::BC7_SRGB_BLOCK);
+    uint32_t bytes_per_pixel = 4;
+    switch (format) {
+        case renderer::Format::R8_UNORM: case renderer::Format::R8_SNORM:
+        case renderer::Format::R8_UINT:  case renderer::Format::R8_SINT:
+        case renderer::Format::R8_SRGB:
+            bytes_per_pixel = 1; break;
+        case renderer::Format::R8G8_UNORM: case renderer::Format::R8G8_SNORM:
+        case renderer::Format::R8G8_UINT:  case renderer::Format::R8G8_SINT:
+        case renderer::Format::R16_UNORM:  case renderer::Format::R16_SNORM:
+        case renderer::Format::R16_UINT:   case renderer::Format::R16_SINT:
+        case renderer::Format::R16_SFLOAT:
+            bytes_per_pixel = 2; break;
+        case renderer::Format::R16G16B16A16_UNORM: case renderer::Format::R16G16B16A16_SNORM:
+        case renderer::Format::R16G16B16A16_UINT:  case renderer::Format::R16G16B16A16_SINT:
+        case renderer::Format::R16G16B16A16_SFLOAT:
+        case renderer::Format::R32G32_SFLOAT: case renderer::Format::R32G32_UINT:
+            bytes_per_pixel = 8; break;
+        case renderer::Format::R32G32B32A32_SFLOAT: case renderer::Format::R32G32B32A32_UINT:
+            bytes_per_pixel = 16; break;
+        default:
+            bytes_per_pixel = 4; break;    // RGBA8 / BGRA8 / R32 / RG16 / 10:10:10:2 / 11:11:10
+    }
+
     size_t offset = 0;
     for (uint32_t i_mip = 0; i_mip < mip_count; i_mip++) {
         auto& region = copy_regions[i_mip];
@@ -2856,13 +2890,22 @@ void copyBufferToImage(
         int32_t mip_width = std::max(tex_size.x >> i_mip, 1u);
         int32_t mip_height = std::max(tex_size.y >> i_mip, 1u);
 
-        // Calculate the size of the current mip level in blocks
-        uint32_t block_width = (mip_width + 3) / 4;
-        uint32_t block_height = (mip_height + 3) / 4;
-        uint32_t block_size =
-            (format == renderer::Format::BC1_RGB_UNORM_BLOCK ||
-             format == renderer::Format::BC1_RGB_SRGB_BLOCK) ? 8 : 16;
-        size_t mip_size = block_width * block_height * block_size;
+        size_t mip_size;
+        if (block_compressed) {
+            // Calculate the size of the current mip level in blocks
+            uint32_t block_width = (mip_width + 3) / 4;
+            uint32_t block_height = (mip_height + 3) / 4;
+            uint32_t block_size =
+                (format == renderer::Format::BC1_RGB_UNORM_BLOCK ||
+                 format == renderer::Format::BC1_RGB_SRGB_BLOCK ||
+                 format == renderer::Format::BC1_RGBA_UNORM_BLOCK ||
+                 format == renderer::Format::BC1_RGBA_SRGB_BLOCK ||
+                 format == renderer::Format::BC4_UNORM_BLOCK ||
+                 format == renderer::Format::BC4_SNORM_BLOCK) ? 8 : 16;
+            mip_size = size_t(block_width) * block_height * block_size;
+        } else {
+            mip_size = size_t(mip_width) * mip_height * bytes_per_pixel;
+        }
 
         region.buffer_offset = offset;
         region.buffer_row_length = 0;
