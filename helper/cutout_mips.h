@@ -4,6 +4,7 @@
 #include <functional>
 #include <cstdint>
 #include <vector>
+#include "mip_filter.h"
 namespace engine::helper {
 inline float cutoutCoverage(const uint8_t* pixels,size_t count,uint8_t cutoff=23) {
     size_t covered=0;
@@ -72,21 +73,10 @@ inline CutoutMipChain cutoutMipChain(const uint8_t* rgba,int w,int h) {
         if(w==1 && h==1) break;
         const int nw=std::max(1,w/2),nh=std::max(1,h/2);
         std::vector<uint8_t> next(size_t(nw)*nh*4);
-        for(int y=0;y<nh;++y) for(int x=0;x<nw;++x) {
-            // Colour weighted by alpha (transparent texels are black and
-            // would otherwise darken every edge into a fringe); alpha plain.
-            unsigned sum[4]={};unsigned wsum[3]={};unsigned count=0;
-            for(int sy=y*h/nh;sy<(y+1)*h/nh;++sy)
-                for(int sx=x*w/nw;sx<(x+1)*w/nw;++sx) {
-                    const uint8_t* p=&current[(size_t(sy)*w+sx)*4];
-                    for(int c=0;c<3;++c) wsum[c]+=unsigned(p[c])*p[3];
-                    for(int c=0;c<4;++c) sum[c]+=p[c];++count;
-                }
-            uint8_t* o=&next[(size_t(y)*nw+x)*4];
-            if(sum[3]) for(int c=0;c<3;++c) o[c]=uint8_t((wsum[c]+sum[3]/2)/sum[3]);
-            else       for(int c=0;c<3;++c) o[c]=uint8_t((sum[c]+count/2)/count);
-            o[3]=uint8_t((sum[3]+count/2)/count);
-        }
+        // Lanczos-3, sRGB-correct, colour weighted by alpha (mip_filter.h)
+        // -- the same kernel the VT pyramid uses, so a card looks the
+        // same before and after VT takeover.
+        downsample2xRgba8(current.data(),uint32_t(w),uint32_t(h),next.data(),true);
         preserveFilteredCutoutCoverage(next,nw,nh,coverage);
         current.swap(next);w=nw;h=nh;
     }

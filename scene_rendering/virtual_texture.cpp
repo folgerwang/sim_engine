@@ -5,6 +5,7 @@
 #include "virtual_texture.h"
 #include "bc7_encoder.h"
 #include "renderer/renderer_helper.h"
+#include "helper/mip_filter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -101,59 +102,10 @@ static void boxDownsampleRgba8(
 static void boxDownsampleSrgb8(
     const uint8_t* src, uint32_t src_w, uint32_t src_h,
     uint8_t* dst) {
-    static const struct Luts {
-        float   to_linear[256];
-        uint8_t to_srgb[4096 + 1];
-        Luts() {
-            for (int i = 0; i < 256; ++i) {
-                const float c = float(i) / 255.0f;
-                to_linear[i] = c <= 0.04045f ? c / 12.92f
-                                             : std::pow((c + 0.055f) / 1.055f, 2.4f);
-            }
-            for (int i = 0; i <= 4096; ++i) {
-                const float l = float(i) / 4096.0f;
-                const float c = l <= 0.0031308f ? l * 12.92f
-                                                : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
-                to_srgb[i] = uint8_t(std::min(255.0f, std::max(0.0f, c * 255.0f + 0.5f)));
-            }
-        }
-    } luts;
-    const uint32_t dst_w = std::max(1u, src_w >> 1);
-    const uint32_t dst_h = std::max(1u, src_h >> 1);
-    for (uint32_t y = 0; y < dst_h; ++y) {
-        for (uint32_t x = 0; x < dst_w; ++x) {
-            const uint32_t sx0 = std::min(x * 2u,         src_w - 1u);
-            const uint32_t sx1 = std::min(x * 2u + 1u,    src_w - 1u);
-            const uint32_t sy0 = std::min(y * 2u,         src_h - 1u);
-            const uint32_t sy1 = std::min(y * 2u + 1u,    src_h - 1u);
-            const uint8_t* s00 = src + (sy0 * src_w + sx0) * 4u;
-            const uint8_t* s10 = src + (sy0 * src_w + sx1) * 4u;
-            const uint8_t* s01 = src + (sy1 * src_w + sx0) * 4u;
-            const uint8_t* s11 = src + (sy1 * src_w + sx1) * 4u;
-            uint8_t*       d   = dst + (y   * dst_w + x  ) * 4u;
-            // Colour is averaged WEIGHTED BY ALPHA.  A cutout's transparent
-            // texels carry black, and a plain average pulled every edge
-            // texel toward it: at the mips where a leaf spray's leaflets
-            // are a texel or two apart, the gaps came out as opaque
-            // black stripes between them -- the comb.  Weighting by alpha
-            // gives an edge texel the colour of the ink beside it, which
-            // is what the eye expects to see through a cutout's fringe.
-            const float a00 = s00[3], a10 = s10[3], a01 = s01[3], a11 = s11[3];
-            const float asum = a00 + a10 + a01 + a11;
-            for (int c = 0; c < 3; ++c) {
-                float lin;
-                if (asum > 0.0f) {
-                    lin = (luts.to_linear[s00[c]] * a00 + luts.to_linear[s10[c]] * a10 +
-                           luts.to_linear[s01[c]] * a01 + luts.to_linear[s11[c]] * a11) / asum;
-                } else {
-                    lin = 0.25f * (luts.to_linear[s00[c]] + luts.to_linear[s10[c]] +
-                                   luts.to_linear[s01[c]] + luts.to_linear[s11[c]]);
-                }
-                d[c] = luts.to_srgb[uint32_t(std::min(lin, 1.0f) * 4096.0f + 0.5f)];
-            }
-            d[3] = uint8_t((uint32_t(s00[3]) + s10[3] + s01[3] + s11[3] + 2u) >> 2);
-        }
-    }
+    // Name kept for the call sites; the filter is no longer a box.
+    // helper/mip_filter.h: separable Lanczos-3, sRGB-correct colour
+    // weighted by alpha (the cutout-fringe rule above), plain alpha.
+    engine::helper::downsample2xRgba8(src, src_w, src_h, dst, /*srgb*/ true);
 }
 
 static er::Format layerFormat(VtLayer layer) {
@@ -2129,28 +2081,11 @@ void VirtualTextureManager::encodeAndCacheVt(
             a_w[k] = std::max(1u, a_w[k - 1] >> 1);
             a_h[k] = std::max(1u, a_h[k - 1] >> 1);
             a_mip[k].resize(uint64_t(a_w[k]) * a_h[k]);
-            // Plain 2x2 box average, matching how boxDownsampleSrgb8
-            // treats the alpha channel on the CPU-pixels path.  No
-            // coverage preservation, deliberately: this split is a
-            // bandwidth change, and silhouettes at distance should
-            // look exactly as they did before it.
-            for (uint32_t y = 0; y < a_h[k]; ++y) {
-                for (uint32_t x = 0; x < a_w[k]; ++x) {
-                    const uint32_t sx0 = std::min(x * 2u, a_w[k - 1] - 1u);
-                    const uint32_t sy0 = std::min(y * 2u, a_h[k - 1] - 1u);
-                    const uint32_t sx1 = std::min(sx0 + 1u, a_w[k - 1] - 1u);
-                    const uint32_t sy1 = std::min(sy0 + 1u, a_h[k - 1] - 1u);
-                    const uint8_t* p = a_mip[k - 1].data();
-                    const uint32_t pw = a_w[k - 1];
-                    const uint32_t sum =
-                        uint32_t(p[size_t(sy0) * pw + sx0]) +
-                        uint32_t(p[size_t(sy0) * pw + sx1]) +
-                        uint32_t(p[size_t(sy1) * pw + sx0]) +
-                        uint32_t(p[size_t(sy1) * pw + sx1]);
-                    a_mip[k][size_t(y) * a_w[k] + x] =
-                        uint8_t((sum + 2u) / 4u);
-                }
-            }
+            // Same Lanczos-3 kernel as the colour pyramid (mip_filter.h),
+            // then the coverage rule above.
+            engine::helper::downsample2xR8(a_mip[k - 1].data(),
+                                           a_w[k - 1], a_h[k - 1],
+                                           a_mip[k].data());
             preserve_coverage(a_mip[k], a_cov0);
         }
 
@@ -2190,17 +2125,8 @@ void VirtualTextureManager::encodeAndCacheVt(
                 }
                 std::vector<uint8_t> tile_half(
                     (kVtTileSize / 2) * (kVtTileSize / 2));
-                for (uint32_t y = 0; y < kVtTileSize / 2; ++y) {
-                    for (uint32_t x = 0; x < kVtTileSize / 2; ++x) {
-                        const uint32_t sum =
-                            uint32_t(tile[size_t(y * 2u) * kVtTileSize + x * 2u]) +
-                            uint32_t(tile[size_t(y * 2u) * kVtTileSize + x * 2u + 1u]) +
-                            uint32_t(tile[size_t(y * 2u + 1u) * kVtTileSize + x * 2u]) +
-                            uint32_t(tile[size_t(y * 2u + 1u) * kVtTileSize + x * 2u + 1u]);
-                        tile_half[size_t(y) * (kVtTileSize / 2) + x] =
-                            uint8_t((sum + 2u) / 4u);
-                    }
-                }
+                engine::helper::downsample2xR8(tile.data(), kVtTileSize, kVtTileSize,
+                                               tile_half.data());
                 // The slot's own mip 1 keeps the slot's coverage too.
                 preserve_coverage(tile_half, coverage_of(tile.data(), tile.size()));
 
