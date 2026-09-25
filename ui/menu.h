@@ -582,6 +582,7 @@ private:
     // prepass.  Costs one frame of input latency.  Off by default until
     // verified in-engine.
     bool frame_ahead_on_ = true;    // default: predicted-depth cull replaces the prepass
+    float vt_lod_bias_ = 0.5f;      // VT LOD bias: how far between two mips every sample sits
     // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
     // 0 = half-res (richest detail), higher = increasingly down-sampled.
     // Clamped to the actual pyramid mip count by the menu UI.  Packed into
@@ -2478,6 +2479,7 @@ public:
     inline bool isHideDeferredPixels() const { return debug_hide_deferred_; }
     inline bool isDepthPrepassOn() const { return depth_prepass_on_; }
     inline bool isFrameAheadOn() const { return frame_ahead_on_; }
+    inline float getVtLodBias() const { return vt_lod_bias_; }
 
     // Forward vs deferred toggle — read by application drawScene to
     // route the cluster opaque pass through the G-buffer + compute

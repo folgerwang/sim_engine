@@ -353,6 +353,7 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
 }
 
 void main() {
+    vt_lod_bias_g = camera_info.vt_lod_bias;   // Render Debug > Leaf cutout mip lerp
     v_uv = v_uv_in;
     // Screen derivatives for the parallax march, taken in uniform control
     // flow before anything branches on the material.

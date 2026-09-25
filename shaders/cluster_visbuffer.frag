@@ -54,6 +54,7 @@ layout(location = 6) in vec4 v_prev_clip;
 layout(location = 0) out uvec2 out_vis;
 
 void main() {
+    vt_lod_bias_g = camera_info.vt_lod_bias;   // Render Debug > Leaf cutout mip lerp
     uint mat_idx = draw_infos[v_cluster_idx].material_idx;
     int  flags   = material_params[mat_idx].flags;
 

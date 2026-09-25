@@ -92,6 +92,7 @@ VbVertex vbFetchVertex(uint vertex_index) {
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 void main() {
+    vt_lod_bias_g = camera_info.vt_lod_bias;   // Render Debug > Leaf cutout mip lerp
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.screen_size.x) || px.y >= int(pc.screen_size.y)) return;
 

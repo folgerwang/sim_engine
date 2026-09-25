@@ -2085,7 +2085,7 @@ struct ViewCameraInfo {
     // N+1 -- the lookahead the analytic sway uses for its forward
     // motion vector (base.vert).  0 disables prediction.
     float           frame_dt;
-    float           terrain_hole_pad1;
+    float           vt_lod_bias;    // Render Debug "Leaf cutout mip lerp": VT LOD bias 0..1
     vec4            terrain_holes[TERRAIN_HOLE_MAX];
     vec4            terrain_hole_rot[TERRAIN_HOLE_MAX];
     // FRAME-AHEAD: the exact view-projection of frame N+1 (the sim,

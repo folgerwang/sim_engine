@@ -82,7 +82,13 @@
 // Applied before the clamp at 0, so mip 0 at arm's length still blends
 // with its half-res slot mip.  Also biases the feedback (wanted mip),
 // which streams pages one half-level coarser -- consistent by design.
-#define VT_LOD_BIAS 0.5
+//
+// RUNTIME: Render Debug > "Leaf cutout mip lerp" (0..1) lands in
+// camera_info.vt_lod_bias.  This header cannot read camera_info itself
+// (two consumers declare it AFTER including this file), so every
+// consumer's main() copies it in: `vt_lod_bias_g = camera_info.vt_lod_bias;`
+float vt_lod_bias_g = 0.5;
+#define VT_LOD_BIAS vt_lod_bias_g
 
 float vtComputeLodGrad(in VirtualTextureMeta meta, vec2 uv_ddx, vec2 uv_ddy) {
     vec2 sz = vec2(float(meta.width_px), float(meta.height_px));

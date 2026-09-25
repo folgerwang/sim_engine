@@ -788,6 +788,7 @@ float terrainSwardField(vec2 p, float dist, out vec2 grad, out float wgt) {
 }
 
 void main() {
+    vt_lod_bias_g = camera_info.vt_lod_bias;   // Render Debug > Leaf cutout mip lerp
 #ifndef GBUFFER_OUTPUT
     // ── Deferred-relight early-out ───────────────────────────────────
     // When the deferred re-rasterise + resolve is armed, every visible

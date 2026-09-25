@@ -10237,6 +10237,15 @@ void Menu::drawRenderDebugMenuContent() {
                 ImGui::SetTooltip("Sim runs one frame ahead; next frame's occlusion\n"
                                   "pyramid is predicted from this frame's depth +\n"
                                   "motion vectors (no depth prepass).  +1 frame latency.");
+            // VT LOD bias: where between two mips every virtual-texture
+            // sample (leaf cutout alpha included) sits.  0 = on the
+            // sharper mip, 0.5 = halfway, 1 = a full level coarser.
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::SliderFloat("Leaf cutout mip lerp", &vt_lod_bias_, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("VT LOD bias for every virtual-texture sample\n"
+                                  "(cutout alpha, albedo, terrain): 0 = sharpest mip,\n"
+                                  "0.5 = halfway between mips, 1 = one level coarser.");
             // Per-instance plant cull (nt_instance_compact.comp) ahead of
             // the GPU node table; off = submit full instance lists and
             // reject out-of-band instances per vertex, as before.
