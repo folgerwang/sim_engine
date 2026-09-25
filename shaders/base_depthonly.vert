@@ -160,6 +160,19 @@ void main() {
         vec3(in_loc_rot_mat_0.w,
              in_loc_rot_mat_1.w,
              in_loc_rot_mat_2.w);
+    // Plants on the cluster path: the cluster pipeline draws (and
+    // shadows) this instance; this pass must not draw it twice.  Same
+    // root and radius the compaction hands off with.
+    if ((model_params.flip_uv_coord & MODEL_FLAG_PLANT_CLUSTER) != 0u &&
+        camera_info.plant_handoff.w > 0.0) {
+        vec3 root = local_world_rot_mat * model_params.model_mat[3].xyz +
+                    vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w, in_loc_rot_mat_2.w);
+        if (distance(root, camera_info.plant_handoff.xyz) <= camera_info.plant_handoff.w) {
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            out_data.vertex_position = vec3(0.0, -4.0e8, 0.0);
+            return;
+        }
+    }
     // Vegetation wind sway — SAME function and SAME inputs as
     // base.vert, so the shadow of a swaying tree stays under the tree.
     if ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) {

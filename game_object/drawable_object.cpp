@@ -8570,7 +8570,9 @@ static void ntStageRecords(
             // Rocks in the tree file: the per-drawable sway bit lives on
             // the push constant, so the veto travels per record and the
             // vertex shader clears the bit after merging the two.
-            (node.no_sway_ ? MODEL_FLAG_NO_SWAY : 0x00u);
+            (node.no_sway_ ? MODEL_FLAG_NO_SWAY : 0x00u) |
+            // Plants on the cluster path (see MODEL_FLAG_PLANT_CLUSTER).
+            (object_->meshes_[mesh_idx].plant_template_idx_ >= 0 ? MODEL_FLAG_PLANT_CLUSTER : 0x00u);
         r.cascade_idx = 0u;
         r.debug_force_red = (s_lod_debug_colors && has_lod && node.lod_band_idx_ >= 0 &&
                              size_t(ni) < object_->lod_debug_ord_.size())

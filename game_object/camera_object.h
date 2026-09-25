@@ -136,6 +136,7 @@ public:
     // Camera & Lens exposure scale — see ViewCameraInfo::exposure_scale.
     void setGlobalLeafAge(float age) { m_view_camera_->setGlobalLeafAge(age); }
     void setVtLodBias(float b) { m_view_camera_->setVtLodBias(b); }
+    void setPlantHandoff(const glm::vec3& eye, float radius_m) { m_view_camera_->setPlantHandoff(eye, radius_m); }
 
     // Terrain holes -- see ViewCamera::setTerrainHoles.
     void setTerrainHoles(const std::vector<std::array<float, 5>>& holes) {

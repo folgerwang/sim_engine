@@ -71,6 +71,7 @@
 #define VISBUF_GBUF_EMISSIVE        5
 #define VISBUF_GBUF_VELOCITY        6
 #define VISBUF_GBUF_MOTION3D        7   // rgba16f forward motion (frame-ahead)
+#define VISBUF_PLANT_MOTION         8   // uvec2[] per dynamic plant vertex: packHalf2x16 of the N->N+1 delta
 #define NODE_TABLE_PARAMS_BINDING   0   // ModelParams per LOD-survivor record
 #define NODE_TABLE_SLOTS_BINDING    1   // record index per bucket slot
 
@@ -902,6 +903,10 @@ struct ViewParams {
 // compute pass is the single authority, so two bands can never both
 // keep, or both drop, an instance whose distance sits on the edge.
 #define MODEL_FLAG_NT_COMPACTED     0x100u
+// Record flag: the node's mesh has a ClusterRenderer plant template, so
+// its instances within camera_info.plant_handoff are drawn by the
+// cluster path (see nt_instance_compact.comp / plant_cluster_expand.comp).
+#define MODEL_FLAG_PLANT_CLUSTER    0x200u
 
 struct ModelParams {
     mat4 model_mat;
@@ -1554,6 +1559,11 @@ struct ClusterBVHNodeGPU {
 // comes from VIEW_PARAMS_SET / PBR_MATERIAL_PARAMS_SET / VISBUF_SET.
 struct VisMaterialPushConstants {
     uvec2   screen_size;
+    // Plants on the cluster path: dynamic vertex index - this = entry in
+    // the plant motion buffer (VISBUF_PLANT_MOTION); valid != 0 when the
+    // buffer holds this frame's deltas.
+    uint    plant_dyn_vertex_first;
+    uint    plant_motion_valid;
 };
 
 // Push constants for the cluster culling compute shader.
@@ -2162,6 +2172,12 @@ struct ViewCameraInfo {
     // its offset under std430 and glm alike (the vec4 arrays end on a
     // 16-byte boundary).
     mat4            next_view_proj;
+    // Plants on the cluster path: xyz = the hand-off eye, w = radius
+    // (0 = off).  Set on the main AND shadow cameras: the drawable
+    // vertex shaders degenerate an instance the cluster path owns
+    // (MODEL_FLAG_PLANT_CLUSTER record within the radius) in the passes
+    // the compaction did not already filter (shadows, classic draws).
+    vec4            plant_handoff;
 };
 
 struct RuntimeLightsParams {

@@ -46,6 +46,10 @@ layout(std430, set = 3, binding = 2) buffer VertexBuf    { uint verts[]; };
 // starting at template_bounds_first[t].
 layout(std430, set = 3, binding = 3) readonly buffer TemplateBoundsBuf { ClusterCullInfo template_bounds[]; };
 layout(std430, set = 3, binding = 4) readonly buffer TemplateBoundsFirstBuf { uint template_bounds_first[]; };
+// Per dynamic vertex (index - dyn_vertex_first): the N -> N+1 world
+// delta of the sway, packHalf2x16 x2 (xy | z,0).  The visibility-buffer
+// material pass turns it into motion3d for the depth predictor / TAA.
+layout(std430, set = 3, binding = 5) writeonly buffer PlantMotionBuf { uvec2 plant_motion[]; };
 
 layout(local_size_x = 128) in;
 
@@ -103,11 +107,20 @@ void main() {
                                    uintBitsToFloat(verts[s + 1u]),
                                    uintBitsToFloat(verts[s + 2u]));
             vec3 p_ws = rot * p_ls + inst_t;
+            vec3 delta = vec3(0.0);
             if (sway) {
                 const float travel = vegSwayTravel(inst_t, p_ls.y, pc.time_s, up_ws,
                                                    job.plant_bits, sway_wind);
                 p_ws += vegSwayVec(travel, sway_dir);
+                if (camera_info.frame_dt > 0.0) {
+                    const float travel_next = vegSwayTravel(inst_t, p_ls.y,
+                                                            pc.time_s + camera_info.frame_dt, up_ws,
+                                                            job.plant_bits, sway_wind);
+                    delta = vegSwayVec(travel_next, sway_dir) - vegSwayVec(travel, sway_dir);
+                }
             }
+            plant_motion[job.dyn_vertex_first + k - params.dyn_vertex_first] =
+                uvec2(packHalf2x16(delta.xy), packHalf2x16(vec2(delta.z, 0.0)));
             const vec3 n_ls = bvDecodeNormal(verts[s + 3u]);
             const vec4 t_ls = bvDecodeTangent(verts[s + 4u]);
             verts[d + 0u] = floatBitsToUint(p_ws.x);

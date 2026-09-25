@@ -55,6 +55,18 @@ layout(set = VISBUF_SET, binding = VISBUF_GBUF_VELOCITY, rg16f)
 layout(set = VISBUF_SET, binding = VISBUF_GBUF_MOTION3D, rgba16f)
     uniform writeonly image2D out_motion3d;
 
+layout(push_constant) uniform VisMaterialParams {
+    VisMaterialPushConstants pc;
+};
+// Plants on the cluster path: per dynamic vertex, the N -> N+1 sway
+// delta written by plant_cluster_expand.comp (see pc.plant_*).
+layout(std430, set = VISBUF_SET, binding = VISBUF_PLANT_MOTION)
+    readonly buffer PlantMotionBuf { uvec2 plant_motion[]; };
+vec3 plantMotionOf(uint vertex_index) {
+    uvec2 p = plant_motion[vertex_index - pc.plant_dyn_vertex_first];
+    return vec3(unpackHalf2x16(p.x), unpackHalf2x16(p.y).x);
+}
+
 // Byte-identical to the copy in cluster_bindless.frag / base.frag: this
 // pass writes the same G-buffer deferred_resolve.comp decodes, so the
 // encoding may not drift.  (The engine already carries four copies of
@@ -67,10 +79,6 @@ vec2 octEncodeDir(vec3 n) {
                                   n.y >= 0.0 ? 1.0 : -1.0);
     return oct * 0.5 + 0.5;
 }
-
-layout(push_constant) uniform VisMaterialParams {
-    uvec2 screen_size;
-} pc;
 
 // BindlessVertex is 24 B = 6 uints: position(3) + packed normal /
 // tangent / uv.  Decoders live in global_definition.glsl.h so this
@@ -303,14 +311,24 @@ void main() {
         vec4(oct_geom.x, oct_geom.y, 0.0, depth_pbr ? depth_orm.b : 0.0));
 
     // Velocity: static world-space geometry, so this is camera motion
-    // alone -- no per-cluster previous transforms needed.
+    // alone -- no per-cluster previous transforms needed.  Plants on the
+    // cluster path (tree_life.y = 1 materials) carry their sway delta
+    // per vertex: forward motion for the depth predictor, and the
+    // previous position (same delta, one frame back) for the velocity.
+    vec3 motion = vec3(0.0);
+    if (pc.plant_motion_valid != 0u && material_params[mat_idx].tree_life.y > 0.5) {
+        vec3 m0 = plantMotionOf(i0), m1 = plantMotionOf(i1), m2 = plantMotionOf(i2);
+        motion = vec3(vbInterp(bary, vec3(m0.x, m1.x, m2.x)).x,
+                      vbInterp(bary, vec3(m0.y, m1.y, m2.y)).x,
+                      vbInterp(bary, vec3(m0.z, m1.z, m2.z)).x);
+    }
     vec4 cur_clip  = camera_info.view_proj      * vec4(world_pos, 1.0);
-    vec4 prev_clip = camera_info.prev_view_proj * vec4(world_pos, 1.0);
+    vec4 prev_clip = camera_info.prev_view_proj * vec4(world_pos - motion, 1.0);
     vec2 cur_ndc   = cur_clip.xy  / cur_clip.w;
     vec2 prev_ndc  = prev_clip.xy / prev_clip.w;
     imageStore(out_velocity, px, vec4(cur_ndc - prev_ndc, 0.0, 0.0));
-    // Cluster geometry is static: no forward motion.  Written explicitly
-    // (not left to the clear) because this pass runs after Phase A's
-    // clear and an actor drawn later overwrites its own pixels anyway.
-    imageStore(out_motion3d, px, vec4(0.0));
+    // Static cluster geometry has no forward motion (written explicitly
+    // because this pass runs after Phase A's clear); expanded plants
+    // hand the predictor their sway delta.
+    imageStore(out_motion3d, px, vec4(motion, any(notEqual(motion, vec3(0.0))) ? 1.0 : 0.0));
 }

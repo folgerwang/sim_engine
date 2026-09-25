@@ -4345,6 +4345,14 @@ void ClusterRenderer::initVisBufferPipelines(
                         b, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
                         er::DescriptorType::STORAGE_IMAGE));
             }
+            // Per-vertex sway delta of the expanded plant tail (see
+            // plant_cluster_expand.comp); a dummy buffer when the plant
+            // path is off so the set is always fully written.
+            vb_bindings.push_back(
+                er::helper::getBufferDescriptionSetLayoutBinding(
+                    VISBUF_PLANT_MOTION,
+                    SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                    er::DescriptorType::STORAGE_BUFFER));
             visbuffer_desc_set_layout_ =
                 device_->createDescriptorSetLayout(vb_bindings);
         }
@@ -4416,8 +4424,12 @@ void ClusterRenderer::updateVisBufferTargets(
     }
 
     er::WriteDescriptorList writes;
-    writes.reserve(8);
+    writes.reserve(9);
 
+    ensurePlantMotionBuffer();
+    er::Helper::addOneBuffer(writes, visbuffer_desc_set_,
+        er::DescriptorType::STORAGE_BUFFER, VISBUF_PLANT_MOTION,
+        plant_motion_buffer_.buffer, plant_motion_buffer_.buffer->getSize());
     er::Helper::addOneBuffer(writes, visbuffer_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, VISBUF_VERTEX_BUFFER,
         merged_vertex_buffer_.buffer,
@@ -4544,6 +4556,8 @@ void ClusterRenderer::dispatchVisBufferMaterial(
 
     glsl::VisMaterialPushConstants push{};
     push.screen_size = screen_size;
+    push.plant_dyn_vertex_first = plant_dyn_vertex_first_;
+    push.plant_motion_valid = plantPathReady() ? 1u : 0u;
 
     cmd_buf->bindPipeline(
         er::PipelineBindPoint::COMPUTE, visbuffer_material_pipeline_);
@@ -7569,6 +7583,15 @@ void ClusterRenderer::finalizePlantTemplates() {
             sizeof(glsl::PlantJobParams));
         plant_counters_primed_ = false;
     }
+    if (ensurePlantMotionBuffer() && visbuffer_desc_set_) {
+        // The material pass already holds the old buffer: refresh just
+        // that binding (the image views are unchanged).
+        er::WriteDescriptorList mw;
+        er::Helper::addOneBuffer(mw, visbuffer_desc_set_,
+            er::DescriptorType::STORAGE_BUFFER, VISBUF_PLANT_MOTION,
+            plant_motion_buffer_.buffer, plant_motion_buffer_.buffer->getSize());
+        device_->updateDescriptorSets(mw);
+    }
     plant_desc_dirty_ = true;
     setPlantHandoff(plant_eye_, plant_radius_m_);
     clog_printf("[PLANT_CLUSTER] %zu templates finalized (%u template clusters)\n",
@@ -7592,7 +7615,7 @@ void ClusterRenderer::initPlantExpandPipeline(
     plant_job_layout_ = ssbo_layout(5);
     // set 3 (expand): 0 cull infos, 1 draw infos, 2 merged vertices,
     // 3 template bounds, 4 template bounds first
-    plant_merged_layout_ = ssbo_layout(5);
+    plant_merged_layout_ = ssbo_layout(6);
     renderer::DescriptorSetLayoutList layouts = {
         global_desc_set_layouts[PBR_GLOBAL_PARAMS_SET],
         global_desc_set_layouts[VIEW_PARAMS_SET],
@@ -7610,6 +7633,16 @@ void ClusterRenderer::initPlantExpandPipeline(
                     "plants stay on the drawable path\n", e.what());
     }
     plant_desc_dirty_ = true;
+}
+
+// uvec2 (half-packed xyz delta) per dynamic vertex.  Sized from the
+// budget; 1 entry when the plant path is off so the binding stays valid.
+// Returns true when the buffer object changed (callers rebind).
+bool ClusterRenderer::ensurePlantMotionBuffer() {
+    const auto old = plant_motion_buffer_.buffer;
+    ensureSSBO(device_, plant_motion_buffer_,
+               uint64_t(std::max(1u, plant_dyn_vertex_cap_)) * sizeof(glm::uvec2), nullptr);
+    return plant_motion_buffer_.buffer != old;
 }
 
 void ClusterRenderer::writePlantDescriptors() {
@@ -7636,6 +7669,7 @@ void ClusterRenderer::writePlantDescriptors() {
     add(plant_merged_set_, 2, merged_vertex_buffer_);
     add(plant_merged_set_, 3, plant_template_bounds_buffer_);
     add(plant_merged_set_, 4, plant_template_bounds_first_buffer_);
+    add(plant_merged_set_, 5, plant_motion_buffer_);
     device_->updateDescriptorSets(writes);
     plant_desc_dirty_ = false;
 }
@@ -7679,6 +7713,7 @@ void ClusterRenderer::recordPlantExpand(
     cmd_buf->addBufferBarrier(cull_info_buffer_.buffer, prev_read, compute_rw);
     cmd_buf->addBufferBarrier(draw_info_buffer_.buffer, prev_read, compute_rw);
     cmd_buf->addBufferBarrier(merged_vertex_buffer_.buffer, prev_read, compute_rw);
+    cmd_buf->addBufferBarrier(plant_motion_buffer_.buffer, prev_read, compute_rw);
     // Last frame's compaction wrote the jobs / work / counters.
     cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, compute_rw, compute_rw);
     cmd_buf->addBufferBarrier(plant_job_buffer_.buffer, compute_rw, compute_rw);
@@ -7720,6 +7755,7 @@ void ClusterRenderer::recordPlantExpand(
     cmd_buf->addBufferBarrier(cull_info_buffer_.buffer, compute_rw, prev_read);
     cmd_buf->addBufferBarrier(draw_info_buffer_.buffer, compute_rw, prev_read);
     cmd_buf->addBufferBarrier(merged_vertex_buffer_.buffer, compute_rw, prev_read);
+    cmd_buf->addBufferBarrier(plant_motion_buffer_.buffer, compute_rw, prev_read);
 }
 
 } // namespace scene_rendering

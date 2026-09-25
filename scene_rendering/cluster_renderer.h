@@ -1649,12 +1649,14 @@ private:
     renderer::BufferInfo plant_template_buffer_;   // PlantTemplateInfo[]
     renderer::BufferInfo plant_template_bounds_buffer_;        // ClusterCullInfo[] object-space, per template cluster
     renderer::BufferInfo plant_template_bounds_first_buffer_;  // uint[] per template: first entry above
+    renderer::BufferInfo plant_motion_buffer_;     // uvec2[vertex_cap] sway delta (visbuffer motion vectors)
     bool plant_desc_dirty_ = true;
     bool plant_counters_primed_ = false;
     void initPlantExpandPipeline(const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
     void padPlantDynamicStaging();                 // finalizeUploads, before totals
     void finalizePlantTemplates();                 // finalizeUploads, after buffers exist
     void writePlantDescriptors();
+    bool ensurePlantMotionBuffer();
 };
 
 } // namespace scene_rendering

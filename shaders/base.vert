@@ -316,6 +316,21 @@ void main() {
     // (pre-instance) height, so a rotated or scaled instance still
     // bends from its own roots.  Same function runs in
     // base_depthonly.vert — shadows track the canopy.
+    // Plants on the cluster path: on a NON-compacted draw the cluster
+    // pipeline owns the instances within the hand-off radius (the
+    // compaction already removed them from a compacted draw, keeping the
+    // ones that did not fit the budget -- those must still draw here).
+    if ((model_params.flip_uv_coord & MODEL_FLAG_PLANT_CLUSTER) != 0u &&
+        (model_params.flip_uv_coord & MODEL_FLAG_NT_COMPACTED) == 0u &&
+        camera_info.plant_handoff.w > 0.0) {
+        vec3 root = local_world_rot_mat * model_params.model_mat[3].xyz +
+                    vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w, in_loc_rot_mat_2.w);
+        if (distance(root, camera_info.plant_handoff.xyz) <= camera_info.plant_handoff.w) {
+            out_data.vertex_ilod_fade = 0.0;
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            return;
+        }
+    }
     float sway_travel = 0.0f;
     if ((model_params.flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) {
         vec3 inst_t = vec3(in_loc_rot_mat_0.w, in_loc_rot_mat_1.w,

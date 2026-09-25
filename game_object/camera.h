@@ -163,6 +163,9 @@ public:
 
     void setGlobalLeafAge(float age) { m_camera_info_.global_leaf_age = age; }
     void setVtLodBias(float b) { m_camera_info_.vt_lod_bias = b; }
+    void setPlantHandoff(const glm::vec3& eye, float radius_m) {
+        m_camera_info_.plant_handoff = glm::vec4(eye, radius_m);
+    }
 
     // Terrain holes (ViewCameraInfo::terrain_holes / terrain_hole_rot):
     // rectangles tile.vert snaps terrain vertices out of -- the parking
