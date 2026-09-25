@@ -624,6 +624,18 @@
 // problem.  Deferred pixels only (forward pixels have no G-buffer to
 // estimate from and stay untouched).
 #define DEBUG_RENDER_MODE_INDIRECT              17
+// Leaf-card texture views (drawable path, forward AND G-buffer).  Both
+// draw the WHOLE card -- the cutout discard is skipped -- so the parts
+// the alpha test removes are visible too.
+//   LEAF_ALPHA  the albedo texture's raw alpha (before any ageing):
+//               grey = alpha, RED = below the material's alpha_cutoff,
+//               i.e. what the cutout throws away.
+//   LEAF_AGE    the ageing input: the cohort (metallic_roughness .b
+//               under LEAF_MASK, the material's group otherwise) as a
+//               solid colour, scaled by the AGED alpha leafAgedColor()
+//               produced (dark = the season / growth cut removed it).
+#define DEBUG_RENDER_MODE_LEAF_ALPHA            18
+#define DEBUG_RENDER_MODE_LEAF_AGE              19
 
 #define LIGHT_COUNT                             1
 // 6 cascades (was 4): smaller extent ratio between adjacent cascades

@@ -3546,7 +3546,9 @@ void main() {
     uint dbg_mode =
         (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
             >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
-    if (dbg_mode == DEBUG_RENDER_MODE_ALBEDO) {
+    if (dbg_mode == DEBUG_RENDER_MODE_ALBEDO ||
+        dbg_mode == DEBUG_RENDER_MODE_LEAF_ALPHA ||    // base.frag wrote the
+        dbg_mode == DEBUG_RENDER_MODE_LEAF_AGE) {      // view into albedo
         color = albedo;
     } else if (dbg_mode == DEBUG_RENDER_MODE_NORMAL) {
         color = N * 0.5 + 0.5;

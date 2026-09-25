@@ -10086,6 +10086,12 @@ void Menu::drawRenderDebugMenuContent() {
         // pixels cannot distinguish.  Deferred pixels only.
         { 17, "17: Indirect diffuse (GI)",   "Indirect diffuse", nullptr },
 
+        // Whole leaf cards, cutout discard OFF: red = texels the alpha
+        // test removes; the age view colours each cohort and darkens
+        // what the season / growth cut removed.
+        { 18, "18: Leaf alpha texture (red = cut)", "Leaf alpha",  "Foliage" },
+        { 19, "19: Leaf age texture (cohort)",      "Leaf age",    nullptr },
+
         { 10, "10: Velocity (NDC delta x50)","Velocity",         "Pipeline / motion" },
         { 12, "12: Hi-Z pyramid (mip)",      "Hi-Z pyramid",     nullptr },
         { 16, "16: Render path (fwd/deferred)","Render path",    nullptr },

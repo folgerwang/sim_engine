@@ -236,6 +236,42 @@ bool decalScreenDoorCull(float base_alpha, float cutoff, float coverage) {
 
 #include "pbr_lighting.glsl.h"
 
+// ── Leaf texture debug views (DEBUG_RENDER_MODE_LEAF_ALPHA / _AGE) ───
+uint dbgModeEarly() {
+    return (camera_info.input_features & FEATURE_INPUT_DEBUG_MODE_MASK)
+               >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
+}
+bool dbgLeafTexMode(uint m) {
+    return m == DEBUG_RENDER_MODE_LEAF_ALPHA || m == DEBUG_RENDER_MODE_LEAF_AGE;
+}
+#ifndef NO_MTL
+vec3 dbgLeafTexColor(uint m, ObjectVsPsData d, PbrMaterialParams mat, float aged_a) {
+    if (m == DEBUG_RENDER_MODE_LEAF_ALPHA) {
+        float raw = mat.base_color_factor.a;
+        if ((mat.material_features & FEATURE_HAS_BASE_COLOR_MAP) != 0 &&
+            !materialIsTriplanar(mat)) {
+            raw *= texture(albedo_tex, getBaseColorUV(d, mat)).a;
+        }
+        if (raw < mat.alpha_cutoff) {
+            return vec3(0.25 + 0.75 * raw / max(mat.alpha_cutoff, 1e-3), 0.0, 0.0);
+        }
+        return vec3(raw);
+    }
+    uint group = 0u;
+    if ((mat.material_features & FEATURE_MATERIAL_LEAF_MASK) != 0) {
+        group = leafMaskGroup(texture(metallic_roughness_tex,
+                                      getMetallicRoughnessUV(d, mat)).b);
+    } else if ((mat.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0) {
+        group = UNPACK_LEAF_GROUP(mat.material_features);
+    }
+    const vec3 pal[8] = vec3[8](
+        vec3(1.0, 0.2, 0.2), vec3(1.0, 0.6, 0.1), vec3(1.0, 1.0, 0.2),
+        vec3(0.2, 1.0, 0.2), vec3(0.2, 1.0, 1.0), vec3(0.3, 0.4, 1.0),
+        vec3(0.9, 0.3, 1.0), vec3(1.0, 1.0, 1.0));
+    return pal[group] * (0.12 + 0.88 * clamp(aged_a, 0.0, 1.0));
+}
+#endif
+
 // ── LOD band debug colours ───────────────────────────────────────────
 // Render Debug > "Colour plant LOD bands": every plant-LOD node is
 // painted by its rung ordinal (drawNodeMesh / ntStageRecords put
@@ -560,7 +596,8 @@ void main() {
 #endif
 #ifdef DEPTH_COVERAGE
 #ifndef NO_MTL
-    if (getBaseColor(ps_in_data, material).a < DBG_CUTOFF(material.alpha_cutoff)) discard;
+    if (getBaseColor(ps_in_data, material).a < DBG_CUTOFF(material.alpha_cutoff) &&
+        !dbgLeafTexMode(dbgModeEarly())) discard;
 #endif
     return;
 #endif
@@ -738,7 +775,8 @@ void main() {
     // The forward path's cutout discard sits AFTER its lighting; here it
     // must run before the writes or masked foliage would stamp opaque
     // rectangles into the G-buffer.
-    if (baseColor.a < DBG_CUTOFF(material.alpha_cutoff)) {
+    if (baseColor.a < DBG_CUTOFF(material.alpha_cutoff) &&
+        !dbgLeafTexMode(dbgModeEarly())) {
         discard;
     }
 #endif // ALPHAMODE_MASK
@@ -795,6 +833,14 @@ void main() {
     // floored a quantisation step clear of the sentinel; the decal
     // permutation overrides it with its coverage instead.
     lodDebugTint(baseColor.rgb);       // LOD band debug (no-op when off)
+    {
+        // Leaf texture views ride the albedo channel; the resolve shows
+        // the G-buffer albedo raw for these modes (as for ALBEDO).
+        uint dbg_m = dbgModeEarly();
+        if (dbgLeafTexMode(dbg_m)) {
+            baseColor.rgb = dbgLeafTexColor(dbg_m, ps_in_data, material, baseColor.a);
+        }
+    }
 #ifdef DECAL
     out_albedo_ao = vec4(baseColor.rgb, gbuf_alpha);
 #else
@@ -850,7 +896,8 @@ void main() {
         (model_params.flip_uv_coord & MODEL_FLAG_DEFERRED_RELIGHT) != 0u &&
         (material.material_features & FEATURE_MATERIAL_BLEND) == 0u) {
 #ifdef ALPHAMODE_MASK
-        if (baseColor.a < DBG_CUTOFF(material.alpha_cutoff)) discard;
+        if (baseColor.a < DBG_CUTOFF(material.alpha_cutoff) &&
+            !dbgLeafTexMode(dbgModeEarly())) discard;
 #endif
         float fast_nl = 0.5;
 #ifdef USE_PUNCTUAL
@@ -1015,7 +1062,8 @@ void main() {
 // the signal we need.  Skip it on that permutation only.
 #if defined(ALPHAMODE_MASK) && !defined(DECAL) && !defined(GBUFFER_OUTPUT)
     // Late discard to avoid samplig artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if(baseColor.a < DBG_CUTOFF(material.alpha_cutoff))
+    if(baseColor.a < DBG_CUTOFF(material.alpha_cutoff) &&
+       !dbgLeafTexMode(dbgModeEarly()))
     {
         discard;
     }
@@ -1069,6 +1117,8 @@ void main() {
             >> FEATURE_INPUT_DEBUG_MODE_SHIFT;
     if (dbg_mode == DEBUG_RENDER_MODE_ALBEDO) {
         outColor = vec4(baseColor.rgb, 1.0);
+    } else if (dbgLeafTexMode(dbg_mode)) {
+        outColor = vec4(dbgLeafTexColor(dbg_mode, ps_in_data, material, baseColor.a), 1.0);
     } else if (dbg_mode == DEBUG_RENDER_MODE_NORMAL) {
         outColor = vec4(normal_info.n * 0.5 + 0.5, 1.0);
     } else if (dbg_mode == DEBUG_RENDER_MODE_GEOMETRIC_NORMAL) {
