@@ -74,6 +74,27 @@ static inline float gp_sanitize_px(float v, float fallback) {
     return v;
 }
 
+// Bar label that stays INSIDE its bar: the full "name  1.23ms" if it
+// fits, the name alone if only that fits, otherwise clipped at the bar
+// edge — a label spilling past its bar was landing on top of the next
+// bar's label, so a row of short scopes read as one unreadable smear.
+static void gp_bar_label(ImDrawList* dl, float bx0, float bx1, float y0, float y1,
+                         const std::string& name, float dur_ms) {
+    const float pad = 3.0f;
+    const float avail = (bx1 - bx0) - 2.0f * pad;
+    if (avail < 12.0f) return;
+    char label[128];
+    snprintf(label, sizeof(label), "%s  %.2fms", name.c_str(), dur_ms);
+    if (ImGui::CalcTextSize(label).x > avail) {
+        snprintf(label, sizeof(label), "%s", name.c_str());
+    }
+    float text_h = ImGui::GetFontSize();
+    float text_y = y0 + (y1 - y0 - text_h) * 0.5f;
+    dl->PushClipRect(ImVec2(bx0 + 1.0f, y0), ImVec2(bx1 - 1.0f, y1), true);
+    dl->AddText(ImVec2(bx0 + pad, text_y), IM_COL32(255, 255, 255, 230), label);
+    dl->PopClipRect();
+}
+
 
 // ============================================================================
 //  Init / Destroy
@@ -864,16 +885,7 @@ void GameProfiler::drawImGui()
             uint32_t border_col = lerpColor(sd.color, IM_COL32(0, 0, 0, 255), 0.4f);
             dl->AddRectFilled(ImVec2(bx0, y0), ImVec2(bx1, y1), fill_col, 2.0f);
             dl->AddRect      (ImVec2(bx0, y0), ImVec2(bx1, y1), border_col, 2.0f);
-            float bar_w = bx1 - bx0;
-            if (bar_w > 30.0f) {
-                char label[128];
-                float dur_ms = sd.end_ms - sd.begin_ms;
-                snprintf(label, sizeof(label), "%s  %.2fms", sd.name.c_str(), dur_ms);
-                float text_h = ImGui::GetFontSize();
-                float text_y = y0 + (y1 - y0 - text_h) * 0.5f;
-                dl->AddText(ImVec2(bx0 + 3.0f, text_y),
-                            IM_COL32(255, 255, 255, 230), label);
-            }
+            gp_bar_label(dl, bx0, bx1, y0, y1, sd.name, sd.end_ms - sd.begin_ms);
             if (mouse.x >= bx0 && mouse.x <= bx1 &&
                 mouse.y >= y0 && mouse.y <= y1) {
                 tooltip_name = sd.name.c_str();
@@ -940,18 +952,8 @@ void GameProfiler::drawImGui()
             dl->AddRectFilled(ImVec2(bx0, y0), ImVec2(bx1, y1), fill_col, 2.0f);
             dl->AddRect      (ImVec2(bx0, y0), ImVec2(bx1, y1), border_col, 2.0f);
 
-            // Label: draw name + duration, vertically centred in the bar.
-            float bar_w = bx1 - bx0;
-            if (bar_w > 30.0f) {
-                char label[128];
-                float dur_ms = sd.end_ms - sd.begin_ms;
-                snprintf(label, sizeof(label), "%s  %.2fms", sd.name.c_str(), dur_ms);
-                float text_h = ImGui::GetFontSize();
-                float text_y = y0 + (y1 - y0 - text_h) * 0.5f;
-                dl->AddText(ImVec2(bx0 + 3.0f, text_y),
-                            IM_COL32(255, 255, 255, 230),
-                            label);
-            }
+            // Label: name + duration, clipped to the bar.
+            gp_bar_label(dl, bx0, bx1, y0, y1, sd.name, sd.end_ms - sd.begin_ms);
 
             // Hover check for tooltip.
             if (mouse.x >= bx0 && mouse.x <= bx1 &&
