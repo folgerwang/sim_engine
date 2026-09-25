@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <unordered_set>
 #include <vector>
@@ -2089,11 +2090,41 @@ void VirtualTextureManager::encodeAndCacheVt(
     // any more once an alpha layer exists.  Re-importing picks up the
     // opaque-albedo encode and its quality win.
     if (albedo_pre_encoded && !cache.bc4_alpha.empty() && alpha_plane) {
+        // ── Coverage-preserving alpha mips ──────────────────────────
+        // A plain box average halves a thin leaflet's alpha at every
+        // level, and once the tip's ramp value (.1 root..tip, cutoff
+        // .09) averages with its transparent neighbours it drops under
+        // the cutoff: far leaves thin to nothing.  So each level (and
+        // each slot's half-res mip 1 below) has its alpha scaled so the
+        // FRACTION of texels at/above the cutoff matches the level
+        // above it -- the same rule the drawable stopgap chain uses
+        // (helper/cutout_mips.h), single-channel here.  kCut = .09 * 255.
+        constexpr uint32_t kCut = 23u;
+        auto coverage_of = [](const uint8_t* a, size_t n) {
+            size_t c = 0;
+            for (size_t i = 0; i < n; ++i) c += a[i] >= kCut;
+            return n ? float(c) / float(n) : 0.0f;
+        };
+        auto preserve_coverage = [](std::vector<uint8_t>& a, float coverage) {
+            if (coverage <= 0.0f || a.empty()) return;
+            const size_t n = a.size();
+            const size_t wanted = std::min(n, std::max(size_t(1),
+                size_t(std::lround(coverage * double(n)))));
+            std::vector<uint8_t> sorted(a);
+            std::nth_element(sorted.begin(), sorted.begin() + (wanted - 1),
+                             sorted.end(), std::greater<uint8_t>());
+            const uint8_t edge = sorted[wanted - 1];
+            if (edge == 0u || edge >= kCut) return;
+            const float scale = (float(kCut) + 0.5f) / float(edge);
+            for (auto& v : a)
+                v = uint8_t(std::min(255.0f, std::round(float(v) * scale)));
+        };
         std::vector<std::vector<uint8_t>> a_mip(mip_count);
         std::vector<uint32_t> a_w(mip_count), a_h(mip_count);
         a_mip[0].assign(alpha_plane,
                         alpha_plane + uint64_t(width) * height);
         a_w[0] = width; a_h[0] = height;
+        const float a_cov0 = coverage_of(a_mip[0].data(), a_mip[0].size());
         for (uint32_t k = 1; k < mip_count; ++k) {
             a_w[k] = std::max(1u, a_w[k - 1] >> 1);
             a_h[k] = std::max(1u, a_h[k - 1] >> 1);
@@ -2120,6 +2151,7 @@ void VirtualTextureManager::encodeAndCacheVt(
                         uint8_t((sum + 2u) / 4u);
                 }
             }
+            preserve_coverage(a_mip[k], a_cov0);
         }
 
         encode_pool_->parallelFor(pre_total_pages,
@@ -2169,6 +2201,8 @@ void VirtualTextureManager::encodeAndCacheVt(
                             uint8_t((sum + 2u) / 4u);
                     }
                 }
+                // The slot's own mip 1 keeps the slot's coverage too.
+                preserve_coverage(tile_half, coverage_of(tile.data(), tile.size()));
 
                 uint8_t* adst0 = cache.bc4_alpha.data()
                                + uint64_t(entry_idx) * kBc4BytesPerEntry;
