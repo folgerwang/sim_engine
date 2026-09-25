@@ -244,16 +244,16 @@ void engine::game_object::DrawableObject::setNtCompactEnabled(bool on) { s_nt_co
 // Frame-ahead Hi-Z for node_table_cull.comp (binding 9).  The generation
 // counter re-dirties every drawable's cull descriptor set when the view
 // changes (resize rebuilds the pyramid).
-static std::shared_ptr<renderer::Sampler>   s_nt_hiz_sampler;
-static std::shared_ptr<renderer::ImageView> s_nt_hiz_view;
+static std::shared_ptr<engine::renderer::Sampler>   s_nt_hiz_sampler;
+static std::shared_ptr<engine::renderer::ImageView> s_nt_hiz_view;
 static glm::uvec2 s_nt_hiz_size(0);
 static uint32_t   s_nt_hiz_mips = 0;
 static glm::mat4  s_nt_hiz_view_proj(1.0f);
 static bool       s_nt_hiz_enabled = false;
 static uint32_t   s_nt_hiz_gen = 1;
 void engine::game_object::DrawableObject::setNtHiZOcclusion(
-    const std::shared_ptr<renderer::Sampler>& sampler,
-    const std::shared_ptr<renderer::ImageView>& view,
+    const std::shared_ptr<engine::renderer::Sampler>& sampler,
+    const std::shared_ptr<engine::renderer::ImageView>& view,
     const glm::uvec2& size,
     uint32_t mip_count,
     const glm::mat4& view_proj,
