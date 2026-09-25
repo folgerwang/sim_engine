@@ -23,6 +23,23 @@ layout(std430, set = PBR_MATERIAL_PARAMS_SET, binding = 1)
     readonly buffer MaterialParamsBuffer {
     BindlessMaterialParams material_params[];
 };
+// ── Tree age of the cluster being shaded ─────────────────────────────
+// Static clusters carry it per material (tree_life.x: the old
+// world-space-copy plant uploads made one material per instance).
+// Plants on the cluster path (plant_cluster_expand.comp) share one
+// material per template, so the per-INSTANCE age rides in the dynamic
+// cluster's ClusterDrawInfo.object_idx (float bits) and
+// tree_life.y == 1 selects it.  Every consumer sets the global from
+// its cluster index before the first material call:
+//   cluster_tree_age_g = clusterTreeAgeOf(cluster_idx);
+float cluster_tree_age_g = 0.0;
+float clusterTreeAgeOf(uint cluster_idx) {
+    return uintBitsToFloat(draw_infos[cluster_idx].object_idx);
+}
+float clusterTreeLife(uint mat_idx) {
+    vec4 tl = material_params[mat_idx].tree_life;
+    return tl.y > 0.5 ? cluster_tree_age_g : tl.x;
+}
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 2)
     uniform sampler2D base_color_textures[MAX_CLUSTER_TEXTURES];
 layout(set = PBR_MATERIAL_PARAMS_SET, binding = 3)

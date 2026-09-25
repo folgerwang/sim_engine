@@ -1472,6 +1472,72 @@ struct BindlessMaterialParams {
 };
 
 // Flattened BVH node for GPU traversal (iterative stack-based).
+// ── Plants on the cluster path (plant_cluster_expand.comp) ───────────
+// Every plant mesh LOD is uploaded ONCE as a hidden object-space
+// "template" (its clusters, vertices and indices sit in the merged
+// buffers like any mesh, bounds_sphere.w < 0 so the cull never draws
+// them).  Each frame the expand pass takes a list of JOBS -- one per
+// visible plant instance -- and for each (job, template cluster) writes
+// a live cluster into the DYNAMIC tail of the cull / draw info arrays
+// and its vertices, transformed to world space with the sway applied,
+// into the dynamic vertex region.  Indices are shared with the template
+// (vertex_offset does the per-instance shift), materials too; the
+// per-instance tree age rides in ClusterDrawInfo.object_idx (float
+// bits) and BindlessMaterialParams.tree_life.y = 1 tells the shaders
+// to read it from there.
+struct PlantTemplateInfo {
+    uint  cluster_first;     // first template cluster (global cluster index)
+    uint  cluster_count;
+    uint  vertex_first;      // first template vertex (merged vertex index)
+    uint  vertex_count;
+};
+struct PlantExpandJob {
+    vec4  row0;              // instance basis columns + translation, the
+    vec4  row1;              // 48 B InstanceDataInfo layout (see base.vert)
+    vec4  row2;
+    uint  template_idx;
+    uint  dyn_cluster_first; // this job's first dynamic cluster (global index)
+    uint  dyn_vertex_first;  // this job's first dynamic vertex (merged index)
+    uint  flags;             // PLANT_JOB_*
+    float tree_age;
+    uint  plant_bits;        // ModelParams::debug_skip_skinning packing (height, root)
+    uint  pad0, pad1;
+};
+#define PLANT_JOB_SWAY   1u   // apply the vegetation sway (MODEL_FLAG_VEGETATION_SWAY)
+// Host-written per frame: the hand-off rule and the budgets.  Shared by
+// nt_instance_compact.comp (which APPENDS jobs for every surviving
+// instance within radius of the eye instead of compacting it for the
+// drawable path) and plant_cluster_expand.comp.
+struct PlantJobParams {
+    vec4  eye_radius;        // xyz = eye, w = hand-off radius (m); w <= 0 disables
+    uint  job_cap;
+    uint  work_cap;
+    uint  cluster_cap;       // dynamic clusters available
+    uint  vertex_cap;        // dynamic vertices available
+    uint  dyn_cluster_first; // first dynamic cluster (global index)
+    uint  dyn_vertex_first;  // first dynamic vertex (merged index)
+    uint  template_count;
+    uint  pad0;
+};
+// GPU counters (uint[PLANT_CTR_COUNT]), zeroed by the expand pass after
+// it consumed them; the compaction's atomics fill them for the NEXT
+// frame.  [4..6] is the expand's indirect dispatch (x = work groups).
+#define PLANT_CTR_JOBS      0
+#define PLANT_CTR_WORK      1
+#define PLANT_CTR_CLUSTERS  2
+#define PLANT_CTR_VERTICES  3
+#define PLANT_CTR_DISPATCH  4   // uvec3 at [4],[5],[6]
+#define PLANT_CTR_DROPPED   7   // instances that did not fit the budget (fell back to the drawable path)
+#define PLANT_CTR_COUNT     8
+struct PlantExpandPush {
+    uint  dyn_cluster_first; // first dynamic cluster (global index)
+    uint  dyn_cluster_count; // dynamic capacity (all get rewritten: unused -> hidden)
+    uint  phase;             // 0 = clear the tail + set the indirect, 1 = expand, 2 = reset counters
+    uint  work_cap;
+    float time_s;            // sway clock for THIS stream
+    uint  pad0, pad1, pad2;
+};
+
 struct ClusterBVHNodeGPU {
     vec4    aabb_min_pad;        // xyz = min, w = left_child_idx (-1 if leaf)
     vec4    aabb_max_pad;        // xyz = max, w = right_child_idx (-1 if leaf)
@@ -2210,6 +2276,8 @@ struct NtCullPushConstants {
 // world through the record's model matrix); eye.xyz is the camera the
 // per-instance LOD bands are measured from.
 #define NT_COMPACT_BAND_TEST  0x100u   // flags: apply the per-instance band test
+#define NT_COMPACT_PLANT_HANDOFF 0x200u   // hand near plant instances to the cluster path (G-buffer pass only)
+#define NT_COMPACT_PLANT_SKIP    0x400u   // other camera passes: drop the same instances without appending
 struct NtCompactPushConstants {
     vec4    planes[6];        // world-space frustum, normals inward
     vec4    eye;              // xyz = LOD eye (camera position)
@@ -2343,6 +2411,22 @@ vec3 bvOctDecode(vec2 e) {
 
 vec3 bvDecodeNormal(uint packed_normal) {
     return bvOctDecode(unpackSnorm2x16(packed_normal));
+}
+
+// Encoders -- the exact inverse of the decoders above, for the GPU
+// passes that WRITE BindlessVertex (plant_cluster_expand.comp).
+vec2 bvOctEncode(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 e = n.xy;
+    if (n.z < 0.0) e = (1.0 - abs(n.yx)) * bvSignNotZero(n.xy);
+    return e;
+}
+uint bvEncodeNormal(vec3 n) {
+    return packSnorm2x16(bvOctEncode(normalize(n)));
+}
+uint bvEncodeTangent(vec4 t) {
+    uint p = packSnorm2x16(bvOctEncode(normalize(t.xyz)));
+    return (t.w >= 0.0) ? (p | 0x10000u) : (p & ~0x10000u);
 }
 
 // Returns the tangent frame as vec4(T.xyz, bitangent_sign) — the exact

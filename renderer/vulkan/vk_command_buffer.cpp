@@ -368,6 +368,12 @@ void VulkanCommandBuffer::dispatch(uint32_t group_count_x, uint32_t group_count_
     vkCmdDispatch(cmd_buf_, group_count_x, group_count_y, group_count_z);
 }
 
+void VulkanCommandBuffer::dispatchIndirect(
+    const std::shared_ptr<renderer::Buffer>& buffer, uint64_t offset) {
+    auto vk_buffer = RENDER_TYPE_CAST(Buffer, buffer);
+    vkCmdDispatchIndirect(cmd_buf_, vk_buffer->get(), offset);
+}
+
 void VulkanCommandBuffer::traceRays(
     const StridedDeviceAddressRegion& raygen_shader_entry,
     const StridedDeviceAddressRegion& miss_shader_entry,

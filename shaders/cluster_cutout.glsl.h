@@ -68,7 +68,7 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
     vec4 base = material_params[mat_idx].base_color_factor;
     bool leaf_mask = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
     uint profile = (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u;
-    float life = material_params[mat_idx].tree_life.x;
+    float life = clusterTreeLife(mat_idx);
 
     if (!leaf_mask && (mat_flags & BINDLESS_MAT_LEAF_AGE) != 0) {
         base = leafAgedColor(base, UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags)),
@@ -160,7 +160,7 @@ float clusterCutoutAlpha(uint mat_idx, int mat_flags, vec2 uv,
     float base_a   = material_params[mat_idx].base_color_factor.a;
     bool  leaf_mask = (mat_flags & BINDLESS_MAT_LEAF_MASK) != 0;
     uint  profile  = (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u;
-    float life     = material_params[mat_idx].tree_life.x;
+    float life     = clusterTreeLife(mat_idx);
 
     // Asymmetric, exactly as clusterCutoutAlbedo: LEAF_AGE without
     // LEAF_MASK ages the FACTOR before the texture multiply.

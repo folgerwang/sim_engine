@@ -1387,6 +1387,10 @@ int ClusterRenderer::countPendingVtMaterials(
 // ─── Finalize uploads (create merged GPU SSBOs) ───────────────────
 
 void ClusterRenderer::finalizeUploads() {
+    // Plants on the cluster path: reserve the dynamic tail (hidden
+    // placeholder clusters + zero vertices) so every buffer sized from
+    // the totals below already has room for this frame's expanded plants.
+    padPlantDynamicStaging();
     total_clusters_all_meshes_ =
         static_cast<uint32_t>(staging_cull_infos_.size());
     // Every cluster is visible again after a (re)finalize: the cull
@@ -1966,6 +1970,9 @@ void ClusterRenderer::finalizeUploads() {
     }
     // Initialize all meshes as visible until the first readback.
     mesh_visible_.assign(mesh_cluster_ranges_.size(), true);
+    // Plant templates: hide them again (finalize reset the flags) and
+    // (re)upload the template table for the expand pass.
+    finalizePlantTemplates();
 
     clog_printf("[CLUSTER_RENDERER] Built cluster→mesh LUT: %u meshes, "
                 "%llu total triangles.\n",
@@ -2045,6 +2052,11 @@ void ClusterRenderer::resetToBaseUploads() {
     staging_vertices_.resize(base_vertex_count_);
     staging_indices_.resize(base_index_count_);
     mesh_cluster_ranges_.resize(base_mesh_count_);
+    // Plant templates and the dynamic pad live in the placed tail just
+    // cut: the sync re-registers them before the next finalize.
+    plant_templates_.clear();
+    plant_pad_cluster_start_ = UINT32_MAX;
+    plant_pad_vertex_start_  = UINT32_MAX;
     if (mesh_prim_material_.size() > base_mesh_count_) {
         mesh_prim_material_.resize(base_mesh_count_);
     }
@@ -3196,6 +3208,7 @@ void ClusterRenderer::initBindlessPipeline(
     const renderer::GraphicPipelineInfo& graphic_pipeline_info,
     const renderer::PipelineRenderbufferFormats& framebuffer_format) {
 
+    initPlantExpandPipeline(global_desc_set_layouts);
     if (!gpu_ready_ || total_merged_vertices_ == 0) {
         clog_printf("[CLUSTER_RENDERER] Skipping bindless pipeline init — "
                     "no merged geometry.\n");
@@ -5600,7 +5613,9 @@ void ClusterRenderer::buildRtShadowBvh() {
     for (uint32_t i = 0; i < n; ++i) {
         const glm::vec4 s = staging_cull_infos_[i].bounds_sphere;
         const glm::vec3 ctr(s.x, s.y, s.z);
-        const glm::vec3 ext(s.w);
+        // Hidden clusters (plant templates in object space, the dynamic
+        // plant tail) have no world-space footprint: a point box.
+        const glm::vec3 ext(s.w > 0.0f ? s.w : 0.0f);
         prims[i] = { ctr - ext, ctr + ext, ctr, i };
     }
 
@@ -5914,6 +5929,11 @@ void ClusterRenderer::buildHwRtShadowAs() {
     for (uint32_t ci = 0; ci < total_clusters_all_meshes_; ++ci) {
         const glsl::ClusterDrawInfo& draw = staging_draw_infos_[ci];
         if (draw.material_idx >= staging_material_params_.size()) continue;
+        // Plant templates sit in OBJECT space and the dynamic plant tail
+        // is rewritten per frame: neither belongs in a static BLAS (the
+        // instanced RT casters cover the plants).
+        if (ci < staging_cull_infos_.size() &&
+            staging_cull_infos_[ci].bounds_sphere.w < 0.0f) continue;
         const glsl::BindlessMaterialParams& m =
             staging_material_params_[draw.material_idx];
         const uint32_t flags = static_cast<uint32_t>(m.flags);
@@ -7413,6 +7433,293 @@ bool ClusterRenderer::verifyIndirectCommands(uint32_t max_commands_to_check) con
     }
     device_->unmapMemory(indirect_draw_buffer_.memory);
     return all_ok;
+}
+
+
+// ═════════════════════════════════════════════════════════════════════
+// PLANTS ON THE CLUSTER PATH — templates, dynamic tail, expand pass
+// ═════════════════════════════════════════════════════════════════════
+uint32_t ClusterRenderer::registerPlantTemplate(
+    const helper::ClusterMesh& cluster_mesh,
+    const game_object::DrawableData& drawable_data,
+    uint32_t mesh_idx,
+    const std::vector<uint32_t>& cluster_prim_map) {
+    if (cluster_mesh.empty() || !cluster_mesh.source) return UINT32_MAX;
+    const uint32_t gid = uploaded_mesh_count_;
+    const uint32_t v_before = uint32_t(staging_vertices_.size());
+    const uint32_t c_before = uint32_t(staging_cull_infos_.size());
+    uploadMeshClusters(cluster_mesh, drawable_data, mesh_idx, cluster_prim_map,
+                       glm::mat4(1.0f), 0.0f);
+    if (uploaded_mesh_count_ == gid) return UINT32_MAX;   // upload declined
+    PlantTemplate t;
+    t.gid = gid;
+    t.cluster_first = c_before;
+    t.cluster_count = uint32_t(staging_cull_infos_.size()) - c_before;
+    t.vertex_first  = v_before;
+    t.vertex_count  = uint32_t(staging_vertices_.size()) - v_before;
+    // The template's materials read the tree age from the dynamic
+    // cluster's ClusterDrawInfo.object_idx (see clusterTreeLife in
+    // cluster_cutout.glsl.h): tree_life.y = 1 is the switch.
+    if (gid < mesh_prim_material_.size()) {
+        for (const auto& kv : mesh_prim_material_[gid]) {
+            if (kv.second < staging_material_params_.size())
+                staging_material_params_[kv.second].tree_life.y = 1.0f;
+        }
+    }
+    plant_templates_.push_back(t);
+    plant_desc_dirty_ = true;
+    return uint32_t(plant_templates_.size() - 1);
+}
+
+void ClusterRenderer::setPlantDynamicBudget(uint32_t max_clusters, uint32_t max_vertices) {
+    plant_dyn_cluster_cap_ = max_clusters;
+    plant_dyn_vertex_cap_  = max_vertices;
+    plant_work_cap_ = max_clusters;                       // one work entry per dynamic cluster
+    plant_job_cap_  = std::max(1u, max_clusters / 2u);    // a template has >= 2 clusters in practice; generous
+}
+
+void ClusterRenderer::setPlantHandoff(const glm::vec3& eye, float radius_m) {
+    plant_eye_ = eye;
+    plant_radius_m_ = radius_m;
+    if (!plant_params_buffer_.buffer) return;
+    glsl::PlantJobParams p{};
+    p.eye_radius = glm::vec4(eye, plantPathReady() ? radius_m : 0.0f);
+    p.job_cap = plant_job_cap_;
+    p.work_cap = plant_work_cap_;
+    p.cluster_cap = plant_dyn_cluster_cap_;
+    p.vertex_cap = plant_dyn_vertex_cap_;
+    p.dyn_cluster_first = plant_dyn_cluster_first_;
+    p.dyn_vertex_first = plant_dyn_vertex_first_;
+    p.template_count = uint32_t(plant_templates_.size());
+    device_->updateBufferMemory(plant_params_buffer_.memory, sizeof(p), &p, 0, true);
+}
+
+void ClusterRenderer::padPlantDynamicStaging() {
+    if (plant_dyn_cluster_cap_ == 0 || plant_dyn_vertex_cap_ == 0) return;
+    // A previous finalize's pad still at the tail is replaced, not stacked.
+    if (plant_pad_cluster_start_ != UINT32_MAX &&
+        staging_cull_infos_.size() == size_t(plant_pad_cluster_start_) + plant_dyn_cluster_cap_ &&
+        staging_draw_infos_.size() == staging_cull_infos_.size() &&
+        staging_vertices_.size()  == size_t(plant_pad_vertex_start_) + plant_dyn_vertex_cap_) {
+        staging_cull_infos_.resize(plant_pad_cluster_start_);
+        staging_draw_infos_.resize(plant_pad_cluster_start_);
+        staging_vertices_.resize(plant_pad_vertex_start_);
+    }
+    plant_pad_cluster_start_ = uint32_t(staging_cull_infos_.size());
+    plant_pad_vertex_start_  = uint32_t(staging_vertices_.size());
+    plant_dyn_cluster_first_ = plant_pad_cluster_start_;
+    plant_dyn_vertex_first_  = plant_pad_vertex_start_;
+    glsl::ClusterCullInfo hidden{};
+    hidden.bounds_sphere = glm::vec4(0.0f, 0.0f, 0.0f, -1e30f);
+    hidden.cone_axis_cutoff = glm::vec4(0.0f, 0.0f, 0.0f, -1.0f);
+    glsl::ClusterDrawInfo empty{};
+    staging_cull_infos_.insert(staging_cull_infos_.end(), plant_dyn_cluster_cap_, hidden);
+    staging_draw_infos_.insert(staging_draw_infos_.end(), plant_dyn_cluster_cap_, empty);
+    staging_vertices_.resize(staging_vertices_.size() + plant_dyn_vertex_cap_, BindlessVertex{});
+    clog_printf("[PLANT_CLUSTER] dynamic tail reserved: %u clusters @ %u, %u vertices @ %u\n",
+                plant_dyn_cluster_cap_, plant_dyn_cluster_first_,
+                plant_dyn_vertex_cap_, plant_dyn_vertex_first_);
+}
+
+void ClusterRenderer::finalizePlantTemplates() {
+    if (plant_templates_.empty() || plant_dyn_cluster_cap_ == 0) return;
+    // Hide every template: the cull never draws object-space geometry.
+    for (const auto& t : plant_templates_) setMeshClustersHidden(t.gid, true);
+    std::vector<glsl::PlantTemplateInfo> infos(plant_templates_.size());
+    std::vector<uint32_t> bounds_first(plant_templates_.size());
+    std::vector<glsl::ClusterCullInfo> tbounds;
+    uint32_t acc = 0;
+    for (size_t i = 0; i < plant_templates_.size(); ++i) {
+        const auto& t = plant_templates_[i];
+        infos[i].cluster_first = t.cluster_first;
+        infos[i].cluster_count = t.cluster_count;
+        infos[i].vertex_first  = t.vertex_first;
+        infos[i].vertex_count  = t.vertex_count;
+        bounds_first[i] = acc;
+        // The templates' ORIGINAL (object-space) bounds: the hide above
+        // overwrote them in the GPU cull infos; the expand reads these.
+        for (uint32_t c = 0; c < t.cluster_count; ++c)
+            tbounds.push_back(staging_cull_infos_[t.cluster_first + c]);
+        acc += t.cluster_count;
+    }
+    ensureSSBO(device_, plant_template_buffer_,
+               infos.size() * sizeof(glsl::PlantTemplateInfo), infos.data());
+    ensureSSBO(device_, plant_template_bounds_buffer_,
+               std::max<size_t>(1, tbounds.size()) * sizeof(glsl::ClusterCullInfo),
+               tbounds.empty() ? nullptr : tbounds.data());
+    ensureSSBO(device_, plant_template_bounds_first_buffer_,
+               bounds_first.size() * sizeof(uint32_t), bounds_first.data());
+    // Job / work / counters / params exist once (sized from the budget).
+    if (!plant_job_buffer_.buffer) {
+        plant_job_buffer_ = createSSBO(device_, uint64_t(plant_job_cap_) * sizeof(glsl::PlantExpandJob), nullptr);
+        plant_work_buffer_ = createSSBO(device_, uint64_t(plant_work_cap_) * sizeof(glm::uvec2), nullptr);
+        er::Helper::createBuffer(
+            device_,
+            SET_3_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, INDIRECT_BUFFER_BIT, TRANSFER_DST_BIT),
+            SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
+            0, plant_counters_buffer_.buffer, plant_counters_buffer_.memory,
+            std::source_location::current(),
+            uint64_t(PLANT_CTR_COUNT) * sizeof(uint32_t));
+        er::Helper::createBuffer(
+            device_,
+            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+            SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+            0, plant_params_buffer_.buffer, plant_params_buffer_.memory,
+            std::source_location::current(),
+            sizeof(glsl::PlantJobParams));
+        plant_counters_primed_ = false;
+    }
+    plant_desc_dirty_ = true;
+    setPlantHandoff(plant_eye_, plant_radius_m_);
+    clog_printf("[PLANT_CLUSTER] %zu templates finalized (%u template clusters)\n",
+                plant_templates_.size(), acc);
+}
+
+void ClusterRenderer::initPlantExpandPipeline(
+    const renderer::DescriptorSetLayoutList& global_desc_set_layouts) {
+    if (plant_expand_pipeline_ != nullptr) return;
+    if (global_desc_set_layouts.size() <= VIEW_PARAMS_SET) return;
+    auto ssbo_layout = [&](uint32_t n) {
+        std::vector<er::DescriptorSetLayoutBinding> b(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            b[i] = er::helper::getBufferDescriptionSetLayoutBinding(
+                i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                er::DescriptorType::STORAGE_BUFFER);
+        }
+        return device_->createDescriptorSetLayout(b);
+    };
+    // set 2 (expand) / set 1 (compact): 0 params, 1 counters, 2 jobs, 3 work, 4 templates
+    plant_job_layout_ = ssbo_layout(5);
+    // set 3 (expand): 0 cull infos, 1 draw infos, 2 merged vertices,
+    // 3 template bounds, 4 template bounds first
+    plant_merged_layout_ = ssbo_layout(5);
+    renderer::DescriptorSetLayoutList layouts = {
+        global_desc_set_layouts[PBR_GLOBAL_PARAMS_SET],
+        global_desc_set_layouts[VIEW_PARAMS_SET],
+        plant_job_layout_,
+        plant_merged_layout_ };
+    plant_expand_pipeline_layout_ = er::helper::createComputePipelineLayout(
+        device_, layouts, sizeof(glsl::PlantExpandPush));
+    try {
+        plant_expand_pipeline_ = er::helper::createComputePipeline(
+            device_, plant_expand_pipeline_layout_,
+            "plant_cluster_expand_comp.spv", std::source_location::current());
+    } catch (const std::exception& e) {
+        plant_expand_pipeline_ = nullptr;
+        clog_printf("[PLANT_CLUSTER] plant_cluster_expand_comp.spv unavailable (%s) -- "
+                    "plants stay on the drawable path\n", e.what());
+    }
+    plant_desc_dirty_ = true;
+}
+
+void ClusterRenderer::writePlantDescriptors() {
+    if (!plant_job_layout_ || !plant_job_buffer_.buffer || !cull_info_buffer_.buffer ||
+        !plant_template_buffer_.buffer) return;
+    if (!plant_job_set_)
+        plant_job_set_ = device_->createDescriptorSets(descriptor_pool_, plant_job_layout_, 1)[0];
+    if (!plant_merged_set_)
+        plant_merged_set_ = device_->createDescriptorSets(descriptor_pool_, plant_merged_layout_, 1)[0];
+    er::WriteDescriptorList writes;
+    writes.reserve(10);
+    auto add = [&](const std::shared_ptr<er::DescriptorSet>& set, uint32_t binding,
+                   const renderer::BufferInfo& buf) {
+        er::Helper::addOneBuffer(writes, set, er::DescriptorType::STORAGE_BUFFER,
+                                 binding, buf.buffer, buf.buffer->getSize());
+    };
+    add(plant_job_set_, 0, plant_params_buffer_);
+    add(plant_job_set_, 1, plant_counters_buffer_);
+    add(plant_job_set_, 2, plant_job_buffer_);
+    add(plant_job_set_, 3, plant_work_buffer_);
+    add(plant_job_set_, 4, plant_template_buffer_);
+    add(plant_merged_set_, 0, cull_info_buffer_);
+    add(plant_merged_set_, 1, draw_info_buffer_);
+    add(plant_merged_set_, 2, merged_vertex_buffer_);
+    add(plant_merged_set_, 3, plant_template_bounds_buffer_);
+    add(plant_merged_set_, 4, plant_template_bounds_first_buffer_);
+    device_->updateDescriptorSets(writes);
+    plant_desc_dirty_ = false;
+}
+
+void ClusterRenderer::recordPlantExpand(
+    const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+    const std::shared_ptr<renderer::DescriptorSet>& pbr_desc_set,
+    const std::shared_ptr<renderer::DescriptorSet>& view_desc_set,
+    float time_s) {
+    if (plant_expand_pipeline_ == nullptr || plant_dyn_cluster_cap_ == 0 ||
+        plant_templates_.empty() || !gpu_ready_ || !cull_info_buffer_.buffer ||
+        !plant_job_buffer_.buffer) {
+        return;
+    }
+    if (plant_desc_dirty_ || !plant_job_set_ || !plant_merged_set_) writePlantDescriptors();
+    if (!plant_job_set_ || !plant_merged_set_) return;
+
+    const renderer::BufferResourceInfo prev_read = {
+        SET_3_FLAG_BITS(Access, SHADER_READ_BIT, INDIRECT_COMMAND_READ_BIT, VERTEX_ATTRIBUTE_READ_BIT),
+        SET_4_FLAG_BITS(PipelineStage, COMPUTE_SHADER_BIT, VERTEX_INPUT_BIT, VERTEX_SHADER_BIT, DRAW_INDIRECT_BIT) |
+        SET_3_FLAG_BITS(PipelineStage, FRAGMENT_SHADER_BIT, TASK_SHADER_BIT_EXT, MESH_SHADER_BIT_EXT) };
+    const renderer::BufferResourceInfo compute_rw = {
+        SET_2_FLAG_BITS(Access, SHADER_READ_BIT, SHADER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, COMPUTE_SHADER_BIT) };
+    const renderer::BufferResourceInfo indirect_read = {
+        SET_FLAG_BIT(Access, INDIRECT_COMMAND_READ_BIT),
+        SET_FLAG_BIT(PipelineStage, DRAW_INDIRECT_BIT) };
+    const renderer::BufferResourceInfo transfer_write = {
+        SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
+        SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+
+    // First use: the counters start at zero.
+    if (!plant_counters_primed_) {
+        cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, compute_rw, transfer_write);
+        cmd_buf->fillBuffer(plant_counters_buffer_.buffer, 0,
+                            uint64_t(PLANT_CTR_COUNT) * sizeof(uint32_t), 0u);
+        cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, transfer_write, compute_rw);
+        plant_counters_primed_ = true;
+    }
+
+    cmd_buf->addBufferBarrier(cull_info_buffer_.buffer, prev_read, compute_rw);
+    cmd_buf->addBufferBarrier(draw_info_buffer_.buffer, prev_read, compute_rw);
+    cmd_buf->addBufferBarrier(merged_vertex_buffer_.buffer, prev_read, compute_rw);
+    // Last frame's compaction wrote the jobs / work / counters.
+    cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, compute_rw, compute_rw);
+    cmd_buf->addBufferBarrier(plant_job_buffer_.buffer, compute_rw, compute_rw);
+    cmd_buf->addBufferBarrier(plant_work_buffer_.buffer, compute_rw, compute_rw);
+
+    cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE, plant_expand_pipeline_);
+    cmd_buf->bindDescriptorSets(renderer::PipelineBindPoint::COMPUTE,
+                                plant_expand_pipeline_layout_,
+                                { pbr_desc_set, view_desc_set, plant_job_set_, plant_merged_set_ }, 0);
+    glsl::PlantExpandPush push{};
+    push.dyn_cluster_first = plant_dyn_cluster_first_;
+    push.dyn_cluster_count = plant_dyn_cluster_cap_;
+    push.work_cap = plant_work_cap_;
+    push.time_s = time_s;
+
+    // Phase 0: hide the tail, write the indirect dispatch.
+    push.phase = 0u;
+    cmd_buf->pushConstants(SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                           plant_expand_pipeline_layout_, &push, sizeof(push));
+    cmd_buf->dispatch((plant_dyn_cluster_cap_ + 127u) / 128u, 1u, 1u);
+    cmd_buf->addBufferBarrier(cull_info_buffer_.buffer, compute_rw, compute_rw);
+    cmd_buf->addBufferBarrier(draw_info_buffer_.buffer, compute_rw, compute_rw);
+    cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, compute_rw, indirect_read);
+    // Phase 1: expand (indirect: one workgroup per work entry).
+    push.phase = 1u;
+    cmd_buf->pushConstants(SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                           plant_expand_pipeline_layout_, &push, sizeof(push));
+    cmd_buf->dispatchIndirect(plant_counters_buffer_.buffer,
+                              uint64_t(PLANT_CTR_DISPATCH) * sizeof(uint32_t));
+    cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, indirect_read, compute_rw);
+    cmd_buf->addBufferBarrier(plant_job_buffer_.buffer, compute_rw, compute_rw);
+    cmd_buf->addBufferBarrier(plant_work_buffer_.buffer, compute_rw, compute_rw);
+    // Phase 2: reset the counters for this frame's compaction.
+    push.phase = 2u;
+    cmd_buf->pushConstants(SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                           plant_expand_pipeline_layout_, &push, sizeof(push));
+    cmd_buf->dispatch(1u, 1u, 1u);
+    cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, compute_rw, compute_rw);
+    cmd_buf->addBufferBarrier(cull_info_buffer_.buffer, compute_rw, prev_read);
+    cmd_buf->addBufferBarrier(draw_info_buffer_.buffer, compute_rw, prev_read);
+    cmd_buf->addBufferBarrier(merged_vertex_buffer_.buffer, compute_rw, prev_read);
 }
 
 } // namespace scene_rendering

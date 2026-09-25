@@ -213,6 +213,18 @@ static bool downscalePreviewPixels(
     return true;
 }
 
+// Relief materials need a resident height map even when albedo uses VT.
+// Return 2 for ORM-height, 1 for albedo, 0 for ordinary preview textures.
+static int nativeSurfaceTextureRole(const engine::helper::ModelPreviewData& md, size_t ti) {
+    int role = 0;
+    for (const auto& section : md.sections) {
+        if ((section.flags & engine::helper::kSecDepthSurface) == 0) continue;
+        if (section.mr_index == int(ti)) return 2;
+        if (section.tex_index == int(ti)) role = 1;
+    }
+    return role;
+}
+
 namespace ego = engine::game_object;
 // Every rung near-distance seen per category, across all loaded files:
 // the debug ordinal is a node's position in its category's set.
@@ -8165,6 +8177,7 @@ struct NodeTableGpu {
     // bucket's first slot and its capacity = max(fwd refs, depth refs).
     std::vector<glsl::ModelParams> stage_records;
     std::vector<glsl::NtCullInfo>  stage_infos;
+    std::vector<uint32_t>          stage_rec_template;   // per record: plant template or 0xFFFFFFFF
     std::vector<uint32_t>          stage_class_idx;
     std::vector<glm::uvec2>        stage_prim_bases;
     std::vector<uint32_t>          cnt_fwd;   // per gp: fwd-class references
@@ -8179,6 +8192,7 @@ struct NodeTableGpu {
     // ── GPU copies, double-buffered by frame parity ───────────────────
     renderer::BufferInfo records[2];
     renderer::BufferInfo infos[2];
+    renderer::BufferInfo rec_template[2];
     renderer::BufferInfo class_idx[2];
     renderer::BufferInfo prim_bases[2];
     uint64_t uploaded_version[2] = { ~uint64_t(0), ~uint64_t(0) };
@@ -8249,6 +8263,22 @@ struct NodeTableGpu {
 static std::shared_ptr<renderer::DescriptorSetLayout> s_nt_compact_desc_set_layout;
 static std::shared_ptr<renderer::PipelineLayout>      s_nt_compact_pipeline_layout;
 static std::shared_ptr<renderer::Pipeline>            s_nt_compact_pipeline;
+// nt_instance_compact.comp set 1: the plant cluster hand-off (params,
+// counters, jobs, work, templates) -- layout-compatible with
+// ClusterRenderer::plantJobDescriptorSetLayout().  When the cluster
+// path is off a dummy set (one small zeroed buffer on every binding:
+// radius 0 = hand nothing off) keeps the binding valid.
+static std::shared_ptr<renderer::DescriptorSetLayout> s_nt_plant_desc_set_layout;
+static std::shared_ptr<renderer::DescriptorSet>       s_nt_plant_dummy_set;
+static renderer::BufferInfo                           s_nt_plant_dummy_buffer;
+static std::shared_ptr<renderer::DescriptorSet>       s_nt_plant_job_set;
+// Bumped whenever MeshInfo::plant_template_idx_ changes (the placed
+// sync re-registers templates): folded into the record staging version
+// so every drawable restages its per-record template table.
+static uint32_t s_plant_template_gen = 0;
+void engine::game_object::DrawableObject::setPlantClusterJobSet(
+    const std::shared_ptr<renderer::DescriptorSet>& set) { s_nt_plant_job_set = set; }
+void engine::game_object::DrawableObject::bumpPlantTemplateGen() { ++s_plant_template_gen; }
 
 // VS side: the record table + the bucket slot table (NODE_TABLE_PARAMS_SET).
 static std::shared_ptr<renderer::DescriptorSetLayout> createNodeTableDescSetLayout(
@@ -8287,11 +8317,11 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
 
 // nt_instance_compact.comp set 0: 0 infos, 1 cmd_src, 2 class_idx,
 // 3 class_prefix, 4 records, 5 inst_src, 6 age_src, 7 inst_dst,
-// 8 age_dst, 9 rec_counts.
+// 8 age_dst, 9 rec_counts, 10 rec_template (plant cluster hand-off).
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCompactDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(10);
-    for (uint32_t i = 0; i < 10; ++i) {
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(11);
+    for (uint32_t i = 0; i < 11; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -8363,6 +8393,7 @@ static void ntReleaseGpu(
     for (int p = 0; p < 2; ++p) {
         nt.records[p].destroy(device);
         nt.infos[p].destroy(device);
+        nt.rec_template[p].destroy(device);
         nt.class_idx[p].destroy(device);
         nt.prim_bases[p].destroy(device);
         nt.cull_desc_sets[p].reset();
@@ -8486,7 +8517,8 @@ static void ntStageRecords(
     // restages AND re-uploads every record (the upload compares this
     // same value).
     const uint64_t want_version =
-        object_->lod_pass_version_ ^ (uint64_t(s_lod_debug_gen) << 48);
+        object_->lod_pass_version_ ^ (uint64_t(s_lod_debug_gen) << 48) ^
+        (uint64_t(s_plant_template_gen) << 40);
     if (nt.staged_version == want_version &&
         std::memcmp(&nt.staged_iw, &iw, sizeof(glm::mat4)) == 0) {
         return;
@@ -8509,6 +8541,7 @@ static void ntStageRecords(
 
     nt.stage_records.clear();
     nt.stage_infos.clear();
+    nt.stage_rec_template.clear();
     nt.stage_class_idx.clear();
     nt.stage_records.reserve(fwd.size() + dep.size() / 8u + 16u);
     nt.stage_infos.reserve(fwd.size() + dep.size() / 8u + 16u);
@@ -8598,6 +8631,10 @@ static void ntStageRecords(
 
         nt.stage_records.push_back(r);
         nt.stage_infos.push_back(ci);
+        {
+            const int32_t t = object_->meshes_[mesh_idx].plant_template_idx_;
+            nt.stage_rec_template.push_back(t >= 0 ? uint32_t(t) : 0xFFFFFFFFu);
+        }
         return uint32_t(nt.stage_records.size() - 1);
     };
     auto count_prims = [&](uint32_t fi, std::vector<uint32_t>& cnt) {
@@ -8751,6 +8788,9 @@ static void ntEnsureBuffers(
                 device, uint64_t(cap) * sizeof(glsl::ModelParams));
             nt.infos[p] = ntCreateHostBuffer(
                 device, uint64_t(cap) * sizeof(glsl::NtCullInfo));
+            ntRetire(nt, nt.rec_template[p], serial);
+            nt.rec_template[p] = ntCreateHostBuffer(
+                device, uint64_t(cap) * sizeof(uint32_t));
             nt.uploaded_version[p] = ~uint64_t(0);
             nt.desc_dirty[p] = true;
         }
@@ -8848,6 +8888,10 @@ static void ntUploadParity(
             nt.infos[parity].memory,
             uint64_t(nt.record_count) * sizeof(glsl::NtCullInfo),
             nt.stage_infos.data());
+        device->updateBufferMemory(
+            nt.rec_template[parity].memory,
+            uint64_t(nt.record_count) * sizeof(uint32_t),
+            nt.stage_rec_template.data());
     }
     if (!nt.stage_class_idx.empty()) {
         device->updateBufferMemory(
@@ -8928,6 +8972,7 @@ static void ntWriteDescriptorSets(
         add(ks, 7, nt.compact_inst);
         add(ks, 8, nt.compact_age);
         add(ks, 9, nt.rec_counts);
+        add(ks, 10, nt.rec_template[parity]);
     }
     add(nt.vs_desc_sets[parity], NODE_TABLE_PARAMS_BINDING, nt.records[parity]);
     add(nt.vs_desc_sets[parity], NODE_TABLE_SLOTS_BINDING, nt.slots);
@@ -10112,11 +10157,20 @@ void DrawableObject::createStaticMembers(
         if (s_nt_compact_desc_set_layout == nullptr) {
             s_nt_compact_desc_set_layout = createNtCompactDescSetLayout(device);
         }
+        if (s_nt_plant_desc_set_layout == nullptr) {
+            std::vector<renderer::DescriptorSetLayoutBinding> pb(5);
+            for (uint32_t i = 0; i < 5; ++i) {
+                pb[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+                    i, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+                    renderer::DescriptorType::STORAGE_BUFFER);
+            }
+            s_nt_plant_desc_set_layout = device->createDescriptorSetLayout(pb);
+        }
         if (s_nt_compact_pipeline_layout == nullptr) {
             s_nt_compact_pipeline_layout =
                 renderer::helper::createComputePipelineLayout(
                     device,
-                    { s_nt_compact_desc_set_layout },
+                    { s_nt_compact_desc_set_layout, s_nt_plant_desc_set_layout },
                     sizeof(glsl::NtCompactPushConstants));
         }
         if (s_nt_compact_pipeline == nullptr) {
@@ -12228,16 +12282,44 @@ void DrawableObject::ntPrepare(
             world_planes = 6u;
         }
         kpc.eye = glm::vec4(s_plant_lod_eye_ws, 1.0f);
-        kpc.flags = world_planes | NT_COMPACT_BAND_TEST;
+        kpc.flags = world_planes | NT_COMPACT_BAND_TEST |
+                    // Hand-off once per frame: the G-buffer pass appends
+                    // the jobs; every other camera pass (forward-covered,
+                    // glass) drops the same instances so they are not
+                    // drawn twice.
+                    ((draw_mode == DrawMode::kGBuffer) ? NT_COMPACT_PLANT_HANDOFF
+                                                       : NT_COMPACT_PLANT_SKIP);
         kpc.record_first = class_first;
         kpc.record_count = class_count;
         kpc.inst_total = inst_total;
         cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE,
                               s_nt_compact_pipeline);
+        // Set 1: the plant cluster hand-off.  Without a cluster path
+        // a dummy set with radius 0 keeps the binding valid.
+        if (!s_nt_plant_dummy_set) {
+            renderer::Helper::createBuffer(
+                device,
+                SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
+                SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
+                0, s_nt_plant_dummy_buffer.buffer, s_nt_plant_dummy_buffer.memory,
+                std::source_location::current(), 256);
+            std::vector<uint8_t> zero(256, 0);
+            device->updateBufferMemory(s_nt_plant_dummy_buffer.memory, 256, zero.data(), 0, true);
+            s_nt_plant_dummy_set = device->createDescriptorSets(
+                object_->shared_descriptor_pool_, s_nt_plant_desc_set_layout, 1)[0];
+            renderer::WriteDescriptorList dw;
+            for (uint32_t b = 0; b < 5; ++b) {
+                renderer::Helper::addOneBuffer(
+                    dw, s_nt_plant_dummy_set, renderer::DescriptorType::STORAGE_BUFFER,
+                    b, s_nt_plant_dummy_buffer.buffer, 256);
+            }
+            device->updateDescriptorSets(dw);
+        }
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
             s_nt_compact_pipeline_layout,
-            { nt.compact_desc_sets[parity] },
+            { nt.compact_desc_sets[parity],
+              s_nt_plant_job_set ? s_nt_plant_job_set : s_nt_plant_dummy_set },
             0);
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -13184,10 +13266,12 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
     for (size_t ti = 0; ti < md.textures.size() && ti < tex_paths.size();
          ++ti) {
         auto& dst = drawable_object->textures_[ti];
+        const int surface_role = nativeSurfaceTextureRole(md, ti);
 
         std::string key = std::filesystem::path(tex_paths[ti])
                               .lexically_normal().generic_string();
         for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+        if (surface_role) key += surface_role == 2 ? "#surface-height" : "#surface-color";
 
         {
             std::lock_guard<std::mutex> lk(s_rwtex_cache_mutex);
@@ -13204,6 +13288,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             tb.w <= 0 || tb.h <= 0) {
             continue;
         }
+        if (surface_role)
+            helper::restoreRwTexSurfaceDetail(tex_paths[ti], tb, surface_role == 2);
         dst.size = glm::uvec3(uint32_t(tb.w), uint32_t(tb.h), 1u);
         dst.linear = false;   // base colour → sRGB semantics
         dst.source_filename_ = tex_paths[ti];
@@ -13289,7 +13375,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
         }
 
         // Depth/PBR cards need a linear ORM-depth sample even before VT
-        // takeover. Keep only the same <=128px preview used by hierarchy loads.
+        // takeover. Relief materials retain up to 1024px; ordinary cards use 128px.
         const bool depth_preview = std::any_of(md.sections.begin(),md.sections.end(),
             [ti](const auto& section) {
                 return (section.flags & (engine::helper::kSecDepthPbr | engine::helper::kSecLeafMask)) != 0 &&
@@ -13300,7 +13386,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwObjModel(
             std::vector<unsigned char> small;
             int w=0,h=0;
             const bool scaled=downscalePreviewPixels(tb.preview_rgba,
-                tb.preview_w,tb.preview_h,128,small,w,h);
+                tb.preview_w,tb.preview_h,surface_role ? 1024 : 128,small,w,h);
             uint32_t mips=1;
             uploadPreviewMips(device,
                 renderer::Format::R8G8B8A8_UNORM,
@@ -14169,9 +14255,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
         for (size_t ti = 0; ti < md.textures.size() && ti < tex_paths.size();
              ++ti) {
             auto& dst = drawable_object->textures_[tex_base + ti];
+            const int surface_role = nativeSurfaceTextureRole(md, ti);
             std::string key = fs::path(tex_paths[ti])
                                   .lexically_normal().generic_string();
             for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+            if (surface_role) key += surface_role == 2 ? "#surface-height" : "#surface-color";
             tex_cutout.resize(drawable_object->textures_.size(), 0);
             auto cit = tex_gpu_cache.find(key);
             if (cit != tex_gpu_cache.end()) {
@@ -14187,6 +14275,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
                 tb.w <= 0 || tb.h <= 0)
                 continue;
+            if (surface_role)
+                helper::restoreRwTexSurfaceDetail(tex_paths[ti], tb, surface_role == 2);
             // ── Content dedup ───────────────────────────────────────
             // PCG bakes write one .rwtex per SOURCE SLOT, so a tree
             // group carries thousands of byte-identical files (a
@@ -14205,6 +14295,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             const int32_t dims[4] = {tb.w, tb.h, tb.preview_w,
                                      tb.preview_h};
             fnv(dims, sizeof(dims));
+            fnv(&surface_role, sizeof(surface_role)); // residency resolution is part of identity
             fnv(tb.preview_rgba.data(), tb.preview_rgba.size());
             fnv(tb.alpha.data(), tb.alpha.size());
             if (tb.bc7_tiles)
@@ -14256,13 +14347,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
                 tb.preview_h > 0 &&
                 tb.preview_rgba.size() >=
                     size_t(tb.preview_w) * size_t(tb.preview_h) * 4u) {
-                // VRAM: cap the stopgap image at 128² (box filter) —
-                // ~4 000 unique .rwtex at 256² was ~1 GB.
+                // Ordinary stopgap images stay at 128px. Surface relief uses
+                // up to 1024px: this image also drives POM and normals.
                 std::vector<unsigned char> ds_pixels;
                 int ds_w = 0, ds_h = 0;
                 const bool scaled = downscalePreviewPixels(
                     tb.preview_rgba, tb.preview_w, tb.preview_h,
-                    128, ds_pixels, ds_w, ds_h);
+                    surface_role ? 1024 : 128, ds_pixels, ds_w, ds_h);
                 // Full mip chain (blit-generated): without it the
                 // 16x anisotropic sampler minifies mip 0 only and
                 // distant foliage shimmers/aliases.  The shared
@@ -14987,9 +15078,11 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
         for (size_t ti = 0; ti < md.textures.size() &&
                             ti < tex_paths.size(); ++ti) {
             auto& dst = drawable_object->textures_[tex_base + ti];
+            const int surface_role = nativeSurfaceTextureRole(md, ti);
             std::string key = fs::path(tex_paths[ti])
                                   .lexically_normal().generic_string();
             for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+            if (surface_role) key += surface_role == 2 ? "#surface-height" : "#surface-color";
             tex_cutout.resize(drawable_object->textures_.size(), 0);
             auto cit = tex_gpu_cache.find(key);
             if (cit != tex_gpu_cache.end()) {
@@ -15005,6 +15098,8 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             if (!helper::readRwTexBaked(tex_paths[ti], tb) ||
                 tb.w <= 0 || tb.h <= 0)
                 continue;
+            if (surface_role)
+                helper::restoreRwTexSurfaceDetail(tex_paths[ti], tb, surface_role == 2);
             // ── Content dedup ───────────────────────────────────────
             // PCG bakes write one .rwtex per SOURCE SLOT, so a tree
             // group carries thousands of byte-identical files (a
@@ -15023,6 +15118,7 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             const int32_t dims[4] = {tb.w, tb.h, tb.preview_w,
                                      tb.preview_h};
             fnv(dims, sizeof(dims));
+            fnv(&surface_role, sizeof(surface_role)); // residency resolution is part of identity
             fnv(tb.preview_rgba.data(), tb.preview_rgba.size());
             fnv(tb.alpha.data(), tb.alpha.size());
             if (tb.bc7_tiles)
@@ -15074,13 +15170,13 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
                 tb.preview_h > 0 &&
                 tb.preview_rgba.size() >=
                     size_t(tb.preview_w) * size_t(tb.preview_h) * 4u) {
-                // VRAM: cap the stopgap image at 128² (box filter) —
-                // ~4 000 unique .rwtex at 256² was ~1 GB.
+                // Ordinary stopgap images stay at 128px. Surface relief uses
+                // up to 1024px: this image also drives POM and normals.
                 std::vector<unsigned char> ds_pixels;
                 int ds_w = 0, ds_h = 0;
                 const bool scaled = downscalePreviewPixels(
                     tb.preview_rgba, tb.preview_w, tb.preview_h,
-                    128, ds_pixels, ds_w, ds_h);
+                    surface_role ? 1024 : 128, ds_pixels, ds_w, ds_h);
                 // Full mip chain (blit-generated): without it the
                 // 16x anisotropic sampler minifies mip 0 only and
                 // distant foliage shimmers/aliases.  The shared

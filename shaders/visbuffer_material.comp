@@ -104,6 +104,7 @@ void main() {
 
     ClusterDrawInfo di = draw_infos[cluster_idx];
     uint mat_idx  = di.material_idx;
+    cluster_tree_age_g = uintBitsToFloat(di.object_idx);
     int  mat_flags = material_params[mat_idx].flags;
 
     // ── Rebuild the triangle ─────────────────────────────────────────

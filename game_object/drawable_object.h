@@ -307,6 +307,11 @@ struct MeshInfo {
     // ClusterRenderer per-mesh index. Set during cluster upload in
     // application.cpp. -1 means this mesh has no cluster data.
     int32_t cluster_global_mesh_idx_ = -1;
+    // Plants on the cluster path: the ClusterRenderer plant TEMPLATE
+    // registered for this mesh (ClusterRenderer::registerPlantTemplate),
+    // -1 = none.  The node-table instance compaction hands instances of
+    // nodes whose mesh has one to the cluster expand pass.
+    int32_t plant_template_idx_ = -1;
 };
 
 // One per-instance world transform, byte-identical to glsl::Instance-
@@ -1535,6 +1540,12 @@ public:
     // submitting each node's full list and rejecting per vertex.
     static void setNtCompactEnabled(bool on);
     static bool ntCompactEnabled();
+    // Plants on the cluster path: the ClusterRenderer's plant job set
+    // (nt_instance_compact.comp set 1).  Null = hand nothing off (a
+    // dummy set with a zero radius is bound instead).
+    static void setPlantClusterJobSet(const std::shared_ptr<renderer::DescriptorSet>& set);
+    // Call after MeshInfo::plant_template_idx_ values changed.
+    static void bumpPlantTemplateGen();
     // Frame-ahead occlusion for the node-table cull: the Hi-Z pyramid the
     // camera passes test node spheres against (node_table_cull.comp
     // binding 9) and the view_proj of the frame it was built for.  The

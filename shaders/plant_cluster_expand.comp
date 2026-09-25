@@ -1,0 +1,145 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+// ── plant_cluster_expand.comp ───────────────────────────────────────
+// Plants on the cluster path.  The node-table instance compaction
+// (nt_instance_compact.comp) hands every surviving plant instance
+// within the hand-off radius to this pass as a JOB (plus one WORK entry
+// per template cluster, and reserves its dynamic cluster / vertex
+// ranges with atomics).  Here, one workgroup per work entry: every
+// thread transforms one template vertex into world space (instance
+// transform, then the vegetation sway -- the same math as base.vert)
+// into the job's dynamic vertex range; thread 0 writes the live
+// ClusterCullInfo / ClusterDrawInfo of the dynamic cluster.
+//
+//   phase 0  one thread per dynamic cluster: hide the whole tail
+//            (bounds_sphere.w < 0) so a slot no job claims is culled,
+//            and thread 0 writes the phase-1 indirect dispatch.
+//   phase 1  (indirect) expand.
+//   phase 2  reset the counters for the compaction that follows.
+//
+// Set 0 = PBR global (the wind clipmap for the sway), set 1 = view
+// camera, set 2 = plant buffers (shared with the compaction's set 1),
+// set 3 = the cluster renderer's merged buffers.
+#include "global_definition.glsl.h"
+#define VEG_WIND_CLIP
+#include "veg_sway.glsl.h"
+
+layout(push_constant) uniform Push { PlantExpandPush pc; };
+
+layout(std430, set = VIEW_PARAMS_SET, binding = VIEW_CAMERA_BUFFER_INDEX) readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+
+layout(std430, set = 2, binding = 0) readonly buffer ParamsBuf   { PlantJobParams params; };
+layout(std430, set = 2, binding = 1) buffer CounterBuf           { uint counters[]; };
+layout(std430, set = 2, binding = 2) readonly buffer JobBuf      { PlantExpandJob jobs[]; };
+layout(std430, set = 2, binding = 3) readonly buffer WorkBuf     { uvec2 work[]; };   // x = job, y = template cluster ordinal
+layout(std430, set = 2, binding = 4) readonly buffer TemplateBuf { PlantTemplateInfo templates[]; };
+
+layout(std430, set = 3, binding = 0) buffer CullInfoBuf  { ClusterCullInfo cull_infos[]; };
+layout(std430, set = 3, binding = 1) buffer DrawInfoBuf  { ClusterDrawInfo draw_infos[]; };
+// BindlessVertex as 6 uints: position (3 floats), packed normal,
+// packed tangent, packed uv -- the mesh shader reads it the same way.
+layout(std430, set = 3, binding = 2) buffer VertexBuf    { uint verts[]; };
+// The templates' object-space bounds (their cull_infos entries carry
+// the hidden sentinel), one per template cluster, template t's slice
+// starting at template_bounds_first[t].
+layout(std430, set = 3, binding = 3) readonly buffer TemplateBoundsBuf { ClusterCullInfo template_bounds[]; };
+layout(std430, set = 3, binding = 4) readonly buffer TemplateBoundsFirstBuf { uint template_bounds_first[]; };
+
+layout(local_size_x = 128) in;
+
+void main() {
+    if (pc.phase == 0u) {
+        const uint i = gl_GlobalInvocationID.x;
+        if (i == 0u) {
+            const uint n = min(counters[PLANT_CTR_WORK], pc.work_cap);
+            counters[PLANT_CTR_DISPATCH + 0] = n;
+            counters[PLANT_CTR_DISPATCH + 1] = 1u;
+            counters[PLANT_CTR_DISPATCH + 2] = 1u;
+        }
+        if (i >= pc.dyn_cluster_count) return;
+        cull_infos[pc.dyn_cluster_first + i].bounds_sphere = vec4(0.0, 0.0, 0.0, -1e30);
+        draw_infos[pc.dyn_cluster_first + i].index_count = 0u;
+        return;
+    }
+    if (pc.phase == 2u) {
+        const uint i = gl_GlobalInvocationID.x;
+        if (i < uint(PLANT_CTR_COUNT)) counters[i] = 0u;
+        return;
+    }
+
+    const uint wi = gl_WorkGroupID.x;
+    if (wi >= min(counters[PLANT_CTR_WORK], pc.work_cap)) return;
+    const uvec2 w = work[wi];
+    const PlantExpandJob job = jobs[w.x];
+    const PlantTemplateInfo tp = templates[job.template_idx];
+    const uint tcluster = tp.cluster_first + w.y;                 // template cluster
+    const uint dcluster = job.dyn_cluster_first + w.y;            // its live copy
+    const ClusterDrawInfo tdi = draw_infos[tcluster];
+    const ClusterCullInfo tci = template_bounds[template_bounds_first[job.template_idx] + w.y];
+
+    // Instance transform, exactly base.vert: basis columns in .xyz,
+    // translation in the .w lanes (the compaction already composed the
+    // node matrix into these rows).
+    const mat3 rot = mat3(job.row0.xyz, job.row1.xyz, job.row2.xyz);
+    const vec3 inst_t = vec3(job.row0.w, job.row1.w, job.row2.w);
+    const float max_scale = max(length(job.row0.xyz), max(length(job.row1.xyz), length(job.row2.xyz)));
+    const bool sway = (job.flags & PLANT_JOB_SWAY) != 0u;
+    const vec3 up_ws = rot * vec3(0.0, 1.0, 0.0);
+    vec2 sway_wind = vec2(0.0);
+    vec2 sway_dir = kVegWindDir;
+    if (sway) { sway_wind = vegWindAt(inst_t.xz); sway_dir = vegWindDir(sway_wind); }
+
+    // ── Vertices: template vertex k -> dynamic vertex k ─────────────
+    // The dynamic cluster reuses the template's INDICES (base vertex
+    // shifted), so the job's whole template vertex range is transformed
+    // once, by the workgroup of the job's first cluster.
+    if (w.y == 0u) {
+        for (uint k = gl_LocalInvocationID.x; k < tp.vertex_count; k += 128u) {
+            const uint s = (tp.vertex_first + k) * 6u;
+            const uint d = (job.dyn_vertex_first + k) * 6u;
+            const vec3 p_ls = vec3(uintBitsToFloat(verts[s + 0u]),
+                                   uintBitsToFloat(verts[s + 1u]),
+                                   uintBitsToFloat(verts[s + 2u]));
+            vec3 p_ws = rot * p_ls + inst_t;
+            if (sway) {
+                const float travel = vegSwayTravel(inst_t, p_ls.y, pc.time_s, up_ws,
+                                                   job.plant_bits, sway_wind);
+                p_ws += vegSwayVec(travel, sway_dir);
+            }
+            const vec3 n_ls = bvDecodeNormal(verts[s + 3u]);
+            const vec4 t_ls = bvDecodeTangent(verts[s + 4u]);
+            verts[d + 0u] = floatBitsToUint(p_ws.x);
+            verts[d + 1u] = floatBitsToUint(p_ws.y);
+            verts[d + 2u] = floatBitsToUint(p_ws.z);
+            verts[d + 3u] = bvEncodeNormal(rot * n_ls);
+            verts[d + 4u] = bvEncodeTangent(vec4(rot * t_ls.xyz, t_ls.w));
+            verts[d + 5u] = verts[s + 5u];
+        }
+    }
+
+    if (gl_LocalInvocationID.x == 0u) {
+        // Bounds: sphere through the instance transform, inflated by the
+        // largest sway travel so a bent canopy never leaves its cull
+        // volume; the AABB likewise.  The backface cone is dropped (a
+        // swaying, double-sided card set has none): cutoff < 0.
+        const float sway_slack = sway ? 1.2 : 0.0;
+        ClusterCullInfo ci;
+        const vec3 c_ws = rot * tci.bounds_sphere.xyz + inst_t;
+        ci.bounds_sphere = vec4(c_ws, tci.bounds_sphere.w * max_scale + sway_slack);
+        ci.cone_axis_cutoff = vec4(0.0, 0.0, 0.0, -1.0);
+        const vec3 e = 0.5 * (tci.aabb_max_pad.xyz - tci.aabb_min_pad.xyz);
+        const vec3 ac = 0.5 * (tci.aabb_max_pad.xyz + tci.aabb_min_pad.xyz);
+        const vec3 e_ws = abs(rot[0]) * e.x + abs(rot[1]) * e.y + abs(rot[2]) * e.z + vec3(sway_slack);
+        const vec3 ac_ws = rot * ac + inst_t;
+        ci.aabb_min_pad = vec4(ac_ws - e_ws, 0.0);
+        ci.aabb_max_pad = vec4(ac_ws + e_ws, 0.0);
+        cull_infos[dcluster] = ci;
+
+        ClusterDrawInfo di = tdi;
+        di.vertex_offset = job.dyn_vertex_first + (tdi.vertex_offset - tp.vertex_first);
+        di.object_idx = floatBitsToUint(job.tree_age);
+        draw_infos[dcluster] = di;
+    }
+}

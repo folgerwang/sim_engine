@@ -1573,6 +1573,88 @@ public:
     uint32_t getRegisteredMeshCount() const {
         return static_cast<uint32_t>(mesh_cluster_ranges_.size());
     }
+
+    // ── Plants on the cluster path ────────────────────────────────────
+    // See PlantTemplateInfo / PlantExpandJob / PlantJobParams in
+    // global_definition.glsl.h, shaders/plant_cluster_expand.comp and
+    // the hand-off in shaders/nt_instance_compact.comp.  A plant mesh
+    // LOD is registered ONCE as a hidden object-space template (before
+    // finalizeUploads).  Each frame the node-table instance compaction
+    // of the plant drawables hands every surviving instance within the
+    // hand-off radius to this path as a GPU job (set 1 of the compact
+    // shader = plantJobDescriptorSet()); recordPlantExpand() -- at the
+    // top of the NEXT frame, before the cluster cull -- writes those
+    // jobs into the dynamic cluster tail and vertex region reserved at
+    // finalize, and the ordinary cull / draw / material passes take it
+    // from there.  Instances over budget stay on the drawable path.
+    uint32_t registerPlantTemplate(
+        const helper::ClusterMesh& cluster_mesh,
+        const game_object::DrawableData& drawable_data,
+        uint32_t mesh_idx,
+        const std::vector<uint32_t>& cluster_prim_map);
+    // Before finalizeUploads: dynamic tail reserved for expanded plants.
+    // 0 disables the path.  Jobs/work capacities follow from these.
+    void setPlantDynamicBudget(uint32_t max_clusters, uint32_t max_vertices);
+    // Per frame, before the plant drawables' compaction runs: the eye
+    // and the hand-off radius (0 = hand nothing off).
+    void setPlantHandoff(const glm::vec3& eye, float radius_m);
+    // Records phases 0/1/2 (hide tail + indirect, expand, reset
+    // counters).  Call once per frame before cullPhaseA / cull, after
+    // the camera UBO is written.  pbr_desc_set = wind clipmap (set 0),
+    // view_desc_set = camera (set 1).
+    void recordPlantExpand(
+        const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
+        const std::shared_ptr<renderer::DescriptorSet>& pbr_desc_set,
+        const std::shared_ptr<renderer::DescriptorSet>& view_desc_set,
+        float time_s);
+    bool plantPathReady() const {
+        return plant_expand_pipeline_ != nullptr && plant_dyn_cluster_cap_ > 0 &&
+               plant_job_buffer_.buffer != nullptr && !plant_templates_.empty();
+    }
+    // The compaction shader's set 1 (params, counters, jobs, work,
+    // templates) -- DrawableObject binds it when the hand-off is armed.
+    const std::shared_ptr<renderer::DescriptorSet>& plantJobDescriptorSet() const { return plant_job_set_; }
+    const std::shared_ptr<renderer::DescriptorSetLayout>& plantJobDescriptorSetLayout() const { return plant_job_layout_; }
+    uint32_t plantTemplateCount() const { return uint32_t(plant_templates_.size()); }
+    uint32_t plantDynClusterCap() const { return plant_dyn_cluster_cap_; }
+    uint32_t plantDynVertexCap()  const { return plant_dyn_vertex_cap_; }
+
+private:
+    struct PlantTemplate {
+        uint32_t gid = 0;             // global mesh id of the hidden upload
+        uint32_t cluster_first = 0, cluster_count = 0;
+        uint32_t vertex_first = 0,  vertex_count = 0;
+    };
+    std::vector<PlantTemplate> plant_templates_;
+    uint32_t plant_dyn_cluster_cap_ = 0;
+    uint32_t plant_dyn_vertex_cap_  = 0;
+    uint32_t plant_job_cap_  = 0;
+    uint32_t plant_work_cap_ = 0;
+    uint32_t plant_dyn_cluster_first_ = 0;   // set at finalize
+    uint32_t plant_dyn_vertex_first_  = 0;
+    uint32_t plant_pad_cluster_start_ = UINT32_MAX;   // where the last finalize's pad sits in staging
+    uint32_t plant_pad_vertex_start_  = UINT32_MAX;
+    glm::vec3 plant_eye_{0.0f};
+    float     plant_radius_m_ = 0.0f;
+    std::shared_ptr<renderer::DescriptorSetLayout> plant_job_layout_;      // set 2 of expand / set 1 of compact
+    std::shared_ptr<renderer::DescriptorSetLayout> plant_merged_layout_;   // set 3 of expand
+    std::shared_ptr<renderer::PipelineLayout>      plant_expand_pipeline_layout_;
+    std::shared_ptr<renderer::Pipeline>            plant_expand_pipeline_;
+    std::shared_ptr<renderer::DescriptorSet>       plant_job_set_;
+    std::shared_ptr<renderer::DescriptorSet>       plant_merged_set_;
+    renderer::BufferInfo plant_params_buffer_;     // PlantJobParams (host visible)
+    renderer::BufferInfo plant_counters_buffer_;   // uint[PLANT_CTR_COUNT] (+ indirect dispatch)
+    renderer::BufferInfo plant_job_buffer_;        // PlantExpandJob[job_cap]
+    renderer::BufferInfo plant_work_buffer_;       // uvec2[work_cap]
+    renderer::BufferInfo plant_template_buffer_;   // PlantTemplateInfo[]
+    renderer::BufferInfo plant_template_bounds_buffer_;        // ClusterCullInfo[] object-space, per template cluster
+    renderer::BufferInfo plant_template_bounds_first_buffer_;  // uint[] per template: first entry above
+    bool plant_desc_dirty_ = true;
+    bool plant_counters_primed_ = false;
+    void initPlantExpandPipeline(const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
+    void padPlantDynamicStaging();                 // finalizeUploads, before totals
+    void finalizePlantTemplates();                 // finalizeUploads, after buffers exist
+    void writePlantDescriptors();
 };
 
 } // namespace scene_rendering

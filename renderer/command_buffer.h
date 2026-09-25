@@ -100,6 +100,11 @@ public:
         uint32_t group_count_x, 
         uint32_t group_count_y, 
         uint32_t group_count_z = 1) = 0;
+    // vkCmdDispatchIndirect: group counts read from `buffer` at
+    // `offset` (a uvec3 written by an earlier GPU pass).
+    virtual void dispatchIndirect(
+        const std::shared_ptr<Buffer>& buffer,
+        uint64_t offset) = 0;
     virtual void traceRays(
         const StridedDeviceAddressRegion& raygen_shader_entry,
         const StridedDeviceAddressRegion& miss_shader_entry,

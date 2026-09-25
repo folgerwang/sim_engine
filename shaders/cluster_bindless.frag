@@ -354,6 +354,7 @@ float shadowFactor(vec3 world_pos, vec3 world_normal, vec2 screen_pixel) {
 
 void main() {
     vt_lod_bias_g = camera_info.vt_lod_bias;   // Render Debug > Leaf cutout mip lerp
+    cluster_tree_age_g = clusterTreeAgeOf(v_cluster_idx);
     v_uv = v_uv_in;
     // Screen derivatives for the parallax march, taken in uniform control
     // flow before anything branches on the material.
@@ -386,7 +387,7 @@ void main() {
     if (!leaf_mask && (mat_flags & BINDLESS_MAT_LEAF_AGE) != 0) {
         uint group = UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags));
 
-        base_color = leafAgedColor(base_color, group, camera_info.global_leaf_age, (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, material_params[mat_idx].tree_life.x);
+        base_color = leafAgedColor(base_color, group, camera_info.global_leaf_age, (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, clusterTreeLife(mat_idx));
     }
 
     // Floor-only debug view: when the collision-LOD overlay is active
@@ -602,7 +603,7 @@ void main() {
         int ageIndex = material_params[mat_idx].normal_tex_idx;
         uint group = UNPACK_BINDLESS_LEAF_GROUP(uint(mat_flags));
         if (ageIndex >= 0) group = leafMaskGroup(texture(normal_textures[nonuniformEXT(ageIndex)], v_uv).b);
-        albedo4 = leafAgedColor(albedo4, group, camera_info.global_leaf_age, (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, material_params[mat_idx].tree_life.x);
+        albedo4 = leafAgedColor(albedo4, group, camera_info.global_leaf_age, (uint(mat_flags) >> BINDLESS_MAT_TREE_PROFILE_SHIFT) & 1023u, clusterTreeLife(mat_idx));
     }
 
     // Alpha mask discard — matches base.frag: if(baseColor.a < alpha_cutoff) discard.

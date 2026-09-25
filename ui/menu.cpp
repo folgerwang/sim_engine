@@ -10240,6 +10240,20 @@ void Menu::drawRenderDebugMenuContent() {
             // VT LOD bias: where between two mips every virtual-texture
             // sample (leaf cutout alpha included) sits.  0 = on the
             // sharper mip, 0.5 = halfway, 1 = a full level coarser.
+            // Plants on the cluster path: instances within the radius are
+            // expanded into cluster geometry (VT textures, visibility
+            // buffer, predicted Hi-Z) instead of the drawable path.
+            if (ImGui::MenuItem("Plants via cluster path", NULL, plant_cluster_path_on_,
+                                deferred_rendering_)) {
+                plant_cluster_path_on_ = !plant_cluster_path_on_;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Node-table plant instances within the radius are\n"
+                                  "expanded on the GPU into world-space clusters and\n"
+                                  "drawn by the cluster pipeline (full-res VT cards).\n"
+                                  "Toggling re-syncs the placed objects.");
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::SliderFloat("Plant cluster radius (m)", &plant_cluster_radius_m_, 0.0f, 600.0f, "%.0f");
             ImGui::SetNextItemWidth(160.0f);
             ImGui::SliderFloat("Leaf cutout mip lerp", &vt_lod_bias_, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemHovered())

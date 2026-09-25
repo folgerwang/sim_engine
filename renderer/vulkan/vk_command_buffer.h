@@ -100,6 +100,9 @@ public:
         uint32_t group_count_x, 
         uint32_t group_count_y, 
         uint32_t group_count_z = 1) final;
+    virtual void dispatchIndirect(
+        const std::shared_ptr<renderer::Buffer>& buffer,
+        uint64_t offset) final;
     virtual void traceRays(
         const StridedDeviceAddressRegion& raygen_shader_entry,
         const StridedDeviceAddressRegion& miss_shader_entry,

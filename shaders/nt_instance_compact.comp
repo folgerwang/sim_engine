@@ -31,6 +31,70 @@ layout(std430, set = 0, binding = 6) readonly buffer AgeSrcBuf   { float age_src
 layout(std430, set = 0, binding = 7) writeonly buffer InstDstBuf { InstanceDataInfo inst_dst[]; };
 layout(std430, set = 0, binding = 8) writeonly buffer AgeDstBuf  { float age_dst[]; };
 layout(std430, set = 0, binding = 9) buffer RecCountBuf          { uint rec_counts[]; };
+// ── Plants on the cluster path (hand-off) ────────────────────────────
+// Per record: the cluster renderer's plant TEMPLATE for the node's mesh
+// (0xFFFFFFFF = none).  A surviving instance whose record has a
+// template and whose root lies within params.eye_radius.w of the eye is
+// NOT compacted for the drawable path: it becomes a job for
+// plant_cluster_expand.comp (set 1), which rasterises it through the
+// cluster pipeline next frame.  Over budget -> it stays on the drawable
+// path, so nothing ever disappears.
+layout(std430, set = 0, binding = 10) readonly buffer RecTemplateBuf { uint rec_template[]; };
+layout(std430, set = 1, binding = 0) readonly buffer PlantParamsBuf { PlantJobParams plant; };
+layout(std430, set = 1, binding = 1) buffer PlantCounterBuf         { uint plant_ctr[]; };
+layout(std430, set = 1, binding = 2) writeonly buffer PlantJobBuf   { PlantExpandJob plant_jobs[]; };
+layout(std430, set = 1, binding = 3) writeonly buffer PlantWorkBuf  { uvec2 plant_work[]; };
+layout(std430, set = 1, binding = 4) readonly buffer PlantTemplateBuf { PlantTemplateInfo plant_templates[]; };
+
+// The hand-off test: a template for the node's mesh and a root within
+// the radius.  Shared by the appending pass (G-buffer) and the passes
+// that merely drop the same instances (forward-covered).
+bool plantInHandoff(uint rec, const InstanceDataInfo d, const mat4 m) {
+    if (plant.eye_radius.w <= 0.0) return false;
+    const uint t = rec_template[rec];
+    if (t >= plant.template_count) return false;
+    const mat3 r = mat3(d.mat_rot_0.xyz, d.mat_rot_1.xyz, d.mat_rot_2.xyz);
+    const vec3 t_inst = vec3(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w);
+    const vec3 trans = r * m[3].xyz + t_inst;
+    const vec3 dv = trans - plant.eye_radius.xyz;
+    return dot(dv, dv) <= plant.eye_radius.w * plant.eye_radius.w;
+}
+
+// Returns true when the instance was handed to the cluster path.
+bool plantHandOff(uint rec, const InstanceDataInfo d, const mat4 m, float age) {
+    const uint t = rec_template[rec];
+    // Composed transform: world = R_inst * (M_node * p) + t_inst, as
+    // three rows (basis columns in .xyz, translation in .w).
+    const mat3 r = mat3(d.mat_rot_0.xyz, d.mat_rot_1.xyz, d.mat_rot_2.xyz);
+    const vec3 t_inst = vec3(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w);
+    const mat3 basis = r * mat3(m);
+    const vec3 trans = r * m[3].xyz + t_inst;
+
+    const PlantTemplateInfo tp = plant_templates[t];
+    const uint c0 = atomicAdd(plant_ctr[PLANT_CTR_CLUSTERS], tp.cluster_count);
+    if (c0 + tp.cluster_count > plant.cluster_cap) { atomicAdd(plant_ctr[PLANT_CTR_DROPPED], 1u); return false; }
+    const uint v0 = atomicAdd(plant_ctr[PLANT_CTR_VERTICES], tp.vertex_count);
+    if (v0 + tp.vertex_count > plant.vertex_cap)   { atomicAdd(plant_ctr[PLANT_CTR_DROPPED], 1u); return false; }
+    const uint j = atomicAdd(plant_ctr[PLANT_CTR_JOBS], 1u);
+    if (j >= plant.job_cap)                        { atomicAdd(plant_ctr[PLANT_CTR_DROPPED], 1u); return false; }
+    const uint w0 = atomicAdd(plant_ctr[PLANT_CTR_WORK], tp.cluster_count);
+    if (w0 + tp.cluster_count > plant.work_cap)    { atomicAdd(plant_ctr[PLANT_CTR_DROPPED], 1u); return false; }
+
+    PlantExpandJob job;
+    job.row0 = vec4(basis[0], trans.x);
+    job.row1 = vec4(basis[1], trans.y);
+    job.row2 = vec4(basis[2], trans.z);
+    job.template_idx = t;
+    job.dyn_cluster_first = plant.dyn_cluster_first + c0;
+    job.dyn_vertex_first  = plant.dyn_vertex_first + v0;
+    job.flags = ((records[rec].flip_uv_coord & MODEL_FLAG_VEGETATION_SWAY) != 0u) ? PLANT_JOB_SWAY : 0u;
+    job.tree_age = age;
+    job.plant_bits = records[rec].debug_skip_skinning;
+    job.pad0 = 0u; job.pad1 = 0u;
+    plant_jobs[j] = job;
+    for (uint c = 0u; c < tp.cluster_count; ++c) plant_work[w0 + c] = uvec2(j, c);
+    return true;
+}
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -83,6 +147,14 @@ void main() {
         for (uint p = 0u; p < plane_count; ++p) {
             if (dot(pc.planes[p].xyz, c) + pc.planes[p].w < -rad) return;
         }
+    }
+
+    // Plants on the cluster path: within the hand-off radius the
+    // instance is expanded into cluster geometry instead of drawn here.
+    if ((pc.flags & (NT_COMPACT_PLANT_HANDOFF | NT_COMPACT_PLANT_SKIP)) != 0u &&
+        plantInHandoff(rec, d, m)) {
+        if ((pc.flags & NT_COMPACT_PLANT_SKIP) != 0u) return;          // the G-buffer pass owns it
+        if (plantHandOff(rec, d, m, age_src[inst])) return;             // over budget: falls through
     }
 
     const uint slot = atomicAdd(rec_counts[rec], 1u);
