@@ -5,6 +5,7 @@
 
 #include <algorithm>      // std::sort — geometry-key attribute ordering
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1654,6 +1655,54 @@ bool readRwTexBaked(const std::string& path, RwTexBaked& out) {
         return false;
     out.bc7_tiles = std::move(blob);
     return true;
+}
+
+void restoreRwTexSurfaceDetail(const std::string& path, RwTexBaked& tex,
+                               bool height_texture) {
+    if (tex.preview_w == tex.w && tex.preview_h == tex.h) return;
+    // The importer writes this lossless, full-resolution copy beside the
+    // VT bake. Do not feed the thumbnail to POM or the relief normal map.
+    int w = 0, h = 0, channels = 0;
+    unsigned char* pixels = stbi_load((path + ".png").c_str(), &w, &h, &channels, 4);
+    if (pixels && w == tex.w && h == tex.h) {
+        tex.preview_rgba.assign(pixels, pixels + size_t(w) * h * 4);
+        tex.preview_w = w;
+        tex.preview_h = h;
+        stbi_image_free(pixels);
+        return;
+    }
+    stbi_image_free(pixels);
+    // Packaged bakes may omit the viewable PNG. The alpha payload is
+    // lossless full-resolution height for ORM textures, not cutout alpha.
+    // Reconstruct only the low-frequency ORM RGB from the preview.
+    if (!height_texture || tex.alpha.size() != size_t(tex.w) * tex.h ||
+        tex.preview_w <= 0 || tex.preview_h <= 0 ||
+        tex.preview_rgba.size() != size_t(tex.preview_w) * tex.preview_h * 4) return;
+    std::vector<unsigned char> rgba(size_t(tex.w) * tex.h * 4);
+    for (int y = 0; y < tex.h; ++y) {
+        for (int x = 0; x < tex.w; ++x) {
+            const float px = (x + 0.5f) * tex.preview_w / tex.w - 0.5f;
+            const float py = (y + 0.5f) * tex.preview_h / tex.h - 0.5f;
+            const int ix = int(std::floor(px)), iy = int(std::floor(py));
+            const float fx = px - ix, fy = py - iy;
+            const size_t dst = (size_t(y) * tex.w + x) * 4;
+            for (int c = 0; c < 3; ++c) {
+                float value = 0.0f;
+                for (int dy = 0; dy < 2; ++dy)
+                    for (int dx = 0; dx < 2; ++dx) {
+                        const int sx = std::clamp(ix + dx, 0, tex.preview_w - 1);
+                        const int sy = std::clamp(iy + dy, 0, tex.preview_h - 1);
+                        value += tex.preview_rgba[(size_t(sy) * tex.preview_w + sx) * 4 + c]
+                               * (dx ? fx : 1.0f - fx) * (dy ? fy : 1.0f - fy);
+                    }
+                rgba[dst + c] = static_cast<unsigned char>(value + 0.5f);
+            }
+            rgba[dst + 3] = tex.alpha[size_t(y) * tex.w + x];
+        }
+    }
+    tex.preview_rgba = std::move(rgba);
+    tex.preview_w = tex.w;
+    tex.preview_h = tex.h;
 }
 
 namespace {

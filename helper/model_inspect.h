@@ -313,6 +313,10 @@ struct RwTexBaked {
     std::shared_ptr<std::vector<uint8_t>> bc7_tiles;
 };
 bool readRwTexBaked(const std::string& path, RwTexBaked& out);
+// Restore the bake's source pixels for resident relief sampling. If the
+// optional PNG is absent, ORM height can still use the embedded alpha plane.
+void restoreRwTexSurfaceDetail(const std::string& path, RwTexBaked& tex,
+                               bool height_texture);
 
 // Dedup triangle-soup vertices in place (exact bit-equality of
 // position/normal/uv) and remap indices; index ORDER is preserved so

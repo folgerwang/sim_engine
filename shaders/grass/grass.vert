@@ -75,6 +75,10 @@ float grassSnapToGrid(float t, float nseg) {
 
 vec2 grassGridPos(vec2 g, float seg) {
     vec2 f = g * (1.0f / seg);
+    if ((tile_params.pad_0 & 1u) != 0u) {
+        f = floor(f * 32767.0f + 0.5f) / 32767.0f;
+        return tile_params.min + f * tile_params.range;
+    }
     uint elods = tile_params.offset;
     if (g.x == 0.0f) {
         float ns = float(elods & 0xFFu);
@@ -99,6 +103,11 @@ float grassGroundHeight(vec2 root_xz) {
                       0.0f, 1.0f) * seg;
     vec2 g0 = min(floor(grid), vec2(seg - 1.0f));
     vec2 gf = grid - g0;
+    if ((tile_params.pad_0 & 1u) != 0u) {
+        vec2 lo = grassGridPos(g0, seg);
+        vec2 hi = grassGridPos(g0 + vec2(1.0f), seg);
+        gf = clamp((root_xz - lo) / (hi - lo), 0.0f, 1.0f);
+    }
 
     float h00 = grassVertexHeight(grassGridPos(g0,                    seg));
     float h10 = grassVertexHeight(grassGridPos(g0 + vec2(1.0f, 0.0f), seg));
@@ -112,8 +121,8 @@ float grassGroundHeight(vec2 root_xz) {
         h = h11 + (h01 - h11) * (1.0f - gf.x)
                 + (h10 - h11) * (1.0f - gf.y);
     }
-    vec2 cell = tile_params.range * tile_params.inv_segment_count;
-    return h - 0.02f * cell.x;
+    // Keep the root offset independent of terrain LOD (same as mesh).
+    return h;
 }
 
 void main() {
@@ -143,7 +152,7 @@ void main() {
             texture(soil_water_layer, world_map_uv).xy *
             SOIL_WATER_LAYER_MAX_THICKNESS;
         built = texture(terrain_flat_mask, world_map_uv).x;
-        bool rejected = soil_water_thickness.y > kGrassWaterFadeStartM ||
+        bool rejected = soil_water_thickness.y >= kGrassWaterFadeEndM ||
                         built > kGrassBuiltRelocate;
         if (!rejected || attempt >= kGrassWaterRelocates) {
             break;
@@ -164,6 +173,7 @@ void main() {
                                       soil_water_thickness.y);
     water_k *= 1.0f - smoothstep(kGrassBuiltFadeStart,
                                  kGrassBuiltFadeEnd, built);
+
     water_k *= grassDensityKeep(
         tuft_h, distance(camera_info.position,
                          vec3(root_xz.x, ground_height, root_xz.y)),
@@ -172,7 +182,8 @@ void main() {
     // Cover: follow the vegetation map (grass_common.glsl.h).
     float cover = kGrassCoverFloor;
     if (water_k > 0.0f) {
-        vec3 macro = textureLod(src_map_mask, world_map_uv, kGrassCoverLod).rgb;
+        vec3 macro = grassCoverSample(src_map_mask, world_map_uv,
+                                     tile_params.inv_world_range);
         cover = grassCoverField(macro, root_xz);
         water_k *= grassCoverKeep(h_tuft.w, cover);
     }
