@@ -270,6 +270,17 @@ vec4 getBaseColor(
                 baseColor *= sRGBToLinear(triplanarSample(
                     albedo_tex, in_data.vertex_position,
                     triplanarNormal(in_data), in_mat.triplanar_tile_m));
+            } else if ((in_mat.material_features &
+                        (FEATURE_MATERIAL_LEAF_MASK | FEATURE_MATERIAL_LEAF_AGE |
+                         FEATURE_MATERIAL_ALPHA_MASK)) != 0) {
+                // Cutout / leaf cards on the drawable path sample their
+                // stopgap RGBA8 chain here (not the VT), so the Render
+                // Debug "Leaf cutout mip lerp" bias is applied at THIS
+                // sample: 0 = sharpest mip, 0.5 = halfway, 1 = a level
+                // coarser.  Same knob as camera_info.vt_lod_bias in
+                // vt_sample.glsl.h for the cluster / terrain path.
+                baseColor *= sRGBToLinear(texture(albedo_tex, getBaseColorUV(in_data, in_mat),
+                                                  camera_info.vt_lod_bias));
             } else {
                 baseColor *= sRGBToLinear(texture(albedo_tex, getBaseColorUV(in_data, in_mat)));
             }
@@ -283,6 +294,14 @@ vec4 getBaseColor(
         baseColor = leafAgedColor(baseColor,
             UNPACK_LEAF_GROUP(in_mat.material_features),
             camera_info.global_leaf_age, in_mat.pad_3, in_data.vertex_tree_age_base);
+    // Garden lawn: grass palette + reserved cohort 7, persisted by both
+    // glTF and native import. This changes colour, never cutout coverage.
+    if ((in_mat.material_features & FEATURE_MATERIAL_LEAF_AGE) != 0 &&
+        UNPACK_LEAF_GROUP(in_mat.material_features) == 7u &&
+        treePalette_seasonMode[min(in_mat.pad_3,TREE_PALETTE_COUNT-1u)] == 2u) {
+        baseColor.rgb = gardenTurfSurface(baseColor.rgb,
+            in_data.vertex_position.xz, camera_info.global_leaf_age);
+    }
     // ── Snow cover ───────────────────────────────────────────────────
     // RGB ONLY.  baseColor.a is the foliage cutout the alpha-mask test
     // reads, and washing it toward 1 would turn every leaf spray back
