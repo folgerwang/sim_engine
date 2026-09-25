@@ -53,6 +53,14 @@ layout(set = 0, binding = 6, rg16f) uniform writeonly image2D dst_wind;
 layout(set = 0, binding = 7) uniform sampler3D src_airflow;
 // Ground height, for the obstacle test.
 layout(set = 0, binding = 8) uniform sampler2D rock_layer;
+// The next-coarser clip level's published wind (rg16f, m/s), the
+// inflow this level inherits where that level has authority
+// (params.has_coarse); the top level binds anything and ignores it.
+layout(set = 0, binding = 9) uniform sampler2D src_coarse_wind;
+// Moving actors stirring the air (cars, people): injector_count live.
+layout(std430, set = 0, binding = 10) readonly buffer InjectorBuf {
+    WindInjector injectors[];
+};
 
 // D2Q9: 0 = rest, 1..4 axis (+x, +z, -x, -z), 5..8 diagonal.  "y" on
 // the lattice is world Z, exactly as in lbm_water.comp.
@@ -129,8 +137,25 @@ void main() {
     ivec2 shift = ivec2(round(
         (params.origin_ws.xz - params.prev_origin_ws.xz) / params.cell_m));
 
-    // Target: the coarse field here, in lattice units.
-    vec2 u_in = coarseWindAt(world_xz, params.sample_height_m) * inv_e;
+    // Target: the coarse field here, in lattice units.  Nested levels
+    // inherit from the level above them (which itself inherits from
+    // the airflow field), feathered at that level's rim exactly like
+    // the consumers' sampleWindClip, so the tiers agree by
+    // construction and a level's rim never becomes a shear line.
+    vec2 u_in = coarseWindAt(world_xz, params.sample_height_m);
+    if (params.has_coarse != 0u) {
+        vec4 cr = params.coarse_region;
+        float span = cr.z * cr.w;
+        if (span > 1.0) {
+            vec2 uv = (world_xz - cr.xy) / span;
+            if (all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
+                vec2 ef = smoothstep(0.0, 0.12, uv) *
+                          (1.0 - smoothstep(0.88, 1.0, uv));
+                u_in = mix(u_in, texture(src_coarse_wind, uv).xy, ef.x * ef.y);
+            }
+        }
+    }
+    u_in *= inv_e;
 
     float f[9];
     bool fresh = (params.reset != 0u);
@@ -195,6 +220,19 @@ void main() {
                     params.gust_scale * inv_e;
         vec2 u_target = mix(u, u_in + gust,
                             clamp(params.inflow_gain, 0.0, 1.0));
+        // (c) actors: a car or a walker drags the air in its gaussian
+        // footprint toward its own velocity, coupling per second so
+        // the stir is frame-rate independent; the lattice then carries
+        // the wake downstream and spreads it on its own.
+        for (uint k = 0u; k < params.injector_count && k < uint(kWindInjectorMax); ++k) {
+            WindInjector inj = injectors[k];
+            float r = max(inj.pos_r.z, params.cell_m);
+            vec2 d = world_xz - inj.pos_r.xy;
+            float d2 = dot(d, d);
+            if (d2 > 9.0 * r * r) continue;
+            float wgt = exp(-d2 / (r * r)) * clamp(inj.pos_r.w * params.dt, 0.0, 1.0);
+            u_target = mix(u_target, inj.vel.xy * inv_e, wgt);
+        }
 
         for (int i = 0; i < 9; ++i) {
             float eu = dot(vec2(kE[i]), u_target);

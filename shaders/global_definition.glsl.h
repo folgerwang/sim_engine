@@ -100,6 +100,18 @@
 // would have meant two CameraObject instances and two write paths, and
 // the shadow camera has no scene depth to offer.
 #define SCENE_DEPTH_TEX_INDEX       7
+// ── Wind clipmap (WindField) ─────────────────────────────────────────
+// The D2Q9 wind lattice as kWindClipLevels nested camera-following
+// levels, finest at the camera, the coarsest spanning the whole map.
+// One rg16f array texture (layer = level, m/s world xz) plus a
+// WindClipInfo SSBO with each level's region.  On set 0 for the same
+// reason the scene depth is: one set app-wide, one write, every
+// vegetation vertex shader (colour, depth-only, shadow) and the
+// deferred resolve read it through vegWindAt() in veg_sway.glsl.h.
+#define WIND_CLIP_TEX_INDEX         8
+#define WIND_CLIP_INFO_INDEX        9
+#define kWindClipLevels             4
+#define kWindInjectorMax            256
 
 // PBR_MATERIAL_PARAMS_SET
 #define PBR_CONSTANT_INDEX          8
@@ -1009,9 +1021,29 @@ struct LbmWaterParams {
 // ground — plants and the river surface both live within a few metres
 // of the terrain, so a full 3D patch would spend most of its cells on
 // air nothing samples.
+// Published by WindField for every consumer (set 0, WIND_CLIP_INFO_INDEX).
+// region[L] = (origin.x, origin.z, cell_m, grid_size), w = 0 dead —
+// the sampleWindFine() contract, one entry per level.
+struct WindClipInfo {
+    vec4  region[kWindClipLevels];
+    vec4  params;           // x = live levels, y = feather, z = time, w = frame_dt
+};
+
+// A moving actor stirring the air: cars, people.  pos_r.xy = world xz,
+// .z = radius (m) of the gaussian footprint, .w = coupling (fraction of
+// the actor's velocity the air at the centre picks up per second).
+struct WindInjector {
+    vec4  pos_r;
+    vec4  vel;              // xy = world xz velocity, m/s
+};
+
 struct WindPatchParams {
     vec4  origin_ws;        // xz = patch corner, world metres
     vec4  prev_origin_ws;
+    // Region of the next-COARSER level (sampleWindFine layout), the
+    // inflow this level relaxes toward where that level has authority;
+    // the top level inflows from the airflow field alone.
+    vec4  coarse_region;
     // The coarse airflow field's extent, so the patch can read its own
     // inflow from it — the fine tier INHERITS the weather rather than
     // inventing a second, disagreeing one.
@@ -1029,9 +1061,9 @@ struct WindPatchParams {
     float obstacle_margin_m;// terrain this far above the slice blocks
     uint  grid_size;        // cells per side
     uint  reset;            // 1 = reinitialise every cell to inflow
-    uint  pad_0;
-    uint  pad_1;
-    uint  pad_2;
+    uint  injector_count;   // live WindInjector entries this step
+    uint  level;            // clip level being stepped (0 = finest)
+    uint  has_coarse;       // 1 = coarse_region is a live finer-than-airflow level
 };
 
 struct PrtLightParams {

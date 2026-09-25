@@ -13,6 +13,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp
+#include "game_object/wind_field.h"
 #include "drawable_object.h"   // PcgInstanceRegistry (furniture)
 #include "helper/engine_helper.h"
 #include "renderer/renderer_helper.h"
@@ -3726,6 +3727,31 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         far_thresh_ = glm::max(kMinAngular, far_thresh_ * 0.9f);
     }
     far_thresh_ = glm::min(far_thresh_, 0.02f);
+    // WIND: walkers near the camera stir the air a little (WindField
+    // clipmap injectors).  Velocity by finite difference of the
+    // position the movers above just wrote, so it is right whatever
+    // path a walker is on; a jump (spawn, teleport) is skipped.
+    if (delta_t > 1e-4f) {
+        auto stir = [&](const glm::vec3& pos, glm::vec3& prev) {
+            const glm::vec3 d = pos - prev;
+            const bool first = glm::dot(prev, prev) < 1e-6f;
+            prev = pos;
+            if (first) return;
+            const glm::vec2 vel(d.x / delta_t, d.z / delta_t);
+            if (glm::dot(vel, vel) > 6.0f * 6.0f) return;      // a jump, not a step
+            WindField::addInjector(glm::vec2(pos.x, pos.z), vel,
+                                   /*radius_m*/ 0.9f, /*coupling*/ 0.25f);
+        };
+        for (auto& a : sim_) {
+            if (!a.inited || a.ride) continue;
+            if (glm::distance(a.pos, camera_pos) > 200.0f) continue;
+            stir(a.pos, a.wind_prev);
+        }
+        for (auto& w : strollers_) {
+            if (glm::distance(w.pos, camera_pos) > 200.0f) continue;
+            stir(w.pos, w.wind_prev);
+        }
+    }
     // FRAME-AHEAD: fill the drawn (N) and previous (N-1) poses now, so
     // both the shadow collectors (which run before draw) and the raster
     // pass see the same frame-N picture.

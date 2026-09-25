@@ -4,6 +4,7 @@
 #extension GL_ARB_shader_draw_parameters : require
 #endif
 #include "global_definition.glsl.h"
+#define VEG_WIND_CLIP    // set 0 here is the global PBR set: the wind clipmap is reachable
 #include "veg_sway.glsl.h"
 
 #ifdef GPU_NODE_TABLE
@@ -321,12 +322,17 @@ void main() {
                            in_loc_rot_mat_2.w);
         // Instance up axis: gates out the deadfall trunks that lie
         // pitched ~90 deg on the ground (see kVegFallenCos).
+        // The wind at this plant's root: LBM clipmap (direction and
+        // strength), one sample shared by the drawn and the N+1 pose —
+        // the field is held for the frame, only the gust phase moves.
+        vec2 sway_wind = vegWindAt(inst_t.xz);
+        vec2 sway_dir  = vegWindDir(sway_wind);
         sway_travel = vegSwayTravel(inst_t, position_ls.y,
                                     camera_info.time_s,
                                     local_world_rot_mat * vec3(0.0f, 1.0f,
                                                                0.0f),
-                                    veg_plant_bits);
-        position_ws += vegSwayVec(sway_travel);
+                                    veg_plant_bits, sway_wind);
+        position_ws += vegSwayVec(sway_travel, sway_dir);
         // FRAME-AHEAD forward motion: the sway is a closed-form function
         // of time, so the N+1 pose is the same function at time +
         // frame_dt.  The delta is what the depth predictor moves this
@@ -335,8 +341,9 @@ void main() {
             float sway_next = vegSwayTravel(inst_t, position_ls.y,
                                             camera_info.time_s + camera_info.frame_dt,
                                             local_world_rot_mat * vec3(0.0f, 1.0f, 0.0f),
-                                            veg_plant_bits);
-            out_data.vertex_motion3d = vegSwayVec(sway_next) - vegSwayVec(sway_travel);
+                                            veg_plant_bits, sway_wind);
+            out_data.vertex_motion3d = vegSwayVec(sway_next, sway_dir) -
+                                       vegSwayVec(sway_travel, sway_dir);
         } else {
             out_data.vertex_motion3d = vec3(0.0);
         }

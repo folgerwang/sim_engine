@@ -23,6 +23,40 @@
 // right, and a grass-clutter quad barely stirs — its motion mostly
 // comes from the flutter term.
 const vec2  kVegWindDir     = vec2(0.8575, 0.5145);   // = water fallback
+// ── Wind source: the LBM clipmap, when the shader can reach it ───────
+// A shader compiled with VEG_WIND_CLIP (base.vert, base_depthonly.vert,
+// deferred_resolve.comp — everything whose set 0 is the global PBR set)
+// reads the wind WindField publishes there: direction AND strength per
+// plant, so a gust front, the lee of a ridge and the wake of a passing
+// car all reach the canopy.  Without the define (falling leaves and the
+// legacy callers) the fixed direction and reference speed below stand
+// in, which is the old procedural sway exactly.
+const float kVegRefWindMps  = 6.0;    // wind the tuned lean corresponds to
+const float kVegWindGainMin = 0.35;   // calm air still stirs the canopy
+const float kVegWindGainMax = 2.5;    // a storm, before it looks silly
+#ifdef VEG_WIND_CLIP
+#include "weather/wind_field.glsl.h"
+layout(set = PBR_GLOBAL_PARAMS_SET, binding = WIND_CLIP_TEX_INDEX)
+    uniform sampler2DArray veg_wind_clip_tex;
+layout(std430, set = PBR_GLOBAL_PARAMS_SET, binding = WIND_CLIP_INFO_INDEX)
+    readonly buffer VegWindClipInfoBuf { WindClipInfo veg_wind_clip; };
+#endif
+// Wind velocity (m/s, world xz) at a plant's root.
+vec2 vegWindAt(vec2 p_xz) {
+#ifdef VEG_WIND_CLIP
+    float w = 0.0;
+    vec2 v = sampleWindClip(veg_wind_clip_tex, veg_wind_clip.region, p_xz, w);
+    return mix(kVegWindDir * kVegRefWindMps, v, w);
+#else
+    return kVegWindDir * kVegRefWindMps;
+#endif
+}
+// Sway direction for a wind sample: along the wind, the fixed direction
+// in dead calm (so the gust term still has somewhere to push).
+vec2 vegWindDir(vec2 wind) {
+    float s = length(wind);
+    return (s > 0.3) ? wind / s : kVegWindDir;
+}
 const float kVegCanopyRefM  = 9.0;
 const float kVegLeanM       = 0.22;   // canopy travel in a full gust
 // ── Height profile shape ─────────────────────────────────────────────
@@ -118,10 +152,14 @@ const float kVegUprightCos  = 0.72;   // >= this: full sway (~44 deg)
 // which only degrades the correction on an already extreme case.
 const float kVegSwayEncodeMaxM = 1.0;
 
-// Travel -> world offset (the arc dip is a function of the travel).
-vec3 vegSwayVec(float s) {
-    vec2 off = kVegWindDir * s;
+// Travel -> world offset (the arc dip is a function of the travel),
+// along `dir` — vegWindDir() of the plant's wind sample.
+vec3 vegSwayVec(float s, vec2 dir) {
+    vec2 off = dir * s;
     return vec3(off.x, -0.30 * dot(off, off), off.y);
+}
+vec3 vegSwayVec(float s) {
+    return vegSwayVec(s, kVegWindDir);
 }
 
 // The travel scalar itself; vegSwayOffset() below is vegSwayVec() of
@@ -156,14 +194,19 @@ float vegPlantRootY(uint bits) {
 }
 
 float vegSwayTravel(vec3 inst_t, float local_h, float t, vec3 up_ws,
-                    uint plant_bits) {
+                    uint plant_bits, vec2 wind) {
     // Fallen/steeply-pitched instances: no swing at all.
     float upright = up_ws.y * inversesqrt(max(dot(up_ws, up_ws), 1e-8f));
     float stand = smoothstep(kVegFallenCos, kVegUprightCos, upright);
     if (stand <= 0.0f) {
         return 0.0f;
     }
-    float ph = dot(inst_t.xz, kVegWindDir) * kVegGustWaveInv;
+    vec2  wdir  = vegWindDir(wind);
+    // Strength from the sampled wind: the tuned lean at the reference
+    // speed, more in a gale, a floor in dead calm.
+    float wgain = clamp(length(wind) * (1.0 / kVegRefWindMps),
+                        kVegWindGainMin, kVegWindGainMax);
+    float ph = dot(inst_t.xz, wdir) * kVegGustWaveInv;
     // two incommensurate travelling waves so the field never breathes
     // in perfect unison
     float g = 0.55 + 0.45 * sin(t * kVegGustFreq - ph)
@@ -192,7 +235,7 @@ float vegSwayTravel(vec3 inst_t, float local_h, float t, vec3 up_ws,
         bend    = h01 * (kVegBendLinear + (1.0 - kVegBendLinear) * h01);
         fl_gain = 1.0;
     }
-    float lean = kVegLeanM * g;
+    float lean = kVegLeanM * g * wgain;
 
     // Per-instance flutter phase from the translation itself — no hash
     // lookup, no divergence between passes, and CRUCIALLY no local_h.
@@ -209,10 +252,19 @@ float vegSwayTravel(vec3 inst_t, float local_h, float t, vec3 up_ws,
     return (lean * bend + fl) * stand;
 }
 
+// Legacy signature: fixed reference wind (falling leaves etc.).
+float vegSwayTravel(vec3 inst_t, float local_h, float t, vec3 up_ws,
+                    uint plant_bits) {
+    return vegSwayTravel(inst_t, local_h, t, up_ws, plant_bits,
+                         kVegWindDir * kVegRefWindMps);
+}
+
 vec3 vegSwayOffset(vec3 inst_t, float local_h, float t, vec3 up_ws,
                    uint plant_bits) {
     // the canopy dips slightly as it leans — an arc, not a shear
-    return vegSwayVec(vegSwayTravel(inst_t, local_h, t, up_ws, plant_bits));
+    vec2 wind = vegWindAt(inst_t.xz);
+    return vegSwayVec(vegSwayTravel(inst_t, local_h, t, up_ws, plant_bits, wind),
+                      vegWindDir(wind));
 }
 
 // ── Crown-volume normal ─────────────────────────────────────────────

@@ -17,6 +17,7 @@
 #include "leaf_age.glsl.h"
 #include "functions.glsl.h"
 #include "brdf.glsl.h"   // D_GGX / V_GGX / F_Schlick for the PBR resolve
+#define VEG_WIND_CLIP        // set 0 is the global PBR set: same wind the vertex shader bent with
 #include "veg_sway.glsl.h"   // vegSwayVec: RT rays launch from the rest pose
 
 // ─── deferred_resolve.comp ────────────────────────────────────────────────
@@ -3094,7 +3095,9 @@ void main() {
     {
         float sway_s = em.b * kVegSwayEncodeMaxM;
         if (sway_s > 0.0) {
-            rt_pos = world_pos - vegSwayVec(sway_s);
+            // Direction from the wind at the pixel (the vertex used the
+            // plant's root; the field is smooth at crown scale).
+            rt_pos = world_pos - vegSwayVec(sway_s, vegWindDir(vegWindAt(world_pos.xz)));
         }
     }
 

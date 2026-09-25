@@ -205,6 +205,7 @@ private:
         bool waiting_for_space = false;
         double last_motion_time = 0.;
         bool  inited = false;
+        glm::vec3 wind_prev{0.0f};     // last position handed to WindField
         // 0 on foot, 2 in their car (the vehicle system drives it; the
         // person is not drawn until it parks)
         uint8_t ride = 0;
@@ -305,6 +306,7 @@ private:
         int   house = -1;              // kind 0: the house visited
         bool  walking = true;
         bool moving = false;
+        glm::vec3 wind_prev{0.0f};     // last position handed to WindField
         VehicleSystem::Stroll road;    // kind 1
         Person look;                   // duty, age, height, bulk, and
                                        // a one-step outdoors schedule

@@ -4,6 +4,7 @@
 #extension GL_ARB_shader_draw_parameters : require
 #endif
 #include "global_definition.glsl.h"
+#define VEG_WIND_CLIP    // set 0 here is the global PBR set: the wind clipmap is reachable
 #include "veg_sway.glsl.h"
 
 #ifdef GPU_NODE_TABLE

@@ -13,6 +13,7 @@
 #include "json.hpp"   // vendored at third_parties/tinygltf/json.hpp
 #include "helper/engine_helper.h"
 #include "helper/junction_control.h"
+#include "game_object/wind_field.h"
 #include "helper/road_intersections.h"
 #include "renderer/renderer_helper.h"
 #include "shaders/global_definition.glsl.h"
@@ -3362,6 +3363,18 @@ void VehicleSystem::update(float delta_t, float speed_scale,
                 frame_[k][r].key = (uint64_t(v.seed | 0x80000000u) << 32) | uint64_t(ordinal++);
     }
     emitSignals(camera_pos, ground);
+    // WIND: every moving car near the camera drags the air with it
+    // (WindField clipmap, wind_patch.comp injectors) — the wake a
+    // passing car leaves in the roadside grass.  Only the finest
+    // levels can resolve a car, so the reach is the level-0 window.
+    for (const auto& v : vehicles_) {
+        if (v.dormant || v.parked || v.speed < 0.5f) continue;
+        const glm::vec2 p(v.pos.x, v.pos.z);
+        const glm::vec2 c(camera_pos.x, camera_pos.z);
+        if (glm::dot(p - c, p - c) > 400.0f * 400.0f) continue;
+        const glm::vec2 vel(std::sin(v.yaw) * v.speed, std::cos(v.yaw) * v.speed);
+        WindField::addInjector(p, vel, /*radius_m*/ 3.0f, /*coupling*/ 0.6f);
+    }
     // FRAME-AHEAD: every stream is emitted now (vehicles, signals,
     // paint); fill the drawn (N) / previous (N-1) rows before the
     // shadow collectors and the raster pass read them.

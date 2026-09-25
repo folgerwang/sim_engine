@@ -105,6 +105,35 @@ vec3 windAt(sampler3D airflow_tex, vec3 world_min, vec3 world_range,
 
 #endif  // WIND_FIELD_COARSE
 
+// ── Clipmap sampling ─────────────────────────────────────────────────
+// `regions` are the kWindClipLevels level regions WindField publishes
+// (WindClipInfo.region), `tex` the rg16f array (layer = level).  Coarse
+// to fine, each live level overrides the coarser one with its feathered
+// weight, so crossing any level's rim rotates the wind smoothly instead
+// of snapping.  Outside every level (or before the sim has stepped) the
+// result is zero and the caller falls back to whatever it had.
+vec2 sampleWindClip(sampler2DArray tex, vec4 regions[kWindClipLevels],
+                    vec2 p_xz, out float out_weight) {
+    vec2  v = vec2(0.0f);
+    float w_total = 0.0f;
+    for (int L = kWindClipLevels - 1; L >= 0; --L) {
+        vec4 region = regions[L];
+        float span = region.z * region.w;
+        if (span <= 1.0f) continue;
+        vec2 uv = (p_xz - region.xy) / span;
+        if (any(lessThanEqual(uv, vec2(0.0f))) ||
+            any(greaterThanEqual(uv, vec2(1.0f)))) continue;
+        vec2 ef = smoothstep(0.0f, kWindPatchFeather, uv) *
+                  (1.0f - smoothstep(1.0f - kWindPatchFeather, 1.0f, uv));
+        float w = ef.x * ef.y;
+        vec2 lv = texture(tex, vec3(uv, float(L))).xy;
+        v = mix(v, lv, w);
+        w_total = max(w_total, w);
+    }
+    out_weight = w_total;
+    return v;
+}
+
 // Convenience for consumers that only want a direction + speed, which
 // is most of them (a grass blade bends along the wind, it does not
 // integrate it).
