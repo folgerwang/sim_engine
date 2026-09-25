@@ -51,16 +51,22 @@ class ViewCamera {
     bool m_apply_proj_jitter_ = false;
     static glm::vec2 s_proj_jitter_ndc_;
     // ── FRAME-AHEAD RENDERING ────────────────────────────────────────
-    // When armed, the camera the GPU and the CPU cull see (m_camera_info_)
-    // is the one computed on the PREVIOUS call, and the freshly computed
-    // one is held in m_camera_next_: the simulation (input included) is
-    // committed a frame before the picture, so every consumer draws frame
-    // N while next_view_proj carries the exact N+1 camera the depth
-    // predictor reprojects with.  Off: no delay, next_view_proj ==
-    // view_proj, frame_dt == 0 (prediction disabled downstream).
+    // m_camera_info_ is ALWAYS the simulation's camera: it is what the
+    // integrator above reads and writes (yaw, pitch, mouse_pos, time),
+    // so it must never be replaced by an older pose -- doing so made the
+    // camera integrate from a stale state every other frame (the
+    // "screen shaking").  When armed, the pose computed on the PREVIOUS
+    // call is held in m_camera_held_ and PUBLISHED (m_camera_drawn_, the
+    // UBO, getCameraInfo()) as the drawn camera, so every consumer draws
+    // frame N while next_view_proj carries the exact N+1 camera the
+    // depth predictor reprojects with.  Only the pose fields come from
+    // the held copy; the live scalars (exposure, leaf age, holes...)
+    // are the current ones.  Off: no delay, next_view_proj == view_proj,
+    // frame_dt == 0 (prediction disabled downstream).
     bool m_frame_ahead_ = false;
     bool m_frame_ahead_primed_ = false;
-    glsl::ViewCameraInfo m_camera_next_{};
+    glsl::ViewCameraInfo m_camera_held_{};     // pose computed last call
+    glsl::ViewCameraInfo m_camera_drawn_{};    // what was published this call
     glm::mat4 m_camera_info_prev_published_vp_ = glm::mat4(0.0f);
 
 public:
@@ -179,8 +185,10 @@ public:
         }
     }
 
+    // The camera the GPU draws with (frame N when frame-ahead is armed
+    // and primed, the live one otherwise).
     const glsl::ViewCameraInfo& getCameraInfo() const {
-        return m_camera_info_;
+        return m_frame_ahead_ && m_frame_ahead_primed_ ? m_camera_drawn_ : m_camera_info_;
     }
     // Frame-ahead (see m_frame_ahead_).  Switching it on delays the
     // picture by one frame from the next update; switching it off drops
@@ -196,7 +204,7 @@ public:
     // player controller / streaming should read; equals getCameraInfo()
     // when frame-ahead is off.
     const glsl::ViewCameraInfo& getNextCameraInfo() const {
-        return m_frame_ahead_ && m_frame_ahead_primed_ ? m_camera_next_ : m_camera_info_;
+        return m_camera_info_;
     }
 
     // Authoritative double-precision position (see m_position_d_).

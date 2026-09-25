@@ -550,32 +550,42 @@ void ViewCamera::updateViewCameraInfo(
     // next_view_proj is the exact N+1 matrix.  Not yet primed (first
     // call after arming): draw this camera and set next = itself, so the
     // first predicted frame is a no-motion one rather than a jump.
+    // m_camera_info_ itself is never touched here: it is the integrator's
+    // state.  The published copy takes its POSE from the held (previous)
+    // camera and everything else from the live one.
+    glsl::ViewCameraInfo published = m_camera_info_;
     if (m_frame_ahead_) {
-        const glsl::ViewCameraInfo fresh = m_camera_info_;
         if (m_frame_ahead_primed_) {
-            // the camera computed last call becomes the drawn one; its
-            // prev_view_proj must be the one drawn before it
-            const glm::mat4 drawn_prev = m_camera_info_prev_published_vp_;
-            m_camera_info_ = m_camera_next_;
-            m_camera_info_.prev_view_proj = drawn_prev;
-            // per-frame scalars that must track the CURRENT sim, not
-            // the delayed picture (time is a clock, not a pose)
-            m_camera_info_.time_s = fresh.time_s - view_camera_params.delta_t;
-            m_camera_info_.input_features = fresh.input_features;
-            m_camera_info_.exposure_scale = fresh.exposure_scale;
-            m_camera_info_.global_leaf_age = fresh.global_leaf_age;
-            m_camera_info_.debug_isolate_material = fresh.debug_isolate_material;
+            const glsl::ViewCameraInfo& h = m_camera_held_;
+            published.view                   = h.view;
+            published.proj                   = h.proj;
+            published.view_proj              = h.view_proj;
+            published.inv_view_proj          = h.inv_view_proj;
+            published.inv_view_proj_relative = h.inv_view_proj_relative;
+            published.inv_view               = h.inv_view;
+            published.inv_proj               = h.inv_proj;
+            published.depth_params           = h.depth_params;
+            published.position               = h.position;
+            published.up_vector              = h.up_vector;
+            published.facing_dir             = h.facing_dir;
+            published.yaw                    = h.yaw;
+            published.pitch                  = h.pitch;
+            published.time_s                 = h.time_s;    // the clock at that pose
+            // its prev_view_proj must be the one drawn before it
+            published.prev_view_proj         = m_camera_info_prev_published_vp_;
+            published.frame_dt               = view_camera_params.delta_t;
+        } else {
+            published.frame_dt = 0.0f;        // first armed call: no motion yet
         }
-        m_camera_next_ = fresh;
-        m_camera_info_.next_view_proj = fresh.view_proj;
-        m_camera_info_.frame_dt = m_frame_ahead_primed_ ? view_camera_params.delta_t : 0.0f;
-        m_camera_info_prev_published_vp_ = m_camera_info_.view_proj;
+        published.next_view_proj = m_camera_info_.view_proj;   // exact N+1
+        m_camera_held_ = m_camera_info_;
         m_frame_ahead_primed_ = true;
     } else {
-        m_camera_info_.next_view_proj = m_camera_info_.view_proj;
-        m_camera_info_.frame_dt = 0.0f;
-        m_camera_info_prev_published_vp_ = m_camera_info_.view_proj;
+        published.next_view_proj = published.view_proj;
+        published.frame_dt = 0.0f;
     }
+    m_camera_info_prev_published_vp_ = published.view_proj;
+    m_camera_drawn_ = published;
 
     // deferrable — AND THIS ONE MATTERS MOST OF ALL.  The view camera UBO
     // carries view_proj / prev_view_proj / position / input_features and
@@ -591,20 +601,25 @@ void ViewCamera::updateViewCameraInfo(
     // immediately, unchanged.)
     m_device_->updateBufferMemory(
         m_view_camera_buffer_->memory,
-        sizeof(m_camera_info_),
-        &m_camera_info_,
+        sizeof(published),
+        &published,
         /*offset*/ 0,
         /*deferrable*/ true);
 }
 
 void ViewCamera::setInputFeatureFlags(uint32_t flags) {
     m_camera_info_.input_features = flags;
+    // Frame-ahead: the buffer holds the DRAWN camera; re-uploading the
+    // live one here would swap the pose mid-frame.
+    m_camera_drawn_.input_features = flags;
+    m_camera_drawn_.debug_isolate_material = m_camera_info_.debug_isolate_material;
+    const glsl::ViewCameraInfo& up = getCameraInfo();
     // Same buffer, same hazard — and this one is called from the middle
     // of drawScene, so it is the write that actually raced.
     m_device_->updateBufferMemory(
         m_view_camera_buffer_->memory,
-        sizeof(m_camera_info_),
-        &m_camera_info_,
+        sizeof(up),
+        &up,
         /*offset*/ 0,
         /*deferrable*/ true);
 }

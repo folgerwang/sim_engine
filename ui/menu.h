@@ -581,7 +581,7 @@ private:
     // frame's depth (depth_predict.comp) instead of drawn by the depth
     // prepass.  Costs one frame of input latency.  Off by default until
     // verified in-engine.
-    bool frame_ahead_on_ = false;
+    bool frame_ahead_on_ = true;    // default: predicted-depth cull replaces the prepass
     // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
     // 0 = half-res (richest detail), higher = increasingly down-sampled.
     // Clamped to the actual pyramid mip count by the menu UI.  Packed into
