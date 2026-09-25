@@ -52,6 +52,8 @@ layout(set = VISBUF_SET, binding = VISBUF_GBUF_EMISSIVE, rgba8)
     uniform writeonly image2D out_emissive_metal;
 layout(set = VISBUF_SET, binding = VISBUF_GBUF_VELOCITY, rg16f)
     uniform writeonly image2D out_velocity;
+layout(set = VISBUF_SET, binding = VISBUF_GBUF_MOTION3D, rgba16f)
+    uniform writeonly image2D out_motion3d;
 
 // Byte-identical to the copy in cluster_bindless.frag / base.frag: this
 // pass writes the same G-buffer deferred_resolve.comp decodes, so the
@@ -305,4 +307,8 @@ void main() {
     vec2 cur_ndc   = cur_clip.xy  / cur_clip.w;
     vec2 prev_ndc  = prev_clip.xy / prev_clip.w;
     imageStore(out_velocity, px, vec4(cur_ndc - prev_ndc, 0.0, 0.0));
+    // Cluster geometry is static: no forward motion.  Written explicitly
+    // (not left to the clear) because this pass runs after Phase A's
+    // clear and an actor drawn later overwrites its own pixels anyway.
+    imageStore(out_motion3d, px, vec4(0.0));
 }

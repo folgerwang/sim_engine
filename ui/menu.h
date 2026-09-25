@@ -575,6 +575,13 @@ private:
     // terrain coverage prepass; the G-buffer drawables pass then writes
     // its own depth (DrawableObject::setGbufferWritesDepth).
     bool depth_prepass_on_ = true;
+    // FRAME-AHEAD RENDERING (predicted-depth cull): the sim runs one
+    // frame ahead of the picture, the actors and the sway emit forward
+    // motion, and next frame's cull pyramid is PREDICTED from this
+    // frame's depth (depth_predict.comp) instead of drawn by the depth
+    // prepass.  Costs one frame of input latency.  Off by default until
+    // verified in-engine.
+    bool frame_ahead_on_ = false;
     // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
     // 0 = half-res (richest detail), higher = increasingly down-sampled.
     // Clamped to the actual pyramid mip count by the menu UI.  Packed into
@@ -2470,6 +2477,7 @@ public:
     inline bool isHideForwardPixels() const { return debug_hide_forward_; }
     inline bool isHideDeferredPixels() const { return debug_hide_deferred_; }
     inline bool isDepthPrepassOn() const { return depth_prepass_on_; }
+    inline bool isFrameAheadOn() const { return frame_ahead_on_; }
 
     // Forward vs deferred toggle — read by application drawScene to
     // route the cluster opaque pass through the G-buffer + compute

@@ -241,6 +241,31 @@ void engine::game_object::DrawableObject::setLodDebugColors(bool on) {
 bool engine::game_object::DrawableObject::getLodDebugColors() { return s_lod_debug_colors; }
 void engine::game_object::DrawableObject::setGbufferWritesDepth(bool on) { s_gbuffer_writes_depth = on; }
 void engine::game_object::DrawableObject::setNtCompactEnabled(bool on) { s_nt_compact_enabled = on; }
+// Frame-ahead Hi-Z for node_table_cull.comp (binding 9).  The generation
+// counter re-dirties every drawable's cull descriptor set when the view
+// changes (resize rebuilds the pyramid).
+static std::shared_ptr<renderer::Sampler>   s_nt_hiz_sampler;
+static std::shared_ptr<renderer::ImageView> s_nt_hiz_view;
+static glm::uvec2 s_nt_hiz_size(0);
+static uint32_t   s_nt_hiz_mips = 0;
+static glm::mat4  s_nt_hiz_view_proj(1.0f);
+static bool       s_nt_hiz_enabled = false;
+static uint32_t   s_nt_hiz_gen = 1;
+void engine::game_object::DrawableObject::setNtHiZOcclusion(
+    const std::shared_ptr<renderer::Sampler>& sampler,
+    const std::shared_ptr<renderer::ImageView>& view,
+    const glm::uvec2& size,
+    uint32_t mip_count,
+    const glm::mat4& view_proj,
+    bool enabled) {
+    if (sampler != s_nt_hiz_sampler || view != s_nt_hiz_view) ++s_nt_hiz_gen;
+    s_nt_hiz_sampler = sampler;
+    s_nt_hiz_view = view;
+    s_nt_hiz_size = size;
+    s_nt_hiz_mips = mip_count;
+    s_nt_hiz_view_proj = view_proj;
+    s_nt_hiz_enabled = enabled && view && sampler && mip_count > 0u;
+}
 bool engine::game_object::DrawableObject::ntCompactEnabled() { return s_nt_compact_enabled; }
 void engine::game_object::DrawableObject::setDebugHidePlants(bool hide_wood, bool hide_leaves) {
     s_dbg_hide_tree_wood = hide_wood;
@@ -8171,6 +8196,7 @@ struct NodeTableGpu {
     std::shared_ptr<renderer::DescriptorSet> cull_desc_sets[2];
     std::shared_ptr<renderer::DescriptorSet> vs_desc_sets[2];
     bool desc_dirty[2] = { true, true };
+    uint32_t hiz_gen[2] = { 0u, 0u };         // s_nt_hiz_gen the cull set was written with
 
     // Buffers replaced by larger ones, freed once no in-flight frame can
     // still reference them (frame serial + 3).
@@ -8243,14 +8269,19 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNodeTableDescSetLayo
 // 3 cmd_dst, 4 slots, 5 counts, 6 prim_flags, 7 class_idx.
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    // 8 = rec_counts (compacted instance count per record).
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(9);
+    // 8 = rec_counts (compacted instance count per record),
+    // 9 = hiz_pyramid (frame-ahead occlusion, sampled).
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(10);
     for (uint32_t i = 0; i < 9; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             renderer::DescriptorType::STORAGE_BUFFER);
     }
+    bindings[9] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        9,
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER);
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -8847,6 +8878,7 @@ static void ntWriteDescriptorSets(
     const std::shared_ptr<ego::DrawableData>& object_,
     NodeTableGpu& nt,
     uint32_t parity) {
+    if (nt.hiz_gen[parity] != s_nt_hiz_gen) nt.desc_dirty[parity] = true;
     if (!nt.desc_dirty[parity]) return;
     if (!nt.cull_desc_sets[parity]) {
         nt.cull_desc_sets[parity] =
@@ -8874,6 +8906,12 @@ static void ntWriteDescriptorSets(
     add(cs, 6, nt.prim_flags_buf);
     add(cs, 7, nt.class_idx[parity]);
     add(cs, 8, nt.rec_counts);
+    if (s_nt_hiz_view && s_nt_hiz_sampler) {
+        renderer::Helper::addOneTexture(
+            writes, cs, renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 9,
+            s_nt_hiz_sampler, s_nt_hiz_view, renderer::ImageLayout::GENERAL);
+    }
+    nt.hiz_gen[parity] = s_nt_hiz_gen;
     if (s_nt_compact_desc_set_layout && object_->tree_age_buffer_.buffer) {
         if (!nt.compact_desc_sets[parity]) {
             nt.compact_desc_sets[parity] =
@@ -11926,6 +11964,10 @@ void DrawableObject::draw(
 // ═════════════════════════════════════════════════════════════════════
 bool DrawableObject::ntEligible(DrawMode draw_mode) const {
     if (!nt_enabled_ || !nt_cull_pipeline_ || !nt_formats_valid_) return false;
+    // node_table_cull.comp statically declares the Hi-Z sampler (binding
+    // 9); until the application has published a pyramid view the set
+    // cannot be completed, so the classic path draws.
+    if (!s_nt_hiz_view || !s_nt_hiz_sampler) return false;
     if (!isReady()) return false;
     const auto& o = *object_;
     // The path is built for the static placed world: the survivor lists
@@ -12087,7 +12129,17 @@ void DrawableObject::ntPrepare(
     const glm::mat4 iw = object_->m_current_instance_world_;
     const glm::mat4 iwT = glm::transpose(iw);
     uint32_t plane_count = 0u;
-    if (!depth_only && s_frustum_cull_active) {
+    if (!depth_only && s_frustum_cull_active && s_nt_hiz_enabled) {
+        // Frame-ahead: hand the shader view_proj * inst_world instead of
+        // the six planes (it derives them) so it can also project the
+        // node sphere onto the predicted-depth Hi-Z pyramid.
+        const glm::mat4 vp_iw = s_nt_hiz_view_proj * iw;
+        for (int p = 0; p < 4; ++p) pc.planes[p] = vp_iw[p];
+        pc.planes[4] = glm::vec4(float(s_nt_hiz_size.x), float(s_nt_hiz_size.y),
+                                 float(s_nt_hiz_mips), 0.0f);
+        pc.flags = NT_CULL_FLAG_VP_PLANES | NT_CULL_FLAG_HIZ;
+        plane_count = 6u;
+    } else if (!depth_only && s_frustum_cull_active) {
         for (int p = 0; p < 6; ++p) pc.planes[p] = iwT * s_frustum_planes[p];
         plane_count = 6u;
     } else if (depth_only && s_shadow_cull_active) {

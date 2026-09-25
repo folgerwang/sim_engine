@@ -57,6 +57,10 @@ layout(location = 0) out vec4 out_albedo_ao;
 layout(location = 1) out vec4 out_normal_rough;
 layout(location = 2) out vec4 out_emissive_metal;
 layout(location = 3) out vec2 out_velocity;
+// RT4 — world-space forward motion N -> N+1 (frame-ahead rendering; see
+// citizen_gbuffer.glsl.h).  Static draws write 0; sway draws write the
+// analytic lookahead from base.vert.
+layout(location = 4) out vec4 out_motion3d;
 
 // The forward path's code after our early return still names outColor;
 // a plain global (not an output) lets it compile and the compiler
@@ -551,6 +555,7 @@ void main() {
     out_normal_rough = vec4(fallback_oct, 0.8, 0.0);
     out_emissive_metal = vec4(fallback_oct, 0.0, 0.0);
     out_velocity = vec2(0.0);
+    out_motion3d = vec4(0.0);
     return;
 #endif
 #ifdef DEPTH_COVERAGE
@@ -834,6 +839,7 @@ void main() {
         out_velocity =
             cur_clip.xy / cur_clip.w - prev_clip.xy / prev_clip.w;
     }
+    out_motion3d = vec4(ps_in_data.vertex_motion3d, 1.0);
     return;
 #endif // GBUFFER_OUTPUT
 

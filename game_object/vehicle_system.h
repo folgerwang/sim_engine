@@ -269,8 +269,15 @@ private:
     // clearcoat parameters vehicle.frag renders car paint with.  Zero
     // on everything that is not painted bodywork, which the shader
     // reads as "shade this the plain way".
+    // FRAME-AHEAD (see shaders/citizen_gbuffer.glsl.h): xform is the
+    // pose the sim just produced (frame N+1); `draw` is frame N (rows of
+    // a 3x4, what the picture shows) and `last` frame N-1, both filled
+    // by resolvePoseHistory() from the (vehicle, ordinal) history.
+    // Static street furniture (signals, paint) keeps draw = last = xform.
     struct PartInstance { glm::mat4 xform; glm::vec4 color;
-                          glm::vec4 extra; glm::vec4 paint; };
+                          glm::vec4 extra; glm::vec4 paint;
+                          glm::vec4 draw[3]; glm::vec4 last[3];
+                          uint64_t key = 0; uint64_t key_pad = 0; };
     struct Mesh {
         ActorShadowGeometry shadow;
         std::shared_ptr<renderer::BufferInfo> pos, nrm, part, idx;
@@ -397,6 +404,11 @@ private:
 
     // per-frame instance streams, one per mesh
     std::vector<std::vector<PartInstance>> frame_;
+    // frame-ahead pose history per (vehicle seed, ordinal) record
+    struct PoseHist { glm::mat4 n, n1; uint32_t seen = 0; uint32_t stamp = 0; };
+    std::unordered_map<uint64_t, PoseHist> hist_parts_;
+    uint32_t hist_stamp_ = 0;
+    void resolvePoseHistory();
 
     static std::shared_ptr<renderer::PipelineLayout> s_pipeline_layout_;
     static std::shared_ptr<renderer::Pipeline>       s_pipeline_;

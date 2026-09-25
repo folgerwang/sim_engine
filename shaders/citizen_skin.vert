@@ -38,12 +38,30 @@ layout(location = 13) in vec4 in_extra;
 // (unit y of the upper pivot, unit y of the lower pivot, blend
 // half-width in unit y, taper = bottom width / top width)
 layout(location = 14) in vec4 in_shape;
+// FRAME-AHEAD POSES (see citizen_gbuffer.glsl.h): in_self/up/lo are the
+// simulation's newest pose (frame N+1).  The picture is drawn at frame N
+// from in_draw* / in_dup* / in_dlo*, and in_last* (the self rows only)
+// is frame N-1 for screen velocity.
+layout(location = 15) in vec4 in_draw0;
+layout(location = 16) in vec4 in_draw1;
+layout(location = 17) in vec4 in_draw2;
+layout(location = 18) in vec4 in_dup0;
+layout(location = 19) in vec4 in_dup1;
+layout(location = 20) in vec4 in_dup2;
+layout(location = 21) in vec4 in_dlo0;
+layout(location = 22) in vec4 in_dlo1;
+layout(location = 23) in vec4 in_dlo2;
+layout(location = 24) in vec4 in_last0;
+layout(location = 25) in vec4 in_last1;
+layout(location = 26) in vec4 in_last2;
 
 layout(location = 0) out vec3 out_normal_ws;
 layout(location = 1) out vec3 out_position_ws;
 layout(location = 2) out vec4 out_color;
 layout(location = 3) out vec3 out_local;
 layout(location = 4) flat out vec4 out_extra;
+layout(location = 6) out vec3 out_position_prev_ws;   // frame N-1
+layout(location = 7) out vec3 out_position_next_ws;   // frame N+1
 
 vec3 xf_point(vec4 r0, vec4 r1, vec4 r2, vec3 p) {
     vec4 h = vec4(p, 1.0);
@@ -87,14 +105,24 @@ void main() {
     float total = max(ws + wu + wl, 1e-6);
     ws /= total; wu /= total; wl /= total;
 
+    // DRAWN pose (frame N)
     vec3 position_ws =
+        ws * xf_point(in_draw0, in_draw1, in_draw2, p) +
+        wu * xf_point(in_dup0, in_dup1, in_dup2, p) +
+        wl * xf_point(in_dlo0, in_dlo1, in_dlo2, p);
+    vec3 normal_ws =
+        ws * xf_normal(in_draw0, in_draw1, in_draw2, n) +
+        wu * xf_normal(in_dup0, in_dup1, in_dup2, n) +
+        wl * xf_normal(in_dlo0, in_dlo1, in_dlo2, n);
+    // frame N+1 (the sim's newest pose, full blend)
+    out_position_next_ws =
         ws * xf_point(in_self0, in_self1, in_self2, p) +
         wu * xf_point(in_up0, in_up1, in_up2, p) +
         wl * xf_point(in_lo0, in_lo1, in_lo2, p);
-    vec3 normal_ws =
-        ws * xf_normal(in_self0, in_self1, in_self2, n) +
-        wu * xf_normal(in_up0, in_up1, in_up2, n) +
-        wl * xf_normal(in_lo0, in_lo1, in_lo2, n);
+    // frame N-1: self rows only.  The up/lo blend differs from self by
+    // the joint bend over one frame -- sub-millimetre at the pivots --
+    // and screen velocity does not need better than that.
+    out_position_prev_ws = xf_point(in_last0, in_last1, in_last2, p);
 
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_position_ws = position_ws;

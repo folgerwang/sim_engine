@@ -50,6 +50,18 @@ class ViewCamera {
     // cameras never should (a jittered shadow map swims).
     bool m_apply_proj_jitter_ = false;
     static glm::vec2 s_proj_jitter_ndc_;
+    // ── FRAME-AHEAD RENDERING ────────────────────────────────────────
+    // When armed, the camera the GPU and the CPU cull see (m_camera_info_)
+    // is the one computed on the PREVIOUS call, and the freshly computed
+    // one is held in m_camera_next_: the simulation (input included) is
+    // committed a frame before the picture, so every consumer draws frame
+    // N while next_view_proj carries the exact N+1 camera the depth
+    // predictor reprojects with.  Off: no delay, next_view_proj ==
+    // view_proj, frame_dt == 0 (prediction disabled downstream).
+    bool m_frame_ahead_ = false;
+    bool m_frame_ahead_primed_ = false;
+    glsl::ViewCameraInfo m_camera_next_{};
+    glm::mat4 m_camera_info_prev_published_vp_ = glm::mat4(0.0f);
 
 public:
     ViewCamera() = delete;
@@ -169,6 +181,22 @@ public:
 
     const glsl::ViewCameraInfo& getCameraInfo() const {
         return m_camera_info_;
+    }
+    // Frame-ahead (see m_frame_ahead_).  Switching it on delays the
+    // picture by one frame from the next update; switching it off drops
+    // the held frame.  Main camera only -- shadow / probe / capture
+    // cameras must never lag.
+    void setFrameAhead(bool on) {
+        if (m_frame_ahead_ == on) return;
+        m_frame_ahead_ = on;
+        m_frame_ahead_primed_ = false;
+    }
+    bool isFrameAhead() const { return m_frame_ahead_; }
+    // The camera the simulation is at (frame N+1 when armed): what the
+    // player controller / streaming should read; equals getCameraInfo()
+    // when frame-ahead is off.
+    const glsl::ViewCameraInfo& getNextCameraInfo() const {
+        return m_frame_ahead_ && m_frame_ahead_primed_ ? m_camera_next_ : m_camera_info_;
     }
 
     // Authoritative double-precision position (see m_position_d_).

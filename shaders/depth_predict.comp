@@ -1,0 +1,130 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#include "global_definition.glsl.h"
+
+// ─── FRAME-AHEAD DEPTH PREDICTION ────────────────────────────────────
+// The simulation is committed one frame ahead of the picture, so when
+// frame N's depth is finished the camera for N+1 is EXACT and every
+// dynamic surface has written its world-space forward motion (RT4,
+// motion3d).  This pass builds the depth buffer frame N+1 will have --
+// every visible frame-N pixel moved by its motion and re-projected
+// through next_view_proj -- as the occluder set for N+1's visibility
+// cull, replacing the depth prepass that re-drew the occluders.
+//
+// It runs on the ASYNC COMPUTE queue while frame N's shading finishes.
+//
+// Three phases, one dispatch each (pc.phase):
+//   0  CLEAR    predicted := far (1.0 as uint bits) everywhere.  A hole
+//               -- ground uncovered by a moving car, the strip a camera
+//               pan brings on screen -- must read "nothing here", never
+//               "occluded", so the cull it feeds stays conservative.
+//   1  SCATTER  each frame-N pixel: unproject (inv_view_proj), add
+//               motion3d, project (next_view_proj), atomicMin the target
+//               texel with the new depth.  Nearest wins where several
+//               pixels land on one texel: that is the surface actually
+//               there.  Sky (depth == 1) is skipped.
+//   2  DILATE   a texel left far whose 3x3 neighbourhood has depth takes
+//               the FARTHEST of those neighbours (still conservative):
+//               sub-texel cracks that reprojection opens in a solid
+//               surface would otherwise punch "visible" holes through
+//               every occluder and the cull would keep drawing what it
+//               should skip.  Real holes (disocclusions) are wider than
+//               a texel and survive.
+// Depth is reversed-or-not agnostic: the engine's projection gives
+// smaller z = nearer (see hiz_build.comp taking max = farthest), and
+// this pass keeps that convention.
+//
+// The target is HALF resolution (the Hi-Z mip-0 size): the cull tests
+// against the pyramid, and scattering at full resolution into a half-
+// resolution target only makes the atomic contention worse.
+
+layout(std430, set = 0, binding = 0) readonly buffer CameraInfoBuffer {
+    ViewCameraInfo camera_info;
+};
+layout(set = 0, binding = 1) uniform sampler2D src_depth;      // frame N, full res
+layout(set = 0, binding = 2) uniform sampler2D src_motion3d;   // RT4, full res
+// Predicted depth as R32_UINT so atomicMin is available (float bits of
+// a non-negative depth order the same as the float).
+layout(set = 0, binding = 3, r32ui) uniform uimage2D dst_pred;
+// The dilated copy hiz_build.comp reads as its mip 0 (r32f).
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D dst_pred_f;
+
+layout(push_constant) uniform PC {
+    uvec2 src_size;      // frame-N depth size
+    uvec2 dst_size;      // predicted size (Hi-Z mip 0)
+    uint  phase;
+    uint  use_motion;    // 0: camera-only prediction (motion3d unbound)
+    uint  pad0, pad1;
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const uint kFarBits = 0x3F800000u;   // floatBitsToUint(1.0)
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+
+    if (pc.phase == 0u) {
+        if (px.x >= pc.dst_size.x || px.y >= pc.dst_size.y) return;
+        imageStore(dst_pred, ivec2(px), uvec4(kFarBits));
+        return;
+    }
+
+    if (pc.phase == 1u) {
+        if (px.x >= pc.src_size.x || px.y >= pc.src_size.y) return;
+        vec2 inv_src = 1.0 / vec2(pc.src_size);
+        vec2 uv = (vec2(px) + 0.5) * inv_src;
+        float z = textureLod(src_depth, uv, 0.0).r;
+        if (z >= 0.99999) return;                    // sky / cleared
+        // Unproject frame N's pixel to world.  NDC y is flipped in this
+        // engine's viewport (see the velocity convention in
+        // cluster_bindless.vert: curNDC - prevNDC); inv_view_proj is the
+        // inverse of the same view_proj the raster used, so a plain
+        // (uv * 2 - 1) round-trips.
+        vec4 ndc = vec4(uv * 2.0 - 1.0, z, 1.0);
+        vec4 wp = camera_info.inv_view_proj * ndc;
+        if (wp.w <= 1e-6) return;
+        vec3 world = wp.xyz / wp.w;
+        if (pc.use_motion != 0u) {
+            vec4 m = textureLod(src_motion3d, uv, 0.0);
+            // a = 1 where a dynamic actor wrote the texel; static
+            // geometry left the clear (0) and moves by camera alone
+            world += m.xyz;
+        }
+        vec4 nc = camera_info.next_view_proj * vec4(world, 1.0);
+        if (nc.w <= 1e-6) return;                    // behind the N+1 eye
+        vec3 nn = nc.xyz / nc.w;
+        if (any(greaterThan(abs(nn.xy), vec2(1.0)))) return;
+        if (nn.z < 0.0 || nn.z >= 1.0) return;
+        ivec2 tp = ivec2((nn.xy * 0.5 + 0.5) * vec2(pc.dst_size));
+        tp = clamp(tp, ivec2(0), ivec2(pc.dst_size) - 1);
+        // A moving surface may cover more than one target texel after the
+        // motion (it came nearer); the dilation phase covers the odd
+        // crack, and a target texel receiving several sources keeps the
+        // nearest.
+        imageAtomicMin(dst_pred, tp, floatBitsToUint(nn.z));
+        return;
+    }
+
+    // phase 2: dilate + convert
+    if (px.x >= pc.dst_size.x || px.y >= pc.dst_size.y) return;
+    uint here = imageLoad(dst_pred, ivec2(px)).r;
+    float out_z = uintBitsToFloat(here);
+    if (here == kFarBits) {
+        float farthest = -1.0;
+        int filled = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                ivec2 q = ivec2(px) + ivec2(dx, dy);
+                if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(pc.dst_size)))) continue;
+                uint v = imageLoad(dst_pred, q).r;
+                if (v == kFarBits) continue;
+                farthest = max(farthest, uintBitsToFloat(v));
+                ++filled;
+            }
+        // a crack, not a hole: at least 6 of 8 neighbours carry depth
+        if (filled >= 6) out_z = farthest;
+    }
+    imageStore(dst_pred_f, ivec2(px), vec4(out_z, 0.0, 0.0, 0.0));
+}

@@ -29,6 +29,8 @@ layout(location = 5) in vec3 in_normal_ls;
 // older path, which paints the same features by position and face.
 layout(location = 6) flat in float in_part;
 layout(location = 7) flat in vec4 in_paint;
+layout(location = 8) in vec3 in_position_prev_ws;   // frame N-1
+layout(location = 9) in vec3 in_position_next_ws;   // frame N+1
 
 // KEEP IN LOCKSTEP with car_gen.py's kPart* constants.
 const int kPartBody = 0, kPartGlass = 1, kPartTrim = 2, kPartChrome = 3,
@@ -448,10 +450,12 @@ void main() {
     if (dot(emissive, emissive) > 0.0) {
         out_albedo_ao = vec4(0.0); out_normal_rough = vec4(0.0);
         out_emissive_metal = vec4(0.0); out_velocity = vec2(0.0);
+        out_motion3d = vec4(0.0);
         return;
     }
-    citizenGbuffer(albedo, N, in_position_ws, camera_info.view_proj,
-                   camera_info.prev_view_proj, kind == 1 ? 0.9 : 0.35);
+    citizenGbufferMotion(albedo, N, in_position_ws, in_position_prev_ws,
+                         in_position_next_ws, camera_info.view_proj,
+                         camera_info.prev_view_proj, kind == 1 ? 0.9 : 0.35);
 #else
     float nl = dot(N, kSunDir) * 0.5 + 0.5;
     vec3 H = normalize(kSunDir + V);

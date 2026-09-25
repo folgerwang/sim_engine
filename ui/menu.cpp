@@ -10222,6 +10222,15 @@ void Menu::drawRenderDebugMenuContent() {
                                 deferred_rendering_)) {
                 depth_prepass_on_ = !depth_prepass_on_;
             }
+            // Frame-ahead: predicted-depth occlusion replaces the prepass.
+            if (ImGui::MenuItem("Frame-ahead (predicted depth cull)", NULL,
+                                frame_ahead_on_, deferred_rendering_)) {
+                frame_ahead_on_ = !frame_ahead_on_;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Sim runs one frame ahead; next frame's occlusion\n"
+                                  "pyramid is predicted from this frame's depth +\n"
+                                  "motion vectors (no depth prepass).  +1 frame latency.");
             // Per-instance plant cull (nt_instance_compact.comp) ahead of
             // the GPU node table; off = submit full instance lists and
             // reject out-of-band instances per vertex, as before.

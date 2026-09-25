@@ -45,6 +45,16 @@ layout(location = 14) in vec4 in_color;
 layout(location = 15) in vec4 in_extra;
 // (metal, flake, coat, pearl) — the paint's parameters, per instance
 layout(location = 16) in vec4 in_paint;
+// FRAME-AHEAD POSES (see citizen_gbuffer.glsl.h).  in_xform is the
+// simulation's newest pose (frame N+1); the picture is drawn at frame N
+// from in_draw*, and in_last* is frame N-1 for true screen velocity.
+// Rows of 3x4 world transforms (a rigid box needs no more).
+layout(location = 17) in vec4 in_draw0;
+layout(location = 18) in vec4 in_draw1;
+layout(location = 19) in vec4 in_draw2;
+layout(location = 20) in vec4 in_last0;
+layout(location = 21) in vec4 in_last1;
+layout(location = 22) in vec4 in_last2;
 
 layout(location = 0) out vec3 out_normal_ws;
 layout(location = 1) out vec3 out_position_ws;
@@ -54,10 +64,23 @@ layout(location = 4) flat out vec4 out_extra;
 layout(location = 5) out vec3 out_normal_ls;
 layout(location = 6) flat out float out_part;
 layout(location = 7) flat out vec4 out_paint;
+layout(location = 8) out vec3 out_position_prev_ws;   // frame N-1
+layout(location = 9) out vec3 out_position_next_ws;   // frame N+1
 
 void main() {
-    mat4 xform = mat4(in_xform0, in_xform1, in_xform2, in_xform3);
+    // Drawn pose = frame N (in_draw* rows); in_xform is N+1, in_last* N-1.
+    mat4 xform = mat4(
+        vec4(in_draw0.x, in_draw1.x, in_draw2.x, 0.0),
+        vec4(in_draw0.y, in_draw1.y, in_draw2.y, 0.0),
+        vec4(in_draw0.z, in_draw1.z, in_draw2.z, 0.0),
+        vec4(in_draw0.w, in_draw1.w, in_draw2.w, 1.0));
     vec3 position_ws = (xform * vec4(in_position, 1.0)).xyz;
+    {
+        vec4 h = vec4(in_position, 1.0);
+        mat4 next = mat4(in_xform0, in_xform1, in_xform2, in_xform3);
+        out_position_next_ws = (next * h).xyz;
+        out_position_prev_ws = vec3(dot(in_last0, h), dot(in_last1, h), dot(in_last2, h));
+    }
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_position_ws = position_ws;
     // The instance transform is a rotation times a uniform scale (a car

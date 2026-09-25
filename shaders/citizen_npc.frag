@@ -12,6 +12,8 @@ layout(location = 0) in vec3 in_normal_ws;
 layout(location = 1) in vec3 in_position_ws;
 layout(location = 2) in vec2 in_uv;
 layout(location = 3) flat in vec4 in_inst;
+layout(location = 4) in vec3 in_position_prev_ws;   // frame N-1
+layout(location = 5) in vec3 in_position_next_ws;   // frame N+1
 
 #include "citizen_gbuffer.glsl.h"
 
@@ -32,8 +34,9 @@ void main() {
     albedo *= 0.90 + 0.20 * in_inst.y;
 #ifdef GBUFFER_OUTPUT
     if (dot(n, camera_info.position - in_position_ws) < 0.0) n = -n;
-    citizenGbuffer(albedo, n, in_position_ws, camera_info.view_proj,
-                   camera_info.prev_view_proj, 0.9);
+    citizenGbufferMotion(albedo, n, in_position_ws, in_position_prev_ws,
+                         in_position_next_ws, camera_info.view_proj,
+                         camera_info.prev_view_proj, 0.9);
 #else
     float nl = dot(n, kSunDir) * 0.5 + 0.5;
     vec3 lit = albedo * (0.45 + 0.70 * nl);

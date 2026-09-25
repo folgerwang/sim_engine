@@ -542,6 +542,41 @@ void ViewCamera::updateViewCameraInfo(
     m_last_vp_aspect_ = view_camera_params.aspect;
     m_last_vp_fov_    = view_camera_params.fov;
 
+    // ── FRAME-AHEAD publish ──────────────────────────────────────────
+    // m_camera_info_ now holds the freshly computed camera (frame N+1
+    // in frame-ahead terms).  Armed: publish the camera computed LAST
+    // call as the drawn one, keep this one as next.  The prev_view_proj
+    // chain then reads N-1 -> N as every velocity consumer expects, and
+    // next_view_proj is the exact N+1 matrix.  Not yet primed (first
+    // call after arming): draw this camera and set next = itself, so the
+    // first predicted frame is a no-motion one rather than a jump.
+    if (m_frame_ahead_) {
+        const glsl::ViewCameraInfo fresh = m_camera_info_;
+        if (m_frame_ahead_primed_) {
+            // the camera computed last call becomes the drawn one; its
+            // prev_view_proj must be the one drawn before it
+            const glm::mat4 drawn_prev = m_camera_info_prev_published_vp_;
+            m_camera_info_ = m_camera_next_;
+            m_camera_info_.prev_view_proj = drawn_prev;
+            // per-frame scalars that must track the CURRENT sim, not
+            // the delayed picture (time is a clock, not a pose)
+            m_camera_info_.time_s = fresh.time_s - view_camera_params.delta_t;
+            m_camera_info_.input_features = fresh.input_features;
+            m_camera_info_.exposure_scale = fresh.exposure_scale;
+            m_camera_info_.global_leaf_age = fresh.global_leaf_age;
+            m_camera_info_.debug_isolate_material = fresh.debug_isolate_material;
+        }
+        m_camera_next_ = fresh;
+        m_camera_info_.next_view_proj = fresh.view_proj;
+        m_camera_info_.frame_dt = m_frame_ahead_primed_ ? view_camera_params.delta_t : 0.0f;
+        m_camera_info_prev_published_vp_ = m_camera_info_.view_proj;
+        m_frame_ahead_primed_ = true;
+    } else {
+        m_camera_info_.next_view_proj = m_camera_info_.view_proj;
+        m_camera_info_.frame_dt = 0.0f;
+        m_camera_info_prev_published_vp_ = m_camera_info_.view_proj;
+    }
+
     // deferrable — AND THIS ONE MATTERS MOST OF ALL.  The view camera UBO
     // carries view_proj / prev_view_proj / position / input_features and
     // is read by essentially every shader in the engine: the CSM shadow

@@ -4308,6 +4308,7 @@ void ClusterRenderer::initVisBufferPipelines(
         //   4  G-buffer normal/rough  storage image (rgba8,  write)
         //   5  G-buffer emissive/met  storage image (rgba8,  write)
         //   6  G-buffer velocity      storage image (rg16f,  write)
+        //   7  G-buffer motion3d      storage image (rgba16f, write)
         if (!visbuffer_desc_set_layout_) {
             std::vector<er::DescriptorSetLayoutBinding> vb_bindings;
             vb_bindings.push_back(
@@ -4324,7 +4325,8 @@ void ClusterRenderer::initVisBufferPipelines(
                                 uint32_t(VISBUF_GBUF_ALBEDO),
                                 uint32_t(VISBUF_GBUF_NORMAL),
                                 uint32_t(VISBUF_GBUF_EMISSIVE),
-                                uint32_t(VISBUF_GBUF_VELOCITY) }) {
+                                uint32_t(VISBUF_GBUF_VELOCITY),
+                                uint32_t(VISBUF_GBUF_MOTION3D) }) {
                 vb_bindings.push_back(
                     er::helper::getTextureSamplerDescriptionSetLayoutBinding(
                         b, SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -4384,7 +4386,8 @@ void ClusterRenderer::updateVisBufferTargets(
     const std::shared_ptr<renderer::ImageView>& gbuf_albedo_view,
     const std::shared_ptr<renderer::ImageView>& gbuf_normal_view,
     const std::shared_ptr<renderer::ImageView>& gbuf_emissive_view,
-    const std::shared_ptr<renderer::ImageView>& gbuf_velocity_view) {
+    const std::shared_ptr<renderer::ImageView>& gbuf_velocity_view,
+    const std::shared_ptr<renderer::ImageView>& gbuf_motion3d_view) {
 
     visbuffer_targets_bound_ = false;
 
@@ -4395,12 +4398,12 @@ void ClusterRenderer::updateVisBufferTargets(
     // All-or-nothing: a half-updated set would leave a stale view bound
     // and the dispatch would write through freed memory after a resize.
     if (!vis_view || !gbuf_albedo_view || !gbuf_normal_view ||
-        !gbuf_emissive_view || !gbuf_velocity_view) {
+        !gbuf_emissive_view || !gbuf_velocity_view || !gbuf_motion3d_view) {
         return;
     }
 
     er::WriteDescriptorList writes;
-    writes.reserve(7);
+    writes.reserve(8);
 
     er::Helper::addOneBuffer(writes, visbuffer_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, VISBUF_VERTEX_BUFFER,
@@ -4421,6 +4424,7 @@ void ClusterRenderer::updateVisBufferTargets(
         { uint32_t(VISBUF_GBUF_NORMAL),    gbuf_normal_view },
         { uint32_t(VISBUF_GBUF_EMISSIVE),  gbuf_emissive_view },
         { uint32_t(VISBUF_GBUF_VELOCITY),  gbuf_velocity_view },
+        { uint32_t(VISBUF_GBUF_MOTION3D),  gbuf_motion3d_view },
     };
     for (const auto& [binding, view] : img_binds) {
         er::Helper::addOneTexture(

@@ -537,8 +537,17 @@ private:
     // rgb + the readability lift; extra: (part kind, style, packed
     // accent colour, seed) -- what citizen.frag paints the garment
     // detail from.  Kind 0 is a plain box.
+    // FRAME-AHEAD (see shaders/citizen_gbuffer.glsl.h): xform is the
+    // pose the sim just produced (frame N+1); the picture is drawn at
+    // frame N from `draw` (rows of a 3x4) and `last` is frame N-1 for
+    // screen velocity.  Both are filled by resolvePoseHistory() from
+    // the (pid, ordinal) history after emission; `key` tags the record
+    // for that lookup and is not uploaded (the vertex layout stops at
+    // `last`).
     struct PartInstance { glm::mat4 xform; glm::vec4 color;
-                          glm::vec4 extra; };
+                          glm::vec4 extra;
+                          glm::vec4 draw[3]; glm::vec4 last[3];
+                          uint64_t key = 0; uint64_t key_pad = 0; };
     std::vector<PartInstance> frame_parts_;   // cube-mesh parts
     // A SKINNED part (the fine tier).  self / up / lo: three 3x4
     // transforms (rows) taking the part's unit box to the world -- as
@@ -550,14 +559,36 @@ private:
     // cube parts.
     struct SkinInstance { glm::vec4 self[3]; glm::vec4 up[3];
                           glm::vec4 lo[3]; glm::vec4 color;
-                          glm::vec4 extra; glm::vec4 shape; };
+                          glm::vec4 extra; glm::vec4 shape;
+                          // frame-ahead history (resolvePoseHistory)
+                          glm::vec4 draw[3]; glm::vec4 dup[3];
+                          glm::vec4 dlo[3]; glm::vec4 last[3];
+                          uint64_t key = 0; uint64_t key_pad = 0; };
     std::vector<SkinInstance> frame_tube_;    // limbs, neck
     std::vector<SkinInstance> frame_blob_;    // torso, pelvis, shoes, hair
     std::vector<SkinInstance> frame_ball_;    // head, hands
     // A CHARACTER MESH instance: (first palette row, seed, lift, 0).
-    struct NpcInstance { glm::vec4 a; };
+    // (first row of the N+1 block, seed, lift, block stride): the
+    // palette carries THREE kNpcRows blocks an instance -- N+1, N
+    // (drawn), N-1 -- see resolvePoseHistory.
+    struct NpcInstance { glm::vec4 a; uint64_t key = 0; uint64_t key_pad = 0; };
     std::vector<NpcInstance> frame_npc_[2];   // per character
-    std::vector<glm::vec4>   frame_palette_;  // kNpcRows rows an instance
+    std::vector<glm::vec4>   frame_palette_;  // 3 * kNpcRows rows an instance
+    // ── FRAME-AHEAD POSE HISTORY ─────────────────────────────────────
+    // Last two frames' poses per emitted record, keyed by (pid, ordinal
+    // of the record within that person's emit).  A record seen for the
+    // first time draws at its N+1 pose (no history -> no motion).
+    struct PoseHist { glm::mat4 n, n1; uint32_t seen = 0; uint32_t stamp = 0; };
+    struct SkinHist { glm::vec4 self[3], up[3], lo[3], self1[3]; uint32_t seen = 0; uint32_t stamp = 0; };
+    struct NpcHist  { glm::vec4 rows[kNpcRows], rows1[kNpcRows]; uint32_t seen = 0; uint32_t stamp = 0; };
+    std::unordered_map<uint64_t, PoseHist> hist_parts_;
+    std::unordered_map<uint64_t, SkinHist> hist_skin_;
+    std::unordered_map<uint64_t, NpcHist>  hist_npc_;
+    uint32_t hist_stamp_ = 0;
+    uint32_t emit_ordinal_ = 0;     // reset per emitPerson
+    int      emit_pid_ = 0;
+    uint64_t emitKey() { return (uint64_t(uint32_t(emit_pid_)) << 32) | uint64_t(emit_ordinal_++); }
+    void resolvePoseHistory();
     std::vector<uint8_t>     is_npc_;
     // Per-frame scratch, kept as members so the render-tier pass does
     // not heap-allocate (and free) a population-sized buffer every

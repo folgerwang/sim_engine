@@ -54,6 +54,70 @@ layout(std430, set = 0, binding = 7) readonly buffer ClassIdxBuf {
 layout(std430, set = 0, binding = 8) readonly buffer RecCountBuf {
     uint rec_counts[];
 };
+// Hi-Z pyramid (max-Z per texel, mip 0 = half res).  Frame-ahead: built
+// from the PREDICTED depth of this very frame, so a node fully behind it
+// is skipped before any of its instances reach the vertex shader.  Only
+// read when pc.flags has NT_CULL_FLAG_HIZ.
+layout(set = 0, binding = 9) uniform sampler2D hiz_pyramid;
+
+// Gribb-Hartmann plane k of clip = M * p, normals inward.  M already maps
+// DRAWABLE space to clip, so the planes come out in drawable space; the
+// normal length is |n_world| * inst_world scale, hence the iw_scale in
+// the renormalisation (uniform-scale instance transforms, as the host
+// side assumes for the radius too).
+vec4 ntFrustumPlane(const mat4 M, uint k) {
+    const vec4 r0 = vec4(M[0][0], M[1][0], M[2][0], M[3][0]);
+    const vec4 r1 = vec4(M[0][1], M[1][1], M[2][1], M[3][1]);
+    const vec4 r2 = vec4(M[0][2], M[1][2], M[2][2], M[3][2]);
+    const vec4 r3 = vec4(M[0][3], M[1][3], M[2][3], M[3][3]);
+    vec4 p;
+    if      (k == 0u) p = r3 + r0;
+    else if (k == 1u) p = r3 - r0;
+    else if (k == 2u) p = r3 + r1;
+    else if (k == 3u) p = r3 - r1;
+    else if (k == 4u) p = r3 + r2;
+    else              p = r3 - r2;
+    return p;
+}
+
+// Sphere (drawable space) vs the Hi-Z pyramid: project the 8 corners of
+// the sphere's bounding cube with M (drawable → clip), take the screen
+// AABB and its nearest NDC depth, and reject when the pyramid's max depth
+// over that AABB is nearer.  Mirrors cluster_cull.comp so both cull paths
+// agree on the same occluder set.  Conservative: anything that cannot
+// be decided (behind the camera, off-screen, sub-pixel) survives.
+bool ntHiZOccluded(const mat4 M, vec3 c, float r, vec2 hiz_size, float hiz_mips) {
+    vec2  ndc_min = vec2( 1.0);
+    vec2  ndc_max = vec2(-1.0);
+    float ndc_z_near = 1.0;
+    for (int i = 0; i < 8; ++i) {
+        const vec3 cw = c + r * vec3(
+            ((i & 1) != 0) ?  1.0 : -1.0,
+            ((i & 2) != 0) ?  1.0 : -1.0,
+            ((i & 4) != 0) ?  1.0 : -1.0);
+        const vec4 cc = M * vec4(cw, 1.0);
+        if (cc.w <= 1e-4) return false;
+        const vec3 nd = cc.xyz / cc.w;
+        ndc_min = min(ndc_min, nd.xy);
+        ndc_max = max(ndc_max, nd.xy);
+        ndc_z_near = min(ndc_z_near, nd.z);
+    }
+    if (ndc_z_near < 0.0) return false;
+    const vec2 uv_min = max(ndc_min * 0.5 + 0.5, vec2(0.0));
+    const vec2 uv_max = min(ndc_max * 0.5 + 0.5, vec2(1.0));
+    if (uv_max.x <= uv_min.x || uv_max.y <= uv_min.y) return false;
+    const vec2  aabb_px = (uv_max - uv_min) * hiz_size;
+    const float max_dim = max(aabb_px.x, aabb_px.y);
+    if (min(aabb_px.x, aabb_px.y) < 0.5 && max_dim < 2.0) return false;
+    float mip = clamp(ceil(log2(max(max_dim * 0.5, 1.0))), 0.0, hiz_mips - 1.0);
+    const float pyramid_max_z = max(
+        max(textureLod(hiz_pyramid, vec2(uv_min.x, uv_min.y), mip).r,
+            textureLod(hiz_pyramid, vec2(uv_min.x, uv_max.y), mip).r),
+        max(textureLod(hiz_pyramid, vec2(uv_max.x, uv_min.y), mip).r,
+            textureLod(hiz_pyramid, vec2(uv_max.x, uv_max.y), mip).r));
+    const float bias = 1e-5 + ndc_z_near * 1e-4;
+    return pyramid_max_z < 0.99999 && ndc_z_near > pyramid_max_z + bias;
+}
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -68,7 +132,23 @@ void main() {
     // The planes were transformed by transpose(inst_world) on the host,
     // so their signed distance is the WORLD distance; only the radius
     // needs the instance-world scale.
-    if (pc.plane_count > 0u) {
+    const bool vp_planes = (pc.flags & NT_CULL_FLAG_VP_PLANES) != 0u;
+    if (vp_planes) {
+        // planes[0..3] carry view_proj * inst_world; planes[4] the Hi-Z
+        // extent.  Frustum first (cheap), then the pyramid.
+        const mat4 M = mat4(pc.planes[0], pc.planes[1], pc.planes[2], pc.planes[3]);
+        const vec3 c = node.sphere.xyz;
+        const float r = node.sphere.w * pc.iw_scale;
+        for (uint k = 0u; k < 6u; ++k) {
+            vec4 p = ntFrustumPlane(M, k);
+            const float n_len = length(p.xyz);
+            if (n_len < 1e-12) continue;            // degenerate (infinite far)
+            p *= pc.iw_scale / n_len;
+            if (dot(p.xyz, c) + p.w < -r) return;
+        }
+        if ((pc.flags & NT_CULL_FLAG_HIZ) != 0u &&
+            ntHiZOccluded(M, c, node.sphere.w, pc.planes[4].xy, pc.planes[4].z)) return;
+    } else if (pc.plane_count > 0u) {
         const vec3 c = node.sphere.xyz;
         const float r = node.sphere.w * pc.iw_scale;
         for (uint k = 0u; k < pc.plane_count && k < 6u; ++k) {

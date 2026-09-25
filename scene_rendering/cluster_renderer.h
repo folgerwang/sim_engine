@@ -1166,7 +1166,8 @@ public:
         const std::shared_ptr<renderer::ImageView>& gbuf_albedo_view,
         const std::shared_ptr<renderer::ImageView>& gbuf_normal_view,
         const std::shared_ptr<renderer::ImageView>& gbuf_emissive_view,
-        const std::shared_ptr<renderer::ImageView>& gbuf_velocity_view);
+        const std::shared_ptr<renderer::ImageView>& gbuf_velocity_view,
+        const std::shared_ptr<renderer::ImageView>& gbuf_motion3d_view);
 
     // Visibility raster, Phase A / Phase B.  Byte-for-byte the same
     // indirect draws as drawOpaqueGBufferPhaseA/B -- only the bound

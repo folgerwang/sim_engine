@@ -654,7 +654,7 @@ void CitizenSystem::initStaticMembers(
 
     s_device_ = device;
     std::vector<er::VertexInputBindingDescription> bindings(3);
-    std::vector<er::VertexInputAttributeDescription> attribs(8);
+    std::vector<er::VertexInputAttributeDescription> attribs(8 + 6);
     bindings[0].binding = 0;
     bindings[0].stride = sizeof(glm::vec3);
     bindings[0].input_rate = er::VertexInputRate::VERTEX;
@@ -680,7 +680,10 @@ void CitizenSystem::initStaticMembers(
     bindings[2].input_rate = er::VertexInputRate::INSTANCE;
     // ...plus the sixth vec4 at location 15: (kind, style, packed
     // accent colour, seed) for the garment painting in citizen.frag.
-    for (int k = 0; k < 6; ++k) {
+    // ...and the FRAME-AHEAD history at 16-21: draw[3] (frame N rows)
+    // then last[3] (frame N-1 rows), straight after `extra` in the
+    // record.  `key` trails them and is never read by the GPU.
+    for (int k = 0; k < 6 + 6; ++k) {
         attribs[2 + k].binding = 2;
         attribs[2 + k].location = uint32_t(10 + k);
         attribs[2 + k].format = er::Format::R32G32B32A32_SFLOAT;
@@ -712,7 +715,7 @@ void CitizenSystem::initStaticMembers(
             SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
         gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
             er::helper::fillPipelineColorBlendStateCreateInfo(
-                std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+                std::vector<er::PipelineColorBlendAttachmentState>(5, att)));
         s_gbuf_pipeline_ = device->createPipeline(
             s_pipeline_layout_, bindings, attribs, input_assembly,
             gbuf_info, gbuf_modules, gbuffer_format,
@@ -730,13 +733,15 @@ void CitizenSystem::initStaticMembers(
     // its back to the camera on the inside of a sharp bend.
     {
         std::vector<er::VertexInputBindingDescription> sb(3);
-        std::vector<er::VertexInputAttributeDescription> sa(2 + 12);
+        std::vector<er::VertexInputAttributeDescription> sa(2 + 12 + 12);
         sb[0] = bindings[0]; sb[1] = bindings[1];
         sa[0] = attribs[0];  sa[1] = attribs[1];
         sb[2].binding = 2;
         sb[2].stride = sizeof(SkinInstance);
         sb[2].input_rate = er::VertexInputRate::INSTANCE;
-        for (int k = 0; k < 12; ++k) {
+        // 3-14 = self/up/lo/color/extra/shape (frame N+1); 15-26 = the
+        // frame-ahead history draw/dup/dlo/last (see citizen_skin.vert)
+        for (int k = 0; k < 12 + 12; ++k) {
             sa[2 + k].binding = 2;
             sa[2 + k].location = uint32_t(3 + k);
             sa[2 + k].format = er::Format::R32G32B32A32_SFLOAT;
@@ -764,7 +769,7 @@ void CitizenSystem::initStaticMembers(
                 SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
             gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
                 er::helper::fillPipelineColorBlendStateCreateInfo(
-                    std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+                    std::vector<er::PipelineColorBlendAttachmentState>(5, att)));
             s_skin_gbuf_pipeline_ = device->createPipeline(
                 s_pipeline_layout_, sb, sa, input_assembly,
                 gbuf_info, gbuf_modules, gbuffer_format,
@@ -965,7 +970,7 @@ void CitizenSystem::initStaticMembers(
                                 HOST_COHERENT_BIT),
                 0, s_npc_palette_buf_->buffer, s_npc_palette_buf_->memory,
                 std::source_location::current(),
-                uint64_t(kMaxNpc) * kNpcRows * sizeof(glm::vec4), nullptr);
+                uint64_t(kMaxNpc) * 3 * kNpcRows * sizeof(glm::vec4), nullptr);
             s_npc_inst_buf_ = std::make_shared<er::BufferInfo>();
             er::Helper::createBuffer(
                 device,
@@ -986,7 +991,7 @@ void CitizenSystem::initStaticMembers(
                 er::Helper::addOneBuffer(
                     w, as.desc, er::DescriptorType::STORAGE_BUFFER, 0,
                     s_npc_palette_buf_->buffer,
-                    uint32_t(uint64_t(kMaxNpc) * kNpcRows * sizeof(glm::vec4)));
+                    uint32_t(uint64_t(kMaxNpc) * 3 * kNpcRows * sizeof(glm::vec4)));
                 er::Helper::addOneTexture(
                     w, as.desc, er::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     1, s_npc_sampler_, as.albedo.view,
@@ -1048,7 +1053,7 @@ void CitizenSystem::initStaticMembers(
                     SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
                 gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
                     er::helper::fillPipelineColorBlendStateCreateInfo(
-                        std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+                        std::vector<er::PipelineColorBlendAttachmentState>(5, att)));
                 s_npc_gbuf_pipeline_ = device->createPipeline(
                     s_npc_layout_, nb, na, ia, gbuf_info, gbuf_modules,
                     gbuffer_format, two_sided,
@@ -3721,6 +3726,10 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
         far_thresh_ = glm::max(kMinAngular, far_thresh_ * 0.9f);
     }
     far_thresh_ = glm::min(far_thresh_, 0.02f);
+    // FRAME-AHEAD: fill the drawn (N) and previous (N-1) poses now, so
+    // both the shadow collectors (which run before draw) and the raster
+    // pass see the same frame-N picture.
+    resolvePoseHistory();
 
     // ── Telemetry: one [citizen] line every ~5 real seconds ──────────
     // Answers "where are the citizens" from the log alone: game clock,
@@ -3805,6 +3814,10 @@ void CitizenSystem::update(float delta_t, const glm::vec3& camera_pos,
 void CitizenSystem::emitPerson(int pid_i, const SimState& a,
                                const Person& p, bool detailed,
                                bool fine, bool npc) {
+    // frame-ahead: every record this call emits is keyed (pid, ordinal)
+    // so resolvePoseHistory() can find its pose from the last two frames
+    emit_pid_ = pid_i;
+    emit_ordinal_ = 0;
     if (!detailed) {
         // FAR TIER: one box, person-sized, duty-tinted — a figure at a
         // distance, not a puppet.  Slight walk bob keeps crowds alive.
@@ -3815,6 +3828,7 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
             auto part=[&](glm::mat4 m,glm::vec3 scale) {
                 frame_parts_.push_back({m*glm::scale(glm::mat4(1.f),scale),
                     glm::vec4(dutyColor(p.duty),.12f),glm::vec4(0.f)});
+                frame_parts_.back().key = emitKey();
             };
             part(root*glm::translate(glm::mat4(1.f),glm::vec3(0,1.25f*s,0)),{.2f*s*p.bulk,.5f*s,.13f*s});
             for(int side:{-1,1}) {
@@ -3837,6 +3851,7 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
                         0.13f * s * p.bulk});
         frame_parts_.push_back({M, glm::vec4(dutyColor(p.duty), 0.12f),
                                 glm::vec4(0.0f)});
+        frame_parts_.back().key = emitKey();
         return;
     }
 
@@ -4168,7 +4183,7 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
         // Children keep the puppet -- a scaled-down adult is not a
         // child.
         if (npc && s_npc_ready_ && p.age != 1 && p.age != 2 &&
-            frame_palette_.size() + size_t(kNpcRows) <=
+            frame_palette_.size() + 3 * size_t(kNpcRows) <=
                 size_t(kMaxNpc) * size_t(kNpcRows)) {
             const int ch = look.female ? 1 : 0;
             const NpcAsset& as = s_npc_[ch].ok ? s_npc_[ch]
@@ -4209,10 +4224,15 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
                         frame_palette_.push_back(
                             glm::vec4(M[0][r], M[1][r], M[2][r], M[3][r]));
                 }
+                // FRAME-AHEAD: two more blocks (frame N = drawn, frame
+                // N-1), filled by resolvePoseHistory() from this
+                // person's history; the N+1 block above is the newest.
+                frame_palette_.resize(frame_palette_.size() + 2 * size_t(kNpcRows));
                 NpcInstance ni;
                 ni.a = glm::vec4(float(base_row),
                                  lookRand(uint32_t(pid_i), 0x51u),
-                                 0.10f, 0.0f);
+                                 0.10f, float(kNpcRows));
+                ni.key = emitKey();
                 frame_npc_[&as == &s_npc_[0] ? 0 : 1].push_back(ni);
                 return;
             }
@@ -4271,6 +4291,7 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
                 up >= 0 ? (meet_y(up) - centre.y) / hy : 10.0f,
                 lo >= 0 ? (meet_y(lo) - centre.y) / hy : -10.0f,
                 blend / hy, taper);
+            si.key = emitKey();
             (mesh == 0 ? frame_tube_ : mesh == 1 ? frame_blob_
                                                  : frame_ball_).push_back(si);
         };
@@ -4419,6 +4440,7 @@ void CitizenSystem::emitPerson(int pid_i, const SimState& a,
             glm::scale(glm::mat4(1.0f), half);
         frame_parts_.push_back({M, glm::vec4(rgb, 0.12f),
                                 glm::vec4(0.0f)});
+        frame_parts_.back().key = emitKey();
     };
     (void)col;
     // torso / head keep the walk-neutral frame
@@ -4452,11 +4474,11 @@ void CitizenSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkin
         out.back().positions = &mesh.positions; out.back().indices = &mesh.indices;
         return out.back();
     };
-    for (const auto& part : frame_parts_) add(s_shadow_cube_).model = part.xform;
+    for (const auto& part : frame_parts_) add(s_shadow_cube_).model = matrix(part.draw);   // drawn (frame N) pose
     auto skin = [&](const std::vector<SkinInstance>& parts, const ActorShadowGeometry& mesh) {
         for (const auto& part : parts) {
             auto& b = add(mesh); b.deformation = 2; b.shape = part.shape;
-            b.palette = {matrix(part.self), matrix(part.up), matrix(part.lo)};
+            b.palette = {matrix(part.draw), matrix(part.dup), matrix(part.dlo)};   // drawn (frame N) pose
         }
     };
     if (s_skin_pipeline_) {
@@ -4467,7 +4489,9 @@ void CitizenSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkin
     for (int c=0; c<2; ++c) {
         const auto& asset=s_npc_[c]; if (!asset.ok) continue;
         for (const auto& inst : frame_npc_[c]) {
-            const size_t row=size_t(inst.a.x+0.5f);
+            // drawn (frame N) block = the second of the three (see
+            // resolvePoseHistory)
+            const size_t row=size_t(inst.a.x+0.5f)+size_t(kNpcRows);
             if (row+kNpcRows>frame_palette_.size()) continue;
             auto& b=add(asset.shadow); b.deformation=3;
             b.joints=&asset.rt_joints; b.weights=&asset.rt_weights;
@@ -4480,13 +4504,13 @@ void CitizenSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkin
 void CitizenSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
     out.positions.clear(); out.indices.clear();
     if (!loaded_ || !s_pipeline_) return;
-    for (const auto& part : frame_parts_)
-        out.append(s_shadow_cube_, [&](const glm::vec3& p) {
-            return glm::vec3(part.xform * glm::vec4(p, 1.0f));
-        });
     auto transform = [](const glm::vec4* rows, const glm::vec4& p) {
         return glm::vec3(glm::dot(rows[0], p), glm::dot(rows[1], p), glm::dot(rows[2], p));
     };
+    for (const auto& part : frame_parts_)
+        out.append(s_shadow_cube_, [&](const glm::vec3& p) {
+            return transform(part.draw, glm::vec4(p, 1.0f));   // drawn (frame N) pose
+        });
     auto skin = [&](const std::vector<SkinInstance>& parts, const ActorShadowGeometry& mesh) {
         for (const auto& part : parts) out.append(mesh, [&](const glm::vec3& v) {
             // Same taper and pivot blend as citizen_skin.vert.
@@ -4498,8 +4522,8 @@ void CitizenSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
                 wl = 1.0f - glm::smoothstep(part.shape.y - part.shape.z, part.shape.y + part.shape.z, v.y);
             }
             const float ws = std::max(0.0f, 1.0f - wu - wl);
-            return (ws * transform(part.self, p) + wu * transform(part.up, p)
-                    + wl * transform(part.lo, p)) / std::max(ws + wu + wl, 1e-6f);
+            return (ws * transform(part.draw, p) + wu * transform(part.dup, p)
+                    + wl * transform(part.dlo, p)) / std::max(ws + wu + wl, 1e-6f);   // drawn (frame N)
         });
     };
     if (s_skin_pipeline_) {
@@ -4531,6 +4555,77 @@ void CitizenSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
     }
 }
 
+// ── FRAME-AHEAD POSE HISTORY ─────────────────────────────────────────
+// The simulation is committed one frame ahead of the picture, so every
+// record emitted this frame carries the N+1 pose.  This fills the pose
+// the picture is DRAWN at (frame N) and the one before it (N-1) from
+// what the same (pid, ordinal) record carried on the last two calls,
+// then rolls the history.  A record with no history yet draws at its
+// N+1 pose: zero motion for one frame, never a jump.  Records not seen
+// this frame are dropped after a short grace so the maps track the
+// crowd inside kShowRadius, not the whole town.
+void CitizenSystem::resolvePoseHistory() {
+    ++hist_stamp_;
+    auto rows_of = [](const glm::mat4& M, glm::vec4* r) {
+        for (int i = 0; i < 3; ++i)
+            r[i] = glm::vec4(M[0][i], M[1][i], M[2][i], M[3][i]);
+    };
+    for (auto& pi : frame_parts_) {
+        auto& h = hist_parts_[pi.key];
+        const glm::mat4 draw = h.seen >= 1 ? h.n  : pi.xform;
+        const glm::mat4 last = h.seen >= 2 ? h.n1 : draw;
+        rows_of(draw, pi.draw);
+        rows_of(last, pi.last);
+        h.n1 = h.seen >= 1 ? h.n : pi.xform;
+        h.n = pi.xform;
+        h.seen = std::min(h.seen + 1u, 2u);
+        h.stamp = hist_stamp_;
+    }
+    for (auto* v : {&frame_tube_, &frame_blob_, &frame_ball_}) {
+        for (auto& si : *v) {
+            auto& h = hist_skin_[si.key];
+            for (int i = 0; i < 3; ++i) {
+                si.draw[i] = h.seen >= 1 ? h.self[i]  : si.self[i];
+                si.dup[i]  = h.seen >= 1 ? h.up[i]    : si.up[i];
+                si.dlo[i]  = h.seen >= 1 ? h.lo[i]    : si.lo[i];
+                si.last[i] = h.seen >= 2 ? h.self1[i] : si.draw[i];
+                h.self1[i] = h.seen >= 1 ? h.self[i] : si.self[i];
+                h.self[i] = si.self[i]; h.up[i] = si.up[i]; h.lo[i] = si.lo[i];
+            }
+            h.seen = std::min(h.seen + 1u, 2u);
+            h.stamp = hist_stamp_;
+        }
+    }
+    for (int c = 0; c < 2; ++c) {
+        for (auto& ni : frame_npc_[c]) {
+            auto& h = hist_npc_[ni.key];
+            const size_t b = size_t(ni.a.x + 0.5f);
+            if (b + 3 * size_t(kNpcRows) > frame_palette_.size()) continue;
+            glm::vec4* next = &frame_palette_[b];
+            glm::vec4* draw = next + kNpcRows;
+            glm::vec4* last = next + 2 * kNpcRows;
+            for (int r = 0; r < kNpcRows; ++r) {
+                draw[r] = h.seen >= 1 ? h.rows[r]  : next[r];
+                last[r] = h.seen >= 2 ? h.rows1[r] : draw[r];
+                h.rows1[r] = h.seen >= 1 ? h.rows[r] : next[r];
+                h.rows[r] = next[r];
+            }
+            h.seen = std::min(h.seen + 1u, 2u);
+            h.stamp = hist_stamp_;
+        }
+    }
+    // A record that vanished (left the tier, walked out of range) is
+    // forgotten after 8 frames; if it comes back it restarts at zero
+    // motion, which is right -- its tier geometry differs anyway.
+    if ((hist_stamp_ & 7u) == 0u) {
+        auto prune = [&](auto& m) {
+            for (auto it = m.begin(); it != m.end();)
+                it = (hist_stamp_ - it->second.stamp > 8u) ? m.erase(it) : std::next(it);
+        };
+        prune(hist_parts_); prune(hist_skin_); prune(hist_npc_);
+    }
+}
+
 void CitizenSystem::draw(
     const std::shared_ptr<er::CommandBuffer>& cmd_buf,
     const er::DescriptorSetList& desc_sets,
@@ -4539,7 +4634,7 @@ void CitizenSystem::draw(
     const glm::uvec2& buffer_size,
     const std::vector<std::shared_ptr<er::ImageView>>& gbuffer) {
     const bool deferred = !gbuffer.empty();
-    if (deferred && (gbuffer.size() != 4 || !s_gbuf_pipeline_)) return;
+    if (deferred && (gbuffer.size() != 5 || !s_gbuf_pipeline_)) return;
     if (!loaded_ || !s_pipeline_) return;
     if (frame_parts_.empty() && frame_tube_.empty() &&
         frame_blob_.empty() && frame_ball_.empty() &&
@@ -4792,6 +4887,7 @@ void CitizenSystem::destroy(const std::shared_ptr<er::Device>& device) {
     frame_npc_[1].clear();
     frame_palette_.clear();
     frame_palette_.shrink_to_fit();
+    hist_parts_.clear(); hist_skin_.clear(); hist_npc_.clear();
     is_npc_.clear();
     is_detailed_.clear();
     is_detailed_.shrink_to_fit();

@@ -109,6 +109,13 @@ public:
     void setApplyProjJitter(bool apply) {
         m_view_camera_->setApplyProjJitter(apply);
     }
+    // Frame-ahead (ViewCamera::setFrameAhead): main camera only.
+    void setFrameAhead(bool on) { if (m_view_camera_) m_view_camera_->setFrameAhead(on); }
+    bool isFrameAhead() const { return m_view_camera_ && m_view_camera_->isFrameAhead(); }
+    // The camera the simulation is at (N+1 when frame-ahead is armed).
+    const glsl::ViewCameraInfo& getNextCameraViewInfo() const {
+        return m_view_camera_->getNextCameraInfo();
+    }
 
     virtual glm::mat4 getViewProjMatrix() {
         return m_view_camera_->getCameraInfo().view_proj;

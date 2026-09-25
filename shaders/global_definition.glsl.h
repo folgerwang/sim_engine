@@ -70,6 +70,7 @@
 #define VISBUF_GBUF_NORMAL          4
 #define VISBUF_GBUF_EMISSIVE        5
 #define VISBUF_GBUF_VELOCITY        6
+#define VISBUF_GBUF_MOTION3D        7   // rgba16f forward motion (frame-ahead)
 #define NODE_TABLE_PARAMS_BINDING   0   // ModelParams per LOD-survivor record
 #define NODE_TABLE_SLOTS_BINDING    1   // record index per bucket slot
 
@@ -1826,6 +1827,11 @@ struct ObjectVsPsData {
     // launch its RT rays from the unswayed surface the BLAS holds.
     float vertex_sway;
     float vertex_tree_age_base;
+    // FRAME-AHEAD: world-space forward motion of this vertex, frame N ->
+    // N+1, metres (base.vert: sway at time + frame_dt minus sway at
+    // time; 0 on non-sway draws).  base.frag writes it to the RT4
+    // motion3d G-buffer for the depth predictor.
+    vec3 vertex_motion3d;
 #ifdef HAS_NORMALS
     vec3 vertex_normal;
     // Crown-shell normal for vegetation draws (veg_sway.glsl.h
@@ -2030,10 +2036,22 @@ struct ViewCameraInfo {
     // (cos yaw, sin yaw, active 0|1, 0).  Filled by
     // ViewCamera::setTerrainHoles from the <map>_holes.txt sidecar;
     // the GPU camera update never writes them.
-    float           terrain_hole_pad0;
+    // FRAME-AHEAD RENDERING (pad0 of the hole block, repurposed).
+    // frame_dt: seconds from the drawn frame N to the committed frame
+    // N+1 -- the lookahead the analytic sway uses for its forward
+    // motion vector (base.vert).  0 disables prediction.
+    float           frame_dt;
     float           terrain_hole_pad1;
     vec4            terrain_holes[TERRAIN_HOLE_MAX];
     vec4            terrain_hole_rot[TERRAIN_HOLE_MAX];
+    // FRAME-AHEAD: the exact view-projection of frame N+1 (the sim,
+    // input included, is committed a frame before the picture).  The
+    // depth predictor reprojects frame N's depth through this to build
+    // the cull pyramid for N+1.  Equal to view_proj until the
+    // application publishes it.  Trailing mat4: every field above keeps
+    // its offset under std430 and glm alike (the vec4 arrays end on a
+    // 16-byte boundary).
+    mat4            next_view_proj;
 };
 
 struct RuntimeLightsParams {
@@ -2129,9 +2147,19 @@ struct NtCullPushConstants {
     uint    mode;             // NT_MODE_*
     float   iw_scale;         // world radius = sphere.w * iw_scale
     uint    pad0;             // 1 = instances were compacted this pass (rec_counts valid)
-    uint    pad1;
+    uint    flags;            // NT_CULL_FLAG_*
     uint    pad2;
 };
+// NtCullPushConstants.flags.  The push block is full (128 bytes), so the
+// frame-ahead occlusion test re-purposes the plane slots:
+//   VP_PLANES  planes[0..3] = view_proj * inst_world (column-major); the
+//              six frustum planes are derived in-shader (Gribb-Hartmann,
+//              renormalised by iw_scale so distances stay in world units)
+//   HIZ        planes[4] = (hiz width, hiz height, mip count, 0); the node
+//              sphere is also tested against the Hi-Z pyramid at binding 9
+//              (the PREDICTED depth of this frame when frame-ahead is on)
+#define NT_CULL_FLAG_VP_PLANES 1u
+#define NT_CULL_FLAG_HIZ       2u
 
 // nt_instance_compact.comp -- one invocation per (class record, instance).
 // 128 bytes.  planes are WORLD space (the per-instance centre is taken to

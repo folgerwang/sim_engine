@@ -1535,6 +1535,19 @@ public:
     // submitting each node's full list and rejecting per vertex.
     static void setNtCompactEnabled(bool on);
     static bool ntCompactEnabled();
+    // Frame-ahead occlusion for the node-table cull: the Hi-Z pyramid the
+    // camera passes test node spheres against (node_table_cull.comp
+    // binding 9) and the view_proj of the frame it was built for.  The
+    // view must stay valid until the next call; pass a null view when
+    // the pyramid is torn down.  enabled=false keeps the binding written
+    // (the shader declares it) but the cull ignores it.
+    static void setNtHiZOcclusion(
+        const std::shared_ptr<renderer::Sampler>& sampler,
+        const std::shared_ptr<renderer::ImageView>& view,
+        const glm::uvec2& size,
+        uint32_t mip_count,
+        const glm::mat4& view_proj,
+        bool enabled);
     static bool debugHideTreeWood();
     static bool debugHideTreeLeaves();
     bool getDebugForceRed() const {

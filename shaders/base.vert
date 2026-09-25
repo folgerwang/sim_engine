@@ -327,6 +327,21 @@ void main() {
                                                                0.0f),
                                     veg_plant_bits);
         position_ws += vegSwayVec(sway_travel);
+        // FRAME-AHEAD forward motion: the sway is a closed-form function
+        // of time, so the N+1 pose is the same function at time +
+        // frame_dt.  The delta is what the depth predictor moves this
+        // vertex by (ObjectVsPsData::vertex_motion3d).
+        if (camera_info.frame_dt > 0.0) {
+            float sway_next = vegSwayTravel(inst_t, position_ls.y,
+                                            camera_info.time_s + camera_info.frame_dt,
+                                            local_world_rot_mat * vec3(0.0f, 1.0f, 0.0f),
+                                            veg_plant_bits);
+            out_data.vertex_motion3d = vegSwayVec(sway_next) - vegSwayVec(sway_travel);
+        } else {
+            out_data.vertex_motion3d = vec3(0.0);
+        }
+    } else {
+        out_data.vertex_motion3d = vec3(0.0);
     }
     gl_Position = camera_info.view_proj * vec4(position_ws, 1.0);
     out_data.vertex_position = position_ws;

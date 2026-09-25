@@ -940,7 +940,7 @@ void VehicleSystem::initStaticMembers(
     // bind the same layout with -1 parts and a zero paint, so one
     // pipeline draws either.
     std::vector<er::VertexInputBindingDescription> bindings(4);
-    std::vector<er::VertexInputAttributeDescription> attribs(10);
+    std::vector<er::VertexInputAttributeDescription> attribs(10 + 6);
     bindings[0].binding = 0;
     bindings[0].stride = sizeof(glm::vec3);
     bindings[0].input_rate = er::VertexInputRate::VERTEX;
@@ -965,7 +965,9 @@ void VehicleSystem::initStaticMembers(
     bindings[3].binding = 3;
     bindings[3].stride = sizeof(PartInstance);
     bindings[3].input_rate = er::VertexInputRate::INSTANCE;
-    for (int k = 0; k < 7; ++k) {
+    // 10-16 = xform/color/extra/paint (frame N+1); 17-22 = the frame-
+    // ahead history draw[3] / last[3] (see vehicle.vert)
+    for (int k = 0; k < 7 + 6; ++k) {
         attribs[3 + k].binding = 3;
         attribs[3 + k].location = uint32_t(10 + k);
         attribs[3 + k].format = er::Format::R32G32B32A32_SFLOAT;
@@ -997,7 +999,7 @@ void VehicleSystem::initStaticMembers(
             SET_FLAG_BIT(ColorComponent, ALL_BITS), false);
         gbuf_info.blend_state_info = std::make_shared<er::PipelineColorBlendStateCreateInfo>(
             er::helper::fillPipelineColorBlendStateCreateInfo(
-                std::vector<er::PipelineColorBlendAttachmentState>(4, att)));
+                std::vector<er::PipelineColorBlendAttachmentState>(5, att)));
         s_gbuf_pipeline_ = device->createPipeline(
             s_pipeline_layout_, bindings, attribs, input_assembly,
             gbuf_info, gbuf_modules, gbuffer_format,
@@ -3344,12 +3346,26 @@ void VehicleSystem::update(float delta_t, float speed_scale,
         frame_.resize(size_t(streamCount()));
     for (auto& f : frame_) f.clear();
     const float draw2 = kDrawRadius * kDrawRadius;
+    std::vector<size_t> before(frame_.size());
     for (const Vehicle& v : vehicles_) {
         const float dx = v.pos.x - camera_pos.x, dz = v.pos.z - camera_pos.z;
         if (dx * dx + dz * dz > draw2) continue;
+        for (size_t k = 0; k < frame_.size(); ++k) before[k] = frame_[k].size();
         emit(v);
+        // FRAME-AHEAD: key every record this vehicle just emitted by
+        // (seed, ordinal) so resolvePoseHistory() finds its last poses.
+        // Ordinal counts across streams in stream order, which emit()
+        // fills deterministically for a given vehicle.
+        uint32_t ordinal = 0;
+        for (size_t k = 0; k < frame_.size(); ++k)
+            for (size_t r = before[k]; r < frame_[k].size(); ++r)
+                frame_[k][r].key = (uint64_t(v.seed | 0x80000000u) << 32) | uint64_t(ordinal++);
     }
     emitSignals(camera_pos, ground);
+    // FRAME-AHEAD: every stream is emitted now (vehicles, signals,
+    // paint); fill the drawn (N) / previous (N-1) rows before the
+    // shadow collectors and the raster pass read them.
+    resolvePoseHistory();
     dbg_timer_ += dt;
     if (dbg_timer_ > 10.0f) {
         dbg_timer_ = 0.0f;
@@ -3507,7 +3523,7 @@ void VehicleSystem::collectGpuShadowGeometry(std::vector<scene_rendering::RtSkin
             out.emplace_back(); auto& b=out.back();
             b.positions=&s_meshes_[mesh].shadow.positions;
             b.indices=&s_meshes_[mesh].shadow.indices;
-            b.model=instance.xform;
+            b.model=glm::mat4(glm::vec4(instance.draw[0].x,instance.draw[1].x,instance.draw[2].x,0),glm::vec4(instance.draw[0].y,instance.draw[1].y,instance.draw[2].y,0),glm::vec4(instance.draw[0].z,instance.draw[1].z,instance.draw[2].z,0),glm::vec4(instance.draw[0].w,instance.draw[1].w,instance.draw[2].w,1));   // drawn (frame N) pose
         }
     }
 }
@@ -3522,9 +3538,40 @@ void VehicleSystem::collectShadowGeometry(ActorShadowGeometry& out) const {
         for (const auto& instance : frame_[stream]) {
             if (instance.extra.x == 5.0f) continue;      // v42: paint casts no shadow
             out.append(s_meshes_[mesh].shadow, [&](const glm::vec3& p) {
-                return glm::vec3(instance.xform * glm::vec4(p, 1.0f));
+                return glm::vec3(glm::dot(instance.draw[0],glm::vec4(p,1.0f)),glm::dot(instance.draw[1],glm::vec4(p,1.0f)),glm::dot(instance.draw[2],glm::vec4(p,1.0f)));
             });
         }
+    }
+}
+
+// ── FRAME-AHEAD POSE HISTORY ─────────────────────────────────────────
+// Same contract as CitizenSystem::resolvePoseHistory: the record holds
+// the N+1 pose, this fills the drawn (N) and previous (N-1) rows from
+// the last two frames of the same keyed record.  Records with key 0
+// (signals, road paint) are static: draw = last = xform.
+void VehicleSystem::resolvePoseHistory() {
+    ++hist_stamp_;
+    auto rows_of = [](const glm::mat4& M, glm::vec4* r) {
+        for (int i = 0; i < 3; ++i)
+            r[i] = glm::vec4(M[0][i], M[1][i], M[2][i], M[3][i]);
+    };
+    for (auto& f : frame_) {
+        for (auto& pi : f) {
+            if (pi.key == 0) { rows_of(pi.xform, pi.draw); rows_of(pi.xform, pi.last); continue; }
+            auto& h = hist_parts_[pi.key];
+            const glm::mat4 draw = h.seen >= 1 ? h.n  : pi.xform;
+            const glm::mat4 last = h.seen >= 2 ? h.n1 : draw;
+            rows_of(draw, pi.draw);
+            rows_of(last, pi.last);
+            h.n1 = h.seen >= 1 ? h.n : pi.xform;
+            h.n = pi.xform;
+            h.seen = std::min(h.seen + 1u, 2u);
+            h.stamp = hist_stamp_;
+        }
+    }
+    if ((hist_stamp_ & 7u) == 0u) {
+        for (auto it = hist_parts_.begin(); it != hist_parts_.end();)
+            it = (hist_stamp_ - it->second.stamp > 8u) ? hist_parts_.erase(it) : std::next(it);
     }
 }
 
@@ -3537,7 +3584,7 @@ void VehicleSystem::draw(
     const std::vector<std::shared_ptr<er::ImageView>>& gbuffer,
     bool glass_only, bool opaque_only) {
     const bool deferred = !gbuffer.empty();
-    if (deferred && (gbuffer.size() != 4 || !s_gbuf_pipeline_)) return;
+    if (deferred && (gbuffer.size() != 5 || !s_gbuf_pipeline_)) return;
     if (!loaded() || !s_pipeline_ || !s_device_ || !s_pipeline_layout_) return;
     if (!color_view || !depth_view) return;
     size_t total = 0;
@@ -3643,6 +3690,7 @@ void VehicleSystem::destroy(const std::shared_ptr<er::Device>& device) {
     (void)device;
     vehicles_.clear();
     frame_.clear();
+    hist_parts_.clear();
     edges_.clear();
     paint_ok_.clear();
     nodes_.clear();
