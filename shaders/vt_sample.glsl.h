@@ -74,12 +74,22 @@
 // vbCalcFullBary).  Same rho^2 metric as vtComputeLod below, so a pixel
 // picks the SAME mip whichever pass shades it; if these two disagreed
 // the vis path and the raster path would stream different pages.
+// LOD bias for every VT sample: +0.5 puts the continuous LOD halfway
+// between two mips on average, so the in-slot trilinear lerp is always
+// engaged (a sample sitting exactly on a mip is the sharpest AND the
+// most aliased place to be; half a level in, the Lanczos-filtered
+// level above it is mixed in and high-frequency shimmer averages out).
+// Applied before the clamp at 0, so mip 0 at arm's length still blends
+// with its half-res slot mip.  Also biases the feedback (wanted mip),
+// which streams pages one half-level coarser -- consistent by design.
+#define VT_LOD_BIAS 0.5
+
 float vtComputeLodGrad(in VirtualTextureMeta meta, vec2 uv_ddx, vec2 uv_ddy) {
     vec2 sz = vec2(float(meta.width_px), float(meta.height_px));
     vec2 dx = uv_ddx * sz;
     vec2 dy = uv_ddy * sz;
     float rho2 = max(dot(dx, dx), dot(dy, dy));
-    return 0.5 * log2(max(rho2, 1.0));
+    return max(0.5 * log2(max(rho2, 1.0)) + VT_LOD_BIAS, 0.0);
 }
 
 void vtPickMipAndFracGrad(in VirtualTextureMeta meta, vec2 uv_ddx, vec2 uv_ddy,
@@ -103,8 +113,9 @@ float vtComputeLod(in VirtualTextureMeta meta, vec2 uv) {
     vec2 dy     = dFdy(src_uv);
     float rho2  = max(dot(dx, dx), dot(dy, dy));
     // 0.5 * log2(rho2) = log2(rho).  Floor at 0 for sub-texel
-    // derivatives (we'd just sample mip 0 anyway).
-    return 0.5 * log2(max(rho2, 1.0));
+    // derivatives (we'd just sample mip 0 anyway).  +VT_LOD_BIAS, see
+    // vtComputeLodGrad.
+    return max(0.5 * log2(max(rho2, 1.0)) + VT_LOD_BIAS, 0.0);
 }
 
 // Convenience: continuous LOD clamped to the VT's mip range and
