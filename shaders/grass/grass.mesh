@@ -113,6 +113,12 @@ float grassSnapToGrid(float t, float nseg) {
 // send 0).
 vec2 grassGridPos(vec2 g, float seg) {
     vec2 f = g * (1.0f / seg);
+    if ((tile_params.pad_0 & 1u) != 0u) {
+        // Packed surface vertices replace the regular grid AFTER edge
+        // stitching in tile.vert. Match their 15-bit coordinates exactly.
+        f = floor(f * 32767.0f + 0.5f) / 32767.0f;
+        return tile_params.min + f * tile_params.range;
+    }
     uint elods = tile_params.offset;
     if (g.x == 0.0f) {
         float ns = float(elods & 0xFFu);
@@ -161,6 +167,11 @@ float grassGroundHeight(vec2 root_xz) {
                       0.0f, 1.0f) * seg;
     vec2 g0 = min(floor(grid), vec2(seg - 1.0f));
     vec2 gf = grid - g0;
+    if ((tile_params.pad_0 & 1u) != 0u) {
+        vec2 lo = grassGridPos(g0, seg);
+        vec2 hi = grassGridPos(g0 + vec2(1.0f), seg);
+        gf = clamp((root_xz - lo) / (hi - lo), 0.0f, 1.0f);
+    }
 
     float h00 = grassVertexHeight(grassGridPos(g0,                    seg));
     float h10 = grassVertexHeight(grassGridPos(g0 + vec2(1.0f, 0.0f), seg));
@@ -176,10 +187,9 @@ float grassGroundHeight(vec2 root_xz) {
         h = h11 + (h01 - h11) * (1.0f - gf.x)
                 + (h10 - h11) * (1.0f - gf.y);
     }
-    // Residue sink: the snapped edge quads above, and the fact that
-    // tile.vert's SNOW/WATER permutations add terms this does not.
-    vec2 cell = tile_params.range * tile_params.inv_segment_count;
-    return h - 0.02f * cell.x;
+    // Root offset is applied once below, in metres. Scaling burial by
+    // the LOD cell size hid short/fading blades as the grid grew coarser.
+    return h;
 }
 
 void main()
@@ -282,7 +292,7 @@ void main()
             texture(soil_water_layer, world_map_uv).xy *
             SOIL_WATER_LAYER_MAX_THICKNESS;
         built = texture(terrain_flat_mask, world_map_uv).x;
-        bool rejected = soil_water_thickness.y > kGrassWaterFadeStartM ||
+        bool rejected = soil_water_thickness.y >= kGrassWaterFadeEndM ||
                         built > kGrassBuiltRelocate;
         if (!rejected || attempt >= kGrassWaterRelocates) {
             break;
@@ -328,13 +338,15 @@ void main()
     // a blade that is both wet and paved cannot come back.
     water_k *= 1.0f - smoothstep(kGrassBuiltFadeStart,
                                  kGrassBuiltFadeEnd, built);
+
     // ── Cover: follow the vegetation map (grass_common.glsl.h) ──────
     // At the FINAL root (re-seated or relocated), on the tuft's own
     // hash lane (.w -- .z is the distance lottery).  Skipped for a
     // tuft that is already gone.
     float cover = kGrassCoverFloor;
     if (water_k > 0.0f) {
-        vec3 macro = textureLod(src_map_mask, world_map_uv, kGrassCoverLod).rgb;
+        vec3 macro = grassCoverSample(src_map_mask, world_map_uv,
+                                     tile_params.inv_world_range);
         cover = grassCoverField(macro, root_xz);
         water_k *= grassCoverKeep(h_tuft.w, cover);
     }
@@ -365,6 +377,10 @@ void main()
         // Widen toward ~pixel coverage first, then fade everything out.
         blade.width *= 1.0f + (kGrassWidenMax - 1.0f) *
             smoothstep(kGrassWidenStartM, kGrassViewFadeStartM, cam_dist);
+        // Density compensation: the stand thins across the density ramp,
+        // the blades widen toward 2x over the same distances.
+        blade.width *= 1.0f + (kGrassDensityWidenMax - 1.0f) *
+            smoothstep(kGrassDenseNearM, kGrassDenseFarM, cam_dist);
         float k = 1.0f - smoothstep(kGrassViewFadeStartM,
                                     kGrassViewFadeEndM, cam_dist);
         blade.height *= k;

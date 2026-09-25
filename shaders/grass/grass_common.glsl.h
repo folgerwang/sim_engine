@@ -64,6 +64,11 @@ const float kGrassViewFadeEndM   = 500.0f;
 // boosted; far grass reads as a low sward, not a picket fence.
 const float kGrassWidenStartM = 60.0f;
 const float kGrassWidenMax    = 3.0f;
+// Density-compensating widen: as the keep fraction falls across
+// kGrassDenseNearM..kGrassDenseFarM the blade width grows toward this
+// factor, so fewer blades still cover the same ground.  Multiplies the
+// anti-alias widen above.
+const float kGrassDensityWidenMax = 2.0f;
 // ── Distance-driven density ──────────────────────────────────────────
 // The dispatch is sized per TILE (TileObject::drawGrass): every tuft of
 // a 128 m tile is emitted at the same density whether it stands 2 m
@@ -99,8 +104,12 @@ const float kGrassWidenMax    = 3.0f;
 // EVERYWHERE within 30 m, not just on one tile: 64 blades/m^2 at the
 // default mul x boost, ~24 at 100 m, ~2 beyond 170 m (where the
 // distance widening makes each blade cover a pixel anyway).
+// Ramps HALVED (FarM 170 -> 100, NearDoubleEnd 60 -> 40): full density
+// still out to NearM, then the fall-off runs twice as fast; the blades
+// widen toward 2x over the same ramp (kGrassDensityWidenMax) so the
+// thinner stand keeps its ground cover.
 const float kGrassDenseNearM   = 30.0f;   // full density out to here
-const float kGrassDenseFarM    = 170.0f;  // ...falling to the far keep here
+const float kGrassDenseFarM    = 100.0f;  // ...falling to the far keep here
 const float kGrassDenseFarKeep = 0.03f;   // of full, at/after FarM
 const float kGrassDenseSoft    = 0.12f;   // hash band a tuft grows in over
 // ── Underfoot doubling ───────────────────────────────────────────────
@@ -117,7 +126,7 @@ const float kGrassDenseSoft    = 0.12f;   // hash band a tuft grows in over
 // terrain.h carries the same three constants and the same product --
 // KEEP IN SYNC.
 const float kGrassNearDoubleM    = 20.0f;  // doubled out to here...
-const float kGrassNearDoubleEndM = 60.0f;  // ...back on the old curve here
+const float kGrassNearDoubleEndM = 40.0f;  // ...back on the old curve here
 const float kGrassNearDoubleK    = 2.0f;   // the underfoot factor
 
 // rho(d) / rho_near.
@@ -180,29 +189,53 @@ const uint  kGrassNearSeats     = 2u;      // candidate roots per tuft
 // same signal terrainMaterialWeights keys the grass material on), so
 // the grass now reads that map too: a tuft's keep probability is
 // mix(kGrassCoverFloor, 1, cover), cover the green excess of the map
-// around the root, smoothed to ~30 m (mip 3 of the 4 m map) so it
-// follows the broad vegetation zones the trees follow and not the
-// texel edges, and roughened by a ~20 m noise so no zone edge is a
-// line.  Its own hash lane and its own soft band, so it neither
-// correlates with the distance lottery nor pops.
-const float kGrassCoverLod   = 3.0f;    // map mip: 4 m texels -> ~32 m
+// around the root. Filter in metres: the resident map can be either
+// full resolution or the 1024px VT fallback, so a fixed mip does not
+// describe a fixed transition width. Its own hash lane and soft band
+// keep the cover independent of the distance lottery.
+const float kGrassCoverFilterM = 16.0f;
 const float kGrassCoverFloor = 0.15f;   // keep on bare ground
 const float kGrassCoverSoft  = 0.15f;   // hash band a tuft shrinks over
 
+vec3 grassCoverSample(sampler2D cover_map, vec2 uv, vec2 inv_world_range) {
+    vec2 base_texel_m = 1.0f / (vec2(textureSize(cover_map, 0)) * inv_world_range);
+    float lod = clamp(floor(log2(kGrassCoverFilterM / max(base_texel_m.x, base_texel_m.y))),
+                      0.0f, float(textureQueryLevels(cover_map) - 1));
+    // Cubic B-spline reconstruction: continuous slope across texel
+    // boundaries, positive weights (no ringing), just four bilinear taps.
+    vec2 size = vec2(textureSize(cover_map, int(lod)));
+    vec2 cell = uv * size - 0.5f;
+    vec2 f = fract(cell);
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = (1.0f - f) * (1.0f - f) * (1.0f - f) / 6.0f;
+    vec2 w1 = (3.0f * f3 - 6.0f * f2 + 4.0f) / 6.0f;
+    vec2 w2 = (-3.0f * f3 + 3.0f * f2 + 3.0f * f + 1.0f) / 6.0f;
+    vec2 w3 = f3 / 6.0f;
+    vec2 a = w0 + w1;
+    vec2 b = w2 + w3;
+    vec2 lo = (floor(cell) - 0.5f + w1 / a) / size;
+    vec2 hi = (floor(cell) + 1.5f + w3 / b) / size;
+    return textureLod(cover_map, lo, lod).rgb * a.x * a.y
+         + textureLod(cover_map, vec2(hi.x, lo.y), lod).rgb * b.x * a.y
+         + textureLod(cover_map, vec2(lo.x, hi.y), lod).rgb * a.x * b.y
+         + textureLod(cover_map, hi, lod).rgb * b.x * b.y;
+}
+
 float grassCoverField(vec3 macro_rgb, vec2 p) {
     float g_ex  = 2.0f * macro_rgb.g - macro_rgb.r - macro_rgb.b;
-    float cover = smoothstep(-0.02f, 0.16f, g_ex);
-    // ragged zone edges: a slow field nudges the threshold
+    // Perturb the input gently, before the smooth curve. Adding and
+    // clamping noise afterwards made the edge alternate full/empty.
     float rag = sin(p.x * 0.31f + 0.7f) * sin(p.y * 0.27f - 1.9f)
               + 0.5f * sin(p.x * 0.083f - 0.4f) * sin(p.y * 0.097f + 2.2f);
-    cover = clamp(cover + 0.18f * rag, 0.0f, 1.0f);
+    float cover = smoothstep(-0.06f, 0.20f, g_ex + 0.012f * rag);
     return mix(kGrassCoverFloor, 1.0f, cover);
 }
 
 // Per-tuft weight from the cover lottery: `h` the tuft's cover hash
 // lane, `cover` grassCoverField at its root.
 float grassCoverKeep(float h, float cover) {
-    return clamp(1.0f + (cover - h) / kGrassCoverSoft, 0.0f, 1.0f);
+    return smoothstep(-kGrassCoverSoft, kGrassCoverSoft, cover - h);
 }
 
 // ── Stand height by zone ─────────────────────────────────────────────
@@ -315,9 +348,12 @@ const int kGrassWaterRelocates = 3;
 // on the same retry budget and the same whole-tuft salt as the
 // waterline rejection above, so a village green keeps its blade budget
 // instead of the town going bald.
-const float kGrassBuiltRelocate  = 0.05f;  // any hint of it: try again
 const float kGrassBuiltFadeStart = 0.05f;  // survivor starts shrinking
 const float kGrassBuiltFadeEnd   = 0.35f;  // fully gone by here
+// Preserve the fade band. Relocating at FadeStart removed nearly every
+// transitional tuft and left a hard boundary despite the smoothstep.
+const float kGrassBuiltRelocate = kGrassBuiltFadeEnd;
+
 // Proportions after the reference photograph (late-season veld): the
 // cured flowering stems stand 0.4-0.9 m and are a few millimetres
 // wide -- wispy, not leafy -- fanning from a crown ~0.4 m across.
