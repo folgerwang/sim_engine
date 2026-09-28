@@ -219,6 +219,13 @@ static int nativeSurfaceTextureRole(const engine::helper::ModelPreviewData& md, 
     int role = 0;
     for (const auto& section : md.sections) {
         if ((section.flags & engine::helper::kSecDepthSurface) == 0) continue;
+        // terrain_pcg's _depth_material() stamps _depthsurface_ on EVERY
+        // PCG material; flat recipes carry a constant height and a
+        // relief scale of 0 (flags >> 16 is the half-float scale).
+        // Only real relief earns the resident 1024 px surface copy --
+        // otherwise every albedo in the world (thousands of unique
+        // .rwtex) is uploaded at 64x the 128 px stopgap footprint.
+        if ((section.flags >> 16) == 0u) continue;
         if (section.mr_index == int(ti)) return 2;
         if (section.tex_index == int(ti)) role = 1;
     }

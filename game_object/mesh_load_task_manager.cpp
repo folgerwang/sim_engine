@@ -287,6 +287,16 @@ void MeshLoadTaskManager::runPhase2(
                 std::cerr
                     << "[MESHLOAD] phase2 error for '" << task->filename
                     << "': " << task->error_message << std::endl;
+                // First device-memory failure: print WHO holds the VRAM
+                // (per allocation site) once, so an OOM at load time is
+                // diagnosable from the console instead of a guess.
+                if (task->error_message.find("OUT_OF_DEVICE_MEMORY") != std::string::npos) {
+                    static bool s_oom_dumped = false;
+                    if (!s_oom_dumped) {
+                        s_oom_dumped = true;
+                        device_->dumpVramBreakdown("first VK_ERROR_OUT_OF_DEVICE_MEMORY at load");
+                    }
+                }
                 return;
             }
 
