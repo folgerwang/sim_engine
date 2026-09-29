@@ -7536,6 +7536,10 @@ void ClusterRenderer::padPlantDynamicStaging() {
 }
 
 void ClusterRenderer::finalizePlantTemplates() {
+    // Queued jobs contain absolute offsets into the PREVIOUS merged buffers.
+    // Even when allocations are reused, new templates can have different
+    // sizes/order. Clear the queue on the next expansion before consuming it.
+    plant_counters_primed_ = false;
     if (plant_templates_.empty() || plant_dyn_cluster_cap_ == 0) return;
     // Hide every template: the cull never draws object-space geometry.
     for (const auto& t : plant_templates_) setMeshClustersHidden(t.gid, true);

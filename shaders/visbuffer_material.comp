@@ -22,6 +22,7 @@
 #include "functions.glsl.h"
 #include "depth_pbr.glsl.h"
 #include "leaf_age.glsl.h"
+#include "veg_sway.glsl.h"
 
 // Declared HERE, before cluster_cutout.glsl.h, not after: that header
 // reads camera_info.global_leaf_age, and glslang resolves identifiers
@@ -62,6 +63,15 @@ layout(push_constant) uniform VisMaterialParams {
 // delta written by plant_cluster_expand.comp (see pc.plant_*).
 layout(std430, set = VISBUF_SET, binding = VISBUF_PLANT_MOTION)
     readonly buffer PlantMotionBuf { uvec2 plant_motion[]; };
+bool plantVertexHasMotion(uint vertex_index) {
+    // A material can also occur on static geometry. Never use material
+    // flags alone to index the dynamic tail (unsigned subtraction wraps).
+    return pc.plant_motion_valid != 0u && vertex_index >= pc.plant_dyn_vertex_first &&
+        vertex_index - pc.plant_dyn_vertex_first < uint(plant_motion.length());
+}
+float plantSwayOf(uint vertex_index) {
+    return unpackHalf2x16(plant_motion[vertex_index - pc.plant_dyn_vertex_first].y).y;
+}
 vec3 plantMotionOf(uint vertex_index) {
     uvec2 p = plant_motion[vertex_index - pc.plant_dyn_vertex_first];
     return vec3(unpackHalf2x16(p.x), unpackHalf2x16(p.y).x);
@@ -116,9 +126,10 @@ void main() {
     int  mat_flags = material_params[mat_idx].flags;
 
     // ── Rebuild the triangle ─────────────────────────────────────────
-    // index_offset is a BYTE offset into the global index buffer; the
-    // indices are uint32, hence the >> 2.
-    uint base = (di.index_offset >> 2u) + prim_id * 3u;
+    // index_offset is firstIndex in uint32 elements, exactly as used by
+    // the indexed draw. Dividing by sizeof(uint) selects another triangle
+    // and can escape the dynamic plant range after vertex_offset is added.
+    uint base = di.index_offset + prim_id * 3u;
     uint i0 = merged_indices[base + 0u] + di.vertex_offset;
     uint i1 = merged_indices[base + 1u] + di.vertex_offset;
     uint i2 = merged_indices[base + 2u] + di.vertex_offset;
@@ -306,9 +317,16 @@ void main() {
         vec4(octEncodeDir(N), gbuf_rough,
              is_foliage ? mix(0.5, 1.0, leaf_front) : 0.0));
 
+    // Preserve the same RT-origin correction as base.frag: RT geometry
+    // is unswayed even though these merged vertices already include wind.
+    bool dynamic_plant = plantVertexHasMotion(i0) &&
+                         plantVertexHasMotion(i1) && plantVertexHasMotion(i2);
+    float sway_travel = dynamic_plant ? vbInterp1(bary,
+        vec3(plantSwayOf(i0), plantSwayOf(i1), plantSwayOf(i2))) : 0.0;
     vec2 oct_geom = octEncodeDir(N_geom);
     imageStore(out_emissive_metal, px,
-        vec4(oct_geom.x, oct_geom.y, 0.0, depth_pbr ? depth_orm.b : 0.0));
+        vec4(oct_geom.x, oct_geom.y, clamp(sway_travel / kVegSwayEncodeMaxM, 0.0, 1.0),
+             depth_pbr ? depth_orm.b : 0.0));
 
     // Velocity: static world-space geometry, so this is camera motion
     // alone -- no per-cluster previous transforms needed.  Plants on the
@@ -316,7 +334,7 @@ void main() {
     // per vertex: forward motion for the depth predictor, and the
     // previous position (same delta, one frame back) for the velocity.
     vec3 motion = vec3(0.0);
-    if (pc.plant_motion_valid != 0u && material_params[mat_idx].tree_life.y > 0.5) {
+    if (dynamic_plant) {
         vec3 m0 = plantMotionOf(i0), m1 = plantMotionOf(i1), m2 = plantMotionOf(i2);
         motion = vec3(vbInterp(bary, vec3(m0.x, m1.x, m2.x)).x,
                       vbInterp(bary, vec3(m0.y, m1.y, m2.y)).x,
