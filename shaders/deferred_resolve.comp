@@ -2904,14 +2904,36 @@ void main() {
             float b = camera_info.depth_params.y;
             float linZ = b / (a + h);
 
-            // Map linearZ to greyscale over a useful viewing band.  50 m
-            // is "near-mid scene"; tweak if your level is bigger or
-            // smaller.  Beyond this distance pixels saturate to white
-            // — they're behind everything visible anyway.
-            const float kVizFarRange = 50.0;
-            float vis = clamp(linZ / kVizFarRange, 0.0, 1.0);
-
-            imageStore(hdr_out, px, vec4(linearTosRGB(vec3(vis)), 1.0));
+            // ── Occluder-coverage view ────────────────────────────────
+            // The pyramid (frame-ahead: PREDICTED from last frame's depth)
+            // against the depth this frame actually rendered, per pixel:
+            //   RED     real geometry here, pyramid says "nothing" (far):
+            //           a HOLE -- no occluder, everything behind is drawn.
+            //   ORANGE  pyramid is much farther than the real surface
+            //           (>1.5x + 2 m): a weak occluder, culls little.
+            //   BLUE    genuinely empty (sky) in both.
+            //   GREY    pyramid ~matches the surface: log distance,
+            //           black = 1 m, white = 2 km.
+            // Standing still vs moving at mip 0 shows whether reprojection
+            // loses occluders; higher mips show what the cull (which reads
+            // a mip matching each object's screen size) actually sees,
+            // where one red texel poisons the whole footprint (max).
+            float scene_z = textureLod(gbuf_depth, uv, 0.0).r;
+            bool  geo  = scene_z < 0.99999;
+            bool  hole = h >= 0.99999;
+            vec3 col;
+            if (hole && geo) {
+                col = vec3(1.0, 0.05, 0.05);
+            } else if (hole) {
+                col = vec3(0.05, 0.08, 0.35);
+            } else {
+                float scene_lin = b / (a + scene_z);
+                float g = clamp(log2(max(linZ, 1.0)) / 11.0, 0.0, 1.0);   // 1 m .. 2 km
+                col = (geo && linZ > scene_lin * 1.5 + 2.0)
+                    ? vec3(1.0, 0.55, 0.05) * (0.35 + 0.65 * g)
+                    : vec3(g);
+            }
+            imageStore(hdr_out, px, vec4(linearTosRGB(col), 1.0));
             return;
         }
     }

@@ -111,20 +111,40 @@ void main() {
     uint here = imageLoad(dst_pred, ivec2(px)).r;
     float out_z = uintBitsToFloat(here);
     if (here == kFarBits) {
+        // The predicted target is the SAME size as the source (1:1), so
+        // any sub-pixel camera motion lands some target texels two source
+        // pixels and their neighbours none: thin LINES of empty texels in
+        // a regular moire grid over every surface (Render Debug view 12
+        // shows them red while moving, gone when still).  The Hi-Z build
+        // then max-reduces each line into "far" and the occlusion cull
+        // loses its occluders -- the frame-rate drop while moving.
+        //
+        // Crack test: a texel with depth on BOTH sides of it along any of
+        // the four axes through it (L-R, U-D, and the two diagonals) sits
+        // inside a surface, not beside it.  That covers a 1-texel line in
+        // any direction AND the crossing of two lines (only its diagonals
+        // are filled), which the old "6 of 8 neighbours" test left open.
+        // A real disocclusion (ground a moving object uncovered, the strip
+        // a pan reveals) has depth on one side only and stays far.  Filled
+        // with the FARTHEST neighbour: conservative, never an occluder
+        // nearer than the surfaces around it.
+        uint n[8];
+        const ivec2 off[8] = ivec2[8](
+            ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
+            ivec2(-1, -1), ivec2(1, 1), ivec2(1, -1), ivec2(-1, 1));
         float farthest = -1.0;
-        int filled = 0;
-        for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                ivec2 q = ivec2(px) + ivec2(dx, dy);
-                if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(pc.dst_size)))) continue;
-                uint v = imageLoad(dst_pred, q).r;
-                if (v == kFarBits) continue;
-                farthest = max(farthest, uintBitsToFloat(v));
-                ++filled;
-            }
-        // a crack, not a hole: at least 6 of 8 neighbours carry depth
-        if (filled >= 6) out_z = farthest;
+        for (int i = 0; i < 8; ++i) {
+            ivec2 q = ivec2(px) + off[i];
+            n[i] = (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(pc.dst_size))))
+                 ? kFarBits : imageLoad(dst_pred, q).r;
+            if (n[i] != kFarBits) farthest = max(farthest, uintBitsToFloat(n[i]));
+        }
+        const bool crack =
+            (n[0] != kFarBits && n[1] != kFarBits) ||   // left  - right
+            (n[2] != kFarBits && n[3] != kFarBits) ||   // up    - down
+            (n[4] != kFarBits && n[5] != kFarBits) ||   // diagonal
+            (n[6] != kFarBits && n[7] != kFarBits);     // anti-diagonal
+        if (crack) out_z = farthest;
     }
     imageStore(dst_pred_f, ivec2(px), vec4(out_z, 0.0, 0.0, 0.0));
 }
