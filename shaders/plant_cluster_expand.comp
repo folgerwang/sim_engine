@@ -137,9 +137,18 @@ void main() {
     // ── Vertices: template vertex k -> dynamic vertex k ─────────────
     // The dynamic cluster reuses the template's INDICES (base vertex
     // shifted), so the job's whole template vertex range is transformed
-    // once, by the workgroup of the job's first cluster.
-    if (w.y == 0u) {
-        for (uint k = gl_LocalInvocationID.x; k < tp.vertex_count; k += 128u) {
+    // once -- SPLIT across all of the job's workgroups (one per template
+    // cluster): workgroup w.y takes the w.y-th equal slice.  It used to be
+    // done entirely by the first cluster's workgroup: ~26K vertices on 128
+    // threads (~200 serial iterations) per tree while the job's other
+    // ~2300 workgroups only wrote a cluster header -- one busy workgroup
+    // per tree, the whole pass (~6 ms) bound by that serial loop.
+    {
+        const uint slice = (tp.vertex_count + tp.cluster_count - 1u) /
+                           max(tp.cluster_count, 1u);
+        const uint k_begin = w.y * slice;
+        const uint k_end   = min(k_begin + slice, tp.vertex_count);
+        for (uint k = k_begin + gl_LocalInvocationID.x; k < k_end; k += 128u) {
             const uint s = (tp.vertex_first + k) * 6u;
             const uint d = (job.dyn_vertex_first + k) * 6u;
             const vec3 p_ls = vec3(uintBitsToFloat(verts[s + 0u]),

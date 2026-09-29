@@ -1,4 +1,5 @@
 #include <vector>
+#include <iostream>     // [ui] dock tab restore log
 #include <filesystem>
 #include <cmath>
 #include <algorithm>
@@ -833,6 +834,12 @@ void Menu::init(
     // destroyed and recreated during swap chain recreation, so the
     // style reverts to default.
     applyFantasyStyle();
+
+    // The fresh context also forgot which tab each docked panel group
+    // had selected, so the last-submitted window (Output Log) came up
+    // active after every resize.  Re-select the remembered tabs over the
+    // next few frames (the dock nodes / tab bars are rebuilt lazily).
+    restore_dock_tabs_frames_ = 120;
 
     // Re-register the background texture with the fresh ImGui/Vulkan
     // descriptor pool. The Vulkan image + view survive swap chain
@@ -4456,6 +4463,70 @@ ImVec2 Menu::viewportCenter() const {
     ImVec2 p, s, c; getViewportScreenRect(p, s, c); return c;
 }
 
+// Remember / restore the active tab of every docked editor panel group.
+// ImGui re-adds a dock node's tabs whenever its windows come back after
+// not being submitted -- a context rebuild on swap-chain recreation
+// (resize / fullscreen), or any frame the editor panels are skipped
+// (loading overlay, play mode, hidden-UI capture) -- and a tab bar that
+// gains tabs selects the NEWEST one: the Output Log, drawn last.  So,
+// per dock node: remember the selected panel while the node's tab count
+// is steady, and whenever the count goes UP, push the remembered tab back
+// (pending selection + focus, then focus returned to the 3D viewport).
+// A user clicking a tab never changes the count, so it is recorded.
+void Menu::restoreDockTabs() {
+    static const char* kPanels[] = {
+        "Content Browser", "File Browser", "Output Log",
+        "Outliner", "Debug Display" };
+    struct NodeNow { int count = 0; const char* selected = nullptr; };
+    std::unordered_map<uint32_t, NodeNow> now;
+    for (const char* name : kPanels) {
+        ImGuiWindow* w = ImGui::FindWindowByName(name);
+        if (!w || !w->DockNode || !w->DockNode->TabBar) continue;
+        NodeNow& n = now[w->DockNode->ID];
+        n.count = w->DockNode->TabBar->Tabs.Size;
+        if (w->DockNode->TabBar->SelectedTabId == w->TabId) n.selected = name;
+    }
+    if (restore_dock_tabs_frames_ > 0) {
+        // Context just rebuilt (Menu::init): every node counts as re-added.
+        --restore_dock_tabs_frames_;
+        for (auto& kv : now) dock_restore_frames_[kv.first] = 30;
+        dock_tab_count_.clear();
+        if (!now.empty()) restore_dock_tabs_frames_ = 0;
+    }
+    bool focused = false;
+    for (auto& kv : now) {
+        const uint32_t id = kv.first;
+        const NodeNow& n = kv.second;
+        auto cit = dock_tab_count_.find(id);
+        const int prev = (cit == dock_tab_count_.end()) ? n.count : cit->second;
+        if (n.count > prev) dock_restore_frames_[id] = 30;   // tabs re-added
+        dock_tab_count_[id] = n.count;
+        int& pending = dock_restore_frames_[id];
+        auto sit = dock_selected_tab_.find(id);
+        if (pending > 0 && sit != dock_selected_tab_.end()) {
+            --pending;
+            ImGuiWindow* w = ImGui::FindWindowByName(sit->second.c_str());
+            if (!w || !w->DockNode || w->DockNode->ID != id || !w->DockNode->TabBar) continue;
+            if (w->DockNode->TabBar->SelectedTabId == w->TabId) {
+                if (pending > 0) std::cout << "[ui] dock tab restored: '" << sit->second << "'" << std::endl;
+                pending = 0;
+                continue;
+            }
+            w->DockNode->TabBar->NextSelectedTabId = w->TabId;
+            ImGui::FocusWindow(w);
+            focused = true;
+            restore_dock_tabs_focused_ = true;
+            continue;                      // don't record while restoring
+        }
+        pending = 0;
+        if (n.count >= prev && n.selected) dock_selected_tab_[id] = n.selected;
+    }
+    if (!focused && restore_dock_tabs_focused_) {
+        ImGui::FocusWindow(nullptr);       // keyboard back to the 3D viewport
+        restore_dock_tabs_focused_ = false;
+    }
+}
+
 void Menu::drawEditorDockSpace() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
@@ -4552,6 +4623,7 @@ void Menu::drawEditorDockSpace() {
     drawContentBrowserPanel();
     drawFileBrowserPanel();
     drawOutputPanel();
+    restoreDockTabs();
     // Shared FLUX.2 popup — drawn ONCE per frame (both browsers can open it).
     drawFluxGeneratePopup();
     // Shared text-to-audio popup — same single-instance rule.

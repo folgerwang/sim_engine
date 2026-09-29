@@ -2312,6 +2312,10 @@ struct NtCullPushConstants {
 #define NT_COMPACT_BAND_TEST  0x100u   // flags: apply the per-instance band test
 #define NT_COMPACT_PLANT_HANDOFF 0x200u   // hand near plant instances to the cluster path (G-buffer pass only)
 #define NT_COMPACT_PLANT_SKIP    0x400u   // other camera passes: drop the same instances without appending
+// Per-INSTANCE occlusion against the predicted-depth Hi-Z pyramid.  When
+// set, planes[0..3] carry view_proj (world -> clip; the frustum planes
+// are derived from it) and planes[4] = (hiz w, hiz h, mip count, 0).
+#define NT_COMPACT_HIZ           0x800u
 struct NtCompactPushConstants {
     vec4    planes[6];        // world-space frustum, normals inward
     vec4    eye;              // xyz = LOD eye (camera position)

@@ -1310,6 +1310,16 @@ public:
     int          dbg_sel_seen_node_ = -3;
 
     bool         editor_layout_built_ = false;
+    // Active tab of each docked panel group, remembered across the ImGui
+    // context teardown that every swap-chain recreation (window resize,
+    // fullscreen toggle) performs -- see restoreDockTabs() in menu.cpp.
+    std::vector<std::string> selected_dock_tabs_;   // (unused, kept for layout)
+    std::unordered_map<uint32_t, std::string> dock_selected_tab_;   // dock node -> panel name
+    std::unordered_map<uint32_t, int>         dock_tab_count_;      // dock node -> tabs last frame
+    std::unordered_map<uint32_t, int>         dock_restore_frames_; // dock node -> restore frames left
+    int          restore_dock_tabs_frames_ = 0;
+    bool         restore_dock_tabs_focused_ = false;
+    void         restoreDockTabs();
 
     // Work-area size the dock tree was last laid out for.  ImGui keeps a
 

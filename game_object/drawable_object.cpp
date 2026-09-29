@@ -8269,6 +8269,7 @@ struct NodeTableGpu {
     uint64_t dbg_serial = 0;
     uint32_t dbg_records = 0;
     uint32_t dbg_inst_total = 0;
+    bool     dbg_hiz = false;                 // the logged dispatch ran the per-instance Hi-Z test
 };
 
 // nt_instance_compact.comp pipeline (file statics: created next to the
@@ -8331,16 +8332,21 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
 // nt_instance_compact.comp set 0: 0 infos, 1 cmd_src, 2 class_idx,
 // 3 class_prefix, 4 records, 5 inst_src, 6 age_src, 7 inst_dst,
 // 8 age_dst, 9 rec_counts, 10 rec_template (plant cluster hand-off),
-// 11 handoff_stamp (per-instance hand-off frame stamps).
+// 11 handoff_stamp (per-instance hand-off frame stamps),
+// 12 hiz_pyramid (per-instance occlusion, sampled).
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCompactDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(12);
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(13);
     for (uint32_t i = 0; i < 12; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
             renderer::DescriptorType::STORAGE_BUFFER);
     }
+    bindings[12] = renderer::helper::getTextureSamplerDescriptionSetLayoutBinding(
+        12,
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        renderer::DescriptorType::COMBINED_IMAGE_SAMPLER);
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -9007,6 +9013,11 @@ static void ntWriteDescriptorSets(
         add(ks, 9, nt.rec_counts);
         add(ks, 10, nt.rec_template[parity]);
         add(ks, 11, nt.handoff_stamp);
+        if (s_nt_hiz_view && s_nt_hiz_sampler) {
+            renderer::Helper::addOneTexture(
+                writes, ks, renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 12,
+                s_nt_hiz_sampler, s_nt_hiz_view, renderer::ImageLayout::GENERAL);
+        }
     }
     add(nt.vs_desc_sets[parity], NODE_TABLE_PARAMS_BINDING, nt.records[parity]);
     add(nt.vs_desc_sets[parity], NODE_TABLE_SLOTS_BINDING, nt.slots);
@@ -12315,12 +12326,24 @@ void DrawableObject::ntPrepare(
 
         glsl::NtCompactPushConstants kpc{};
         uint32_t world_planes = 0u;
-        if (s_frustum_cull_active) {
+        uint32_t hiz_flag = 0u;
+        if (s_frustum_cull_active && s_nt_hiz_enabled &&
+            nt.hiz_gen[parity] == s_nt_hiz_gen) {
+            // Per-INSTANCE occlusion (see nt_instance_compact.comp): the
+            // node-level Hi-Z test below never rejects a plant tile node.
+            // World space: the compaction places instances in world
+            // coordinates, so view_proj alone (no inst_world).  Same
+            // guard as the node cull's VP-planes path above.
+            for (int p = 0; p < 4; ++p) kpc.planes[p] = s_nt_hiz_view_proj[p];
+            kpc.planes[4] = glm::vec4(float(s_nt_hiz_size.x), float(s_nt_hiz_size.y),
+                                      float(s_nt_hiz_mips), 0.0f);
+            hiz_flag = NT_COMPACT_HIZ;
+        } else if (s_frustum_cull_active) {
             for (int p = 0; p < 6; ++p) kpc.planes[p] = s_frustum_planes[p];
             world_planes = 6u;
         }
         kpc.eye = glm::vec4(s_plant_lod_eye_ws, 1.0f);
-        kpc.flags = world_planes | NT_COMPACT_BAND_TEST |
+        kpc.flags = world_planes | hiz_flag | NT_COMPACT_BAND_TEST |
                     // Hand-off once per frame: the G-buffer pass appends
                     // the jobs; every other camera pass (forward-covered,
                     // glass) drops the same instances so they are not
@@ -12386,7 +12409,11 @@ void DrawableObject::ntPrepare(
                           << f[4] << "," << f[5] << "," << f[6] << "," << f[7] << " | "
                           << f[8] << "," << f[9] << "," << f[10] << "," << f[11] << "]"
                           << " eye=(" << s_plant_lod_eye_ws.x << "," << s_plant_lod_eye_ws.y << "," << s_plant_lod_eye_ws.z << ")"
-                          << " planes=" << (s_frustum_cull_active ? 6 : 0) << std::endl;
+                          << " planes=" << (s_frustum_cull_active ? 6 : 0)
+                          << " inst_hiz=" << (nt.dbg_hiz ? "on" : "OFF")
+                          << " (hiz_enabled=" << int(s_nt_hiz_enabled)
+                          << " set_gen_ok=" << int(nt.hiz_gen[0] == s_nt_hiz_gen || nt.hiz_gen[1] == s_nt_hiz_gen)
+                          << ")" << std::endl;
                 device->unmapMemory(nt.dbg_rb.memory);
             }
         }
@@ -12416,6 +12443,7 @@ void DrawableObject::ntPrepare(
             nt.dbg_serial = serial;
             nt.dbg_records = nt.record_count;
             nt.dbg_inst_total = inst_total;
+            nt.dbg_hiz = (kpc.flags & NT_COMPACT_HIZ) != 0u;
         }
 
         cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_rw, compute_read);
