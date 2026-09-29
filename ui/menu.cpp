@@ -2276,6 +2276,10 @@ bool Menu::draw(
                                     turn_off_grass_pass_)) {
                     turn_off_grass_pass_ = !turn_off_grass_pass_;
                 }
+                if (ImGui::MenuItem("Grass patch culling", NULL,
+                                    grass_patch_cull_)) {
+                    grass_patch_cull_ = !grass_patch_cull_;
+                }
                 // Placed PCG layers rather than terrain passes, but this
                 // is the menu people reach for to strip the world back,
                 // so they live beside the two tile passes.

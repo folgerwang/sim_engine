@@ -59,7 +59,60 @@ layout(triangles, max_vertices=256, max_primitives=256) out;
 // whose 16 blades are all outside emits nothing, and an invisible blade
 // inside a visible workgroup collapses to a degenerate (zero-size)
 // strip so it rasterises no fragments.
-shared uint s_wg_visible;
+// ── Output compaction ────────────────────────────────────────────────
+// Culled blades used to stay in the output as degenerate strips (the
+// output counts were the full 16 blades whenever ONE blade survived),
+// so every hidden blade still cost 16 vertices + 14 triangles of
+// primitive setup.  Survivors are now packed to the front in lane
+// order (deterministic: the same blade always lands in the same slot
+// for the same survivor set) and the group declares only their count.
+shared uint s_blade_vis[16];
+
+#ifdef GRASS_HIZ
+// ── GPU occlusion (G-buffer pass) ────────────────────────────────────
+// The same Hi-Z pyramid the cluster and plant culls test against: built
+// this frame from the PROJECTED (frame-ahead) depth, i.e. last frame's
+// depth reprojected to this frame's camera (depth_predict.comp -> Hi-Z
+// build), so it costs the grass nothing extra.  It holds the FARTHEST
+// depth per texel: a blade is dropped only when every texel its screen
+// box touches has something strictly nearer.
+layout(set = 3, binding = 0) uniform sampler2D grass_hiz;
+
+bool grassHiZOccluded(vec3 lo, vec3 hi) {
+    const mat4 M = camera_info.view_proj;
+    vec2  ndc_min = vec2( 1.0f);
+    vec2  ndc_max = vec2(-1.0f);
+    float ndc_z_near = 1.0f;
+    for (int i = 0; i < 8; ++i) {
+        const vec3 cw = vec3(((i & 1) != 0) ? hi.x : lo.x,
+                             ((i & 2) != 0) ? hi.y : lo.y,
+                             ((i & 4) != 0) ? hi.z : lo.z);
+        const vec4 cc = M * vec4(cw, 1.0f);
+        if (cc.w <= 1e-4f) return false;          // crosses the eye plane
+        const vec3 nd = cc.xyz / cc.w;
+        ndc_min = min(ndc_min, nd.xy);
+        ndc_max = max(ndc_max, nd.xy);
+        ndc_z_near = min(ndc_z_near, nd.z);
+    }
+    if (ndc_z_near < 0.0f) return false;
+    const vec2 uv_min = max(ndc_min * 0.5f + 0.5f, vec2(0.0f));
+    const vec2 uv_max = min(ndc_max * 0.5f + 0.5f, vec2(1.0f));
+    if (uv_max.x <= uv_min.x || uv_max.y <= uv_min.y) return false;
+    const vec2  hiz_size = vec2(textureSize(grass_hiz, 0));
+    const float hiz_mips = float(textureQueryLevels(grass_hiz));
+    const vec2  box_px = (uv_max - uv_min) * hiz_size;
+    const float max_dim = max(box_px.x, box_px.y);
+    const float mip = clamp(ceil(log2(max(max_dim * 0.5f, 1.0f))),
+                            0.0f, hiz_mips - 1.0f);
+    const float far_z = max(
+        max(textureLod(grass_hiz, vec2(uv_min.x, uv_min.y), mip).r,
+            textureLod(grass_hiz, vec2(uv_min.x, uv_max.y), mip).r),
+        max(textureLod(grass_hiz, vec2(uv_max.x, uv_min.y), mip).r,
+            textureLod(grass_hiz, vec2(uv_max.x, uv_max.y), mip).r));
+    const float bias = 1e-5f + ndc_z_near * 1e-4f;
+    return far_z < 0.99999f && ndc_z_near > far_z + bias;
+}
+#endif
 
 bool grassRootVisible(vec3 root_ws, float radius_m) {
     const mat4 vp = camera_info.view_proj;
@@ -192,17 +245,50 @@ float grassGroundHeight(vec2 root_xz) {
     return h;
 }
 
+// ── Patch mode (tile_params.pad_0 bit 1) ─────────────────────────────
+// The tile is cut into kGrassPatchGrid x kGrassPatchGrid patches (8 m on
+// a 128 m tile) and the dispatch is 2D: gl_WorkGroupID.y = patch,
+// gl_WorkGroupID.x = the group within it (tile_params.vt_normal_id
+// groups per patch; grass never samples the VT, so the two VT id fields
+// carry the patch sizing -- vt_mr_ao_id = floatBits(tufts per patch at
+// keep 1)).  Every tuft of a patch roots INSIDE the patch, so a whole
+// group can be rejected -- frustum, Hi-Z, empty -- before any blade is
+// placed, which is where the grass time went (a dozen height fetches per
+// blade, paid by every dispatched blade whether it was seen or not).
+//
+// Density is the same law as before, one level finer: a patch carries
+// tufts_full * keep_eff(d_min of the PATCH) tufts and the lottery keeps
+// keep_eff(d) / keep_eff(d_min) of them.  keep_eff folds in the near
+// re-seating the tile mode does by moving dropped tufts into the near
+// disc (that needs tufts to leave their patch): the underfoot disc gets
+// its extra tufts directly, as density, with the same grow-in band.
+// Tuft ids are (patch << 16) | index-in-patch, so raising a patch's
+// count only ADDS tufts; nothing already standing moves.
+const uint kGrassPatchGrid = 16u;
+
+float grassNearSeatBand(float d) {
+    return 1.0f - smoothstep(kGrassNearSeatM - kGrassNearSeatBandM,
+                             kGrassNearSeatM, d);
+}
+float grassKeepLaw(float d, bool patched) {
+    return patched ? grassKeepAtDistance(d) * (1.0f + grassNearSeatBand(d))
+                   : grassKeepAtDistance(d);
+}
+float grassKeepWeight(float h, float d, float keep_ref, bool patched) {
+    return clamp(1.0f + (grassKeepLaw(d, patched) / max(keep_ref, 1e-4f) - h)
+                        / kGrassDenseSoft, 0.0f, 1.0f);
+}
+
+shared float s_patch_h[9];
+
 void main()
 {
     uint blade_idx = gl_GlobalInvocationID.x;
     uint local_idx = gl_LocalInvocationID.x;
+    const bool patched = (tile_params.pad_0 & 2u) != 0u;
 
-    const uint num_vertex    = 16 * uint(kGrassBladeVerts);
-    const uint num_primitive = 16 * uint(kGrassBladeTris);
-    // SetMeshOutputsEXT is deferred until the workgroup cull below has
-    // decided whether this group emits anything at all.
-    if (local_idx == 0u) s_wg_visible = 0u;
-    barrier();
+    // SetMeshOutputsEXT is deferred until the cull below has counted
+    // the surviving blades (output compaction).
 
     // Two independent draws: one per TUFT (shared root) and one per
     // BLADE (its own size, facing, lean and phase within the tuft).
@@ -212,11 +298,78 @@ void main()
     const uint  blades_per_tuft = uint(kGrassTuftBlades);
     uint tuft_idx  = blade_idx / blades_per_tuft;
     uint blade_in  = blade_idx - tuft_idx * blades_per_tuft;
+    uint blade_key = blade_idx;
     // Integer hashes (grassHash4) -- see grass_common.glsl.h for why
     // the float hash43 draws put the near field on a lattice.
     const uvec2 tile_key = floatBitsToUint(tile_params.min);
+
+    // Where this group's tufts may root, and the distance-law reference
+    // the lottery divides by (tile mode: the tile; patch mode: the patch).
+    vec2  place_min   = tile_params.min;
+    vec2  place_range = tile_params.range;
+    float keep_ref    = grassKeepAtDistance(grassTileMinDist(
+        camera_info.position.xz, tile_params.min, tile_params.range));
+    bool  slot_live   = true;
+    if (patched) {
+        const uint  patch_id   = gl_WorkGroupID.y;
+        const uint  k_group = gl_WorkGroupID.x;
+        const vec2  psize   = tile_params.range / float(kGrassPatchGrid);
+        place_min   = tile_params.min +
+            vec2(float(patch_id % kGrassPatchGrid), float(patch_id / kGrassPatchGrid)) * psize;
+        place_range = psize;
+        const float d_min_p = grassTileMinDist(camera_info.position.xz,
+                                               place_min, place_range);
+        keep_ref = grassKeepLaw(d_min_p, true);
+        // Tufts in this patch: tufts_full * keep_ref, the fraction as a
+        // hashed coin (monotonic in the distance, so no flicker).
+        const float want = uintBitsToFloat(tile_params.vt_mr_ao_id) * keep_ref;
+        const float coin = grassHash4(tile_key, patch_id, 7u).x;
+        const uint  n_tufts = uint(want) + ((coin < fract(want)) ? 1u : 0u);
+        const uint  n_blades = n_tufts * blades_per_tuft;
+        // ── Whole-group rejects: empty slice, past the fade ──────────
+        if (k_group * 16u >= n_blades ||
+            d_min_p > kGrassViewFadeEndM) {
+            SetMeshOutputsEXT(0u, 0u);
+            return;
+        }
+        // ── Patch box: frustum (+ Hi-Z) before any blade is placed ───
+        // Ground range from a 3x3 sample of the rendered height (one
+        // lane each), padded for the surface between samples; blades
+        // lean up to ~2.5 m and stand up to ~2 m.
+        if (local_idx < 9u) {
+            const vec2 f = vec2(float(local_idx % 3u), float(local_idx / 3u)) * 0.5f;
+            s_patch_h[local_idx] = grassVertexHeight(place_min + f * psize);
+        }
+        barrier();
+        float h_lo = s_patch_h[0], h_hi = s_patch_h[0];
+        for (int i = 1; i < 9; ++i) {
+            h_lo = min(h_lo, s_patch_h[i]);
+            h_hi = max(h_hi, s_patch_h[i]);
+        }
+        const float kLeanPad = 3.0f;
+        const vec3 box_lo = vec3(place_min.x - kLeanPad, h_lo - 2.0f,
+                                 place_min.y - kLeanPad);
+        const vec3 box_hi = vec3(place_min.x + psize.x + kLeanPad, h_hi + 3.0f,
+                                 place_min.y + psize.y + kLeanPad);
+        bool patch_visible = grassRootVisible(0.5f * (box_lo + box_hi),
+                                              0.5f * length(box_hi - box_lo));
+#ifdef GRASS_HIZ
+        if (patch_visible && grassHiZOccluded(box_lo, box_hi)) patch_visible = false;
+#endif
+        if (!patch_visible) {
+            SetMeshOutputsEXT(0u, 0u);
+            return;
+        }
+        // This lane's blade inside the patch.
+        const uint b_local = k_group * 16u + local_idx;
+        slot_live = b_local < n_blades;
+        const uint t_local = b_local / blades_per_tuft;
+        tuft_idx  = (patch_id << 16u) | t_local;
+        blade_in  = b_local - t_local * blades_per_tuft;
+        blade_key = tuft_idx * 8u + blade_in;
+    }
     vec4 h_tuft  = grassHash4(tile_key, tuft_idx, 0u);
-    vec4 h_blade = grassHash4(tile_key, blade_idx, 1u);
+    vec4 h_blade = grassHash4(tile_key, blade_key, 1u);
 
     // ── Root placement with waterline rejection ─────────────────────
     // .y of the soil-water layer is the WATER column standing over the
@@ -245,11 +398,10 @@ void main()
     // This tile's share of the distance law (grass_common.glsl.h): the
     // C++ dispatched it at keep(d_min) of full, the lottery keeps
     // keep(d) / keep(d_min) of what it dispatched.
-    const float keep_tile = grassKeepAtDistance(grassTileMinDist(
-        camera_info.position.xz, tile_params.min, tile_params.range));
     float d_root = distance(camera_info.position.xz,
-                            tile_params.min + h_tuft.xy * tile_params.range);
-    float dens_k = grassDensityKeep(tuft_h, d_root, keep_tile);
+                            place_min + h_tuft.xy * place_range);
+    float dens_k = slot_live
+        ? grassKeepWeight(tuft_h, d_root, keep_ref, patched) : 0.0f;
     // ── Near-field re-seating (grass_common.glsl.h) ─────────────────
     // A dropped tuft tries a candidate root inside the near disc; the
     // candidate's weight fades with the original root's own margin so
@@ -257,8 +409,8 @@ void main()
     // re-seated blade: its weight is final and skips the 3D lottery
     // below (inside the near disc the lottery is 1 anyway).
     float seat_w = 0.0f;
-    if (dens_k <= 0.0f) {
-        float free_w = clamp((-grassDensityMargin(tuft_h, d_root, keep_tile)
+    if (dens_k <= 0.0f && !patched) {
+        float free_w = clamp((-grassDensityMargin(tuft_h, d_root, keep_ref)
                               - kGrassDenseSoft) / kGrassDenseSoft,
                              0.0f, 1.0f);
         if (free_w > 0.0f) {
@@ -279,12 +431,12 @@ void main()
         }
     }
     if (dens_k <= 0.0f) {
-        root_xz = tile_params.min + h_tuft.xy * tile_params.range;
+        root_xz = place_min + h_tuft.xy * place_range;
         world_map_uv = (root_xz - tile_params.world_min) *
                        tile_params.inv_world_range;
     } else
     for (int attempt = 0; ; ++attempt) {
-        root_xz = grassRootXZ(tile_params.min, tile_params.range,
+        root_xz = grassRootXZ(place_min, place_range,
                               h_tuft, h_blade);
         world_map_uv = (root_xz - tile_params.world_min) *
                        tile_params.inv_world_range;
@@ -327,10 +479,10 @@ void main()
     if (seat_w > 0.0f) {
         dens_k = seat_w;              // re-seated: weight already final
     } else if (dens_k > 0.0f) {
-        dens_k = grassDensityKeep(
+        dens_k = grassKeepWeight(
             tuft_h, distance(camera_info.position,
                              vec3(root_xz.x, ground_height, root_xz.y)),
-            keep_tile);
+            keep_ref, patched);
     }
     water_k *= dens_k;
     // Still on graded ground after every retry (deep inside a town):
@@ -386,28 +538,6 @@ void main()
         blade.height *= k;
         blade.width  *= k;
     }
-    // ── Workgroup frustum cull (see s_wg_visible) ─────────────────────
-    // Wind lean + flutter can push the tip up to ~0.45 x height sideways
-    // and the widening can grow the blade to 3x, so pad the test sphere
-    // by the full height plus a metre.
-    const bool blade_visible =
-        blade.height > 0.0f && blade.width > 0.0f &&
-        grassRootVisible(blade.root_ws + vec3(0.0f, 0.5f * blade.height, 0.0f),
-                         blade.height + 1.0f);
-    if (blade_visible) atomicOr(s_wg_visible, 1u);
-    barrier();
-    if (s_wg_visible == 0u) {
-        SetMeshOutputsEXT(0u, 0u);
-        return;
-    }
-    SetMeshOutputsEXT(num_vertex, num_primitive);
-    if (!blade_visible) {
-        // Degenerate strip: still emitted (the workgroup's output
-        // counts are uniform) but covers no pixels.
-        blade.height = 0.0f;
-        blade.width  = 0.0f;
-    }
-
     // ── Wind sway ───────────────────────────────────────────────────
     // Quadratic in height (the root is planted, the tip carries the
     // travel) — that is already how grassBladeVertex spends `arc`, so
@@ -429,8 +559,51 @@ void main()
         }
     }
 
+    // ── Cull: frustum (+ Hi-Z occlusion), then compact ──────────────
+    // Wind lean + flutter can push the tip up to ~0.45 x height sideways
+    // and the widening can grow the blade to 3x, so the frustum sphere
+    // is padded by the full height plus a metre (unchanged).
+    bool blade_visible =
+        blade.height > 0.0f && blade.width > 0.0f &&
+        grassRootVisible(blade.root_ws + vec3(0.0f, 0.5f * blade.height, 0.0f),
+                         blade.height + 1.0f);
+#ifdef GRASS_HIZ
+    if (blade_visible) {
+        // Exact box of the blade as grassBladeVertex will build it (the
+        // wind above is already in blade.arc): the centre curve runs
+        // root -> root + arc horizontally and rises at most `height`
+        // (it can dip by the droop), plus the ribbon half-width and a
+        // flower head's radius.
+        float arc_len = length(blade.arc);
+        float droop = 0.5f * arc_len * arc_len / max(blade.height, 0.05f);
+        float pad = blade.width + 0.03f;
+        vec3 lo = blade.root_ws + vec3(min(blade.arc.x, 0.0f),
+                                       min(blade.height - droop, 0.0f),
+                                       min(blade.arc.z, 0.0f)) - vec3(pad);
+        vec3 hi = blade.root_ws + vec3(max(blade.arc.x, 0.0f),
+                                       blade.height,
+                                       max(blade.arc.z, 0.0f)) + vec3(pad);
+        if (grassHiZOccluded(lo, hi)) blade_visible = false;
+    }
+#endif
+    s_blade_vis[local_idx] = blade_visible ? 1u : 0u;
+    barrier();
+    uint slot = 0u, n_vis = 0u;
+    for (uint j = 0u; j < 16u; ++j) {
+        const uint vj = s_blade_vis[j];
+        if (j < local_idx) slot += vj;
+        n_vis += vj;
+    }
+    if (n_vis == 0u) {
+        SetMeshOutputsEXT(0u, 0u);
+        return;
+    }
+    SetMeshOutputsEXT(n_vis * uint(kGrassBladeVerts),
+                      n_vis * uint(kGrassBladeTris));
+    if (!blade_visible) return;
+
     for (int i_ring = 0; i_ring < kGrassRings; i_ring++) {
-        uint v_idx = local_idx * uint(kGrassBladeVerts) + uint(i_ring) * 2u;
+        uint v_idx = slot * uint(kGrassBladeVerts) + uint(i_ring) * 2u;
         for (int i_side = 0; i_side < 2; i_side++) {
             float side_sign = (i_side == 0) ? 1.0f : -1.0f;
             vec3  p_ws; vec3 n_ws; float v;
@@ -448,9 +621,9 @@ void main()
     }
 
     for (int i_poly = 0; i_poly < kGrassBladeTris; i_poly++) {
-        gl_PrimitiveTriangleIndicesEXT[local_idx * uint(kGrassBladeTris) + uint(i_poly)] =
-            uvec3(local_idx * uint(kGrassBladeVerts) + uint(i_poly),
-                  local_idx * uint(kGrassBladeVerts) + uint(i_poly) + 1u,
-                  local_idx * uint(kGrassBladeVerts) + uint(i_poly) + 2u);
+        gl_PrimitiveTriangleIndicesEXT[slot * uint(kGrassBladeTris) + uint(i_poly)] =
+            uvec3(slot * uint(kGrassBladeVerts) + uint(i_poly),
+                  slot * uint(kGrassBladeVerts) + uint(i_poly) + 1u,
+                  slot * uint(kGrassBladeVerts) + uint(i_poly) + 2u);
     }
 }

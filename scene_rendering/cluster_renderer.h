@@ -500,6 +500,16 @@ private:
     renderer::BufferInfo rt_bvh_nodes_buffer_;
     renderer::BufferInfo rt_bvh_leaves_buffer_;
     renderer::BufferInfo rt_pos_uv_buffer_;
+    // Vertices actually packed into rt_pos_uv_buffer_ (a PREFIX of the
+    // merged vertex array).  Equals total_merged_vertices_ when the
+    // software BVH is built; on the hardware-only path it stops at the
+    // highest vertex the static BLAS references, so the plant templates
+    // and dynamic tail (never static RT geometry) are not repacked and
+    // re-uploaded on every rebuild.
+    uint32_t             rt_pos_uv_vertex_count_ = 0;
+    // Cluster entries uploaded to rt_cull/draw_infos (SW traversal only;
+    // 1 on the hardware-only path to keep the bindings legal).
+    uint32_t             rt_cluster_info_count_ = 0;
     renderer::BufferInfo rt_cull_infos_buffer_;
     renderer::BufferInfo rt_draw_infos_buffer_;
     renderer::BufferInfo rt_materials_buffer_;

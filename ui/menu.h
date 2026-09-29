@@ -292,6 +292,7 @@ private:
     // someone re-found the menu item, which read as "the grass
     // disappeared" every time.
     bool turn_off_grass_pass_ = false;
+    bool grass_patch_cull_ = true;
     // Placed PCG layers, matched by their asset path suffix:
     //   _pcg_trees / _pcg_clutter*  -> plants
     //   _pcg_houses                 -> houses
@@ -2516,6 +2517,9 @@ public:
     inline bool isGrassPassTurnOff() {
         return turn_off_grass_pass_;
     }
+    // Grass patch culling (per-8 m-patch frustum / Hi-Z reject before
+    // any blade is placed).  Off = the old whole-tile dispatch.
+    inline bool isGrassPatchCullOn() const { return grass_patch_cull_; }
 
     inline bool isPlantPassTurnOff() {
         return turn_off_plant_pass_;

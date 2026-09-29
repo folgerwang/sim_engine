@@ -5763,6 +5763,61 @@ void ClusterRenderer::buildRtShadowBvh() {
     }
     rt_sw_bvh_valid_ = (n > 0);
     rt_bvh_node_count_    = (uint32_t)nodes.size();
+    const auto t_nodes = std::chrono::steady_clock::now();
+
+    // ── How much of the merged geometry the RT-side buffers carry ────
+    // The software traversal walks every cluster, so it needs all of
+    // it.  The hardware-only path reads these buffers for exactly one
+    // thing: vertices of the STATIC BLAS (hit UVs for masked static
+    // casters, closest-hit GI shading).  The per-mesh casters have their
+    // own rt_mesh_pos_uv, and the static BLAS never contains plant
+    // templates (object space) or the dynamic plant tail (hidden, w<0)
+    // -- see buildHwRtShadowAs.  Those are the bulk of the merged
+    // vertices in a PCG world, and repacking + re-uploading them on
+    // every rebuild was the RT-side cost of this function.  So pack only
+    // the prefix up to the highest vertex a static-BLAS candidate
+    // references (the kept set below is a superset of what
+    // buildHwRtShadowAs keeps: it skips the same templates / hidden
+    // clusters but not the material-based exclusions).
+    uint32_t rt_vtx_count     = total_merged_vertices_;
+    uint32_t rt_cluster_count = total_clusters_all_meshes_;
+    if (!build_sw_rt_bvh_ && total_merged_vertices_ > 0) {
+        size_t cur = 0;
+        auto isTpl = [&](uint32_t ci) {
+            while (cur < plant_templates_.size() &&
+                   ci >= plant_templates_[cur].cluster_first +
+                         plant_templates_[cur].cluster_count) {
+                ++cur;
+            }
+            return cur < plant_templates_.size() &&
+                   ci >= plant_templates_[cur].cluster_first;
+        };
+        uint32_t vbound = 1u;   // vertex 0: the degenerate-triangle fallback
+        const uint32_t nc = std::min<uint32_t>(
+            total_clusters_all_meshes_,
+            (uint32_t)staging_draw_infos_.size());
+        for (uint32_t ci = 0; ci < nc; ++ci) {
+            if (isTpl(ci)) continue;
+            if (ci < staging_cull_infos_.size() &&
+                staging_cull_infos_[ci].bounds_sphere.w < 0.0f) continue;
+            const glsl::ClusterDrawInfo& d = staging_draw_infos_[ci];
+            uint32_t mx = 0u;
+            const uint32_t end = std::min<uint32_t>(
+                d.index_offset + d.index_count,
+                (uint32_t)staging_indices_.size());
+            for (uint32_t k = d.index_offset; k < end; ++k) {
+                mx = std::max(mx, staging_indices_[k]);
+            }
+            if (d.index_count > 0) {
+                vbound = std::max(vbound, d.vertex_offset + mx + 1u);
+            }
+        }
+        rt_vtx_count     = std::min(vbound, total_merged_vertices_);
+        rt_cluster_count = 1u;
+    }
+    rt_pos_uv_vertex_count_ = rt_vtx_count;
+    rt_cluster_info_count_  = rt_cluster_count;
+    const auto t_scan = std::chrono::steady_clock::now();
     ensureDeviceSSBO(device_, rt_bvh_nodes_buffer_,
                      nodes.size() * sizeof(glsl::RtBvhNode), nodes.data());
     ensureDeviceSSBO(device_, rt_bvh_leaves_buffer_,
@@ -5779,8 +5834,9 @@ void ClusterRenderer::buildRtShadowBvh() {
     // BLAS vertex source (vec4 stride, R32G32B32 positions) — do NOT
     // compress it.
     {
-        std::vector<glm::vec4> pos_uv(staging_vertices_.size());
-        for (size_t i = 0; i < staging_vertices_.size(); ++i) {
+        std::vector<glm::vec4> pos_uv(
+            std::min<size_t>(rt_vtx_count, staging_vertices_.size()));
+        for (size_t i = 0; i < pos_uv.size(); ++i) {
             const BindlessVertex& v = staging_vertices_[i];
             // BindlessVertex already stores the UV as packHalf2x16 — the
             // exact encoding this SoA carries — so the repack is a bit
@@ -5806,11 +5862,16 @@ void ClusterRenderer::buildRtShadowBvh() {
     // merged INDEX buffer has no CPU access after finalize and is now
     // DEVICE_LOCAL itself (see finalizeUploads), so the trace binds it
     // directly instead of a ~25 MiB rt_indices duplicate.
+    const auto t_posuv = std::chrono::steady_clock::now();
     ensureDeviceSSBO(device_, rt_cull_infos_buffer_,
-                     staging_cull_infos_.size() * sizeof(glsl::ClusterCullInfo),
+                     std::min<size_t>(rt_cluster_count,
+                                      staging_cull_infos_.size()) *
+                         sizeof(glsl::ClusterCullInfo),
                      staging_cull_infos_.data());
     ensureDeviceSSBO(device_, rt_draw_infos_buffer_,
-                     staging_draw_infos_.size() * sizeof(glsl::ClusterDrawInfo),
+                     std::min<size_t>(rt_cluster_count,
+                                      staging_draw_infos_.size()) *
+                         sizeof(glsl::ClusterDrawInfo),
                      staging_draw_infos_.data());
     {
         std::vector<glsl::BindlessMaterialParams> mat_fallback;
@@ -5868,17 +5929,17 @@ void ClusterRenderer::buildRtShadowBvh() {
         er::DescriptorType::STORAGE_BUFFER, 0,
         rt_cull_infos_buffer_.buffer,
         static_cast<uint32_t>(
-            total_clusters_all_meshes_ * sizeof(glsl::ClusterCullInfo)));
+            rt_cluster_count * sizeof(glsl::ClusterCullInfo)));
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 1,
         rt_draw_infos_buffer_.buffer,
         static_cast<uint32_t>(
-            total_clusters_all_meshes_ * sizeof(glsl::ClusterDrawInfo)));
+            rt_cluster_count * sizeof(glsl::ClusterDrawInfo)));
     er::Helper::addOneBuffer(rt_writes, rt_shadow_desc_set_,
         er::DescriptorType::STORAGE_BUFFER, 2,
         rt_pos_uv_buffer_.buffer,
         static_cast<uint32_t>(
-            total_merged_vertices_ * sizeof(glm::vec4)));
+            rt_vtx_count * sizeof(glm::vec4)));
     // Binding 3: the merged index buffer itself — DEVICE_LOCAL since the
     // finalizeUploads conversion, so no duplicate copy is needed for the
     // per-pixel trace.
@@ -5941,14 +6002,27 @@ void ClusterRenderer::buildRtShadowBvh() {
     writeRtSkeletonDescriptors();
 
     rt_shadow_ready_ = true;
-    const double ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t0).count();
+    const auto t_end = std::chrono::steady_clock::now();
+    auto msBetween = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const double ms = msBetween(t0, t_end);
     clog_printf(
         "[CLUSTER_RENDERER] RT shadow BVH: %u clusters -> %u nodes, "
         "%zu leaf refs (%.1f ms build, %.1f MB)\n",
         n, rt_bvh_node_count_, leaf_indices.size(), ms,
         (nodes.size() * sizeof(glsl::RtBvhNode) +
          leaf_indices.size() * 4.0) / (1024.0 * 1024.0));
+    clog_printf(
+        "[CLUSTER_RENDERER] RT side buffers (%s): nodes %.1f ms, "
+        "vertex-bound scan %.1f ms, pos/uv pack+upload %.1f ms "
+        "(%u of %u verts), cull/draw/mat+descriptors %.1f ms "
+        "(%u of %u clusters)\n",
+        build_sw_rt_bvh_ ? "sw+hw" : "hw-only",
+        msBetween(t0, t_nodes), msBetween(t_nodes, t_scan),
+        msBetween(t_scan, t_posuv), rt_vtx_count, total_merged_vertices_,
+        msBetween(t_posuv, t_end), rt_cluster_count,
+        total_clusters_all_meshes_);
 
     // Hardware-RT variant of the same data (BLAS/TLAS for ray query).
     buildHwRtShadowAs();
@@ -6120,8 +6194,9 @@ void ClusterRenderer::buildHwRtShadowAs() {
         tri.vertex_format = er::Format::R32G32B32_SFLOAT;
         tri.vertex_data.device_address = vertex_addr;
         tri.vertex_stride = sizeof(glm::vec4);   // pos.xyz + packed uv
-        tri.max_vertex    = total_merged_vertices_ > 0
-                                ? total_merged_vertices_ - 1 : 0;
+        // Only the packed prefix exists (see rt_pos_uv_vertex_count_).
+        tri.max_vertex    = rt_pos_uv_vertex_count_ > 0
+                                ? rt_pos_uv_vertex_count_ - 1 : 0;
         tri.index_type    = er::IndexType::UINT32;
         tri.index_data.device_address = idx_buf.buffer->getDeviceAddress();
         tri.transform_data.device_address = 0;   // identity
