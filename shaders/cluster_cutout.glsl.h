@@ -58,6 +58,41 @@
 // Requires the cluster bindless set (cluster_bindless_bindings.glsl.h),
 // vt_sample.glsl.h, leaf_age.glsl.h and a `camera_info` in scope.
 
+// ── Cutout alpha from the RESIDENT albedo (no BC4 layer) ─────────────
+// The drawable G-buffer path cuts leaves with the resident RGBA copy of
+// the albedo (the .rwtex preview, alpha intact) and then the leaf-age
+// fade.  The VT albedo, in contrast, is baked OPAQUE: the cutout lives
+// only in the separate alpha plane, which reaches the VT as the BC4
+// layer (BINDLESS_MAT_ALPHA_VT).  Without that layer the cluster path
+// used to read the VT albedo's alpha -- 1.0 -- and drew every leaf card
+// as a solid quad.  Every ALPHA_MASK material keeps a resident albedo
+// slot (base_color_tex_idx, see registerClusterMaterial's
+// needs_resident_albedo), so take the alpha from THAT texture, exactly
+// like the G-buffer path.  Depth surfaces are triplanar and opaque.
+// Triplanar depth surfaces (world-space UVs, tile > 0 in emissive_vt_id)
+// have no UV parameterisation to sample by.  A DEPTH_SURFACE with tile 0
+// -- the leaf cards' "_depthsurface_0" relief -- is UV-mapped and is NOT
+// excluded.
+bool clusterIsTriplanar(uint mat_idx, int mat_flags) {
+    return (mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0 &&
+           uintBitsToFloat(material_params[mat_idx].emissive_vt_id) > 0.0;
+}
+
+float clusterResidentCutoutAlpha(uint mat_idx, int mat_flags, vec2 uv,
+                                 vec2 lod_uv_ddx, vec2 lod_uv_ddy,
+                                 bool have_grad, float fallback) {
+    int tex_idx = material_params[mat_idx].base_color_tex_idx;
+    if ((mat_flags & BINDLESS_MAT_ALPHA_MASK) == 0 ||
+        material_params[mat_idx].albedo_vt_id == VT_INVALID_ID ||  // tex IS the resident sample
+        clusterIsTriplanar(mat_idx, mat_flags) || tex_idx < 0) {
+        return fallback;
+    }
+    return have_grad
+        ? textureGrad(base_color_textures[nonuniformEXT(tex_idx)], uv,
+                      lod_uv_ddx, lod_uv_ddy).a
+        : TEX_SAMPLE_HW(base_color_textures[nonuniformEXT(tex_idx)], uv).a;
+}
+
 // Albedo RGBA as the cutout sees it: factor x texture, aged.
 // `lod_uv_ddx/ddy` are the analytic UV gradients from the visibility
 // buffer's barycentric derivation; pass vec2(0) from a fragment shader
@@ -84,6 +119,19 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
         // both passes land on the same mip and the same page.
         tex = have_grad ? vtSampleAlbedoGrad(vt, uv, lod_uv_ddx, lod_uv_ddy)
                         : VT_SAMPLE_ALBEDO_HW(vt, uv);
+    } else if (tex_idx >= 0 && !clusterIsTriplanar(mat_idx, mat_flags)) {
+        // NOT registered in the VT (the VT id table is capped: a large
+        // PCG world's plant textures register after it is full) but the
+        // material kept a RESIDENT albedo -- every cutout / depth-surface
+        // material does (registerClusterMaterial: needs_resident_albedo).
+        // Sample it, exactly like the drawable G-buffer path, which reads
+        // this same RGBA copy with its alpha intact.  Without this the
+        // plant templates rendered base_color_factor alone with alpha
+        // 1.0: flat solid leaf cards (and the alpha test cut nothing).
+        tex = have_grad
+            ? textureGrad(base_color_textures[nonuniformEXT(tex_idx)], uv,
+                          lod_uv_ddx, lod_uv_ddy)
+            : TEX_SAMPLE_HW(base_color_textures[nonuniformEXT(tex_idx)], uv);
     }
     // NO LEGACY BINDLESS FALLBACK.  A material without a VT id used to
     // sample base_color_textures[] here.  It now falls through with
@@ -104,6 +152,10 @@ vec4 clusterCutoutAlbedo(uint mat_idx, int mat_flags, vec2 uv,
         tex.a = have_grad
             ? vtSampleAlphaGrad(vt, uv, lod_uv_ddx, lod_uv_ddy)
             : VT_SAMPLE_ALPHA_HW(vt, uv);
+    } else {
+        tex.a = clusterResidentCutoutAlpha(mat_idx, mat_flags, uv,
+                                           lod_uv_ddx, lod_uv_ddy,
+                                           have_grad, tex.a);
     }
 
     vec4 albedo4 = base * tex;

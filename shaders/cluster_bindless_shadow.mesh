@@ -109,6 +109,7 @@ vec3 fetchVertexPosition(uint vertex_idx) {
 shared uint s_index_offset;
 shared uint s_index_count;
 shared uint s_vertex_base;
+shared uint s_vertex_shift;   // draw.vertex_offset (base vertex added to every index)
 shared uint s_vertex_count;
 shared uint s_tri_count;
 
@@ -127,6 +128,10 @@ void main() {
         s_index_count  = draw.index_count;
         s_tri_count    = draw.index_count / 3u;
         s_vertex_base  = merged_indices[draw.index_offset];
+        // Static clusters use absolute indices (vertex_offset 0); the
+        // dynamic plant clusters reuse their template's indices and move
+        // them with vertex_offset, exactly like vkCmdDrawIndexed.
+        s_vertex_shift = draw.vertex_offset;
         s_vertex_count = 0u;  // seeded for atomicMax below
     }
     barrier();
@@ -156,7 +161,7 @@ void main() {
 
     // ── Emit unique vertices (each lane handles strided range) ────────
     for (uint v = lane; v < vcount; v += gl_WorkGroupSize.x) {
-        vec3 world_pos = fetchVertexPosition(vbase + v);
+        vec3 world_pos = fetchVertexPosition(vbase + v + s_vertex_shift);
         gl_MeshVerticesEXT[v].gl_Position = vp * vec4(world_pos, 1.0);
     }
 

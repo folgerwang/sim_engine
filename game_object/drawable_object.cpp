@@ -8254,6 +8254,12 @@ struct NodeTableGpu {
     renderer::BufferInfo compact_inst;        // device, InstanceDataInfo per slot
     renderer::BufferInfo compact_age;         // device, float per slot
     uint32_t compact_capacity = 0;
+    // Plant cluster hand-off stamps (nt_instance_compact.comp binding
+    // 11): 2 uints per SOURCE instance (instance_buffer_ entry), device
+    // local, zero-initialised, persistent across frames (not per parity:
+    // the frame id picks the word).
+    renderer::BufferInfo handoff_stamp;
+    uint32_t handoff_capacity = 0;            // instances covered
     std::shared_ptr<renderer::DescriptorSet> compact_desc_sets[2];
     bool     pass_compacted = false;
     uint64_t stat_inst_submitted = 0;         // instances the compact pass tested
@@ -8324,11 +8330,12 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
 
 // nt_instance_compact.comp set 0: 0 infos, 1 cmd_src, 2 class_idx,
 // 3 class_prefix, 4 records, 5 inst_src, 6 age_src, 7 inst_dst,
-// 8 age_dst, 9 rec_counts, 10 rec_template (plant cluster hand-off).
+// 8 age_dst, 9 rec_counts, 10 rec_template (plant cluster hand-off),
+// 11 handoff_stamp (per-instance hand-off frame stamps).
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCompactDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(11);
-    for (uint32_t i = 0; i < 11; ++i) {
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(12);
+    for (uint32_t i = 0; i < 12; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -8412,6 +8419,8 @@ static void ntReleaseGpu(
     nt.dbg_rb.destroy(device);
     nt.compact_inst.destroy(device);
     nt.compact_age.destroy(device);
+    nt.handoff_stamp.destroy(device);
+    nt.handoff_capacity = 0;
     nt.rec_counts_capacity = 0;
     nt.compact_capacity = 0;
     nt.prim_flags_buf.destroy(device);
@@ -8784,7 +8793,22 @@ static void ntStageRecords(
 static void ntEnsureBuffers(
     const std::shared_ptr<renderer::Device>& device,
     NodeTableGpu& nt,
-    uint64_t serial) {
+    uint64_t serial,
+    uint32_t source_inst_count) {
+    // Hand-off stamps: one pair per source instance.  Grow-only; a
+    // regrow forgets last frame's stamps, which only costs one frame in
+    // which the handed-off instances are drawn by both paths.
+    if (source_inst_count > nt.handoff_capacity || !nt.handoff_stamp.buffer) {
+        const uint32_t cap = std::max(source_inst_count, 1024u);
+        ntRetire(nt, nt.handoff_stamp, serial);
+        const std::vector<uint32_t> zero(size_t(cap) * 2u, 0u);
+        nt.handoff_stamp = ntCreateDeviceBuffer(
+            device, uint64_t(cap) * 2u * sizeof(uint32_t),
+            SET_2_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, TRANSFER_DST_BIT),
+            zero.data());
+        nt.handoff_capacity = cap;
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+    }
     // Record tables (both parities are resized together so a parity
     // never lags behind the staging it must hold).
     if (nt.record_count > nt.record_capacity || !nt.records[0].buffer) {
@@ -8982,6 +9006,7 @@ static void ntWriteDescriptorSets(
         add(ks, 8, nt.compact_age);
         add(ks, 9, nt.rec_counts);
         add(ks, 10, nt.rec_template[parity]);
+        add(ks, 11, nt.handoff_stamp);
     }
     add(nt.vs_desc_sets[parity], NODE_TABLE_PARAMS_BINDING, nt.records[parity]);
     add(nt.vs_desc_sets[parity], NODE_TABLE_SLOTS_BINDING, nt.slots);
@@ -12167,7 +12192,11 @@ void DrawableObject::ntPrepare(
     const uint32_t parity = uint32_t(serial & 1u);
 
     ntExpireRetired(device, nt, serial);
-    ntEnsureBuffers(device, nt, serial);
+    ntEnsureBuffers(device, nt, serial,
+                    object_->instance_buffer_.buffer
+                        ? uint32_t(object_->instance_buffer_.buffer->getSize() /
+                                   sizeof(glsl::InstanceDataInfo))
+                        : 0u);
     ntUploadParity(device, nt, parity);
     ntWriteDescriptorSets(device, object_->shared_descriptor_pool_,
                           nt_cull_desc_set_layout_, node_table_desc_set_layout_,
@@ -14334,6 +14363,18 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwCharacter(
             dst.linear = false;
             dst.source_filename_ = tex_paths[ti];
             dst.vt_bc7_tiles = tb.bc7_tiles;
+            // Keep the full-res cutout alpha plane for the VT registration
+            // (BC4 alpha layer).  The BC7 blob is baked OPAQUE -- alpha
+            // lives only in this plane -- so without it the cluster path
+            // (visibility buffer / VT) reads alpha 1.0 and every leaf card
+            // is a solid quad.  loadRwObjModel always kept it; these
+            // loaders (instanced groups -- the PCG trees -- and
+            // characters) did not.  Shared by the cached copies below.
+            if (!tb.alpha.empty() &&
+                tb.alpha.size() == size_t(tb.w) * size_t(tb.h)) {
+                dst.cpu_alpha = std::make_shared<std::vector<uint8_t>>(
+                    tb.alpha.begin(), tb.alpha.end());
+            }
             if (!dst.vt_bc7_tiles && tb.preview_w == tb.w &&
                 tb.preview_h == tb.h && !tb.preview_rgba.empty())
                 dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(
@@ -15157,6 +15198,18 @@ std::shared_ptr<ego::DrawableData> DrawableObject::loadRwInstanced(
             dst.linear = false;
             dst.source_filename_ = tex_paths[ti];
             dst.vt_bc7_tiles = tb.bc7_tiles;
+            // Keep the full-res cutout alpha plane for the VT registration
+            // (BC4 alpha layer).  The BC7 blob is baked OPAQUE -- alpha
+            // lives only in this plane -- so without it the cluster path
+            // (visibility buffer / VT) reads alpha 1.0 and every leaf card
+            // is a solid quad.  loadRwObjModel always kept it; these
+            // loaders (instanced groups -- the PCG trees -- and
+            // characters) did not.  Shared by the cached copies below.
+            if (!tb.alpha.empty() &&
+                tb.alpha.size() == size_t(tb.w) * size_t(tb.h)) {
+                dst.cpu_alpha = std::make_shared<std::vector<uint8_t>>(
+                    tb.alpha.begin(), tb.alpha.end());
+            }
             if (!dst.vt_bc7_tiles && tb.preview_w == tb.w &&
                 tb.preview_h == tb.h && !tb.preview_rgba.empty())
                 dst.cpu_pixels = std::make_shared<std::vector<uint8_t>>(

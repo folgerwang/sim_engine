@@ -583,7 +583,7 @@ private:
     // verified in-engine.
     bool frame_ahead_on_ = true;    // default: predicted-depth cull replaces the prepass
     float vt_lod_bias_ = 0.5f;      // VT LOD bias: how far between two mips every sample sits
-    bool  plant_cluster_path_on_ = false;    // plants near the eye rasterised through the cluster path
+    bool  plant_cluster_path_on_ = true;     // plants near the eye rasterised through the cluster path
     float plant_cluster_radius_m_ = 200.0f; // hand-off radius (m)
     // Hi-Z mip level chosen for the DEBUG_RENDER_MODE_HIZ visualisation.
     // 0 = half-res (richest detail), higher = increasingly down-sampled.

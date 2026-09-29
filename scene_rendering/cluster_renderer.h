@@ -1598,6 +1598,21 @@ public:
     // Per frame, before the plant drawables' compaction runs: the eye
     // and the hand-off radius (0 = hand nothing off).
     void setPlantHandoff(const glm::vec3& eye, float radius_m);
+    // Once per frame, AFTER recordPlantExpand (or where it would have
+    // been recorded) and BEFORE setPlantHandoff: latches which hand-off
+    // frame the expand just drew (PlantJobParams.drawn_frame) and opens
+    // a new id for this frame's compaction (PlantJobParams.handoff_frame).
+    void advancePlantHandoffFrame();
+    // Cluster count the CSM shadow culls walk: the dynamic plant tail
+    // (always last) is excluded -- plant shadows come from the drawable
+    // path, which the shadow camera never hands off.
+    uint32_t shadowClusterCount() const {
+        if (plant_dyn_cluster_cap_ > 0 && plant_pad_cluster_start_ != UINT32_MAX &&
+            plant_dyn_cluster_first_ + plant_dyn_cluster_cap_ == total_clusters_all_meshes_) {
+            return plant_dyn_cluster_first_;
+        }
+        return total_clusters_all_meshes_;
+    }
     // Records phases 0/1/2 (hide tail + indirect, expand, reset
     // counters).  Call once per frame before cullPhaseA / cull, after
     // the camera UBO is written.  pbr_desc_set = wind clipmap (set 0),
@@ -1652,6 +1667,10 @@ private:
     renderer::BufferInfo plant_motion_buffer_;     // uvec2[vertex_cap] sway delta (visbuffer motion vectors)
     bool plant_desc_dirty_ = true;
     bool plant_counters_primed_ = false;
+    // Hand-off frame ids (1..65534, 0 = none); see advancePlantHandoffFrame.
+    uint32_t plant_handoff_frame_ = 0;        // this frame's compaction stamps with it
+    uint32_t plant_drawn_frame_ = 0;          // the expand of this frame drew that id's jobs
+    uint32_t plant_expand_drew_frame_ = 0;    // set by recordPlantExpand, consumed by advance
     void initPlantExpandPipeline(const renderer::DescriptorSetLayoutList& global_desc_set_layouts);
     void padPlantDynamicStaging();                 // finalizeUploads, before totals
     void finalizePlantTemplates();                 // finalizeUploads, after buffers exist

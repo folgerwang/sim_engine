@@ -68,8 +68,33 @@ void main() {
         return;
     }
     if (pc.phase == 2u) {
-        const uint i = gl_GlobalInvocationID.x;
-        if (i < uint(PLANT_CTR_COUNT)) counters[i] = 0u;
+        // One thread: read the last compaction's totals, adapt the
+        // radius, then reset the per-frame counters.
+        if (gl_GlobalInvocationID.x != 0u) return;
+        const float r_max = params.eye_radius.w;
+        float r = uintBitsToFloat(counters[PLANT_CTR_RADIUS]);
+        if (!(r > 0.0) || r > r_max) r = r_max;
+        if (r_max > 0.0) {
+            // CLUSTERS counts every attempt (the cluster reservation is
+            // the first one and is never rolled back), so it is the
+            // cluster DEMAND of the whole candidate set.
+            const float demand = float(counters[PLANT_CTR_CLUSTERS]);
+            const float cap = float(params.cluster_cap);
+            if (counters[PLANT_CTR_DROPPED] > 0u) {
+                // Demand ~ r^2: aim at 70% of the tail.
+                const float f = demand > cap
+                    ? clamp(sqrt(0.7 * cap / max(demand, 1.0)), 0.5, 0.9) : 0.9;
+                r = max(r * f, 4.0);
+            } else if (counters[PLANT_CTR_CLUSTERS] < params.cluster_cap / 4u * 3u &&
+                       counters[PLANT_CTR_VERTICES] < params.vertex_cap / 4u * 3u) {
+                // Room to spare: grow slowly.  The gap between the 0.7
+                // target and this 0.75 threshold is the hysteresis that
+                // keeps the radius from oscillating.
+                r = min(r * 1.02, r_max);
+            }
+        }
+        counters[PLANT_CTR_RADIUS] = floatBitsToUint(r);
+        for (uint i = 0u; i < uint(PLANT_CTR_COUNT); ++i) counters[i] = 0u;
         return;
     }
 

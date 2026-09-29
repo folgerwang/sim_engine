@@ -1869,8 +1869,11 @@ void VirtualTextureManager::encodeAndCacheVt(
     // missing cache anyway.  The threshold matches writeRwTex's own
     // cutout test (alpha < 250) so a .rwtex bake and a runtime encode
     // agree on which textures are cutout.
+    // A separate alpha plane is AUTHORITATIVE when given: the albedo it
+    // accompanies may have been encoded opaque (alpha stripped), so its
+    // channel 3 would read "no cutout" for a leaf texture.
     bool has_cutout = false;
-    if (albedo_pixels) {
+    if (albedo_pixels && !alpha_plane) {
         const uint64_t n = uint64_t(width) * height;
         for (uint64_t i = 0; i < n; ++i) {
             if (albedo_pixels[i * 4u + 3u] < 250u) { has_cutout = true; break; }
@@ -1910,6 +1913,13 @@ void VirtualTextureManager::encodeAndCacheVt(
     std::vector<uint32_t> mip_w(mip_count), mip_h(mip_count);
     mip_pixels[0].assign(albedo_pixels,
                          albedo_pixels + uint64_t(width) * height * 4u);
+    // The alpha plane wins over the pixels' own channel 3 (see the
+    // has_cutout test above): the BC4 alpha layer is encoded from these
+    // tiles, and the pyramid's alpha-weighted RGB filter wants it too.
+    if (alpha_plane) {
+        const uint64_t n = uint64_t(width) * height;
+        for (uint64_t i = 0; i < n; ++i) mip_pixels[0][i * 4u + 3u] = alpha_plane[i];
+    }
     mip_w[0] = width; mip_h[0] = height;
     for (uint32_t k = 1; k < mip_count; ++k) {
         mip_w[k] = std::max(1u, mip_w[k - 1] >> 1);

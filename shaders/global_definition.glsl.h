@@ -1522,7 +1522,18 @@ struct PlantJobParams {
     uint  dyn_cluster_first; // first dynamic cluster (global index)
     uint  dyn_vertex_first;  // first dynamic vertex (merged index)
     uint  template_count;
+    // Hand-off bookkeeping (see nt_instance_compact.comp).  The expand
+    // consumes the jobs one frame after the compaction appended them, so
+    // the instances the cluster path DRAWS this frame are the ones handed
+    // off at drawn_frame -- NOT the ones this frame's compaction hands off.
+    // Every drawable pass skips exactly that set (a per-instance stamp),
+    // otherwise the two paths disagree whenever the set changes (over
+    // budget the winners are atomic-order random every frame).
+    uint  handoff_frame;     // id this frame's compaction stamps its jobs with (1..65534)
+    uint  drawn_frame;       // id whose jobs the expand drew this frame (0 = none)
     uint  pad0;
+    uint  pad1;
+    uint  pad2;
 };
 // GPU counters (uint[PLANT_CTR_COUNT]), zeroed by the expand pass after
 // it consumed them; the compaction's atomics fill them for the NEXT
@@ -1533,7 +1544,14 @@ struct PlantJobParams {
 #define PLANT_CTR_VERTICES  3
 #define PLANT_CTR_DISPATCH  4   // uvec3 at [4],[5],[6]
 #define PLANT_CTR_DROPPED   7   // instances that did not fit the budget (fell back to the drawable path)
-#define PLANT_CTR_COUNT     8
+#define PLANT_CTR_COUNT     8   // [0, COUNT) are reset every frame by the expand's phase 2
+// Persistent (not reset): the ADAPTIVE hand-off radius as float bits
+// (0 = not yet set -> PlantJobParams.eye_radius.w).  Phase 2 shrinks it
+// when the last compaction dropped instances and regrows it when the
+// tail had room, so the handed-off set is the NEAREST plants, stable
+// from frame to frame, instead of whichever won the atomics.
+#define PLANT_CTR_RADIUS    8
+#define PLANT_CTR_WORDS     9   // buffer size in uints
 struct PlantExpandPush {
     uint  dyn_cluster_first; // first dynamic cluster (global index)
     uint  dyn_cluster_count; // dynamic capacity (all get rewritten: unused -> hidden)

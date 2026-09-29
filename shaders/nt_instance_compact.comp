@@ -45,19 +45,59 @@ layout(std430, set = 1, binding = 1) buffer PlantCounterBuf         { uint plant
 layout(std430, set = 1, binding = 2) writeonly buffer PlantJobBuf   { PlantExpandJob plant_jobs[]; };
 layout(std430, set = 1, binding = 3) writeonly buffer PlantWorkBuf  { uvec2 plant_work[]; };
 layout(std430, set = 1, binding = 4) readonly buffer PlantTemplateBuf { PlantTemplateInfo plant_templates[]; };
+// Per source instance, two words (slot = frame id & 1): which frame
+// handed this instance to the cluster path, and with which template(s).
+// word = (frame id << 16) | (1 << (template & 15)).  The expand draws
+// frame F's jobs in frame F+1, so every pass of frame F+1 skips exactly
+// the instances stamped F (plant.drawn_frame) -- see PlantJobParams.
+layout(std430, set = 0, binding = 11) buffer HandoffStampBuf { uint handoff_stamp[]; };
+
+uint plantTemplateBit(uint t) { return 1u << (t & 15u); }
+
+// Drawn by the cluster path THIS frame (a job appended last frame).
+bool plantOwnedByClusters(uint rec, uint inst) {
+    if (plant.drawn_frame == 0u) return false;
+    const uint t = rec_template[rec];
+    if (t == 0xFFFFFFFFu) return false;
+    const uint w = inst * 2u + (plant.drawn_frame & 1u);
+    if (w >= uint(handoff_stamp.length())) return false;
+    const uint v = handoff_stamp[w];
+    return (v >> 16) == plant.drawn_frame && (v & plantTemplateBit(t)) != 0u;
+}
+
+// Record a successful hand-off for the frame after this one.  Several
+// records can share an instance list (one per band / mesh), hence the
+// CAS: a stale frame is replaced, the same frame accumulates bits.
+void plantStampHandoff(uint inst, uint t) {
+    const uint w = inst * 2u + (plant.handoff_frame & 1u);
+    if (w >= uint(handoff_stamp.length())) return;
+    const uint bit = plantTemplateBit(t);
+    uint old = handoff_stamp[w];
+    for (uint it = 0u; it < 16u; ++it) {
+        const uint want = ((old >> 16) == plant.handoff_frame)
+            ? (old | bit) : ((plant.handoff_frame << 16) | bit);
+        const uint seen = atomicCompSwap(handoff_stamp[w], old, want);
+        if (seen == old) return;
+        old = seen;
+    }
+}
 
 // The hand-off test: a template for the node's mesh and a root within
 // the radius.  Shared by the appending pass (G-buffer) and the passes
 // that merely drop the same instances (forward-covered).
 bool plantInHandoff(uint rec, const InstanceDataInfo d, const mat4 m) {
     if (plant.eye_radius.w <= 0.0) return false;
+    // Adaptive radius (plant_cluster_expand.comp phase 2), <= the slider.
+    const float r_adapt = uintBitsToFloat(plant_ctr[PLANT_CTR_RADIUS]);
+    const float radius = (r_adapt > 0.0) ? min(r_adapt, plant.eye_radius.w)
+                                         : plant.eye_radius.w;
     const uint t = rec_template[rec];
     if (t >= plant.template_count) return false;
     const mat3 r = mat3(d.mat_rot_0.xyz, d.mat_rot_1.xyz, d.mat_rot_2.xyz);
     const vec3 t_inst = vec3(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w);
     const vec3 trans = r * m[3].xyz + t_inst;
     const vec3 dv = trans - plant.eye_radius.xyz;
-    return dot(dv, dv) <= plant.eye_radius.w * plant.eye_radius.w;
+    return dot(dv, dv) <= radius * radius;
 }
 
 // Returns true when the instance was handed to the cluster path.
@@ -149,12 +189,27 @@ void main() {
         }
     }
 
-    // Plants on the cluster path: within the hand-off radius the
-    // instance is expanded into cluster geometry instead of drawn here.
+    // Plants on the cluster path.  Two separate questions:
+    //  1. Who draws this instance THIS frame?  The cluster path draws the
+    //     jobs appended LAST frame (the expand runs before the cull), so
+    //     the drawable path skips exactly the instances stamped with
+    //     plant.drawn_frame -- in every camera pass, not only this one.
+    //  2. (G-buffer pass only) hand it off for NEXT frame: append a job
+    //     and stamp it with plant.handoff_frame.
+    // Skipping on (2) instead of (1) -- what this used to do -- made the
+    // two paths disagree whenever the handed-off set changed between
+    // frames: a new instance was drawn by neither path for a frame, a
+    // dropped one by both.  Over budget (a few dozen trees fit the
+    // 96k-cluster tail) the winners are atomic-order random, so the set
+    // changed EVERY frame: trees vanishing and doubling -- the flicker.
     if ((pc.flags & (NT_COMPACT_PLANT_HANDOFF | NT_COMPACT_PLANT_SKIP)) != 0u &&
-        plantInHandoff(rec, d, m)) {
-        if ((pc.flags & NT_COMPACT_PLANT_SKIP) != 0u) return;          // the G-buffer pass owns it
-        if (plantHandOff(rec, d, m, age_src[inst])) return;             // over budget: falls through
+        plant.eye_radius.w > 0.0) {
+        const bool owned = plantOwnedByClusters(rec, inst);
+        if ((pc.flags & NT_COMPACT_PLANT_HANDOFF) != 0u && plantInHandoff(rec, d, m) &&
+            plantHandOff(rec, d, m, age_src[inst])) {
+            plantStampHandoff(inst, rec_template[rec]);
+        }
+        if (owned) return;
     }
 
     const uint slot = atomicAdd(rec_counts[rec], 1u);

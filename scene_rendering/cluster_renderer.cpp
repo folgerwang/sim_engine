@@ -776,6 +776,22 @@ uint32_t ClusterRenderer::registerClusterMaterial(
                             : static_cast<const void*>(albedo_tex->vt_bc7_tiles.get());
                     auto vt_it = vt_albedo_id_cache_.find(vt_key);
                     uint32_t vid = kInvalidVtId;
+                    {
+                        // [PLANT_CUTOUT] diagnostic: where the cutout alpha
+                        // is (or is not) on the way into the VT.
+                        static int s_cut_logged = 0;
+                        if (mat.alpha_mask_ && s_cut_logged < 16) {
+                            ++s_cut_logged;
+                            clog_printf("[PLANT_CUTOUT] register '%s' %ux%u blob=%d cpu_px=%d "
+                                        "cpu_alpha=%zu cache_hit=%d%s\n",
+                                        mat.name_.c_str(), albedo_tex->size.x, albedo_tex->size.y,
+                                        int(albedo_has_blob), int(albedo_has_cpu),
+                                        albedo_tex->cpu_alpha ? albedo_tex->cpu_alpha->size() : size_t(0),
+                                        int(vt_it != vt_albedo_id_cache_.end()),
+                                        vt_it != vt_albedo_id_cache_.end() && vt_manager_->hasAlphaLayer(vt_it->second)
+                                            ? " (cached vt HAS alpha layer)" : "");
+                        }
+                    }
                     if (vt_it != vt_albedo_id_cache_.end()) {
                         vid = vt_it->second;
                     } else {
@@ -1316,6 +1332,19 @@ int ClusterRenderer::preRegisterVtMaterials(
         const uint8_t* px = has_cpu
             ? albedo_tex->cpu_pixels->data()
             : nullptr;
+        // The cutout alpha plane MUST ride along here too.  This warm-up
+        // registers most plant textures before uploadMeshClusters ever
+        // sees them, and that call then reuses this vid from the cache.
+        // Registered without the plane, a .rwtex whose BC7 blob was baked
+        // opaque (alpha split into its own plane) got no BC4 alpha layer,
+        // so BINDLESS_MAT_ALPHA_VT stayed clear and the cluster cutout
+        // read the blob's alpha = 1.0: every leaf card a solid quad.
+        const uint8_t* alpha_px =
+            (albedo_tex->cpu_alpha &&
+             albedo_tex->cpu_alpha->size() ==
+                 size_t(albedo_tex->size.x) * size_t(albedo_tex->size.y))
+                ? albedo_tex->cpu_alpha->data()
+                : nullptr;
         const uint32_t vid = vt_manager_->registerMaterial(
             px,
             albedo_tex->image,
@@ -1324,7 +1353,8 @@ int ClusterRenderer::preRegisterVtMaterials(
             /*emissive*/nullptr,
             albedo_tex->size.x,
             albedo_tex->size.y,
-            albedo_tex->vt_bc7_tiles);
+            albedo_tex->vt_bc7_tiles,
+            alpha_px);
         // Cache EVEN failed registrations (pool full, …) so the warm-up
         // doesn't retry the same texture every frame; uploadMeshClusters
         // checks vid validity before using a cached entry.
@@ -1341,7 +1371,10 @@ int ClusterRenderer::preRegisterVtMaterials(
         // textures; at a flat 1/frame the cluster merge sat behind
         // minutes of warm-up.
         if (has_blob) {
-            ++registered;
+            // A cutout plane adds a Lanczos alpha pyramid + BC4 encode
+            // (parallel, a few ms): weigh it as several memcpy ones.
+            // A FAILED registration (VT id table full) did no work at all.
+            registered += (alpha_px && vid != kInvalidVtId) ? 4 : 1;
         } else {
             registered = max_new;   // heavy encode — consume the budget
         }
@@ -1692,7 +1725,11 @@ void ClusterRenderer::finalizeUploads() {
     }
 
     // ── DEBUG: validate merged staging data — write to file ──
-    {
+    // First finalize only: it walks every merged index and vertex (twice)
+    // and rewrote the file on EVERY placed-scene rebuild -- pure hitch.
+    static bool s_cluster_dump_done = false;
+    if (!s_cluster_dump_done) {
+        s_cluster_dump_done = true;
         FILE* dbg = std::fopen("cluster_debug_dump.txt", "w");
         if (dbg) {
             const uint32_t n_verts = static_cast<uint32_t>(staging_vertices_.size());
@@ -2864,7 +2901,8 @@ void ClusterRenderer::cullShadow(
     const glm::vec3 light_unit = glm::normalize(light_dir);
     const glm::vec3 synth_cam = -light_unit * 1.0e6f;
 
-    const uint32_t groups = (total_clusters_all_meshes_ + 63) / 64;
+    const uint32_t shadow_clusters = shadowClusterCount();
+    const uint32_t groups = (shadow_clusters + 63) / 64;
 
     // One dispatch per cascade.  Push constants change per dispatch
     // (view_proj only); descriptor set changes per dispatch (each
@@ -2877,7 +2915,7 @@ void ClusterRenderer::cullShadow(
         // silently dropped by the shader guard).
         push.camera_pos_pad      = glm::vec4(
             synth_cam, float(shadow_cull_trans_capacity_));
-        push.total_clusters      = total_clusters_all_meshes_;
+        push.total_clusters      = shadow_clusters;
         push.total_bvh_nodes     = 0;
         push.lod_error_threshold = 1.0f;
         push.use_bvh             = 0;
@@ -5019,11 +5057,13 @@ uint32_t ClusterRenderer::drawClusterShadow(
         all_desc_sets);
 
     // Push total_clusters so the task shader can clamp lane_idx on the
-    // last (partial) task workgroup.
+    // last (partial) task workgroup.  The dynamic plant tail is left
+    // out: plant shadows come from the drawable path.
+    const uint32_t shadow_clusters = shadowClusterCount();
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, TASK_BIT_EXT),
         bindless_shadow_pipeline_layout_,
-        &total_clusters_all_meshes_,
+        &shadow_clusters,
         sizeof(uint32_t),
         0);
 
@@ -5035,10 +5075,10 @@ uint32_t ClusterRenderer::drawClusterShadow(
     // mesh-workgroup launch.
     constexpr uint32_t kClustersPerTaskWg = 32u;
     const uint32_t task_wg_count =
-        (total_clusters_all_meshes_ + kClustersPerTaskWg - 1u) /
+        (shadow_clusters + kClustersPerTaskWg - 1u) /
         kClustersPerTaskWg;
     cmd_buf->drawMeshTasks(task_wg_count, 1u, 1u);
-    return total_clusters_all_meshes_;
+    return shadow_clusters;
 }
 
 // ─── Cluster CSM shadow draw — VS+GS broadcast (kGeometryShader) ────────
@@ -5438,7 +5478,12 @@ void ClusterRenderer::recreate(
         static_cast<uint32_t>(
             total_materials_ * sizeof(glsl::BindlessMaterialParams)));
 
-    // Texture descriptors are baked into dummy_texture_ — re-write using it.
+    // Resident texture arrays: the REAL views, exactly as
+    // rewriteBindlessDescriptorsAfterRefinalize writes them.  This used to
+    // write dummy_texture_ into every slot, so after a window resize every
+    // resident albedo (the cutout alpha of the plant leaf cards, which
+    // have no VT) and every leaf-age / relief map read the dummy: solid
+    // leaf cards until the next placed-scene rebuild.
     for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
         auto tex_write = std::make_shared<er::TextureDescriptor>();
         tex_write->binding           = 2;
@@ -5447,7 +5492,10 @@ void ClusterRenderer::recreate(
         tex_write->desc_set          = bindless_desc_set_;
         tex_write->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         tex_write->sampler           = default_sampler_;
-        tex_write->texture           = dummy_texture_.view;
+        tex_write->texture           =
+            (ti < staging_tex_views_.size() && staging_tex_views_[ti])
+                ? staging_tex_views_[ti]
+                : dummy_texture_.view;
         writes.push_back(tex_write);
     }
     for (uint32_t ti = 0; ti < MAX_CLUSTER_TEXTURES; ++ti) {
@@ -5458,7 +5506,10 @@ void ClusterRenderer::recreate(
         nw->desc_set          = bindless_desc_set_;
         nw->image_layout      = er::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         nw->sampler           = default_sampler_;
-        nw->texture           = dummy_texture_.view;
+        nw->texture           =
+            (ti < staging_normal_tex_views_.size() && staging_normal_tex_views_[ti])
+                ? staging_normal_tex_views_[ti]
+                : dummy_texture_.view;
         writes.push_back(nw);
     }
 
@@ -5940,12 +5991,29 @@ void ClusterRenderer::buildHwRtShadowAs() {
     uint32_t demoted_tris = 0;
     opaque_idx.reserve(staging_indices_.size());
     opaque_tri_mat.reserve(staging_indices_.size() / 3u);
+    // Plant template cluster ranges.  The bounds test below never caught
+    // them: finalizePlantTemplates hides templates in the GPU cull infos
+    // only, AFTER this build, and staging keeps their real bounds -- so
+    // every template (~3.9M object-space tris at the world origin) was
+    // built into this BLAS (~260 MB, ~80 ms per rebuild) as phantom
+    // casters.  plant_templates_ is appended in cluster order.
+    size_t tpl_cursor = 0;
+    auto isPlantTemplateCluster = [&](uint32_t ci) {
+        while (tpl_cursor < plant_templates_.size() &&
+               ci >= plant_templates_[tpl_cursor].cluster_first +
+                     plant_templates_[tpl_cursor].cluster_count) {
+            ++tpl_cursor;
+        }
+        return tpl_cursor < plant_templates_.size() &&
+               ci >= plant_templates_[tpl_cursor].cluster_first;
+    };
     for (uint32_t ci = 0; ci < total_clusters_all_meshes_; ++ci) {
         const glsl::ClusterDrawInfo& draw = staging_draw_infos_[ci];
         if (draw.material_idx >= staging_material_params_.size()) continue;
         // Plant templates sit in OBJECT space and the dynamic plant tail
         // is rewritten per frame: neither belongs in a static BLAS (the
         // instanced RT casters cover the plants).
+        if (isPlantTemplateCluster(ci)) continue;
         if (ci < staging_cull_infos_.size() &&
             staging_cull_infos_[ci].bounds_sphere.w < 0.0f) continue;
         const glsl::BindlessMaterialParams& m =
@@ -6002,6 +6070,17 @@ void ClusterRenderer::buildHwRtShadowAs() {
                 mat_dst.push_back(draw.material_idx);
             }
         }
+    }
+    // Nothing static to put in this BLAS is NORMAL: in a placed PCG world
+    // every caster is an instanced per-mesh BLAS in the TLAS, and the
+    // cluster merge holds only plant templates, which are excluded above.
+    // The static AS must still be built -- returning here left the RT
+    // path "not ready" and the renderer fell back to CSM.  One degenerate
+    // (zero-area, never hit) triangle keeps the BLAS / TLAS alive, the
+    // same trick as stageRtSentinelCluster.
+    if (opaque_idx.empty() && masked_idx.empty() && !staging_vertices_.empty()) {
+        opaque_idx.assign(3, 0u);
+        opaque_tri_mat.assign(1, 0u);
     }
     const uint32_t opaque_tris = (uint32_t)opaque_idx.size() / 3u;
     const uint32_t masked_tris = (uint32_t)masked_idx.size() / 3u;
@@ -7505,7 +7584,20 @@ void ClusterRenderer::setPlantHandoff(const glm::vec3& eye, float radius_m) {
     p.dyn_cluster_first = plant_dyn_cluster_first_;
     p.dyn_vertex_first = plant_dyn_vertex_first_;
     p.template_count = uint32_t(plant_templates_.size());
+    p.handoff_frame = plant_handoff_frame_;
+    p.drawn_frame = plant_drawn_frame_;
     device_->updateBufferMemory(plant_params_buffer_.memory, sizeof(p), &p, 0, true);
+}
+
+void ClusterRenderer::advancePlantHandoffFrame() {
+    // What the expand recorded this frame consumed: last frame's jobs,
+    // unless it did not run or had to drop the queue (primed == false).
+    plant_drawn_frame_ = plant_expand_drew_frame_;
+    plant_expand_drew_frame_ = 0;
+    // 1..65534: fits the stamp's 16 high bits, never 0 ("none"), and the
+    // cycle length is even so consecutive ids always alternate parity
+    // (the stamp word is chosen by id & 1).
+    plant_handoff_frame_ = (plant_handoff_frame_ % 65534u) + 1u;
 }
 
 void ClusterRenderer::padPlantDynamicStaging() {
@@ -7577,7 +7669,7 @@ void ClusterRenderer::finalizePlantTemplates() {
             SET_FLAG_BIT(MemoryProperty, DEVICE_LOCAL_BIT),
             0, plant_counters_buffer_.buffer, plant_counters_buffer_.memory,
             std::source_location::current(),
-            uint64_t(PLANT_CTR_COUNT) * sizeof(uint32_t));
+            uint64_t(PLANT_CTR_WORDS) * sizeof(uint32_t));
         er::Helper::createBuffer(
             device_,
             SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT),
@@ -7600,6 +7692,45 @@ void ClusterRenderer::finalizePlantTemplates() {
     setPlantHandoff(plant_eye_, plant_radius_m_);
     clog_printf("[PLANT_CLUSTER] %zu templates finalized (%u template clusters)\n",
                 plant_templates_.size(), acc);
+    // ── [PLANT_CUTOUT] diagnostic: what the template materials carry ──
+    // One summary per finalize plus the first few distinct materials:
+    // ALPHA_MASK (cutout on), ALPHA_VT (BC4 alpha layer exists), the VT
+    // id, the cutoff and the factor alpha.  Leaf cards drawn as solid
+    // quads on the cluster path show up here as mask=1 alpha_vt=0.
+    {
+        uint32_t n = 0, n_mask = 0, n_avt = 0, n_novt = 0, n_leafmask = 0, n_age = 0;
+        std::unordered_set<uint32_t> seen;
+        int printed = 0;
+        for (const auto& t : plant_templates_) {
+            if (t.gid >= mesh_prim_material_.size()) continue;
+            for (const auto& kv : mesh_prim_material_[t.gid]) {
+                const uint32_t mi = kv.second;
+                if (mi >= staging_material_params_.size() || !seen.insert(mi).second) continue;
+                const auto& mp = staging_material_params_[mi];
+                ++n;
+                const bool mask = (mp.flags & BINDLESS_MAT_ALPHA_MASK) != 0;
+                const bool avt  = (mp.flags & BINDLESS_MAT_ALPHA_VT) != 0;
+                n_mask += mask; n_avt += avt;
+                n_novt += mp.albedo_vt_id == 0xFFFFFFFFu;
+                n_leafmask += (mp.flags & BINDLESS_MAT_LEAF_MASK) != 0;
+                n_age += (mp.flags & BINDLESS_MAT_LEAF_AGE) != 0;
+                if (printed < 12 && (mp.flags & BINDLESS_MAT_FOLIAGE_SSS) != 0) {
+                    ++printed;
+                    clog_printf("[PLANT_CUTOUT] mat %u '%s' flags=0x%08x mask=%d alpha_vt=%d "
+                                "vt=%u layer=%d cutoff=%.3f factor_a=%.3f tex_idx=%d\n",
+                                mi,
+                                mi < staging_material_names_.size()
+                                    ? staging_material_names_[mi].first.c_str() : "?",
+                                uint32_t(mp.flags), int(mask), int(avt), mp.albedo_vt_id,
+                                int(vt_manager_ && vt_manager_->hasAlphaLayer(mp.albedo_vt_id)),
+                                mp.alpha_cutoff, mp.base_color_factor.a, mp.base_color_tex_idx);
+                }
+            }
+        }
+        clog_printf("[PLANT_CUTOUT] template materials: %u, ALPHA_MASK %u, ALPHA_VT %u, "
+                    "no VT %u, LEAF_MASK %u, LEAF_AGE %u\n",
+                    n, n_mask, n_avt, n_novt, n_leafmask, n_age);
+    }
 }
 
 void ClusterRenderer::initPlantExpandPipeline(
@@ -7705,11 +7836,17 @@ void ClusterRenderer::recordPlantExpand(
         SET_FLAG_BIT(Access, TRANSFER_WRITE_BIT),
         SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
 
+    // The instances this expand turns into clusters are the ones the
+    // compaction stamped with the current hand-off id -- unless the queue
+    // is about to be dropped below (templates re-finalized), in which
+    // case nothing handed off is drawn and the drawables keep them all.
+    plant_expand_drew_frame_ = plant_counters_primed_ ? plant_handoff_frame_ : 0u;
+
     // First use: the counters start at zero.
     if (!plant_counters_primed_) {
         cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, compute_rw, transfer_write);
         cmd_buf->fillBuffer(plant_counters_buffer_.buffer, 0,
-                            uint64_t(PLANT_CTR_COUNT) * sizeof(uint32_t), 0u);
+                            uint64_t(PLANT_CTR_WORDS) * sizeof(uint32_t), 0u);
         cmd_buf->addBufferBarrier(plant_counters_buffer_.buffer, transfer_write, compute_rw);
         plant_counters_primed_ = true;
     }

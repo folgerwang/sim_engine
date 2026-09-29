@@ -567,6 +567,15 @@ void main() {
             vt_alb_handled = true;
         }
     }
+    // Not in the VT (id table full) but a resident albedo exists: the
+    // cutout / depth-surface materials keep one.  Sample it like the
+    // drawable G-buffer path does -- colour AND the cutout alpha.
+    // Triplanar depth surfaces are sampled by world position below.
+    if (!has_vt_alb && tex_idx >= 0 &&
+        !((mat_flags & BINDLESS_MAT_DEPTH_SURFACE) != 0 &&
+          uintBitsToFloat(material_params[mat_idx].emissive_vt_id) > 0.0)) {
+        albedo_tex = texture(base_color_textures[nonuniformEXT(tex_idx)], v_uv);
+    }
     // Case 3 (legacy bindless albedo) is GONE -- an unregistered
     // material now falls through to case 4 with albedo_tex = vec4(1.0),
     // i.e. base_color_factor alone.  See the matching note in
@@ -598,6 +607,13 @@ void main() {
     if ((mat_flags & BINDLESS_MAT_ALPHA_VT) != 0) {
         albedo4.a = base_color.a *
                     vtSampleAlpha(material_params[mat_idx].albedo_vt_id, v_uv);
+    } else if (has_vt_alb && !(depth_surface && depth_tile > 0.0) && tex_idx >= 0 &&
+               (mat_flags & BINDLESS_MAT_ALPHA_MASK) != 0) {
+        // No BC4 layer: the VT albedo is opaque, so cut with the
+        // resident RGBA albedo like the drawable G-buffer path does
+        // (same rule as clusterResidentCutoutAlpha, cluster_cutout.glsl.h).
+        albedo4.a = base_color.a *
+                    texture(base_color_textures[nonuniformEXT(tex_idx)], v_uv).a;
     }
     if (leaf_mask) {
         int ageIndex = material_params[mat_idx].normal_tex_idx;
