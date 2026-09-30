@@ -1666,6 +1666,10 @@ void ClusterRenderer::finalizeUploads() {
         cull_desc_set_ = device_->createDescriptorSets(
             descriptor_pool_, cull_desc_set_layout_, 1)[0];
     }
+    if (!cull_desc_set_b_) {
+        cull_desc_set_b_ = device_->createDescriptorSets(
+            descriptor_pool_, cull_desc_set_layout_, 1)[0];
+    }
 
     // material_params_buffer_ was just created above; staging_material_params_
     // still has the source data for the size lookup.  total_materials_ isn't
@@ -1693,6 +1697,25 @@ void ClusterRenderer::finalizeUploads() {
         // — the shader's sample is gated on use_hiz_cull anyway, so
         // a null binding is fine until the first descriptor refresh.
         hiz_sampler_, hiz_view_);
+    writeCullDescriptors(
+        device_, cull_desc_set_b_,
+        total_clusters_all_meshes_,
+        cull_info_buffer_, draw_info_buffer_,
+        indirect_draw_buffer_,
+        total_clusters_all_meshes_,
+        draw_count_buffer_,
+        visible_buffer_,
+        material_params_buffer_, mat_count,
+        trans_indirect_draw_buffer_,
+        trans_indirect_capacity_,
+        trans_draw_count_buffer_,
+        visibility_bit_buffer_,
+        indirect_draw_buffer_phase_a_,
+        draw_count_buffer_phase_a_,
+        // Phase B twin: the real-depth pyramid (falls back to the
+        // prediction until the application provides it).
+        hiz_view_b_ ? hiz_sampler_b_ : hiz_sampler_,
+        hiz_view_b_ ? hiz_view_b_ : hiz_view_);
 
     // ── Per-cascade shadow cull descriptor sets (Option B) ───────────
     // One descriptor set per cascade; same layout as cull_desc_set_, but
@@ -2498,6 +2521,24 @@ void ClusterRenderer::setHiZTexture(
     }
 }
 
+void ClusterRenderer::setHiZTextureB(
+    const std::shared_ptr<renderer::Sampler>& sampler,
+    const std::shared_ptr<renderer::ImageView>& view) {
+    const bool changed = (sampler != hiz_sampler_b_) || (view != hiz_view_b_);
+    hiz_sampler_b_ = sampler;
+    hiz_view_b_    = view;
+    if (!view) hiz_real_valid_ = false;
+    if (changed && cull_desc_set_b_ && sampler && view) {
+        er::WriteDescriptorList writes;
+        writes.reserve(1);
+        er::Helper::addOneTexture(writes, cull_desc_set_b_,
+            er::DescriptorType::COMBINED_IMAGE_SAMPLER, 11,
+            sampler, view,
+            er::ImageLayout::GENERAL);
+        device_->updateDescriptorSets(writes);
+    }
+}
+
 // ─── Cull (single dispatch for ALL clusters) ──────────────────────
 
 // ── Debug-readback prologue ─────────────────────────────────────────────
@@ -3135,9 +3176,14 @@ void ClusterRenderer::cullPhaseB(
     cmd_buf->pushConstants(
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         cull_pipeline_layout_, &push, sizeof(push));
+    // Two-phase occlusion: test the REAL mid-frame pyramid when the
+    // application built it this frame (cull_desc_set_b_), else the
+    // prediction / last-frame pyramid as before.
     cmd_buf->bindDescriptorSets(
         er::PipelineBindPoint::COMPUTE,
-        cull_pipeline_layout_, { cull_desc_set_ });
+        cull_pipeline_layout_,
+        { (hiz_real_valid_ && cull_desc_set_b_ && hiz_view_b_)
+              ? cull_desc_set_b_ : cull_desc_set_ });
 
     uint32_t groups = (total_clusters_all_meshes_ + 63) / 64;
     cmd_buf->dispatch(groups, 1);
@@ -5442,6 +5488,7 @@ uint32_t ClusterRenderer::drawTranslucentOit(
 void ClusterRenderer::onDescriptorPoolDestroyed() {
     bindless_desc_set_.reset();
     cull_desc_set_.reset();
+    cull_desc_set_b_.reset();
     for (auto& s : cull_desc_sets_shadow_) s.reset();
     cluster_mesh_data_desc_set_.reset();
     oit_composite_desc_set_.reset();
@@ -5566,6 +5613,10 @@ void ClusterRenderer::recreate(
             cull_desc_set_ = device_->createDescriptorSets(
                 descriptor_pool_, cull_desc_set_layout_, 1)[0];
         }
+        if (!cull_desc_set_b_) {
+            cull_desc_set_b_ = device_->createDescriptorSets(
+                descriptor_pool_, cull_desc_set_layout_, 1)[0];
+        }
         const uint32_t mat_count = std::max<uint32_t>(1u, total_materials_);
         writeCullDescriptors(
             device_, cull_desc_set_,
@@ -5583,6 +5634,23 @@ void ClusterRenderer::recreate(
             indirect_draw_buffer_phase_a_,
             draw_count_buffer_phase_a_,
             hiz_sampler_, hiz_view_);
+        writeCullDescriptors(
+            device_, cull_desc_set_b_,
+            total_clusters_all_meshes_,
+            cull_info_buffer_, draw_info_buffer_,
+            indirect_draw_buffer_,
+            total_clusters_all_meshes_,
+            draw_count_buffer_,
+            visible_buffer_,
+            material_params_buffer_, mat_count,
+            trans_indirect_draw_buffer_,
+            trans_indirect_capacity_,
+            trans_draw_count_buffer_,
+            visibility_bit_buffer_,
+            indirect_draw_buffer_phase_a_,
+            draw_count_buffer_phase_a_,
+            hiz_view_b_ ? hiz_sampler_b_ : hiz_sampler_,
+            hiz_view_b_ ? hiz_view_b_ : hiz_view_);
     }
 }
 
@@ -7475,6 +7543,7 @@ void ClusterRenderer::destroy() {
     cull_pipeline_.reset();
     cull_pipeline_layout_.reset();
     cull_desc_set_.reset();
+    cull_desc_set_b_.reset();
     for (auto& s : cull_desc_sets_shadow_) s.reset();
     cull_desc_set_layout_.reset();
 

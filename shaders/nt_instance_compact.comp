@@ -110,6 +110,14 @@ layout(std430, set = 1, binding = 4) readonly buffer PlantTemplateBuf { PlantTem
 // frame F's jobs in frame F+1, so every pass of frame F+1 skips exactly
 // the instances stamped F (plant.drawn_frame) -- see PlantJobParams.
 layout(std430, set = 0, binding = 11) buffer HandoffStampBuf { uint handoff_stamp[]; };
+// ── Two-phase occlusion (NT_COMPACT_RETEST / NT_COMPACT_PHASE_B) ────────
+// retest[]  : (rec, inst) of every instance Phase A's Hi-Z test rejected.
+// pb_words[] : [0] retest count, [1 .. 1+cap) Phase B survivors per record,
+//             [1+cap .. 1+2cap) node-level Phase A Hi-Z rejections
+//             (node_table_cull.comp; cap = the host's record capacity,
+//             which only that shader needs -- its pc.pad2).
+layout(std430, set = 0, binding = 13) buffer RetestBuf  { uvec2 retest[]; };
+layout(std430, set = 0, binding = 14) buffer PhaseBBuf  { uint pb_words[]; };
 
 uint plantTemplateBit(uint t) { return 1u << (t & 15u); }
 
@@ -200,29 +208,39 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 void main() {
     const uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.inst_total || pc.record_count == 0u) return;
+    const bool phase_b = (pc.flags & NT_COMPACT_PHASE_B) != 0u;
 
-    // Which class entry owns this invocation: last e with prefix[e] <= gid.
-    uint lo = 0u, hi = pc.record_count - 1u;
-    while (lo < hi) {
-        const uint mid = (lo + hi + 1u) >> 1u;
-        if (class_prefix[pc.record_first + mid] <= gid) lo = mid; else hi = mid - 1u;
+    uint rec, inst;
+    if (phase_b) {
+        // One invocation per Phase A rejection; band + frustum passed
+        // there, only the occlusion test is repeated (real depth now).
+        if (gid >= pb_words[0]) return;
+        rec  = retest[gid].x;
+        inst = retest[gid].y;
+    } else {
+        // Which class entry owns this invocation: last e with prefix[e] <= gid.
+        uint lo = 0u, hi = pc.record_count - 1u;
+        while (lo < hi) {
+            const uint mid = (lo + hi + 1u) >> 1u;
+            if (class_prefix[pc.record_first + mid] <= gid) lo = mid; else hi = mid - 1u;
+        }
+        rec = class_idx[pc.record_first + lo];
+        const uint k = gid - class_prefix[pc.record_first + lo];
+        const NtCullInfo info0 = infos[rec];
+        if (info0.prim_count == 0u) return;
+        // The node's instance range, straight from its first command.
+        const uint src = info0.cmd_ofs_u32;
+        const uint n = min(cmd_src[src + 1u], info0.inst_cap);
+        if (k >= n) return;
+        inst = cmd_src[src + 4u] + k;
     }
-    const uint rec = class_idx[pc.record_first + lo];
-    const uint k = gid - class_prefix[pc.record_first + lo];
     const NtCullInfo info = infos[rec];
-    if (info.prim_count == 0u) return;
-
-    // The node's instance range, straight from its first command.
-    const uint src = info.cmd_ofs_u32;
-    const uint n = min(cmd_src[src + 1u], info.inst_cap);
-    if (k >= n) return;
-    const uint inst = cmd_src[src + 4u] + k;
     const InstanceDataInfo d = inst_src[inst];
     const mat4 m = records[rec].model_mat;
 
     // ── Per-instance LOD band (same expression base.vert used) ────────
     const uint ilod_bits = floatBitsToUint(records[rec].model_params_pad0);
-    if ((pc.flags & NT_COMPACT_BAND_TEST) != 0u && ilod_bits != 0u) {
+    if (!phase_b && (pc.flags & NT_COMPACT_BAND_TEST) != 0u && ilod_bits != 0u) {
         const vec3 inst_t = (m * vec4(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w, 1.0)).xyz;
         const float ilod_d = distance(inst_t.xz, pc.eye.xz);
         const float ilod_near = float((ilod_bits >> 16) & 0x7FFFu) * 0.25;
@@ -233,7 +251,7 @@ void main() {
     // ── Per-instance frustum (+ occlusion) ────────────────────────────
     const bool hiz = (pc.flags & NT_COMPACT_HIZ) != 0u;
     const uint plane_count = hiz ? 6u : min(pc.flags & 0xFFu, 6u);
-    if (plane_count > 0u) {
+    if (plane_count > 0u && (!phase_b || hiz)) {
         const mat3 r = mat3(d.mat_rot_0.xyz, d.mat_rot_1.xyz, d.mat_rot_2.xyz);
         const vec3 t = vec3(d.mat_rot_0.w, d.mat_rot_1.w, d.mat_rot_2.w);
         // Same order base.vert places a vertex in: the record matrix
@@ -246,17 +264,26 @@ void main() {
         const float rad = info.mesh_sphere.w * s_inst * s_node * 1.1 + 1.0;
         if (hiz) {
             const mat4 M = mat4(pc.planes[0], pc.planes[1], pc.planes[2], pc.planes[3]);
-            for (uint k = 0u; k < 6u; ++k) {
-                vec4 p = ncFrustumPlane(M, k);
-                const float n_len = length(p.xyz);
-                if (n_len < 1e-12) continue;          // degenerate (infinite far)
-                p /= n_len;
-                if (dot(p.xyz, c) + p.w < -rad) return;
+            if (!phase_b) {
+                for (uint k = 0u; k < 6u; ++k) {
+                    vec4 p = ncFrustumPlane(M, k);
+                    const float n_len = length(p.xyz);
+                    if (n_len < 1e-12) continue;          // degenerate (infinite far)
+                    p /= n_len;
+                    if (dot(p.xyz, c) + p.w < -rad) return;
+                }
             }
             // Before the plant hand-off below: an occluded plant needs no
             // cluster job either.  (One the cluster path draws THIS frame
             // is not drawn here anyway, so returning early is consistent.)
-            if (ncHiZOccluded(M, c, rad, pc.planes[4].xy, pc.planes[4].z)) return;
+            if (ncHiZOccluded(M, c, rad, pc.planes[4].xy, pc.planes[4].z)) {
+                if (!phase_b && (pc.flags & NT_COMPACT_RETEST) != 0u) {
+                    // Not dropped: Phase B decides against the real depth.
+                    const uint slot_r = atomicAdd(pb_words[0], 1u);
+                    if (slot_r < pc.inst_total) retest[slot_r] = uvec2(rec, inst);
+                }
+                return;
+            }
         } else {
             for (uint p = 0u; p < plane_count; ++p) {
                 if (dot(pc.planes[p].xyz, c) + pc.planes[p].w < -rad) return;
@@ -287,7 +314,13 @@ void main() {
         if (owned) return;
     }
 
-    const uint slot = atomicAdd(rec_counts[rec], 1u);
+    uint slot;
+    if (phase_b) {
+        // Appended after Phase A's survivors of the same record.
+        slot = rec_counts[rec] + atomicAdd(pb_words[1u + rec], 1u);
+    } else {
+        slot = atomicAdd(rec_counts[rec], 1u);
+    }
     if (slot >= info.inst_cap) return;
     const uint dst = info.out_base + slot;
     inst_dst[dst] = d;

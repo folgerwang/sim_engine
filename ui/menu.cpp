@@ -10313,6 +10313,22 @@ void Menu::drawRenderDebugMenuContent() {
                 ImGui::SetTooltip("Sim runs one frame ahead; next frame's occlusion\n"
                                   "pyramid is predicted from this frame's depth +\n"
                                   "motion vectors (no depth prepass).  +1 frame latency.");
+            if (ImGui::MenuItem("  Prediction ignores holes", NULL,
+                                hiz_ignore_holes_on_, deferred_rendering_ && frame_ahead_on_)) {
+                hiz_ignore_holes_on_ = !hiz_ignore_holes_on_;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Predicted pyramid: the max-reduce skips texels the\n"
+                                  "reprojection left empty (else every disocclusion\n"
+                                  "sliver reads as far and its occluder is lost).");
+            if (ImGui::MenuItem("  Two-phase re-test (real depth)", NULL,
+                                hiz_two_phase_on_, deferred_rendering_ && frame_ahead_on_)) {
+                hiz_two_phase_on_ = !hiz_two_phase_on_;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Phase B: what the prediction rejected is re-tested\n"
+                                  "against the real mid-frame depth pyramid and drawn\n"
+                                  "if visible (clusters, node-table plants, grass).");
             // VT LOD bias: where between two mips every virtual-texture
             // sample (leaf cutout alpha included) sits.  0 = on the
             // sharper mip, 0.5 = halfway, 1 = a full level coarser.

@@ -120,6 +120,16 @@ public:
         const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
         const std::shared_ptr<renderer::ImageView>& depth_view,
         const glm::uvec2& buffer_size, bool coverage_only = false);
+    // Two-phase occlusion, Phase B: after the application rebuilt the
+    // real-depth Hi-Z pyramid from everything drawGbuffer drew, re-test
+    // the node-table instances Phase A rejected and draw the survivors
+    // (node-table buckets only; the classic drawables were complete).
+    void drawGbufferPhaseB(
+        std::shared_ptr<renderer::CommandBuffer> cmd_buf,
+        const renderer::DescriptorSetList& desc_sets,
+        const std::vector<std::shared_ptr<renderer::ImageView>>& gbuffer_views,
+        const std::shared_ptr<renderer::ImageView>& depth_view,
+        const glm::uvec2& buffer_size);
 
     // Forward translucent GLASS pass: draw ONLY the Blend/glass
     // primitives of every registered drawable, alpha-blended over the

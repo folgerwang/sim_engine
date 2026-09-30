@@ -59,6 +59,11 @@ layout(std430, set = 0, binding = 8) readonly buffer RecCountBuf {
 // is skipped before any of its instances reach the vertex shader.  Only
 // read when pc.flags has NT_CULL_FLAG_HIZ.
 layout(set = 0, binding = 9) uniform sampler2D hiz_pyramid;
+// Two-phase occlusion (NT_CULL_FLAG_RETEST / PHASE_B), shared with
+// nt_instance_compact.comp: [0] retest count, [1 .. 1+cap) Phase B
+// survivors per record, [1+cap .. 1+2cap) node-level Phase A rejections.
+// cap = pc.pad2.
+layout(std430, set = 0, binding = 10) buffer PhaseBBuf { uint pb_words[]; };
 
 // Gribb-Hartmann plane k of clip = M * p, normals inward.  M already maps
 // DRAWABLE space to clip, so the planes come out in drawable space; the
@@ -127,6 +132,11 @@ void main() {
     const uint rec = class_idx[pc.record_first + i];
     const NtCullInfo node = infos[rec];
     if (node.prim_count == 0u) return;
+    const bool phase_b = (pc.flags & NT_CULL_FLAG_PHASE_B) != 0u;
+    const uint node_flag_at = 1u + pc.pad2 + rec;
+    // Phase B: was the whole node rejected by Phase A's occlusion test?
+    // Then every Phase A survivor of the record is still undrawn.
+    const bool node_rejected_a = phase_b && pb_words[node_flag_at] != 0u;
 
     // ── Spatial cull: node sphere vs the pass volume (drawable space) ─
     // The planes were transformed by transpose(inst_world) on the host,
@@ -147,7 +157,12 @@ void main() {
             if (dot(p.xyz, c) + p.w < -r) return;
         }
         if ((pc.flags & NT_CULL_FLAG_HIZ) != 0u &&
-            ntHiZOccluded(M, c, node.sphere.w, pc.planes[4].xy, pc.planes[4].z)) return;
+            ntHiZOccluded(M, c, node.sphere.w, pc.planes[4].xy, pc.planes[4].z)) {
+            if (!phase_b && (pc.flags & NT_CULL_FLAG_RETEST) != 0u) {
+                pb_words[node_flag_at] = 1u;
+            }
+            return;
+        }
     } else if (pc.plane_count > 0u) {
         const vec3 c = node.sphere.xyz;
         const float r = node.sphere.w * pc.iw_scale;
@@ -169,9 +184,25 @@ void main() {
     // ── Compacted instances: point the commands at the record's range ─
     const bool compacted = pc.pad0 != 0u;
     uint c_count = 0u;
+    uint c_first = node.out_base;
     if (compacted) {
-        c_count = min(rec_counts[rec], node.inst_cap);
+        const uint count_a = min(rec_counts[rec], node.inst_cap);
+        if (phase_b) {
+            const uint count_b = min(pb_words[1u + rec], node.inst_cap - count_a);
+            if (node_rejected_a) {
+                c_count = count_a + count_b;      // nothing of it was drawn
+            } else {
+                c_count = count_b;               // only the retested survivors
+                c_first = node.out_base + count_a;
+            }
+        } else {
+            c_count = count_a;
+        }
         if (c_count == 0u) return;              // every instance culled
+    } else if (phase_b) {
+        // Uncompacted records were drawn whole in Phase A unless the node
+        // itself was rejected there.
+        if (!node_rejected_a) return;
     }
 
     // ── Emit one command per primitive into its bucket ───────────────
@@ -197,7 +228,7 @@ void main() {
         cmd_dst[dst + 1u] = compacted ? c_count : cmd_src[src + 1u];   // instance_count
         cmd_dst[dst + 2u] = cmd_src[src + 2u];   // first_index
         cmd_dst[dst + 3u] = cmd_src[src + 3u];   // vertex_offset
-        cmd_dst[dst + 4u] = compacted ? node.out_base : cmd_src[src + 4u];   // first_instance
+        cmd_dst[dst + 4u] = compacted ? c_first : cmd_src[src + 4u];   // first_instance
         slots[slot] = rec;
     }
 }

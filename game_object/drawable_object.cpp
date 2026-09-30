@@ -285,6 +285,20 @@ void engine::game_object::DrawableObject::setNtHiZOcclusion(
     s_nt_hiz_view_proj = view_proj;
     s_nt_hiz_enabled = enabled && view && sampler && mip_count > 0u;
 }
+static std::shared_ptr<engine::renderer::Sampler>   s_nt_hiz_b_sampler;
+static std::shared_ptr<engine::renderer::ImageView> s_nt_hiz_b_view;
+static uint32_t   s_nt_hiz_b_gen = 1;
+static bool       s_nt_only_draw_pass = false;
+void engine::game_object::DrawableObject::setNtHiZOcclusionB(
+    const std::shared_ptr<engine::renderer::Sampler>& sampler,
+    const std::shared_ptr<engine::renderer::ImageView>& view) {
+    if (sampler != s_nt_hiz_b_sampler || view != s_nt_hiz_b_view) ++s_nt_hiz_b_gen;
+    s_nt_hiz_b_sampler = sampler;
+    s_nt_hiz_b_view = view;
+}
+void engine::game_object::DrawableObject::setNtOnlyDrawPass(bool on) {
+    s_nt_only_draw_pass = on;
+}
 bool engine::game_object::DrawableObject::ntCompactEnabled() { return s_nt_compact_enabled; }
 void engine::game_object::DrawableObject::setDebugHidePlants(bool hide_wood, bool hide_leaves) {
     s_dbg_hide_tree_wood = hide_wood;
@@ -8261,10 +8275,25 @@ struct NodeTableGpu {
     renderer::BufferInfo handoff_stamp;
     uint32_t handoff_capacity = 0;            // instances covered
     std::shared_ptr<renderer::DescriptorSet> compact_desc_sets[2];
+    // ── Two-phase occlusion (Phase B) ────────────────────────────────
+    // retest: (rec, inst) per Phase A Hi-Z rejection, fwd_inst_total
+    // entries.  phase_b: [0] retest count, [1, 1+cap) Phase B survivors
+    // per record, [1+cap, 1+2cap) node-level Phase A rejections, cap =
+    // rec_counts_capacity.  The *_b descriptor sets are the A sets with
+    // the REAL depth pyramid at the Hi-Z binding.
+    renderer::BufferInfo retest;
+    uint32_t retest_capacity = 0;
+    renderer::BufferInfo phase_b;
+    uint32_t phase_b_capacity = 0;            // rec_counts_capacity it was sized for
+    std::shared_ptr<renderer::DescriptorSet> cull_desc_sets_b[2];
+    std::shared_ptr<renderer::DescriptorSet> compact_desc_sets_b[2];
+    uint32_t hiz_gen_b[2] = { 0u, 0u };
+    bool     pass_retest_armed = false;       // Phase A recorded retests this frame
+    uint64_t pass_retest_serial = 0;
     bool     pass_compacted = false;
     uint64_t stat_inst_submitted = 0;         // instances the compact pass tested
-    // [nt.compact] debug readback (G-buffer pass, every ~4 s).
-    renderer::BufferInfo dbg_rb;              // host visible, 4 KB
+    // [nt.compact] debug readback (G-buffer pass, every ~1 s).
+    renderer::BufferInfo dbg_rb;              // host visible, 8 KB
     bool     dbg_pending = false;
     uint64_t dbg_serial = 0;
     uint32_t dbg_records = 0;
@@ -8314,8 +8343,10 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNodeTableDescSetLayo
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
     // 8 = rec_counts (compacted instance count per record),
-    // 9 = hiz_pyramid (frame-ahead occlusion, sampled).
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(10);
+    // 9 = hiz_pyramid (frame-ahead occlusion, sampled),
+    // 10 = phase_b (two-phase occlusion: retest count, Phase B counts,
+    //      node-level Phase A rejections).
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(11);
     for (uint32_t i = 0; i < 9; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
@@ -8326,6 +8357,10 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
         9,
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER);
+    bindings[10] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+        10,
+        SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+        renderer::DescriptorType::STORAGE_BUFFER);
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -8333,10 +8368,11 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNtCullDescSetLayout(
 // 3 class_prefix, 4 records, 5 inst_src, 6 age_src, 7 inst_dst,
 // 8 age_dst, 9 rec_counts, 10 rec_template (plant cluster hand-off),
 // 11 handoff_stamp (per-instance hand-off frame stamps),
-// 12 hiz_pyramid (per-instance occlusion, sampled).
+// 12 hiz_pyramid (per-instance occlusion, sampled),
+// 13 retest, 14 phase_b (two-phase occlusion).
 static std::shared_ptr<renderer::DescriptorSetLayout> createNtCompactDescSetLayout(
     const std::shared_ptr<renderer::Device>& device) {
-    std::vector<renderer::DescriptorSetLayoutBinding> bindings(13);
+    std::vector<renderer::DescriptorSetLayoutBinding> bindings(15);
     for (uint32_t i = 0; i < 12; ++i) {
         bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
             i,
@@ -8347,6 +8383,12 @@ static std::shared_ptr<renderer::DescriptorSetLayout> createNtCompactDescSetLayo
         12,
         SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
         renderer::DescriptorType::COMBINED_IMAGE_SAMPLER);
+    for (uint32_t i = 13; i < 15; ++i) {
+        bindings[i] = renderer::helper::getBufferDescriptionSetLayoutBinding(
+            i,
+            SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
+            renderer::DescriptorType::STORAGE_BUFFER);
+    }
     return device->createDescriptorSetLayout(bindings);
 }
 
@@ -8420,7 +8462,13 @@ static void ntReleaseGpu(
         nt.vs_desc_sets[p].reset();
         nt.class_prefix[p].destroy(device);
         nt.compact_desc_sets[p].reset();
+        nt.compact_desc_sets_b[p].reset();
+        nt.cull_desc_sets_b[p].reset();
     }
+    nt.retest.destroy(device);
+    nt.retest_capacity = 0;
+    nt.phase_b.destroy(device);
+    nt.phase_b_capacity = 0;
     nt.rec_counts.destroy(device);
     nt.dbg_rb.destroy(device);
     nt.compact_inst.destroy(device);
@@ -8877,6 +8925,25 @@ static void ntEnsureBuffers(
         nt.rec_counts_capacity = cap;
         nt.desc_dirty[0] = nt.desc_dirty[1] = true;
     }
+    // Two-phase occlusion scratch, sized with the tables they index.
+    if (nt.rec_counts_capacity != nt.phase_b_capacity || !nt.phase_b.buffer) {
+        ntRetire(nt, nt.phase_b, serial);
+        nt.phase_b = ntCreateDeviceBuffer(
+            device, uint64_t(1u + 2u * nt.rec_counts_capacity) * sizeof(uint32_t),
+            SET_3_FLAG_BITS(BufferUsage, STORAGE_BUFFER_BIT, TRANSFER_DST_BIT, TRANSFER_SRC_BIT));
+        nt.phase_b_capacity = nt.rec_counts_capacity;
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+    }
+    if (nt.fwd_inst_total > nt.retest_capacity || !nt.retest.buffer) {
+        const uint32_t cap = std::max(
+            nt.fwd_inst_total + nt.fwd_inst_total / 4u + 1024u, 4096u);
+        ntRetire(nt, nt.retest, serial);
+        nt.retest = ntCreateDeviceBuffer(
+            device, uint64_t(cap) * sizeof(glm::uvec2),
+            SET_FLAG_BIT(BufferUsage, STORAGE_BUFFER_BIT));
+        nt.retest_capacity = cap;
+        nt.desc_dirty[0] = nt.desc_dirty[1] = true;
+    }
     if (nt.compact_total > nt.compact_capacity || !nt.compact_inst.buffer) {
         const uint32_t cap = std::max(
             nt.compact_total + nt.compact_total / 4u + 1024u, 4096u);
@@ -8962,9 +9029,14 @@ static void ntWriteDescriptorSets(
     NodeTableGpu& nt,
     uint32_t parity) {
     if (nt.hiz_gen[parity] != s_nt_hiz_gen) nt.desc_dirty[parity] = true;
+    if (nt.hiz_gen_b[parity] != s_nt_hiz_b_gen) nt.desc_dirty[parity] = true;
     if (!nt.desc_dirty[parity]) return;
     if (!nt.cull_desc_sets[parity]) {
         nt.cull_desc_sets[parity] =
+            device->createDescriptorSets(pool, cull_layout, 1)[0];
+    }
+    if (!nt.cull_desc_sets_b[parity]) {
+        nt.cull_desc_sets_b[parity] =
             device->createDescriptorSets(pool, cull_layout, 1)[0];
     }
     if (!nt.vs_desc_sets[parity]) {
@@ -8972,7 +9044,7 @@ static void ntWriteDescriptorSets(
             device->createDescriptorSets(pool, vs_layout, 1)[0];
     }
     renderer::WriteDescriptorList writes;
-    writes.reserve(22);
+    writes.reserve(64);
     const auto& cs = nt.cull_desc_sets[parity];
     auto add = [&](const std::shared_ptr<renderer::DescriptorSet>& set,
                    uint32_t binding, const renderer::BufferInfo& buf) {
@@ -8989,34 +9061,75 @@ static void ntWriteDescriptorSets(
     add(cs, 6, nt.prim_flags_buf);
     add(cs, 7, nt.class_idx[parity]);
     add(cs, 8, nt.rec_counts);
+    add(cs, 10, nt.phase_b);
     if (s_nt_hiz_view && s_nt_hiz_sampler) {
         renderer::Helper::addOneTexture(
             writes, cs, renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 9,
             s_nt_hiz_sampler, s_nt_hiz_view, renderer::ImageLayout::GENERAL);
     }
+    // Phase B twin: same buffers, the REAL depth pyramid at binding 9
+    // (the prediction until the application provides one).
+    {
+        const auto& cb = nt.cull_desc_sets_b[parity];
+        for (uint32_t b = 0; b < 9; ++b) {
+            const renderer::BufferInfo* src = nullptr;
+            switch (b) {
+                case 0: src = &nt.infos[parity]; break;
+                case 1: src = &object_->indirect_draw_cmd_; break;
+                case 2: src = &nt.prim_bases[parity]; break;
+                case 3: src = &nt.cmds; break;
+                case 4: src = &nt.slots; break;
+                case 5: src = &nt.counts; break;
+                case 6: src = &nt.prim_flags_buf; break;
+                case 7: src = &nt.class_idx[parity]; break;
+                default: src = &nt.rec_counts; break;
+            }
+            add(cb, b, *src);
+        }
+        add(cb, 10, nt.phase_b);
+        const auto& hv = s_nt_hiz_b_view ? s_nt_hiz_b_view : s_nt_hiz_view;
+        const auto& hs = s_nt_hiz_b_view ? s_nt_hiz_b_sampler : s_nt_hiz_sampler;
+        if (hv && hs) {
+            renderer::Helper::addOneTexture(
+                writes, cb, renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 9,
+                hs, hv, renderer::ImageLayout::GENERAL);
+        }
+    }
     nt.hiz_gen[parity] = s_nt_hiz_gen;
+    nt.hiz_gen_b[parity] = s_nt_hiz_b_gen;
     if (s_nt_compact_desc_set_layout && object_->tree_age_buffer_.buffer) {
         if (!nt.compact_desc_sets[parity]) {
             nt.compact_desc_sets[parity] =
                 device->createDescriptorSets(pool, s_nt_compact_desc_set_layout, 1)[0];
         }
-        const auto& ks = nt.compact_desc_sets[parity];
-        add(ks, 0, nt.infos[parity]);
-        add(ks, 1, object_->indirect_draw_cmd_);
-        add(ks, 2, nt.class_idx[parity]);
-        add(ks, 3, nt.class_prefix[parity]);
-        add(ks, 4, nt.records[parity]);
-        add(ks, 5, object_->instance_buffer_);
-        add(ks, 6, object_->tree_age_buffer_);
-        add(ks, 7, nt.compact_inst);
-        add(ks, 8, nt.compact_age);
-        add(ks, 9, nt.rec_counts);
-        add(ks, 10, nt.rec_template[parity]);
-        add(ks, 11, nt.handoff_stamp);
-        if (s_nt_hiz_view && s_nt_hiz_sampler) {
-            renderer::Helper::addOneTexture(
-                writes, ks, renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 12,
-                s_nt_hiz_sampler, s_nt_hiz_view, renderer::ImageLayout::GENERAL);
+        if (!nt.compact_desc_sets_b[parity]) {
+            nt.compact_desc_sets_b[parity] =
+                device->createDescriptorSets(pool, s_nt_compact_desc_set_layout, 1)[0];
+        }
+        for (int which = 0; which < 2; ++which) {
+            const auto& ks = which == 0 ? nt.compact_desc_sets[parity]
+                                        : nt.compact_desc_sets_b[parity];
+            add(ks, 0, nt.infos[parity]);
+            add(ks, 1, object_->indirect_draw_cmd_);
+            add(ks, 2, nt.class_idx[parity]);
+            add(ks, 3, nt.class_prefix[parity]);
+            add(ks, 4, nt.records[parity]);
+            add(ks, 5, object_->instance_buffer_);
+            add(ks, 6, object_->tree_age_buffer_);
+            add(ks, 7, nt.compact_inst);
+            add(ks, 8, nt.compact_age);
+            add(ks, 9, nt.rec_counts);
+            add(ks, 10, nt.rec_template[parity]);
+            add(ks, 11, nt.handoff_stamp);
+            add(ks, 13, nt.retest);
+            add(ks, 14, nt.phase_b);
+            const auto& hv = (which == 1 && s_nt_hiz_b_view) ? s_nt_hiz_b_view : s_nt_hiz_view;
+            const auto& hs = (which == 1 && s_nt_hiz_b_view) ? s_nt_hiz_b_sampler : s_nt_hiz_sampler;
+            if (hv && hs) {
+                renderer::Helper::addOneTexture(
+                    writes, ks, renderer::DescriptorType::COMBINED_IMAGE_SAMPLER, 12,
+                    hs, hv, renderer::ImageLayout::GENERAL);
+            }
         }
     }
     add(nt.vs_desc_sets[parity], NODE_TABLE_PARAMS_BINDING, nt.records[parity]);
@@ -11653,6 +11766,9 @@ void DrawableObject::draw(
                draw_mode, csm_cascade_idx);
         return;
     }
+    // Phase B re-draw: node-table buckets only, never the classic path
+    // (those drawables were already drawn in full by Phase A).
+    if (s_nt_only_draw_pass) return;
 
     // In mesh-shader mode, drawMesh needs the GS pipeline list as a
     // fallback for ineligible primitives (skinned, cutout, UINT16
@@ -12106,7 +12222,8 @@ void DrawableObject::ntBeginPass(
     const std::vector<std::shared_ptr<DrawableObject>>& drawables,
     DrawMode draw_mode,
     bool depth_only,
-    uint32_t csm_cascade_idx) {
+    uint32_t csm_cascade_idx,
+    bool phase_b) {
     if (!nt_enabled_ || !cmd_buf) return;
     // A stale "prepared" flag from an earlier pass must never let draw()
     // issue buckets the cull did not build for this pass.
@@ -12125,7 +12242,16 @@ void DrawableObject::ntBeginPass(
             continue;
         }
         if (!d->ntEligible(draw_mode)) continue;
-        d->ntPrepare(cmd_buf, draw_mode, depth_only, csm_cascade_idx);
+        // Phase B only re-tests drawables whose Phase A armed a retest
+        // list this frame (same serial); the rest have nothing to add.
+        if (phase_b) {
+            if (!d->object_ || !d->object_->nt_ ||
+                !d->object_->nt_->pass_retest_armed ||
+                d->object_->nt_->pass_retest_serial != nt_frame_serial_) {
+                continue;
+            }
+        }
+        d->ntPrepare(cmd_buf, draw_mode, depth_only, csm_cascade_idx, phase_b);
     }
 
     // Once-a-second summary (the forward hook runs exactly once a frame).
@@ -12169,7 +12295,8 @@ void DrawableObject::ntPrepare(
     const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
     DrawMode draw_mode,
     bool depth_only,
-    uint32_t csm_cascade_idx) {
+    uint32_t csm_cascade_idx,
+    bool phase_b) {
     stagePerDrawState();
     if (!isReady() || !object_->instance_buffer_.buffer ||
         !object_->indirect_draw_cmd_.buffer || !nt_device_) {
@@ -12232,6 +12359,18 @@ void DrawableObject::ntPrepare(
     const glm::mat4 iw = object_->m_current_instance_world_;
     const glm::mat4 iwT = glm::transpose(iw);
     uint32_t plane_count = 0u;
+    // ── Two-phase occlusion ─────────────────────────────────────────
+    // Phase A (G-buffer camera pass, per-node + per-instance Hi-Z against
+    // the frame-ahead prediction) records what it rejects; Phase B, run
+    // by the application after the real-depth pyramid exists, re-tests
+    // exactly that against the real depth and draws the survivors.
+    const bool hiz_pass = !depth_only && s_frustum_cull_active && s_nt_hiz_enabled;
+    const bool two_phase = hiz_pass && draw_mode == DrawMode::kGBuffer &&
+                           s_nt_hiz_b_view && nt.phase_b.buffer &&
+                           nt.retest.buffer &&
+                           nt.hiz_gen[parity] == s_nt_hiz_gen;
+    if (phase_b && !two_phase) return;        // nothing armed: pass_ready stays false
+    nt.pass_retest_armed = false;
     if (!depth_only && s_frustum_cull_active && s_nt_hiz_enabled) {
         // Frame-ahead: hand the shader view_proj * inst_world instead of
         // the six planes (it derives them) so it can also project the
@@ -12241,6 +12380,10 @@ void DrawableObject::ntPrepare(
         pc.planes[4] = glm::vec4(float(s_nt_hiz_size.x), float(s_nt_hiz_size.y),
                                  float(s_nt_hiz_mips), 0.0f);
         pc.flags = NT_CULL_FLAG_VP_PLANES | NT_CULL_FLAG_HIZ;
+        if (two_phase) {
+            pc.flags |= phase_b ? NT_CULL_FLAG_PHASE_B : NT_CULL_FLAG_RETEST;
+            pc.pad2 = nt.rec_counts_capacity;   // phase_b layout stride
+        }
         plane_count = 6u;
     } else if (!depth_only && s_frustum_cull_active) {
         for (int p = 0; p < 6; ++p) pc.planes[p] = iwT * s_frustum_planes[p];
@@ -12318,11 +12461,28 @@ void DrawableObject::ntPrepare(
         cmd_buf->addBufferBarrier(nt.compact_inst.buffer, vertex_attr_read, compute_write);
         cmd_buf->addBufferBarrier(nt.compact_age.buffer, vertex_attr_read, compute_write);
         cmd_buf->addBufferBarrier(nt.records[parity].buffer, host_write, compute_read);
+        if (two_phase && phase_b) {
+            // Phase A's retest list / counts -> this dispatch.
+            cmd_buf->addBufferBarrier(nt.retest.buffer, compute_rw, compute_rw);
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, compute_rw, compute_rw);
+            cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_read, compute_rw);
+        }
         cmd_buf->addBufferBarrier(nt.class_prefix[parity].buffer, host_write, compute_read);
-        cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_read, transfer_write);
-        cmd_buf->fillBuffer(nt.rec_counts.buffer, 0,
-                            uint64_t(nt.record_count) * sizeof(uint32_t), 0u);
-        cmd_buf->addBufferBarrier(nt.rec_counts.buffer, transfer_write, compute_rw);
+        if (!phase_b) {
+            cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_read, transfer_write);
+            cmd_buf->fillBuffer(nt.rec_counts.buffer, 0,
+                                uint64_t(nt.record_count) * sizeof(uint32_t), 0u);
+            cmd_buf->addBufferBarrier(nt.rec_counts.buffer, transfer_write, compute_rw);
+        }
+        if (two_phase && !phase_b) {
+            // Phase A: clear the retest count, the Phase B counts and the
+            // node-rejection flags (one buffer) before this dispatch.
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, compute_rw, transfer_write);
+            cmd_buf->fillBuffer(nt.phase_b.buffer, 0,
+                                uint64_t(1u + 2u * nt.rec_counts_capacity) * sizeof(uint32_t), 0u);
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, transfer_write, compute_rw);
+            cmd_buf->addBufferBarrier(nt.retest.buffer, compute_rw, compute_rw);
+        }
 
         glsl::NtCompactPushConstants kpc{};
         uint32_t world_planes = 0u;
@@ -12343,7 +12503,10 @@ void DrawableObject::ntPrepare(
             world_planes = 6u;
         }
         kpc.eye = glm::vec4(s_plant_lod_eye_ws, 1.0f);
-        kpc.flags = world_planes | hiz_flag | NT_COMPACT_BAND_TEST |
+        if (two_phase && hiz_flag != 0u) {
+            kpc.flags |= phase_b ? NT_COMPACT_PHASE_B : NT_COMPACT_RETEST;
+        }
+        kpc.flags |= world_planes | hiz_flag | NT_COMPACT_BAND_TEST |
                     // Hand-off once per frame: the G-buffer pass appends
                     // the jobs; every other camera pass (forward-covered,
                     // glass) drops the same instances so they are not
@@ -12379,7 +12542,8 @@ void DrawableObject::ntPrepare(
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
             s_nt_compact_pipeline_layout,
-            { nt.compact_desc_sets[parity],
+            { (phase_b && nt.compact_desc_sets_b[parity])
+                  ? nt.compact_desc_sets_b[parity] : nt.compact_desc_sets[parity],
               s_nt_plant_job_set ? s_nt_plant_job_set : s_nt_plant_dummy_set },
             0);
         cmd_buf->pushConstants(
@@ -12396,15 +12560,20 @@ void DrawableObject::ntPrepare(
         if (nt.dbg_pending && serial >= nt.dbg_serial + 3u && nt.dbg_rb.memory) {
             nt.dbg_pending = false;
             const uint32_t* p = static_cast<const uint32_t*>(
-                device->mapMemory(nt.dbg_rb.memory, 4096, 0));
+                device->mapMemory(nt.dbg_rb.memory, 8192, 0));
             if (p) {
                 const uint32_t nrec = std::min<uint32_t>(nt.dbg_records, 512u);
                 uint64_t sum = 0; uint32_t nonzero = 0;
                 for (uint32_t i = 0; i < nrec; ++i) { sum += p[i]; nonzero += p[i] ? 1u : 0u; }
                 const float* f = reinterpret_cast<const float*>(p + 512);
+                // Two-phase: [1024] = retest count, [1025 ..] Phase B
+                // survivors per record (first nrec), copied by Phase B.
+                uint64_t sum_b = 0;
+                for (uint32_t i = 0; i < nrec; ++i) sum_b += p[1025 + i];
                 std::cout << "[nt.compact] " << (object_->nodes_.empty() ? std::string("?") : object_->nodes_[0].name_)
                           << " records=" << nt.dbg_records << " (first " << nrec << ": survivors=" << sum
                           << " nonzero_records=" << nonzero << ") tested=" << nt.dbg_inst_total
+                          << " phaseB(retested=" << p[1024] << " drawn=" << sum_b << ")"
                           << " inst0=[" << f[0] << "," << f[1] << "," << f[2] << "," << f[3] << " | "
                           << f[4] << "," << f[5] << "," << f[6] << "," << f[7] << " | "
                           << f[8] << "," << f[9] << "," << f[10] << "," << f[11] << "]"
@@ -12417,15 +12586,18 @@ void DrawableObject::ntPrepare(
                 device->unmapMemory(nt.dbg_rb.memory);
             }
         }
-        if (draw_mode == DrawMode::kGBuffer && !nt.dbg_pending &&
-            serial >= nt.dbg_serial + 240u) {
+        if (draw_mode == DrawMode::kGBuffer && !phase_b && !nt.dbg_pending &&
+            serial >= nt.dbg_serial + 60u) {
             if (!nt.dbg_rb.buffer) {
                 renderer::Helper::createBuffer(
                     device,
                     SET_FLAG_BIT(BufferUsage, TRANSFER_DST_BIT),
                     SET_2_FLAG_BITS(MemoryProperty, HOST_VISIBLE_BIT, HOST_COHERENT_BIT),
                     0, nt.dbg_rb.buffer, nt.dbg_rb.memory,
-                    std::source_location::current(), 4096);
+                    std::source_location::current(), 8192);
+                // Phase B counters read as zero until a Phase B copies them.
+                std::vector<uint8_t> zero(8192, 0);
+                device->updateBufferMemory(nt.dbg_rb.memory, 8192, zero.data(), 0, true);
             }
             const renderer::BufferResourceInfo transfer_read = {
                 SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
@@ -12445,6 +12617,17 @@ void DrawableObject::ntPrepare(
             nt.dbg_inst_total = inst_total;
             nt.dbg_hiz = (kpc.flags & NT_COMPACT_HIZ) != 0u;
         }
+        if (phase_b && nt.dbg_pending && nt.dbg_serial == serial && nt.dbg_rb.buffer) {
+            // Same frame's capture: add the Phase B counters.
+            const renderer::BufferResourceInfo transfer_read = {
+                SET_FLAG_BIT(Access, TRANSFER_READ_BIT),
+                SET_FLAG_BIT(PipelineStage, TRANSFER_BIT) };
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, compute_rw, transfer_read);
+            const uint32_t nrec = std::min<uint32_t>(nt.record_count, 512u);
+            cmd_buf->copyBuffer(nt.phase_b.buffer, nt.dbg_rb.buffer,
+                                { { 0, 4096, uint64_t(1u + nrec) * 4u } });
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, transfer_read, compute_rw);
+        }
 
         cmd_buf->addBufferBarrier(nt.rec_counts.buffer, compute_rw, compute_read);
         cmd_buf->addBufferBarrier(nt.compact_inst.buffer, compute_write, vertex_attr_read);
@@ -12453,12 +12636,24 @@ void DrawableObject::ntPrepare(
     }
 
     if (class_count > 0u) {
+        if (two_phase && !phase_b && !compact) {
+            // No compaction this pass: the node cull is the only Phase A
+            // writer of the phase-B buffer, so clear it here.
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, compute_rw, transfer_write);
+            cmd_buf->fillBuffer(nt.phase_b.buffer, 0,
+                                uint64_t(1u + 2u * nt.rec_counts_capacity) * sizeof(uint32_t), 0u);
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, transfer_write, compute_rw);
+        }
+        if (two_phase) {
+            cmd_buf->addBufferBarrier(nt.phase_b.buffer, compute_rw, compute_rw);
+        }
         cmd_buf->bindPipeline(renderer::PipelineBindPoint::COMPUTE,
                               nt_cull_pipeline_);
         cmd_buf->bindDescriptorSets(
             renderer::PipelineBindPoint::COMPUTE,
             nt_cull_pipeline_layout_,
-            { nt.cull_desc_sets[parity] },
+            { (phase_b && nt.cull_desc_sets_b[parity])
+                  ? nt.cull_desc_sets_b[parity] : nt.cull_desc_sets[parity] },
             0);
         cmd_buf->pushConstants(
             SET_FLAG_BIT(ShaderStage, COMPUTE_BIT),
@@ -12473,6 +12668,10 @@ void DrawableObject::ntPrepare(
     cmd_buf->addBufferBarrier(nt.counts.buffer, compute_rw, indirect_read);
 
     nt.pass_ready = true;
+    if (two_phase && !phase_b) {
+        nt.pass_retest_armed = true;
+        nt.pass_retest_serial = serial;
+    }
     nt.pass_compacted = compact;
     nt.pass_parity = parity;
     nt.pass_mode = mode;

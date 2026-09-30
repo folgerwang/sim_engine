@@ -31,6 +31,18 @@ layout(push_constant) uniform PushConstants {
     // Used to clamp the 2×2 sample positions so we don't read off the
     // edge when destination is half of an odd-sized source.
     uvec2 src_size;
+    // 1: HOLE-IGNORING reduce, for the pyramid built from the frame-ahead
+    // prediction.  A texel of exactly 1.0 there means "no frame-N pixel
+    // landed here" (disocclusion, reprojection gap) -- it is NOT a claim
+    // that nothing is there, and a plain max would let one such texel
+    // turn every coarser texel over it into "far" and lose the occluders
+    // around it (the walking frame-rate drop).  The reduce takes the max
+    // of the texels that carry data and outputs 1.0 only when none do.
+    // Sky is scattered as 0.99999 (depth_predict.comp) so it still reads
+    // as "no occluder".  What this wrongly hides, Phase B (tested against
+    // the real depth) draws.  0 for the real-depth pyramid: plain max.
+    uint  ignore_holes;
+    uint  pad;
 };
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -62,6 +74,16 @@ void main() {
 
     // Conservative-far: take the deepest of the four.  A cluster is only
     // rejected if its closest point is still BEHIND this far value.
-    float far_z = max(max(d00, d10), max(d01, d11));
+    float far_z;
+    if (ignore_holes != 0u) {
+        far_z = -1.0;
+        if (d00 < 1.0) far_z = max(far_z, d00);
+        if (d10 < 1.0) far_z = max(far_z, d10);
+        if (d01 < 1.0) far_z = max(far_z, d01);
+        if (d11 < 1.0) far_z = max(far_z, d11);
+        if (far_z < 0.0) far_z = 1.0;
+    } else {
+        far_z = max(max(d00, d10), max(d01, d11));
+    }
     imageStore(dst_mip, ivec2(dst_px), vec4(far_z, 0.0, 0.0, 0.0));
 }

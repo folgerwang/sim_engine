@@ -60,6 +60,12 @@ layout(push_constant) uniform PC {
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 const uint kFarBits = 0x3F800000u;   // floatBitsToUint(1.0)
+// Sky is scattered as a VALID far value just below 1.0 so the Hi-Z build
+// can tell it from a hole (exactly 1.0 = nothing landed here).  Every
+// occlusion test already treats >= 0.99999 as "no occluder", so sky
+// still occludes nothing; the build's hole-ignoring reduce (predicted
+// pyramid only) skips exact-1.0 texels and keeps the sky.
+const float kSkyDepth = 0.99999;
 
 void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
@@ -75,7 +81,8 @@ void main() {
         vec2 inv_src = 1.0 / vec2(pc.src_size);
         vec2 uv = (vec2(px) + 0.5) * inv_src;
         float z = textureLod(src_depth, uv, 0.0).r;
-        if (z >= 0.99999) return;                    // sky / cleared
+        const bool sky = z >= 0.99999;
+        if (sky) z = kSkyDepth;
         // Unproject frame N's pixel to world.  NDC y is flipped in this
         // engine's viewport (see the velocity convention in
         // cluster_bindless.vert: curNDC - prevNDC); inv_view_proj is the
@@ -95,7 +102,11 @@ void main() {
         if (nc.w <= 1e-6) return;                    // behind the N+1 eye
         vec3 nn = nc.xyz / nc.w;
         if (any(greaterThan(abs(nn.xy), vec2(1.0)))) return;
-        if (nn.z < 0.0 || nn.z >= 1.0) return;
+        if (sky) {
+            nn.z = kSkyDepth;                        // stays sky wherever it lands
+        } else if (nn.z < 0.0 || nn.z >= 1.0) {
+            return;
+        }
         ivec2 tp = ivec2((nn.xy * 0.5 + 0.5) * vec2(pc.dst_size));
         tp = clamp(tp, ivec2(0), ivec2(pc.dst_size) - 1);
         // A moving surface may cover more than one target texel after the

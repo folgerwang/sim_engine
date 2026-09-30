@@ -1559,6 +1559,16 @@ public:
         uint32_t mip_count,
         const glm::mat4& view_proj,
         bool enabled);
+    // Two-phase occlusion: the REAL mid-frame depth pyramid (same size /
+    // mips / view_proj as the prediction above) that Phase B re-tests
+    // against.  Null = no Phase B this frame.
+    static void setNtHiZOcclusionB(
+        const std::shared_ptr<renderer::Sampler>& sampler,
+        const std::shared_ptr<renderer::ImageView>& view);
+    // While set, draw() issues ONLY node-table buckets a preceding
+    // ntBeginPass prepared and never falls through to the classic path
+    // (the Phase B re-draw must not repeat the classic drawables).
+    static void setNtOnlyDrawPass(bool on);
     static bool debugHideTreeWood();
     static bool debugHideTreeLeaves();
     bool getDebugForceRed() const {
@@ -2014,7 +2024,8 @@ public:
         const std::vector<std::shared_ptr<DrawableObject>>& drawables,
         DrawMode draw_mode,
         bool depth_only,
-        uint32_t csm_cascade_idx);
+        uint32_t csm_cascade_idx,
+        bool phase_b = false);
     // Menu toggle.  Off = every drawable records through the classic
     // per-node path exactly as before.
     static void setNodeTableEnabled(bool on) { nt_enabled_ = on; }
@@ -2036,7 +2047,8 @@ private:
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         DrawMode draw_mode,
         bool depth_only,
-        uint32_t csm_cascade_idx);
+        uint32_t csm_cascade_idx,
+        bool phase_b = false);
     void ntDraw(
         const std::shared_ptr<renderer::CommandBuffer>& cmd_buf,
         const renderer::DescriptorSetList& desc_set_list,

@@ -362,6 +362,12 @@ private:
     renderer::BufferInfo draw_count_buffer_phase_a_;
 
     std::shared_ptr<renderer::DescriptorSet> cull_desc_set_;
+    // Phase B twin of cull_desc_set_: identical except binding 11 holds
+    // the REAL mid-frame depth pyramid (application buildHiZReal) instead
+    // of the frame-ahead prediction.  cullPhaseB binds it while the
+    // application says the real pyramid was built this frame.
+    std::shared_ptr<renderer::DescriptorSet> cull_desc_set_b_;
+    bool hiz_real_valid_ = false;
 
     // ── Merged vertex/index buffers for bindless rendering ──
     renderer::BufferInfo merged_vertex_buffer_; // BindlessVertex[]
@@ -815,6 +821,8 @@ private:
     // pick an appropriate mip and clamp the sample coordinates.
     std::shared_ptr<renderer::Sampler>   hiz_sampler_;
     std::shared_ptr<renderer::ImageView> hiz_view_;
+    std::shared_ptr<renderer::Sampler>   hiz_sampler_b_;
+    std::shared_ptr<renderer::ImageView> hiz_view_b_;
     glm::uvec2                           hiz_size_      = glm::uvec2(0);
     uint32_t                             hiz_mip_count_ = 0;
 
@@ -1234,6 +1242,12 @@ public:
     // sampler used to read the pyramid (point/CLAMP_TO_EDGE filter
     // recommended), the mip-0 image view, the mip-0 size in pixels, and
     // the total mip count so the shader can clamp its mip pick.
+    // Real-depth pyramid for Phase B (see cull_desc_set_b_).  Null view
+    // = Phase B falls back to the prediction set.
+    void setHiZTextureB(
+        const std::shared_ptr<renderer::Sampler>& sampler,
+        const std::shared_ptr<renderer::ImageView>& view);
+    void setHiZRealValid(bool v) { hiz_real_valid_ = v; }
     void setHiZTexture(
         const std::shared_ptr<renderer::Sampler>& sampler,
         const std::shared_ptr<renderer::ImageView>& view,

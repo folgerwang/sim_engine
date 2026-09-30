@@ -2304,6 +2304,15 @@ struct NtCullPushConstants {
 //              (the PREDICTED depth of this frame when frame-ahead is on)
 #define NT_CULL_FLAG_VP_PLANES 1u
 #define NT_CULL_FLAG_HIZ       2u
+// Two-phase occlusion (see nt_instance_compact.comp "Phase B"):
+//   RETEST   Phase A: a node the Hi-Z test rejects is flagged in the
+//            phase-B buffer so Phase B re-tests it against the REAL depth.
+//   PHASE_B  this dispatch is Phase B: commands cover only what Phase A
+//            did not draw (the retested survivors; the whole record when
+//            Phase A rejected the node), tested against the pyramid at
+//            binding 9, which is the real mid-frame depth in this phase.
+#define NT_CULL_FLAG_RETEST    4u
+#define NT_CULL_FLAG_PHASE_B   8u
 
 // nt_instance_compact.comp -- one invocation per (class record, instance).
 // 128 bytes.  planes are WORLD space (the per-instance centre is taken to
@@ -2316,6 +2325,16 @@ struct NtCullPushConstants {
 // set, planes[0..3] carry view_proj (world -> clip; the frustum planes
 // are derived from it) and planes[4] = (hiz w, hiz h, mip count, 0).
 #define NT_COMPACT_HIZ           0x800u
+// Two-phase occlusion.  Phase A (RETEST): an instance the Hi-Z test
+// rejects -- and nothing else -- is appended to the retest list (binding
+// 13) instead of being dropped.  Phase B (PHASE_B): one invocation per
+// retest entry, tested against the pyramid at binding 12 (the REAL
+// mid-frame depth in this phase); survivors are appended to the record's
+// compacted range AFTER Phase A's count.  Phase A may then test against
+// a best-guess pyramid (prediction holes ignored) without ever losing an
+// instance: what it wrongly rejects, Phase B draws.
+#define NT_COMPACT_RETEST        0x1000u
+#define NT_COMPACT_PHASE_B       0x2000u
 struct NtCompactPushConstants {
     vec4    planes[6];        // world-space frustum, normals inward
     vec4    eye;              // xyz = LOD eye (camera position)

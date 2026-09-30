@@ -583,6 +583,8 @@ private:
     // prepass.  Costs one frame of input latency.  Off by default until
     // verified in-engine.
     bool frame_ahead_on_ = true;    // default: predicted-depth cull replaces the prepass
+    bool hiz_ignore_holes_on_ = true;   // predicted pyramid: reduce ignores reprojection holes
+    bool hiz_two_phase_on_ = true;      // Phase B re-test against the real mid-frame depth
     float vt_lod_bias_ = 0.5f;      // VT LOD bias: how far between two mips every sample sits
     bool  plant_cluster_path_on_ = true;     // plants near the eye rasterised through the cluster path
     float plant_cluster_radius_m_ = 200.0f; // hand-off radius (m)
@@ -2492,6 +2494,8 @@ public:
     inline bool isHideDeferredPixels() const { return debug_hide_deferred_; }
     inline bool isDepthPrepassOn() const { return depth_prepass_on_; }
     inline bool isFrameAheadOn() const { return frame_ahead_on_; }
+    inline bool isHiZIgnoreHolesOn() const { return hiz_ignore_holes_on_; }
+    inline bool isHiZTwoPhaseOn() const { return hiz_two_phase_on_; }
     inline float getVtLodBias() const { return vt_lod_bias_; }
     inline bool  isPlantClusterPathOn() const { return plant_cluster_path_on_; }
     inline float getPlantClusterRadiusM() const { return plant_cluster_radius_m_; }
